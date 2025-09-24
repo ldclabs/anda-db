@@ -1,0 +1,29 @@
+[project]
+name = "anda-db"
+version = "0.1.0"
+description = "AndaDB: A Rust-powered knowledge and memory database for AI agents, with Python FFI."
+authors = [
+    { name = "LDCLabs", email = "info@ldclabs.com" }
+]
+license = "MIT"
+keywords = ["database", "ai-agent", "knowledge", "memory", "rust", "ffi"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Operating System :: OS Independent",
+    "License :: OSI Approved :: MIT License",
+    "Intended Audience :: Developers",
+    "Topic :: Database"
+]
+
+[tool.maturin]
+manifest-path = "Cargo.toml"
+features = ["pyo3/extension-module"]
+
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project.urls]
+Homepage = "https://github.com/ldclabs/anda_db"
+Repository = "https://github.com/ldclabs/anda_db"

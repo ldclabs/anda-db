@@ -11,6 +11,7 @@ members = [
   "rs/anda_db_utils",
   "rs/anda_kip",
   "rs/anda_object_store",
+  "py/anda_cognitive_nexus_py",
 ]
 
 [workspace.package]
@@ -69,6 +70,16 @@ nom = "8"
 nom-language = "0.1"
 regex = "1.11"
 rustc-hash = "2"
+candid = "0.10"
+pyo3 = "0.20.3"
+pyo3-asyncio = "0.20.0"
+async-std = "1.9"
+serde-pyobject = "0.2.0"
+
+# From Anda
+anda_core = "0.8.0"
+anda_engine = "0.8.0"
+
 
 [workspace.metadata.cargo-shear]
 ignored = ["blas-src"]

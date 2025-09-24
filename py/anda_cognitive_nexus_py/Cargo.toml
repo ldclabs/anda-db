@@ -1,0 +1,30 @@
+[package]
+name = "anda_cognitive_nexus_py"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "anda_cognitive_nexus_py"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Python Bindings
+pyo3 = { workspace = true, features = [ "extension-module", "serde"] }
+pyo3-asyncio = { workspace = true, features = ["attributes", "async-std-runtime", "tokio-runtime"] }  
+async-std = { workspace = true }
+tokio = { workspace = true }
+serde-pyobject = { workspace = true }
+
+# Anda
+anda_db = { path = "../../rs/anda_db" }
+anda_cognitive_nexus = { path = "../../rs/anda_cognitive_nexus" }
+anda_kip = { path = "../../rs/anda_kip" }
+anda_object_store = { path = "../../rs/anda_object_store" }
+
+# Other Crates
+serde_json = { workspace = true }
+serde = { workspace = true }
+candid = { workspace = true }
+object_store = { workspace = true }
+log = { workspace = true }
+structured-logger = { workspace = true }
