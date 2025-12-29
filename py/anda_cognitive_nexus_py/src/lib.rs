@@ -1,18 +1,20 @@
+#![allow(non_local_definitions)]
+
 use anda_cognitive_nexus::CognitiveNexus;
 use anda_db::database::{AndaDB, DBConfig};
-use object_store::local::LocalFileSystem;
+use anda_kip::executor::Executor;
+use anda_kip::Json;
 use anda_kip::{CommandType, KipError, Request, Response};
+use anda_object_store::MetaStoreBuilder;
+use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
-use pyo3::prelude::*;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use serde::{Deserialize, Serialize};
-use serde_pyobject::to_pyobject;
 use serde_json::{Map, Value};
+use serde_pyobject::to_pyobject;
 use std::sync::Arc;
-use anda_object_store::{MetaStoreBuilder};
-use anda_kip::Json;
-use anda_kip::executor::Executor;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// This is a simple example of exposing a Rust function to Python using PyO3.
@@ -93,14 +95,16 @@ impl PyAndaDB {
         let fut = async move {
             match create_kip_db(db_config).await {
                 Ok(nexus) => Ok(PyAndaDB { nexus }),
-                Err(e) => Err(PyRuntimeError::new_err(format!("DB creation error: {}", e)))
+                Err(e) => Err(PyRuntimeError::new_err(format!("DB creation error: {}", e))),
             }
         };
-        Ok(pyo3_asyncio::tokio::future_into_py(py, fut)?)
+        pyo3_asyncio::tokio::future_into_py(py, fut)
     }
 
     #[pyo3(signature = (command, dry_run = false, parameters = None))]
-    #[pyo3(text_signature = "(command: str, dry_run: bool = False, parameters: dict = None) -> Awaitable[Dict[str, Any]]")]
+    #[pyo3(
+        text_signature = "(command: str, dry_run: bool = False, parameters: dict = None) -> Awaitable[Dict[str, Any]]"
+    )]
     /// Execute a KIP command asynchronously.
     ///
     /// Args:
@@ -142,7 +146,10 @@ impl PyAndaDB {
             })
             .unwrap_or_default();
 
-        log::debug!("params_map: {}", serde_json::to_string(&params_map).unwrap());
+        log::debug!(
+            "params_map: {}",
+            serde_json::to_string(&params_map).unwrap()
+        );
 
         let nexus = self.nexus.clone();
 
@@ -168,8 +175,9 @@ impl PyAndaDB {
                         let py_cmd_wrapper = Py::new(py, PyCommandType::from(cmd_type))?;
 
                         // 2) Convert response (serde-serializable) into a Python object using serde-pyobject
-                        let py_response = to_pyobject(py, &response)
-                            .map_err(|e| PyRuntimeError::new_err(format!("Response conversion error: {}", e)))?;
+                        let py_response = to_pyobject(py, &response).map_err(|e| {
+                            PyRuntimeError::new_err(format!("Response conversion error: {}", e))
+                        })?;
 
                         // 3) Build the resulting Python dict {"type": <PyCommandType>, "response": <py_response>}
                         let out_dict = PyDict::new(py);
@@ -181,13 +189,16 @@ impl PyAndaDB {
 
                     Ok(py_obj)
                 }
-                Err(e) => Err(PyRuntimeError::new_err(format!("KIP execution error: {}", e))),
+                Err(e) => Err(PyRuntimeError::new_err(format!(
+                    "KIP execution error: {}",
+                    e
+                ))),
             }
         };
 
         // Convert the Rust Future -> Python awaitable
-        Ok(pyo3_asyncio::tokio::future_into_py(py, fut)?)
-    }    
+        pyo3_asyncio::tokio::future_into_py(py, fut)
+    }
 }
 
 /// Exposes the Rust AndaDbConfig struct as a Python class.
@@ -227,8 +238,7 @@ impl AndaDbConfig {
         db_desc: Option<String>,
         meta_cache_capacity: Option<u64>,
     ) -> PyResult<Self> {
-        Ok(
-            AndaDbConfig {
+        Ok(AndaDbConfig {
             store_location_type,
             store_location,
             db_name,
@@ -249,11 +259,16 @@ impl AndaDbConfig {
     pub fn verify_config(&self) -> Result<(), String> {
         if let StoreLocationType::LocalFile = self.store_location_type {
             if self.store_location.trim().is_empty() {
-                return Err("store_location is required when store_location_type is LocalFile".to_string());
+                return Err(
+                    "store_location is required when store_location_type is LocalFile".to_string(),
+                );
             }
             use std::path::Path;
             if !Path::new(&self.store_location).exists() {
-                return Err(format!("store_location path does not exist: {}", self.store_location));
+                return Err(format!(
+                    "store_location path does not exist: {}",
+                    self.store_location
+                ));
             }
         }
         Ok(())
@@ -300,12 +315,15 @@ impl TryFrom<&str> for StoreLocationType {
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         let s: String = value.to_string();
 
-        if StoreLocationType::InMem.__str__() == s
-            { Ok(StoreLocationType::InMem) }
-        else if  StoreLocationType::LocalFile.__str__() == s
-            { Ok(StoreLocationType::LocalFile) }
-        else { 
-            Err(PyValueError::new_err(format!("Invalid StoreLocationType: {}", s)))
+        if StoreLocationType::InMem.__str__() == s {
+            Ok(StoreLocationType::InMem)
+        } else if StoreLocationType::LocalFile.__str__() == s {
+            Ok(StoreLocationType::LocalFile)
+        } else {
+            Err(PyValueError::new_err(format!(
+                "Invalid StoreLocationType: {}",
+                s
+            )))
         }
     }
 }
@@ -322,11 +340,8 @@ impl TryFrom<&str> for StoreLocationType {
 ///
 /// # Errors
 /// Returns an error if the config is invalid or DB/Nexus creation fails.
-pub async fn create_kip_db(
-    db_config: AndaDbConfig,
-) -> Result<Arc<CognitiveNexus>, BoxError> {
-    db_config.verify_config()
-        .map_err(|e| KipError::Execution(e))?;
+pub async fn create_kip_db(db_config: AndaDbConfig) -> Result<Arc<CognitiveNexus>, BoxError> {
+    db_config.verify_config().map_err(KipError::Execution)?;
 
     let db_name = db_config.db_name.as_str();
     let db_desc = db_config.db_desc.as_deref().unwrap_or_default();
@@ -339,7 +354,8 @@ pub async fn create_kip_db(
                 LocalFileSystem::new_with_prefix(&db_config.store_location)
                     .map_err(|err| KipError::Execution(err.to_string()))?,
                 meta_cache_capacity,
-            ).build();
+            )
+            .build();
             Arc::new(local_file)
         }
     };
@@ -373,10 +389,10 @@ pub async fn create_kip_db(
 /// Returns an error if the KIP command execution fails.
 ///
 /// # Example
-/// 
+///
 /// Refer to tools/anda_cognitive_nexus_py/examples directory
 pub async fn execute_kip(
-    nexus: &(impl Executor + Sync),
+    nexus: &impl Executor,
     command: String,
     parameters: Option<Map<String, Json>>,
     dry_run: bool,
@@ -540,7 +556,8 @@ mod tests {
         };
 
         // Create Nexus instance for in-memory DB
-        let nexus_in_mem = block_on(create_kip_db(db_config_in_mem)).expect("Failed to create in_mem Nexus");
+        let nexus_in_mem =
+            block_on(create_kip_db(db_config_in_mem)).expect("Failed to create in_mem Nexus");
 
         // Use empty Map for parameters
         let empty_params: Map<String, Json> = Map::new();
@@ -552,7 +569,11 @@ mod tests {
             false,
         ))
         .expect("Execution of medical_knowledge_kml failed");
-        assert!(matches!(response1, Response::Ok { .. }), "Expected first KML execution to be Ok, but got {:?}", response1);
+        assert!(
+            matches!(response1, Response::Ok { .. }),
+            "Expected first KML execution to be Ok, but got {:?}",
+            response1
+        );
         println!("Medical Knowledge KML executed successfully (in_mem DB).");
 
         // 2. Execute the second KML command from the demo to add more data
@@ -571,7 +592,11 @@ mod tests {
             false,
         ))
         .expect("Execution of new_drug_kml failed");
-        assert!(matches!(response2, Response::Ok { .. }), "Expected third KML execution to be Ok, but got {:?}", response2);
+        assert!(
+            matches!(response2, Response::Ok { .. }),
+            "Expected third KML execution to be Ok, but got {:?}",
+            response2
+        );
         println!("New Drug KML executed successfully (in_mem DB).");
         // 3. Execute a KQL query from the demo to verify the data
         println!("\n3. Executing KQL Query to find all drugs...");
@@ -594,16 +619,25 @@ mod tests {
         println!("Query Response: {:#?}", query_response);
 
         // 4. Assert that the query was successful and returned the correct data
-        assert!(matches!(query_response, Response::Ok { .. }), "Expected KQL query to be Ok, but got {:?}", query_response);
+        assert!(
+            matches!(query_response, Response::Ok { .. }),
+            "Expected KQL query to be Ok, but got {:?}",
+            query_response
+        );
 
         if let Response::Ok { result, .. } = query_response {
             let result_array = result.as_array().expect("Result should be an array");
-            assert_eq!(result_array.len(), 2, "Expected to find 2 drugs, but found {}", result_array.len());
+            assert_eq!(
+                result_array.len(),
+                2,
+                "Expected to find 2 drugs, but found {}",
+                result_array.len()
+            );
             println!("Successfully found 2 drugs as expected.");
         } else {
             panic!("Query failed, expected Ok response");
         }
 
-        println!("\n--- Full Stateful KIP Execution Test Passed ---");        
+        println!("\n--- Full Stateful KIP Execution Test Passed ---");
     }
 }

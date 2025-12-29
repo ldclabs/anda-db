@@ -1,7 +1,7 @@
 use anda_db_btree::BTreeIndex;
 use bytes::Bytes;
 use ciborium::from_reader;
-use ic_auth_types::{ByteBufB64, canonical_cbor_into_vec};
+use ic_auth_types::{ByteBufB64, deterministic_cbor_into_vec};
 use parking_lot::RwLock;
 use serde::{Serialize, de::DeserializeOwned};
 use std::{fmt::Debug, hash::Hash, str::FromStr, sync::Arc};
@@ -101,7 +101,7 @@ impl BTree {
     where
         T: Serialize,
     {
-        canonical_cbor_into_vec(cursor)
+        deterministic_cbor_into_vec(cursor)
             .map(|v| ByteBufB64(v).to_string())
             .ok()
     }

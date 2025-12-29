@@ -8,7 +8,7 @@ use futures::{
 };
 use moka::future::Cache;
 use object_store::{
-    GetOptions, ObjectMeta, ObjectStore, PutOptions, PutResult, UpdateVersion,
+    GetOptions, ObjectMeta, ObjectStore, ObjectStoreExt, PutOptions, PutResult, UpdateVersion,
     buffered::{BufReader, BufWriter},
     path::Path,
 };
@@ -486,7 +486,7 @@ impl Storage {
     pub async fn stream_reader(
         &self,
         doc_path: &str,
-    ) -> Result<Pin<Box<dyn tokio::io::AsyncRead>>, DBError> {
+    ) -> Result<Pin<Box<dyn tokio::io::AsyncRead + Send>>, DBError> {
         let path = self.full_path(doc_path);
         let meta = self
             .inner
@@ -500,10 +500,14 @@ impl Storage {
             self.inner.metadata.config.object_chunk_size,
         );
 
+        // Coerce both branches to the same trait-object type to avoid
+        // concrete-type mismatches between `ZstdDecoder` and `BufReader`.
         if self.inner.metadata.config.compress_level > 0 {
-            Ok(Box::pin(ZstdDecoder::new(reader)))
+            let r: Pin<Box<dyn tokio::io::AsyncRead + Send>> = Box::pin(ZstdDecoder::new(reader));
+            Ok(r)
         } else {
-            Ok(Box::pin(reader))
+            let r: Pin<Box<dyn tokio::io::AsyncRead + Send>> = Box::pin(reader);
+            Ok(r)
         }
     }
 

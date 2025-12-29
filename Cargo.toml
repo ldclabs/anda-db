@@ -11,7 +11,7 @@ members = [
   "rs/anda_db_utils",
   "rs/anda_kip",
   "rs/anda_object_store",
-  "py/anda_cognitive_nexus_py",
+  # "py/anda_cognitive_nexus_py",
 ]
 
 [workspace.package]
@@ -60,9 +60,9 @@ tantivy-tokenizer-api = "0.6"
 tantivy-jieba = "0.17"
 structured-logger = "1"
 smallvec = "1.15"
-criterion = "0.7"
-ic_auth_types = { version = "0.6" }
-object_store = { version = "0.12" }
+criterion = "0.8"
+ic_auth_types = { version = "0.7" }
+object_store = { version = "0.13" }
 moka = { version = "0.12", features = ["future"] }
 zstd-safe = "7"
 async-compression = { version = "0.4", features = ["tokio", "zstd"] }

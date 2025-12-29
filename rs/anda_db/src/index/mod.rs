@@ -1,5 +1,5 @@
 use anda_db_schema::{Document, Fv, Json, Vector};
-use ic_auth_types::canonical_cbor_into_vec;
+use ic_auth_types::deterministic_cbor_into_vec;
 use std::borrow::Cow;
 
 mod bm25;
@@ -59,7 +59,7 @@ pub fn virtual_field_value(vals: &[Option<&Fv>]) -> Option<Fv> {
     }
     let mut data = Vec::new();
     for val in vals {
-        data.extend(canonical_cbor_into_vec(val).ok()?);
+        data.extend(deterministic_cbor_into_vec(val).ok()?);
     }
     Some(Fv::Bytes(data))
 }

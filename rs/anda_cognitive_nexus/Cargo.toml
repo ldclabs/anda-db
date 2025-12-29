@@ -31,7 +31,7 @@ regex = { workspace = true }
 rustc-hash = { workspace = true }
 
 [dev-dependencies]
-anda_object_store = { path = "../anda_object_store", version = "0.2" }
+anda_object_store = { path = "../anda_object_store", version = "0.3" }
 tokio = { workspace = true, features = ["full"] }
 object_store = { workspace = true }
 structured-logger = { workspace = true }

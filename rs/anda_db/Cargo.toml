@@ -37,7 +37,7 @@ rustc-hash = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
 structured-logger = { workspace = true }
-anda_object_store = { path = "../anda_object_store", version = "0.2" }
+anda_object_store = { path = "../anda_object_store", version = "0.3" }
 serde_json = { workspace = true }
 
 [features]

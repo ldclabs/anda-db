@@ -1,6 +1,6 @@
 [package]
 name = "anda_object_store"
-version = "0.2.1"
+version = "0.3.0"
 description = "A Rust library that extends the functionality of the object_store crate with metadata management and encryption."
 keywords = ["database", "object_store", "encryption", "anda", "AndaDB"]
 categories = ["database", "data-structures", "text-processing"]

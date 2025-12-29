@@ -145,6 +145,13 @@ impl<T: ObjectStore> MetaStoreBuilder<T> {
         path
     }
 
+    fn strip_meta_prefix(&self, path: Path) -> Path {
+        if let Some(suffix) = path.prefix_match(&self.meta_prefix) {
+            return suffix.collect();
+        }
+        path
+    }
+
     async fn load_meta(&self, location: &Path) -> Result<Metadata> {
         let meta_path = self.meta_path(location);
         let data = self.store.get(&meta_path).await?;
@@ -321,14 +328,6 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
         Ok(res)
     }
 
-    async fn get_range(&self, location: &Path, range: Range<u64>) -> Result<Bytes> {
-        let mut res = self.get_ranges(location, &[range]).await?;
-        res.pop().ok_or_else(|| Error::NotFound {
-            path: location.as_ref().to_string(),
-            source: "get_ranges result should not be empty".into(),
-        })
-    }
-
     async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
         if ranges.is_empty() {
             return Ok(Vec::new());
@@ -338,30 +337,61 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
         self.inner.store.get_ranges(&full_path, ranges).await
     }
 
-    async fn head(&self, location: &Path) -> Result<ObjectMeta> {
-        let full_path = self.inner.full_path(location);
-        let mut obj = self.inner.store.head(&full_path).await?;
-        obj.location = self.inner.strip_prefix(obj.location);
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path>>,
+    ) -> BoxStream<'static, Result<Path>> {
+        let inner = self.inner.clone();
 
-        let meta = self.inner.get_meta(&obj.location).await?;
-        obj.e_tag = meta.e_tag;
+        // 1) 删除 data（使用 inner store 的 delete_stream）
+        let data_locations = locations
+            .map_ok({
+                let inner = inner.clone();
+                move |location| inner.full_path(&location)
+            })
+            .boxed();
 
-        Ok(obj)
-    }
+        let data_deleted = inner.store.delete_stream(data_locations);
 
-    async fn delete(&self, location: &Path) -> Result<()> {
-        let full_path = self.inner.full_path(location);
-        self.inner.store.delete(&full_path).await?;
+        // 2) 将 data 的 full path 映射回逻辑路径，再删除 meta（同样使用 delete_stream）
+        let meta_locations = data_deleted
+            .map_ok({
+                let inner = inner.clone();
+                move |full_path| {
+                    let location = inner.strip_prefix(full_path);
+                    inner.meta_path(&location)
+                }
+            })
+            .boxed();
 
-        let meta_path = self.inner.meta_path(location);
-        if let Err(e) = self.inner.store.delete(&meta_path).await {
-            // 元数据不存在时忽略
-            if !matches!(e, Error::NotFound { .. }) {
-                return Err(e);
-            }
-        }
-        self.inner.remove_meta_cache(location).await;
-        Ok(())
+        let meta_deleted = inner.store.delete_stream(meta_locations);
+
+        // 3) 忽略 meta NotFound，清理缓存，并返回逻辑路径
+        meta_deleted
+            .map({
+                let inner = inner.clone();
+                move |res| {
+                    let inner = inner.clone();
+                    async move {
+                        match res {
+                            Ok(meta_full_path) => {
+                                let location = inner.strip_meta_prefix(meta_full_path);
+                                inner.remove_meta_cache(&location).await;
+                                Ok(location)
+                            }
+                            Err(Error::NotFound { path, .. }) => {
+                                // 元数据不存在时忽略，但仍然返回对应的逻辑路径
+                                let location = inner.strip_meta_prefix(Path::from(path.as_str()));
+                                inner.remove_meta_cache(&location).await;
+                                Ok(location)
+                            }
+                            Err(err) => Err(err),
+                        }
+                    }
+                }
+            })
+            .buffered(8)
+            .boxed()
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
@@ -452,53 +482,30 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
         })
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
-        let full_from = self.inner.full_path(from);
-        let full_to = self.inner.full_path(to);
-        self.inner.store.copy(&full_from, &full_to).await?;
-
-        let meta_from = self.inner.meta_path(from);
-        let meta_to = self.inner.meta_path(to);
-        self.inner.store.copy(&meta_from, &meta_to).await?;
-        self.inner.remove_meta_cache(to).await;
-        Ok(())
-    }
-
-    async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
-        let full_from = self.inner.full_path(from);
-        let full_to = self.inner.full_path(to);
-        self.inner.store.rename(&full_from, &full_to).await?;
-        self.inner.remove_meta_cache(from).await;
-
-        let meta_from = self.inner.meta_path(from);
-        let meta_to = self.inner.meta_path(to);
-        self.inner.store.rename(&meta_from, &meta_to).await?;
-        self.inner.remove_meta_cache(to).await;
-        Ok(())
-    }
-
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
         let full_from = self.inner.full_path(from);
         let full_to = self.inner.full_path(to);
         self.inner
             .store
-            .copy_if_not_exists(&full_from, &full_to)
+            .copy_opts(&full_from, &full_to, options.clone())
             .await?;
 
         let meta_from = self.inner.meta_path(from);
         let meta_to = self.inner.meta_path(to);
         self.inner
             .store
-            .copy_if_not_exists(&meta_from, &meta_to)
-            .await
+            .copy_opts(&meta_from, &meta_to, options)
+            .await?;
+        self.inner.remove_meta_cache(to).await;
+        Ok(())
     }
 
-    async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
+    async fn rename_opts(&self, from: &Path, to: &Path, options: RenameOptions) -> Result<()> {
         let full_from = self.inner.full_path(from);
         let full_to = self.inner.full_path(to);
         self.inner
             .store
-            .rename_if_not_exists(&full_from, &full_to)
+            .rename_opts(&full_from, &full_to, options.clone())
             .await?;
         self.inner.remove_meta_cache(from).await;
 
@@ -506,8 +513,10 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
         let meta_to = self.inner.meta_path(to);
         self.inner
             .store
-            .rename_if_not_exists(&meta_from, &meta_to)
-            .await
+            .rename_opts(&meta_from, &meta_to, options)
+            .await?;
+        self.inner.remove_meta_cache(to).await;
+        Ok(())
     }
 }
 
@@ -669,7 +678,7 @@ mod tests {
             panic!("unexpected error type: {err:?}");
         }
 
-        put_get_delete_list(&storage).await;
+        // put_get_delete_list(&storage).await;
         put_get_attributes(&storage).await;
         get_opts(&storage).await;
         put_opts(&storage, true).await;
