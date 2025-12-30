@@ -512,10 +512,11 @@ where
                 }
 
                 if let Some(mut ob) = self.buckets.get_mut(&old_bucket_id)
-                    && ob.tokens.swap_remove_if(|k| &token == k).is_some() {
-                        ob.size = ob.size.saturating_sub(size);
-                        ob.is_dirty = true;
-                    }
+                    && ob.tokens.swap_remove_if(|k| &token == k).is_some()
+                {
+                    ob.size = ob.size.saturating_sub(size);
+                    ob.is_dirty = true;
+                }
 
                 let mut next_new_bucket = false;
                 {
@@ -608,7 +609,7 @@ where
         // buckets_to_update: FxHashMap<bucketid, FxHashMap<token, size_decrease>>
         let mut buckets_to_update: FxHashMap<u32, FxHashMap<String, usize>> = FxHashMap::default();
         // Remove from inverted index
-        let mut tokens_to_remove = Vec::new();
+        let mut tokens_to_remove: FxHashSet<String> = FxHashSet::default();
         for (token, _) in token_freqs {
             if let Some(mut posting) = self.postings.get_mut(&token) {
                 // Remove document from postings list
@@ -617,7 +618,7 @@ where
                     if posting.1.is_empty() {
                         size_decrease =
                             estimate_cbor_size(&(&token, (posting.0, &[(val.0, val.1)]))) + 2;
-                        tokens_to_remove.push(token.clone());
+                        tokens_to_remove.insert(token.clone());
                     }
                     let b = buckets_to_update.entry(posting.0).or_default();
                     b.insert(token, size_decrease);
@@ -625,7 +626,7 @@ where
             }
         }
 
-        for token in &tokens_to_remove {
+        for token in tokens_to_remove.iter() {
             self.postings.remove(token);
         }
 
@@ -735,6 +736,10 @@ where
             return FxHashMap::default();
         }
 
+        // Be defensive against invalid params to avoid NaNs/inf in ranking.
+        let k1 = params.k1.max(0.0);
+        let b = params.b.clamp(0.0, 1.0);
+
         let mut tokenizer = self.tokenizer.clone();
         let query_terms = collect_tokens(&mut tokenizer, term, None);
         if query_terms.is_empty() {
@@ -749,27 +754,34 @@ where
             .iter()
             .filter_map(|(term, _)| {
                 self.postings.get(term).map(|postings| {
-                    let doc_freq = postings.1.len() as f32;
+                    // Filter out deleted / not-loaded documents.
+                    // `remove()` depends on the caller providing original text; if they don't,
+                    // postings can become stale. Also, when only part of buckets are loaded,
+                    // postings might contain docs missing in `doc_tokens`.
+                    let mut docs: Vec<(u64, usize, f32)> = Vec::with_capacity(postings.1.len());
+                    for (doc_id, token_freq) in postings.1.iter() {
+                        if let Some(tokens) = self.doc_tokens.get(doc_id).map(|v| *v as f32) {
+                            docs.push((*doc_id, *token_freq, tokens));
+                        }
+                    }
+
+                    let doc_freq = docs.len() as f32;
+                    if doc_freq == 0.0 || doc_count == 0.0 {
+                        return FxHashMap::default();
+                    }
+
+                    // Classic Okapi BM25: ln(1 + (N - df + 0.5)/(df + 0.5))
                     let idf_raw = (doc_count - doc_freq + 0.5) / (doc_freq + 0.5);
-                    // 避免数值问题并注释说明：经典 BM25 使用 ln(idf_raw)
-                    // let idf = idf_raw.max(1e-6).ln();
                     let idf = (idf_raw + 1.0).ln();
 
                     // compute BM25 score for each document
                     let mut term_scores = FxHashMap::default();
-                    for (doc_id, token_freq) in postings.1.iter() {
-                        let tokens = self
-                            .doc_tokens
-                            .get(doc_id)
-                            .map(|v| *v as f32)
-                            .unwrap_or(0.0);
-                        let tf_component = (*token_freq as f32 * (params.k1 + 1.0))
-                            / (*token_freq as f32
-                                + params.k1
-                                    * (1.0 - params.b + params.b * tokens / avg_doc_tokens));
+                    for (doc_id, token_freq, tokens) in docs {
+                        let token_freq_f = token_freq as f32;
+                        let tf_component = (token_freq_f * (k1 + 1.0))
+                            / (token_freq_f + k1 * (1.0 - b + b * tokens / avg_doc_tokens));
 
-                        let score = idf * tf_component;
-                        term_scores.insert(*doc_id, score);
+                        term_scores.insert(doc_id, idf * tf_component);
                     }
                     term_scores
                 })
@@ -905,15 +917,11 @@ where
 
         meta.stats.last_saved = now_ms.max(meta.stats.last_saved);
 
-        ciborium::into_writer(
-            &BM25IndexRef {
-                metadata: &self.metadata(),
-            },
-            w,
-        )
-        .map_err(|err| BM25Error::Serialization {
-            name: self.name.clone(),
-            source: err.into(),
+        ciborium::into_writer(&BM25IndexRef { metadata: &meta }, w).map_err(|err| {
+            BM25Error::Serialization {
+                name: self.name.clone(),
+                source: err.into(),
+            }
         })?;
 
         self.update_metadata(|m| {
@@ -956,12 +964,17 @@ where
                     source: err.into(),
                 })?;
 
-                if let Ok(conti) = f(*bucket.key(), &buf).await {
-                    // Only mark as clean if persistence was successful, otherwise wait for next round
-                    bucket.is_dirty = false;
-                    if !conti {
-                        return Ok(());
-                    }
+                let conti = f(*bucket.key(), &buf)
+                    .await
+                    .map_err(|err| BM25Error::Generic {
+                        name: self.name.clone(),
+                        source: err,
+                    })?;
+
+                // Only mark as clean if persistence was successful.
+                bucket.is_dirty = false;
+                if !conti {
+                    return Ok(());
                 }
             }
         }
@@ -1052,6 +1065,20 @@ mod tests {
         let removed = index.remove(99, "This document doesn't exist", 0);
         assert!(!removed);
         assert_eq!(index.len(), 3);
+    }
+
+    #[test]
+    fn test_remove_with_wrong_text_does_not_leak_into_search() {
+        let index = create_test_index();
+
+        // remove() currently relies on caller providing the original text.
+        // Even if postings are not fully cleaned, search must not return deleted documents.
+        let removed = index.remove(2, "totally different text", 0);
+        assert!(removed);
+        assert_eq!(index.len(), 3);
+
+        let results = index.search("fox", 10, None);
+        assert!(!results.iter().any(|(id, _)| *id == 2));
     }
 
     #[test]
