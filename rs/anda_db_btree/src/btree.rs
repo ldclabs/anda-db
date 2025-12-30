@@ -66,6 +66,11 @@ where
 
     /// Last saved version of the index
     last_saved_version: AtomicU64,
+
+    /// Number of dirty buckets pending persistence.
+    ///
+    /// Used to make `flush()` and `store_dirty_buckets()` fast when there is nothing to persist.
+    dirty_bucket_count: AtomicU32,
 }
 
 /// Type alias for posting values: (bucket id, update version, Vec<document id>)
@@ -267,6 +272,13 @@ where
     PK: Ord + Eq + Hash + Debug + Clone + Serialize + DeserializeOwned,
     FV: Ord + Eq + Hash + Debug + Clone + Serialize + DeserializeOwned,
 {
+    fn mark_bucket_dirty(&self, bucket: &mut (usize, bool, UniqueVec<FV>)) {
+        if !bucket.1 {
+            bucket.1 = true;
+            self.dirty_bucket_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Creates a new empty B-tree index with the given configuration
     ///
     /// # Arguments
@@ -287,7 +299,7 @@ where
             name: name.clone(),
             config: config.clone(),
             postings: DashMap::new(),
-            buckets: DashMap::from_iter(vec![(0, (0, true, UniqueVec::default()))]),
+            buckets: DashMap::from_iter(vec![(0, (0, false, UniqueVec::default()))]),
             btree: RwLock::new(BTreeSet::new()),
             metadata: RwLock::new(BTreeMetadata {
                 name,
@@ -297,6 +309,7 @@ where
             max_bucket_id: AtomicU32::new(0),
             query_count: AtomicU64::new(0),
             last_saved_version: AtomicU64::new(0),
+            dirty_bucket_count: AtomicU32::new(0),
         }
     }
 
@@ -346,12 +359,13 @@ where
             name: index.metadata.name.clone(),
             config: index.metadata.config.clone(),
             postings: DashMap::with_capacity(index.metadata.stats.num_elements as usize),
-            buckets: DashMap::from_iter(vec![(0, (0, true, UniqueVec::default()))]),
+            buckets: DashMap::from_iter(vec![(0, (0, false, UniqueVec::default()))]),
             btree: RwLock::new(BTreeSet::new()),
             metadata: RwLock::new(index.metadata),
             query_count,
             max_bucket_id,
             last_saved_version,
+            dirty_bucket_count: AtomicU32::new(0),
         })
     }
 
@@ -451,13 +465,23 @@ where
     pub fn insert(&self, doc_id: PK, field_value: FV, now_ms: u64) -> Result<bool, BTreeError> {
         let bucket = self.max_bucket_id.load(Ordering::Relaxed);
 
+        // Ensure the current bucket exists.
+        // This avoids races where max_bucket_id advances before the bucket entry is created,
+        // and also supports calling insert() after load_metadata() but before load_buckets().
+        self.buckets
+            .entry(bucket)
+            .or_insert_with(|| (0, false, UniqueVec::default()));
+
         // Calculate the size increase for this insertion
         let mut is_new = false;
         let mut size_increase = 0;
         match self.postings.entry(field_value.clone()) {
             dashmap::Entry::Occupied(mut entry) => {
-                // Check if duplicate keys are allowed
-                if !self.config.allow_duplicates {
+                let posting = entry.get_mut();
+
+                // Unique index semantics: allow idempotent insert of the same (doc_id, field_value)
+                // while rejecting a different doc_id for an existing field_value.
+                if !self.config.allow_duplicates && !posting.2.contains(&doc_id) {
                     return Err(BTreeError::AlreadyExists {
                         name: self.name.clone(),
                         id: json!(doc_id),
@@ -465,7 +489,6 @@ where
                     });
                 }
 
-                let posting = entry.get_mut();
                 // Add doc_id if it doesn't exist
                 if posting.2.push(doc_id.clone()) {
                     size_increase = estimate_cbor_size(&doc_id) + 2;
@@ -502,7 +525,7 @@ where
             if b.2.is_empty() || b.0 + size_increase < self.config.bucket_overload_size {
                 b.0 += size_increase;
                 // Mark as dirty, needs to be persisted
-                b.1 = true;
+                self.mark_bucket_dirty(&mut *b);
                 // Add field value to bucket if not already present
                 b.2.push(field_value.clone());
             } else {
@@ -532,11 +555,12 @@ where
                 dashmap::Entry::Vacant(entry) => {
                     // Create a new bucket with the initial size
                     entry.insert((size_increase, true, vec![field_value].into()));
+                    self.dirty_bucket_count.fetch_add(1, Ordering::Relaxed);
                 }
                 dashmap::Entry::Occupied(mut entry) => {
                     let bucket_entry = entry.get_mut();
                     bucket_entry.0 += size_increase;
-                    bucket_entry.1 = true; // Mark as dirty
+                    self.mark_bucket_dirty(bucket_entry);
                     bucket_entry.2.push(field_value);
                 }
             }
@@ -570,16 +594,17 @@ where
 
         {
             if let Some(mut posting) = self.postings.get_mut(&field_value) {
-                removed = true;
                 bucket_id = posting.0;
+                let prev_posting_size = estimate_cbor_size(&*posting) + 2;
                 if posting.2.swap_remove_if(|id| id == &doc_id).is_some() {
-                    size_decrease = if posting.2.len() > 1 {
-                        estimate_cbor_size(&doc_id) + 2
-                    } else {
-                        estimate_cbor_size(&posting) + 2
-                    };
+                    removed = true;
                     posting.1 += 1; // increment version
                     posting_empty = posting.2.is_empty();
+                    size_decrease = if posting_empty {
+                        prev_posting_size
+                    } else {
+                        estimate_cbor_size(&doc_id) + 2
+                    };
                 }
             }
         }
@@ -588,7 +613,7 @@ where
             // Update the bucket state
             if let Some(mut b) = self.buckets.get_mut(&bucket_id) {
                 b.0 = b.0.saturating_sub(size_decrease);
-                b.1 = true;
+                self.mark_bucket_dirty(&mut *b);
 
                 if posting_empty {
                     // remove FV from the bucket
@@ -644,12 +669,18 @@ where
 
         let bucket_id = self.max_bucket_id.load(Ordering::Relaxed);
 
+        // Ensure the current bucket exists (see insert()).
+        self.buckets
+            .entry(bucket_id)
+            .or_insert_with(|| (0, false, UniqueVec::default()));
+
         // Phase 1: collect existing postings and prepare modifications
         // Skip duplicate field values if not allowed
         if !self.config.allow_duplicates {
             for field_value in &field_values {
-                // Check if the field value already exists with this doc_id
-                if self.postings.contains_key(field_value) {
+                if let Some(posting) = self.postings.get(field_value)
+                    && !posting.2.contains(&doc_id)
+                {
                     return Err(BTreeError::AlreadyExists {
                         name: self.name.clone(),
                         id: json!(doc_id),
@@ -702,31 +733,34 @@ where
         // field_values_to_migrate: (old_bucket_id, field_value, size)
         let mut field_values_to_migrate: Vec<(u32, FV, usize)> = Vec::new();
         for (bucket_id, (size_increase, field_values)) in bucket_updates {
-            if let Some(mut bucket_entry) = self.buckets.get_mut(&bucket_id) {
-                // Check if the bucket would overflow
-                if bucket_entry.2.is_empty()
-                    || bucket_entry.0 + size_increase < self.config.bucket_overload_size
-                {
-                    // Bucket has enough space, update directly
-                    bucket_entry.0 += size_increase;
-                    bucket_entry.1 = true; // Mark as dirty
+            let mut bucket_entry = self
+                .buckets
+                .entry(bucket_id)
+                .or_insert_with(|| (0, false, UniqueVec::default()));
 
-                    // Update field values contained in the bucket
-                    for fv in field_values {
-                        bucket_entry.2.push(fv);
-                    }
-                } else {
-                    // Bucket doesn't have enough space, need to migrate these values to a new bucket
-                    for fv in field_values {
-                        let size = if let Some(posting) = self.postings.get(&fv) {
-                            estimate_cbor_size(&posting) + 2
-                        } else {
-                            0
-                        };
+            // Check if the bucket would overflow
+            if bucket_entry.2.is_empty()
+                || bucket_entry.0 + size_increase < self.config.bucket_overload_size
+            {
+                // Bucket has enough space, update directly
+                bucket_entry.0 += size_increase;
+                self.mark_bucket_dirty(&mut *bucket_entry);
 
-                        if size > 0 {
-                            field_values_to_migrate.push((bucket_id, fv, size));
-                        }
+                // Update field values contained in the bucket
+                for fv in field_values {
+                    bucket_entry.2.push(fv);
+                }
+            } else {
+                // Bucket doesn't have enough space, need to migrate these values to a new bucket
+                for fv in field_values {
+                    let size = if let Some(posting) = self.postings.get(&fv) {
+                        estimate_cbor_size(&posting) + 2
+                    } else {
+                        0
+                    };
+
+                    if size > 0 {
+                        field_values_to_migrate.push((bucket_id, fv, size));
                     }
                 }
             }
@@ -739,7 +773,7 @@ where
             {
                 self.buckets
                     .entry(next_bucket_id)
-                    .or_insert_with(|| (0, true, UniqueVec::default()));
+                    .or_insert_with(|| (0, false, UniqueVec::default()));
                 // release the lock on the entry
             }
 
@@ -760,6 +794,7 @@ where
                     if nb.2.is_empty() || nb.0 + size < self.config.bucket_overload_size {
                         // Bucket has enough space, update directly
                         nb.0 += size;
+                        self.mark_bucket_dirty(&mut *nb);
                         nb.2.push(field_value.clone());
                     } else {
                         // Bucket doesn't have enough space, need to migrate to the next bucket
@@ -778,11 +813,12 @@ where
                         dashmap::Entry::Vacant(entry) => {
                             // Create a new bucket with the initial size
                             entry.insert((size, true, vec![field_value].into()));
+                            self.dirty_bucket_count.fetch_add(1, Ordering::Relaxed);
                         }
                         dashmap::Entry::Occupied(mut entry) => {
                             let bucket_entry = entry.get_mut();
                             bucket_entry.0 += size;
-                            bucket_entry.1 = true; // Mark as dirty
+                            self.mark_bucket_dirty(bucket_entry);
                             bucket_entry.2.push(field_value);
                         }
                     }
@@ -839,20 +875,20 @@ where
             if let Some(mut posting) = self.postings.get_mut(&field_value) {
                 bucket_id = posting.0;
 
+                let prev_posting_size = estimate_cbor_size(&*posting) + 2;
+
                 // Check if the document ID exists in the posting
                 if posting.2.swap_remove_if(|id| id == &doc_id).is_some() {
                     removed = true;
-
-                    // Calculate size decrease based on whether this is the last document
-                    size_decrease = if posting.2.len() > 1 {
-                        estimate_cbor_size(&doc_id) + 2
-                    } else {
-                        estimate_cbor_size(&posting) + 2
-                    };
-
-                    // Remove the document ID from the posting
                     posting.1 += 1; // Increment version
                     posting_empty = posting.2.is_empty();
+
+                    // Calculate size decrease based on whether this key is fully removed.
+                    size_decrease = if posting_empty {
+                        prev_posting_size
+                    } else {
+                        estimate_cbor_size(&doc_id) + 2
+                    };
                 }
             }
 
@@ -893,7 +929,7 @@ where
         for (bucket_id, (size_decrease, field_values)) in bucket_updates {
             if let Some(mut bucket) = self.buckets.get_mut(&bucket_id) {
                 bucket.0 = bucket.0.saturating_sub(size_decrease);
-                bucket.1 = true; // Mark as dirty
+                self.mark_bucket_dirty(&mut *bucket); // Mark as dirty
 
                 // Remove field values that are completely removed
                 for fv in &values_to_remove {
@@ -1014,7 +1050,7 @@ where
             }
             RangeQuery::Gt(start_key) => {
                 for k in self.btree.read().range((
-                    std::ops::Bound::Excluded(start_key.clone()),
+                    std::ops::Bound::Excluded(start_key),
                     std::ops::Bound::Unbounded,
                 )) {
                     if let Some(posting) = self.postings.get(k) {
@@ -1168,7 +1204,7 @@ where
                 .btree
                 .read()
                 .range((
-                    std::ops::Bound::Excluded(cursor.clone()),
+                    std::ops::Bound::Excluded(cursor),
                     std::ops::Bound::Unbounded,
                 ))
                 .take(limit)
@@ -1178,7 +1214,7 @@ where
                 .btree
                 .read()
                 .range((
-                    std::ops::Bound::Excluded(cursor.clone()),
+                    std::ops::Bound::Excluded(cursor),
                     std::ops::Bound::Unbounded,
                 ))
                 .cloned()
@@ -1199,7 +1235,7 @@ where
             }
             RangeQuery::Gt(start_key) => {
                 for k in self.btree.read().range((
-                    std::ops::Bound::Excluded(start_key.clone()),
+                    std::ops::Bound::Excluded(start_key),
                     std::ops::Bound::Unbounded,
                 )) {
                     results.push(k.clone());
@@ -1295,12 +1331,18 @@ where
     where
         F: AsyncFnMut(u32, &[u8]) -> Result<bool, BoxError>,
     {
-        if !self.store_metadata(metadata, now_ms)? {
+        let meta_saved = self.store_metadata(metadata, now_ms)?;
+        let had_dirty = self.has_dirty_buckets();
+        if !meta_saved && !had_dirty {
             return Ok(false);
         }
-
         self.store_dirty_buckets(f).await?;
-        Ok(true)
+        Ok(meta_saved || had_dirty)
+    }
+
+    /// Returns whether there are dirty buckets pending persistence.
+    pub fn has_dirty_buckets(&self) -> bool {
+        self.dirty_bucket_count.load(Ordering::Relaxed) > 0
     }
 
     /// Stores the index metadata to a writer
@@ -1314,6 +1356,12 @@ where
     ///
     /// * `Result<bool, Error>` - true if the metadata was saved, false if the version was not updated
     pub fn store_metadata<W: Write>(&self, w: W, now_ms: u64) -> Result<bool, BTreeError> {
+        // Fast path: if the version is already saved, avoid cloning metadata.
+        let current_version = { self.metadata.read().stats.version };
+        if self.last_saved_version.load(Ordering::Relaxed) >= current_version {
+            return Ok(false);
+        }
+
         let mut meta = self.metadata();
         let prev_saved_version = self
             .last_saved_version
@@ -1355,6 +1403,10 @@ where
     where
         F: AsyncFnMut(u32, &[u8]) -> Result<bool, BoxError>,
     {
+        if self.dirty_bucket_count.load(Ordering::Relaxed) == 0 {
+            return Ok(());
+        }
+
         let mut buf = Vec::with_capacity(4096);
         for mut bucket in self.buckets.iter_mut() {
             if bucket.1 {
@@ -1380,6 +1432,11 @@ where
                 if let Ok(conti) = f(*bucket.key(), &buf).await {
                     // Only mark as clean if persistence was successful, otherwise wait for next round
                     bucket.1 = false;
+                    let _ = self.dirty_bucket_count.fetch_update(
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                        |v| Some(v.saturating_sub(1)),
+                    );
                     if !conti {
                         return Ok(());
                     }
@@ -1554,6 +1611,11 @@ mod tests {
         let result = unique_index.insert(1, "apple".to_string(), now_ms());
         assert!(result.is_ok());
 
+        // unique 索引：重复插入同一个 doc_id 应该是幂等的
+        let result = unique_index.insert(1, "apple".to_string(), now_ms());
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
+
         let result = unique_index.insert(2, "apple".to_string(), now_ms());
         assert!(result.is_err());
         match result {
@@ -1572,6 +1634,10 @@ mod tests {
 
         // 测试删除不存在的条目
         let result = index.remove(100, "nonexistent".to_string(), now_ms());
+        assert!(!result);
+
+        // key 存在但 doc_id 不存在：应该返回 false
+        let result = index.remove(999, "banana".to_string(), now_ms());
         assert!(!result);
 
         // 测试删除后的搜索
@@ -2057,6 +2123,58 @@ mod tests {
         let ids = result.unwrap();
         assert!(ids.contains(&1));
         assert!(ids.contains(&6));
+    }
+
+    #[tokio::test]
+    async fn test_flush_persists_dirty_buckets_even_if_metadata_already_saved() {
+        let index = create_test_index();
+        let _ = index.insert(1, "apple".to_string(), now_ms()).unwrap();
+
+        // 先只保存元数据（模拟：元数据已落盘，但 buckets 还没落盘）
+        let mut meta_buf = Vec::new();
+        assert!(index.store_metadata(&mut meta_buf, now_ms()).unwrap());
+        assert!(index.has_dirty_buckets());
+
+        // 再 flush：即使元数据版本没变化，也应继续持久化 dirty buckets
+        let writes = Arc::new(Mutex::new(0usize));
+        let writes_clone = writes.clone();
+        let mut meta_buf2 = Vec::new();
+        let saved = index
+            .flush(&mut meta_buf2, now_ms(), async move |_, _| {
+                let mut g = writes_clone.lock().await;
+                *g += 1;
+                Ok(true)
+            })
+            .await
+            .unwrap();
+
+        assert!(saved);
+        assert_eq!(*writes.lock().await, 1);
+        assert!(!index.has_dirty_buckets());
+    }
+
+    #[test]
+    fn test_insert_after_load_metadata_without_loading_buckets() {
+        let meta = BTreeMetadata {
+            name: "loaded_index".to_string(),
+            config: BTreeConfig {
+                bucket_overload_size: 1024,
+                allow_duplicates: true,
+            },
+            stats: BTreeStats {
+                version: 1,
+                max_bucket_id: 3,
+                ..Default::default()
+            },
+        };
+
+        let owned = BTreeIndexOwned { metadata: meta };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&owned, &mut buf).unwrap();
+
+        let index = BTreeIndex::<u64, String>::load_metadata(&buf[..]).unwrap();
+        let result = index.insert(1, "apple".to_string(), now_ms());
+        assert!(result.is_ok());
     }
 
     #[test]
