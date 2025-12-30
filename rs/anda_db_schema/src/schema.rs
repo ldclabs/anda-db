@@ -141,14 +141,67 @@ impl<'de> Deserialize<'de> for Schema {
     {
         let val = SchemaOwned::deserialize(deserializer)?;
 
-        Ok(Schema {
-            idx: val.fields.iter().map(|f| f.idx()).collect(),
-            fields: val
-                .fields
-                .into_iter()
-                .map(|f| (f.name().to_string(), f))
-                .collect(),
-        })
+        // Validate invariants here because `FieldEntry` derives `Deserialize` and would
+        // otherwise allow invalid names / duplicate indexes.
+        let mut idx = BTreeSet::<usize>::new();
+        let mut fields = BTreeMap::<String, FieldEntry>::new();
+
+        for f in val.fields.into_iter() {
+            crate::validate_field_name(f.name()).map_err(serde::de::Error::custom)?;
+
+            if f.idx() > u16::MAX as usize {
+                return Err(serde::de::Error::custom(format!(
+                    "field index {:?} exceeds u16::MAX",
+                    f.idx()
+                )));
+            }
+
+            if !idx.insert(f.idx()) {
+                return Err(serde::de::Error::custom(format!(
+                    "duplicate field index {:?}",
+                    f.idx()
+                )));
+            }
+
+            let name = f.name().to_string();
+            if fields.insert(name.clone(), f).is_some() {
+                return Err(serde::de::Error::custom(format!(
+                    "duplicate field name {name:?}"
+                )));
+            }
+        }
+
+        let id = fields.get(Schema::ID_KEY).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "schema is missing required field {:?}",
+                Schema::ID_KEY
+            ))
+        })?;
+
+        if id.idx() != 0 {
+            return Err(serde::de::Error::custom(format!(
+                "field {:?} must have index 0, got {:?}",
+                Schema::ID_KEY,
+                id.idx()
+            )));
+        }
+
+        if id.r#type() != &FieldType::U64 {
+            return Err(serde::de::Error::custom(format!(
+                "field {:?} must have type U64, got {:?}",
+                Schema::ID_KEY,
+                id.r#type()
+            )));
+        }
+
+        if !id.unique() {
+            return Err(serde::de::Error::custom(format!(
+                "field {:?} must be unique",
+                Schema::ID_KEY
+            )));
+        }
+
+        Ok(Schema { idx, fields })
     }
 }
 
@@ -242,9 +295,11 @@ impl SchemaBuilder {
     /// # Errors
     /// Returns an error if:
     /// - The schema has no fields
-    /// - The schema has too many fields (more than u8::MAX)
+    /// - The schema has too many fields
     pub fn build(self) -> Result<Schema, SchemaError> {
-        if self.fields.len() > u8::MAX as usize {
+        // Field index 0 is reserved for `_id`, so maximum field count is `u16::MAX + 1`.
+        const MAX_FIELDS: usize = u16::MAX as usize + 1;
+        if self.fields.len() > MAX_FIELDS {
             return Err(SchemaError::Schema(
                 "Schema has reached the maximum number of fields".to_string(),
             ));
@@ -271,6 +326,7 @@ impl Eq for Schema {}
 mod tests {
     use super::*;
     use crate::{Fe, Ft, Fv};
+    use serde_json::json;
 
     #[test]
     fn test_schema_builder() {
@@ -432,5 +488,84 @@ mod tests {
         println!("Field names: {field_names:?}");
         assert!(field_names.contains(&"_id"));
         assert!(field_names.contains(&"name"));
+    }
+
+    #[test]
+    fn test_schema_serde_roundtrip_json() {
+        let mut builder = SchemaBuilder::new();
+        builder
+            .add_field(Fe::new("name".to_string(), Ft::Text).unwrap())
+            .unwrap();
+        builder
+            .add_field(Fe::new("age".to_string(), Ft::Option(Box::new(Ft::U64))).unwrap())
+            .unwrap();
+
+        let schema = builder.build().unwrap();
+        let v = serde_json::to_value(&schema).unwrap();
+        let schema2: Schema = serde_json::from_value(v).unwrap();
+        assert_eq!(schema, schema2);
+    }
+
+    #[test]
+    fn test_schema_deserialize_rejects_invalid_invariants() {
+        let mut builder = SchemaBuilder::new();
+        builder
+            .add_field(Fe::new("name".to_string(), Ft::Text).unwrap())
+            .unwrap();
+        let schema = builder.build().unwrap();
+
+        // Start from a valid JSON representation, then mutate it.
+        let _v = serde_json::to_value(&schema).unwrap();
+
+        // 1) Missing _id
+        let mut missing_id = serde_json::to_value(&schema).unwrap();
+        let fields_missing = missing_id
+            .get_mut("fields")
+            .and_then(|x| x.as_array_mut())
+            .unwrap();
+        fields_missing.retain(|f| f.get("n") != Some(&json!("_id")));
+        assert!(serde_json::from_value::<Schema>(missing_id).is_err());
+
+        // 2) Invalid field name
+        let mut invalid_name = serde_json::to_value(&schema).unwrap();
+        let fields2 = invalid_name
+            .get_mut("fields")
+            .and_then(|x| x.as_array_mut())
+            .unwrap();
+        if let Some(name_field) = fields2
+            .iter_mut()
+            .find(|f| f.get("n") == Some(&json!("name")))
+        {
+            name_field["n"] = json!("Name");
+        }
+        assert!(serde_json::from_value::<Schema>(invalid_name).is_err());
+
+        // 3) Duplicate idx (make `name` use idx 0)
+        let mut dup_idx = serde_json::to_value(&schema).unwrap();
+        let fields3 = dup_idx
+            .get_mut("fields")
+            .and_then(|x| x.as_array_mut())
+            .unwrap();
+        if let Some(name_field) = fields3
+            .iter_mut()
+            .find(|f| f.get("n") == Some(&json!("name")))
+        {
+            name_field["i"] = json!(0);
+        }
+        assert!(serde_json::from_value::<Schema>(dup_idx).is_err());
+
+        // 4) _id wrong type
+        let mut id_wrong_type = serde_json::to_value(&schema).unwrap();
+        let fields4 = id_wrong_type
+            .get_mut("fields")
+            .and_then(|x| x.as_array_mut())
+            .unwrap();
+        if let Some(id_field) = fields4
+            .iter_mut()
+            .find(|f| f.get("n") == Some(&json!("_id")))
+        {
+            id_field["t"] = json!("Text");
+        }
+        assert!(serde_json::from_value::<Schema>(id_wrong_type).is_err());
     }
 }
