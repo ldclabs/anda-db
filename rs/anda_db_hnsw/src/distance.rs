@@ -1,5 +1,4 @@
 use half::bf16;
-use ndarray::ArrayView1;
 use rand::{distr::Uniform, prelude::*, rng};
 use serde::{Deserialize, Serialize};
 
@@ -30,22 +29,20 @@ impl DistanceMetric {
     ///
     /// * `Result<f32, HnswError>` - The computed distance or an error if the dimensions don't match.
     pub fn compute(&self, a: &[bf16], b: &[bf16]) -> Result<f32, HnswError> {
-        // 使用线程本地缓冲区
-        A_BUFFER.with_borrow_mut(|a_buf| {
-            B_BUFFER.with_borrow_mut(|b_buf| {
-                // 确保缓冲区足够大
-                if a_buf.len() < a.len() {
-                    a_buf.resize(a.len(), 0.0);
-                    b_buf.resize(b.len(), 0.0);
-                }
+        if a.len() != b.len() {
+            return Err(HnswError::DimensionMismatch {
+                name: "unknown".to_string(),
+                expected: a.len(),
+                got: b.len(),
+            });
+        }
 
-                // 转换为 f32 数组
-                let a_array = convert_to_f32_array(a, a_buf);
-                let b_array = convert_to_f32_array(b, b_buf);
-
-                self.compute_f32(a_array, b_array)
-            })
-        })
+        match self {
+            DistanceMetric::Euclidean => Ok(euclidean_distance_bf16(a, b)),
+            DistanceMetric::Cosine => Ok(cosine_distance_bf16(a, b)),
+            DistanceMetric::InnerProduct => Ok(inner_product_bf16(a, b)),
+            DistanceMetric::Manhattan => Ok(manhattan_distance_bf16(a, b)),
+        }
     }
 
     pub fn compute_f32(&self, a: &[f32], b: &[f32]) -> Result<f32, HnswError> {
@@ -58,27 +55,12 @@ impl DistanceMetric {
         }
 
         match self {
-            DistanceMetric::Euclidean => Ok(euclidean_distance_simd(a, b)),
-            DistanceMetric::Cosine => Ok(cosine_distance_simd(a, b)),
-            DistanceMetric::InnerProduct => Ok(inner_product_simd(a, b)),
-            DistanceMetric::Manhattan => Ok(manhattan_distance_simd(a, b)),
+            DistanceMetric::Euclidean => Ok(euclidean_distance_f32(a, b)),
+            DistanceMetric::Cosine => Ok(cosine_distance_f32(a, b)),
+            DistanceMetric::InnerProduct => Ok(inner_product_f32(a, b)),
+            DistanceMetric::Manhattan => Ok(manhattan_distance_f32(a, b)),
         }
     }
-}
-
-#[inline]
-fn convert_to_f32_array<'a>(input: &[bf16], buffer: &'a mut [f32]) -> &'a [f32] {
-    debug_assert!(buffer.len() >= input.len());
-    for (i, &val) in input.iter().enumerate() {
-        buffer[i] = val.to_f32();
-    }
-    &buffer[..input.len()]
-}
-
-// 使用线程本地存储的缓冲区，避免频繁分配内存
-thread_local! {
-    static A_BUFFER: std::cell::RefCell<Vec<f32>> = std::cell::RefCell::new(Vec::with_capacity(1024));
-    static B_BUFFER: std::cell::RefCell<Vec<f32>> = std::cell::RefCell::new(Vec::with_capacity(1024));
 }
 
 /// Random layer generator for HNSW
@@ -155,84 +137,97 @@ impl LayerGen {
 }
 
 #[inline]
-fn euclidean_distance_simd(a: &[f32], b: &[f32]) -> f32 {
-    // 边界情况处理
-    if a.is_empty() {
-        return 0.0;
-    } else if a.len() == 1 {
-        let diff = a[0] - b[0];
-        return diff.abs();
+fn euclidean_distance_f32(a: &[f32], b: &[f32]) -> f32 {
+    let mut sum = 0.0f32;
+    for (&x, &y) in a.iter().zip(b) {
+        let d = x - y;
+        sum += d * d;
     }
-
-    let a_array = ArrayView1::from(a);
-    let b_array = ArrayView1::from(b);
-
-    // 计算欧几里德距离
-    let diff = &a_array - &b_array;
-    diff.dot(&diff).sqrt()
+    sum.sqrt()
 }
 
 #[inline]
-fn cosine_distance_simd(a: &[f32], b: &[f32]) -> f32 {
-    // 边界情况处理
-    if a.is_empty() {
-        return 0.0;
-    } else if a.len() == 1 {
-        if a[0] == 0.0 || b[0] == 0.0 {
-            return 1.0; // 零向量的余弦距离为1
-        }
-        return 1.0 - (a[0] * b[0]) / (a[0].abs() * b[0].abs());
+fn cosine_distance_f32(a: &[f32], b: &[f32]) -> f32 {
+    let mut dot = 0.0f32;
+    let mut norm_a2 = 0.0f32;
+    let mut norm_b2 = 0.0f32;
+    for (&x, &y) in a.iter().zip(b) {
+        dot += x * y;
+        norm_a2 += x * x;
+        norm_b2 += y * y;
     }
-
-    let a_array = ArrayView1::from(a);
-    let b_array = ArrayView1::from(b);
-
-    // 计算点积
-    let dot_product = a_array.dot(&b_array);
-
-    // 计算向量范数
-    let norm_a = a_array.dot(&a_array).sqrt();
-    let norm_b = b_array.dot(&b_array).sqrt();
-
-    // 处理零向量情况
+    let norm_a = norm_a2.sqrt();
+    let norm_b = norm_b2.sqrt();
     if norm_a < f32::EPSILON || norm_b < f32::EPSILON {
         return 1.0;
     }
-
-    // 计算余弦距离
-    1.0 - (dot_product / (norm_a * norm_b))
+    1.0 - (dot / (norm_a * norm_b))
 }
 
 #[inline]
-fn inner_product_simd(a: &[f32], b: &[f32]) -> f32 {
-    // 边界情况处理
-    if a.is_empty() {
-        return 0.0;
-    } else if a.len() == 1 {
-        return -(a[0] * b[0]);
+fn inner_product_f32(a: &[f32], b: &[f32]) -> f32 {
+    let mut dot = 0.0f32;
+    for (&x, &y) in a.iter().zip(b) {
+        dot += x * y;
     }
-
-    let a_array = ArrayView1::from(a);
-    let b_array = ArrayView1::from(b);
-
-    // 计算负内积
-    -a_array.dot(&b_array)
+    -dot
 }
 
 #[inline]
-fn manhattan_distance_simd(a: &[f32], b: &[f32]) -> f32 {
-    // 边界情况处理
-    if a.is_empty() {
-        return 0.0;
-    } else if a.len() == 1 {
-        return (a[0] - b[0]).abs();
+fn manhattan_distance_f32(a: &[f32], b: &[f32]) -> f32 {
+    let mut sum = 0.0f32;
+    for (&x, &y) in a.iter().zip(b) {
+        sum += (x - y).abs();
     }
+    sum
+}
 
-    let a_array = ArrayView1::from(a);
-    let b_array = ArrayView1::from(b);
+#[inline]
+fn euclidean_distance_bf16(a: &[bf16], b: &[bf16]) -> f32 {
+    let mut sum = 0.0f32;
+    for (&x, &y) in a.iter().zip(b) {
+        let d = x.to_f32() - y.to_f32();
+        sum += d * d;
+    }
+    sum.sqrt()
+}
 
-    // 计算曼哈顿距离
-    (&a_array - &b_array).mapv(|x| x.abs()).sum()
+#[inline]
+fn cosine_distance_bf16(a: &[bf16], b: &[bf16]) -> f32 {
+    let mut dot = 0.0f32;
+    let mut norm_a2 = 0.0f32;
+    let mut norm_b2 = 0.0f32;
+    for (&x, &y) in a.iter().zip(b) {
+        let xf = x.to_f32();
+        let yf = y.to_f32();
+        dot += xf * yf;
+        norm_a2 += xf * xf;
+        norm_b2 += yf * yf;
+    }
+    let norm_a = norm_a2.sqrt();
+    let norm_b = norm_b2.sqrt();
+    if norm_a < f32::EPSILON || norm_b < f32::EPSILON {
+        return 1.0;
+    }
+    1.0 - (dot / (norm_a * norm_b))
+}
+
+#[inline]
+fn inner_product_bf16(a: &[bf16], b: &[bf16]) -> f32 {
+    let mut dot = 0.0f32;
+    for (&x, &y) in a.iter().zip(b) {
+        dot += x.to_f32() * y.to_f32();
+    }
+    -dot
+}
+
+#[inline]
+fn manhattan_distance_bf16(a: &[bf16], b: &[bf16]) -> f32 {
+    let mut sum = 0.0f32;
+    for (&x, &y) in a.iter().zip(b) {
+        sum += (x.to_f32() - y.to_f32()).abs();
+    }
+    sum
 }
 
 #[cfg(test)]
@@ -266,7 +261,7 @@ mod tests {
     }
 
     #[test]
-    fn test_simd_vs_scalar() {
+    fn test_distance_impl_vs_scalar() {
         let mut rng = rand::rng();
 
         fn euclidean_distance_scalar(a: &[f32], b: &[f32]) -> f32 {
@@ -306,35 +301,35 @@ mod tests {
         }
 
         // 测试欧几里得距离
-        let simd_euclidean = euclidean_distance_simd(&v1, &v2);
+        let impl_euclidean = euclidean_distance_f32(&v1, &v2);
         let scalar_euclidean = euclidean_distance_scalar(&v1, &v2);
         assert!(
-            (simd_euclidean - scalar_euclidean).abs() < 1e-4,
-            "欧几里得距离: SIMD={simd_euclidean}, 标量={scalar_euclidean}"
+            (impl_euclidean - scalar_euclidean).abs() < 1e-4,
+            "欧几里得距离: impl={impl_euclidean}, 标量={scalar_euclidean}"
         );
 
         // 测试余弦距离
-        let simd_cosine = cosine_distance_simd(&v1, &v2);
+        let impl_cosine = cosine_distance_f32(&v1, &v2);
         let scalar_cosine = cosine_distance_scalar(&v1, &v2);
         assert!(
-            (simd_cosine - scalar_cosine).abs() < 1e-4,
-            "余弦距离: SIMD={simd_cosine}, 标量={scalar_cosine}"
+            (impl_cosine - scalar_cosine).abs() < 1e-4,
+            "余弦距离: impl={impl_cosine}, 标量={scalar_cosine}"
         );
 
         // 测试内积
-        let simd_inner = inner_product_simd(&v1, &v2);
+        let impl_inner = inner_product_f32(&v1, &v2);
         let scalar_inner = inner_product_scalar(&v1, &v2);
         assert!(
-            (simd_inner - scalar_inner).abs() < 1e-4,
-            "内积: SIMD={simd_inner}, 标量={scalar_inner}"
+            (impl_inner - scalar_inner).abs() < 1e-4,
+            "内积: impl={impl_inner}, 标量={scalar_inner}"
         );
 
         // 测试曼哈顿距离
-        let simd_manhattan = manhattan_distance_simd(&v1, &v2);
+        let impl_manhattan = manhattan_distance_f32(&v1, &v2);
         let scalar_manhattan = manhattan_distance_scalar(&v1, &v2);
         assert!(
-            (simd_manhattan - scalar_manhattan).abs() < 1e-4,
-            "曼哈顿距离: SIMD={simd_manhattan}, 标量={scalar_manhattan}"
+            (impl_manhattan - scalar_manhattan).abs() < 1e-4,
+            "曼哈顿距离: impl={impl_manhattan}, 标量={scalar_manhattan}"
         );
     }
 }

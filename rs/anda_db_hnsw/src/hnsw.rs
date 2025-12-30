@@ -531,11 +531,12 @@ impl HnswIndex {
                 &mut distance_cache,
             )?;
             if let Some(&(nearest_id, nearest_dist, nearest_layer)) = nearest.first()
-                && nearest_dist < entry_point_dist {
-                    entry_point_node = nearest_id;
-                    entry_point_layer = nearest_layer;
-                    entry_point_dist = nearest_dist;
-                }
+                && nearest_dist < entry_point_dist
+            {
+                entry_point_node = nearest_id;
+                entry_point_layer = nearest_layer;
+                entry_point_dist = nearest_dist;
+            }
         }
 
         #[allow(clippy::type_complexity)]
@@ -575,10 +576,11 @@ impl HnswIndex {
             if let Some(closest_in_layer) = selected_neighbors
                 .iter()
                 .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(cmp::Ordering::Equal))
-                && closest_in_layer.1 < entry_point_dist {
-                    entry_point_node = closest_in_layer.0;
-                    entry_point_dist = closest_in_layer.1;
-                }
+                && closest_in_layer.1 < entry_point_dist
+            {
+                entry_point_node = closest_in_layer.0;
+                entry_point_dist = closest_in_layer.1;
+            }
 
             // 记录新节点需要连接的邻居，并收集反向连接信息
             for (neighbor_id, dist, layer) in selected_neighbors {
@@ -696,15 +698,16 @@ impl HnswIndex {
                     // select_neighbors 会读取 self.nodes
                     // 修改 self.nodes 必须在 select_neighbors 之后
                     if let Some(node) = nodes.get(&neighbor_id)
-                        && node.neighbors.len() > layer as usize {
-                            // Update neighbor connections
-                            let mut node = node.clone();
-                            node.neighbors[layer as usize] = selected
-                                .into_iter()
-                                .map(|(id, dist, _)| (id, bf16::from_f32(dist)))
-                                .collect();
-                            nodes.insert(neighbor_id, node);
-                        };
+                        && node.neighbors.len() > layer as usize
+                    {
+                        // Update neighbor connections
+                        let mut node = node.clone();
+                        node.neighbors[layer as usize] = selected
+                            .into_iter()
+                            .map(|(id, dist, _)| (id, bf16::from_f32(dist)))
+                            .collect();
+                        nodes.insert(neighbor_id, node);
+                    };
                 }
             }
         }
@@ -824,11 +827,12 @@ impl HnswIndex {
                 &mut distance_cache,
             )?;
             if let Some(node) = nearest.first()
-                && node.1 < current_dist {
-                    current_dist = node.1;
-                    current_node = node.0;
-                    current_node_layer = node.2;
-                }
+                && node.1 < current_dist
+            {
+                current_dist = node.1;
+                current_node = node.0;
+                current_node_layer = node.2;
+            }
         }
 
         // 在底层搜索最近的邻居
@@ -927,43 +931,25 @@ impl HnswIndex {
         // Get nearest candidates
         while let Some((Reverse(OrderedFloat(dist)), point, _)) = candidates.pop() {
             if let Some((OrderedFloat(max_dist), _, _)) = results.peek()
-                && &dist > max_dist && results.len() >= ef {
-                    break;
-                };
+                && &dist > max_dist
+                && results.len() >= ef
+            {
+                break;
+            };
 
             // Check neighbors of current node
             if let Some(node) = nodes.get(&point)
-                && let Some(neighbors) = node.neighbors.get(layer as usize) {
-                    for &(neighbor, _) in neighbors {
-                        if !visited.contains(&neighbor) {
-                            visited.insert(neighbor);
-                            if let Some(neighbor_node) = nodes.get(&neighbor) {
-                                match self.get_distance_with_cache(
-                                    distance_cache,
-                                    query,
-                                    neighbor_node,
-                                ) {
-                                    Ok(dist) => {
-                                        if let Some((OrderedFloat(max_dist), _, _)) = results.peek()
-                                        {
-                                            if &dist < max_dist || results.len() < ef {
-                                                candidates.push((
-                                                    Reverse(OrderedFloat(dist)),
-                                                    neighbor,
-                                                    neighbor_node.layer,
-                                                ));
-                                                results.push((
-                                                    OrderedFloat(dist),
-                                                    neighbor,
-                                                    neighbor_node.layer,
-                                                ));
-
-                                                // Prune distant results
-                                                if results.len() > ef {
-                                                    results.pop();
-                                                }
-                                            }
-                                        } else {
+                && let Some(neighbors) = node.neighbors.get(layer as usize)
+            {
+                for &(neighbor, _) in neighbors {
+                    if !visited.contains(&neighbor) {
+                        visited.insert(neighbor);
+                        if let Some(neighbor_node) = nodes.get(&neighbor) {
+                            match self.get_distance_with_cache(distance_cache, query, neighbor_node)
+                            {
+                                Ok(dist) => {
+                                    if let Some((OrderedFloat(max_dist), _, _)) = results.peek() {
+                                        if &dist < max_dist || results.len() < ef {
                                             candidates.push((
                                                 Reverse(OrderedFloat(dist)),
                                                 neighbor,
@@ -974,17 +960,34 @@ impl HnswIndex {
                                                 neighbor,
                                                 neighbor_node.layer,
                                             ));
+
+                                            // Prune distant results
+                                            if results.len() > ef {
+                                                results.pop();
+                                            }
                                         }
+                                    } else {
+                                        candidates.push((
+                                            Reverse(OrderedFloat(dist)),
+                                            neighbor,
+                                            neighbor_node.layer,
+                                        ));
+                                        results.push((
+                                            OrderedFloat(dist),
+                                            neighbor,
+                                            neighbor_node.layer,
+                                        ));
                                     }
-                                    Err(e) => {
-                                        log::warn!("Distance calculation error: {e:?}");
-                                        distance_cache.insert(neighbor, f32::MAX);
-                                    }
-                                };
-                            }
+                                }
+                                Err(e) => {
+                                    log::warn!("Distance calculation error: {e:?}");
+                                    distance_cache.insert(neighbor, f32::MAX);
+                                }
+                            };
                         }
                     }
                 }
+            }
         }
 
         Ok(results
@@ -1309,20 +1312,25 @@ impl HnswIndex {
 
         let mut buf = Vec::with_capacity(4096);
         while let Some(id) = dirty_nodes.pop_first() {
-            // 每次迭代都重新获取guard，并立即使用完毕
-            let node_data = {
+            // 只在序列化阶段短暂持有 map 的 guard；await 前必须释放。
+            let has_node = {
                 let nodes = self.nodes.pin();
                 if let Some(node) = nodes.get(&id) {
                     buf.clear();
-                    ciborium::into_writer(&node, &mut buf).expect("Failed to serialize node");
-                    Some(buf.clone()) // 克隆数据以避免持有guard
+                    ciborium::into_writer(&node, &mut buf).map_err(|err| {
+                        HnswError::Serialization {
+                            name: self.name.clone(),
+                            source: err.into(),
+                        }
+                    })?;
+                    true
                 } else {
-                    None
+                    false
                 }
-            }; // guard在这里被释放
+            };
 
-            if let Some(data) = node_data {
-                match f(id, &data).await {
+            if has_node {
+                match f(id, &buf).await {
                     Ok(true) => {
                         // continue
                     }
