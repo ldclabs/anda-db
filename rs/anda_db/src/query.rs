@@ -101,7 +101,7 @@ pub struct RRFReranker {
     ///
     /// Higher values reduce the impact of high rankings,
     /// making the algorithm more forgiving to items that
-    /// rank poorly in some lists.
+    /// rank poorly in some lists. Must be positive (typically 60).
     pub k: f32,
 }
 
@@ -112,6 +112,18 @@ impl Default for RRFReranker {
 }
 
 impl RRFReranker {
+    /// Creates a new RRFReranker with the specified k value.
+    ///
+    /// # Arguments
+    /// * `k` - The constant factor in the RRF formula. Must be positive.
+    ///
+    /// # Panics
+    /// Panics if k is not positive (k <= 0).
+    pub fn new(k: f32) -> Self {
+        assert!(k > 0.0, "RRFReranker k must be positive, got {}", k);
+        Self { k }
+    }
+
     /// Reranks results using the Reciprocal Rank Fusion algorithm.
     ///
     /// This method combines multiple ranked lists into a single ranking
@@ -125,11 +137,14 @@ impl RRFReranker {
     /// # Returns
     /// A Vec of (document_id, score) pairs, sorted by descending score.
     pub fn rerank(&self, ranked_lists: &[Vec<u64>]) -> Vec<(u64, f32)> {
+        // Ensure k is positive to avoid division by zero or negative scores
+        let k = if self.k > 0.0 { self.k } else { 60.0 };
+
         let mut scores: FxHashMap<u64, f32> = FxHashMap::default();
 
         for ranked in ranked_lists {
             for (rank, &doc_id) in ranked.iter().enumerate() {
-                let score = 1.0 / (self.k + rank as f32);
+                let score = 1.0 / (k + rank as f32);
                 *scores.entry(doc_id).or_insert(0.0) += score;
             }
         }

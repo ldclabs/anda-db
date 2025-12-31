@@ -364,14 +364,27 @@ impl Collection {
 
     /// Automatically repairs indexes if needed.
     /// This is called during collection opening to ensure index integrity.
+    ///
+    /// This method scans for documents between the persisted checkpoint and the
+    /// max_document_id that may have been written but not indexed (due to crash
+    /// or incomplete flush). It limits the scan to prevent unbounded loops.
     async fn auto_repair_indexes(&self) -> Result<usize, DBError> {
         let persisted_max_document_id = self.storage.stats().check_point;
         let maybe_max_document_id = self.max_document_id.load(Ordering::Relaxed);
+
+        // Early exit if no potential dirty documents
+        if persisted_max_document_id >= maybe_max_document_id {
+            return Ok(0);
+        }
+
         let now_ms = unix_ms();
         let mut id = persisted_max_document_id;
         let mut fixed = 0;
+        // Limit consecutive misses to avoid unbounded scanning in case of sparse IDs
+        let mut consecutive_misses = 0;
+        const MAX_CONSECUTIVE_MISSES: u32 = 100;
 
-        loop {
+        while id < maybe_max_document_id {
             id += 1;
             match self
                 .storage
@@ -379,11 +392,21 @@ impl Collection {
                 .await
             {
                 Err(_) => {
-                    if id > maybe_max_document_id {
+                    consecutive_misses += 1;
+                    // If we've had too many consecutive misses, assume no more dirty docs
+                    if consecutive_misses >= MAX_CONSECUTIVE_MISSES {
+                        log::debug!(
+                            action = "auto_repair_indexes",
+                            collection = self.name,
+                            id = id;
+                            "Stopping repair scan after {MAX_CONSECUTIVE_MISSES} consecutive misses",
+                        );
                         return Ok(fixed);
                     }
                 }
                 Ok((doc, _)) => {
+                    // Reset consecutive miss counter on successful fetch
+                    consecutive_misses = 0;
                     // dirty document exists
                     fixed += 1;
                     let doc = Document::try_from_doc(self.schema(), doc)?;
@@ -418,6 +441,8 @@ impl Collection {
                 }
             }
         }
+
+        Ok(fixed)
     }
 
     /// Sets the collection to read-only mode.
@@ -527,17 +552,23 @@ impl Collection {
     /// * `now_ms` - Current timestamp in milliseconds
     ///
     /// # Returns
-    /// `true` if metadata was stored, `false` if no changes needed to be stored
+    /// `Some(max_document_id)` if metadata was stored, `None` if no changes needed to be stored
     async fn store_metadata(&self, now_ms: u64) -> Result<Option<DocumentId>, DBError> {
-        let mut meta = self.metadata();
+        // First check if save is needed using atomic version
+        let current_version = {
+            let meta = self.metadata.read();
+            meta.stats.version
+        };
         let prev_saved_version = self
             .last_saved_version
-            .fetch_max(meta.stats.version, Ordering::Release);
-        if prev_saved_version >= meta.stats.version {
+            .fetch_max(current_version, Ordering::AcqRel);
+        if prev_saved_version >= current_version {
             // No need to save if the version is not updated
             return Ok(None);
         }
 
+        // Re-acquire metadata with lock to get consistent snapshot for saving
+        let mut meta = self.metadata();
         meta.stats.last_saved = now_ms.max(meta.stats.last_saved);
         let ver = { self.metadata_version.read().clone() };
         let ver = self
