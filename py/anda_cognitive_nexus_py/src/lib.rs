@@ -341,7 +341,9 @@ impl TryFrom<&str> for StoreLocationType {
 /// # Errors
 /// Returns an error if the config is invalid or DB/Nexus creation fails.
 pub async fn create_kip_db(db_config: AndaDbConfig) -> Result<Arc<CognitiveNexus>, BoxError> {
-    db_config.verify_config().map_err(KipError::Execution)?;
+    db_config
+        .verify_config()
+        .map_err(KipError::internal_error)?;
 
     let db_name = db_config.db_name.as_str();
     let db_desc = db_config.db_desc.as_deref().unwrap_or_default();
@@ -352,7 +354,7 @@ pub async fn create_kip_db(db_config: AndaDbConfig) -> Result<Arc<CognitiveNexus
         StoreLocationType::LocalFile => {
             let local_file = MetaStoreBuilder::new(
                 LocalFileSystem::new_with_prefix(&db_config.store_location)
-                    .map_err(|err| KipError::Execution(err.to_string()))?,
+                    .map_err(|err| KipError::internal_error(err.to_string()))?,
                 meta_cache_capacity,
             )
             .build();
@@ -505,7 +507,7 @@ mod tests {
     static NEW_DRUG_KML: &str = r#"
         UPSERT {
             CONCEPT ?brain_fog {
-                {type: "Symptom", name: $symptom_name}
+                {type: "Symptom", name: "Brain Fog"}
                 SET ATTRIBUTES {
                     description: "Mental fatigue and lack of clarity",
                     cognitive_impact: "high"
@@ -580,16 +582,10 @@ mod tests {
         // 2. Execute the second KML command from the demo to add more data
         println!("\n2. Executing New Drug KML...");
 
-        let mut ql_parameters = Map::new();
-        ql_parameters.insert(
-            "symptom_name".to_string(),
-            Json::String("Brain Fog".to_string()),
-        );
-
         let (_, response2) = block_on(execute_kip(
             nexus_in_mem.as_ref(),
             NEW_DRUG_KML.to_string(),
-            Some(ql_parameters.clone()),
+            None,
             false,
         ))
         .expect("Execution of new_drug_kml failed");

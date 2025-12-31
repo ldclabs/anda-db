@@ -42,8 +42,8 @@ Add `anda_db` and its related components to your `Cargo.toml`.
 ```toml
 [dependencies]
 anda_db = "0.7"
-anda_cognitive_nexus = "0.4"
-anda_kip = "0.5"
+anda_cognitive_nexus = "0.6"
+anda_kip = "0.6"
 # Add an object_store backend, e.g., object_store = { version = "0.12", features = ["local"] }
 tokio = { version = "1", features = ["full"] }
 ```

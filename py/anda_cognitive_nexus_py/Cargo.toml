@@ -1,6 +1,6 @@
 [package]
 name = "anda_cognitive_nexus_py"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [lib]
@@ -9,8 +9,12 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # Python Bindings
-pyo3 = { workspace = true, features = [ "extension-module", "serde"] }
-pyo3-asyncio = { workspace = true, features = ["attributes", "async-std-runtime", "tokio-runtime"] }  
+pyo3 = { workspace = true, features = ["extension-module", "serde"] }
+pyo3-asyncio = { workspace = true, features = [
+  "attributes",
+  "async-std-runtime",
+  "tokio-runtime",
+] }
 async-std = { workspace = true }
 tokio = { workspace = true }
 serde-pyobject = { workspace = true }

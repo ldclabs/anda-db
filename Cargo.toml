@@ -11,8 +11,11 @@ members = [
   "rs/anda_db_utils",
   "rs/anda_kip",
   "rs/anda_object_store",
-  # "py/anda_cognitive_nexus_py",
+  "py/anda_cognitive_nexus_py",
 ]
+# Python binding package (anda_cognitive_nexus_py) is excluded from workspace testing
+# because it requires Python library linking. Test it separately with:
+#   cargo test -p anda_cognitive_nexus_py --lib
 
 [workspace.package]
 description = "Anda DB is a Rust library designed as a specialized database for AI Agents, focusing on knowledge & memory."

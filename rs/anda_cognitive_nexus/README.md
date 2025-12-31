@@ -37,7 +37,7 @@ Add `anda_cognitive_nexus` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-anda_cognitive_nexus = { version = "0.2" }
+anda_cognitive_nexus = { version = "0.6" }
 ```
 
 ### Example Usage

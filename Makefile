@@ -10,4 +10,7 @@ fix:
 	@cargo clippy --fix --workspace --tests
 
 test:
-	@cargo test --workspace --all-features -- --nocapture
+	@cargo test --workspace --all-features --exclude anda_cognitive_nexus_py -- --nocapture
+
+test-py:
+	@cargo test -p anda_cognitive_nexus_py --lib

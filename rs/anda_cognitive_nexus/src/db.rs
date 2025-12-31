@@ -25,6 +25,7 @@ use std::{
     str::FromStr,
     sync::Arc,
 };
+use tokio::sync::RwLock;
 
 use crate::{entity::*, helper::*, types::*};
 
@@ -41,11 +42,28 @@ use crate::{entity::*, helper::*, types::*};
 /// - **Caching**: Thread-safe caching for improved query performance
 /// - **Protocol Support**: Full KIP implementation with KQL, KML, and Meta commands
 ///
+/// Core database structure for the cognitive nexus system.
+///
+/// `CognitiveNexus` manages a knowledge graph consisting of concepts and propositions,
+/// providing high-level operations for querying and manipulating the knowledge base.
+/// It implements the Knowledge Interchange Protocol (KIP) executor interface.
+///
+/// # Concurrency
+///
+/// The struct uses an async read-write lock (`RwLock`) to ensure KML execution consistency:
+/// - **Read lock**: Acquired for KQL queries and Meta commands (allows concurrent reads)
+/// - **Write lock**: Acquired for KML mutations (ensures exclusive access during data modifications)
+///
+/// This prevents race conditions during complex KML transactions that may involve
+/// multiple concept and proposition updates across collections.
 #[derive(Clone, Debug)]
 pub struct CognitiveNexus {
     db: Arc<AndaDB>,
     concepts: Arc<Collection>,
     propositions: Arc<Collection>,
+    /// Read-write lock for KML execution consistency.
+    /// KQL/Meta commands acquire read lock; KML commands acquire write lock.
+    kml_lock: Arc<RwLock<()>>,
 }
 
 /// Implementation of the Knowledge Interchange Protocol (KIP) executor.
@@ -68,18 +86,32 @@ impl Executor for CognitiveNexus {
     /// - Modification results for KML commands
     /// - Metadata for Meta commands
     ///
+    /// # Concurrency
+    ///
+    /// - KQL and Meta commands acquire a read lock (allows concurrent execution)
+    /// - KML commands acquire a write lock (ensures exclusive access during mutations)
+    ///
     async fn execute(&self, command: Command, dry_run: bool) -> Response {
         match command {
-            Command::Kql(command) => self.execute_kql(command).await.into(),
-            Command::Kml(command) => match self.execute_kml(command, dry_run).await {
-                Ok(result) => Response::Ok {
-                    result,
-                    next_cursor: None,
-                    ignore: Some(true),
-                },
-                Err(error) => Response::err(error),
-            },
-            Command::Meta(command) => self.execute_meta(command).await.into(),
+            Command::Kql(command) => {
+                let _guard = self.kml_lock.read().await;
+                self.execute_kql(command).await.into()
+            }
+            Command::Kml(command) => {
+                let _guard = self.kml_lock.write().await;
+                match self.execute_kml(command, dry_run).await {
+                    Ok(result) => Response::Ok {
+                        result,
+                        next_cursor: None,
+                        ignore: Some(true),
+                    },
+                    Err(error) => Response::err(error),
+                }
+            }
+            Command::Meta(command) => {
+                let _guard = self.kml_lock.read().await;
+                self.execute_meta(command).await.into()
+            }
         }
     }
 }
@@ -190,6 +222,7 @@ impl CognitiveNexus {
             db,
             concepts,
             propositions,
+            kml_lock: Arc::new(RwLock::new(())),
         };
 
         if !this
@@ -513,6 +546,32 @@ impl CognitiveNexus {
         ctx: &mut QueryContext,
         clauses: Vec<WhereClause>,
     ) -> Result<(), KipError> {
+        // 优化：检测是否可以使用快速路径
+        // 快速路径适用于: NOT { (?bound_var, "predicate", ?unbound_var) }
+        // 这种模式可以通过单次批量查询完成，而不需要对每个 entity 单独查询
+        if clauses.len() == 1 {
+            if let WhereClause::Proposition(prop_clause) = &clauses[0] {
+                if let PropositionMatcher::Object {
+                    subject: TargetTerm::Variable(subj_var),
+                    predicate: PredTerm::Literal(pred),
+                    object: TargetTerm::Variable(obj_var),
+                } = &prop_clause.matcher
+                {
+                    // 检查 subject 变量是否已绑定，object 变量是否未绑定
+                    let subj_bound = ctx.entities.contains_key(subj_var);
+                    let obj_bound = ctx.entities.contains_key(obj_var);
+
+                    if subj_bound && !obj_bound {
+                        // 快速路径：批量查询所有有此谓词关系的 subjects
+                        return self
+                            .execute_not_proposition_fast_path(ctx, subj_var, pred)
+                            .await;
+                    }
+                }
+            }
+        }
+
+        // 标准路径：对于复杂情况使用原有逻辑
         let mut not_context = ctx.clone();
         for clause in clauses {
             Box::pin(self.execute_where_clause(&mut not_context, clause)).await?;
@@ -536,6 +595,62 @@ impl CognitiveNexus {
             if let Some(existing) = ctx.predicates.get_mut(&pred) {
                 existing.retain(|id| !ids.contains(id));
             }
+        }
+
+        Ok(())
+    }
+
+    /// 快速路径处理 NOT { (?bound_var, "predicate", ?unbound_var) } 模式
+    ///
+    /// 优化策略：
+    /// 1. 一次性查询所有具有指定谓词的命题
+    /// 2. 收集所有这些命题的 subject
+    /// 3. 从原始绑定中排除这些 subjects
+    ///
+    /// 复杂度：O(1) 数据库查询 + O(M) 内存操作
+    /// 相比原始实现的 O(N) 数据库查询有显著提升
+    async fn execute_not_proposition_fast_path(
+        &self,
+        ctx: &mut QueryContext,
+        subject_var: &str,
+        predicate: &str,
+    ) -> Result<(), KipError> {
+        // 一次性查询所有具有此谓词的命题
+        let proposition_ids = self
+            .propositions
+            .query_ids(
+                Filter::Field((
+                    "predicates".to_string(),
+                    RangeQuery::Eq(Fv::Text(predicate.to_string())),
+                )),
+                None,
+            )
+            .await
+            .map_err(db_to_kip_error)?;
+
+        // 收集所有有此关系的 subjects
+        let mut subjects_with_relation: FxHashSet<EntityID> =
+            FxHashSet::with_capacity_and_hasher(proposition_ids.len(), Default::default());
+
+        for id in proposition_ids {
+            let subject = self
+                .try_get_proposition_with(&ctx.cache, id, |prop| {
+                    if prop.predicates.contains(predicate) {
+                        Ok(Some(prop.subject.clone()))
+                    } else {
+                        Ok(None)
+                    }
+                })
+                .await?;
+
+            if let Some(subj) = subject {
+                subjects_with_relation.insert(subj);
+            }
+        }
+
+        // 从原始绑定中排除有此关系的 subjects
+        if let Some(existing) = ctx.entities.get_mut(subject_var) {
+            existing.retain(|id| !subjects_with_relation.contains(id));
         }
 
         Ok(())
@@ -1668,7 +1783,7 @@ impl CognitiveNexus {
                         for name in &keys {
                             concept.metadata.remove(name);
                         }
-                        if concept.attributes.len() < length
+                        if concept.metadata.len() < length
                             && self
                                 .concepts
                                 .update(
@@ -1760,7 +1875,9 @@ impl CognitiveNexus {
 
                         // If no predicates left, delete the proposition
                         if proposition.predicates.is_empty() {
-                            let _ = self.propositions.remove(*id).await;
+                            if self.propositions.remove(*id).await.is_ok() {
+                                deleted_propositions += 1;
+                            }
                         } else {
                             // Otherwise, update the proposition with remaining predicates
                             if self
@@ -1835,14 +1952,15 @@ impl CognitiveNexus {
                         propositions_ids.extend(ids);
                     }
 
-                    deleted_propositions += propositions_ids.len() as u64;
-
                     for id in propositions_ids {
-                        let _ = self.propositions.remove(id).await;
+                        if self.propositions.remove(id).await.is_ok() {
+                            deleted_propositions += 1;
+                        }
                     }
 
-                    deleted_concepts += 1;
-                    let _ = self.concepts.remove(*id).await;
+                    if self.concepts.remove(*id).await.is_ok() {
+                        deleted_concepts += 1;
+                    }
                 }
                 EntityID::Proposition(_, _) => {
                     // ignore
@@ -3429,6 +3547,102 @@ mod tests {
             result,
             json!(["Aspirin".to_string(), "Ibuprofen".to_string()])
         );
+    }
+
+    #[tokio::test]
+    async fn test_kql_not_clause_fast_path_orphan_concepts() {
+        let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+        setup_test_data(&nexus).await.unwrap();
+
+        // 设置测试数据：创建一个 Domain 和一些概念，部分概念有 belongs_to_domain 关系
+        let setup_kml = r#"
+        UPSERT {
+            CONCEPT ?domain {
+                {type: "Domain", name: "TestDomain"}
+                SET ATTRIBUTES {
+                    "description": "Test domain for orphan detection"
+                }
+            }
+            CONCEPT ?belongs_to_domain_type {
+                {type: "$PropositionType", name: "belongs_to_domain"}
+            }
+
+            // Drug 类型中，只有 Aspirin 属于 TestDomain，其他不属于任何 domain
+            CONCEPT ?aspirin_with_domain {
+                {type: "Drug", name: "Aspirin"}
+                SET PROPOSITIONS {
+                    ("belongs_to_domain", {type: "Domain", name: "TestDomain"})
+                }
+            }
+
+            // 创建一个孤儿药物（不属于任何 domain）
+            CONCEPT ?orphan_drug {
+                {type: "Drug", name: "OrphanDrug"}
+                SET ATTRIBUTES {
+                    "description": "A drug without domain"
+                }
+            }
+        }
+        "#;
+        nexus
+            .execute_kml(parse_kml(setup_kml).unwrap(), false)
+            .await
+            .unwrap();
+
+        // 测试：查找没有 belongs_to_domain 关系的 Drug 概念（孤儿概念）
+        // 这个查询应该使用快速路径优化
+        let kql = r#"
+        FIND(?n.name)
+        WHERE {
+            ?n {type: "Drug"}
+            NOT {
+                (?n, "belongs_to_domain", ?d)
+            }
+        }
+        "#;
+
+        let query = parse_kql(kql).unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+
+        // OrphanDrug 没有 belongs_to_domain 关系，应该被返回
+        // Aspirin 有 belongs_to_domain 关系，不应该被返回
+        assert_eq!(result, json!(["OrphanDrug".to_string()]));
+
+        // 测试：查找没有 treats 关系的 Drug 概念
+        let kql = r#"
+        FIND(?n.name)
+        WHERE {
+            ?n {type: "Drug"}
+            NOT {
+                (?n, "treats", ?s)
+            }
+        }
+        "#;
+
+        let query = parse_kql(kql).unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+
+        // OrphanDrug 没有 treats 关系，应该被返回
+        // Aspirin 有 treats 关系（treats Headache 和 Fever），不应该被返回
+        assert_eq!(result, json!(["OrphanDrug".to_string()]));
+
+        // 测试：查找没有任何关系的 Symptom 概念
+        // Headache 和 Fever 都被 Aspirin treats，所以不会被返回
+        let kql = r#"
+        FIND(?n.name)
+        WHERE {
+            ?n {type: "Symptom"}
+            NOT {
+                (?d, "treats", ?n)
+            }
+        }
+        "#;
+
+        let query = parse_kql(kql).unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+
+        // 所有 Symptom 都被 treats，应该返回空
+        assert_eq!(result, json!([]));
     }
 
     #[tokio::test]

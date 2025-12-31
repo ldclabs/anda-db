@@ -1,5 +1,5 @@
-use anda_kip::{Response, Json, Map};
-use anda_cognitive_nexus_py::{execute_kip, create_kip_db, AndaDbConfig, StoreLocationType};
+use anda_cognitive_nexus_py::{create_kip_db, execute_kip, AndaDbConfig, StoreLocationType};
+use anda_kip::{Json, Map, Response};
 // Create basic concept types and medical knowledge capsule
 static MEDICAL_KNOWLEDGE_KML: &str = r#"
     UPSERT {
@@ -85,7 +85,7 @@ static MEDICAL_KNOWLEDGE_KML: &str = r#"
 static NEW_DRUG_KML: &str = r#"
     UPSERT {
         CONCEPT ?brain_fog {
-            {type: "Symptom", name: $symptom_name}
+            {type: "Symptom", name: :symptom_name}
             SET ATTRIBUTES {
                 description: "Mental fatigue and lack of clarity",
                 cognitive_impact: "high"
@@ -145,16 +145,20 @@ async fn main() {
         let path = Path::new(&db_config_local_file.store_location);
         if path.exists() {
             if path.is_file() {
-                panic!("store_location exists but is a file, not a directory: {}", db_config_local_file.store_location);
+                panic!(
+                    "store_location exists but is a file, not a directory: {}",
+                    db_config_local_file.store_location
+                );
             }
         } else {
-            std::fs::create_dir_all(path)
-                .expect("Failed to create store_location directory");
+            std::fs::create_dir_all(path).expect("Failed to create store_location directory");
         }
     }
 
     // Create Nexus instance for local_file DB
-    let nexus_local_file = create_kip_db(db_config_local_file).await.expect("Failed to create local_file Nexus");
+    let nexus_local_file = create_kip_db(db_config_local_file)
+        .await
+        .expect("Failed to create local_file Nexus");
 
     let (_, response2) = execute_kip(
         nexus_local_file.as_ref(),
@@ -164,7 +168,11 @@ async fn main() {
     )
     .await
     .expect("Execution of medical_knowledge_kml (local_file) failed");
-    assert!(matches!(response2, Response::Ok { .. }), "Expected second KML execution to be Ok, but got {:?}", response2);
+    assert!(
+        matches!(response2, Response::Ok { .. }),
+        "Expected second KML execution to be Ok, but got {:?}",
+        response2
+    );
     println!("Medical Knowledge KML executed successfully (local_file DB).");
 
     // 2. Execute the second KML command from the demo to add more data
@@ -184,7 +192,11 @@ async fn main() {
     )
     .await
     .expect("Execution of new_drug_kml failed");
-    assert!(matches!(response2, Response::Ok { .. }), "Expected third KML execution to be Ok, but got {:?}", response2);
+    assert!(
+        matches!(response2, Response::Ok { .. }),
+        "Expected third KML execution to be Ok, but got {:?}",
+        response2
+    );
     println!("New Drug KML executed successfully (local_file DB).");
 
     // 3. Execute a KQL query from the demo to verify the data
@@ -197,22 +209,28 @@ async fn main() {
     ORDER BY ?drug.attributes.risk_level ASC
     "#;
 
-    let (_, query_response) = execute_kip(
-        nexus_local_file.as_ref(),
-        query.to_string(), 
-        None, 
-        false)
-        .await
-        .expect("Execution of KQL query failed");
+    let (_, query_response) =
+        execute_kip(nexus_local_file.as_ref(), query.to_string(), None, false)
+            .await
+            .expect("Execution of KQL query failed");
 
     println!("Query Response: {:#?}", query_response);
 
     // 4. Assert that the query was successful and returned the correct data
-    assert!(matches!(query_response, Response::Ok { .. }), "Expected KQL query to be Ok, but got {:?}", query_response);
+    assert!(
+        matches!(query_response, Response::Ok { .. }),
+        "Expected KQL query to be Ok, but got {:?}",
+        query_response
+    );
 
     if let Response::Ok { result, .. } = query_response {
         let result_array = result.as_array().expect("Result should be an array");
-        assert_eq!(result_array.len(), 2, "Expected to find 2 drugs, but found {}", result_array.len());
+        assert_eq!(
+            result_array.len(),
+            2,
+            "Expected to find 2 drugs, but found {}",
+            result_array.len()
+        );
         println!("Successfully found 2 drugs as expected.");
     } else {
         panic!("Query failed, expected Ok response");
