@@ -5,9 +5,8 @@ use nom::{
     branch::alt,
     bytes::{tag, tag_no_case, take},
     character::{
-        anychar, char,
-        complete::{alpha1, alphanumeric1},
-        none_of,
+        anychar,
+        complete::{alpha1, alphanumeric1, char, none_of},
     },
     combinator::{cut, map, map_opt, map_res, opt, recognize, value, verify},
     error::context,
@@ -75,13 +74,18 @@ fn skip_ws_and_comments(input: &str) -> IResult<&str, (), VerboseError<&str>> {
 }
 
 fn string<'a>() -> impl Parser<&'a str, Output = String, Error = VerboseError<&'a str>> {
-    delimited(
-        char('"'),
-        cut(fold(0.., character(), String::new, |mut string, c| {
-            string.push(c);
-            string
-        })),
-        char('"'),
+    context(
+        "JSON string \"...\"",
+        preceded(
+            char('"'),
+            cut(terminated(
+                fold(0.., character(), String::new, |mut string, c| {
+                    string.push(c);
+                    string
+                }),
+                char('"'),
+            )),
+        ),
     )
 }
 

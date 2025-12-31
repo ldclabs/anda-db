@@ -403,6 +403,7 @@ pub async fn execute_kip(
         command,
         parameters: params_map,
         dry_run,
+        ..Default::default()
     };
 
     Ok(request.execute(nexus).await)

@@ -722,7 +722,7 @@ pub enum KmlStatement {
 
 /// Represents an UPSERT block - the primary vehicle for "Knowledge Capsules".
 /// Provides atomic creation or update of knowledge, ensuring idempotent operations.
-/// Structure: `UPSERT { CONCEPT @handle { ... } } WITH METADATA { ... }`
+/// Structure: `UPSERT { CONCEPT ?handle { ... } } WITH METADATA { ... }`
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct UpsertBlock {
     /// List of concepts and propositions to upsert
@@ -743,10 +743,10 @@ pub enum UpsertItem {
 
 /// Represents a concept definition within an UPSERT block.
 /// Defines a concept node with its attributes and outgoing propositions.
-/// Structure: `CONCEPT @handle { { ... } SET ATTRIBUTES { ... } SET PROPOSITIONS { ... } } WITH METADATA { ... }`
+/// Structure: `CONCEPT ?handle { { ... } SET ATTRIBUTES { ... } SET PROPOSITIONS { ... } } WITH METADATA { ... }`
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct ConceptBlock {
-    /// Local handle for referencing within the transaction (starts with @)
+    /// Local handle for referencing within the transaction (starts with ?)
     pub handle: String,
     /// Concept clause for matching the existing concept or creating new one
     pub concept: ConceptMatcher,
@@ -772,10 +772,10 @@ pub struct SetProposition {
 
 /// Represents a standalone proposition definition within an UPSERT block.
 /// Used for creating complex relationships that don't naturally belong to a single concept.
-/// Structure: `PROPOSITION @handle { ({ ... }, "predicate", { ... }) SET ATTRIBUTES { ... } } WITH METADATA { ... }`
+/// Structure: `PROPOSITION ?handle { ({ ... }, "predicate", { ... }) SET ATTRIBUTES { ... } } WITH METADATA { ... }`
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct PropositionBlock {
-    /// Local handle for referencing within the transaction (starts with @)
+    /// Local handle for referencing within the transaction (starts with ?)
     pub handle: String,
     /// Proposition clause for matching the existing proposition or creating new one
     pub proposition: PropositionMatcher,
@@ -902,21 +902,24 @@ pub fn compare_json(left: &Json, right: &Json) -> Option<Ordering> {
         (Json::String(a), Json::String(b)) => {
             // try to compare as number
             if let Ok(a) = Number::from_str(a)
-                && let Ok(b) = Number::from_str(b) {
-                    return a
-                        .as_f64()
-                        .unwrap_or(0.0)
-                        .partial_cmp(&b.as_f64().unwrap_or(0.0));
-                }
+                && let Ok(b) = Number::from_str(b)
+            {
+                return a
+                    .as_f64()
+                    .unwrap_or(0.0)
+                    .partial_cmp(&b.as_f64().unwrap_or(0.0));
+            }
             // try to compare as datetime
             if let Ok(a) = DateTime::parse_from_rfc3339(a)
-                && let Ok(b) = DateTime::parse_from_rfc3339(b) {
-                    return Some(a.cmp(&b));
-                }
+                && let Ok(b) = DateTime::parse_from_rfc3339(b)
+            {
+                return Some(a.cmp(&b));
+            }
             if let Ok(a) = DateTime::parse_from_rfc2822(a)
-                && let Ok(b) = DateTime::parse_from_rfc2822(b) {
-                    return Some(a.cmp(&b));
-                }
+                && let Ok(b) = DateTime::parse_from_rfc2822(b)
+            {
+                return Some(a.cmp(&b));
+            }
 
             Some(a.cmp(b))
         }

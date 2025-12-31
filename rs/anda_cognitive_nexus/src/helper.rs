@@ -69,7 +69,7 @@ pub fn extract_concept_field_value(concept: &Concept, path: &[String]) -> Result
                     .pipe(Ok)
             }
         }
-        _ => Err(KipError::InvalidCommand(format!(
+        _ => Err(KipError::invalid_syntax(format!(
             "Invalid field path: {}",
             path.join(".")
         ))),
@@ -107,7 +107,7 @@ pub fn extract_proposition_field_value(
     validate_dot_path_var(path, EntityType::PropositionLink)?;
 
     if !proposition.predicates.contains(predicate) {
-        return Err(KipError::Execution(format!(
+        return Err(KipError::internal_error(format!(
             "Invalid predicate: {}",
             predicate
         )));
@@ -116,7 +116,7 @@ pub fn extract_proposition_field_value(
     if path.is_empty() {
         return proposition
             .to_proposition_link(predicate)
-            .ok_or_else(|| KipError::InvalidCommand(format!("Invalid predicate: {}", predicate)));
+            .ok_or_else(|| KipError::invalid_syntax(format!("Invalid predicate: {}", predicate)));
     }
 
     let prop = proposition
@@ -160,7 +160,7 @@ pub fn extract_proposition_field_value(
                     .pipe(Ok)
             }
         }
-        _ => Err(KipError::InvalidCommand(format!(
+        _ => Err(KipError::invalid_syntax(format!(
             "Invalid field path: {}",
             path.join(".")
         ))),
@@ -281,7 +281,7 @@ pub fn match_predicate_against_proposition(
                 Ok(None)
             }
         }
-        _ => Err(KipError::InvalidCommand(format!(
+        _ => Err(KipError::invalid_syntax(format!(
             "Predicate must be either Literal or Variable, got: {predicate:?}"
         ))),
     }
@@ -305,9 +305,9 @@ pub fn match_predicate_against_proposition(
 /// * Others → `Execution`
 pub fn db_to_kip_error(err: DBError) -> KipError {
     match &err {
-        DBError::Schema { .. } => KipError::Parse(format!("{err}")),
-        DBError::NotFound { .. } => KipError::NotFound(format!("{err}")),
-        DBError::AlreadyExists { .. } => KipError::AlreadyExists(format!("{err}")),
-        _ => KipError::Execution(format!("{err}")),
+        DBError::Schema { .. } => KipError::invalid_syntax(format!("{err}")),
+        DBError::NotFound { .. } => KipError::not_found(format!("{err}")),
+        DBError::AlreadyExists { .. } => KipError::duplicate_exists(format!("{err}")),
+        _ => KipError::internal_error(format!("{err}")),
     }
 }

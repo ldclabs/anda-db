@@ -846,7 +846,7 @@ mod tests {
         // Missing concept clause in concept
         let input3 = r#"
         UPSERT {
-            CONCEPT @drug {
+            CONCEPT ?drug {
                 SET ATTRIBUTES { name: "Test" }
             }
         }

@@ -20,7 +20,7 @@ async fn main() -> Result<(), KipError> {
     // let object_store = InMemory::new();
     let object_store = MetaStoreBuilder::new(
         LocalFileSystem::new_with_prefix("./debug/metastore")
-            .map_err(|err| KipError::Execution(err.to_string()))?,
+            .map_err(|err| KipError::internal_error(err.to_string()))?,
         10000,
     )
     .build();

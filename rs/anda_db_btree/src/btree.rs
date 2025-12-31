@@ -525,7 +525,7 @@ where
             if b.2.is_empty() || b.0 + size_increase < self.config.bucket_overload_size {
                 b.0 += size_increase;
                 // Mark as dirty, needs to be persisted
-                self.mark_bucket_dirty(&mut *b);
+                self.mark_bucket_dirty(&mut b);
                 // Add field value to bucket if not already present
                 b.2.push(field_value.clone());
             } else {
@@ -613,7 +613,7 @@ where
             // Update the bucket state
             if let Some(mut b) = self.buckets.get_mut(&bucket_id) {
                 b.0 = b.0.saturating_sub(size_decrease);
-                self.mark_bucket_dirty(&mut *b);
+                self.mark_bucket_dirty(&mut b);
 
                 if posting_empty {
                     // remove FV from the bucket
@@ -744,7 +744,7 @@ where
             {
                 // Bucket has enough space, update directly
                 bucket_entry.0 += size_increase;
-                self.mark_bucket_dirty(&mut *bucket_entry);
+                self.mark_bucket_dirty(&mut bucket_entry);
 
                 // Update field values contained in the bucket
                 for fv in field_values {
@@ -794,7 +794,7 @@ where
                     if nb.2.is_empty() || nb.0 + size < self.config.bucket_overload_size {
                         // Bucket has enough space, update directly
                         nb.0 += size;
-                        self.mark_bucket_dirty(&mut *nb);
+                        self.mark_bucket_dirty(&mut nb);
                         nb.2.push(field_value.clone());
                     } else {
                         // Bucket doesn't have enough space, need to migrate to the next bucket
@@ -929,7 +929,7 @@ where
         for (bucket_id, (size_decrease, field_values)) in bucket_updates {
             if let Some(mut bucket) = self.buckets.get_mut(&bucket_id) {
                 bucket.0 = bucket.0.saturating_sub(size_decrease);
-                self.mark_bucket_dirty(&mut *bucket); // Mark as dirty
+                self.mark_bucket_dirty(&mut bucket); // Mark as dirty
 
                 // Remove field values that are completely removed
                 for fv in &values_to_remove {

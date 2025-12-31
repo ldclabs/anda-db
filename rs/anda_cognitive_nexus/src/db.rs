@@ -134,7 +134,7 @@ impl CognitiveNexus {
     where
         F: AsyncFnOnce(&CognitiveNexus) -> Result<(), KipError>,
     {
-        let schema = Concept::schema().map_err(KipError::parse)?;
+        let schema = Concept::schema().map_err(KipError::invalid_syntax)?;
         let concepts = db
             .open_or_create_collection(
                 schema,
@@ -159,7 +159,7 @@ impl CognitiveNexus {
             .await
             .map_err(db_to_kip_error)?;
 
-        let schema = Proposition::schema().map_err(KipError::parse)?;
+        let schema = Proposition::schema().map_err(KipError::invalid_syntax)?;
         let propositions = db
             .open_or_create_collection(
                 schema,
@@ -404,7 +404,7 @@ impl CognitiveNexus {
         clause: ConceptClause,
     ) -> Result<(), KipError> {
         if ctx.entities.contains_key(&clause.variable) {
-            return Err(KipError::InvalidCommand(format!(
+            return Err(KipError::invalid_syntax(format!(
                 "Variable '{}' already exists in context",
                 clause.variable
             )));
@@ -427,16 +427,16 @@ impl CognitiveNexus {
         if let Some(var) = &clause.variable
             && ctx.entities.contains_key(var)
         {
-            return Err(KipError::InvalidCommand(format!(
+            return Err(KipError::invalid_syntax(format!(
                 "Variable '{var}' already exists in context",
             )));
         }
 
         let result = match clause.matcher {
             PropositionMatcher::ID(id) => {
-                let entity_id = EntityID::from_str(&id).map_err(KipError::Parse)?;
+                let entity_id = EntityID::from_str(&id).map_err(KipError::invalid_syntax)?;
                 if !matches!(entity_id, EntityID::Proposition(_, _)) {
-                    return Err(KipError::InvalidCommand(format!(
+                    return Err(KipError::invalid_syntax(format!(
                         "Invalid proposition link ID: {id:?}"
                     )));
                 }
@@ -730,7 +730,7 @@ impl CognitiveNexus {
 
         let me = me
             .first()
-            .ok_or_else(|| KipError::Execution(format!("Concept {matcher} not found")))?;
+            .ok_or_else(|| KipError::not_found(format!("Concept {matcher} not found")))?;
         let me = self
             .try_get_concept_with(&cache, *me, |concept| {
                 extract_concept_field_value(concept, &["attributes".to_string()])
@@ -819,7 +819,7 @@ impl CognitiveNexus {
 
         let id = id
             .first()
-            .ok_or_else(|| KipError::Execution(format!("Concept type {name:?} not found")))?;
+            .ok_or_else(|| KipError::not_found(format!("Concept type {name:?} not found")))?;
         let result = self
             .try_get_concept_with(&QueryCache::default(), *id, |concept| {
                 extract_concept_field_value(concept, &[])
@@ -856,7 +856,7 @@ impl CognitiveNexus {
 
         let id = id
             .first()
-            .ok_or_else(|| KipError::Execution(format!("Proposition type {name:?} not found")))?;
+            .ok_or_else(|| KipError::not_found(format!("Proposition type {name:?} not found")))?;
         let result = self
             .try_get_concept_with(&QueryCache::default(), *id, |concept| {
                 extract_concept_field_value(concept, &[])
@@ -988,7 +988,7 @@ impl CognitiveNexus {
             let start_nodes = match objects {
                 TargetEntities::IDs(ids) => ids,
                 _ => {
-                    return Err(KipError::InvalidCommand(
+                    return Err(KipError::invalid_syntax(
                         "The subject or object cannot both be variables in multi-hop matching"
                             .to_string(),
                     ));
@@ -1160,7 +1160,7 @@ impl CognitiveNexus {
             PredTerm::Literal(pred) => vec![pred.clone()],
             PredTerm::Alternative(preds) => preds.clone(),
             _ => {
-                return Err(KipError::InvalidCommand(format!(
+                return Err(KipError::invalid_syntax(format!(
                     "Predicate must be either Literal or Alternative, got: {predicate:?}"
                 )));
             }
@@ -1381,7 +1381,7 @@ impl CognitiveNexus {
                     })
                     .await
             {
-                return Err(KipError::NotFound(format!(
+                return Err(KipError::not_found(format!(
                     "Concept type {} not found",
                     r#type
                 )));
@@ -1441,7 +1441,7 @@ impl CognitiveNexus {
                 })
                 .await
             {
-                return Err(KipError::NotFound(format!(
+                return Err(KipError::not_found(format!(
                     "Proposition type {} not found",
                     r#predicate
                 )));
@@ -1564,7 +1564,7 @@ impl CognitiveNexus {
         }
 
         let target_entities = ctx.entities.get(&target).cloned().ok_or_else(|| {
-            KipError::InvalidCommand(format!("Target term '{}' not found in context", target))
+            KipError::reference_error(format!("Target term '{}' not found in context", target))
         })?;
         let mut updated_concepts: u64 = 0;
         let mut updated_propositions: u64 = 0;
@@ -1653,7 +1653,7 @@ impl CognitiveNexus {
         }
 
         let target_entities = ctx.entities.get(&target).cloned().ok_or_else(|| {
-            KipError::InvalidCommand(format!("Target term '{}' not found in context", target))
+            KipError::reference_error(format!("Target term '{}' not found in context", target))
         })?;
         let mut updated_concepts: u64 = 0;
         let mut updated_propositions: u64 = 0;
@@ -1740,7 +1740,7 @@ impl CognitiveNexus {
         }
 
         let target_entities = ctx.entities.get(&target).cloned().ok_or_else(|| {
-            KipError::InvalidCommand(format!("Target term '{}' not found in context", target))
+            KipError::reference_error(format!("Target term '{}' not found in context", target))
         })?;
 
         let mut deleted_propositions: u64 = 0;
@@ -1806,7 +1806,7 @@ impl CognitiveNexus {
         }
 
         let target_entities = ctx.entities.get(&target).cloned().ok_or_else(|| {
-            KipError::InvalidCommand(format!("Target term '{}' not found in context", target))
+            KipError::reference_error(format!("Target term '{}' not found in context", target))
         })?;
         let mut deleted_propositions: u64 = 0;
         let mut deleted_concepts: u64 = 0;
@@ -1912,7 +1912,7 @@ impl CognitiveNexus {
                 let subject = self.resolve_entity_id(subject.as_ref(), cached_pks).await?;
                 let object = self.resolve_entity_id(object.as_ref(), cached_pks).await?;
                 if subject == object {
-                    return Err(KipError::InvalidCommand(format!(
+                    return Err(KipError::invalid_syntax(format!(
                         "Subject and object cannot be the same: {}",
                         subject
                     )));
@@ -1976,7 +1976,7 @@ impl CognitiveNexus {
         metadata: Map<String, Json>,
     ) -> Result<(), KipError> {
         if !self.concepts.contains(id) {
-            return Err(KipError::NotFound(format!(
+            return Err(KipError::not_found(format!(
                 "Concept {} not found",
                 ConceptPK::ID(id)
             )));
@@ -2015,7 +2015,7 @@ impl CognitiveNexus {
         metadata: Map<String, Json>,
     ) -> Result<(), KipError> {
         if !self.propositions.contains(id) {
-            return Err(KipError::NotFound(format!(
+            return Err(KipError::not_found(format!(
                 "Proposition {} not found",
                 PropositionPK::ID(id, predicate)
             )));
@@ -2122,7 +2122,7 @@ impl CognitiveNexus {
             )
             .await
             .map_err(db_to_kip_error)?;
-        ids.pop().ok_or(KipError::NotFound(format!(
+        ids.pop().ok_or(KipError::not_found(format!(
             "Concept {} not found",
             ConceptPK::Object {
                 r#type: ty.to_string(),
@@ -2134,11 +2134,11 @@ impl CognitiveNexus {
     async fn query_concept_ids(&self, matcher: &ConceptMatcher) -> Result<Vec<u64>, KipError> {
         match matcher {
             ConceptMatcher::ID(id) => {
-                let entity_id = EntityID::from_str(id).map_err(KipError::Parse)?;
+                let entity_id = EntityID::from_str(id).map_err(KipError::invalid_syntax)?;
                 if let EntityID::Concept(concept_id) = entity_id {
                     Ok(vec![concept_id])
                 } else {
-                    Err(KipError::InvalidCommand(format!(
+                    Err(KipError::invalid_syntax(format!(
                         "Invalid concept node ID: {}",
                         id
                     )))
@@ -2283,7 +2283,7 @@ impl CognitiveNexus {
     ) -> Result<(Vec<Json>, Option<String>), KipError> {
         let ids = bindings
             .get(var)
-            .ok_or_else(|| KipError::InvalidCommand(format!("Unbound variable: {var:?}")))?;
+            .ok_or_else(|| KipError::reference_error(format!("Unbound variable: {var:?}")))?;
 
         let mut result = Vec::with_capacity(ids.len());
         let has_order_by = order_by.iter().any(|v| v.variable.var == var);
@@ -2383,9 +2383,10 @@ impl CognitiveNexus {
             TargetTerm::Proposition(proposition_matcher) => {
                 match *proposition_matcher {
                     PropositionMatcher::ID(id) => {
-                        let entity_id = EntityID::from_str(&id).map_err(KipError::Parse)?;
+                        let entity_id =
+                            EntityID::from_str(&id).map_err(KipError::invalid_syntax)?;
                         if !matches!(entity_id, EntityID::Proposition(_, _)) {
-                            return Err(KipError::InvalidCommand(format!(
+                            return Err(KipError::invalid_syntax(format!(
                                 "Invalid proposition link ID: {id:?}"
                             )));
                         }
@@ -2424,7 +2425,7 @@ impl CognitiveNexus {
             None => {
                 // 如果当前游标没有绑定，尝试从快照中获取
                 let ids = bindings_snapshot.get_mut(&dot_path.var).ok_or_else(|| {
-                    KipError::InvalidCommand(format!("Unbound variable1: {:?}", dot_path.var))
+                    KipError::reference_error(format!("Unbound variable1: {:?}", dot_path.var))
                 })?;
 
                 let id = match ids.pop() {
@@ -2588,7 +2589,7 @@ impl CognitiveNexus {
         bindings_cursor: &mut FxHashMap<String, EntityID>,
     ) -> Result<Option<bool>, KipError> {
         if args.len() != 2 {
-            return Err(KipError::InvalidCommand(
+            return Err(KipError::invalid_syntax(
                 "Filter functions require exactly 2 arguments".to_string(),
             ));
         }
@@ -2620,7 +2621,7 @@ impl CognitiveNexus {
             FilterFunction::Regex => {
                 // 简单的正则表达式匹配
                 let rt = regex::Regex::new(pattern)
-                    .map_err(|e| KipError::Parse(format!("Invalid regex: {e:?}")))?
+                    .map_err(|e| KipError::invalid_syntax(format!("Invalid regex: {e:?}")))?
                     .is_match(string);
                 Ok(Some(rt))
             }
@@ -2635,7 +2636,7 @@ impl CognitiveNexus {
         match target {
             TargetTerm::Variable(handle) => {
                 if !handle_map.contains_key(handle) {
-                    return Err(KipError::InvalidCommand(format!(
+                    return Err(KipError::reference_error(format!(
                         "Undefined handle: {handle}"
                     )));
                 }
@@ -2661,7 +2662,7 @@ impl CognitiveNexus {
             TargetTerm::Variable(handle) => handle_map
                 .get(&handle)
                 .cloned()
-                .ok_or_else(|| KipError::InvalidCommand(format!("Undefined handle: {handle}"))),
+                .ok_or_else(|| KipError::reference_error(format!("Undefined handle: {handle}"))),
             TargetTerm::Concept(concept_matcher) => {
                 let concept_pk = ConceptPK::try_from(concept_matcher)?;
                 self.resolve_entity_id(&EntityPK::Concept(concept_pk), cached_pks)
@@ -2730,7 +2731,7 @@ impl CognitiveNexus {
                     if let Some(id) = ids.first() {
                         Ok(EntityID::Proposition(*id, predicate.clone()))
                     } else {
-                        Err(KipError::NotFound(format!(
+                        Err(KipError::not_found(format!(
                             "proposition link not found: {}",
                             proposition_pk
                         )))
@@ -3255,10 +3256,14 @@ mod tests {
         let result = nexus.execute_kql(query).await;
         // 应该返回错误，因为多跳查询要求主语或宾语至少有一个是具体的ID
         assert!(result.is_err());
-        if let Err(KipError::InvalidCommand(msg)) = result {
-            assert!(msg.contains("cannot both be variables in multi-hop matching"));
+        if let Err(err) = result {
+            assert!(matches!(err.code, KipErrorCode::InvalidSyntax));
+            assert!(
+                err.message
+                    .contains("cannot both be variables in multi-hop matching")
+            );
         } else {
-            panic!("Expected InvalidCommand error");
+            panic!("Expected InvalidSyntax error");
         }
     }
 
@@ -3442,7 +3447,8 @@ mod tests {
 
         let query = parse_kql(kql).unwrap();
         let res = nexus.execute_kql(query).await;
-        assert!(matches!(res, Err(KipError::InvalidCommand(_))));
+        assert!(res.is_err());
+        assert!(matches!(res.unwrap_err().code, KipErrorCode::InvalidSyntax));
 
         // 测试UNION子句
         let kql = r#"
@@ -3700,7 +3706,11 @@ mod tests {
 
         let meta_cmd = MetaCommand::Describe(DescribeTarget::Primer);
         let result = nexus.execute_meta(meta_cmd).await;
-        assert!(matches!(result, Err(KipError::NotFound(_))));
+        assert!(result.is_err());
+        assert!(matches!(
+            result.as_ref().unwrap_err().code,
+            KipErrorCode::NotFound
+        ));
         assert!(
             result
                 .err()
@@ -3779,7 +3789,8 @@ mod tests {
         let res = nexus
             .execute_meta(parse_meta("DESCRIBE CONCEPT TYPE \"drug\"").unwrap())
             .await;
-        assert!(matches!(res, Err(KipError::NotFound(_))));
+        assert!(res.is_err());
+        assert!(matches!(res.unwrap_err().code, KipErrorCode::NotFound));
     }
 
     #[tokio::test]
@@ -3806,7 +3817,8 @@ mod tests {
         let res = nexus
             .execute_meta(parse_meta("DESCRIBE PROPOSITION TYPE \"treats1\"").unwrap())
             .await;
-        assert!(matches!(res, Err(KipError::NotFound(_))));
+        assert!(res.is_err());
+        assert!(matches!(res.unwrap_err().code, KipErrorCode::NotFound));
     }
 
     #[tokio::test]

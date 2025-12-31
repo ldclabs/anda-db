@@ -170,7 +170,7 @@ pub struct UpsertResult {
 /// # Returns
 ///
 /// * `Ok(())` if the path is valid for the given entity type
-/// * `Err(KipError::Parse)` if the path is invalid
+/// * `Err(KipError)` with InvalidSyntax code if the path is invalid
 ///
 /// # Examples
 ///
@@ -190,19 +190,19 @@ pub fn validate_dot_path_var(path: &[String], et: EntityType) -> Result<(), KipE
             "id" | "attributes" | "metadata" => Ok(()),
             "type" | "name" if et == EntityType::ConceptNode => Ok(()),
             "subject" | "predicate" | "object" if et == EntityType::PropositionLink => Ok(()),
-            _ => Err(KipError::Parse(format!(
+            _ => Err(KipError::invalid_syntax(format!(
                 "Dot notation path: invalid path component {:?}",
                 path[0]
             ))),
         },
         2 => match (path[0].as_str(), path[1].as_str()) {
             ("attributes", _) | ("metadata", _) => Ok(()),
-            _ => Err(KipError::Parse(format!(
+            _ => Err(KipError::invalid_syntax(format!(
                 "Dot notation path: invalid path components {:?}",
                 path.join("."),
             ))),
         },
-        _ => Err(KipError::Parse(format!(
+        _ => Err(KipError::invalid_syntax(format!(
             "Dot notation path: too many components in path {:?}",
             path.join(".")
         ))),

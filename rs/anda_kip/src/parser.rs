@@ -69,7 +69,7 @@ pub fn parse_kip(input: &str) -> Result<Command, KipError> {
         map(meta::parse_meta_command, Command::Meta),
     ))))
     .parse(input)
-    .map_err(|err| KipError::Parse(format_nom_error(input, err)))?;
+    .map_err(|err| format_nom_error(input, err))?;
     Ok(rt.1)
 }
 
@@ -97,7 +97,7 @@ pub fn parse_kip(input: &str) -> Result<Command, KipError> {
 pub fn parse_kql(input: &str) -> Result<KqlQuery, KipError> {
     let rt = all_consuming(json::ws(kql::parse_kql_query))
         .parse(input)
-        .map_err(|err| KipError::Parse(format_nom_error(input, err)))?;
+        .map_err(|err| format_nom_error(input, err))?;
     Ok(rt.1)
 }
 
@@ -125,7 +125,7 @@ pub fn parse_kql(input: &str) -> Result<KqlQuery, KipError> {
 pub fn parse_kml(input: &str) -> Result<KmlStatement, KipError> {
     let rt = all_consuming(json::ws(kml::parse_kml_statement))
         .parse(input)
-        .map_err(|err| KipError::Parse(format_nom_error(input, err)))?;
+        .map_err(|err| format_nom_error(input, err))?;
     Ok(rt.1)
 }
 
@@ -153,7 +153,7 @@ pub fn parse_kml(input: &str) -> Result<KmlStatement, KipError> {
 pub fn parse_meta(input: &str) -> Result<MetaCommand, KipError> {
     let rt = all_consuming(json::ws(meta::parse_meta_command))
         .parse(input)
-        .map_err(|err| KipError::Parse(format_nom_error(input, err)))?;
+        .map_err(|err| format_nom_error(input, err))?;
     Ok(rt.1)
 }
 
@@ -183,7 +183,7 @@ pub fn parse_meta(input: &str) -> Result<MetaCommand, KipError> {
 pub fn parse_json(input: &str) -> Result<Json, KipError> {
     let rt = all_consuming(json::ws(json::json_value()))
         .parse(input)
-        .map_err(|err| KipError::Parse(format_nom_error(input, err)))?;
+        .map_err(|err| format_nom_error(input, err))?;
     Ok(rt.1)
 }
 

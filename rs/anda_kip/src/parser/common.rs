@@ -108,13 +108,15 @@ pub fn json_value_map(input: &str) -> VResult<'_, Map<String, Json>> {
     map(
         context(
             "KIP key-value map",
-            delimited(
+            preceded(
                 ws(char('{')),
-                opt(terminated(
-                    separated_list1(ws(char(',')), key_json_pair),
-                    opt(ws(char(','))), // Allow trailing comma
+                cut(terminated(
+                    opt(terminated(
+                        separated_list1(ws(char(',')), key_json_pair),
+                        opt(ws(char(','))), // Allow trailing comma
+                    )),
+                    ws(char('}')),
                 )),
-                ws(char('}')),
             ),
         ),
         |opt_kvs| opt_kvs.unwrap_or_default().into_iter().collect(),
@@ -123,10 +125,13 @@ pub fn json_value_map(input: &str) -> VResult<'_, Map<String, Json>> {
 }
 
 fn key_json_pair(input: &str) -> VResult<'_, (String, Json)> {
-    separated_pair(
-        alt((quoted_string, map(identifier, |s| s.to_string()))),
-        ws(char(':')),
-        json_value(),
+    context(
+        "key-value pair",
+        separated_pair(
+            alt((quoted_string, map(identifier, |s| s.to_string()))),
+            cut(ws(char(':'))),
+            cut(json_value()),
+        ),
     )
     .parse(input)
 }
@@ -521,5 +526,39 @@ mod tests {
         assert!(key_value_pair("key: ").is_err());
         assert!(json_value_map("{ key: }").is_err());
         assert!(json_value_map("{ key value }").is_err());
+    }
+
+    #[test]
+    fn test_error_messages_with_context() {
+        // 测试未闭合字符串的错误信息应包含完整上下文
+        let input = r#"{ name: "test, age: 25 }"#;
+        let result = json_value_map(input);
+        assert!(result.is_err());
+        if let Err(nom::Err::Failure(e)) = &result {
+            let err_str = format!("{}", e);
+            // 验证错误信息包含 JSON string 和 KIP key-value map 的上下文
+            assert!(
+                err_str.contains("JSON string"),
+                "Error should mention JSON string context"
+            );
+            assert!(
+                err_str.contains("KIP key-value map"),
+                "Error should mention KIP key-value map context"
+            );
+        } else {
+            panic!("Expected Failure error, got {:?}", result);
+        }
+
+        // 测试空值的错误信息
+        let input2 = r#"{ key: }"#;
+        let result2 = json_value_map(input2);
+        assert!(result2.is_err());
+        if let Err(nom::Err::Failure(e)) = &result2 {
+            let err_str = format!("{}", e);
+            assert!(
+                err_str.contains("KIP key-value map"),
+                "Error should mention KIP key-value map context"
+            );
+        }
     }
 }

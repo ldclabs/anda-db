@@ -63,21 +63,20 @@ impl TryFrom<ConceptMatcher> for ConceptPK {
     /// * `Err(KipError)` - If the matcher is invalid or unsupported
     ///
     /// # Errors
-    /// - `KipError::Parse` - If the ID string cannot be parsed
-    /// - `KipError::InvalidCommand` - If the matcher type is unsupported
+    /// - `KipErrorCode::InvalidSyntax` - If the ID string cannot be parsed or the matcher type is unsupported
     fn try_from(value: ConceptMatcher) -> Result<Self, Self::Error> {
         match value {
             ConceptMatcher::ID(id) => {
-                let id = EntityID::from_str(&id).map_err(KipError::Parse)?;
+                let id = EntityID::from_str(&id).map_err(KipError::invalid_syntax)?;
                 match id {
                     EntityID::Concept(id) => Ok(ConceptPK::ID(id)),
-                    _ => Err(KipError::InvalidCommand(format!(
+                    _ => Err(KipError::invalid_syntax(format!(
                         "ConceptMatcher::ID must be a Concept ID, got: {id:?}"
                     ))),
                 }
             }
             ConceptMatcher::Object { r#type, name } => Ok(ConceptPK::Object { r#type, name }),
-            _ => Err(KipError::InvalidCommand(format!(
+            _ => Err(KipError::invalid_syntax(format!(
                 "ConceptMatcher must be either ID or Object, got: {value:?}"
             ))),
         }
@@ -138,15 +137,14 @@ impl TryFrom<PropositionMatcher> for PropositionPK {
     /// * `Err(KipError)` - If the matcher is invalid or unsupported
     ///
     /// # Errors
-    /// - `KipError::Parse` - If the ID string cannot be parsed
-    /// - `KipError::InvalidCommand` - If the matcher type is unsupported or predicate is not literal
+    /// - `KipErrorCode::InvalidSyntax` - If the ID string cannot be parsed, matcher type is unsupported, or predicate is not literal
     fn try_from(value: PropositionMatcher) -> Result<Self, Self::Error> {
         match value {
             PropositionMatcher::ID(id) => {
-                let id = EntityID::from_str(&id).map_err(KipError::Parse)?;
+                let id = EntityID::from_str(&id).map_err(KipError::invalid_syntax)?;
                 match id {
                     EntityID::Proposition(id, predicate) => Ok(PropositionPK::ID(id, predicate)),
-                    _ => Err(KipError::InvalidCommand(format!(
+                    _ => Err(KipError::invalid_syntax(format!(
                         "PropositionMatcher::ID must be a Proposition ID, got: {id:?}"
                     ))),
                 }
@@ -161,7 +159,7 @@ impl TryFrom<PropositionMatcher> for PropositionPK {
                 let predicate = match predicate {
                     PredTerm::Literal(value) => value,
                     val => {
-                        return Err(KipError::InvalidCommand(format!(
+                        return Err(KipError::invalid_syntax(format!(
                             "PropositionMatcher::Object's predicate must be a literal string, got: {val:?}"
                         )));
                     }
@@ -217,7 +215,7 @@ impl TryFrom<TargetTerm> for EntityPK {
             TargetTerm::Proposition(value) => {
                 Ok(EntityPK::Proposition(PropositionPK::try_from(*value)?))
             }
-            _ => Err(KipError::InvalidCommand(format!(
+            _ => Err(KipError::invalid_syntax(format!(
                 "TargetTerm must be either Concept or Proposition, got: {value:?}"
             ))),
         }

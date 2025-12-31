@@ -76,11 +76,11 @@ pub trait Executor: Send + Sync {
     /// # Error Handling
     ///
     /// Implementations should return appropriate `KipError` variants for different
-    /// failure scenarios:
-    /// - `KipError::Execution`: For runtime execution errors
-    /// - `KipError::Validation`: For semantic validation failures
-    /// - `KipError::NotFound`: For queries that find no matching data
-    /// - `KipError::PermissionDenied`: For authorization failures
+    /// failure scenarios following KIP Standard Error Codes:
+    /// - **1xxx (Syntax Errors)**: `KipError::invalid_syntax()`, `KipError::invalid_identifier()`
+    /// - **2xxx (Schema Errors)**: `KipError::type_mismatch()`, `KipError::constraint_violation()`
+    /// - **3xxx (Logic/Data Errors)**: `KipError::not_found()`, `KipError::reference_error()`
+    /// - **4xxx (System Errors)**: `KipError::internal_error()`, `KipError::execution_timeout()`
     ///
     /// # Performance Considerations
     ///
@@ -116,9 +116,9 @@ pub trait Executor: Send + Sync {
 ///
 /// # Error Types
 ///
-/// This function can return errors from two sources:
-/// - **Parse Errors**: `KipError::Parse` when the input string is malformed
-/// - **Execution Errors**: Any `KipError` variant returned by the executor
+/// This function can return errors following KIP Standard Error Codes:
+/// - **Parse Errors**: `KIP_1001` (InvalidSyntax) when the input string is malformed
+/// - **Execution Errors**: Various KIP error codes returned by the executor
 ///
 /// # Examples
 ///
@@ -137,7 +137,7 @@ pub trait Executor: Send + Sync {
 ///     // Execute a KML statement
 ///     let kml_result = execute_kip(
 ///         &my_executor,
-///         "UPSERT { CONCEPT @drug { {type: \"Drug\", name: \"Aspirin\" } } }",
+///         "UPSERT { CONCEPT ?drug { {type: \"Drug\", name: \"Aspirin\" } } }",
 ///         true // dry_run
 ///     ).await;
 ///     println!("{kml_result:#?}");
