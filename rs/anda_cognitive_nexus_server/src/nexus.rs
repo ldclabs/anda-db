@@ -7,12 +7,15 @@ use anda_db::{
     query::{Filter, Query, RangeQuery},
     unix_ms,
 };
-use anda_db_schema::{AndaDBSchema, BoxError, FieldEntry, FieldType, Fv, Schema, SchemaError};
+use anda_db_schema::{
+    AndaDBSchema, BoxError, FieldEntry, FieldType, Fv, Json, Schema, SchemaError,
+};
 use anda_kip::{
     CommandType, META_SELF_NAME, PERSON_SELF_KIP, PERSON_SYSTEM_KIP, PERSON_TYPE, Request,
     Response, parse_kml,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::sync::Arc;
 
 #[derive(Debug, Deserialize, Serialize, AndaDBSchema)]
@@ -22,8 +25,7 @@ pub struct KIPLog {
     pub command: CommandType,
     #[field_type = "Map<String, Json>"]
     pub request: Request,
-    #[field_type = "Map<String, Json>"]
-    pub response: Response,
+    pub response: Json,
     pub period: u64,
     pub timestamp: u64,
 }
@@ -33,7 +35,7 @@ pub struct KIPLogRef<'a> {
     pub _id: u64,
     pub command: CommandType,
     pub request: &'a Request,
-    pub response: &'a Response,
+    pub response: Json,
     pub period: u64,
     pub timestamp: u64,
 }
@@ -107,7 +109,10 @@ impl Nexus {
             _id: 0, // This will be set by the database
             command,
             request: &request,
-            response: &res,
+            response: match &res {
+                Response::Ok { .. } => json!({"result": "..."}),
+                Response::Err { error, .. } => json!({"error": error}),
+            },
             period: timestamp / 3600 / 1000,
             timestamp,
         };
@@ -122,10 +127,7 @@ impl Nexus {
         request: ListLogParams,
     ) -> Result<(Vec<KIPLog>, Option<String>), BoxError> {
         let limit = request.limit.unwrap_or(10).min(100);
-        let cursor = match BTree::from_cursor::<u64>(&request.cursor)? {
-            Some(cursor) => cursor,
-            None => 0,
-        };
+        let cursor = (BTree::from_cursor::<u64>(&request.cursor)?).unwrap_or_default();
         let filter = Some(Filter::Field((
             "_id".to_string(),
             RangeQuery::Gt(Fv::U64(cursor)),
@@ -150,7 +152,6 @@ impl Nexus {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     #[test]
     fn test_conversation_status() {}

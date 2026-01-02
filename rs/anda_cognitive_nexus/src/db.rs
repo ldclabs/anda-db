@@ -549,9 +549,9 @@ impl CognitiveNexus {
         // 优化：检测是否可以使用快速路径
         // 快速路径适用于: NOT { (?bound_var, "predicate", ?unbound_var) }
         // 这种模式可以通过单次批量查询完成，而不需要对每个 entity 单独查询
-        if clauses.len() == 1 {
-            if let WhereClause::Proposition(prop_clause) = &clauses[0] {
-                if let PropositionMatcher::Object {
+        if clauses.len() == 1
+            && let WhereClause::Proposition(prop_clause) = &clauses[0]
+                && let PropositionMatcher::Object {
                     subject: TargetTerm::Variable(subj_var),
                     predicate: PredTerm::Literal(pred),
                     object: TargetTerm::Variable(obj_var),
@@ -568,8 +568,6 @@ impl CognitiveNexus {
                             .await;
                     }
                 }
-            }
-        }
 
         // 标准路径：对于复杂情况使用原有逻辑
         let mut not_context = ctx.clone();

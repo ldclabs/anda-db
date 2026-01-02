@@ -23,8 +23,11 @@ const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 #[command(author, version, about, long_about = None)]
 struct Cli {
     /// Port to listen on
-    #[clap(short, long, default_value = "127.0.0.1:8042")]
+    #[clap(long, env = "ADDR", default_value = "127.0.0.1:8080")]
     addr: String,
+
+    #[clap(long, env = "API_KEY")]
+    api_key: Option<String>,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -78,6 +81,7 @@ async fn main() -> Result<(), BoxError> {
         nexus,
         name: APP_NAME.to_string(),
         version: APP_VERSION.to_string(),
+        api_key: cli.api_key,
     };
     let app = Router::new()
         .route("/", routing::get(get_information))
