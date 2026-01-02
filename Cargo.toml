@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "rs/anda_cognitive_nexus",
+  "rs/anda_cognitive_nexus_server",
   "rs/anda_db",
   "rs/anda_db_btree",
   "rs/anda_db_derive",
@@ -35,8 +36,19 @@ license = "MIT"
 aes-gcm = "0.10"
 async-trait = "0.1"
 async-stream = "0.3"
+axum = { version = "0.8", features = [
+  "http1",
+  "http2",
+  "json",
+  # "macros",
+  "matched-path",
+  "tokio",
+  "query",
+], default-features = true }
 bytes = "1"
 base64 = "0.22"
+clap = { version = "4.5", features = ["derive", "env"] }
+dotenv = "0.15"
 hex = "0.4"
 croaring = "2.3"
 chrono = "0.4"
@@ -47,7 +59,6 @@ ciborium = "0.2"
 dashmap = "6.1"
 rand = "0.9"
 ordered-float = "5"
-ndarray = { version = "0.16" }
 blas-src = { version = "0.11" }
 half = { version = "2.6", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
@@ -73,16 +84,9 @@ nom = "8"
 nom-language = "0.1"
 regex = "1.11"
 rustc-hash = "2"
-candid = "0.10"
 pyo3 = "0.20.3"
 pyo3-asyncio = "0.20.0"
-async-std = "1.9"
 serde-pyobject = "0.2.0"
-
-# From Anda
-anda_core = "0.8.0"
-anda_engine = "0.8.0"
-
 
 [workspace.metadata.cargo-shear]
 ignored = ["blas-src"]

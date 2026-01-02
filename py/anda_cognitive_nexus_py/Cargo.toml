@@ -15,20 +15,18 @@ pyo3-asyncio = { workspace = true, features = [
   "async-std-runtime",
   "tokio-runtime",
 ] }
-async-std = { workspace = true }
 tokio = { workspace = true }
 serde-pyobject = { workspace = true }
 
 # Anda
-anda_db = { path = "../../rs/anda_db" }
-anda_cognitive_nexus = { path = "../../rs/anda_cognitive_nexus" }
-anda_kip = { path = "../../rs/anda_kip" }
-anda_object_store = { path = "../../rs/anda_object_store" }
+anda_cognitive_nexus = { version = "0.6", path = "../../rs/anda_cognitive_nexus" }
+anda_kip = { version = "0.6", path = "../../rs/anda_kip" }
+anda_db = { version = "0.7", path = "../../rs/anda_db", features = ["full"] }
+anda_object_store = { version = "0.3", path = "../../rs/anda_object_store" }
 
 # Other Crates
 serde_json = { workspace = true }
 serde = { workspace = true }
-candid = { workspace = true }
 object_store = { workspace = true }
 log = { workspace = true }
 structured-logger = { workspace = true }

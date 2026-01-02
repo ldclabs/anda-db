@@ -281,24 +281,25 @@ impl Request {
 
             // If there's an error and we have parameters, check for placeholder misuse
             if let Response::Err { ref error, .. } = response
-                && error.code.starts_with("KIP_1") && !self.parameters.is_empty() {
-                    let warnings =
-                        Self::find_placeholders_in_strings(&self.command, &self.parameters);
-                    if let Err(extra_hint) = warnings {
-                        let mut new_error = error.clone();
-                        new_error.hint = Some(match &error.hint {
-                            Some(existing) => format!("{} {}", existing, extra_hint),
-                            None => extra_hint,
-                        });
-                        return (
-                            cmd_type,
-                            Response::Err {
-                                error: new_error,
-                                result: None,
-                            },
-                        );
-                    }
+                && error.code.starts_with("KIP_1")
+                && !self.parameters.is_empty()
+            {
+                let warnings = Self::find_placeholders_in_strings(&self.command, &self.parameters);
+                if let Err(extra_hint) = warnings {
+                    let mut new_error = error.clone();
+                    new_error.hint = Some(match &error.hint {
+                        Some(existing) => format!("{} {}", existing, extra_hint),
+                        None => extra_hint,
+                    });
+                    return (
+                        cmd_type,
+                        Response::Err {
+                            error: new_error,
+                            result: None,
+                        },
+                    );
                 }
+            }
 
             (cmd_type, response)
         }
@@ -463,6 +464,17 @@ pub struct ErrorObject {
 //         }
 //     }
 // }
+
+impl From<String> for ErrorObject {
+    fn from(message: String) -> Self {
+        ErrorObject {
+            code: "KIP_4000".to_string(),
+            message,
+            hint: None,
+            data: None,
+        }
+    }
+}
 
 /// Conversion from serde_json::Error to ErrorObject
 ///

@@ -16,7 +16,6 @@ futures = { workspace = true }
 rand = { workspace = true }
 ordered-float = { workspace = true }
 half = { workspace = true }
-ndarray = { workspace = true }
 serde = { workspace = true }
 smallvec = { workspace = true, features = ["serde", "const_new"] }
 parking_lot = { workspace = true }
