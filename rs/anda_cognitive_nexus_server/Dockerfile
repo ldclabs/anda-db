@@ -6,6 +6,7 @@ RUN apt-get update \
 
 WORKDIR /build
 COPY rs ./rs
+COPY py ./py
 COPY Cargo.toml ./
 RUN cargo build --release -p anda_cognitive_nexus_server
 
