@@ -2,9 +2,13 @@
 
 [![Crates.io](https://img.shields.io/crates/v/anda_cognitive_nexus.svg)](https://crates.io/crates/anda_cognitive_nexus) [![Docs.rs](https://docs.rs/anda_cognitive_nexus/badge.svg)](https://docs.rs/anda_cognitive_nexus)
 
-**Anda Cognitive Nexus** is a Rust implementation of the **KIP (Knowledge Interaction Protocol)**, built on top of [Anda DB](https://github.com/ldclabs/anda-db/tree/main/rs/anda_db). It provides a powerful, persistent, and graph-based long-term memory system for AI Agents, enabling them to learn, reason, and evolve.
+**Anda Cognitive Nexus** is a Rust implementation of **KIP (Knowledge Interaction Protocol)** built on top of [anda_db](https://github.com/ldclabs/anda-db/tree/main/rs/anda_db). It provides a persistent, graph-based long-term memory substrate for AI agents (concepts + propositions) with a KIP executor API.
 
-**👉 [Read the full KIP Specification](https://github.com/ldclabs/KIP)**
+Links:
+
+- **KIP spec**: https://github.com/ldclabs/KIP
+- **HTTP server** (optional): https://github.com/ldclabs/anda-db/tree/main/rs/anda_cognitive_nexus_server
+- **Database core**: https://github.com/ldclabs/anda-db/tree/main/rs/anda_db
 
 ## What is KIP?
 
@@ -12,10 +16,10 @@
 
 ### Key Design Principles
 
-*   **LLM-Friendly**: A clean, declarative syntax that is easy for LLMs to generate and parse.
-*   **Graph-Native**: Optimized for the structure and query patterns of knowledge graphs.
-*   **Explainable**: KIP queries and manipulations serve as a transparent, auditable "chain of thought" for an AI's reasoning process.
-*   **Comprehensive**: Manages the full lifecycle of knowledge, from initial query to long-term evolution and learning.
+*   **LLM-Friendly**: Declarative syntax that is easy for LLMs/tools to generate.
+*   **Graph-Native**: Optimized for knowledge graph patterns.
+*   **Auditable**: Queries and mutations can be logged and reviewed as an execution trail.
+*   **Lifecycle-aware**: Supports querying, inserting, and evolving knowledge over time.
 
 ## Core Concepts
 
@@ -26,79 +30,71 @@
 
 ## Features
 
-*   **Full KIP Implementation**: Provides both the **Knowledge Query Language (KQL)** and **Knowledge Manipulation Language (KML)**.
-*   **Persistent & Performant**: Built on Anda DB for efficient, durable storage.
-*   **Self-Describing Schema**: The types for concepts and propositions are themselves defined within the graph, allowing for a flexible and extensible knowledge structure.
+*   **KIP executor**: Runs KQL / KML / META commands via `anda_kip`.
+*   **Persistent & performant**: Built on Anda DB for durable storage and indexing.
+*   **Self-describing schema**: Concept/proposition types live inside the graph.
 *   **Async API**: Designed for modern, non-blocking applications.
 
 ## Getting Started
 
-Add `anda_cognitive_nexus` to your `Cargo.toml`:
+Add dependencies to your `Cargo.toml` (pick a concrete `object_store` backend):
 
 ```toml
 [dependencies]
-anda_cognitive_nexus = { version = "0.6" }
+anda_cognitive_nexus = "0.6"
+anda_kip = "0.6"
+tokio = { version = "1", features = ["full"] }
+
+# Provide an ObjectStore implementation
+object_store = { version = "0.13", features = ["fs"] }
+
+# Optional (recommended for local filesystem): metadata + conditional put support
+anda_object_store = "0.3"
 ```
 
-### Example Usage
+### Quickstart (in-memory)
 
-Here's a brief example of how to initialize the nexus, insert knowledge using KML, and retrieve it with KQL.
+This example boots a Nexus on an in-memory object store, inserts a small capsule via KML, and queries it via KQL.
 
 ```rust
 use anda_cognitive_nexus::{CognitiveNexus, KipError};
-use anda_db::{database::{AndaDB, DBConfig}, storage::StorageConfig};
+use anda_db::database::{AndaDB, DBConfig};
 use anda_kip::{parse_kml, parse_kql};
-use anda_object_store::MetaStoreBuilder;
-use object_store::local::LocalFileSystem;
+use object_store::memory::InMemory;
 use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), KipError> {
-    // 1. Set up storage and database
-    let object_store = MetaStoreBuilder::new(LocalFileSystem::new_with_prefix("./db")?, 10000).build();
-    let db_config = DBConfig::default();
-    let db = AndaDB::connect(Arc::new(object_store), db_config).await?;
+    // 1) Set up storage and database
+    let db = AndaDB::connect(Arc::new(InMemory::new()), DBConfig::default()).await?;
 
-    // 2. Connect to the Cognitive Nexus
-    let nexus = CognitiveNexus::connect(Arc::new(db), |_| async { Ok(()) }).await?;
+    // 2) Connect to the Cognitive Nexus
+    let nexus = CognitiveNexus::connect(Arc::new(db), async |_nexus| Ok(()) ).await?;
     println!("Connected to Anda Cognitive Nexus: {}", nexus.name());
 
-    // 3. Manipulate Knowledge with KML (Knowledge Manipulation Language)
+    // 3) Manipulate Knowledge with KML
     let kml_string = r#"
     UPSERT {
-        // Define concept types
         CONCEPT ?drug_type {
             {type: "$ConceptType", name: "Drug"}
-            SET ATTRIBUTES {
-                description: "Pharmaceutical drug concept type"
-            }
+            SET ATTRIBUTES { description: "Pharmaceutical drug concept type" }
         }
 
         CONCEPT ?symptom_type {
             {type: "$ConceptType", name: "Symptom"}
-            SET ATTRIBUTES {
-                description: "Medical symptom concept type"
-            }
+            SET ATTRIBUTES { description: "Medical symptom concept type" }
         }
 
-        // Define relation types
         CONCEPT ?treats_relation {
             {type: "$PropositionType", name: "treats"}
-            SET ATTRIBUTES {
-                description: "Drug treats symptom relationship"
-            }
+            SET ATTRIBUTES { description: "Drug treats symptom relationship" }
         }
 
-        // Create symptom concepts
         CONCEPT ?headache {
             {type: "Symptom", name: "Headache"}
-            SET ATTRIBUTES {
-                severity_scale: "1-10",
-                description: "Pain in the head or neck area"
-            }
+            SET ATTRIBUTES { severity_scale: "1-10", description: "Pain in the head or neck area" }
         }
 
-        // Create a drug and the symptom it treats
         CONCEPT ?aspirin {
             {type: "Drug", name: "Aspirin"}
             SET ATTRIBUTES { molecular_formula: "C9H8O4", risk_level: 1 }
@@ -114,7 +110,7 @@ async fn main() -> Result<(), KipError> {
     let kml_result = nexus.execute_kml(kml_commands, false).await?;
     println!("KML Execution Result: {:#?}", kml_result);
 
-    // 4. Query Knowledge with KQL (Knowledge Query Language)
+    // 4) Query Knowledge with KQL
     let kql_query = r#"
     FIND(?drug.name, ?drug.attributes.risk_level)
     WHERE {
@@ -131,14 +127,38 @@ async fn main() -> Result<(), KipError> {
 }
 ```
 
+### LLM-friendly request/response
+
+If you want a single structured interface (handy for function calling), use `anda_kip::Request` / `Response`. This is also what `anda_cognitive_nexus_server` expects under `POST /kip` with `method=execute_kip`.
+
+```rust
+use anda_kip::{Request, Response};
+
+let req = Request {
+    command: "DESCRIBE PRIMER".to_string(),
+    ..Default::default()
+};
+
+let (_ty, resp): (_, Response) = req.execute(&nexus).await;
+println!("{resp:?}");
+```
+
 ## Run the Demo
 
-This repository includes a [comprehensive demo](https://github.com/ldclabs/anda-db/tree/main/rs/anda_cognitive_nexus/examples/kip_demo.rs) that showcases more advanced KML and KQL features. To run it:
+This repository includes a comprehensive demo: https://github.com/ldclabs/anda-db/tree/main/rs/anda_cognitive_nexus/examples/kip_demo.rs
+
+To run it:
 
 ```bash
 mkdir -p ./debug/metastore
-cargo run --example kip_demo
+cargo run -p anda_cognitive_nexus --example kip_demo
 ```
+
+## Related
+
+- `anda_kip`: parser + request/response model for KIP.
+- `anda_db`: embedded storage engine.
+- `anda_cognitive_nexus_server`: expose KIP over HTTP (JSON-RPC).
 
 ## License
 

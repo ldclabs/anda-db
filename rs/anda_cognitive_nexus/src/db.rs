@@ -551,23 +551,23 @@ impl CognitiveNexus {
         // 这种模式可以通过单次批量查询完成，而不需要对每个 entity 单独查询
         if clauses.len() == 1
             && let WhereClause::Proposition(prop_clause) = &clauses[0]
-                && let PropositionMatcher::Object {
-                    subject: TargetTerm::Variable(subj_var),
-                    predicate: PredTerm::Literal(pred),
-                    object: TargetTerm::Variable(obj_var),
-                } = &prop_clause.matcher
-                {
-                    // 检查 subject 变量是否已绑定，object 变量是否未绑定
-                    let subj_bound = ctx.entities.contains_key(subj_var);
-                    let obj_bound = ctx.entities.contains_key(obj_var);
+            && let PropositionMatcher::Object {
+                subject: TargetTerm::Variable(subj_var),
+                predicate: PredTerm::Literal(pred),
+                object: TargetTerm::Variable(obj_var),
+            } = &prop_clause.matcher
+        {
+            // 检查 subject 变量是否已绑定，object 变量是否未绑定
+            let subj_bound = ctx.entities.contains_key(subj_var);
+            let obj_bound = ctx.entities.contains_key(obj_var);
 
-                    if subj_bound && !obj_bound {
-                        // 快速路径：批量查询所有有此谓词关系的 subjects
-                        return self
-                            .execute_not_proposition_fast_path(ctx, subj_var, pred)
-                            .await;
-                    }
-                }
+            if subj_bound && !obj_bound {
+                // 快速路径：批量查询所有有此谓词关系的 subjects
+                return self
+                    .execute_not_proposition_fast_path(ctx, subj_var, pred)
+                    .await;
+            }
+        }
 
         // 标准路径：对于复杂情况使用原有逻辑
         let mut not_context = ctx.clone();

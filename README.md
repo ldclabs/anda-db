@@ -10,6 +10,7 @@ At its heart, Anda DB powers the **[Anda Cognitive Nexus](./rs/anda_cognitive_ne
 ## Key Features
 
 -   **Embedded & Performant:** Designed as a Rust library, not a standalone server, for direct integration and high performance within your application.
+-   **Optional Server Mode:** Provides a production-ready HTTP server (`anda_cognitive_nexus_server`) when you want to expose KIP over an API.
 -   **Multi-Modal Data:** Natively store and index diverse data types, including documents, key-value pairs, and vector embeddings (`bfloat16`).
 -   **Pluggable & Secure Storage:** Built on the [`object_store`](https://docs.rs/object_store) crate, allowing for various storage backends (local filesystem, AWS S3, GCS) with optional, transparent AES-256-GCM encryption at rest.
 -   **Advanced Indexing:**
@@ -27,6 +28,7 @@ Anda DB features a highly modular design, with each crate providing a distinct c
 
 -   `anda_db`: The core database engine that integrates collections, indexing, and query execution.
 -   `anda_cognitive_nexus`: The high-level implementation of the KIP-based knowledge graph, providing long-term memory for AI agents.
+-   `anda_cognitive_nexus_server`: An Axum-based HTTP server that exposes KIP via a small JSON-RPC API (`GET /`, `POST /kip`).
 -   `anda_kip`: A complete parser and execution framework for the KIP language (KQL and KML).
 -   `anda_db_schema`: Defines the data structures, types, and schema system.
 -   `anda_db_derive`: Provides the procedural macros (`AndaDBSchema`) for convenient schema definition.
@@ -50,16 +52,18 @@ tokio = { version = "1", features = ["full"] }
 
 ### Example: Basic Database Usage
 
-The following example demonstrates setting up a database, defining a schema, adding documents, and performing a hybrid search query.
+The following example demonstrates setting up a database, defining a schema, adding documents, and running a simple hybrid search.
+
+For a complete, runnable end-to-end demo (including BM25 tokenizer setup and richer schema), see: [`rs/anda_db/examples/db_demo.rs`](./rs/anda_db/examples/db_demo.rs).
 
 ```rust
 use anda_db::{
-    collection::{Collection, CollectionConfig},
+    collection::CollectionConfig,
     database::{AndaDB, DBConfig},
     error::DBError,
     index::HnswConfig,
-    query::{Filter, Query, RangeQuery, Search},
-    schema::{AndaDBSchema, FieldType, Fv, Json, Vector, vector_from_f32},
+    query::{Query, Search},
+    schema::{AndaDBSchema, Vector, vector_from_f32},
 };
 use anda_object_store::MetaStoreBuilder;
 use object_store::local::LocalFileSystem;
@@ -71,59 +75,67 @@ pub struct Knowledge {
     pub _id: u64,
     pub description: String,
     pub embedding: Vector,
-    pub author: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), DBError> {
-    // 1. Initialize storage
+    // 1) Initialize storage (local filesystem)
     let object_store = MetaStoreBuilder::new(LocalFileSystem::new_with_prefix("./db")?, 10000).build();
     let db = AndaDB::connect(Arc::new(object_store), DBConfig::default()).await?;
 
-    // 2. Define a collection and its indexes
+    // 2) Define a collection and its indexes
     let collection = db
-        .open_or_create_collection(Knowledge::schema()?, CollectionConfig::new("knowledge"), |coll| async {
-            coll.create_btree_index_nx(&["author"]).await?;
-            coll.create_bm25_index_nx(&["description"]).await?;
-            coll.create_hnsw_index_nx("embedding", HnswConfig { dimension: 4, ..Default::default() }).await?;
-            Ok(())
+        .open_or_create_collection(
+            Knowledge::schema()?,
+            CollectionConfig {
+                name: "knowledge".to_string(),
+                description: "Knowledge collection".to_string(),
+            },
+            async |coll| {
+                coll.create_bm25_index_nx(&["description"]).await?;
+                coll.create_hnsw_index_nx(
+                    "embedding",
+                    HnswConfig {
+                        dimension: 4,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+                Ok(())
+            },
+        )
+        .await?;
+
+    // 3) Add documents
+    collection
+        .add_from(&Knowledge {
+            _id: 0,
+            description: "Rust is a systems programming language focused on safety.".to_string(),
+            embedding: vector_from_f32(vec![0.1, 0.2, 0.3, 0.4]),
+        })
+        .await?;
+    collection
+        .add_from(&Knowledge {
+            _id: 0,
+            description: "A vector database is used for similarity search.".to_string(),
+            embedding: vector_from_f32(vec![0.5, 0.6, 0.7, 0.8]),
+        })
+        .await?;
+    collection.flush(anda_db::unix_ms()).await?;
+
+    // 4) Hybrid search (BM25 + vector)
+    let results: Vec<Knowledge> = collection
+        .search_as(Query {
+            search: Some(Search {
+                text: Some("language".to_string()),
+                vector: Some(vec![0.15, 0.25, 0.35, 0.45]),
+                ..Default::default()
+            }),
+            ..Default::default()
         })
         .await?;
 
-    // 3. Add documents
-    collection.add_from(&Knowledge {
-        _id: 0,
-        description: "Rust is a systems programming language focused on safety.".to_string(),
-        embedding: vector_from_f32(vec![0.1, 0.2, 0.3, 0.4]),
-        author: "Graydon".to_string(),
-    }).await?;
-
-    collection.add_from(&Knowledge {
-        _id: 0,
-        description: "A vector database is used for similarity search.".to_string(),
-        embedding: vector_from_f32(vec![0.5, 0.6, 0.7, 0.8]),
-        author: "Anda".to_string(),
-    }).await?;
-
-    collection.flush(anda_db::unix_ms()).await?;
-
-    // 4. Perform a hybrid search
-    let query_text = "language";
-    let query_vector = vec![0.15, 0.25, 0.35, 0.45];
-
-    let results: Vec<Knowledge> = collection.search_as(Query {
-        search: Some(Search {
-            text: Some(query_text.to_string()),
-            vector: Some(query_vector),
-            ..Default::default()
-        }),
-        ..Default::default()
-    }).await?;
-
-    println!("Found {} results for query '{}':", results.len(), query_text);
-    for doc in results {
-        println!("- ID: {}, Description: {}", doc._id, doc.description);
-    }
+    println!("Found {} results", results.len());
 
     db.close().await?;
     Ok(())
@@ -174,6 +186,60 @@ async fn main() -> Result<(), KipError> {
     nexus.close().await?;
     Ok(())
 }
+```
+
+### Run as a Server: `anda_cognitive_nexus_server`
+
+If you want to interact with a Cognitive Nexus over HTTP (e.g. from non-Rust clients), use the server crate:
+
+-   Source: [`rs/anda_cognitive_nexus_server`](./rs/anda_cognitive_nexus_server)
+-   API: `GET /` (info), `POST /kip` (JSON-RPC)
+
+#### Start the server (local persistent DB)
+
+```bash
+cargo run -p anda_cognitive_nexus_server -- local --db ./db
+```
+
+Environment variables:
+
+-   `ADDR` (default `127.0.0.1:8080`)
+-   `API_KEY` (optional; if set, clients must send `Authorization: Bearer <API_KEY>`)
+-   `LOCAL_DB_PATH` (default `./db`, same as `--db`)
+
+#### Call the API
+
+```bash
+curl -sS http://127.0.0.1:8080/ | jq
+```
+
+Execute a KIP command:
+
+```bash
+curl -sS http://127.0.0.1:8080/kip \
+    -H 'Content-Type: application/json' \
+    -d '{
+        "method": "execute_kip",
+        "params": {
+            "command": "DESCRIBE PRIMER",
+            "parameters": {},
+            "dry_run": false
+        }
+    }' | jq
+```
+
+List execution logs:
+
+```bash
+curl -sS http://127.0.0.1:8080/kip \
+    -H 'Content-Type: application/json' \
+    -d '{
+        "method": "list_logs",
+        "params": {
+            "cursor": null,
+            "limit": 10
+        }
+    }' | jq
 ```
 
 ## Building and Testing

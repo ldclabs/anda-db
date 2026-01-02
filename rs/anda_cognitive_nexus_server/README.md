@@ -31,6 +31,7 @@ You can use the official Docker image:
 
 ```bash
 docker run -d \
+  --name anda_kip \
   -p 8080:8080 \
   -e API_KEY=your_secret_key \
   -v $(pwd)/db:/app/db \
@@ -77,10 +78,49 @@ Executes a KIP request (KQL or KML).
 {
   "method": "execute_kip",
   "params": {
-    "command": "DESCRIBE PRIMER"
+    "command": "DESCRIBE PRIMER",
+    "parameters": {},
+    "dry_run": false
   }
 }
 ```
+
+**`execute_kip` Parameters** (matches `anda_kip::Request`):
+
+| Parameter    | Type    | Required | Description                                                                                                                                                                                                                                                                                 |
+| :----------- | :------ | :------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `command`    | String  | No       | A complete KIP command text. **Mutually exclusive with `commands`**.                                                                                                                                                                                                                        |
+| `commands`   | Array   | No       | Batch execution. **Mutually exclusive with `command`**. Each element can be a `String` (uses shared `parameters`) or an `Object` with `{command, parameters}` (command-specific params override shared). Commands execute sequentially; **execution stops on first error**.                 |
+| `parameters` | Object  | No       | Placeholder substitution map. Placeholders like `:name` are replaced before execution. Placeholders must occupy a full JSON value position (e.g. `name: :symptom_name`) and must not be embedded inside quoted strings (e.g. `"Hello :name"`), because replacement uses JSON serialization. |
+| `dry_run`    | Boolean | No       | If `true`, validates syntax/logic only (no execution / no persistence).                                                                                                                                                                                                                     |
+
+Batch execution is also supported via `commands`:
+
+```json
+{
+  "method": "execute_kip",
+  "params": {
+    "commands": [
+      "DESCRIBE PRIMER",
+      {
+        "command": "UPSERT { CONCEPT ?e { {type: \"Event\", name: :name} } }",
+        "parameters": { "name": "MyEvent" }
+      }
+    ],
+    "parameters": {},
+    "dry_run": false
+  }
+}
+```
+
+**Response structure** (matches `anda_kip::Response`):
+
+| Key           | Type             | Required | Description                                                                                |
+| :------------ | :--------------- | :------- | :----------------------------------------------------------------------------------------- |
+| `result`      | Object/Array/etc | No       | **Must** exist when the request succeeds; structure depends on the KIP command.            |
+| `error`       | Object           | No       | **Must** exist when the request fails; contains structured error details.                  |
+| `next_cursor` | String           | No       | Opaque pagination cursor; if present, more results may be available.                       |
+| `ignore`      | Boolean          | No       | If `true`, the client should ignore this response (used by some commands/implementations). |
 
 #### List Logs
 Retrieves the history of KIP executions.
@@ -100,4 +140,4 @@ Copyright © 2025 [LDC Labs](https://github.com/ldclabs).
 
 `ldclabs/anda-db` is licensed under the MIT License. See the [MIT license][license] for the full license text.
 
-[license]: ./../LICENSE-MIT
+[license]: ../../LICENSE

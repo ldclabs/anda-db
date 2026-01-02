@@ -24,6 +24,8 @@ WORKDIR /app
 # your custom setup goes here
 COPY --from=builder /build/target/release/anda_cognitive_nexus_server ./anda_cognitive_nexus_server
 
+ENV ADDR="0.0.0.0:8080"
+
 EXPOSE 8080
 # entry point
 ENTRYPOINT [ "/app/anda_cognitive_nexus_server" ]

@@ -128,13 +128,14 @@ fn extract_doc_comments(attrs: &[Attribute]) -> String {
     for attr in attrs {
         if attr.path().is_ident("doc")
             && let Ok(meta_name_value) = attr.meta.require_name_value()
-                && let Expr::Lit(expr_lit) = &meta_name_value.value
-                    && let Lit::Str(lit_str) = &expr_lit.lit {
-                        let comment = lit_str.value().trim().to_string();
-                        if !comment.is_empty() {
-                            doc_comments.push(comment);
-                        }
-                    }
+            && let Expr::Lit(expr_lit) = &meta_name_value.value
+            && let Lit::Str(lit_str) = &expr_lit.lit
+        {
+            let comment = lit_str.value().trim().to_string();
+            if !comment.is_empty() {
+                doc_comments.push(comment);
+            }
+        }
     }
 
     doc_comments.join(" ")
