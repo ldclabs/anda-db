@@ -1518,7 +1518,9 @@ impl CognitiveNexus {
             .upsert_concept(concept_pk, attributes, metadata)
             .await?;
 
-        handle_map.insert(concept_block.handle.clone(), entity_id.clone());
+        if let Some(handle) = concept_block.handle {
+            handle_map.insert(handle, entity_id.clone());
+        }
 
         if let Some(propositions) = concept_block.set_propositions {
             for set_prop in propositions {
@@ -1578,7 +1580,9 @@ impl CognitiveNexus {
             .upsert_proposition(proposition_pk, attributes, metadata, cached_pks)
             .await?;
 
-        handle_map.insert(proposition_block.handle.clone(), entity_id.clone());
+        if let Some(handle) = proposition_block.handle {
+            handle_map.insert(handle, entity_id.clone());
+        }
 
         Ok(Some(entity_id))
     }

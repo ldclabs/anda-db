@@ -403,7 +403,7 @@ WITH METADATA {
                         set_propositions,
                         metadata,
                     }) => {
-                        assert_eq!(handle, "cognizine");
+                        assert_eq!(handle, &Some("cognizine".to_string()));
                         assert_eq!(
                             concept,
                             &ast::ConceptMatcher::Object {
@@ -428,7 +428,7 @@ WITH METADATA {
                         set_propositions,
                         metadata,
                     }) => {
-                        assert_eq!(handle, "neural_bloom");
+                        assert_eq!(handle, &Some("neural_bloom".to_string()));
                         assert_eq!(
                             concept,
                             &ast::ConceptMatcher::Object {

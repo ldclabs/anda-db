@@ -747,7 +747,7 @@ pub enum UpsertItem {
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct ConceptBlock {
     /// Local handle for referencing within the transaction (starts with ?)
-    pub handle: String,
+    pub handle: Option<String>,
     /// Concept clause for matching the existing concept or creating new one
     pub concept: ConceptMatcher,
     /// Optional attributes to set on the concept
@@ -776,7 +776,7 @@ pub struct SetProposition {
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct PropositionBlock {
     /// Local handle for referencing within the transaction (starts with ?)
-    pub handle: String,
+    pub handle: Option<String>,
     /// Proposition clause for matching the existing proposition or creating new one
     pub proposition: PropositionMatcher,
     /// Optional attributes to set on the concept

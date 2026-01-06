@@ -60,10 +60,10 @@ fn parse_upsert_item(input: &str) -> VResult<'_, UpsertItem> {
 
 fn parse_concept_block(input: &str) -> VResult<'_, ConceptBlock> {
     context(
-        "CONCEPT ?local_handle { ... }",
+        "CONCEPT [?local_handle] { ... }",
         map(
             (
-                preceded(ws(tag("CONCEPT")), ws(variable)),
+                preceded(ws(tag("CONCEPT")), opt(ws(variable))),
                 cut(braced_block((
                     ws(parse_concept_matcher),
                     opt(context(
@@ -116,10 +116,10 @@ fn parse_set_proposition(input: &str) -> VResult<'_, SetProposition> {
 
 fn parse_proposition_block(input: &str) -> VResult<'_, PropositionBlock> {
     context(
-        "PROPOSITION ?local_handle { ... }",
+        "PROPOSITION [?local_handle] { ... }",
         map(
             (
-                preceded(ws(tag("PROPOSITION")), ws(variable)),
+                preceded(ws(tag("PROPOSITION")), opt(ws(variable))),
                 cut(braced_block((
                     ws(parse_prop_mather),
                     opt(context(
@@ -265,7 +265,7 @@ mod tests {
 
                 match &upsert.items[0] {
                     UpsertItem::Concept(concept) => {
-                        assert_eq!(concept.handle, "drug");
+                        assert_eq!(concept.handle, Some("drug".to_string()));
                         assert_eq!(
                             concept.concept,
                             ConceptMatcher::Object {
@@ -315,7 +315,7 @@ mod tests {
 
                 match &upsert.items[0] {
                     UpsertItem::Concept(concept) => {
-                        assert_eq!(concept.handle, "drug");
+                        assert_eq!(concept.handle, Some("drug".to_string()));
                         assert_eq!(
                             concept.concept,
                             ConceptMatcher::Object {
@@ -411,7 +411,7 @@ mod tests {
                 // Check first concept with propositions
                 match &upsert.items[0] {
                     UpsertItem::Concept(concept) => {
-                        assert_eq!(concept.handle, "cognizine");
+                        assert_eq!(concept.handle, Some("cognizine".to_string()));
                         assert_eq!(
                             concept.concept,
                             ConceptMatcher::Object {
@@ -461,7 +461,7 @@ mod tests {
 
                 match &upsert.items[0] {
                     UpsertItem::Concept(concept) => {
-                        assert_eq!(concept.handle, "drug");
+                        assert_eq!(concept.handle, Some("drug".to_string()));
                         assert_eq!(
                             concept.concept,
                             ConceptMatcher::Object {
@@ -516,7 +516,7 @@ mod tests {
 
                 match &upsert.items[0] {
                     UpsertItem::Proposition(prop) => {
-                        assert_eq!(prop.handle, "stmt");
+                        assert_eq!(prop.handle, Some("stmt".to_string()));
                         assert_eq!(
                             prop.proposition,
                             PropositionMatcher::Object {
@@ -732,7 +732,7 @@ mod tests {
                 // Check first item (concept)
                 match &upsert.items[0] {
                     UpsertItem::Concept(concept) => {
-                        assert_eq!(concept.handle, "drug");
+                        assert_eq!(concept.handle, Some("drug".to_string()));
                         assert_eq!(concept.concept, ConceptMatcher::ID("drug_001".to_string()));
                         let attrs = concept.set_attributes.as_ref().unwrap();
                         assert_eq!(attrs["name"], Json::String("TestDrug".to_string()));
@@ -745,7 +745,7 @@ mod tests {
                 // Check second item (proposition)
                 match &upsert.items[1] {
                     UpsertItem::Proposition(prop) => {
-                        assert_eq!(prop.handle, "relation");
+                        assert_eq!(prop.handle, Some("relation".to_string()));
                         assert_eq!(
                             prop.proposition,
                             PropositionMatcher::Object {
@@ -770,7 +770,7 @@ mod tests {
                 // Check third item (concept with proposition referencing local handle)
                 match &upsert.items[2] {
                     UpsertItem::Concept(concept) => {
-                        assert_eq!(concept.handle, "target");
+                        assert_eq!(concept.handle, Some("target".to_string()));
                         assert_eq!(concept.concept, ConceptMatcher::ID("drug_002".to_string()));
                         let props = concept.set_propositions.as_ref().unwrap();
                         assert_eq!(props.len(), 1);
@@ -784,6 +784,37 @@ mod tests {
                         );
                     }
                     _ => panic!("Expected ConceptBlock"),
+                }
+            }
+            _ => panic!("Expected UpsertBlock"),
+        }
+    }
+
+    #[test]
+    fn test_parse_proposition_block_without_handle() {
+        let input = r#"
+        UPSERT {
+            PROPOSITION {
+                ( { name: "Zhang San" }, "stated", { type: "Paper", name: "paper_doi" } )
+            }
+        }
+        "#;
+
+        let result = parse_kml_statement(input);
+        assert!(result.is_ok());
+
+        let (_, statement) = result.unwrap();
+        match statement {
+            KmlStatement::Upsert(upserts) => {
+                assert_eq!(upserts.len(), 1);
+                let upsert = &upserts[0];
+                assert_eq!(upsert.items.len(), 1);
+
+                match &upsert.items[0] {
+                    UpsertItem::Proposition(prop) => {
+                        assert_eq!(prop.handle, None);
+                    }
+                    _ => panic!("Expected PropositionBlock"),
                 }
             }
             _ => panic!("Expected UpsertBlock"),
@@ -811,11 +842,42 @@ mod tests {
                 assert_eq!(upsert.items.len(), 1);
                 match &upsert.items[0] {
                     UpsertItem::Concept(concept) => {
-                        assert_eq!(concept.handle, "minimal");
+                        assert_eq!(concept.handle, Some("minimal".to_string()));
                         assert_eq!(concept.concept, ConceptMatcher::ID("test_001".to_string()));
                         assert!(concept.set_attributes.is_none());
                         assert!(concept.set_propositions.is_none());
                         assert!(concept.metadata.is_none());
+                    }
+                    _ => panic!("Expected ConceptBlock"),
+                }
+            }
+            _ => panic!("Expected UpsertBlock"),
+        }
+    }
+
+    #[test]
+    fn test_parse_concept_block_without_handle() {
+        let input = r#"
+        UPSERT {
+            CONCEPT {
+                { id: "test_001" }
+            }
+        }
+        "#;
+
+        let result = parse_kml_statement(input);
+        assert!(result.is_ok());
+
+        let (_, statement) = result.unwrap();
+        match statement {
+            KmlStatement::Upsert(upserts) => {
+                assert_eq!(upserts.len(), 1);
+                let upsert = &upserts[0];
+                assert_eq!(upsert.items.len(), 1);
+                match &upsert.items[0] {
+                    UpsertItem::Concept(concept) => {
+                        assert_eq!(concept.handle, None);
+                        assert_eq!(concept.concept, ConceptMatcher::ID("test_001".to_string()));
                     }
                     _ => panic!("Expected ConceptBlock"),
                 }
