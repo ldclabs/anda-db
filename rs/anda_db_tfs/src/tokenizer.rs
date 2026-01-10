@@ -94,7 +94,7 @@ pub fn jieba_tokenizer() -> TokenizerChain {
     use tantivy::tokenizer::{LowerCaser, RemoveLongFilter, Stemmer};
     use tantivy_jieba::JiebaTokenizer;
 
-    TokenizerChain::builder(JiebaTokenizer {})
+    TokenizerChain::builder(JiebaTokenizer::new())
         .filter(RemoveLongFilter::limit(32))
         .filter(LowerCaser)
         .filter(Stemmer::default())

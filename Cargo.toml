@@ -71,7 +71,7 @@ papaya = { version = "0.2" }
 log = { version = "0.4", features = ["kv", "kv_serde"] }
 tantivy = "0.25"
 tantivy-tokenizer-api = "0.6"
-tantivy-jieba = "0.17"
+tantivy-jieba = "0.18"
 structured-logger = "1"
 smallvec = "1.15"
 criterion = "0.8"
@@ -84,9 +84,9 @@ nom = "8"
 nom-language = "0.1"
 regex = "1.11"
 rustc-hash = "2"
-pyo3 = "0.20.3"
-pyo3-asyncio = "0.20.0"
-serde-pyobject = "0.2.0"
+pyo3 = "0.20"
+pyo3-asyncio = "0.20"
+serde-pyobject = "0.2"
 
 [workspace.metadata.cargo-shear]
 ignored = ["blas-src"]
