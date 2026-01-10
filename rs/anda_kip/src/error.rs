@@ -23,17 +23,13 @@ pub enum KipErrorCode {
     InvalidSyntax,
     /// KIP_1002: InvalidIdentifier - Used illegal identifier format (e.g., starting with a number).
     InvalidIdentifier,
-    /// KIP_1003: UnsupportedVersion - The requested protocol version is not supported.
-    UnsupportedVersion,
 
     // 2xxx: Schema & Type errors
     /// KIP_2001: TypeMismatch - Attempted to use a Concept Type or Proposition Predicate undefined in Schema.
     TypeMismatch,
-    /// KIP_2002: AttributeUndefined - Attempted to write an undefined attribute (if Schema is in strict mode).
-    AttributeUndefined,
-    /// KIP_2003: ConstraintViolation - Violated data constraints (e.g., missing required field).
+    /// KIP_2002: ConstraintViolation - Violated data constraints (e.g., missing required field).
     ConstraintViolation,
-    /// KIP_2004: InvalidValueType - JSON type of attribute value mismatches Schema definition.
+    /// KIP_2003: InvalidValueType - JSON type of attribute value mismatches Schema definition.
     InvalidValueType,
 
     // 3xxx: Logic & Data errors
@@ -62,12 +58,10 @@ impl KipErrorCode {
             // 1xxx: Syntax & Parsing
             Self::InvalidSyntax => "KIP_1001",
             Self::InvalidIdentifier => "KIP_1002",
-            Self::UnsupportedVersion => "KIP_1003",
             // 2xxx: Schema & Type
             Self::TypeMismatch => "KIP_2001",
-            Self::AttributeUndefined => "KIP_2002",
-            Self::ConstraintViolation => "KIP_2003",
-            Self::InvalidValueType => "KIP_2004",
+            Self::ConstraintViolation => "KIP_2002",
+            Self::InvalidValueType => "KIP_2003",
             // 3xxx: Logic & Data
             Self::ReferenceError => "KIP_3001",
             Self::NotFound => "KIP_3002",
@@ -86,10 +80,8 @@ impl KipErrorCode {
             // 1xxx: Syntax & Parsing
             Self::InvalidSyntax => "InvalidSyntax",
             Self::InvalidIdentifier => "InvalidIdentifier",
-            Self::UnsupportedVersion => "UnsupportedVersion",
             // 2xxx: Schema & Type
             Self::TypeMismatch => "TypeMismatch",
-            Self::AttributeUndefined => "AttributeUndefined",
             Self::ConstraintViolation => "ConstraintViolation",
             Self::InvalidValueType => "InvalidValueType",
             // 3xxx: Logic & Data
@@ -112,13 +104,9 @@ impl KipErrorCode {
                 "Check parenthesis matching, keyword spelling, and statement structure. Ensure JSON data format is valid."
             }
             Self::InvalidIdentifier => "Identifiers must match regex `[a-zA-Z_][a-zA-Z0-9_]*`.",
-            Self::UnsupportedVersion => "Please check the KIP version supported by the system.",
             // 2xxx: Schema & Type
             Self::TypeMismatch => {
                 "Execute `DESCRIBE` to confirm type names. Remember types are case-sensitive (`Drug` vs `drug`)."
-            }
-            Self::AttributeUndefined => {
-                "Check `instance_schema`. If it's a new attribute, confirm if dynamic extension is allowed."
             }
             Self::ConstraintViolation => "Supply the missing required attributes.",
             Self::InvalidValueType => "Correct the JSON value type.",
@@ -197,11 +185,6 @@ impl KipError {
         Self::new(KipErrorCode::InvalidIdentifier, format!("{err}"))
     }
 
-    /// Creates an UnsupportedVersion error (KIP_1003)
-    pub fn unsupported_version(err: impl Display) -> Self {
-        Self::new(KipErrorCode::UnsupportedVersion, format!("{err}"))
-    }
-
     // ==================== 2xxx: Schema & Type Errors ====================
 
     /// Creates a TypeMismatch error (KIP_2001)
@@ -209,17 +192,12 @@ impl KipError {
         Self::new(KipErrorCode::TypeMismatch, format!("{err}"))
     }
 
-    /// Creates an AttributeUndefined error (KIP_2002)
-    pub fn attribute_undefined(err: impl Display) -> Self {
-        Self::new(KipErrorCode::AttributeUndefined, format!("{err}"))
-    }
-
-    /// Creates a ConstraintViolation error (KIP_2003)
+    /// Creates a ConstraintViolation error (KIP_2002)
     pub fn constraint_violation(err: impl Display) -> Self {
         Self::new(KipErrorCode::ConstraintViolation, format!("{err}"))
     }
 
-    /// Creates an InvalidValueType error (KIP_2004)
+    /// Creates an InvalidValueType error (KIP_2003)
     pub fn invalid_value_type(err: impl Display) -> Self {
         Self::new(KipErrorCode::InvalidValueType, format!("{err}"))
     }

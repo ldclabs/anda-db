@@ -15,11 +15,14 @@ pub static META_SYSTEM_NAME: &str = "$system";
 /// The type identifier for domain entities.
 pub static DOMAIN_TYPE: &str = "Domain";
 
+/// The type identifier for event entities.
+pub static EVENT_TYPE: &str = "Event";
+
 /// The type identifier for person entities.
 pub static PERSON_TYPE: &str = "Person";
 
 /// The type identifier for event entities.
-pub static EVENT_TYPE: &str = "Event";
+pub static SLEEP_TASK_TYPE: &str = "SleepTask";
 
 /// The predicate type for domain membership relationships.
 pub static BELONGS_TO_DOMAIN_TYPE: &str = "belongs_to_domain";
@@ -27,11 +30,14 @@ pub static BELONGS_TO_DOMAIN_TYPE: &str = "belongs_to_domain";
 /// The genesis capsule containing the initial state of the Cognitive Nexus.
 pub static GENESIS_KIP: &str = include_str!("../capsules/Genesis.kip");
 
+/// The Event type definition capsule.
+pub static EVENT_KIP: &str = include_str!("../capsules/Event.kip");
+
 /// The Person type definition capsule.
 pub static PERSON_KIP: &str = include_str!("../capsules/Person.kip");
 
 /// The Event type definition capsule.
-pub static EVENT_KIP: &str = include_str!("../capsules/Event.kip");
+pub static SLEEP_TASK_KIP: &str = include_str!("../capsules/SleepTask.kip");
 
 /// The $self capsule representing the agent itself (should replace $self_reserved_principal_id).
 pub static PERSON_SELF_KIP: &str = include_str!("../capsules/persons/self.kip");

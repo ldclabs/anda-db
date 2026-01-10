@@ -255,6 +255,16 @@ impl CognitiveNexus {
             this.execute_kml(parse_kml(EVENT_KIP)?, false).await?;
         }
 
+        if !this
+            .has_concept(&ConceptPK::Object {
+                r#type: META_CONCEPT_TYPE.to_string(),
+                name: SLEEP_TASK_TYPE.to_string(),
+            })
+            .await
+        {
+            this.execute_kml(parse_kml(SLEEP_TASK_KIP)?, false).await?;
+        }
+
         f(&this).await?;
         Ok(this)
     }
@@ -3104,7 +3114,7 @@ mod tests {
             result,
             json!([{
                 "_type":"ConceptNode",
-                "id":"C:13",
+                "id":"C:16",
                 "type":"Drug",
                 "name":"Aspirin",
                 "attributes":{"dosage":"325mg","molecular_formula":"C9H8O4","risk_level":2},
@@ -3968,7 +3978,7 @@ mod tests {
             .unwrap();
         let domains: Vec<ConceptNode> = serde_json::from_value(result).unwrap();
         // println!("{:#?}", domains);
-        assert_eq!(domains.len(), 1);
+        assert_eq!(domains.len(), 3);
         assert_eq!(domains[0].r#type, "Domain");
         assert_eq!(domains[0].name, "CoreSchema");
     }
@@ -4086,7 +4096,7 @@ mod tests {
             .await
             .unwrap();
         let result: Vec<PropositionLink> = serde_json::from_value(result).unwrap();
-        assert_eq!(result.len(), 8);
+        assert_eq!(result.len(), 10);
 
         let (result, _) = nexus
             .execute_meta(parse_meta(r#"SEARCH PROPOSITION "test_data" LIMIT 5"#).unwrap())
