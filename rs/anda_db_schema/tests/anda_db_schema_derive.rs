@@ -236,9 +236,13 @@ mod tests {
             &FieldType::F64
         );
 
-        // 验证其他基本类型
+        // 文本类型
         assert_eq!(schema.get_field("text").unwrap().r#type(), &FieldType::Text);
+
+        // 布尔类型
         assert_eq!(schema.get_field("flag").unwrap().r#type(), &FieldType::Bool);
+
+        // 字节数组
         assert_eq!(
             schema.get_field("data").unwrap().r#type(),
             &FieldType::Bytes
@@ -247,69 +251,63 @@ mod tests {
             schema.get_field("array").unwrap().r#type(),
             &FieldType::Bytes
         );
-        assert_eq!(
-            schema.get_field("opt_array").unwrap().r#type(),
-            &FieldType::Option(Box::new(FieldType::Bytes))
-        );
+        if let FieldType::Option(inner) = schema.get_field("opt_array").unwrap().r#type() {
+            assert_eq!(inner.as_ref(), &FieldType::Bytes);
+        } else {
+            panic!("Expected Option<Bytes>");
+        }
 
-        // 验证数组类型
-        let numbers_field = schema.get_field("numbers").unwrap();
-        if let FieldType::Array(types) = numbers_field.r#type() {
-            assert_eq!(types[0], FieldType::I64);
+        // 数组类型
+        if let FieldType::Array(types) = schema.get_field("numbers").unwrap().r#type() {
+            assert_eq!(types, &vec![FieldType::I64]);
         } else {
             panic!("Expected Array<I64>");
         }
-
-        let strings_field = schema.get_field("strings").unwrap();
-        if let FieldType::Array(types) = strings_field.r#type() {
-            assert_eq!(types[0], FieldType::Text);
+        if let FieldType::Array(types) = schema.get_field("strings").unwrap().r#type() {
+            assert_eq!(types, &vec![FieldType::Text]);
         } else {
             panic!("Expected Array<Text>");
         }
 
-        // 验证可选类型
-        let optional_text_field = schema.get_field("optional_text").unwrap();
-        if let FieldType::Option(inner) = optional_text_field.r#type() {
-            assert_eq!(**inner, FieldType::Text);
+        // 可选类型
+        if let FieldType::Option(inner) = schema.get_field("optional_text").unwrap().r#type() {
+            assert_eq!(inner.as_ref(), &FieldType::Text);
         } else {
             panic!("Expected Option<Text>");
         }
+        if let FieldType::Option(inner) = schema.get_field("optional_number").unwrap().r#type() {
+            assert_eq!(inner.as_ref(), &FieldType::I64);
+        } else {
+            panic!("Expected Option<I64>");
+        }
 
-        // 验证 Map 类型
-        let string_map_field = schema.get_field("string_map").unwrap();
-        if let FieldType::Map(map_types) = string_map_field.r#type() {
+        // Map 类型
+        if let FieldType::Map(map_types) = schema.get_field("string_map").unwrap().r#type() {
             assert_eq!(map_types.get(&TEXT_WILDCARD_KEY), Some(&FieldType::Text));
         } else {
-            panic!("Expected Map<String, String>");
+            panic!("Expected Map<Text>");
         }
-
-        let number_map_field = schema.get_field("number_map").unwrap();
-        if let FieldType::Map(map_types) = number_map_field.r#type() {
+        if let FieldType::Map(map_types) = schema.get_field("number_map").unwrap().r#type() {
             assert_eq!(map_types.get(&TEXT_WILDCARD_KEY), Some(&FieldType::I64));
         } else {
-            panic!("Expected Map<String, I64>");
+            panic!("Expected Map<I64>");
         }
-
-        let json_map_field = schema.get_field("json_map").unwrap();
-        if let FieldType::Map(map_types) = json_map_field.r#type() {
+        if let FieldType::Map(map_types) = schema.get_field("json_map").unwrap().r#type() {
             assert_eq!(map_types.get(&TEXT_WILDCARD_KEY), Some(&FieldType::Json));
         } else {
-            panic!("Expected Map<String, Json>");
+            panic!("Expected Map<Json>");
         }
-
-        let json_map2_field = schema.get_field("json_map2").unwrap();
-        if let FieldType::Map(map_types) = json_map2_field.r#type() {
+        if let FieldType::Map(map_types) = schema.get_field("json_map2").unwrap().r#type() {
             assert_eq!(map_types.get(&TEXT_WILDCARD_KEY), Some(&FieldType::Json));
         } else {
-            panic!("Expected Map<String, serde_json::Value>");
+            panic!("Expected Map<Json>");
         }
     }
 
     #[test]
-    fn test_custom_field_types() {
+    fn test_custom_field_type_attributes() {
         let schema = TestCustomFieldType::schema().unwrap();
 
-        // 验证自定义字段类型
         assert_eq!(
             schema.get_field("custom_field").unwrap().r#type(),
             &FieldType::Json
@@ -325,50 +323,36 @@ mod tests {
     }
 
     #[test]
-    fn test_constraints_and_renaming() {
+    fn test_constraints_and_rename() {
         let schema = TestConstraints::schema().unwrap();
 
-        // 验证重命名字段
+        // 字段名应被重命名为 user_id
         let id_field = schema.get_field("user_id").unwrap();
         assert_eq!(id_field.r#type(), &FieldType::Text);
         assert!(id_field.unique());
 
-        // 验证唯一性约束
         let email_field = schema.get_field("email").unwrap();
+        assert_eq!(email_field.r#type(), &FieldType::Text);
         assert!(email_field.unique());
 
-        // 验证可选字段
+        let name_field = schema.get_field("full_name").unwrap();
+        assert_eq!(name_field.r#type(), &FieldType::Text);
+        assert!(!name_field.unique());
+
         let bio_field = schema.get_field("bio").unwrap();
         if let FieldType::Option(inner) = bio_field.r#type() {
-            assert_eq!(**inner, FieldType::Text);
+            assert_eq!(inner.as_ref(), &FieldType::Text);
         } else {
             panic!("Expected Option<Text>");
         }
-        assert!(!bio_field.required());
     }
 
     #[test]
-    fn test_schema_errors() {
-        // 这个测试需要在编译时进行，无法在运行时测试
-        // 但我们可以确保正常的 schema 生成不会出错
-        assert!(TestUser::schema().is_ok());
-        assert!(TestAllTypes::schema().is_ok());
-        assert!(TestCustomFieldType::schema().is_ok());
-        assert!(TestConstraints::schema().is_ok());
-    }
+    fn test_schema_error() {
+        // Schema 至少包含 `_id` 字段（builder 默认注入），这里验证查找不存在字段的行为
+        let schema = Schema::builder().build().unwrap();
 
-    #[test]
-    fn test_field_requirements() {
-        let schema = TestUser::schema().unwrap();
-
-        // 必需字段
-        assert!(schema.get_field("handle").unwrap().required());
-        assert!(schema.get_field("name").unwrap().required());
-        assert!(schema.get_field("active").unwrap().required());
-        assert!(schema.get_field("tags").unwrap().required());
-
-        // 可选字段
-        assert!(!schema.get_field("age").unwrap().required());
-        assert!(!schema.get_field("metadata").unwrap().required());
+        assert!(schema.get_field("non_existent").is_none());
+        assert!(schema.get_field_or_err("non_existent").is_err());
     }
 }

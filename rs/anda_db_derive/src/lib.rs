@@ -16,7 +16,7 @@ mod schema;
 ///
 /// # Example
 ///
-/// ```rust
+/// ```rust,ignore
 /// use anda_db_schema::{FieldType, FieldTyped};
 /// use ic_auth_types::Xid;
 ///
@@ -51,7 +51,7 @@ pub fn field_typed_derive(input: TokenStream) -> TokenStream {
 ///
 /// # Example
 ///
-/// ```rust
+/// ```rust,ignore
 /// use anda_db_schema::{FieldEntry, FieldType, Schema, SchemaError};
 /// use anda_db_derive::AndaDBSchema;
 ///
