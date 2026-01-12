@@ -856,7 +856,7 @@ impl CognitiveNexus {
             .ok_or_else(|| KipError::not_found(format!("Concept {matcher} not found")))?;
         let me = self
             .try_get_concept_with(&cache, *me, |concept| {
-                extract_concept_field_value(concept, &["attributes".to_string()])
+                extract_concept_field_value(concept, &[])
             })
             .await?;
 
