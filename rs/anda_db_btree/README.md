@@ -156,6 +156,6 @@ The library provides a comprehensive error type `BTreeError` that covers various
 - `BTreeError::AlreadyExists`: When trying to insert a duplicate key with `allow_duplicates` set to false
 
 ## License
-Copyright © 2025 [LDC Labs](https://github.com/ldclabs).
+Copyright © 2026 [LDC Labs](https://github.com/ldclabs).
 
 `ldclabs/anda-db` is licensed under the MIT License. See [LICENSE](../../LICENSE) for the full license text.

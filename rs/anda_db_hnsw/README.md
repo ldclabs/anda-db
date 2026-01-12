@@ -281,6 +281,6 @@ The library uses a custom error type `HnswError` for various error conditions:
 
 ## License
 
-Copyright © 2025 [LDC Labs](https://github.com/ldclabs).
+Copyright © 2026 [LDC Labs](https://github.com/ldclabs).
 
 `ldclabs/anda-db` is licensed under the MIT License. See [LICENSE](../../LICENSE) for the full license text.
