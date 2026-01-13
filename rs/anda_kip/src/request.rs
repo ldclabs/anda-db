@@ -505,6 +505,17 @@ impl From<KipError> for ErrorObject {
     }
 }
 
+/// Display implementation for ErrorObject
+impl std::fmt::Display for ErrorObject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(hint) = &self.hint {
+            write!(f, "[{}] {}, Hint: {}", self.code, self.message, hint)
+        } else {
+            write!(f, "[{}] {}", self.code, self.message)
+        }
+    }
+}
+
 /// Conversion from KipError to Response
 ///
 /// Automatically wraps KIP errors in the appropriate response format
