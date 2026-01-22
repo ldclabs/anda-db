@@ -354,6 +354,37 @@ impl CognitiveNexus {
         self.concepts.get_as(id).await.map_err(db_to_kip_error)
     }
 
+    /// Retrieves an existing concept or initializes a new one if it does not exist.
+    /// Caller should ensure the concept type is existing and the name is not empty.
+    pub async fn get_or_init_concept(
+        &self,
+        r#type: String,
+        name: String,
+        attributes: Map<String, Json>,
+        metadata: Map<String, Json>,
+    ) -> Result<Concept, KipError> {
+        match self.query_concept_id(&r#type, &name).await {
+            Ok(id) => self.concepts.get_as(id).await.map_err(db_to_kip_error),
+            Err(_) => {
+                let mut concept = Concept {
+                    _id: 0, // Will be set by the database
+                    r#type,
+                    name,
+                    attributes,
+                    metadata,
+                };
+                let id = self
+                    .concepts
+                    .add_from(&concept)
+                    .await
+                    .map_err(db_to_kip_error)?;
+
+                concept._id = id;
+                Ok(concept)
+            }
+        }
+    }
+
     pub async fn execute_kql(&self, command: KqlQuery) -> Result<(Json, Option<String>), KipError> {
         let mut ctx = QueryContext::default();
 

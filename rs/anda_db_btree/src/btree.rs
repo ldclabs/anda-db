@@ -1088,7 +1088,9 @@ where
                 {
                     if let Some(posting) = self.postings.get(k) {
                         let (conti, rt) = f(k, &posting.2);
-                        groups.push(rt);
+                        if !rt.is_empty() {
+                            groups.push(rt);
+                        }
                         if !conti {
                             break;
                         }
@@ -1107,7 +1109,9 @@ where
                 {
                     if let Some(posting) = self.postings.get(k) {
                         let (conti, rt) = f(k, &posting.2);
-                        groups.push(rt);
+                        if !rt.is_empty() {
+                            groups.push(rt);
+                        }
                         if !conti {
                             break;
                         }
