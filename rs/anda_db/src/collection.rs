@@ -367,24 +367,21 @@ impl Collection {
     ///
     /// This method scans for documents between the persisted checkpoint and the
     /// max_document_id that may have been written but not indexed (due to crash
-    /// or incomplete flush). It limits the scan to prevent unbounded loops.
+    /// or incomplete flush). It also scans slightly beyond max_document_id to
+    /// recover documents written but not recorded in metadata.
     async fn auto_repair_indexes(&self) -> Result<usize, DBError> {
         let persisted_max_document_id = self.storage.stats().check_point;
         let maybe_max_document_id = self.max_document_id.load(Ordering::Relaxed);
 
-        // Early exit if no potential dirty documents
-        if persisted_max_document_id >= maybe_max_document_id {
-            return Ok(0);
-        }
-
         let now_ms = unix_ms();
         let mut id = persisted_max_document_id;
         let mut fixed = 0;
+
         // Limit consecutive misses to avoid unbounded scanning in case of sparse IDs
         let mut consecutive_misses = 0;
         const MAX_CONSECUTIVE_MISSES: u32 = 100;
 
-        while id < maybe_max_document_id {
+        loop {
             id += 1;
             match self
                 .storage
@@ -393,22 +390,43 @@ impl Collection {
             {
                 Err(_) => {
                     consecutive_misses += 1;
-                    // If we've had too many consecutive misses, assume no more dirty docs
-                    if consecutive_misses >= MAX_CONSECUTIVE_MISSES {
-                        log::debug!(
-                            action = "auto_repair_indexes",
-                            collection = self.name,
-                            id = id;
-                            "Stopping repair scan after {MAX_CONSECUTIVE_MISSES} consecutive misses",
-                        );
-                        return Ok(fixed);
+                    // If we've had too many consecutive misses, assume no more dirty docs.
+                    // If we haven't reached maybe_max_document_id, we use a larger limit.
+                    // If we have reached maybe_max_document_id, we use a smaller limit (10) for efficiency.
+                    let limit = if id < maybe_max_document_id {
+                        MAX_CONSECUTIVE_MISSES
+                    } else {
+                        10
+                    };
+
+                    if consecutive_misses >= limit {
+                        if fixed > 0 || (id < maybe_max_document_id && consecutive_misses > 1) {
+                            log::info!(
+                                action = "auto_repair_indexes",
+                                collection = self.name,
+                                id = id;
+                                "Stopping repair scan after {consecutive_misses} consecutive misses",
+                            );
+                        }
+                        break;
                     }
                 }
                 Ok((doc, _)) => {
                     // Reset consecutive miss counter on successful fetch
                     consecutive_misses = 0;
-                    // dirty document exists
-                    fixed += 1;
+                    self.max_document_id.fetch_max(id, Ordering::AcqRel);
+
+                    let mut is_new = false;
+                    {
+                        let mut doc_ids = self.doc_ids.write();
+                        if !doc_ids.contains(id) {
+                            doc_ids.add(id);
+                            self.doc_ids_index.write().insert(id);
+                            fixed += 1;
+                            is_new = true;
+                        }
+                    }
+
                     let doc = Document::try_from_doc(self.schema(), doc)?;
                     // try to repair indexes
                     for index in &self.btree_indexes {
@@ -435,10 +453,17 @@ impl Collection {
                         }
                     }
 
-                    self.update_metadata(|meta| {
-                        meta.stats.version += 1;
-                    });
+                    if is_new {
+                        self.update_metadata(|meta| {
+                            meta.stats.version += 1;
+                        });
+                    }
                 }
+            }
+
+            // Safety limit to prevent infinite scan
+            if id > maybe_max_document_id + 1000 {
+                break;
             }
         }
 
