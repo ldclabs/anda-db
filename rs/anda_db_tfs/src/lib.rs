@@ -21,3 +21,9 @@ pub use bm25::*;
 pub use error::*;
 pub use query::*;
 pub use tokenizer::*;
+
+#[cfg(any(test, feature = "tantivy-jieba"))]
+mod jieba_tokenizer;
+
+#[cfg(any(test, feature = "tantivy-jieba"))]
+pub use jieba_tokenizer::*;

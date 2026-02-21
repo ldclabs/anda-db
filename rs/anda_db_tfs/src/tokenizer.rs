@@ -88,19 +88,6 @@ pub fn default_tokenizer() -> TokenizerChain {
         .build()
 }
 
-/// Creates a new `TokenizerChain` with `JiebaTokenizer` as the default tokenizer and `RemoveLongFilter`, `LowerCaser` and `Stemmer` as the default filters.
-#[cfg(any(test, feature = "tantivy-jieba"))]
-pub fn jieba_tokenizer() -> TokenizerChain {
-    use tantivy::tokenizer::{LowerCaser, RemoveLongFilter, Stemmer};
-    use tantivy_jieba::JiebaTokenizer;
-
-    TokenizerChain::builder(JiebaTokenizer::new())
-        .filter(RemoveLongFilter::limit(32))
-        .filter(LowerCaser)
-        .filter(Stemmer::default())
-        .build()
-}
-
 /// Tokenizes text and optionally filters tokens
 ///
 /// # Arguments

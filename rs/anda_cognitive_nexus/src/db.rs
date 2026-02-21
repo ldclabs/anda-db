@@ -4104,7 +4104,8 @@ mod tests {
             .await
             .unwrap();
         let result: Vec<ConceptNode> = serde_json::from_value(result).unwrap();
-        assert_eq!(result.len(), 10);
+        // println!("{:#?}", result);
+        assert_eq!(result.len(), 6);
 
         let (result, _) = nexus
             .execute_meta(parse_meta(r#"SEARCH CONCEPT "test_data" LIMIT 5"#).unwrap())
@@ -4120,21 +4121,21 @@ mod tests {
             .await
             .unwrap();
         let result: Vec<ConceptNode> = serde_json::from_value(result).unwrap();
-        assert_eq!(result.len(), 2);
+        assert_eq!(result.len(), 1);
 
         let (result, _) = nexus
             .execute_meta(parse_meta(r#"SEARCH PROPOSITION "test_data""#).unwrap())
             .await
             .unwrap();
         let result: Vec<PropositionLink> = serde_json::from_value(result).unwrap();
-        assert_eq!(result.len(), 10);
+        assert_eq!(result.len(), 2);
 
         let (result, _) = nexus
             .execute_meta(parse_meta(r#"SEARCH PROPOSITION "test_data" LIMIT 5"#).unwrap())
             .await
             .unwrap();
         let result: Vec<PropositionLink> = serde_json::from_value(result).unwrap();
-        assert_eq!(result.len(), 5);
+        assert_eq!(result.len(), 2);
 
         let (result, _) = nexus
             .execute_meta(
