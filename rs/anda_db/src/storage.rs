@@ -112,7 +112,7 @@ struct StorageStatsAtomic {
     total_fetch_bytes: AtomicU64,
     /// Total number of `put` operations.
     total_put_count: AtomicU64,
-    /// Total bytes written to the object store (before compression).
+    /// Total bytes submitted for writing (pre-compression size).
     total_put_bytes: AtomicU64,
     /// Total number of `delete` operations.
     total_delete_count: AtomicU64,
@@ -134,7 +134,7 @@ pub struct StorageStats {
     pub total_fetch_bytes: u64,
     /// Total number of `put` operations.
     pub total_put_count: u64,
-    /// Total bytes written to the object store (before compression).
+    /// Total bytes submitted for writing (pre-compression size).
     pub total_put_bytes: u64,
     /// Total number of `delete` operations.
     pub total_delete_count: u64,
@@ -398,10 +398,12 @@ impl Storage {
         let version: ObjectVersion = (&result.meta).into();
         let bytes = result.bytes().await.map_err(DBError::from)?;
 
-        let bytes = try_decompress(
-            bytes,
-            self.inner.metadata.config.max_small_object_size as u64,
-        );
+        // Use a generous multiple of max_small_object_size as the decompression
+        // bomb guard. The put path checks pre-compression size against
+        // max_small_object_size, so normal data always fits within this limit.
+        let max_decompress_size =
+            (self.inner.metadata.config.max_small_object_size as u64).saturating_mul(16);
+        let bytes = try_decompress(bytes, max_decompress_size);
         self.inner
             .stats
             .total_fetch_count
@@ -715,13 +717,19 @@ impl Storage {
             self.inner.object_store.list(Some(&path_prefix))
         };
 
+        // Use inner_fetch (bypassing cache) to avoid polluting the cache
+        // with every listed object during large scans.
         (stream
             .map_err(DBError::from)
             .try_filter_map(|meta| {
                 let this = self.clone();
                 async move {
-                    let result = this.inner_get(&meta.location).await?;
-                    Ok(Some(result))
+                    let (bytes, version) = this.inner_fetch(&meta.location).await?;
+                    let doc: T = from_reader(&bytes[..]).map_err(|err| DBError::Serialization {
+                        name: this.inner.base_path.to_string(),
+                        source: err.into(),
+                    })?;
+                    Ok(Some((doc, version)))
                 }
             })
             .boxed()) as _
@@ -775,20 +783,22 @@ impl Storage {
 impl InnerStorage {
     /// Internal helper to put bytes, handling compression, size checks, cache invalidation, and stats updates.
     async fn put(&self, path: Path, data: Bytes, mode: PutMode) -> Result<ObjectVersion, DBError> {
+        // Check original (pre-compression) size to ensure the decompression path
+        // can always recover the data within the same limit.
+        let original_len = data.len();
+        if data.len() > self.metadata.config.max_small_object_size {
+            return Err(DBError::PayloadTooLarge {
+                path: path.to_string(),
+                size: original_len,
+                limit: self.metadata.config.max_small_object_size,
+            });
+        }
+
         let data = if self.metadata.config.compress_level > 0 {
             try_compress(data, self.metadata.config.compress_level)
         } else {
             data
         };
-
-        let data_len = data.len();
-        if data_len > self.metadata.config.max_small_object_size {
-            return Err(DBError::PayloadTooLarge {
-                path: path.to_string(),
-                size: data_len,
-                limit: self.metadata.config.max_small_object_size,
-            });
-        }
 
         let result = self
             .object_store
@@ -810,7 +820,7 @@ impl InnerStorage {
         self.stats.total_put_count.fetch_add(1, Ordering::Relaxed);
         self.stats
             .total_put_bytes
-            .fetch_add(data_len as u64, Ordering::Relaxed);
+            .fetch_add(original_len as u64, Ordering::Relaxed);
 
         Ok(result.into())
     }
@@ -923,12 +933,15 @@ impl tokio::io::AsyncWrite for SingleWriter {
 }
 
 /// Compresses bytes using zstd-safe.
+/// Returns the original data unchanged if compression does not reduce size
+/// (e.g. already-compressed or incompressible payloads).
 #[inline]
 fn try_compress(data: Bytes, compress_level: i32) -> Bytes {
     let size = zstd_safe::compress_bound(data.len());
     let mut buf = Vec::with_capacity(size);
     match zstd_safe::compress(&mut buf, &data[..], compress_level) {
-        Ok(_) => buf.into(),
+        Ok(_) if buf.len() < data.len() => buf.into(),
+        Ok(_) => data, // Compression did not reduce size, return original
         Err(err) => {
             log::error!("Failed to compress data: {err:?}");
             data
@@ -1189,12 +1202,15 @@ mod tests {
     async fn test_stream_reader() {
         let storage = create_test_storage().await;
 
-        // 创建测试数据
+        // Write data using stream_writer (the paired write path for stream_reader)
         let data = b"test data for streaming".to_vec();
-        storage
-            .put_bytes("stream_doc", data.clone().into(), PutMode::Create)
+        let mut writer = storage.stream_writer("stream_doc");
+        tokio::io::AsyncWriteExt::write_all(&mut writer, &data)
             .await
-            .expect("Failed to create document for streaming");
+            .expect("Failed to write data");
+        tokio::io::AsyncWriteExt::shutdown(&mut writer)
+            .await
+            .expect("Failed to shutdown writer");
 
         // 创建流式读取器
         let mut reader = storage
@@ -1498,5 +1514,65 @@ mod tests {
             .await
             .unwrap();
         assert!(after.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_storage_list_and_meta() {
+        let storage = create_test_storage().await;
+
+        #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+        struct T {
+            id: i32,
+        }
+
+        // 创建测试数据
+        storage.create("users/1", &T { id: 1 }).await.unwrap();
+        storage.create("users/2", &T { id: 2 }).await.unwrap();
+        storage.create("users/3", &T { id: 3 }).await.unwrap();
+        storage.create("apps/1", &T { id: 101 }).await.unwrap();
+
+        // 1. 测试 list_meta (无 prefix)
+        let all_meta = storage
+            .list_meta(None, None)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(all_meta.len(), 4);
+
+        // 2. 测试 list_meta (有 prefix)
+        let users_meta = storage
+            .list_meta(Some("users/"), None)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(users_meta.len(), 3);
+
+        // 3. 测试 list_meta (有 offset)
+        // object_store 的 list 结果通常是按字典序排序的
+        let offset = "users/1";
+        let users_meta_offset = storage
+            .list_meta(Some("users/"), Some(offset))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(users_meta_offset.len(), 2);
+        // 应该剩下 "users/2" 和 "users/3"
+
+        // 4. 测试 list (有 prefix)
+        let users: Vec<(T, ObjectVersion)> = storage
+            .list::<T>(Some("users/"), None)
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(users.len(), 3);
+
+        // 5. 测试 list (有 offset)
+        let users_offset: Vec<(T, ObjectVersion)> = storage
+            .list::<T>(Some("users/"), Some("users/2"))
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(users_offset.len(), 1);
+        assert_eq!(users_offset[0].0.id, 3);
     }
 }
