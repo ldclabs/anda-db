@@ -407,6 +407,10 @@ impl BTree {
         new_value: &Fv,
         now_ms: u64,
     ) -> Result<bool, DBError> {
+        if old_value == new_value {
+            return Ok(false);
+        }
+
         if old_value == &Fv::Null {
             return self.insert(doc_id, new_value, now_ms);
         }
@@ -440,8 +444,8 @@ impl BTree {
                 .map(|(r, i)| i > 0 || r > 0);
         }
 
-        let rt1 = self.remove(doc_id, old_value, now_ms);
-        let rt2 = self.insert(doc_id, new_value, now_ms)?;
+        let rt1 = self.insert(doc_id, new_value, now_ms)?;
+        let rt2 = self.remove(doc_id, old_value, now_ms);
         Ok(rt1 || rt2)
     }
 

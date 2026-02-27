@@ -632,11 +632,11 @@ impl Collection {
     /// # Returns
     /// Ok(()) if successful, or an error if storing fails
     async fn store_indexes(&self, now_ms: u64) -> Result<(), DBError> {
-        let _ = try_join_await!(
+        try_join_await!(
             try_join_all(self.btree_indexes.iter().map(|index| index.flush(now_ms))),
             try_join_all(self.bm25_indexes.iter().map(|index| index.flush(now_ms))),
             try_join_all(self.hnsw_indexes.iter().map(|index| index.flush(now_ms))),
-        );
+        )?;
 
         Ok(())
     }
@@ -1223,15 +1223,8 @@ impl Collection {
                         .btree_index_value(index, &doc)
                         .unwrap_or(Cow::Owned(FieldValue::Null));
 
-                    match index.update(id, &old_value, &new_value, now_ms) {
-                        Ok(_) => {
-                            btree_updated.insert(index, (old_value, new_value));
-                        }
-                        Err(err) => {
-                            let _ = index.update(id, &new_value, &old_value, now_ms);
-                            return Err(err);
-                        }
-                    }
+                    index.update(id, &old_value, &new_value, now_ms)?;
+                    btree_updated.insert(index, (old_value, new_value));
                 }
             }
 
@@ -1387,10 +1380,17 @@ impl Collection {
     /// A vector of matching documents, or an error if the search fails
     pub async fn search(&self, query: Query) -> Result<Vec<Document>, DBError> {
         let ids = self.search_ids(query).await?;
+        let schema = self.schema();
         let mut docs = Vec::with_capacity(ids.len());
-        for id in ids {
-            if let Ok((doc, _)) = self.storage.get::<DocumentOwned>(&Self::doc_path(id)).await {
-                let doc = Document::try_from_doc(self.schema(), doc)?;
+        let mut stream = futures::stream::iter(ids)
+            .map(|id| {
+                let storage = self.storage.clone();
+                async move { storage.get::<DocumentOwned>(&Self::doc_path(id)).await }
+            })
+            .buffered(8);
+        while let Some(result) = stream.next().await {
+            if let Ok((doc, _)) = result {
+                let doc = Document::try_from_doc(schema.clone(), doc)?;
                 docs.push(doc);
             }
         }
@@ -1590,6 +1590,21 @@ impl Collection {
         candidates: &[DocumentId],
         limit: usize,
     ) -> Result<Vec<DocumentId>, DBError> {
+        if candidates.is_empty() {
+            self.filter_by_field_with(filter, None, limit)
+        } else {
+            let cand_set: FxHashSet<DocumentId> = candidates.iter().copied().collect();
+            self.filter_by_field_with(filter, Some(&cand_set), limit)
+        }
+    }
+
+    /// Inner implementation of `filter_by_field` using a `FxHashSet` for O(1) candidate lookups.
+    fn filter_by_field_with(
+        &self,
+        filter: Filter,
+        candidates: Option<&FxHashSet<DocumentId>>,
+        limit: usize,
+    ) -> Result<Vec<DocumentId>, DBError> {
         let mut result = Vec::new();
         match filter {
             Filter::Field((index_name, filter)) => {
@@ -1606,7 +1621,7 @@ impl Collection {
                     result.reserve_exact(limit);
                     let _: Vec<()> = index.range_query_with(filter, |_, ids| {
                         for id in ids {
-                            if candidates.is_empty() || candidates.contains(id) {
+                            if candidates.map_or(true, |s| s.contains(id)) {
                                 result.push(*id);
                                 if limit > 0 && result.len() >= limit {
                                     return (false, vec![]);
@@ -1626,7 +1641,7 @@ impl Collection {
             Filter::Or(queries) => {
                 let mut rt: UniqueVec<u64> = UniqueVec::with_capacity(limit);
                 for query in queries {
-                    let ids = self.filter_by_field(*query, candidates, limit)?;
+                    let ids = self.filter_by_field_with(*query, candidates, limit)?;
                     rt.extend(ids);
                     if limit > 0 && rt.len() >= limit {
                         break;
@@ -1643,10 +1658,11 @@ impl Collection {
             Filter::And(queries) => {
                 let mut iter = queries.into_iter();
                 if let Some(query) = iter.next() {
-                    let mut rt: UniqueVec<u64> = self.filter_by_field(*query, &[], 0)?.into();
+                    let mut rt: UniqueVec<u64> = self.filter_by_field_with(*query, None, 0)?.into();
 
                     for query in iter {
-                        let keys: UniqueVec<u64> = self.filter_by_field(*query, &[], 0)?.into();
+                        let keys: UniqueVec<u64> =
+                            self.filter_by_field_with(*query, None, 0)?.into();
                         rt.intersect_with(&keys);
                         if rt.is_empty() {
                             return Ok(vec![]);
@@ -1663,10 +1679,12 @@ impl Collection {
             }
             Filter::Not(query) => {
                 result.reserve_exact(limit);
-                let exclude: FxHashSet<u64> =
-                    self.filter_by_field(*query, &[], 0)?.into_iter().collect();
+                let exclude: FxHashSet<u64> = self
+                    .filter_by_field_with(*query, None, 0)?
+                    .into_iter()
+                    .collect();
                 for id in self.doc_ids_index.read().iter() {
-                    if !exclude.contains(id) && (candidates.is_empty() || candidates.contains(id)) {
+                    if !exclude.contains(id) && candidates.map_or(true, |s| s.contains(id)) {
                         result.push(*id);
                         if limit > 0 && result.len() >= limit {
                             break;
@@ -1682,7 +1700,7 @@ impl Collection {
     ///
     /// # Arguments
     /// * `query` - The range query to apply to document IDs
-    /// * `candidates` - Optional list of document IDs to filter (if empty, all documents are considered)
+    /// * `candidates` - Optional set of document IDs to filter (if None, all documents are considered)
     /// * `limit` - The number of results to stop retrieving. The returned vector may be shorter or larger than this limit.
     ///
     /// # Returns
@@ -1690,14 +1708,14 @@ impl Collection {
     fn filter_by_id(
         &self,
         query: RangeQuery<DocumentId>,
-        candidates: &[DocumentId],
+        candidates: Option<&FxHashSet<DocumentId>>,
         limit: usize,
     ) -> Vec<DocumentId> {
         let mut result = Vec::new();
         match query {
             RangeQuery::Eq(id) => {
                 if self.doc_ids_index.read().contains(&id)
-                    && (candidates.is_empty() || candidates.contains(&id))
+                    && candidates.map_or(true, |s| s.contains(&id))
                 {
                     result.push(id);
                 }
@@ -1708,7 +1726,7 @@ impl Collection {
                     std::ops::Bound::Excluded(start_key),
                     std::ops::Bound::Unbounded,
                 )) {
-                    if candidates.is_empty() || candidates.contains(id) {
+                    if candidates.map_or(true, |s| s.contains(id)) {
                         result.push(*id);
                         if limit > 0 && result.len() >= limit {
                             return result;
@@ -1723,7 +1741,7 @@ impl Collection {
                     .read()
                     .range(std::ops::RangeFrom { start: start_key })
                 {
-                    if candidates.is_empty() || candidates.contains(id) {
+                    if candidates.map_or(true, |s| s.contains(id)) {
                         result.push(*id);
                         if limit > 0 && result.len() >= limit {
                             return result;
@@ -1740,7 +1758,7 @@ impl Collection {
                     .range(std::ops::RangeTo { end: end_key })
                     .rev()
                 {
-                    if candidates.is_empty() || candidates.contains(id) {
+                    if candidates.map_or(true, |s| s.contains(id)) {
                         tmp.push(*id);
                         if limit > 0 && tmp.len() >= limit {
                             break;
@@ -1759,7 +1777,7 @@ impl Collection {
                     .range(std::ops::RangeToInclusive { end: end_key })
                     .rev()
                 {
-                    if candidates.is_empty() || candidates.contains(id) {
+                    if candidates.map_or(true, |s| s.contains(id)) {
                         tmp.push(*id);
                         if limit > 0 && tmp.len() >= limit {
                             break;
@@ -1770,9 +1788,11 @@ impl Collection {
                 result.extend(tmp);
             }
             RangeQuery::Between(start_key, end_key) => {
-                result.reserve_exact(limit.min((1 + end_key - start_key) as usize));
+                result.reserve_exact(
+                    limit.min(end_key.saturating_sub(start_key).saturating_add(1) as usize),
+                );
                 for id in self.doc_ids_index.read().range(start_key..=end_key) {
-                    if candidates.is_empty() || candidates.contains(id) {
+                    if candidates.map_or(true, |s| s.contains(id)) {
                         result.push(*id);
                         if limit > 0 && result.len() >= limit {
                             return result;
@@ -1784,9 +1804,7 @@ impl Collection {
                 result.reserve_exact(limit.min(ids.len()));
                 let doc_ids_index = self.doc_ids_index.read();
                 for id in ids.into_iter() {
-                    if doc_ids_index.contains(&id)
-                        && (candidates.is_empty() || candidates.contains(&id))
-                    {
+                    if doc_ids_index.contains(&id) && candidates.map_or(true, |s| s.contains(&id)) {
                         result.push(id);
                         if limit > 0 && result.len() >= limit {
                             return result;
@@ -1834,9 +1852,9 @@ impl Collection {
                 result.reserve_exact(limit);
                 // 先收集要排除的 key，再遍历全集差集
                 let exclude: FxHashSet<u64> =
-                    self.filter_by_id(*query, &[], 0).into_iter().collect();
+                    self.filter_by_id(*query, None, 0).into_iter().collect();
                 for id in self.doc_ids_index.read().iter() {
-                    if !exclude.contains(id) && (candidates.is_empty() || candidates.contains(id)) {
+                    if !exclude.contains(id) && candidates.map_or(true, |s| s.contains(id)) {
                         result.push(*id);
                         if limit > 0 && result.len() >= limit {
                             return result;
