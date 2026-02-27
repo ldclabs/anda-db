@@ -667,13 +667,6 @@ where
         // New values that need to be added to the B-tree
         let mut new_btree_values = Vec::new();
 
-        let bucket_id = self.max_bucket_id.load(Ordering::Relaxed);
-
-        // Ensure the current bucket exists (see insert()).
-        self.buckets
-            .entry(bucket_id)
-            .or_insert_with(|| (0, false, UniqueVec::default()));
-
         // Phase 1: collect existing postings and prepare modifications
         // Skip duplicate field values if not allowed
         if !self.config.allow_duplicates {
@@ -689,6 +682,12 @@ where
                 }
             }
         }
+
+        // Ensure the current bucket exists (see insert()).
+        let bucket_id = self.max_bucket_id.load(Ordering::Relaxed);
+        self.buckets
+            .entry(bucket_id)
+            .or_insert_with(|| (0, false, UniqueVec::default()));
 
         for field_value in field_values {
             let mut size_increase = 0;
@@ -970,8 +969,6 @@ where
         new_field_values: Vec<FV>,
         now_ms: u64,
     ) -> Result<(usize, usize), BTreeError> {
-        use rustc_hash::FxHashSet;
-
         // 去重
         let old_set: FxHashSet<_> = old_field_values.into_iter().collect();
         let new_set: FxHashSet<_> = new_field_values.into_iter().collect();
@@ -981,13 +978,14 @@ where
         // 需要删除的值 = 旧集合 - 新集合
         let to_remove: Vec<_> = old_set.difference(&new_set).cloned().collect();
 
-        let removed = if !to_remove.is_empty() {
-            self.remove_array(doc_id.clone(), to_remove, now_ms)
+        let inserted = if !to_insert.is_empty() {
+            self.insert_array(doc_id.clone(), to_insert, now_ms)?
         } else {
             0
         };
-        let inserted = if !to_insert.is_empty() {
-            self.insert_array(doc_id, to_insert, now_ms)?
+
+        let removed = if !to_remove.is_empty() {
+            self.remove_array(doc_id, to_remove, now_ms)
         } else {
             0
         };
@@ -1238,48 +1236,46 @@ where
                 }
             }
             RangeQuery::Gt(start_key) => {
-                for k in self.btree.read().range((
-                    std::ops::Bound::Excluded(start_key),
-                    std::ops::Bound::Unbounded,
-                )) {
-                    results.push(k.clone());
-                }
+                results.extend(
+                    self.btree
+                        .read()
+                        .range((
+                            std::ops::Bound::Excluded(start_key),
+                            std::ops::Bound::Unbounded,
+                        ))
+                        .cloned(),
+                );
             }
             RangeQuery::Ge(start_key) => {
-                for k in self
-                    .btree
-                    .read()
-                    .range(std::ops::RangeFrom { start: start_key })
-                {
-                    results.push(k.clone());
-                }
+                results.extend(
+                    self.btree
+                        .read()
+                        .range(std::ops::RangeFrom { start: start_key })
+                        .cloned(),
+                );
             }
             RangeQuery::Lt(end_key) => {
-                for k in self.btree.read().range(std::ops::RangeTo { end: end_key }) {
-                    results.push(k.clone());
-                }
+                results.extend(
+                    self.btree
+                        .read()
+                        .range(std::ops::RangeTo { end: end_key })
+                        .cloned(),
+                );
             }
             RangeQuery::Le(end_key) => {
-                for k in self
-                    .btree
-                    .read()
-                    .range(std::ops::RangeToInclusive { end: end_key })
-                {
-                    results.push(k.clone());
-                }
+                results.extend(
+                    self.btree
+                        .read()
+                        .range(std::ops::RangeToInclusive { end: end_key })
+                        .cloned(),
+                );
             }
             RangeQuery::Between(start_key, end_key) => {
-                for k in self.btree.read().range(start_key..=end_key) {
-                    results.push(k.clone());
-                }
+                results.extend(self.btree.read().range(start_key..=end_key).cloned());
             }
             RangeQuery::Include(keys) => {
                 let btree = self.btree.read();
-                for k in keys.into_iter() {
-                    if btree.contains(&k) {
-                        results.push(k.clone());
-                    }
-                }
+                results.extend(keys.into_iter().filter(|k| btree.contains(k)));
             }
             RangeQuery::And(queries) => {
                 let mut iter = queries.into_iter();
@@ -1288,11 +1284,8 @@ where
                         self.range_keys(*query).into_iter().collect();
 
                     for query in iter {
-                        let keys: BTreeSet<FV> = self.range_keys(*query).into_iter().collect();
-                        intersection = intersection
-                            .intersection(&keys)
-                            .cloned()
-                            .collect::<BTreeSet<_>>();
+                        let keys: FxHashSet<FV> = self.range_keys(*query).into_iter().collect();
+                        intersection.retain(|k| keys.contains(k));
                         if intersection.is_empty() {
                             return vec![];
                         }
@@ -1304,8 +1297,7 @@ where
             RangeQuery::Or(queries) => {
                 let mut seen = FxHashSet::default();
                 for query in queries {
-                    let keys = self.range_keys(*query);
-                    for k in keys {
+                    for k in self.range_keys(*query) {
                         if seen.insert(k.clone()) {
                             results.push(k);
                         }
@@ -1314,11 +1306,13 @@ where
             }
             RangeQuery::Not(query) => {
                 let exclude: FxHashSet<FV> = self.range_keys(*query).into_iter().collect();
-                for k in self.btree.read().iter() {
-                    if !exclude.contains(k) {
-                        results.push(k.clone());
-                    }
-                }
+                results.extend(
+                    self.btree
+                        .read()
+                        .iter()
+                        .filter(|k| !exclude.contains(k))
+                        .cloned(),
+                );
             }
         }
 
@@ -1367,6 +1361,8 @@ where
         }
 
         let mut meta = self.metadata();
+        // Atomically claim the right to serialize this version.
+        // Only one concurrent caller will see prev < meta.stats.version and proceed.
         let prev_saved_version = self
             .last_saved_version
             .fetch_max(meta.stats.version, Ordering::Relaxed);
@@ -1376,12 +1372,15 @@ where
         }
 
         meta.stats.last_saved = now_ms.max(meta.stats.last_saved);
-        ciborium::into_writer(&BTreeIndexRef { metadata: &meta }, w).map_err(|err| {
-            BTreeError::Serialization {
+        if let Err(err) = ciborium::into_writer(&BTreeIndexRef { metadata: &meta }, w) {
+            // Serialization failed: revert last_saved_version so the next call can retry.
+            self.last_saved_version
+                .fetch_min(prev_saved_version, Ordering::Relaxed);
+            return Err(BTreeError::Serialization {
                 name: self.name.clone(),
                 source: err.into(),
-            }
-        })?;
+            });
+        }
 
         self.update_metadata(|m| {
             m.stats.last_saved = meta.stats.last_saved.max(m.stats.last_saved);
@@ -1414,24 +1413,28 @@ where
         let mut buf = Vec::with_capacity(4096);
         for mut bucket in self.buckets.iter_mut() {
             if bucket.1 {
-                // If the bucket is dirty, it needs to be persisted
-                let postings: FxHashMap<_, _> = bucket
-                    .2
-                    .iter()
-                    .filter_map(|fv| self.postings.get(fv).map(|p| (fv, p)))
-                    .collect();
+                // If the bucket is dirty, it needs to be persisted.
+                // Scope the postings Ref guards so they are dropped before the
+                // potentially slow async write, reducing lock contention.
+                {
+                    let postings: FxHashMap<_, _> = bucket
+                        .2
+                        .iter()
+                        .filter_map(|fv| self.postings.get(fv).map(|p| (fv, p)))
+                        .collect();
 
-                buf.clear();
-                ciborium::into_writer(
-                    &BucketRef {
-                        postings: &postings,
-                    },
-                    &mut buf,
-                )
-                .map_err(|err| BTreeError::Serialization {
-                    name: self.name.clone(),
-                    source: err.into(),
-                })?;
+                    buf.clear();
+                    ciborium::into_writer(
+                        &BucketRef {
+                            postings: &postings,
+                        },
+                        &mut buf,
+                    )
+                    .map_err(|err| BTreeError::Serialization {
+                        name: self.name.clone(),
+                        source: err.into(),
+                    })?;
+                }
 
                 if let Ok(conti) = f(*bucket.key(), &buf).await {
                     // Only mark as clean if persistence was successful, otherwise wait for next round
