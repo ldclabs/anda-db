@@ -1673,18 +1673,22 @@ impl Collection {
             Filter::And(queries) => {
                 let mut iter = queries.into_iter();
                 if let Some(query) = iter.next() {
-                    let mut rt: UniqueVec<u64> = self.filter_by_field_with(*query, None, 0)?.into();
+                    let mut rt: FxHashSet<DocumentId> = self
+                        .filter_by_field_with(*query, candidates, 0)?
+                        .into_iter()
+                        .collect();
 
                     for query in iter {
-                        let keys: UniqueVec<u64> =
-                            self.filter_by_field_with(*query, None, 0)?.into();
-                        rt.intersect_with(&keys);
+                        rt = self
+                            .filter_by_field_with(*query, Some(&rt), 0)?
+                            .into_iter()
+                            .collect();
                         if rt.is_empty() {
                             return Ok(vec![]);
                         }
                     }
 
-                    result = rt.into();
+                    result = rt.into_iter().collect();
                     // 由调用方控制结果长度
                     // if limit > 0 && result.len() > limit {
                     //     result.truncate(limit);
