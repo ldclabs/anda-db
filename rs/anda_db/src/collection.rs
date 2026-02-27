@@ -1458,7 +1458,9 @@ impl Collection {
 
             let reranker = params.reranker.unwrap_or_default();
             let reranked = reranker.rerank(&results);
-            candidates.extend(reranked.into_iter().map(|(id, _)| id));
+            let mut uniq_candidates = UniqueVec::with_capacity(top_k);
+            uniq_candidates.extend(reranked.into_iter().map(|(id, _)| id));
+            candidates = uniq_candidates.into();
 
             if candidates.is_empty() {
                 return Ok(result);
@@ -1591,10 +1593,23 @@ impl Collection {
         limit: usize,
     ) -> Result<Vec<DocumentId>, DBError> {
         if candidates.is_empty() {
-            self.filter_by_field_with(filter, None, limit)
+            let mut result = self.filter_by_field_with(filter, None, limit)?;
+            result.sort_unstable();
+            Ok(result)
         } else {
             let cand_set: FxHashSet<DocumentId> = candidates.iter().copied().collect();
-            self.filter_by_field_with(filter, Some(&cand_set), limit)
+            let matched: FxHashSet<DocumentId> = self
+                .filter_by_field_with(filter, Some(&cand_set), 0)?
+                .into_iter()
+                .collect();
+
+            let mut result = Vec::with_capacity(matched.len().min(candidates.len()));
+            for id in candidates {
+                if matched.contains(id) {
+                    result.push(*id);
+                }
+            }
+            Ok(result)
         }
     }
 
@@ -2732,6 +2747,30 @@ mod tests {
         let stats = collection.stats();
         assert_eq!(stats.num_documents, 0);
         assert_eq!(stats.delete_count, 1);
+
+        db.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_filter_by_field_result_ordering() -> Result<(), DBError> {
+        let db = setup_test_db().await?;
+        let collection = create_test_collection(&db, async |_| Ok(())).await?;
+
+        for (name, age) in [("Alice", 30_u32), ("Bob", 25_u32), ("Charlie", 35_u32)] {
+            let doc = create_test_doc(0, name, age, vec!["x"]);
+            collection.add_from(&doc).await?;
+        }
+
+        // candidates 为空：结果应为正序
+        let filter_all = Filter::Field((Schema::ID_KEY.to_string(), RangeQuery::Gt(Fv::U64(0))));
+        let ids = collection.filter_by_field(filter_all, &[], 0)?;
+        assert_eq!(ids, vec![1, 2, 3]);
+
+        // candidates 非空：结果顺序应遵循 candidates 顺序
+        let filter_subset = Filter::Field((Schema::ID_KEY.to_string(), RangeQuery::Ge(Fv::U64(2))));
+        let ids = collection.filter_by_field(filter_subset, &[3, 1, 2], 0)?;
+        assert_eq!(ids, vec![3, 2]);
 
         db.close().await?;
         Ok(())
