@@ -58,14 +58,28 @@ pub struct BM25Index<T: Tokenizer + Clone> {
 
 #[derive(Default)]
 struct Bucket {
-    // Indicates if the bucket has new data that needs to be persisted
-    is_dirty: bool,
+    /// Version counter incremented on each modification
+    dirty_version: u64,
+    /// Version that was last successfully persisted
+    saved_version: u64,
     // Current size of the bucket in bytes
     size: usize,
     // List of tokens stored in this bucket
     tokens: UniqueVec<String>,
     // Set of document IDs associated with this bucket
     doc_ids: FxHashSet<u64>,
+}
+
+impl Bucket {
+    #[inline]
+    fn is_dirty(&self) -> bool {
+        self.dirty_version > self.saved_version
+    }
+
+    #[inline]
+    fn mark_dirty(&mut self) {
+        self.dirty_version += 1;
+    }
 }
 
 /// Parameters for the BM25 ranking algorithm
@@ -486,10 +500,10 @@ where
         // Phase 2: Update bucket states
         // tokens_to_migrate: (old_bucket_id, token, size)
         let mut tokens_to_migrate: Vec<(u32, String, usize)> = Vec::new();
-        for (id, val) in buckets_to_update {
-            let mut bucket = self.buckets.entry(id).or_default();
+        for (bid, val) in buckets_to_update {
+            let mut bucket = self.buckets.entry(bid).or_default();
             // Mark as dirty, needs to be persisted
-            bucket.is_dirty = true;
+            bucket.mark_dirty();
             for (token, size) in val {
                 if bucket.tokens.is_empty() || bucket.size + size < self.config.bucket_overload_size
                 {
@@ -497,7 +511,7 @@ where
                         bucket.size += size;
                     }
                 } else {
-                    tokens_to_migrate.push((id, token, size));
+                    tokens_to_migrate.push((bid, token, size));
                 }
             }
         }
@@ -515,7 +529,7 @@ where
                     && ob.tokens.swap_remove_if(|k| &token == k).is_some()
                 {
                     ob.size = ob.size.saturating_sub(size);
-                    ob.is_dirty = true;
+                    ob.mark_dirty();
                 }
 
                 let mut next_new_bucket = false;
@@ -524,7 +538,7 @@ where
 
                     if nb.tokens.is_empty() || nb.size + size < self.config.bucket_overload_size {
                         // Bucket has enough space, update directly
-                        nb.is_dirty = true;
+                        nb.mark_dirty();
                         nb.size += size;
                         nb.tokens.push(token.clone());
                         nb.doc_ids.insert(id);
@@ -541,7 +555,7 @@ where
                         posting.0 = next_bucket_id;
                     }
                     let mut nb = self.buckets.entry(next_bucket_id).or_default();
-                    nb.is_dirty = true;
+                    nb.mark_dirty();
                     nb.size += size;
                     nb.tokens.push(token.clone());
                 }
@@ -554,7 +568,7 @@ where
                 .insert(id);
         } else {
             let mut b = self.buckets.entry(bucket_id).or_default();
-            b.is_dirty = true;
+            b.mark_dirty();
             b.doc_ids.insert(id);
         }
 
@@ -634,7 +648,7 @@ where
         for (bucket_id, val) in buckets_to_update {
             if let Some(mut b) = self.buckets.get_mut(&bucket_id) {
                 // Mark as dirty, needs to be persisted
-                b.is_dirty = true;
+                b.mark_dirty();
                 for (token, size_decrease) in val {
                     b.size = b.size.saturating_sub(size_decrease);
                     if tokens_to_remove.contains(&token) {
@@ -648,7 +662,7 @@ where
         if !removed_id {
             for mut bucket in self.buckets.iter_mut() {
                 if bucket.doc_ids.remove(&id) {
-                    bucket.is_dirty = true;
+                    bucket.mark_dirty();
                     break;
                 }
             }
@@ -678,11 +692,7 @@ where
         let scored_docs = self.score_term(query.trim(), params);
 
         self.search_count.fetch_add(1, Ordering::Relaxed);
-        let mut sorted_scores: Vec<(u64, f32)> = scored_docs.into_iter().collect();
-        // Convert to vector and sort by score (descending)
-        sorted_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        sorted_scores.truncate(top_k);
-        sorted_scores
+        Self::top_k_results(scored_docs, top_k)
     }
 
     /// Searches the index for documents matching the query expression
@@ -707,11 +717,20 @@ where
         let scored_docs = self.execute_query(&query_expr, params, false);
 
         self.search_count.fetch_add(1, Ordering::Relaxed);
-        // Convert to vector and sort by score (descending)
-        let mut results: Vec<(u64, f32)> = scored_docs.into_iter().collect();
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        results.truncate(top_k);
+        Self::top_k_results(scored_docs, top_k)
+    }
 
+    /// Extracts the top-k results from scored documents using partial sorting.
+    /// Uses `select_nth_unstable_by` for O(n + k·log(k)) instead of O(n·log(n)).
+    fn top_k_results(scored_docs: FxHashMap<u64, f32>, top_k: usize) -> Vec<(u64, f32)> {
+        let mut results: Vec<(u64, f32)> = scored_docs.into_iter().collect();
+        if results.len() > top_k && top_k > 0 {
+            results.select_nth_unstable_by(top_k - 1, |a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            results.truncate(top_k);
+        }
+        results.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         results
     }
 
@@ -730,7 +749,8 @@ where
         }
     }
 
-    /// Scores a single term
+    /// Scores a single term (or multi-term query text) using BM25.
+    /// Accumulates scores directly without intermediate allocations.
     fn score_term(&self, term: &str, params: &BM25Params) -> FxHashMap<u64, f32> {
         if self.postings.is_empty() {
             return FxHashMap::default();
@@ -749,49 +769,41 @@ where
         let mut scores: FxHashMap<u64, f32> =
             FxHashMap::with_capacity_and_hasher(self.doc_tokens.len().min(1000), FxBuildHasher);
         let doc_count = self.doc_tokens.len() as f32;
-        let avg_doc_tokens = self.avg_doc_tokens.read().max(1.0);
-        let term_scores: Vec<FxHashMap<u64, f32>> = query_terms
-            .iter()
-            .filter_map(|(term, _)| {
-                self.postings.get(term).map(|postings| {
-                    // Filter out deleted / not-loaded documents.
-                    // `remove()` depends on the caller providing original text; if they don't,
-                    // postings can become stale. Also, when only part of buckets are loaded,
-                    // postings might contain docs missing in `doc_tokens`.
-                    let mut docs: Vec<(u64, usize, f32)> = Vec::with_capacity(postings.1.len());
-                    for (doc_id, token_freq) in postings.1.iter() {
-                        if let Some(tokens) = self.doc_tokens.get(doc_id).map(|v| *v as f32) {
-                            docs.push((*doc_id, *token_freq, tokens));
-                        }
+        let avg_doc_tokens = *self.avg_doc_tokens.read();
+        let avg_doc_tokens = avg_doc_tokens.max(1.0);
+
+        for (query_token, _) in &query_terms {
+            if let Some(postings) = self.postings.get(query_token) {
+                // Two-pass approach: first count valid docs for IDF, then compute scores.
+                // This avoids allocating an intermediate Vec per query term.
+                // Filter out deleted / not-loaded documents.
+                // `remove()` depends on the caller providing original text; if they don't,
+                // postings can become stale. Also, when only part of buckets are loaded,
+                // postings might contain docs missing in `doc_tokens`.
+                let mut doc_freq: usize = 0;
+                for (doc_id, _) in postings.1.iter() {
+                    if self.doc_tokens.contains_key(doc_id) {
+                        doc_freq += 1;
                     }
+                }
 
-                    let doc_freq = docs.len() as f32;
-                    if doc_freq == 0.0 || doc_count == 0.0 {
-                        return FxHashMap::default();
+                if doc_freq == 0 || doc_count == 0.0 {
+                    continue;
+                }
+
+                // Classic Okapi BM25: ln(1 + (N - df + 0.5)/(df + 0.5))
+                let df = doc_freq as f32;
+                let idf = ((doc_count - df + 0.5) / (df + 0.5) + 1.0).ln();
+
+                // Compute BM25 score for each valid document
+                for (doc_id, token_freq) in postings.1.iter() {
+                    if let Some(doc_len) = self.doc_tokens.get(doc_id).map(|v| *v as f32) {
+                        let tf = *token_freq as f32;
+                        let tf_component = (tf * (k1 + 1.0))
+                            / (tf + k1 * (1.0 - b + b * doc_len / avg_doc_tokens));
+                        *scores.entry(*doc_id).or_default() += idf * tf_component;
                     }
-
-                    // Classic Okapi BM25: ln(1 + (N - df + 0.5)/(df + 0.5))
-                    let idf_raw = (doc_count - doc_freq + 0.5) / (doc_freq + 0.5);
-                    let idf = (idf_raw + 1.0).ln();
-
-                    // compute BM25 score for each document
-                    let mut term_scores = FxHashMap::default();
-                    for (doc_id, token_freq, tokens) in docs {
-                        let token_freq_f = token_freq as f32;
-                        let tf_component = (token_freq_f * (k1 + 1.0))
-                            / (token_freq_f + k1 * (1.0 - b + b * tokens / avg_doc_tokens));
-
-                        term_scores.insert(doc_id, idf * tf_component);
-                    }
-                    term_scores
-                })
-            })
-            .collect();
-
-        // merge term scores into a single score for each document
-        for term_score in term_scores {
-            for (doc_id, score) in term_score {
-                *scores.entry(doc_id).or_default() += score;
+                }
             }
         }
 
@@ -800,12 +812,15 @@ where
 
     /// Scores an OR query
     fn score_or(&self, subqueries: &[Box<QueryType>], params: &BM25Params) -> FxHashMap<u64, f32> {
-        let mut result = FxHashMap::default();
         if subqueries.is_empty() {
-            return result;
+            return FxHashMap::default();
+        }
+        if subqueries.len() == 1 {
+            return self.execute_query(&subqueries[0], params, false);
         }
 
         // Execute all subqueries and merge results
+        let mut result = FxHashMap::default();
         for subquery in subqueries {
             let sub_result = self.execute_query(subquery, params, false);
 
@@ -821,6 +836,9 @@ where
     fn score_and(&self, subqueries: &[Box<QueryType>], params: &BM25Params) -> FxHashMap<u64, f32> {
         if subqueries.is_empty() {
             return FxHashMap::default();
+        }
+        if subqueries.len() == 1 {
+            return self.execute_query(&subqueries[0], params, false);
         }
 
         // Execute the first subquery
@@ -917,12 +935,15 @@ where
 
         meta.stats.last_saved = now_ms.max(meta.stats.last_saved);
 
-        ciborium::into_writer(&BM25IndexRef { metadata: &meta }, w).map_err(|err| {
-            BM25Error::Serialization {
+        if let Err(err) = ciborium::into_writer(&BM25IndexRef { metadata: &meta }, w) {
+            // Serialization failed: revert last_saved_version so the next call can retry.
+            self.last_saved_version
+                .fetch_min(prev_saved_version, Ordering::Relaxed);
+            return Err(BM25Error::Serialization {
                 name: self.name.clone(),
                 source: err.into(),
-            }
-        })?;
+            });
+        }
 
         self.update_metadata(|m| {
             m.stats.last_saved = meta.stats.last_saved.max(m.stats.last_saved);
@@ -931,14 +952,30 @@ where
         Ok(true)
     }
 
-    /// Stores dirty buckets to persistent storage using the provided async function
+    /// Stores dirty buckets to persistent storage using the provided async function.
+    /// Serializes each dirty bucket synchronously and releases all DashMap locks
+    /// before making async persistence calls to minimize lock contention.
     pub async fn store_dirty_buckets<F>(&self, mut f: F) -> Result<(), BM25Error>
     where
         F: AsyncFnMut(u32, &[u8]) -> Result<bool, BoxError>,
     {
+        // Collect dirty bucket IDs to avoid holding iter locks during async calls
+        let dirty_buckets: Vec<(u32, u64)> = self
+            .buckets
+            .iter()
+            .filter(|b| b.is_dirty())
+            .map(|b| (*b.key(), b.dirty_version))
+            .collect();
+
         let mut buf = Vec::with_capacity(4096);
-        for mut bucket in self.buckets.iter_mut() {
-            if bucket.is_dirty {
+        for (bucket_id, snapshot_version) in dirty_buckets {
+            // Serialize within a scoped block to release all DashMap locks before async call
+            {
+                let bucket = match self.buckets.get(&bucket_id) {
+                    Some(b) if b.is_dirty() => b,
+                    _ => continue,
+                };
+
                 let postings: FxHashMap<_, _> = bucket
                     .tokens
                     .iter()
@@ -963,19 +1000,22 @@ where
                     name: self.name.clone(),
                     source: err.into(),
                 })?;
+            } // All DashMap Ref/RefMut guards dropped here
 
-                let conti = f(*bucket.key(), &buf)
-                    .await
-                    .map_err(|err| BM25Error::Generic {
-                        name: self.name.clone(),
-                        source: err,
-                    })?;
+            let conti = f(bucket_id, &buf).await.map_err(|err| BM25Error::Generic {
+                name: self.name.clone(),
+                source: err,
+            })?;
 
-                // Only mark as clean if persistence was successful.
-                bucket.is_dirty = false;
-                if !conti {
-                    return Ok(());
-                }
+            // Use version-based dirty tracking: only mark as saved up to the snapshot version.
+            // If another write incremented dirty_version after our snapshot, the bucket
+            // will remain dirty and be re-persisted on the next flush.
+            if let Some(mut b) = self.buckets.get_mut(&bucket_id) {
+                b.saved_version = b.saved_version.max(snapshot_version);
+            }
+
+            if !conti {
+                return Ok(());
             }
         }
 

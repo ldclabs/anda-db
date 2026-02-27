@@ -2,7 +2,7 @@
 name = "anda_db_tfs"
 description = "A full-text search library using the BM25 ranking algorithm in Rust."
 repository = "https://github.com/ldclabs/anda_db/tree/main/rs/anda_db_tfs"
-version = "0.5.5"
+version = "0.5.6"
 publish = true
 edition.workspace = true
 keywords.workspace = true
