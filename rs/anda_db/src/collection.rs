@@ -1621,7 +1621,7 @@ impl Collection {
                     result.reserve_exact(limit);
                     let _: Vec<()> = index.range_query_with(filter, |_, ids| {
                         for id in ids {
-                            if candidates.map_or(true, |s| s.contains(id)) {
+                            if candidates.is_none_or(|s| s.contains(id)) {
                                 result.push(*id);
                                 if limit > 0 && result.len() >= limit {
                                     return (false, vec![]);
@@ -1684,7 +1684,7 @@ impl Collection {
                     .into_iter()
                     .collect();
                 for id in self.doc_ids_index.read().iter() {
-                    if !exclude.contains(id) && candidates.map_or(true, |s| s.contains(id)) {
+                    if !exclude.contains(id) && candidates.is_none_or(|s| s.contains(id)) {
                         result.push(*id);
                         if limit > 0 && result.len() >= limit {
                             break;
@@ -1715,7 +1715,7 @@ impl Collection {
         match query {
             RangeQuery::Eq(id) => {
                 if self.doc_ids_index.read().contains(&id)
-                    && candidates.map_or(true, |s| s.contains(&id))
+                    && candidates.is_none_or(|s| s.contains(&id))
                 {
                     result.push(id);
                 }
@@ -1726,7 +1726,7 @@ impl Collection {
                     std::ops::Bound::Excluded(start_key),
                     std::ops::Bound::Unbounded,
                 )) {
-                    if candidates.map_or(true, |s| s.contains(id)) {
+                    if candidates.is_none_or(|s| s.contains(id)) {
                         result.push(*id);
                         if limit > 0 && result.len() >= limit {
                             return result;
@@ -1741,7 +1741,7 @@ impl Collection {
                     .read()
                     .range(std::ops::RangeFrom { start: start_key })
                 {
-                    if candidates.map_or(true, |s| s.contains(id)) {
+                    if candidates.is_none_or(|s| s.contains(id)) {
                         result.push(*id);
                         if limit > 0 && result.len() >= limit {
                             return result;
@@ -1758,7 +1758,7 @@ impl Collection {
                     .range(std::ops::RangeTo { end: end_key })
                     .rev()
                 {
-                    if candidates.map_or(true, |s| s.contains(id)) {
+                    if candidates.is_none_or(|s| s.contains(id)) {
                         tmp.push(*id);
                         if limit > 0 && tmp.len() >= limit {
                             break;
@@ -1777,7 +1777,7 @@ impl Collection {
                     .range(std::ops::RangeToInclusive { end: end_key })
                     .rev()
                 {
-                    if candidates.map_or(true, |s| s.contains(id)) {
+                    if candidates.is_none_or(|s| s.contains(id)) {
                         tmp.push(*id);
                         if limit > 0 && tmp.len() >= limit {
                             break;
@@ -1792,7 +1792,7 @@ impl Collection {
                     limit.min(end_key.saturating_sub(start_key).saturating_add(1) as usize),
                 );
                 for id in self.doc_ids_index.read().range(start_key..=end_key) {
-                    if candidates.map_or(true, |s| s.contains(id)) {
+                    if candidates.is_none_or(|s| s.contains(id)) {
                         result.push(*id);
                         if limit > 0 && result.len() >= limit {
                             return result;
@@ -1804,7 +1804,7 @@ impl Collection {
                 result.reserve_exact(limit.min(ids.len()));
                 let doc_ids_index = self.doc_ids_index.read();
                 for id in ids.into_iter() {
-                    if doc_ids_index.contains(&id) && candidates.map_or(true, |s| s.contains(&id)) {
+                    if doc_ids_index.contains(&id) && candidates.is_none_or(|s| s.contains(&id)) {
                         result.push(id);
                         if limit > 0 && result.len() >= limit {
                             return result;
@@ -1854,7 +1854,7 @@ impl Collection {
                 let exclude: FxHashSet<u64> =
                     self.filter_by_id(*query, None, 0).into_iter().collect();
                 for id in self.doc_ids_index.read().iter() {
-                    if !exclude.contains(id) && candidates.map_or(true, |s| s.contains(id)) {
+                    if !exclude.contains(id) && candidates.is_none_or(|s| s.contains(id)) {
                         result.push(*id);
                         if limit > 0 && result.len() >= limit {
                             return result;

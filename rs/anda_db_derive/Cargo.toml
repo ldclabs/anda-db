@@ -2,7 +2,7 @@
 name = "anda_db_derive"
 description = "A Rust procedural macro crate that provides derive macros for AndaDB schema types."
 repository = "https://github.com/ldclabs/anda_db/tree/main/rs/anda_db_derive"
-version = "0.4.3"
+version = "0.4.4"
 publish = true
 edition.workspace = true
 keywords.workspace = true
@@ -18,8 +18,3 @@ quote = "1.0"
 proc-macro2 = "1.0"
 
 [dev-dependencies]
-half = { workspace = true }
-serde = { workspace = true, features = ["derive"] }
-serde_bytes = { workspace = true }
-serde_json = { workspace = true }
-ic_auth_types = { workspace = true }

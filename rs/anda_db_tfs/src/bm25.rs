@@ -772,7 +772,7 @@ where
         let avg_doc_tokens = *self.avg_doc_tokens.read();
         let avg_doc_tokens = avg_doc_tokens.max(1.0);
 
-        for (query_token, _) in &query_terms {
+        for query_token in query_terms.keys() {
             if let Some(postings) = self.postings.get(query_token) {
                 // Two-pass approach: first count valid docs for IDF, then compute scores.
                 // This avoids allocating an intermediate Vec per query term.

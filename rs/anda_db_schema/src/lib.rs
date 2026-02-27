@@ -37,10 +37,12 @@ pub fn validate_field_name(s: &str) -> Result<(), SchemaError> {
         )));
     }
 
-    for c in s.chars() {
-        if !matches!(c, 'a'..='z' | '0'..='9' | '_' ) {
+    // Only ASCII characters are allowed, so byte-level checking is sufficient and faster
+    for &b in s.as_bytes() {
+        if !matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_' ) {
             return Err(SchemaError::FieldName(format!(
-                "Invalid character {c:?} in {s:?}"
+                "Invalid character {:?} in {s:?}",
+                char::from(b)
             )));
         }
     }

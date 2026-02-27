@@ -286,7 +286,7 @@ impl Document {
         T: Serialize,
     {
         let field = self.schema.get_field_or_err(name)?;
-        let value = Fv::serialized(&value, Some(field.r#type()))?;
+        let value = Fv::serialized(value, Some(field.r#type()))?;
         field.validate(&value)?;
         self.fields.insert(field.idx(), value);
         Ok(self)

@@ -1068,9 +1068,8 @@ impl FieldValue {
                     }
 
                     let mut rt: Vec<FieldValue> = Vec::with_capacity(types.len());
-                    for (i, ft) in types.iter().enumerate() {
-                        let val = ft.extract(values[i].clone())?;
-                        rt.push(val);
+                    for (ft, val) in types.iter().zip(values) {
+                        rt.push(ft.extract(val)?);
                     }
 
                     Ok(FieldValue::Array(rt))
@@ -1338,11 +1337,14 @@ impl FieldEntry {
         &self.r#type
     }
 
+    /// Check if this field is required.
+    ///
+    /// A field is required if its type is NOT `FieldType::Option(_)`.
+    ///
+    /// # Returns
+    /// * `bool` - True if the field is required
     pub fn required(&self) -> bool {
-        if let FieldType::Option(_) = self.r#type {
-            return false;
-        }
-        true
+        !matches!(self.r#type, FieldType::Option(_))
     }
 
     /// Check if the field is unique
@@ -1393,7 +1395,7 @@ impl FieldEntry {
     /// * `Result<(), SchemaError>` - Ok if valid, or an error message if invalid
     pub fn validate(&self, value: &FieldValue) -> Result<(), SchemaError> {
         if value == &FieldValue::Null {
-            if let FieldType::Option(_) = self.r#type {
+            if matches!(self.r#type, FieldType::Option(_)) {
                 return Ok(());
             }
 
