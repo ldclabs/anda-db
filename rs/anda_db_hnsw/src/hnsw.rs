@@ -119,7 +119,7 @@ pub enum SelectNeighborsStrategy {
     Simple,
 
     /// Heuristic neighbor selection algorithm (NN-descent) that considers diversity.
-    /// It will comsume more time to build the index, but will improve search performance.
+    /// It will consume more time to build the index, but will improve search performance.
     Heuristic,
 }
 
@@ -621,8 +621,9 @@ impl HnswIndex {
         {
             // 更新入口点（如果需要）和元数据
             let mut entry_point_guard = self.entry_point.write();
-            if layer > entry_point_guard.1 || entry_point_guard.0 == 0 {
-                // Update if new node is higher layer OR if entry point was 0 (first node case)
+            if layer > entry_point_guard.1 || !nodes.contains_key(&entry_point_guard.0) {
+                // Update if new node is at a higher layer OR if the current entry point
+                // no longer exists (e.g., was concurrently deleted).
                 *entry_point_guard = (id, layer);
             }
             // Release entry point lock before metadata lock
@@ -747,24 +748,37 @@ impl HnswIndex {
     ///
     /// * `bool` - True if the node was deleted, false otherwise
     pub fn remove(&self, id: u64, now_ms: u64) -> bool {
-        let mut deleted = false;
-
         let nodes = self.nodes.pin();
-        if let Some(node) = nodes.remove(&id) {
-            deleted = true;
-            self.ids.write().remove(id);
-            self.try_update_entry_point(node);
-            self.update_metadata(|m| {
-                m.stats.version += 1;
-                m.stats.last_deleted = now_ms;
-                m.stats.delete_count += 1;
-            });
+        let Some(node) = nodes.remove(&id) else {
+            return false;
+        };
+
+        self.ids.write().remove(id);
+        self.try_update_entry_point(node);
+        self.update_metadata(|m| {
+            m.stats.version += 1;
+            m.stats.last_deleted = now_ms;
+            m.stats.delete_count += 1;
+        });
+
+        // Only iterate the deleted node's known neighbors instead of scanning ALL nodes.
+        // This reduces complexity from O(N) to O(K*L) where K=max_connections, L=max_layers.
+        // Note: nodes that reference the deleted node but are NOT in the deleted node's
+        // neighbor list (due to pruning) will retain stale references. These stale references
+        // are harmlessly skipped during search (nodes.get() returns None).
+        let mut neighbor_ids: FxHashSet<u64> = FxHashSet::with_capacity_and_hasher(
+            node.neighbors.iter().map(|l| l.len()).sum(),
+            FxBuildHasher,
+        );
+        for layer_neighbors in &node.neighbors {
+            for &(nid, _) in layer_neighbors {
+                neighbor_ids.insert(nid);
+            }
         }
 
-        if deleted {
-            let mut dirty_nodes = BTreeSet::new();
-            // 遍历所有节点，删除与已删除节点的连接
-            for n in nodes.values() {
+        let mut dirty_nodes = BTreeSet::new();
+        for &neighbor_id in &neighbor_ids {
+            if let Some(n) = nodes.get(&neighbor_id) {
                 let mut updated = false;
                 let mut o = Cow::Borrowed(n);
                 for layer in 0..=(n.layer as usize) {
@@ -775,17 +789,17 @@ impl HnswIndex {
                 }
                 if updated {
                     o.to_mut().version += 1;
-                    dirty_nodes.insert(n.id);
-                    nodes.insert(n.id, o.into_owned());
+                    dirty_nodes.insert(neighbor_id);
+                    nodes.insert(neighbor_id, o.into_owned());
                 }
-            }
-
-            if !dirty_nodes.is_empty() {
-                self.dirty_nodes.write().extend(dirty_nodes);
             }
         }
 
-        deleted
+        if !dirty_nodes.is_empty() {
+            self.dirty_nodes.write().extend(dirty_nodes);
+        }
+
+        true
     }
 
     /// Searches for the k nearest neighbors to the query vector
@@ -948,25 +962,11 @@ impl HnswIndex {
                             match self.get_distance_with_cache(distance_cache, query, neighbor_node)
                             {
                                 Ok(dist) => {
-                                    if let Some((OrderedFloat(max_dist), _, _)) = results.peek() {
-                                        if &dist < max_dist || results.len() < ef {
-                                            candidates.push((
-                                                Reverse(OrderedFloat(dist)),
-                                                neighbor,
-                                                neighbor_node.layer,
-                                            ));
-                                            results.push((
-                                                OrderedFloat(dist),
-                                                neighbor,
-                                                neighbor_node.layer,
-                                            ));
-
-                                            // Prune distant results
-                                            if results.len() > ef {
-                                                results.pop();
-                                            }
-                                        }
-                                    } else {
+                                    // results always has ≥1 element (the entry point),
+                                    // so peek() always returns Some here.
+                                    if let Some((OrderedFloat(max_dist), _, _)) = results.peek()
+                                        && (&dist < max_dist || results.len() < ef)
+                                    {
                                         candidates.push((
                                             Reverse(OrderedFloat(dist)),
                                             neighbor,
@@ -977,6 +977,11 @@ impl HnswIndex {
                                             neighbor,
                                             neighbor_node.layer,
                                         ));
+
+                                        // Prune distant results
+                                        if results.len() > ef {
+                                            results.pop();
+                                        }
                                     }
                                 }
                                 Err(e) => {
@@ -1244,17 +1249,21 @@ impl HnswIndex {
         }
 
         meta.stats.last_saved = now_ms.max(meta.stats.last_saved);
-        ciborium::into_writer(
+        if let Err(err) = ciborium::into_writer(
             &HnswIndexRef {
                 entry_point: *self.entry_point.read(),
                 metadata: &meta,
             },
             w,
-        )
-        .map_err(|err| HnswError::Serialization {
-            name: self.name.clone(),
-            source: err.into(),
-        })?;
+        ) {
+            // Serialization failed: revert last_saved_version so the next call can retry.
+            self.last_saved_version
+                .fetch_min(prev_saved_version, Ordering::Relaxed);
+            return Err(HnswError::Serialization {
+                name: self.name.clone(),
+                source: err.into(),
+            });
+        }
 
         self.update_metadata(|m| {
             m.stats.last_saved = meta.stats.last_saved.max(m.stats.last_saved);
