@@ -15,21 +15,24 @@ use crate::ast::*;
 // --- Top Level KQL Parser ---
 
 pub fn parse_kql_query(input: &str) -> VResult<'_, KqlQuery> {
-    map(
-        (
-            ws(parse_find_clause),
-            ws(parse_where_block),
-            opt(ws(parse_order_by_clause)),
-            opt(ws(parse_limit_clause)),
-            opt(ws(parse_cursor_clause)),
+    context(
+        "KQL query: FIND(...) WHERE { ... } [ORDER BY ...] [LIMIT N] [CURSOR \"...\"]",
+        map(
+            (
+                ws(parse_find_clause),
+                cut(ws(parse_where_block)),
+                opt(ws(parse_order_by_clause)),
+                opt(ws(parse_limit_clause)),
+                opt(ws(parse_cursor_clause)),
+            ),
+            |(find_clause, where_clauses, order_by, limit, cursor)| KqlQuery {
+                find_clause,
+                where_clauses,
+                order_by,
+                limit,
+                cursor,
+            },
         ),
-        |(find_clause, where_clauses, order_by, limit, cursor)| KqlQuery {
-            find_clause,
-            where_clauses,
-            order_by,
-            limit,
-            cursor,
-        },
     )
     .parse(input)
 }
@@ -51,7 +54,11 @@ fn parse_find_clause(input: &str) -> VResult<'_, FindClause> {
 }
 
 fn parse_find_expression(input: &str) -> VResult<'_, FindExpression> {
-    alt((parse_aggregation_expression, parse_find_variable)).parse(input)
+    context(
+        "FIND expression: ?variable or COUNT(?var), SUM(?var), AVG(?var), MIN(?var), MAX(?var)",
+        alt((parse_aggregation_expression, parse_find_variable)),
+    )
+    .parse(input)
 }
 
 fn parse_find_variable(input: &str) -> VResult<'_, FindExpression> {
@@ -102,14 +109,17 @@ fn parse_where_group(input: &str) -> VResult<'_, Vec<WhereClause>> {
 }
 
 fn parse_single_where_clause(input: &str) -> VResult<'_, WhereClause> {
-    alt((
-        map(parse_optional_clause, WhereClause::Optional),
-        map(parse_not_clause, WhereClause::Not),
-        map(parse_union_expression, WhereClause::Union),
-        map(parse_filter_clause, WhereClause::Filter),
-        map(parse_concept_clause, WhereClause::Concept),
-        map(parse_prop_clause, WhereClause::Proposition),
-    ))
+    context(
+        "WHERE clause item: ?var {matcher} | (?s, \"pred\", ?o) | FILTER(...) | OPTIONAL {...} | NOT {...} | UNION {...}",
+        alt((
+            map(parse_optional_clause, WhereClause::Optional),
+            map(parse_not_clause, WhereClause::Not),
+            map(parse_union_expression, WhereClause::Union),
+            map(parse_filter_clause, WhereClause::Filter),
+            map(parse_concept_clause, WhereClause::Concept),
+            map(parse_prop_clause, WhereClause::Proposition),
+        )),
+    )
     .parse(input)
 }
 
@@ -338,17 +348,20 @@ fn parse_primary_expression(input: &str) -> VResult<'_, FilterExpression> {
 
 // 解析比较表达式
 fn parse_comparison_expression(input: &str) -> VResult<'_, FilterExpression> {
-    map(
-        (
-            parse_filter_operand,
-            ws(parse_comparison_operator),
-            parse_filter_operand,
+    context(
+        "FILTER comparison: ?var == value, ?var != value, ?var < value, etc.",
+        map(
+            (
+                parse_filter_operand,
+                ws(parse_comparison_operator),
+                cut(parse_filter_operand),
+            ),
+            |(left, operator, right)| FilterExpression::Comparison {
+                left,
+                operator,
+                right,
+            },
         ),
-        |(left, operator, right)| FilterExpression::Comparison {
-            left,
-            operator,
-            right,
-        },
     )
     .parse(input)
 }
@@ -367,10 +380,13 @@ fn parse_function_expression(input: &str) -> VResult<'_, FilterExpression> {
 
 // 解析过滤器操作数
 fn parse_filter_operand(input: &str) -> VResult<'_, FilterOperand> {
-    alt((
-        map(dot_path_var, FilterOperand::Variable),
-        map(kip_value, FilterOperand::Literal),
-    ))
+    context(
+        "FILTER operand: ?variable.path or literal value (string, number, true, false, null)",
+        alt((
+            map(dot_path_var, FilterOperand::Variable),
+            map(kip_value, FilterOperand::Literal),
+        )),
+    )
     .parse(input)
 }
 
@@ -435,12 +451,12 @@ fn parse_union_expression(input: &str) -> VResult<'_, Vec<WhereClause>> {
 
 fn parse_order_by_clause(input: &str) -> VResult<'_, Vec<OrderByCondition>> {
     context(
-        "KQL ORDER BY clause",
+        "ORDER BY ?variable [ASC|DESC], ...",
         preceded(
             ws(tag("ORDER ")),
             preceded(
                 ws(tag("BY ")),
-                separated_list1(ws(char(',')), parse_order_by_condition),
+                cut(separated_list1(ws(char(',')), parse_order_by_condition)),
             ),
         ),
     )

@@ -93,14 +93,14 @@ fn string<'a>() -> impl Parser<&'a str, Output = String, Error = VerboseError<&'
 // - Allow trailing comma
 fn array<'a>() -> impl Parser<&'a str, Output = Vec<Json>, Error = VerboseError<&'a str>> {
     context(
-        "JSON array [ ... ]",
+        "JSON array [value, ...]",
         delimited(
             char('['),
             cut(ws(terminated(
                 separated_list0(ws(char(',')), json_value()),
                 opt(ws(char(','))),
             ))),
-            char(']'),
+            cut(char(']')),
         ),
     )
 }
@@ -115,22 +115,25 @@ fn identifier<'a>() -> impl Parser<&'a str, Output = &'a str, Error = VerboseErr
 
 fn object<'a>() -> impl Parser<&'a str, Output = Map<String, Json>, Error = VerboseError<&'a str>> {
     context(
-        "JSON object { ... }",
+        "JSON object { key: value, ... }",
         map(
             delimited(
                 char('{'),
                 cut(ws(terminated(
                     separated_list0(
                         ws(char(',')),
-                        separated_pair(
-                            alt((string(), map(identifier(), |s| s.to_string()))),
-                            ws(char(':')),
-                            json_value(),
+                        context(
+                            "JSON key-value pair: key: value",
+                            separated_pair(
+                                alt((string(), map(identifier(), |s| s.to_string()))),
+                                cut(ws(char(':'))),
+                                cut(json_value()),
+                            ),
                         ),
                     ),
                     opt(ws(char(','))),
                 ))),
-                char('}'),
+                cut(char('}')),
             ),
             |key_values| key_values.into_iter().collect(),
         ),

@@ -14,10 +14,13 @@ use crate::ast::*;
 // --- Top Level META Parser ---
 
 pub fn parse_meta_command(input: &str) -> VResult<'_, MetaCommand> {
-    alt((
-        map(parse_describe_command, MetaCommand::Describe),
-        map(parse_search_command, MetaCommand::Search),
-    ))
+    context(
+        "META command: DESCRIBE ... or SEARCH ...",
+        alt((
+            map(parse_describe_command, MetaCommand::Describe),
+            map(parse_search_command, MetaCommand::Search),
+        )),
+    )
     .parse(input)
 }
 

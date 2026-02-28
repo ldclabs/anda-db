@@ -13,6 +13,7 @@ use nom::{
     Parser,
     branch::alt,
     combinator::{all_consuming, map},
+    error::context,
 };
 
 use crate::ast::{Command, Json, KmlStatement, KqlQuery, MetaCommand};
@@ -63,11 +64,14 @@ use crate::error::{KipError, format_nom_error};
 /// let meta_result = parse_kip("DESCRIBE PRIMER");
 /// ```
 pub fn parse_kip(input: &str) -> Result<Command, KipError> {
-    let rt = all_consuming(json::ws(alt((
-        map(kql::parse_kql_query, Command::Kql),
-        map(kml::parse_kml_statement, Command::Kml),
-        map(meta::parse_meta_command, Command::Meta),
-    ))))
+    let rt = all_consuming(json::ws(context(
+        "KIP command: FIND (KQL) | UPSERT/DELETE (KML) | DESCRIBE/SEARCH (META)",
+        alt((
+            map(kql::parse_kql_query, Command::Kql),
+            map(kml::parse_kml_statement, Command::Kml),
+            map(meta::parse_meta_command, Command::Meta),
+        )),
+    )))
     .parse(input)
     .map_err(|err| format_nom_error(input, err))?;
     Ok(rt.1)
@@ -887,5 +891,74 @@ WITH METADATA {
             }
             _ => panic!("Expected Upsert"),
         }
+    }
+
+    #[test]
+    fn test_error_messages_quality() {
+        // Helper to extract error message
+        fn err_msg(input: &str) -> String {
+            parse_kip(input).unwrap_err().message
+        }
+
+        // 1. Unterminated string
+        let msg = err_msg(r#"UPSERT { CONCEPT ?drug { {type: "Drug, name: "Aspirin"} } }"#);
+        println!("=== Unterminated string ===\n{msg}\n");
+        assert!(msg.contains("line"), "Should contain line number");
+        assert!(msg.contains("column"), "Should contain column number");
+
+        // 2. Missing closing brace
+        let msg = err_msg(r#"UPSERT { CONCEPT ?drug { {type: "Drug", name: "Aspirin"} }"#);
+        println!("=== Missing closing brace ===\n{msg}\n");
+        assert!(msg.contains("line"), "Should contain line number");
+
+        // 3. Wrong keyword (lowercase)
+        let msg = err_msg(r#"find(?drug) WHERE { ?drug {type: "Drug"} }"#);
+        println!("=== Wrong keyword ===\n{msg}\n");
+        assert!(
+            msg.contains("FIND")
+                || msg.contains("UPSERT")
+                || msg.contains("DESCRIBE")
+                || msg.contains("KIP"),
+            "Should mention valid KIP keywords"
+        );
+
+        // 4. Trailing content
+        let msg = err_msg(r#"DESCRIBE PRIMER extra_stuff"#);
+        println!("=== Trailing content ===\n{msg}\n");
+        assert!(
+            msg.contains("trailing")
+                || msg.contains("extra")
+                || msg.contains("Unexpected")
+                || msg.contains("Eof"),
+            "Should indicate trailing content issue"
+        );
+
+        // 5. Missing WHERE
+        let msg = err_msg(r#"FIND(?drug) { ?drug {type: "Drug"} }"#);
+        println!("=== Missing WHERE ===\n{msg}\n");
+        assert!(
+            msg.contains("WHERE") || msg.contains("line"),
+            "Should mention WHERE or show location"
+        );
+
+        // 6. Empty input
+        let msg = err_msg("");
+        println!("=== Empty input ===\n{msg}\n");
+        assert!(
+            msg.contains("end of input") || msg.contains("KIP"),
+            "Should mention empty/end of input"
+        );
+
+        // 7. Invalid JSON escape
+        let msg = err_msg(r#"UPSERT { CONCEPT ?drug { {type: "Drug", name: "test\x"} } }"#);
+        println!("=== Invalid escape ===\n{msg}\n");
+        assert!(msg.contains("line"), "Should contain line number");
+
+        // 8. Unclosed JSON array
+        let msg = err_msg(
+            r#"UPSERT { CONCEPT ?drug { {type: "Drug", name: "Aspirin"} SET ATTRIBUTES { tags: ["a", "b" } } }"#,
+        );
+        println!("=== Unclosed array ===\n{msg}\n");
+        assert!(msg.contains("line"), "Should contain line number");
     }
 }

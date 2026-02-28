@@ -40,16 +40,23 @@ where
 /// Parses a valid identifier (e.g., for variables, types, predicates).
 /// An identifier starts with a letter or underscore, followed by any combination of letters, digits, or underscores.
 pub fn identifier(input: &str) -> VResult<'_, &str> {
-    recognize(pair(
-        alt((alpha1, tag("_"))),
-        many0(alt((alphanumeric1, tag("_")))),
-    ))
+    context(
+        "identifier (letter or underscore, followed by letters, digits, underscores)",
+        recognize(pair(
+            alt((alpha1, tag("_"))),
+            many0(alt((alphanumeric1, tag("_")))),
+        )),
+    )
     .parse(input)
 }
 
 /// Parses a KIP variable, like `?my_var`.
 pub fn variable(input: &str) -> VResult<'_, String> {
-    map(preceded(char('?'), cut(identifier)), |s| s.to_string()).parse(input)
+    context(
+        "KIP variable: ?identifier",
+        map(preceded(char('?'), cut(identifier)), |s| s.to_string()),
+    )
+    .parse(input)
 }
 
 /// Parses a dot notation path, like `?var`, `?var.field` or `?var.attributes.key`.
@@ -81,13 +88,16 @@ pub fn dot_path_var(input: &str) -> VResult<'_, DotPathVar> {
 
 /// Parses any KIP value (string, number, boolean, null).
 pub fn kip_value(input: &str) -> VResult<'_, Value> {
-    alt((
-        value(Value::Null, tag_no_case("null")),
-        value(Value::Bool(true), tag_no_case("true")),
-        value(Value::Bool(false), tag_no_case("false")),
-        map(quoted_string, Value::String),
-        map(parse_number, Value::Number),
-    ))
+    context(
+        "KIP value: string, number, true, false, or null",
+        alt((
+            value(Value::Null, tag_no_case("null")),
+            value(Value::Bool(true), tag_no_case("true")),
+            value(Value::Bool(false), tag_no_case("false")),
+            map(quoted_string, Value::String),
+            map(parse_number, Value::Number),
+        )),
+    )
     .parse(input)
 }
 

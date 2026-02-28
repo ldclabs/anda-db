@@ -16,10 +16,13 @@ use crate::ast::*;
 // --- Top Level KML Parser ---
 
 pub fn parse_kml_statement(input: &str) -> VResult<'_, KmlStatement> {
-    alt((
-        map(parse_upsert_blocks, KmlStatement::Upsert),
-        map(parse_delete_statement, KmlStatement::Delete),
-    ))
+    context(
+        "KML statement: UPSERT { ... } or DELETE ...",
+        alt((
+            map(parse_upsert_blocks, KmlStatement::Upsert),
+            map(parse_delete_statement, KmlStatement::Delete),
+        )),
+    )
     .parse(input)
 }
 
@@ -51,10 +54,13 @@ fn parse_upsert_blocks(input: &str) -> VResult<'_, Vec<UpsertBlock>> {
 }
 
 fn parse_upsert_item(input: &str) -> VResult<'_, UpsertItem> {
-    alt((
-        map(parse_concept_block, UpsertItem::Concept),
-        map(parse_proposition_block, UpsertItem::Proposition),
-    ))
+    context(
+        "UPSERT item: CONCEPT ... or PROPOSITION ...",
+        alt((
+            map(parse_concept_block, UpsertItem::Concept),
+            map(parse_proposition_block, UpsertItem::Proposition),
+        )),
+    )
     .parse(input)
 }
 
@@ -145,12 +151,15 @@ fn parse_proposition_block(input: &str) -> VResult<'_, PropositionBlock> {
 fn parse_delete_statement(input: &str) -> VResult<'_, DeleteStatement> {
     preceded(
         ws(tag("DELETE ")),
-        cut(alt((
-            parse_delete_attributes,
-            parse_delete_metadata,
-            parse_delete_propositions,
-            parse_delete_concept,
-        ))),
+        cut(context(
+            "DELETE target: ATTRIBUTES | METADATA | PROPOSITIONS | CONCEPT",
+            alt((
+                parse_delete_attributes,
+                parse_delete_metadata,
+                parse_delete_propositions,
+                parse_delete_concept,
+            )),
+        )),
     )
     .parse(input)
 }

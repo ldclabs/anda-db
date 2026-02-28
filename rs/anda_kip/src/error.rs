@@ -7,7 +7,7 @@
 //! - **3xxx (Logic/Data Errors)**: Logic or data errors, such as referencing non-existent variables or IDs.
 //! - **4xxx (System Errors)**: System-level errors, such as timeouts or insufficient permissions.
 
-use nom_language::error::{VerboseError, VerboseErrorKind, convert_error};
+use nom_language::error::{VerboseError, VerboseErrorKind};
 use std::fmt::Display;
 
 use thiserror::Error;
@@ -255,28 +255,393 @@ pub fn format_nom_error(input: &str, err: nom::Err<VerboseError<&str>>) -> KipEr
 
 fn format_verbose_error(input: &str, ve: VerboseError<&str>) -> String {
     let mut msg = String::new();
-    if let Some((slice, kind)) = ve.errors.first() {
-        let offending = take_first_chars(slice, 1024);
-        let kind_str = match kind {
-            VerboseErrorKind::Context(ctx) => format!("Context: {ctx}"),
-            VerboseErrorKind::Char(c) => format!("Expected char: '{c}'"),
-            VerboseErrorKind::Nom(e) => format!("Parser: {:?}", e),
-        };
 
-        let fragment = format!("{}\nOffending slice:\n{}", kind_str, offending);
-        msg.push_str(&fragment);
-        if offending.len() < slice.len() {
-            msg.push_str("(truncated...)");
+    // 1. Collect all context labels (from outermost to innermost)
+    let contexts: Vec<&str> = ve
+        .errors
+        .iter()
+        .filter_map(|(_, kind)| match kind {
+            VerboseErrorKind::Context(ctx) => Some(*ctx),
+            _ => None,
+        })
+        .collect();
+
+    // 2. Find the deepest (most specific) error entry
+    let deepest = ve.errors.first();
+
+    // 3. Check if error is at the start of input (top-level parse failure)
+    let is_at_start = deepest
+        .map(|(slice, _)| slice.len() == input.len())
+        .unwrap_or(false);
+
+    // 4. Build the parsing context — show only the most relevant 3 levels
+    if !contexts.is_empty() && !is_at_start {
+        msg.push_str("Parsing context: ");
+        let display_contexts: Vec<&str> = contexts.iter().rev().copied().collect();
+        let start_idx = if display_contexts.len() > 3 {
+            display_contexts.len() - 3
+        } else {
+            0
+        };
+        for (i, ctx) in display_contexts[start_idx..].iter().enumerate() {
+            if i > 0 {
+                msg.push_str(" > ");
+            }
+            msg.push_str(ctx);
         }
-        msg.push_str("\n\n");
+        msg.push('\n');
     }
 
-    msg.push_str(&convert_error(input, ve));
+    // 5. Show the specific error
+    if let Some((slice, kind)) = deepest {
+        let error_desc = match kind {
+            VerboseErrorKind::Char(c) => {
+                let got = slice.chars().next();
+                match got {
+                    Some(g) => format!("Expected '{}', but found '{}'", c, g),
+                    None => format!("Expected '{}', but reached end of input", c),
+                }
+            }
+            VerboseErrorKind::Context(ctx) => format!("Failed to parse: {ctx}"),
+            VerboseErrorKind::Nom(e) => match e {
+                nom::error::ErrorKind::Tag => {
+                    if is_at_start {
+                        let got = take_first_chars(slice, 20);
+                        format!(
+                            "Unrecognized KIP command starting with: \"{}\". \
+                             A KIP statement must begin with FIND, UPSERT, DELETE, DESCRIBE, or SEARCH (case-sensitive).",
+                            got
+                        )
+                    } else {
+                        let got = take_first_chars(slice, 30);
+                        format!("Expected a keyword, but found: \"{}\"", got)
+                    }
+                }
+                nom::error::ErrorKind::Char => "Unexpected character".to_string(),
+                nom::error::ErrorKind::Alpha => {
+                    let got = slice.chars().next();
+                    match got {
+                        Some(g) => {
+                            format!("Expected a letter (a-z, A-Z), but found '{}'", g)
+                        }
+                        None => {
+                            "Expected a letter (a-z, A-Z), but reached end of input".to_string()
+                        }
+                    }
+                }
+                nom::error::ErrorKind::Verify => "Validation check failed".to_string(),
+                nom::error::ErrorKind::MapRes => "Value conversion/validation failed".to_string(),
+                nom::error::ErrorKind::Eof => {
+                    let remaining = take_first_chars(slice, 60);
+                    format!(
+                        "Unexpected trailing content after valid KIP statement: \"{}\"",
+                        remaining
+                    )
+                }
+                nom::error::ErrorKind::Alt => {
+                    if is_at_start {
+                        if slice.is_empty() {
+                            "Empty input. A KIP statement must begin with FIND, UPSERT, DELETE, DESCRIBE, or SEARCH.".to_string()
+                        } else {
+                            let got = take_first_chars(slice, 20);
+                            format!(
+                                "Unrecognized KIP command starting with: \"{}\". \
+                                 A KIP statement must begin with FIND, UPSERT, DELETE, DESCRIBE, or SEARCH (case-sensitive).",
+                                got
+                            )
+                        }
+                    } else {
+                        let got = take_first_chars(slice, 40);
+                        format!("No valid KIP syntax matched at: \"{}\"", got)
+                    }
+                }
+                _ => format!("Parser {:?} failed", e),
+            },
+        };
+        msg.push_str(&error_desc);
+        msg.push('\n');
+
+        // 6. Show precise location (line:column) and context window
+        let offset = input.len() - slice.len();
+        let (line, col) = compute_line_col(input, offset);
+        msg.push_str(&format!("Location: line {}, column {}\n", line, col));
+
+        // 7. Show a context window around the error
+        if !input.is_empty() {
+            msg.push_str(&format_error_context_window(input, offset));
+        }
+    }
+
+    // 8. Add recovery suggestions based on context
+    if let Some(suggestion) = generate_recovery_suggestion(&contexts, deepest, is_at_start) {
+        msg.push_str("\nSuggestion: ");
+        msg.push_str(&suggestion);
+        msg.push('\n');
+    }
 
     msg
 }
 
-// 取 slice 的前 n 个字符（避免中途截断多字节字符）
+/// Compute 1-based line and column from byte offset
+fn compute_line_col(input: &str, offset: usize) -> (usize, usize) {
+    let prefix = &input[..offset];
+    let line = prefix.chars().filter(|c| *c == '\n').count() + 1;
+    let last_newline = prefix.rfind('\n').map(|p| p + 1).unwrap_or(0);
+    let col = input[last_newline..offset].chars().count() + 1;
+    (line, col)
+}
+
+/// Format a context window showing the error location with a pointer
+fn format_error_context_window(input: &str, offset: usize) -> String {
+    let mut result = String::new();
+    let lines: Vec<&str> = input.lines().collect();
+
+    let prefix = &input[..offset];
+    let error_line_idx = prefix.chars().filter(|c| *c == '\n').count(); // 0-based
+    let last_newline = prefix.rfind('\n').map(|p| p + 1).unwrap_or(0);
+    let error_col = input[last_newline..offset].chars().count(); // 0-based for pointer
+
+    // Show up to 2 lines before and 1 line after
+    let start = error_line_idx.saturating_sub(2);
+    let end = (error_line_idx + 2).min(lines.len());
+
+    result.push_str("Context:\n");
+    for i in start..end {
+        let line_num = i + 1;
+        let line_content = lines[i];
+        let trimmed = take_first_chars(line_content, 120);
+        if i == error_line_idx {
+            result.push_str(&format!("  --> | {}\n", trimmed));
+            // Add pointer
+            let pointer_offset = error_col;
+            result.push_str(&format!("      | {}^\n", " ".repeat(pointer_offset)));
+        } else {
+            result.push_str(&format!("  {:>3} | {}\n", line_num, trimmed));
+        }
+    }
+
+    result
+}
+
+/// Generate a recovery suggestion based on the parsing context and error
+fn generate_recovery_suggestion(
+    contexts: &[&str],
+    deepest: Option<&(&str, VerboseErrorKind)>,
+    is_at_start: bool,
+) -> Option<String> {
+    // If error is at the start of input, always give top-level guidance
+    if is_at_start {
+        return Some(
+            "A KIP statement must start with one of: \
+             FIND (for queries), UPSERT/DELETE (for modifications), \
+             or DESCRIBE/SEARCH (for schema exploration). \
+             All keywords are case-sensitive and must be UPPERCASE."
+                .to_string(),
+        );
+    }
+
+    let innermost = contexts.first().copied().unwrap_or("");
+
+    // JSON-specific suggestions
+    if innermost.contains("JSON string") {
+        return Some(
+            "Check for unterminated strings: ensure every '\"' has a matching closing '\"'. \
+             Inside JSON strings, special characters must be escaped: \
+             use \\\" for quotes, \\\\ for backslashes, \\n for newlines."
+                .to_string(),
+        );
+    }
+
+    if innermost.contains("JSON object") || innermost.contains("key-value") {
+        if let Some((_, VerboseErrorKind::Char(c))) = deepest {
+            if *c == '}' {
+                return Some(
+                    "Unclosed JSON object. Ensure every '{' has a matching '}'. \
+                     Check for missing commas between key-value pairs, \
+                     or unterminated string values inside the object."
+                        .to_string(),
+                );
+            }
+            if *c == ':' {
+                return Some(
+                    "Expected ':' after key in object. Format: { key: value } or { \"key\": value }. \
+                     Keys can be unquoted identifiers (letters, digits, underscores) or quoted strings."
+                        .to_string(),
+                );
+            }
+        }
+        return Some(
+            "Check JSON object syntax: { key: value, key2: value2 }. \
+             Keys can be identifiers or quoted strings. \
+             Values can be strings, numbers, booleans, null, arrays, or nested objects. \
+             Trailing commas are allowed."
+                .to_string(),
+        );
+    }
+
+    if innermost.contains("JSON array") {
+        return Some(
+            "Check JSON array syntax: [value1, value2, ...]. \
+             Ensure every '[' has a matching ']'. \
+             Trailing commas are allowed."
+                .to_string(),
+        );
+    }
+
+    // KIP structure-specific suggestions
+    if innermost.contains("FIND") {
+        return Some(
+            "FIND clause syntax: FIND(?variable) or FIND(?var1, ?var2, COUNT(?var3)). \
+             Variables start with '?' followed by an identifier. \
+             Aggregation functions: COUNT, SUM, AVG, MIN, MAX."
+                .to_string(),
+        );
+    }
+
+    if innermost.contains("WHERE") {
+        return Some(
+            "WHERE clause syntax: WHERE { <clauses> }. \
+             Each clause is either: a concept match (?var {type: \"T\", name: \"N\"}), \
+             a proposition match (?s, \"predicate\", ?o), \
+             FILTER(...), OPTIONAL {...}, NOT {...}, or UNION {...}."
+                .to_string(),
+        );
+    }
+
+    if innermost.contains("CONCEPT") && innermost.contains("?local_handle") {
+        return Some(
+            "CONCEPT block syntax: CONCEPT [?handle] { {type: \"T\", name: \"N\"} [SET ATTRIBUTES {...}] [SET PROPOSITIONS {...}] }. \
+             The concept matcher {type: \"...\", name: \"...\"} or {id: \"...\"} or {type: \"...\"} or {name: \"...\"} is required. \
+             Handle is optional: CONCEPT { ... } is also valid."
+                .to_string(),
+        );
+    }
+
+    if innermost.contains("PROPOSITION") && innermost.contains("?local_handle") {
+        return Some(
+            "PROPOSITION block syntax: PROPOSITION [?handle] { (subject, \"predicate\", object) [SET ATTRIBUTES {...}] }. \
+             Subject/object can be: ?variable, {type: \"T\", name: \"N\"}, {id: \"...\"}, or {type: \"...\"}, or {name: \"...\"}."
+                .to_string(),
+        );
+    }
+
+    if innermost.contains("SET ATTRIBUTES") {
+        return Some(
+            "SET ATTRIBUTES syntax: SET ATTRIBUTES { key: value, key2: value2 }. \
+             Keys are identifiers or quoted strings. Values are JSON values."
+                .to_string(),
+        );
+    }
+
+    if innermost.contains("SET PROPOSITIONS") {
+        return Some(
+            "SET PROPOSITIONS syntax: SET PROPOSITIONS { (\"predicate\", target) [WITH METADATA {...}] ... }. \
+             Target can be: ?variable, {type: \"T\", name: \"N\"}, {id: \"...\"}, or {type: \"...\"}, or {name: \"...\"}."
+                .to_string(),
+        );
+    }
+
+    if innermost.contains("WITH METADATA") {
+        return Some(
+            "WITH METADATA syntax: WITH METADATA { key: value, ... }. \
+             Common metadata keys: source, author, confidence (0.0-1.0), status."
+                .to_string(),
+        );
+    }
+
+    if innermost.contains("UPSERT") {
+        return Some(
+            "UPSERT block syntax: UPSERT { CONCEPT ... | PROPOSITION ... } [WITH METADATA {...}]. \
+             Must contain at least one CONCEPT or PROPOSITION block."
+                .to_string(),
+        );
+    }
+
+    if innermost.contains("DELETE") {
+        return Some(
+            "DELETE syntax variants: \
+             DELETE ATTRIBUTES {\"attr1\", \"attr2\"} FROM ?var WHERE {...}, \
+             DELETE METADATA {\"key1\"} FROM ?var WHERE {...}, \
+             DELETE PROPOSITIONS ?var WHERE {...}, \
+             DELETE CONCEPT ?var DETACH WHERE {...}."
+                .to_string(),
+        );
+    }
+
+    if innermost.contains("FILTER") {
+        return Some(
+            "FILTER syntax: FILTER(expression). \
+             Comparisons: ?var == value, ?var != value, ?var < value, ?var > value, ?var <= value, ?var >= value. \
+             Functions: CONTAINS(?var, \"text\"), STARTS_WITH(?var, \"prefix\"), ENDS_WITH(?var, \"suffix\"), REGEX(?var, \"pattern\"). \
+             Logical: expr && expr, expr || expr, !(expr)."
+                .to_string(),
+        );
+    }
+
+    if innermost.contains("DESCRIBE") || innermost.contains("SEARCH") {
+        return Some(
+            "META commands: DESCRIBE PRIMER | DESCRIBE DOMAINS | \
+             DESCRIBE CONCEPT TYPES [LIMIT N] | DESCRIBE CONCEPT TYPE \"TypeName\" | \
+             DESCRIBE PROPOSITION TYPES [LIMIT N] | DESCRIBE PROPOSITION TYPE \"pred\" | \
+             SEARCH CONCEPT \"term\" [WITH TYPE \"T\"] [LIMIT N] | \
+             SEARCH PROPOSITION \"term\" [WITH TYPE \"T\"] [LIMIT N]."
+                .to_string(),
+        );
+    }
+
+    if innermost.contains("concept matcher") || innermost.contains("proposition matcher") {
+        return Some(
+            "Concept matcher formats: {type: \"TypeName\", name: \"Name\"} or {id: \"ID\"} or {type: \"Name\"} or {name: \"Name\"}. \
+             Proposition matcher formats: (?subject, \"predicate\", ?object) or (id: \"proposition_id\")."
+                .to_string(),
+        );
+    }
+
+    if innermost.contains("dot notation") {
+        return Some(
+            "Dot path syntax: ?variable or ?variable.field or ?variable.field.subfield. \
+             Variable names must start with '?' followed by a letter or underscore, \
+             and can contain letters, digits, and underscores. \
+             Path segments follow the same identifier rules."
+                .to_string(),
+        );
+    }
+
+    // Generic fallback based on error type
+    if let Some((slice, kind)) = deepest {
+        if slice.is_empty() {
+            return Some(
+                "Unexpected end of input. Check for unclosed brackets { }, parentheses ( ), \
+                 or unterminated strings \"...\". The KIP statement may be incomplete."
+                    .to_string(),
+            );
+        }
+        // Trailing content error
+        if matches!(kind, VerboseErrorKind::Nom(nom::error::ErrorKind::Eof)) {
+            return Some(
+                "There is unexpected content after a valid KIP statement. \
+                 Each parse_kip() call should contain exactly one complete statement. \
+                 Remove the extra text or split into separate statements."
+                    .to_string(),
+            );
+        }
+    }
+
+    // Top-level suggestion
+    if contexts.is_empty() {
+        return Some(
+            "A KIP statement must start with one of: \
+             FIND (for queries), UPSERT/DELETE (for modifications), \
+             or DESCRIBE/SEARCH (for schema exploration). \
+             Keywords are case-sensitive and must be UPPERCASE."
+                .to_string(),
+        );
+    }
+
+    None
+}
+
+/// Take the first n characters of a string (avoids mid-byte truncation)
 fn take_first_chars(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
