@@ -8,6 +8,7 @@ members = [
   "rs/anda_db_derive",
   "rs/anda_db_hnsw",
   "rs/anda_db_schema",
+  "rs/anda_db_server",
   "rs/anda_db_tfs",
   "rs/anda_db_utils",
   "rs/anda_kip",

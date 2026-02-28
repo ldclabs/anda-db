@@ -1,0 +1,33 @@
+[package]
+name = "anda_db_server"
+version = "0.1.0"
+description = "A HTTP server for Anda DB, supporting JSON and CBOR data interchange formats."
+categories = ["database", "data-structures", "web-programming"]
+repository = "https://github.com/ldclabs/anda_db/tree/main/rs/anda_db_server"
+publish = false
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anda_db_schema = { version = "0.4", path = "../anda_db_schema" }
+anda_db = { version = "0.7", path = "../anda_db", features = ["full"] }
+anda_object_store = { version = "0.3", path = "../anda_object_store" }
+axum = { workspace = true }
+bytes = { workspace = true }
+ciborium = { workspace = true }
+clap = { workspace = true }
+dotenv = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio-util = { workspace = true }
+structured-logger = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+object_store = { workspace = true, features = ["fs", "aws"] }
+log = { workspace = true }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+axum = { workspace = true }
+ciborium = { workspace = true }
+http-body-util = "0.1"
+serde_json = { workspace = true }
