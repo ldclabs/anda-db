@@ -115,18 +115,23 @@ impl BM25 {
 
     pub async fn flush(&self, now_ms: u64) -> Result<bool, DBError> {
         let mut buf = Vec::with_capacity(256);
-        if !self.index.store_metadata(&mut buf, now_ms)? {
+        let meta_saved = self.index.store_metadata(&mut buf, now_ms)?;
+        let had_dirty = self.index.has_dirty_buckets();
+
+        if !meta_saved && !had_dirty {
             return Ok(false);
         }
 
-        let path = BM25::metadata_path(&self.name);
-        let ver = { self.metadata_version.read().clone() };
-        let ver = self
-            .storage
-            .put_bytes(&path, buf.into(), PutMode::Update(ver.into()))
-            .await?;
-        {
-            *self.metadata_version.write() = ver;
+        if meta_saved {
+            let path = BM25::metadata_path(&self.name);
+            let ver = { self.metadata_version.read().clone() };
+            let ver = self
+                .storage
+                .put_bytes(&path, buf.into(), PutMode::Update(ver.into()))
+                .await?;
+            {
+                *self.metadata_version.write() = ver;
+            }
         }
 
         let n = Arc::new(self.name.clone());
@@ -142,7 +147,16 @@ impl BM25 {
             })
             .await?;
 
-        Ok(true)
+        Ok(meta_saved || had_dirty)
+    }
+
+    pub fn has_pending_flush(&self) -> bool {
+        if self.index.has_dirty_buckets() {
+            return true;
+        }
+
+        let stats = self.index.stats();
+        stats.version > stats.last_saved
     }
 
     pub fn name(&self) -> &str {

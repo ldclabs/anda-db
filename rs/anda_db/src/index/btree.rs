@@ -652,6 +652,15 @@ impl BTree {
             BTree::Bytes(btree) => btree.flush(now_ms).await,
         }
     }
+
+    pub fn has_pending_flush(&self) -> bool {
+        match self {
+            BTree::I64(btree) => btree.has_pending_flush(),
+            BTree::U64(btree) => btree.has_pending_flush(),
+            BTree::String(btree) => btree.has_pending_flush(),
+            BTree::Bytes(btree) => btree.has_pending_flush(),
+        }
+    }
 }
 
 impl<FV> InnerBTree<FV>
@@ -742,5 +751,14 @@ where
             .await?;
 
         Ok(meta_saved || had_dirty)
+    }
+
+    fn has_pending_flush(&self) -> bool {
+        if self.index.has_dirty_buckets() {
+            return true;
+        }
+
+        let stats = self.index.stats();
+        stats.version > stats.last_saved
     }
 }

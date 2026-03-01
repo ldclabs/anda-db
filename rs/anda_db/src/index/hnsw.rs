@@ -109,34 +109,39 @@ impl Hnsw {
 
     pub async fn flush(&self, now_ms: u64) -> Result<bool, DBError> {
         let mut buf = Vec::with_capacity(256);
-        if !self.index.store_metadata(&mut buf, now_ms)? {
+        let meta_saved = self.index.store_metadata(&mut buf, now_ms)?;
+        let had_dirty = self.index.has_dirty_nodes();
+
+        if !meta_saved && !had_dirty {
             return Ok(false);
         }
 
-        let path = Hnsw::metadata_path(&self.name);
-        let metadata_version = { self.metadata_version.read().clone() };
-        let metadata_version = self
-            .storage
-            .put_bytes(
-                &path,
-                Bytes::copy_from_slice(&buf[..]),
-                PutMode::Update(metadata_version.into()),
-            )
-            .await?;
-        {
-            *self.metadata_version.write() = metadata_version;
-        }
+        if meta_saved {
+            let path = Hnsw::metadata_path(&self.name);
+            let metadata_version = { self.metadata_version.read().clone() };
+            let metadata_version = self
+                .storage
+                .put_bytes(
+                    &path,
+                    Bytes::copy_from_slice(&buf[..]),
+                    PutMode::Update(metadata_version.into()),
+                )
+                .await?;
+            {
+                *self.metadata_version.write() = metadata_version;
+            }
 
-        buf.clear();
-        self.index.store_ids(&mut buf)?;
-        let path = Hnsw::ids_path(&self.name);
-        let ids_version = { self.ids_version.read().clone() };
-        let ids_version = self
-            .storage
-            .put_bytes(&path, buf.into(), PutMode::Update(ids_version.into()))
-            .await?;
-        {
-            *self.ids_version.write() = ids_version;
+            buf.clear();
+            self.index.store_ids(&mut buf)?;
+            let path = Hnsw::ids_path(&self.name);
+            let ids_version = { self.ids_version.read().clone() };
+            let ids_version = self
+                .storage
+                .put_bytes(&path, buf.into(), PutMode::Update(ids_version.into()))
+                .await?;
+            {
+                *self.ids_version.write() = ids_version;
+            }
         }
 
         let n = Arc::new(self.name.clone());
@@ -152,7 +157,16 @@ impl Hnsw {
             })
             .await?;
 
-        Ok(true)
+        Ok(meta_saved || had_dirty)
+    }
+
+    pub fn has_pending_flush(&self) -> bool {
+        if self.index.has_dirty_nodes() {
+            return true;
+        }
+
+        let stats = self.index.stats();
+        stats.version > stats.last_saved
     }
 
     pub fn name(&self) -> &str {

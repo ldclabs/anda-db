@@ -434,22 +434,43 @@ impl Collection {
                             if fv.as_ref() == &FieldValue::Null {
                                 continue;
                             }
-                            // ignore errors
-                            let _ = index.insert(id, &fv, now_ms);
+                            if let Err(err) = index.insert(id, &fv, now_ms) {
+                                log::warn!(
+                                    action = "auto_repair_indexes",
+                                    collection = self.name,
+                                    doc_id = id,
+                                    index = index.name();
+                                    "Failed to repair BTree index: {err:?}",
+                                );
+                            }
                         }
                     }
 
                     for index in &self.bm25_indexes {
                         if let Some(text) = self.index_hooks.bm25_index_value(index, &doc) {
-                            // ignore errors
-                            let _ = index.insert(id, &text, now_ms);
+                            if let Err(err) = index.insert(id, &text, now_ms) {
+                                log::warn!(
+                                    action = "auto_repair_indexes",
+                                    collection = self.name,
+                                    doc_id = id,
+                                    index = index.name();
+                                    "Failed to repair BM25 index: {err:?}",
+                                );
+                            }
                         }
                     }
 
                     for index in &self.hnsw_indexes {
                         if let Some(vector) = self.index_hooks.hnsw_index_value(index, &doc) {
-                            // ignore errors
-                            let _ = index.insert(id, vector.into_owned(), now_ms);
+                            if let Err(err) = index.insert(id, vector.into_owned(), now_ms) {
+                                log::warn!(
+                                    action = "auto_repair_indexes",
+                                    collection = self.name,
+                                    doc_id = id,
+                                    index = index.name();
+                                    "Failed to repair HNSW index: {err:?}",
+                                );
+                            }
                         }
                     }
 
@@ -524,17 +545,28 @@ impl Collection {
     /// # Returns
     /// `true` if changes were flushed, `false` if no changes needed to be flushed
     pub async fn flush(&self, now_ms: u64) -> Result<bool, DBError> {
-        let check_point = match self.store_metadata(now_ms).await? {
-            Some(id) => id,
-            None => return Ok(false),
+        let check_point = self.store_metadata(now_ms).await?;
+
+        // Fast path: no collection metadata update and no index has pending data.
+        let has_pending_indexes = self.has_pending_index_flush();
+        if check_point.is_none() && !has_pending_indexes {
+            return Ok(false);
+        }
+
+        let indexes_saved = if has_pending_indexes {
+            self.store_indexes(now_ms).await?
+        } else {
+            false
         };
 
-        self.store_ids().await?;
-        self.store_indexes(now_ms).await?;
+        if let Some(check_point) = check_point {
+            self.store_ids().await?;
+            // check_point is the last persisted document ID
+            self.storage.store_metadata(check_point, now_ms).await?;
+            return Ok(true);
+        }
 
-        // check_point is the last persisted document ID
-        self.storage.store_metadata(check_point, now_ms).await?;
-        Ok(true)
+        Ok(indexes_saved)
     }
 
     /// Drops the collection, deleting all associated data from storage.
@@ -579,27 +611,43 @@ impl Collection {
     /// # Returns
     /// `Some(max_document_id)` if metadata was stored, `None` if no changes needed to be stored
     async fn store_metadata(&self, now_ms: u64) -> Result<Option<DocumentId>, DBError> {
-        // First check if save is needed using atomic version
-        let current_version = {
-            let meta = self.metadata.read();
-            meta.stats.version
-        };
-        let prev_saved_version = self
-            .last_saved_version
-            .fetch_max(current_version, Ordering::AcqRel);
-        if prev_saved_version >= current_version {
-            // No need to save if the version is not updated
+        // Fast path: if version is already saved, avoid cloning metadata.
+        let current_version = { self.metadata.read().stats.version };
+        if self.last_saved_version.load(Ordering::Relaxed) >= current_version {
             return Ok(None);
         }
 
-        // Re-acquire metadata with lock to get consistent snapshot for saving
+        // Re-acquire metadata with lock to get consistent snapshot for saving.
         let mut meta = self.metadata();
+        // Atomically claim the right to save this version.
+        // Only one concurrent caller will see prev < meta.stats.version and proceed.
+        let prev_saved_version = self
+            .last_saved_version
+            .fetch_max(meta.stats.version, Ordering::Relaxed);
+        if prev_saved_version >= meta.stats.version {
+            return Ok(None);
+        }
+
         meta.stats.last_saved = now_ms.max(meta.stats.last_saved);
         let ver = { self.metadata_version.read().clone() };
-        let ver = self
+        let ver = match self
             .storage
             .put(Self::METADATA_PATH, &meta, Some(ver))
-            .await?;
+            .await
+        {
+            Ok(ver) => ver,
+            Err(err) => {
+                // Write failed: revert only if no other writer has already
+                // advanced this atomic to a newer version.
+                let _ = self.last_saved_version.compare_exchange(
+                    meta.stats.version,
+                    prev_saved_version,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+                return Err(err);
+            }
+        };
         *self.metadata_version.write() = ver;
         self.update_metadata(|m| {
             m.stats.last_saved = meta.stats.last_saved.max(m.stats.last_saved);
@@ -631,14 +679,22 @@ impl Collection {
     ///
     /// # Returns
     /// Ok(()) if successful, or an error if storing fails
-    async fn store_indexes(&self, now_ms: u64) -> Result<(), DBError> {
-        try_join_await!(
+    async fn store_indexes(&self, now_ms: u64) -> Result<bool, DBError> {
+        let (btree_saved, bm25_saved, hnsw_saved) = try_join_await!(
             try_join_all(self.btree_indexes.iter().map(|index| index.flush(now_ms))),
             try_join_all(self.bm25_indexes.iter().map(|index| index.flush(now_ms))),
             try_join_all(self.hnsw_indexes.iter().map(|index| index.flush(now_ms))),
         )?;
 
-        Ok(())
+        Ok(btree_saved.into_iter().any(|saved| saved)
+            || bm25_saved.into_iter().any(|saved| saved)
+            || hnsw_saved.into_iter().any(|saved| saved))
+    }
+
+    fn has_pending_index_flush(&self) -> bool {
+        self.btree_indexes.iter().any(BTree::has_pending_flush)
+            || self.bm25_indexes.iter().any(BM25::has_pending_flush)
+            || self.hnsw_indexes.iter().any(Hnsw::has_pending_flush)
     }
 
     /// Sets the tokenizer for text analysis.
@@ -1330,11 +1386,14 @@ impl Collection {
 
         let now_ms = unix_ms();
         {
-            if !self.doc_ids_index.write().remove(&id) {
+            // Keep lock ordering consistent with add()/auto_repair_indexes():
+            // doc_ids -> doc_ids_index, to avoid potential deadlocks.
+            let mut doc_ids = self.doc_ids.write();
+            let mut doc_ids_index = self.doc_ids_index.write();
+            if !doc_ids_index.remove(&id) {
                 return Ok(None);
             }
-
-            self.doc_ids.write().remove(id);
+            doc_ids.remove(id);
         }
 
         self.update_metadata(|meta| {
@@ -2751,6 +2810,68 @@ mod tests {
         let stats = collection.stats();
         assert_eq!(stats.num_documents, 0);
         assert_eq!(stats.delete_count, 1);
+
+        db.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_flush_persists_dirty_indexes_even_when_collection_metadata_unchanged()
+    -> Result<(), DBError> {
+        let db = setup_test_db().await?;
+
+        {
+            let collection = create_test_collection(&db, async |collection| {
+                collection.create_btree_index_nx(&["name"]).await?;
+                Ok(())
+            })
+            .await?;
+
+            let doc = create_test_doc(0, "Alice", 30, vec!["smart"]);
+            let id = collection.add_from(&doc).await?;
+            assert_eq!(id, 1);
+
+            // First flush to persist the baseline state.
+            assert!(collection.flush(unix_ms()).await?);
+
+            // Mutate index-only state directly: remove the mapping from btree index.
+            let index = collection.get_btree_index(&["name"])?;
+            assert!(index.remove(id, &Fv::Text("Alice".to_string()), unix_ms()));
+
+            // Collection metadata version is unchanged, but index is dirty and must still flush.
+            assert!(collection.flush(unix_ms()).await?);
+        }
+
+        // Reopen and verify the index-only change is durable.
+        db.close().await?;
+        let db = AndaDB::connect(
+            db.object_store(),
+            DBConfig {
+                name: "test_db".to_string(),
+                description: "Test database".to_string(),
+                storage: StorageConfig {
+                    compress_level: 0,
+                    ..Default::default()
+                },
+                lock: None,
+            },
+        )
+        .await?;
+
+        let collection = db
+            .open_collection("test_collection".to_string(), async |_| Ok(()))
+            .await?;
+
+        let ids = collection
+            .search_ids(Query {
+                filter: Some(Filter::Field((
+                    "name".to_string(),
+                    RangeQuery::Eq(Fv::Text("Alice".to_string())),
+                ))),
+                ..Default::default()
+            })
+            .await?;
+        assert!(ids.is_empty());
 
         db.close().await?;
         Ok(())
