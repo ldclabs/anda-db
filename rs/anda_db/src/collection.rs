@@ -447,8 +447,8 @@ impl Collection {
                     }
 
                     for index in &self.bm25_indexes {
-                        if let Some(text) = self.index_hooks.bm25_index_value(index, &doc) {
-                            if let Err(err) = index.insert(id, &text, now_ms) {
+                        if let Some(text) = self.index_hooks.bm25_index_value(index, &doc)
+                            && let Err(err) = index.insert(id, &text, now_ms) {
                                 log::warn!(
                                     action = "auto_repair_indexes",
                                     collection = self.name,
@@ -457,12 +457,11 @@ impl Collection {
                                     "Failed to repair BM25 index: {err:?}",
                                 );
                             }
-                        }
                     }
 
                     for index in &self.hnsw_indexes {
-                        if let Some(vector) = self.index_hooks.hnsw_index_value(index, &doc) {
-                            if let Err(err) = index.insert(id, vector.into_owned(), now_ms) {
+                        if let Some(vector) = self.index_hooks.hnsw_index_value(index, &doc)
+                            && let Err(err) = index.insert(id, vector.into_owned(), now_ms) {
                                 log::warn!(
                                     action = "auto_repair_indexes",
                                     collection = self.name,
@@ -471,7 +470,6 @@ impl Collection {
                                     "Failed to repair HNSW index: {err:?}",
                                 );
                             }
-                        }
                     }
 
                     if is_new {

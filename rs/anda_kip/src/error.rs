@@ -406,9 +406,8 @@ fn format_error_context_window(input: &str, offset: usize) -> String {
     let end = (error_line_idx + 2).min(lines.len());
 
     result.push_str("Context:\n");
-    for i in start..end {
+    for (i, line_content) in lines.iter().enumerate().take(end).skip(start) {
         let line_num = i + 1;
-        let line_content = lines[i];
         let trimmed = take_first_chars(line_content, 120);
         if i == error_line_idx {
             result.push_str(&format!("  --> | {}\n", trimmed));
