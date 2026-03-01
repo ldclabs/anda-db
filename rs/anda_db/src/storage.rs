@@ -270,22 +270,27 @@ impl Storage {
     ///
     /// Returns `DBError` if writing the metadata fails.
     pub async fn store_metadata(&self, check_point: u64, now_ms: u64) -> Result<(), DBError> {
-        let prev = self
+        let prev_last_saved = self
             .inner
             .stats
             .last_saved
             .fetch_max(now_ms, Ordering::Acquire);
-        if prev >= now_ms {
-            // Don't save if the last saved time is greater than now
+        let check_point_advanced = if check_point > 0 {
+            let prev_check_point = self
+                .inner
+                .stats
+                .check_point
+                .fetch_max(check_point, Ordering::AcqRel);
+            check_point > prev_check_point
+        } else {
+            false
+        };
+
+        if prev_last_saved >= now_ms && !check_point_advanced {
+            // Skip only when both timestamp and checkpoint are unchanged.
             return Ok(());
         }
 
-        if check_point > 0 {
-            self.inner
-                .stats
-                .check_point
-                .store(check_point, Ordering::Release);
-        }
         self.inner.stats.version.fetch_add(1, Ordering::Release);
         let metadata = self.metadata();
         self.put(Storage::METADATA_PATH, &metadata, None).await?;

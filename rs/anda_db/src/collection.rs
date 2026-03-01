@@ -448,28 +448,30 @@ impl Collection {
 
                     for index in &self.bm25_indexes {
                         if let Some(text) = self.index_hooks.bm25_index_value(index, &doc)
-                            && let Err(err) = index.insert(id, &text, now_ms) {
-                                log::warn!(
-                                    action = "auto_repair_indexes",
-                                    collection = self.name,
-                                    doc_id = id,
-                                    index = index.name();
-                                    "Failed to repair BM25 index: {err:?}",
-                                );
-                            }
+                            && let Err(err) = index.insert(id, &text, now_ms)
+                        {
+                            log::warn!(
+                                action = "auto_repair_indexes",
+                                collection = self.name,
+                                doc_id = id,
+                                index = index.name();
+                                "Failed to repair BM25 index: {err:?}",
+                            );
+                        }
                     }
 
                     for index in &self.hnsw_indexes {
                         if let Some(vector) = self.index_hooks.hnsw_index_value(index, &doc)
-                            && let Err(err) = index.insert(id, vector.into_owned(), now_ms) {
-                                log::warn!(
-                                    action = "auto_repair_indexes",
-                                    collection = self.name,
-                                    doc_id = id,
-                                    index = index.name();
-                                    "Failed to repair HNSW index: {err:?}",
-                                );
-                            }
+                            && let Err(err) = index.insert(id, vector.into_owned(), now_ms)
+                        {
+                            log::warn!(
+                                action = "auto_repair_indexes",
+                                collection = self.name,
+                                doc_id = id,
+                                index = index.name();
+                                "Failed to repair HNSW index: {err:?}",
+                            );
+                        }
                     }
 
                     if is_new {
@@ -2830,7 +2832,10 @@ mod tests {
             assert_eq!(id, 1);
 
             // First flush to persist the baseline state.
-            assert!(collection.flush(unix_ms()).await?);
+            // Use the same millisecond timestamp as the initial storage metadata save
+            // to ensure checkpoint persistence is not skipped by rate limiting.
+            let same_ms = collection.storage.stats().last_saved;
+            assert!(collection.flush(same_ms).await?);
 
             // Mutate index-only state directly: remove the mapping from btree index.
             let index = collection.get_btree_index(&["name"])?;
