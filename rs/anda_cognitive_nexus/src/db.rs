@@ -1695,9 +1695,11 @@ impl CognitiveNexus {
             }
         }?;
 
-        let now_ms = unix_ms();
-        try_join_await!(self.concepts.flush(now_ms), self.propositions.flush(now_ms))
-            .map_err(db_to_kip_error)?;
+        if !dry_run {
+            let now_ms = unix_ms();
+            try_join_await!(self.concepts.flush(now_ms), self.propositions.flush(now_ms))
+                .map_err(db_to_kip_error)?;
+        }
 
         Ok(result)
     }
@@ -2780,10 +2782,15 @@ impl CognitiveNexus {
             FilterFunction::StartsWith => Ok(Some(string.starts_with(pattern))),
             FilterFunction::EndsWith => Ok(Some(string.ends_with(pattern))),
             FilterFunction::Regex => {
-                // 简单的正则表达式匹配
-                let rt = regex::Regex::new(pattern)
-                    .map_err(|e| KipError::invalid_syntax(format!("Invalid regex: {e:?}")))?
-                    .is_match(string);
+                let rt = if let Some(compiled) = ctx.regex_cache.get(pattern) {
+                    compiled.is_match(string)
+                } else {
+                    let compiled = regex::Regex::new(pattern)
+                        .map_err(|e| KipError::invalid_syntax(format!("Invalid regex: {e:?}")))?;
+                    let rt = compiled.is_match(string);
+                    ctx.regex_cache.insert(pattern.to_string(), compiled);
+                    rt
+                };
                 Ok(Some(rt))
             }
         }
@@ -3152,6 +3159,24 @@ mod tests {
                 "metadata":{"source":"test_data","confidence":0.95}
             }])
         );
+    }
+
+    #[tokio::test]
+    async fn test_kql_filter_regex() {
+        let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+        setup_test_data(&nexus).await.unwrap();
+
+        let kql = r#"
+        FIND(?drug.name)
+        WHERE {
+            ?drug {type: "Drug"}
+            FILTER(REGEX(?drug.name, "^Asp.*"))
+        }
+        "#;
+
+        let query = parse_kql(kql).unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        assert_eq!(result, json!(["Aspirin"]));
     }
 
     #[tokio::test]

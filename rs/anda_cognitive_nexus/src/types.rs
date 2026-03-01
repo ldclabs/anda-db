@@ -263,6 +263,12 @@ pub struct QueryContext {
     /// Provides thread-safe caching of concepts and propositions to avoid
     /// redundant database queries during query execution.
     pub cache: Arc<QueryCache>,
+
+    /// Compiled regex cache for FILTER(REGEX(...)) evaluation.
+    ///
+    /// This avoids recompiling the same regex pattern for each row
+    /// during a single query execution.
+    pub regex_cache: FxHashMap<String, regex::Regex>,
 }
 
 /// Thread-safe cache for storing loaded entities during query execution.
