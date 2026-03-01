@@ -366,6 +366,14 @@ where
         self.total_tokens
             .store(total_tokens as u64, Ordering::Relaxed);
 
+        let doc_count = self.doc_tokens.len();
+        let avg = if doc_count == 0 {
+            0.0
+        } else {
+            total_tokens as f32 / doc_count as f32
+        };
+        *self.avg_doc_tokens.write() = avg;
+
         Ok(())
     }
 
@@ -723,8 +731,12 @@ where
     /// Extracts the top-k results from scored documents using partial sorting.
     /// Uses `select_nth_unstable_by` for O(n + k·log(k)) instead of O(n·log(n)).
     fn top_k_results(scored_docs: FxHashMap<u64, f32>, top_k: usize) -> Vec<(u64, f32)> {
+        if top_k == 0 || scored_docs.is_empty() {
+            return Vec::new();
+        }
+
         let mut results: Vec<(u64, f32)> = scored_docs.into_iter().collect();
-        if results.len() > top_k && top_k > 0 {
+        if results.len() > top_k {
             results.select_nth_unstable_by(top_k - 1, |a, b| {
                 b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
             });
@@ -905,12 +917,19 @@ where
     where
         F: AsyncFnMut(u32, &[u8]) -> Result<bool, BoxError>,
     {
-        if !self.store_metadata(metadata, now_ms)? {
+        let meta_saved = self.store_metadata(metadata, now_ms)?;
+        let has_dirty = self.has_dirty_buckets();
+        if !meta_saved && !has_dirty {
             return Ok(false);
         }
 
         self.store_dirty_buckets(f).await?;
-        Ok(true)
+        Ok(meta_saved || has_dirty)
+    }
+
+    /// Returns whether there are dirty buckets pending persistence.
+    pub fn has_dirty_buckets(&self) -> bool {
+        self.buckets.iter().any(|b| b.is_dirty())
     }
 
     /// Stores the index metadata to a writer in CBOR format.
@@ -924,10 +943,15 @@ where
     ///
     /// * `Result<bool, BM25Error>` - true if the metadata was saved, false if the version was not updated
     pub fn store_metadata<W: Write>(&self, w: W, now_ms: u64) -> Result<bool, BM25Error> {
+        let current_version = { self.metadata.read().stats.version };
+        if self.last_saved_version.load(Ordering::Relaxed) >= current_version {
+            return Ok(false);
+        }
+
         let mut meta = self.metadata();
         let prev_saved_version = self
             .last_saved_version
-            .fetch_max(meta.stats.version, Ordering::Release);
+            .fetch_max(meta.stats.version, Ordering::Relaxed);
         if prev_saved_version >= meta.stats.version {
             // No need to save if the version is not updated
             return Ok(false);
@@ -936,9 +960,13 @@ where
         meta.stats.last_saved = now_ms.max(meta.stats.last_saved);
 
         if let Err(err) = ciborium::into_writer(&BM25IndexRef { metadata: &meta }, w) {
-            // Serialization failed: revert last_saved_version so the next call can retry.
-            self.last_saved_version
-                .fetch_min(prev_saved_version, Ordering::Relaxed);
+            // Serialization failed: revert only if this call still owns the claimed version.
+            let _ = self.last_saved_version.compare_exchange(
+                meta.stats.version,
+                prev_saved_version,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
             return Err(BM25Error::Serialization {
                 name: self.name.clone(),
                 source: err.into(),
@@ -1045,6 +1073,8 @@ where
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
 
     // 创建一个简单的测试索引
     fn create_test_index() -> BM25Index<TokenizerChain> {
@@ -1152,6 +1182,17 @@ mod tests {
     }
 
     #[test]
+    fn test_search_top_k_zero_returns_empty() {
+        let index = create_test_index();
+
+        let basic = index.search("fox", 0, None);
+        assert!(basic.is_empty());
+
+        let advanced = index.search_advanced("fox OR dog", 0, None);
+        assert!(advanced.is_empty());
+    }
+
+    #[test]
     fn test_empty_index() {
         let tokenizer = default_tokenizer();
         let index = BM25Index::new("anda_db_tfs_bm25".to_string(), tokenizer, None);
@@ -1204,6 +1245,32 @@ mod tests {
             assert_eq!(original_results[i].0, loaded_results[i].0);
             assert!((original_results[i].1 - loaded_results[i].1).abs() < 0.001);
         }
+    }
+
+    #[tokio::test]
+    async fn test_flush_persists_dirty_buckets_even_if_metadata_unchanged() {
+        let index = create_test_index();
+        index.insert(99, "new fox document", 1).unwrap();
+
+        let mut metadata_buf = Vec::new();
+        assert!(index.store_metadata(&mut metadata_buf, 2).unwrap());
+        assert!(index.has_dirty_buckets());
+
+        let writes = Arc::new(Mutex::new(0usize));
+        let writes_clone = writes.clone();
+        let mut metadata_buf2 = Vec::new();
+        let saved = index
+            .flush(&mut metadata_buf2, 3, async move |_, _| {
+                let mut g = writes_clone.lock().await;
+                *g += 1;
+                Ok(true)
+            })
+            .await
+            .unwrap();
+
+        assert!(saved);
+        assert!(*writes.lock().await > 0);
+        assert!(!index.has_dirty_buckets());
     }
 
     #[test]
