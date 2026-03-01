@@ -1220,12 +1220,20 @@ impl HnswIndex {
     where
         F: AsyncFnMut(u64, &[u8]) -> Result<bool, BoxError>,
     {
-        if !self.store_metadata(metadata, now_ms)? {
+        let meta_saved = self.store_metadata(metadata, now_ms)?;
+        let had_dirty = self.has_dirty_nodes();
+        if !meta_saved && !had_dirty {
             return Ok(false);
         }
+
         self.store_ids(ids)?;
         self.store_dirty_nodes(f).await?;
-        Ok(true)
+        Ok(meta_saved || had_dirty)
+    }
+
+    /// Returns whether there are dirty nodes pending persistence.
+    pub fn has_dirty_nodes(&self) -> bool {
+        !self.dirty_nodes.read().is_empty()
     }
 
     /// Stores the index metadata to a writer in CBOR format.
@@ -1239,10 +1247,18 @@ impl HnswIndex {
     ///
     /// * `Result<bool, HnswError>` - true if the metadata was saved, false if the version was not updated
     pub fn store_metadata<W: Write>(&self, w: W, now_ms: u64) -> Result<bool, HnswError> {
+        // Fast path: if the version is already saved, avoid cloning metadata.
+        let current_version = { self.metadata.read().stats.version };
+        if self.last_saved_version.load(Ordering::Relaxed) >= current_version {
+            return Ok(false);
+        }
+
         let mut meta = self.metadata();
+        // Atomically claim the right to serialize this version.
+        // Only one concurrent caller will see prev < meta.stats.version and proceed.
         let prev_saved_version = self
             .last_saved_version
-            .fetch_max(meta.stats.version, Ordering::Release);
+            .fetch_max(meta.stats.version, Ordering::Relaxed);
         if prev_saved_version >= meta.stats.version {
             // No need to save if the version is not updated
             return Ok(false);
@@ -1256,9 +1272,14 @@ impl HnswIndex {
             },
             w,
         ) {
-            // Serialization failed: revert last_saved_version so the next call can retry.
-            self.last_saved_version
-                .fetch_min(prev_saved_version, Ordering::Relaxed);
+            // Serialization failed: try to revert only if no other writer has already
+            // advanced this atomic to a newer version.
+            let _ = self.last_saved_version.compare_exchange(
+                meta.stats.version,
+                prev_saved_version,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
             return Err(HnswError::Serialization {
                 name: self.name.clone(),
                 source: err.into(),
@@ -1707,6 +1728,43 @@ mod tests {
             let results = loaded_index.search_f32(&[5.0, 5.0, 0.0], 10).unwrap();
             assert_eq!(results.len(), 10);
         }
+    }
+
+    #[tokio::test]
+    async fn test_flush_persists_dirty_nodes_even_if_metadata_already_saved() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let config = HnswConfig {
+            dimension: 2,
+            ..Default::default()
+        };
+        let index = HnswIndex::new("anda_db_hnsw".to_string(), Some(config));
+
+        index.insert_f32(1, vec![1.0, 1.0], 0).unwrap();
+        assert!(index.has_dirty_nodes());
+
+        // Save metadata first (simulate metadata already persisted, nodes pending).
+        let mut metadata = Vec::new();
+        assert!(index.store_metadata(&mut metadata, 0).unwrap());
+        assert!(index.has_dirty_nodes());
+
+        // flush should still persist dirty nodes even when metadata version is unchanged.
+        let writes = Arc::new(AtomicUsize::new(0));
+        let writes_clone = Arc::clone(&writes);
+        let mut metadata2 = Vec::new();
+        let mut ids = Vec::new();
+        let saved = index
+            .flush(&mut metadata2, &mut ids, 0, async move |_, _| {
+                writes_clone.fetch_add(1, Ordering::Relaxed);
+                Ok(true)
+            })
+            .await
+            .unwrap();
+
+        assert!(saved);
+        assert_eq!(writes.load(Ordering::Relaxed), 1);
+        assert!(!index.has_dirty_nodes());
     }
 
     #[test]
