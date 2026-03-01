@@ -43,11 +43,12 @@ where
     config: BTreeConfig,
 
     /// Buckets store information about where posting entries are stored and their current state
-    /// The mapping is: bucket_id -> (bucket_size, is_dirty, vec<field_values>)
+    /// The mapping is: bucket_id -> (bucket_size, is_dirty, vec<field_values>, dirty_version)
     /// - bucket_size: Current size of the bucket in bytes
     /// - is_dirty: Indicates if the bucket has new data that needs to be persisted
     /// - field_values: List of field values stored in this bucket
-    buckets: DashMap<u32, (usize, bool, UniqueVec<FV>)>,
+    /// - dirty_version: Monotonic counter increased on every bucket mutation
+    buckets: DashMap<u32, (usize, bool, UniqueVec<FV>, u64)>,
 
     /// Inverted index mapping field values to posting values
     postings: DashMap<FV, PostingValue<PK>>,
@@ -272,10 +273,11 @@ where
     PK: Ord + Eq + Hash + Debug + Clone + Serialize + DeserializeOwned,
     FV: Ord + Eq + Hash + Debug + Clone + Serialize + DeserializeOwned,
 {
-    fn mark_bucket_dirty(&self, bucket: &mut (usize, bool, UniqueVec<FV>)) {
+    fn mark_bucket_dirty(&self, bucket: &mut (usize, bool, UniqueVec<FV>, u64)) {
+        bucket.3 = bucket.3.wrapping_add(1);
         if !bucket.1 {
             bucket.1 = true;
-            self.dirty_bucket_count.fetch_add(1, Ordering::Relaxed);
+            self.dirty_bucket_count.fetch_add(1, Ordering::Release);
         }
     }
 
@@ -299,7 +301,7 @@ where
             name: name.clone(),
             config: config.clone(),
             postings: DashMap::new(),
-            buckets: DashMap::from_iter(vec![(0, (0, false, UniqueVec::default()))]),
+            buckets: DashMap::from_iter(vec![(0, (0, false, UniqueVec::default(), 0))]),
             btree: RwLock::new(BTreeSet::new()),
             metadata: RwLock::new(BTreeMetadata {
                 name,
@@ -359,7 +361,7 @@ where
             name: index.metadata.name.clone(),
             config: index.metadata.config.clone(),
             postings: DashMap::with_capacity(index.metadata.stats.num_elements as usize),
-            buckets: DashMap::from_iter(vec![(0, (0, false, UniqueVec::default()))]),
+            buckets: DashMap::from_iter(vec![(0, (0, false, UniqueVec::default(), 0))]),
             btree: RwLock::new(BTreeSet::new()),
             metadata: RwLock::new(index.metadata),
             query_count,
@@ -403,7 +405,7 @@ where
                 self.btree.write().extend(bks.iter().cloned());
                 // Update bucket information
                 // Larger buckets have the most recent state and can override smaller buckets
-                self.buckets.insert(i, (data.len(), false, bks.into()));
+                self.buckets.insert(i, (data.len(), false, bks.into(), 0));
                 self.postings.extend(bucket.postings);
             }
         }
@@ -470,7 +472,7 @@ where
         // and also supports calling insert() after load_metadata() but before load_buckets().
         self.buckets
             .entry(bucket)
-            .or_insert_with(|| (0, false, UniqueVec::default()));
+            .or_insert_with(|| (0, false, UniqueVec::default(), 0));
 
         // Calculate the size increase for this insertion
         let mut is_new = false;
@@ -544,7 +546,9 @@ where
                 // The freed space can still accommodate small growth in other field values
                 if b.2.swap_remove_if(|k| &field_value == k).is_some() {
                     b.0 = b.0.saturating_sub(size_decrease);
-                    // b.1 = true; // do not need to set dirty
+                    // Source bucket must be marked dirty, otherwise stale on-disk
+                    // entries may survive and be resurrected after restart.
+                    self.mark_bucket_dirty(&mut b);
                 }
             }
         }
@@ -554,8 +558,8 @@ where
             match self.buckets.entry(new_bucket) {
                 dashmap::Entry::Vacant(entry) => {
                     // Create a new bucket with the initial size
-                    entry.insert((size_increase, true, vec![field_value].into()));
-                    self.dirty_bucket_count.fetch_add(1, Ordering::Relaxed);
+                    entry.insert((size_increase, true, vec![field_value].into(), 1));
+                    self.dirty_bucket_count.fetch_add(1, Ordering::Release);
                 }
                 dashmap::Entry::Occupied(mut entry) => {
                     let bucket_entry = entry.get_mut();
@@ -566,11 +570,13 @@ where
             }
         }
 
-        self.update_metadata(|m| {
-            m.stats.version += 1;
-            m.stats.last_inserted = now_ms;
-            m.stats.insert_count += 1;
-        });
+        if size_increase > 0 {
+            self.update_metadata(|m| {
+                m.stats.version += 1;
+                m.stats.last_inserted = now_ms;
+                m.stats.insert_count += 1;
+            });
+        }
 
         Ok(size_increase > 0)
     }
@@ -687,7 +693,7 @@ where
         let bucket_id = self.max_bucket_id.load(Ordering::Relaxed);
         self.buckets
             .entry(bucket_id)
-            .or_insert_with(|| (0, false, UniqueVec::default()));
+            .or_insert_with(|| (0, false, UniqueVec::default(), 0));
 
         for field_value in field_values {
             let mut size_increase = 0;
@@ -735,7 +741,7 @@ where
             let mut bucket_entry = self
                 .buckets
                 .entry(bucket_id)
-                .or_insert_with(|| (0, false, UniqueVec::default()));
+                .or_insert_with(|| (0, false, UniqueVec::default(), 0));
 
             // Check if the bucket would overflow
             if bucket_entry.2.is_empty()
@@ -772,7 +778,7 @@ where
             {
                 self.buckets
                     .entry(next_bucket_id)
-                    .or_insert_with(|| (0, false, UniqueVec::default()));
+                    .or_insert_with(|| (0, false, UniqueVec::default(), 0));
                 // release the lock on the entry
             }
 
@@ -785,7 +791,8 @@ where
                     && ob.2.swap_remove_if(|k| &field_value == k).is_some()
                 {
                     ob.0 = ob.0.saturating_sub(size);
-                    // ob.1 = true; // do not need to set dirty
+                    // Source bucket must be marked dirty, see insert() migration path.
+                    self.mark_bucket_dirty(&mut ob);
                 }
 
                 let mut new_bucket = false;
@@ -811,8 +818,8 @@ where
                     match self.buckets.entry(next_bucket_id) {
                         dashmap::Entry::Vacant(entry) => {
                             // Create a new bucket with the initial size
-                            entry.insert((size, true, vec![field_value].into()));
-                            self.dirty_bucket_count.fetch_add(1, Ordering::Relaxed);
+                            entry.insert((size, true, vec![field_value].into(), 1));
+                            self.dirty_bucket_count.fetch_add(1, Ordering::Release);
                         }
                         dashmap::Entry::Occupied(mut entry) => {
                             let bucket_entry = entry.get_mut();
@@ -924,6 +931,8 @@ where
             }
         }
 
+        let values_to_remove_set: FxHashSet<FV> = values_to_remove.iter().cloned().collect();
+
         // Update all modified buckets
         for (bucket_id, (size_decrease, field_values)) in bucket_updates {
             if let Some(mut bucket) = self.buckets.get_mut(&bucket_id) {
@@ -931,8 +940,8 @@ where
                 self.mark_bucket_dirty(&mut bucket); // Mark as dirty
 
                 // Remove field values that are completely removed
-                for fv in &values_to_remove {
-                    if field_values.contains(fv) {
+                for fv in &field_values {
+                    if values_to_remove_set.contains(fv) {
                         bucket.2.swap_remove_if(|k| k == fv);
                     }
                 }
@@ -1340,7 +1349,7 @@ where
 
     /// Returns whether there are dirty buckets pending persistence.
     pub fn has_dirty_buckets(&self) -> bool {
-        self.dirty_bucket_count.load(Ordering::Relaxed) > 0
+        self.dirty_bucket_count.load(Ordering::Acquire) > 0
     }
 
     /// Stores the index metadata to a writer
@@ -1373,9 +1382,14 @@ where
 
         meta.stats.last_saved = now_ms.max(meta.stats.last_saved);
         if let Err(err) = ciborium::into_writer(&BTreeIndexRef { metadata: &meta }, w) {
-            // Serialization failed: revert last_saved_version so the next call can retry.
-            self.last_saved_version
-                .fetch_min(prev_saved_version, Ordering::Relaxed);
+            // Serialization failed: try to revert only if no other writer has already
+            // advanced this atomic to a newer version.
+            let _ = self.last_saved_version.compare_exchange(
+                meta.stats.version,
+                prev_saved_version,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
             return Err(BTreeError::Serialization {
                 name: self.name.clone(),
                 source: err.into(),
@@ -1406,48 +1420,87 @@ where
     where
         F: AsyncFnMut(u32, &[u8]) -> Result<bool, BoxError>,
     {
-        if self.dirty_bucket_count.load(Ordering::Relaxed) == 0 {
+        let dirty_count_snapshot = self.dirty_bucket_count.load(Ordering::Acquire);
+        if dirty_count_snapshot == 0 {
+            return Ok(());
+        }
+
+        // Snapshot dirty bucket IDs first to avoid holding mutable bucket refs across await.
+        let dirty_bucket_ids: Vec<u32> = self
+            .buckets
+            .iter()
+            .filter_map(|b| if b.1 { Some(*b.key()) } else { None })
+            .collect();
+
+        // Self-heal: if the counter indicates dirty buckets but none are actually dirty,
+        // attempt to reset the counter only when it has not changed since snapshot.
+        // This avoids permanently reporting dirty state due to possible counter drift.
+        if dirty_bucket_ids.is_empty() {
+            let _ = self.dirty_bucket_count.compare_exchange(
+                dirty_count_snapshot,
+                0,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
             return Ok(());
         }
 
         let mut buf = Vec::with_capacity(4096);
-        for mut bucket in self.buckets.iter_mut() {
-            if bucket.1 {
-                // If the bucket is dirty, it needs to be persisted.
-                // Scope the postings Ref guards so they are dropped before the
-                // potentially slow async write, reducing lock contention.
-                {
-                    let postings: FxHashMap<_, _> = bucket
-                        .2
-                        .iter()
-                        .filter_map(|fv| self.postings.get(fv).map(|p| (fv, p)))
-                        .collect();
+        for bucket_id in dirty_bucket_ids {
+            let Some(bucket) = self.buckets.get(&bucket_id) else {
+                continue;
+            };
+            if !bucket.1 {
+                continue;
+            }
+            let dirty_version = bucket.3;
 
-                    buf.clear();
-                    ciborium::into_writer(
-                        &BucketRef {
-                            postings: &postings,
-                        },
-                        &mut buf,
-                    )
-                    .map_err(|err| BTreeError::Serialization {
-                        name: self.name.clone(),
-                        source: err.into(),
-                    })?;
-                }
+            // If the bucket is dirty, it needs to be persisted.
+            // Scope the postings Ref guards so they are dropped before the
+            // potentially slow async write, reducing lock contention.
+            {
+                let postings: FxHashMap<_, _> = bucket
+                    .2
+                    .iter()
+                    .filter_map(|fv| self.postings.get(fv).map(|p| (fv, p)))
+                    .collect();
 
-                if let Ok(conti) = f(*bucket.key(), &buf).await {
-                    // Only mark as clean if persistence was successful, otherwise wait for next round
-                    bucket.1 = false;
-                    let _ = self.dirty_bucket_count.fetch_update(
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                        |v| Some(v.saturating_sub(1)),
-                    );
-                    if !conti {
-                        return Ok(());
-                    }
-                }
+                buf.clear();
+                ciborium::into_writer(
+                    &BucketRef {
+                        postings: &postings,
+                    },
+                    &mut buf,
+                )
+                .map_err(|err| BTreeError::Serialization {
+                    name: self.name.clone(),
+                    source: err.into(),
+                })?;
+            }
+            drop(bucket);
+
+            let conti = f(bucket_id, &buf)
+                .await
+                .map_err(|err| BTreeError::Generic {
+                    name: self.name.clone(),
+                    source: err,
+                })?;
+
+            // Only mark as clean if it is still dirty after persistence.
+            if let Some(mut bucket) = self.buckets.get_mut(&bucket_id)
+                && bucket.1
+                && bucket.3 == dirty_version
+            {
+                bucket.1 = false;
+                let _ = self.dirty_bucket_count.fetch_update(
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                    |v| Some(v.saturating_sub(1)),
+                );
+            }
+
+            if !conti {
+                return Ok(());
             }
         }
 
@@ -1629,6 +1682,26 @@ mod tests {
             Err(BTreeError::AlreadyExists { .. }) => (),
             _ => panic!("Expected AlreadyExists error"),
         }
+    }
+
+    #[test]
+    fn test_insert_idempotent_does_not_update_stats() {
+        let index = create_test_index();
+
+        let inserted = index.insert(1, "apple".to_string(), now_ms()).unwrap();
+        assert!(inserted);
+        let stats_after_first = index.stats();
+
+        let inserted = index.insert(1, "apple".to_string(), now_ms()).unwrap();
+        assert!(!inserted);
+        let stats_after_second = index.stats();
+
+        assert_eq!(stats_after_first.insert_count, 1);
+        assert_eq!(
+            stats_after_second.insert_count,
+            stats_after_first.insert_count
+        );
+        assert_eq!(stats_after_second.version, stats_after_first.version);
     }
 
     #[test]
@@ -2158,6 +2231,192 @@ mod tests {
         assert!(saved);
         assert_eq!(*writes.lock().await, 1);
         assert!(!index.has_dirty_buckets());
+    }
+
+    #[tokio::test]
+    async fn test_store_dirty_buckets_propagates_write_error() {
+        let index = create_test_index();
+        index.insert(1, "apple".to_string(), now_ms()).unwrap();
+        assert!(index.has_dirty_buckets());
+
+        let err = index
+            .store_dirty_buckets(async |_, _| Err::<bool, BoxError>("write failed".into()))
+            .await
+            .unwrap_err();
+
+        match err {
+            BTreeError::Generic { .. } => {}
+            other => panic!("Expected Generic error, got: {other:?}"),
+        }
+
+        assert!(index.has_dirty_buckets());
+    }
+
+    #[tokio::test]
+    async fn test_store_dirty_buckets_keeps_dirty_when_mutated_during_persist() {
+        let index = Arc::new(create_test_index());
+        index.insert(1, "apple".to_string(), now_ms()).unwrap();
+        assert!(index.has_dirty_buckets());
+
+        let index_for_cb = index.clone();
+        index
+            .store_dirty_buckets(async move |_, _| {
+                index_for_cb
+                    .insert(2, "banana".to_string(), now_ms())
+                    .unwrap();
+                Ok(true)
+            })
+            .await
+            .unwrap();
+
+        // A concurrent mutation happened during persistence, so bucket must remain dirty.
+        assert!(index.has_dirty_buckets());
+
+        index
+            .store_dirty_buckets(async |_, _| Ok(true))
+            .await
+            .unwrap();
+        assert!(!index.has_dirty_buckets());
+    }
+
+    #[tokio::test]
+    async fn test_store_dirty_buckets_self_heals_drifted_counter() {
+        let index = create_test_index();
+        index.insert(1, "apple".to_string(), now_ms()).unwrap();
+        assert!(index.has_dirty_buckets());
+
+        index
+            .store_dirty_buckets(async |_, _| Ok(true))
+            .await
+            .unwrap();
+        assert!(!index.has_dirty_buckets());
+
+        // Simulate counter drift: no bucket is dirty but counter is stale (>0).
+        index.dirty_bucket_count.store(1, Ordering::Release);
+
+        index
+            .store_dirty_buckets(async |_, _| {
+                panic!("no dirty bucket should be written");
+            })
+            .await
+            .unwrap();
+
+        assert!(!index.has_dirty_buckets());
+    }
+
+    #[tokio::test]
+    async fn test_migrated_source_bucket_is_persisted_to_prevent_resurrection() {
+        let config = BTreeConfig {
+            bucket_overload_size: 80,
+            allow_duplicates: true,
+        };
+        let index = BTreeIndex::new("resurrection_test".to_string(), Some(config));
+
+        // Step 1: initial data persisted in bucket 0.
+        index.insert(1, "apple".to_string(), now_ms()).unwrap();
+
+        let metadata_buf = Arc::new(Mutex::new(Vec::new()));
+        let bucket_data = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+
+        {
+            let mut meta = metadata_buf.lock().await;
+            index
+                .flush(&mut *meta, now_ms(), {
+                    let bucket_data = bucket_data.clone();
+                    async move |bucket_id, data| {
+                        let mut guard = bucket_data.lock().await;
+                        while guard.len() <= bucket_id as usize {
+                            guard.push(Vec::new());
+                        }
+                        guard[bucket_id as usize] = data.to_vec();
+                        Ok(true)
+                    }
+                })
+                .await
+                .unwrap();
+        }
+
+        // Step 2: force migration of "apple" to a new bucket.
+        let mut doc_id = 2u64;
+        while index.stats().max_bucket_id == 0 && doc_id < 200 {
+            index.insert(doc_id, "apple".to_string(), now_ms()).unwrap();
+            doc_id += 1;
+        }
+        assert!(index.stats().max_bucket_id > 0);
+
+        {
+            let mut meta = metadata_buf.lock().await;
+            index
+                .flush(&mut *meta, now_ms(), {
+                    let bucket_data = bucket_data.clone();
+                    async move |bucket_id, data| {
+                        let mut guard = bucket_data.lock().await;
+                        while guard.len() <= bucket_id as usize {
+                            guard.push(Vec::new());
+                        }
+                        guard[bucket_id as usize] = data.to_vec();
+                        Ok(true)
+                    }
+                })
+                .await
+                .unwrap();
+        }
+
+        // Step 3: remove all docs for "apple", persist again.
+        for id in 1..doc_id {
+            index.remove(id, "apple".to_string(), now_ms());
+        }
+        assert!(
+            index
+                .query_with(&"apple".to_string(), |ids| Some(ids.clone()))
+                .is_none()
+        );
+
+        {
+            let mut meta = metadata_buf.lock().await;
+            index
+                .flush(&mut *meta, now_ms(), {
+                    let bucket_data = bucket_data.clone();
+                    async move |bucket_id, data| {
+                        let mut guard = bucket_data.lock().await;
+                        while guard.len() <= bucket_id as usize {
+                            guard.push(Vec::new());
+                        }
+                        guard[bucket_id as usize] = data.to_vec();
+                        Ok(true)
+                    }
+                })
+                .await
+                .unwrap();
+        }
+
+        // Step 4: reload and verify no resurrection.
+        let meta = { metadata_buf.lock().await.clone() };
+        let mut loaded = BTreeIndex::<u64, String>::load_metadata(&meta[..]).unwrap();
+
+        loaded
+            .load_buckets({
+                let bucket_data = bucket_data.clone();
+                async move |bucket_id| {
+                    let guard = bucket_data.lock().await;
+                    if bucket_id as usize >= guard.len() {
+                        return Ok(None);
+                    }
+                    if guard[bucket_id as usize].is_empty() {
+                        return Ok(None);
+                    }
+                    Ok(Some(guard[bucket_id as usize].clone()))
+                }
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            loaded
+                .query_with(&"apple".to_string(), |ids| Some(ids.clone()))
+                .is_none(),
+            "apple should not resurrect from stale source bucket"
+        );
     }
 
     #[test]
