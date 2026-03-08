@@ -6,9 +6,10 @@
 use anda_db::error::DBError;
 use anda_db_utils::Pipe;
 use anda_kip::{
-    EntityType, Json, KipError, Map, OrderByCondition, OrderDirection, PredTerm,
-    validate_dot_path_var,
+    EntityType, FilterExpression, FilterOperand, Json, KipError, Map, OrderByCondition,
+    OrderDirection, PredTerm, validate_dot_path_var,
 };
+use rustc_hash::FxHashMap;
 use std::borrow::Cow;
 
 use crate::entity::{Concept, EntityID, Properties, Proposition};
@@ -309,5 +310,35 @@ pub fn db_to_kip_error(err: DBError) -> KipError {
         DBError::NotFound { .. } => KipError::not_found(format!("{err}")),
         DBError::AlreadyExists { .. } => KipError::duplicate_exists(format!("{err}")),
         _ => KipError::internal_error(format!("{err}")),
+    }
+}
+
+/// Extension trait for `FilterExpression` to check for unbound variables.
+pub trait FilterExpressionExt {
+    /// Returns `true` if the expression references any variable NOT already in `bound`.
+    fn has_unbound_variables(&self, bound: &FxHashMap<String, EntityID>) -> bool;
+}
+
+impl FilterExpressionExt for FilterExpression {
+    fn has_unbound_variables(&self, bound: &FxHashMap<String, EntityID>) -> bool {
+        match self {
+            FilterExpression::Comparison { left, right, .. } => {
+                operand_has_unbound(left, bound) || operand_has_unbound(right, bound)
+            }
+            FilterExpression::Logical { left, right, .. } => {
+                left.has_unbound_variables(bound) || right.has_unbound_variables(bound)
+            }
+            FilterExpression::Not(inner) => inner.has_unbound_variables(bound),
+            FilterExpression::Function { args, .. } => {
+                args.iter().any(|a| operand_has_unbound(a, bound))
+            }
+        }
+    }
+}
+
+fn operand_has_unbound(op: &FilterOperand, bound: &FxHashMap<String, EntityID>) -> bool {
+    match op {
+        FilterOperand::Variable(dot_path) => !bound.contains_key(&dot_path.var),
+        FilterOperand::Literal(_) => false,
     }
 }

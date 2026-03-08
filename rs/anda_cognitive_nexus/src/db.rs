@@ -673,18 +673,10 @@ impl CognitiveNexus {
 
         for id in proposition_ids {
             let subject = self
-                .try_get_proposition_with(&ctx.cache, id, |prop| {
-                    if prop.predicates.contains(predicate) {
-                        Ok(Some(prop.subject.clone()))
-                    } else {
-                        Ok(None)
-                    }
-                })
+                .try_get_proposition_with(&ctx.cache, id, |prop| Ok(prop.subject.clone()))
                 .await?;
 
-            if let Some(subj) = subject {
-                subjects_with_relation.insert(subj);
-            }
+            subjects_with_relation.insert(subject);
         }
 
         // 从原始绑定中排除有此关系的 subjects
@@ -880,22 +872,25 @@ impl CognitiveNexus {
             r#type: PERSON_TYPE.to_string(),
             name: META_SELF_NAME.to_string(),
         };
-        let me = self.query_concept_ids(&matcher).await?;
 
-        let me = me
+        // Query identity and domains in parallel
+        let domain_matcher = ConceptMatcher::Type(DOMAIN_TYPE.to_string());
+        let (me_ids, domain_ids) = try_join_await!(
+            self.query_concept_ids(&matcher),
+            self.query_concept_ids(&domain_matcher)
+        )?;
+
+        let me_id = me_ids
             .first()
             .ok_or_else(|| KipError::not_found(format!("Concept {matcher} not found")))?;
         let me = self
-            .try_get_concept_with(&cache, *me, |concept| {
+            .try_get_concept_with(&cache, *me_id, |concept| {
                 extract_concept_field_value(concept, &[])
             })
             .await?;
 
-        let domains = self
-            .query_concept_ids(&ConceptMatcher::Type(DOMAIN_TYPE.to_string()))
-            .await?;
-        let mut domain_map: Vec<DomainInfo> = Vec::with_capacity(domains.len());
-        for id in domains {
+        let mut domain_map: Vec<DomainInfo> = Vec::with_capacity(domain_ids.len());
+        for id in domain_ids {
             let mut info = self
                 .try_get_concept_with(&cache, id, |concept| Ok(DomainInfo::from(concept)))
                 .await?;
@@ -2451,7 +2446,7 @@ impl CognitiveNexus {
         let mut result = Vec::with_capacity(ids.len());
         let has_order_by = order_by.iter().any(|v| v.variable.var == var);
         for eid in ids {
-            if !has_order_by && cursor.map(|v| v <= eid).unwrap_or(false) {
+            if !has_order_by && cursor.map(|v| eid <= v).unwrap_or(false) {
                 continue;
             }
 
@@ -2709,6 +2704,19 @@ impl CognitiveNexus {
                     Some(result) => result,
                     None => return Ok(None),
                 };
+
+                // Short-circuit: skip right evaluation when result is already determined
+                // and right side won't consume new bindings (all its variables are
+                // already bound in bindings_cursor from left side evaluation).
+                let can_short_circuit = match &operator {
+                    LogicalOperator::And if !left_result => true,
+                    LogicalOperator::Or if left_result => true,
+                    _ => false,
+                };
+                if can_short_circuit && !right.has_unbound_variables(bindings_cursor) {
+                    return Ok(Some(left_result));
+                }
+
                 let right_result = match Box::pin(self.evaluate_filter_expression(
                     ctx,
                     *right,
