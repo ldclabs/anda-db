@@ -144,10 +144,10 @@ fn rpc_error(resp: &Value) -> &Value {
 fn articles_schema_json() -> Value {
     json!({
         "fields": [
-            {"n": "_id", "d": "", "t": "U64", "u": true, "i": 0},
-            {"n": "title", "d": "Article title", "t": "Text", "u": false, "i": 1},
-            {"n": "body", "d": "Article content", "t": "Text", "u": false, "i": 2},
-            {"n": "score", "d": "Relevance score", "t": {"Option": "U64"}, "u": false, "i": 3}
+            {"name": "_id", "description": "", "type": "U64", "unique": true, "index": 0},
+            {"name": "title", "description": "Article title", "type": "Text", "unique": false, "index": 1},
+            {"name": "body", "description": "Article content", "type": "Text", "unique": false, "index": 2},
+            {"name": "score", "description": "Relevance score", "type": {"Option": "U64"}, "unique": false, "index": 3}
         ]
     })
 }
@@ -229,13 +229,14 @@ async fn test_collection_and_document_crud_on_db_path() {
         })),
     )
     .await;
+
     let doc_id = rpc_result(&add)["_id"].as_u64().unwrap();
 
     let get = rpc_call_db(
         &app,
         "test_db",
         "get_document",
-        Some(json!({"collection": "articles", "id": doc_id})),
+        Some(json!({"collection": "articles", "_id": doc_id})),
     )
     .await;
     assert_eq!(rpc_result(&get)["title"], "Hello World");
@@ -246,7 +247,7 @@ async fn test_collection_and_document_crud_on_db_path() {
         "update_document",
         Some(json!({
             "collection": "articles",
-            "id": doc_id,
+            "_id": doc_id,
             "fields": {"title": "Updated"}
         })),
     )
@@ -257,7 +258,7 @@ async fn test_collection_and_document_crud_on_db_path() {
         &app,
         "test_db",
         "remove_document",
-        Some(json!({"collection": "articles", "id": doc_id})),
+        Some(json!({"collection": "articles", "_id": doc_id})),
     )
     .await;
     assert_eq!(rpc_result(&remove)["title"], "Updated");
@@ -429,7 +430,7 @@ async fn test_cross_database_document_access_returns_not_found() {
         &app,
         "tenant_c",
         "get_document",
-        Some(json!({"collection": "articles", "id": doc_id})),
+        Some(json!({"collection": "articles", "_id": doc_id})),
     )
     .await;
     assert_eq!(rpc_error(&wrong_db_get)["code"], NOT_FOUND);
@@ -438,7 +439,7 @@ async fn test_cross_database_document_access_returns_not_found() {
         &app,
         "test_db",
         "get_document",
-        Some(json!({"collection": "articles", "id": doc_id})),
+        Some(json!({"collection": "articles", "_id": doc_id})),
     )
     .await;
     assert_eq!(rpc_result(&right_db_get)["title"], "Doc In Test DB");

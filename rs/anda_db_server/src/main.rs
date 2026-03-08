@@ -157,11 +157,12 @@ async fn main() -> Result<(), BoxError> {
     let cancel_token = CancellationToken::new();
     let db_clone = db.clone();
     let cancel_clone = cancel_token.clone();
-    tokio::spawn(async move {
+    let db_task = async {
         db_clone
             .auto_flush(cancel_clone, Duration::from_secs(30))
             .await;
-    });
+        Ok::<(), std::io::Error>(())
+    };
 
     let mut databases = BTreeMap::new();
     databases.insert(db_config.name.clone(), db.clone());
@@ -180,11 +181,10 @@ async fn main() -> Result<(), BoxError> {
     let addr: SocketAddr = cli.addr.parse()?;
     let listener = create_reuse_port_listener(addr).await?;
     log::warn!("{}@{} listening on {:?}", APP_NAME, APP_VERSION, addr);
+    let server_task =
+        axum::serve(listener, app).with_graceful_shutdown(shutdown_signal(cancel_token));
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(cancel_token))
-        .await?;
-
+    tokio::try_join!(server_task, db_task)?;
     Ok(())
 }
 

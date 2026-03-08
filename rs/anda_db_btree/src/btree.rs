@@ -1166,7 +1166,7 @@ where
                 }
             }
             RangeQuery::Include(keys) => {
-                let keys = BTreeSet::from_iter(keys.into_iter());
+                let keys = BTreeSet::from_iter(keys);
                 for k in keys.into_iter() {
                     if let Some(posting) = self.postings.get(&k) {
                         let (conti, rt) = f(&k, &posting.2);
@@ -1310,7 +1310,7 @@ where
                 results.extend(self.btree.read().range(start_key..=end_key).cloned());
             }
             RangeQuery::Include(keys) => {
-                let keys = BTreeSet::from_iter(keys.into_iter());
+                let keys = BTreeSet::from_iter(keys);
                 let btree = self.btree.read();
                 results.extend(keys.into_iter().filter(|k| btree.contains(k)));
             }

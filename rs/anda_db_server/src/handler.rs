@@ -12,13 +12,13 @@ use anda_db::{
     schema::{DocumentId, Fv, Schema},
     storage::StorageConfig,
 };
+use anda_db_schema::Cbor;
 use axum::{
     body::Bytes,
     extract::{Path, State},
     http::HeaderMap,
     response::IntoResponse,
 };
-use ciborium::Value as Cbor;
 use object_store::ObjectStore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -48,7 +48,7 @@ pub struct CreateCollectionParams {
     #[serde(default)]
     pub btree_indexes: Vec<Vec<String>>,
     #[serde(default)]
-    pub bm25_indexes: Vec<Vec<String>>,
+    pub bm25_indexes: Vec<String>,
     #[serde(default)]
     pub hnsw_indexes: Vec<HnswIndexDef>,
 }
@@ -67,20 +67,20 @@ pub struct CollectionParams {
 #[derive(Debug, Deserialize)]
 pub struct AddDocumentParams {
     pub collection: String,
-    pub document: JsonValue,
+    pub document: BTreeMap<String, Fv>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct DocumentParams {
     pub collection: String,
-    pub id: DocumentId,
+    pub _id: DocumentId,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct UpdateDocumentParams {
     pub collection: String,
-    pub id: DocumentId,
-    pub fields: JsonValue,
+    pub _id: DocumentId,
+    pub fields: BTreeMap<String, Fv>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -100,6 +100,22 @@ pub struct QueryIdsParams {
 pub struct CreateDatabaseParams {
     pub name: String,
     pub description: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct InformationResult<'a> {
+    name: &'a str,
+    version: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct StatusResult {
+    result: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct AddDocumentResult {
+    _id: DocumentId,
 }
 
 pub async fn handle_root_rpc(
@@ -137,65 +153,62 @@ async fn handle_rpc_impl<F, Fut>(
     dispatch: F,
 ) -> axum::response::Response
 where
-    F: Fn(String, JsonValue) -> Fut,
-    Fut: std::future::Future<Output = Result<JsonValue, RpcError>>,
+    F: FnOnce(String, Fv) -> Fut,
+    Fut: std::future::Future<Output = Result<Fv, RpcError>>,
 {
     let req_ct = ContentType::from_content_type(&headers);
-    match parse_request(&body, req_ct) {
-        Ok(ParsedRpcRequest::Json(req)) => {
-            let params = req.params.unwrap_or(JsonValue::Null);
-            match dispatch(req.method, params).await {
-                Ok(value) => AppResponse::new(JsonRpcResponse::success(value), ct).into_response(),
-                Err(err) => AppResponse::new(JsonRpcResponse::error(err), ct).into_response(),
-            }
-        }
-        Ok(ParsedRpcRequest::Cbor(req)) => {
-            let params = match req.params {
-                Some(v) => match cbor_to_json(v) {
-                    Ok(value) => value,
-                    Err(err) => {
-                        return AppResponse::new(CborRpcResponse::error(err), ct).into_response();
-                    }
-                },
-                None => JsonValue::Null,
-            };
-
-            match dispatch(req.method, params).await {
-                Ok(value) => match json_to_cbor(&value) {
-                    Ok(cbor_value) => {
-                        AppResponse::new(CborRpcResponse::success(cbor_value), ct).into_response()
-                    }
-                    Err(err) => AppResponse::new(CborRpcResponse::error(err), ct).into_response(),
-                },
-                Err(err) => AppResponse::new(CborRpcResponse::error(err), ct).into_response(),
-            }
-        }
-        Err(err) => match ct {
-            ContentType::Json => AppResponse::new(JsonRpcResponse::error(err), ct).into_response(),
-            ContentType::Cbor => AppResponse::new(CborRpcResponse::error(err), ct).into_response(),
-        },
-    }
+    let result = match parse_request(&body, req_ct) {
+        Ok((method, params)) => dispatch(method, params).await,
+        Err(err) => Err(err),
+    };
+    build_response(result, ct)
 }
 
-enum ParsedRpcRequest {
-    Json(JsonRpcRequest),
-    Cbor(CborRpcRequest),
-}
-
-fn parse_request(body: &[u8], ct: ContentType) -> Result<ParsedRpcRequest, RpcError> {
+fn build_response(result: Result<Fv, RpcError>, ct: ContentType) -> axum::response::Response {
     match ct {
-        ContentType::Json => serde_json::from_slice(body)
-            .map(ParsedRpcRequest::Json)
-            .map_err(|e| RpcError::new(PARSE_ERROR, format!("parse error: {e}"))),
-        ContentType::Cbor => ciborium::de::from_reader(body)
-            .map(ParsedRpcRequest::Cbor)
-            .map_err(|e| RpcError::new(PARSE_ERROR, format!("parse error: {e}"))),
+        ContentType::Json => {
+            let resp = match result {
+                Ok(value) => match serde_json::to_value(value) {
+                    Ok(v) => JsonRpcResponse::success(v),
+                    Err(e) => JsonRpcResponse::error(RpcError::new(
+                        INTERNAL_ERROR,
+                        format!("failed to serialize response: {e}"),
+                    )),
+                },
+                Err(err) => JsonRpcResponse::error(err),
+            };
+            AppResponse::new(resp, ct).into_response()
+        }
+        ContentType::Cbor => {
+            let resp = match result {
+                Ok(value) => CborRpcResponse::success(value.into()),
+                Err(err) => CborRpcResponse::error(err),
+            };
+            AppResponse::new(resp, ct).into_response()
+        }
     }
 }
 
-fn cbor_to_json(value: Cbor) -> Result<JsonValue, RpcError> {
-    serde_json::to_value(value)
-        .map_err(|e| RpcError::new(INVALID_PARAMS, format!("invalid CBOR params: {e}")))
+fn parse_request(body: &[u8], ct: ContentType) -> Result<(String, Fv), RpcError> {
+    match ct {
+        ContentType::Json => {
+            let req: JsonRpcRequest = serde_json::from_slice(body)
+                .map_err(|e| RpcError::new(PARSE_ERROR, format!("parse JSON error: {e}")))?;
+            let cbor = json_to_cbor(&req.params.unwrap_or(JsonValue::Null))?;
+            let fv = Fv::try_from(cbor).map_err(|err| {
+                RpcError::new(INVALID_PARAMS, format!("invalid CBOR params: {err}"))
+            })?;
+            Ok((req.method, fv))
+        }
+        ContentType::Cbor => {
+            let req: CborRpcRequest = ciborium::de::from_reader(body)
+                .map_err(|e| RpcError::new(PARSE_ERROR, format!("parse CBOR error: {e}")))?;
+            let fv = Fv::try_from(req.params.unwrap_or(Cbor::Null)).map_err(|err| {
+                RpcError::new(INVALID_PARAMS, format!("invalid CBOR params: {err}"))
+            })?;
+            Ok((req.method, fv))
+        }
+    }
 }
 
 fn json_to_cbor(value: &JsonValue) -> Result<Cbor, RpcError> {
@@ -207,14 +220,17 @@ fn json_to_cbor(value: &JsonValue) -> Result<Cbor, RpcError> {
     })
 }
 
-async fn dispatch_root(
-    app: &AppState,
-    method: &str,
-    params: JsonValue,
-) -> Result<JsonValue, RpcError> {
+fn serialize_result<T>(value: &T) -> Result<Fv, RpcError>
+where
+    T: Serialize,
+{
+    Fv::serialized(value, None).map_err(|e| RpcError::new(INTERNAL_ERROR, e.to_string()))
+}
+
+async fn dispatch_root(app: &AppState, method: &str, params: Fv) -> Result<Fv, RpcError> {
     match method {
         "get_information" => get_information(app),
-        "create_database" => create_database(app, params).await,
+        "create_database" => create_database(app, Fv::deserialized(params)?).await,
         "list_databases" => list_databases(app).await,
         _ => Err(RpcError::new(
             METHOD_NOT_FOUND,
@@ -227,24 +243,24 @@ async fn dispatch_db(
     app: &AppState,
     db_name: &str,
     method: &str,
-    params: JsonValue,
-) -> Result<JsonValue, RpcError> {
+    params: Fv,
+) -> Result<Fv, RpcError> {
     let db = get_database(app, db_name).await?;
 
     match method {
         "get_information" => get_information(app),
         "get_db_metadata" => get_db_metadata(&db),
         "flush_db" => flush_db(&db).await,
-        "create_collection" => create_collection(&db, params).await,
-        "get_collection_metadata" => get_collection_metadata(&db, params).await,
-        "delete_collection" => delete_collection(&db, params).await,
-        "add_document" => add_document(&db, params).await,
-        "get_document" => get_document(&db, params).await,
-        "update_document" => update_document(&db, params).await,
-        "remove_document" => remove_document(&db, params).await,
-        "search_documents" => search_documents(&db, params).await,
-        "search_document_ids" => search_document_ids(&db, params).await,
-        "query_document_ids" => query_document_ids(&db, params).await,
+        "create_collection" => create_collection(&db, Fv::deserialized(params)?).await,
+        "get_collection_metadata" => get_collection_metadata(&db, Fv::deserialized(params)?).await,
+        "delete_collection" => delete_collection(&db, Fv::deserialized(params)?).await,
+        "add_document" => add_document(&db, Fv::deserialized(params)?).await,
+        "get_document" => get_document(&db, Fv::deserialized(params)?).await,
+        "update_document" => update_document(&db, Fv::deserialized(params)?).await,
+        "remove_document" => remove_document(&db, Fv::deserialized(params)?).await,
+        "search_documents" => search_documents(&db, Fv::deserialized(params)?).await,
+        "search_document_ids" => search_document_ids(&db, Fv::deserialized(params)?).await,
+        "query_document_ids" => query_document_ids(&db, Fv::deserialized(params)?).await,
         _ => Err(RpcError::new(
             METHOD_NOT_FOUND,
             format!("method not found: {method}"),
@@ -252,17 +268,14 @@ async fn dispatch_db(
     }
 }
 
-fn get_information(app: &AppState) -> Result<JsonValue, RpcError> {
-    Ok(serde_json::json!({
-        "name": app.name,
-        "version": app.version,
-    }))
+fn get_information(app: &AppState) -> Result<Fv, RpcError> {
+    serialize_result(&InformationResult {
+        name: &app.name,
+        version: &app.version,
+    })
 }
 
-async fn create_database(app: &AppState, params: JsonValue) -> Result<JsonValue, RpcError> {
-    let req: CreateDatabaseParams =
-        serde_json::from_value(params).map_err(|e| RpcError::new(INVALID_PARAMS, e.to_string()))?;
-
+async fn create_database(app: &AppState, req: CreateDatabaseParams) -> Result<Fv, RpcError> {
     if req.name.trim().is_empty() {
         return Err(RpcError::new(
             INVALID_PARAMS,
@@ -287,11 +300,7 @@ async fn create_database(app: &AppState, params: JsonValue) -> Result<JsonValue,
         lock: None,
     };
 
-    let db = Arc::new(
-        AndaDB::connect(app.object_store.clone(), cfg)
-            .await
-            .map_err(RpcError::from)?,
-    );
+    let db = Arc::new(AndaDB::connect(app.object_store.clone(), cfg).await?);
 
     {
         let mut dbs = app.databases.write().await;
@@ -304,13 +313,13 @@ async fn create_database(app: &AppState, params: JsonValue) -> Result<JsonValue,
         dbs.insert(req.name.clone(), db.clone());
     }
 
-    serde_json::to_value(db.metadata()).map_err(|e| RpcError::new(INTERNAL_ERROR, e.to_string()))
+    serialize_result(&db.metadata())
 }
 
-async fn list_databases(app: &AppState) -> Result<JsonValue, RpcError> {
+async fn list_databases(app: &AppState) -> Result<Fv, RpcError> {
     let dbs = app.databases.read().await;
     let names: Vec<String> = dbs.keys().cloned().collect();
-    serde_json::to_value(names).map_err(|e| RpcError::new(INTERNAL_ERROR, e.to_string()))
+    serialize_result(&names)
 }
 
 async fn get_database(app: &AppState, db_name: &str) -> Result<Arc<AndaDB>, RpcError> {
@@ -320,20 +329,16 @@ async fn get_database(app: &AppState, db_name: &str) -> Result<Arc<AndaDB>, RpcE
         .ok_or_else(|| RpcError::new(NOT_FOUND, format!("database not found: {db_name}")))
 }
 
-fn get_db_metadata(db: &AndaDB) -> Result<JsonValue, RpcError> {
-    let metadata = db.metadata();
-    serde_json::to_value(metadata).map_err(|e| RpcError::new(INTERNAL_ERROR, e.to_string()))
+fn get_db_metadata(db: &AndaDB) -> Result<Fv, RpcError> {
+    serialize_result(&db.metadata())
 }
 
-async fn flush_db(db: &AndaDB) -> Result<JsonValue, RpcError> {
-    db.flush().await.map_err(RpcError::from)?;
-    Ok(serde_json::json!({"result": "flushed"}))
+async fn flush_db(db: &AndaDB) -> Result<Fv, RpcError> {
+    db.flush().await?;
+    serialize_result(&StatusResult { result: "flushed" })
 }
 
-async fn create_collection(db: &AndaDB, params: JsonValue) -> Result<JsonValue, RpcError> {
-    let req: CreateCollectionParams =
-        serde_json::from_value(params).map_err(|e| RpcError::new(INVALID_PARAMS, e.to_string()))?;
-
+async fn create_collection(db: &AndaDB, req: CreateCollectionParams) -> Result<Fv, RpcError> {
     let btree_indexes = req.btree_indexes;
     let bm25_indexes = req.bm25_indexes;
     let hnsw_indexes = req.hnsw_indexes;
@@ -344,9 +349,14 @@ async fn create_collection(db: &AndaDB, params: JsonValue) -> Result<JsonValue, 
                 let fields: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
                 col.create_btree_index_nx(&fields).await?;
             }
-            for fields in &bm25_indexes {
-                let fields: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
-                col.create_bm25_index_nx(&fields).await?;
+            if !bm25_indexes.is_empty() {
+                col.create_bm25_index_nx(
+                    &bm25_indexes
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<&str>>(),
+                )
+                .await?;
             }
             for hnsw in &hnsw_indexes {
                 col.create_hnsw_index_nx(&hnsw.field, hnsw.config.clone())
@@ -354,141 +364,87 @@ async fn create_collection(db: &AndaDB, params: JsonValue) -> Result<JsonValue, 
             }
             Ok(())
         })
-        .await
-        .map_err(RpcError::from)?;
+        .await?;
 
-    serde_json::to_value(col.metadata()).map_err(|e| RpcError::new(INTERNAL_ERROR, e.to_string()))
+    serialize_result(&col.metadata())
 }
 
-async fn get_collection_metadata(db: &AndaDB, params: JsonValue) -> Result<JsonValue, RpcError> {
-    let req: CollectionParams =
-        serde_json::from_value(params).map_err(|e| RpcError::new(INVALID_PARAMS, e.to_string()))?;
+async fn get_collection_metadata(db: &AndaDB, req: CollectionParams) -> Result<Fv, RpcError> {
     let col = open_collection(db, &req.collection).await?;
-    serde_json::to_value(col.metadata()).map_err(|e| RpcError::new(INTERNAL_ERROR, e.to_string()))
+    serialize_result(&col.metadata())
 }
 
-async fn delete_collection(db: &AndaDB, params: JsonValue) -> Result<JsonValue, RpcError> {
-    let req: CollectionParams =
-        serde_json::from_value(params).map_err(|e| RpcError::new(INVALID_PARAMS, e.to_string()))?;
-    db.delete_collection(&req.collection)
-        .await
-        .map_err(RpcError::from)?;
-    Ok(serde_json::json!({"result": "deleted"}))
+async fn delete_collection(db: &AndaDB, req: CollectionParams) -> Result<Fv, RpcError> {
+    db.delete_collection(&req.collection).await?;
+    serialize_result(&StatusResult { result: "deleted" })
 }
 
-async fn add_document(db: &AndaDB, params: JsonValue) -> Result<JsonValue, RpcError> {
-    let mut req: AddDocumentParams =
-        serde_json::from_value(params).map_err(|e| RpcError::new(INVALID_PARAMS, e.to_string()))?;
-
+async fn add_document(db: &AndaDB, mut req: AddDocumentParams) -> Result<Fv, RpcError> {
+    req.document.insert("_id".to_string(), 0u64.into());
     let col = open_collection(db, &req.collection).await?;
-    if let Some(obj) = req.document.as_object_mut() {
-        obj.entry("_id").or_insert(JsonValue::from(0u64));
+    let id = col.add_from(&req.document).await?;
+    let _ = col.flush(anda_db::unix_ms()).await;
+    serialize_result(&AddDocumentResult { _id: id })
+}
+
+async fn get_document(db: &AndaDB, req: DocumentParams) -> Result<Fv, RpcError> {
+    let col = open_collection(db, &req.collection).await?;
+    Ok(col.get_as(req._id).await?)
+}
+
+async fn update_document(db: &AndaDB, req: UpdateDocumentParams) -> Result<Fv, RpcError> {
+    let col = open_collection(db, &req.collection).await?;
+    let doc = col.update(req._id, req.fields).await?;
+    let _ = col.flush(anda_db::unix_ms()).await;
+    doc.try_into().map_err(|e| {
+        RpcError::new(
+            INTERNAL_ERROR,
+            format!("failed to serialize updated document: {e}"),
+        )
+    })
+}
+
+async fn remove_document(db: &AndaDB, req: DocumentParams) -> Result<Fv, RpcError> {
+    let col = open_collection(db, &req.collection).await?;
+    let doc = col.remove(req._id).await?;
+    let _ = col.flush(anda_db::unix_ms()).await;
+    match doc {
+        Some(doc) => {
+            let rt: Fv = doc.try_into().map_err(|e| {
+                RpcError::new(
+                    INTERNAL_ERROR,
+                    format!("failed to serialize removed document: {e}"),
+                )
+            })?;
+            Ok(rt)
+        }
+        None => Ok(Fv::Null),
     }
-
-    let id = col.add_from(&req.document).await.map_err(RpcError::from)?;
-    let _ = col.flush(anda_db::unix_ms()).await;
-    Ok(serde_json::json!({"_id": id}))
 }
 
-async fn get_document(db: &AndaDB, params: JsonValue) -> Result<JsonValue, RpcError> {
-    let req: DocumentParams =
-        serde_json::from_value(params).map_err(|e| RpcError::new(INVALID_PARAMS, e.to_string()))?;
+async fn search_documents(db: &AndaDB, req: SearchParams) -> Result<Fv, RpcError> {
     let col = open_collection(db, &req.collection).await?;
-    let doc: JsonValue = col.get_as(req.id).await.map_err(RpcError::from)?;
-    Ok(doc)
+    let docs: Vec<Fv> = col.search_as(req.query).await?;
+    serialize_result(&docs)
 }
 
-async fn update_document(db: &AndaDB, params: JsonValue) -> Result<JsonValue, RpcError> {
-    let req: UpdateDocumentParams =
-        serde_json::from_value(params).map_err(|e| RpcError::new(INVALID_PARAMS, e.to_string()))?;
+async fn search_document_ids(db: &AndaDB, req: SearchParams) -> Result<Fv, RpcError> {
     let col = open_collection(db, &req.collection).await?;
-    let fields = value_to_update_fields(col.schema().as_ref(), &req.fields)?;
-    let doc = col.update(req.id, fields).await.map_err(RpcError::from)?;
-    let doc: JsonValue = doc.try_into().map_err(RpcError::from)?;
-    let _ = col.flush(anda_db::unix_ms()).await;
-    Ok(doc)
+    let ids = col.search_ids(req.query).await?;
+    serialize_result(&ids)
 }
 
-async fn remove_document(db: &AndaDB, params: JsonValue) -> Result<JsonValue, RpcError> {
-    let req: DocumentParams =
-        serde_json::from_value(params).map_err(|e| RpcError::new(INVALID_PARAMS, e.to_string()))?;
+async fn query_document_ids(db: &AndaDB, req: QueryIdsParams) -> Result<Fv, RpcError> {
     let col = open_collection(db, &req.collection).await?;
-    let doc = col.remove(req.id).await.map_err(RpcError::from)?;
-    let result: JsonValue = match doc {
-        Some(doc) => doc.try_into().map_err(RpcError::from)?,
-        None => JsonValue::Null,
-    };
-    let _ = col.flush(anda_db::unix_ms()).await;
-    Ok(result)
-}
-
-async fn search_documents(db: &AndaDB, params: JsonValue) -> Result<JsonValue, RpcError> {
-    let req: SearchParams =
-        serde_json::from_value(params).map_err(|e| RpcError::new(INVALID_PARAMS, e.to_string()))?;
-    let col = open_collection(db, &req.collection).await?;
-    let docs: Vec<JsonValue> = col.search_as(req.query).await.map_err(RpcError::from)?;
-    serde_json::to_value(docs).map_err(|e| RpcError::new(INTERNAL_ERROR, e.to_string()))
-}
-
-async fn search_document_ids(db: &AndaDB, params: JsonValue) -> Result<JsonValue, RpcError> {
-    let req: SearchParams =
-        serde_json::from_value(params).map_err(|e| RpcError::new(INVALID_PARAMS, e.to_string()))?;
-    let col = open_collection(db, &req.collection).await?;
-    let ids = col.search_ids(req.query).await.map_err(RpcError::from)?;
-    serde_json::to_value(ids).map_err(|e| RpcError::new(INTERNAL_ERROR, e.to_string()))
-}
-
-async fn query_document_ids(db: &AndaDB, params: JsonValue) -> Result<JsonValue, RpcError> {
-    let req: QueryIdsParams =
-        serde_json::from_value(params).map_err(|e| RpcError::new(INVALID_PARAMS, e.to_string()))?;
-    let col = open_collection(db, &req.collection).await?;
-    let ids = col
-        .query_ids(req.filter, req.limit)
-        .await
-        .map_err(RpcError::from)?;
-    serde_json::to_value(ids).map_err(|e| RpcError::new(INTERNAL_ERROR, e.to_string()))
+    let ids = col.query_ids(req.filter, req.limit).await?;
+    serialize_result(&ids)
 }
 
 async fn open_collection(
     db: &AndaDB,
     name: &str,
 ) -> Result<Arc<anda_db::collection::Collection>, RpcError> {
-    db.open_collection(name.to_string(), async |_| Ok(()))
-        .await
-        .map_err(RpcError::from)
-}
-
-fn value_to_update_fields(
-    schema: &anda_db_schema::Schema,
-    value: &JsonValue,
-) -> Result<BTreeMap<String, Fv>, RpcError> {
-    let cbor = Cbor::serialized(value)
-        .map_err(|e| RpcError::new(INVALID_PARAMS, format!("failed to convert value: {e}")))?;
-
-    let map = cbor
-        .into_map()
-        .map_err(|e| RpcError::new(INVALID_PARAMS, format!("expected object/map, got: {e:?}")))?;
-
-    let mut fields = BTreeMap::new();
-    for (k, v) in map {
-        let name = k.into_text().map_err(|e| {
-            RpcError::new(INVALID_PARAMS, format!("expected string key, got: {e:?}"))
-        })?;
-
-        if name == anda_db_schema::Schema::ID_KEY {
-            continue;
-        }
-
-        let field = schema
-            .get_field_or_err(&name)
-            .map_err(|e| RpcError::new(INVALID_PARAMS, e.to_string()))?;
-
-        let fv = field
-            .extract(v, false)
-            .map_err(|e| RpcError::new(INVALID_PARAMS, e.to_string()))?;
-
-        fields.insert(name, fv);
-    }
-
-    Ok(fields)
+    Ok(db
+        .open_collection(name.to_string(), async |_| Ok(()))
+        .await?)
 }

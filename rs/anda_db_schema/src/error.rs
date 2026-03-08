@@ -10,6 +10,7 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub enum SchemaError {
     #[error("Invalid schema: {0}")]
     Schema(String),
+
     /// Invalid field type error
     #[error("Invalid field type: {0}")]
     FieldType(String),

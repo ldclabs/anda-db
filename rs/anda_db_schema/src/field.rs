@@ -1245,26 +1245,26 @@ pub struct FieldEntry {
     /// - Not be empty
     /// - Not exceed 64 characters
     /// - Contain only lowercase letters, numbers, and underscores
-    #[serde(rename = "n")]
+    #[serde(rename = "n", alias = "name")]
     name: String,
 
     /// Field description
     /// This can be used by clients to improve the LLM's understanding of available fields
     /// and their expected values.
-    #[serde(rename = "d")]
+    #[serde(rename = "d", alias = "description")]
     description: String,
 
     /// Field type
-    #[serde(rename = "t")]
+    #[serde(rename = "t", alias = "type")]
     r#type: FieldType,
 
     /// Whether the field value must be unique in the collection
-    #[serde(rename = "u")]
+    #[serde(rename = "u", alias = "unique")]
     unique: bool,
 
     /// Field index value - field names are not stored with each record,
     /// but are referenced by index to save storage space
-    #[serde(rename = "i")]
+    #[serde(rename = "i", alias = "index")]
     idx: usize,
 }
 
