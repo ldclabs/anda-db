@@ -628,8 +628,15 @@ where
             }
 
             if posting_empty {
-                self.btree.write().remove(&field_value);
-                self.postings.remove(&field_value);
+                // Atomically check-and-remove: only remove if the posting is still empty.
+                // Between dropping the `get_mut` above and here, a concurrent `insert`
+                // could have added a new doc_id, making the posting non-empty again.
+                if let dashmap::Entry::Occupied(entry) = self.postings.entry(field_value.clone())
+                    && entry.get().2.is_empty()
+                {
+                    entry.remove();
+                    self.btree.write().remove(&field_value);
+                }
             }
 
             self.update_metadata(|m| {
@@ -697,9 +704,24 @@ where
 
         for field_value in field_values {
             let mut size_increase = 0;
+            let mut target_bucket_id = bucket_id;
             match self.postings.entry(field_value.clone()) {
                 dashmap::Entry::Occupied(mut entry) => {
                     let posting = entry.get_mut();
+                    // Track the posting's actual bucket, not the current max_bucket_id
+                    target_bucket_id = posting.0;
+
+                    // Re-check uniqueness constraint atomically while holding the entry lock.
+                    // The pre-check above may have passed, but a concurrent insert could have
+                    // added a different doc_id between the pre-check and here.
+                    if !self.config.allow_duplicates && !posting.2.contains(&doc_id) {
+                        return Err(BTreeError::AlreadyExists {
+                            name: self.name.clone(),
+                            id: json!(doc_id),
+                            value: json!(field_value),
+                        });
+                    }
+
                     // Only add the doc_id if it's not already present
                     if posting.2.push(doc_id.clone()) {
                         // Calculate size increase for this insertion
@@ -719,9 +741,9 @@ where
             };
 
             if size_increase > 0 {
-                // Update the bucket size tracking
+                // Update the bucket size tracking for the posting's actual bucket
                 let bucket_entry = bucket_updates
-                    .entry(bucket_id)
+                    .entry(target_bucket_id)
                     .or_insert_with(|| (0, FxHashSet::default()));
                 bucket_entry.0 += size_increase;
                 bucket_entry.1.insert(field_value);
@@ -915,23 +937,24 @@ where
             }
         }
 
-        // Remove empty postings from the index and B-tree
-        if !values_to_remove.is_empty() {
-            // Remove from the B-tree
+        // Remove empty postings from the index and B-tree.
+        // Use atomic check-and-remove: a concurrent `insert` might have re-populated
+        // a posting between the first pass and here, so only remove if still empty.
+        let mut actually_removed = FxHashSet::default();
+        for value in &values_to_remove {
+            if let dashmap::Entry::Occupied(entry) = self.postings.entry(value.clone())
+                && entry.get().2.is_empty()
             {
-                let mut btree = self.btree.write();
-                for value in &values_to_remove {
-                    btree.remove(value);
-                }
-            }
-
-            // Remove from the postings map
-            for value in &values_to_remove {
-                self.postings.remove(value);
+                entry.remove();
+                actually_removed.insert(value.clone());
             }
         }
-
-        let values_to_remove_set: FxHashSet<FV> = values_to_remove.iter().cloned().collect();
+        if !actually_removed.is_empty() {
+            let mut btree = self.btree.write();
+            for value in &actually_removed {
+                btree.remove(value);
+            }
+        }
 
         // Update all modified buckets
         for (bucket_id, (size_decrease, field_values)) in bucket_updates {
@@ -941,7 +964,7 @@ where
 
                 // Remove field values that are completely removed
                 for fv in &field_values {
-                    if values_to_remove_set.contains(fv) {
+                    if actually_removed.contains(fv) {
                         bucket.2.swap_remove_if(|k| k == fv);
                     }
                 }
@@ -1129,6 +1152,9 @@ where
                 return groups.into_iter().rev().flatten().collect();
             }
             RangeQuery::Between(start_key, end_key) => {
+                if start_key > end_key {
+                    return results; // empty result for invalid range
+                }
                 for k in self.btree.read().range(start_key..=end_key) {
                     if let Some(posting) = self.postings.get(k) {
                         let (conti, rt) = f(k, &posting.2);
@@ -1140,6 +1166,7 @@ where
                 }
             }
             RangeQuery::Include(keys) => {
+                let keys = BTreeSet::from_iter(keys.into_iter());
                 for k in keys.into_iter() {
                     if let Some(posting) = self.postings.get(&k) {
                         let (conti, rt) = f(&k, &posting.2);
@@ -1283,6 +1310,7 @@ where
                 results.extend(self.btree.read().range(start_key..=end_key).cloned());
             }
             RangeQuery::Include(keys) => {
+                let keys = BTreeSet::from_iter(keys.into_iter());
                 let btree = self.btree.read();
                 results.extend(keys.into_iter().filter(|k| btree.contains(k)));
             }
@@ -1304,14 +1332,13 @@ where
                 }
             }
             RangeQuery::Or(queries) => {
-                let mut seen = FxHashSet::default();
+                // Use BTreeSet to ensure keys are returned in global B-tree order,
+                // so that early-stop/limit semantics stay deterministic.
+                let mut merged = BTreeSet::new();
                 for query in queries {
-                    for k in self.range_keys(*query) {
-                        if seen.insert(k.clone()) {
-                            results.push(k);
-                        }
-                    }
+                    merged.extend(self.range_keys(*query));
                 }
+                results.extend(merged);
             }
             RangeQuery::Not(query) => {
                 let exclude: FxHashSet<FV> = self.range_keys(*query).into_iter().collect();
@@ -3014,5 +3041,117 @@ mod tests {
         let stats = index.stats();
         assert_eq!(stats.num_elements, 1);
         assert_eq!(stats.delete_count, 1);
+    }
+
+    #[test]
+    fn test_insert_array_uses_correct_bucket_for_existing_postings() {
+        // Regression test: insert_array Occupied branch must track size in the
+        // posting's actual bucket, not the current max_bucket_id.
+        let config = BTreeConfig {
+            bucket_overload_size: 80, // small to force migration
+            allow_duplicates: true,
+        };
+        let index = BTreeIndex::new("bucket_track".to_string(), Some(config));
+
+        // Fill bucket 0 until a migration happens (creates bucket 1+).
+        let mut doc = 1u64;
+        while index.stats().max_bucket_id == 0 && doc < 200 {
+            index.insert(doc, "alpha".to_string(), now_ms()).unwrap();
+            doc += 1;
+        }
+        let bucket_after_migration = index.stats().max_bucket_id;
+        assert!(bucket_after_migration > 0, "migration should have occurred");
+
+        // "alpha" now lives in the migrated bucket (> 0).
+        // Insert a new value "beta" via single insert so it lands in the current max bucket.
+        index.insert(1, "beta".to_string(), now_ms()).unwrap();
+
+        // Now use insert_array to add a doc to BOTH "alpha" and "beta".
+        // The fix ensures "alpha"'s size_increase is attributed to its actual bucket,
+        // not the current max_bucket_id.
+        let result =
+            index.insert_array(999, vec!["alpha".to_string(), "beta".to_string()], now_ms());
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 2);
+
+        // Verify both postings contain doc 999.
+        let alpha_ids = index
+            .query_with(&"alpha".to_string(), |ids| Some(ids.clone()))
+            .unwrap();
+        assert!(alpha_ids.contains(&999));
+        let beta_ids = index
+            .query_with(&"beta".to_string(), |ids| Some(ids.clone()))
+            .unwrap();
+        assert!(beta_ids.contains(&999));
+    }
+
+    #[test]
+    fn test_insert_array_enforces_unique_in_occupied_branch() {
+        // Regression test: insert_array Occupied branch must re-check allow_duplicates
+        // atomically while holding the entry lock, matching insert() behaviour.
+        let config = BTreeConfig {
+            bucket_overload_size: 1024,
+            allow_duplicates: false,
+        };
+        let unique_index = BTreeIndex::new("unique_array".to_string(), Some(config));
+
+        // Insert doc 1 with "apple" via single insert.
+        unique_index
+            .insert(1, "apple".to_string(), now_ms())
+            .unwrap();
+
+        // insert_array with a different doc_id for the same field_value should fail.
+        let result = unique_index.insert_array(2, vec!["apple".to_string()], now_ms());
+        assert!(result.is_err());
+        match result {
+            Err(BTreeError::AlreadyExists { .. }) => {}
+            other => panic!("Expected AlreadyExists, got: {other:?}"),
+        }
+
+        // insert_array with the SAME doc_id should be idempotent (no error, 0 inserted).
+        let result = unique_index.insert_array(1, vec!["apple".to_string()], now_ms());
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 0);
+    }
+
+    #[test]
+    fn test_range_keys_or_returns_sorted_order() {
+        let index = create_populated_index();
+        // keys: apple < banana < cherry < date < eggplant
+
+        // Or of two non-overlapping ranges in reverse declaration order.
+        // Previously would return keys in subquery order (eggplant first)
+        // due to FxHashSet dedup; now must return global B-tree order.
+        let query = RangeQuery::Or(vec![
+            Box::new(RangeQuery::Ge("eggplant".to_string())),
+            Box::new(RangeQuery::Le("banana".to_string())),
+        ]);
+
+        let results = index.range_query_with(query, |k, _| (true, vec![k.clone()]));
+        assert_eq!(
+            results,
+            vec!["apple", "banana", "eggplant"],
+            "Or query must return keys in global B-tree order"
+        );
+    }
+
+    #[test]
+    fn test_range_keys_or_deduplicates() {
+        let index = create_populated_index();
+        // Overlapping ranges: banana..=cherry and apple..=cherry
+        let query = RangeQuery::Or(vec![
+            Box::new(RangeQuery::Between(
+                "banana".to_string(),
+                "cherry".to_string(),
+            )),
+            Box::new(RangeQuery::Between(
+                "apple".to_string(),
+                "cherry".to_string(),
+            )),
+        ]);
+
+        let results = index.range_query_with(query, |k, _| (true, vec![k.clone()]));
+        // Should be deduplicated and sorted
+        assert_eq!(results, vec!["apple", "banana", "cherry"]);
     }
 }
