@@ -6,7 +6,7 @@ use nom::{
     combinator::{cut, map, map_res, opt},
     error::context,
     multi::{fold, many1, separated_list1},
-    sequence::{pair, preceded, separated_pair, terminated},
+    sequence::{delimited, pair, preceded, separated_pair, terminated},
 };
 
 use super::common::*;
@@ -381,9 +381,17 @@ fn parse_function_expression(input: &str) -> VResult<'_, FilterExpression> {
 // 解析过滤器操作数
 fn parse_filter_operand(input: &str) -> VResult<'_, FilterOperand> {
     context(
-        "FILTER operand: ?variable.path or literal value (string, number, true, false, null)",
+        "FILTER operand: ?variable.path, literal value, or [value, ...] list",
         alt((
             map(dot_path_var, FilterOperand::Variable),
+            map(
+                delimited(
+                    ws(char('[')),
+                    separated_list1(ws(char(',')), kip_value),
+                    ws(char(']')),
+                ),
+                FilterOperand::List,
+            ),
             map(kip_value, FilterOperand::Literal),
         )),
     )
@@ -410,6 +418,9 @@ fn parse_filter_function(input: &str) -> VResult<'_, FilterFunction> {
         map(tag("STARTS_WITH"), |_| FilterFunction::StartsWith),
         map(tag("ENDS_WITH"), |_| FilterFunction::EndsWith),
         map(tag("REGEX"), |_| FilterFunction::Regex),
+        map(tag("IS_NOT_NULL"), |_| FilterFunction::IsNotNull),
+        map(tag("IS_NULL"), |_| FilterFunction::IsNull),
+        map(tag("IN"), |_| FilterFunction::In),
     ))
     .parse(input)
 }
@@ -1006,6 +1017,135 @@ mod tests {
                 }
                 _ => panic!("Expected function expression for: {input}"),
             }
+        }
+    }
+
+    #[test]
+    fn test_parse_in_filter() {
+        let input = r#"FILTER(IN(?status, ["active", "pending", "review"]))"#;
+        let result = parse_filter_clause(input);
+        assert!(result.is_ok(), "Failed to parse IN filter");
+
+        let (_, filter) = result.unwrap();
+        match filter.expression {
+            FilterExpression::Function { func, args } => {
+                assert_eq!(func, FilterFunction::In);
+                assert_eq!(args.len(), 2);
+                match &args[0] {
+                    FilterOperand::Variable(var) => assert_eq!(var.var, "status"),
+                    _ => panic!("Expected variable as first argument"),
+                }
+                match &args[1] {
+                    FilterOperand::List(values) => {
+                        assert_eq!(values.len(), 3);
+                        assert_eq!(values[0], Value::String("active".to_string()));
+                        assert_eq!(values[1], Value::String("pending".to_string()));
+                        assert_eq!(values[2], Value::String("review".to_string()));
+                    }
+                    _ => panic!("Expected list as second argument"),
+                }
+            }
+            _ => panic!("Expected function expression"),
+        }
+    }
+
+    #[test]
+    fn test_parse_in_filter_with_mixed_values() {
+        let input = r#"FILTER(IN(?score, [1, 2, 3]))"#;
+        let result = parse_filter_clause(input);
+        assert!(result.is_ok(), "Failed to parse IN filter with numbers");
+
+        let (_, filter) = result.unwrap();
+        match filter.expression {
+            FilterExpression::Function { func, args } => {
+                assert_eq!(func, FilterFunction::In);
+                assert_eq!(args.len(), 2);
+                match &args[1] {
+                    FilterOperand::List(values) => {
+                        assert_eq!(values.len(), 3);
+                    }
+                    _ => panic!("Expected list as second argument"),
+                }
+            }
+            _ => panic!("Expected function expression"),
+        }
+    }
+
+    #[test]
+    fn test_parse_is_null_filter() {
+        let input = "FILTER(IS_NULL(?description))";
+        let result = parse_filter_clause(input);
+        assert!(result.is_ok(), "Failed to parse IS_NULL filter");
+
+        let (_, filter) = result.unwrap();
+        match filter.expression {
+            FilterExpression::Function { func, args } => {
+                assert_eq!(func, FilterFunction::IsNull);
+                assert_eq!(args.len(), 1);
+                match &args[0] {
+                    FilterOperand::Variable(var) => assert_eq!(var.var, "description"),
+                    _ => panic!("Expected variable as argument"),
+                }
+            }
+            _ => panic!("Expected function expression"),
+        }
+    }
+
+    #[test]
+    fn test_parse_is_not_null_filter() {
+        let input = "FILTER(IS_NOT_NULL(?drug.name))";
+        let result = parse_filter_clause(input);
+        assert!(result.is_ok(), "Failed to parse IS_NOT_NULL filter");
+
+        let (_, filter) = result.unwrap();
+        match filter.expression {
+            FilterExpression::Function { func, args } => {
+                assert_eq!(func, FilterFunction::IsNotNull);
+                assert_eq!(args.len(), 1);
+                match &args[0] {
+                    FilterOperand::Variable(var) => {
+                        assert_eq!(var.var, "drug");
+                        assert_eq!(var.path, vec!["name".to_string()]);
+                    }
+                    _ => panic!("Expected variable as argument"),
+                }
+            }
+            _ => panic!("Expected function expression"),
+        }
+    }
+
+    #[test]
+    fn test_parse_new_functions_in_complex_filter() {
+        let input =
+            r#"FILTER(IS_NOT_NULL(?drug.name) && IN(?drug.status, ["active", "approved"]))"#;
+        let result = parse_filter_clause(input);
+        assert!(
+            result.is_ok(),
+            "Failed to parse complex filter with new functions"
+        );
+
+        let (_, filter) = result.unwrap();
+        match filter.expression {
+            FilterExpression::Logical {
+                operator,
+                left,
+                right,
+            } => {
+                assert_eq!(operator, LogicalOperator::And);
+                match left.as_ref() {
+                    FilterExpression::Function { func, .. } => {
+                        assert_eq!(*func, FilterFunction::IsNotNull);
+                    }
+                    _ => panic!("Expected IS_NOT_NULL on left"),
+                }
+                match right.as_ref() {
+                    FilterExpression::Function { func, .. } => {
+                        assert_eq!(*func, FilterFunction::In);
+                    }
+                    _ => panic!("Expected IN on right"),
+                }
+            }
+            _ => panic!("Expected logical AND expression"),
         }
     }
 

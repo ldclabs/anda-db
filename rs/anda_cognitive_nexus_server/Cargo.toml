@@ -10,9 +10,9 @@ license.workspace = true
 
 [dependencies]
 anda_db_schema = { version = "0.4", path = "../anda_db_schema" }
-anda_kip = { version = "0.6", path = "../anda_kip" }
+anda_kip = { version = "0.7", path = "../anda_kip" }
 anda_db = { version = "0.7", path = "../anda_db", features = ["full"] }
-anda_cognitive_nexus = { version = "0.6", path = "../anda_cognitive_nexus" }
+anda_cognitive_nexus = { version = "0.7", path = "../anda_cognitive_nexus" }
 anda_object_store = { version = "0.3", path = "../anda_object_store" }
 axum = { workspace = true }
 clap = { workspace = true }

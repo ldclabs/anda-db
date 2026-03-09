@@ -621,13 +621,15 @@ pub enum FilterExpression {
 }
 
 /// Represents an operand in a filter expression.
-/// Can be either a variable reference, dot notation path, or a literal value.
+/// Can be either a variable reference, dot notation path, a literal value, or a list of values.
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub enum FilterOperand {
     /// A dot notation path (e.g., `?risk`, `?drug.attributes.risk_level`)
     Variable(DotPathVar),
     /// A literal value
     Literal(Value),
+    /// A list of literal values (e.g., `["a", "b", "c"]`)
+    List(Vec<Value>),
 }
 
 /// Comparison operators supported in filter expressions.
@@ -688,6 +690,12 @@ pub enum FilterFunction {
     EndsWith,
     /// REGEX(?str, "pattern") - checks if string matches regex pattern
     Regex,
+    /// IN(?expr, [value1, value2, ...]) - checks if value is in the given list
+    In,
+    /// IS_NULL(?expr) - checks if value is null or undefined
+    IsNull,
+    /// IS_NOT_NULL(?expr) - checks if value is not null or undefined
+    IsNotNull,
 }
 
 /// Represents an ORDER BY condition for result sorting.

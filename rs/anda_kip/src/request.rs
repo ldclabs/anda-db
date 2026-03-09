@@ -6,6 +6,7 @@
 //! LLM Agents send structured requests (typically encapsulated in Function Calling)
 //! containing KIP commands to the Cognitive Nexus, which returns structured JSON responses.
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::borrow::Cow;
 
 use crate::{
@@ -311,16 +312,18 @@ impl Request {
     /// Returns an array of results for all successfully executed commands.
     async fn execute_batch(&self, nexus: &impl Executor) -> (CommandType, Response) {
         let mut results = Vec::with_capacity(self.commands.len());
-        let mut last_command_type = CommandType::Unknown;
+        let mut command_type = CommandType::Unknown;
 
         for (cmd, params) in self.iter_commands() {
             let substituted = Self::substitute_params(&cmd, &params);
             let (cmd_type, response) = execute_kip(nexus, &substituted, self.dry_run).await;
-            last_command_type = cmd_type;
+            if command_type != CommandType::Kml && cmd_type != CommandType::Unknown {
+                command_type = cmd_type;
+            }
 
             match response {
-                Response::Ok { result, .. } => {
-                    results.push(result);
+                Response::Ok { .. } => {
+                    results.push(response);
                 }
                 Response::Err { mut error, .. } => {
                     // Check for placeholder misuse if it's a syntax error
@@ -333,24 +336,15 @@ impl Request {
                             });
                         }
                     }
+                    results.push(Response::err(error));
 
                     // Stop on first error, return error response
-                    return (
-                        last_command_type,
-                        Response::Err {
-                            error,
-                            result: if results.is_empty() {
-                                None
-                            } else {
-                                Some(Json::Array(results))
-                            },
-                        },
-                    );
+                    return (command_type, Response::ok(json!(results)));
                 }
             }
         }
 
-        (last_command_type, Response::ok(Json::Array(results)))
+        (command_type, Response::ok(json!(results)))
     }
 }
 
@@ -569,7 +563,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{parse_kml, parse_kql};
+    use crate::{Command, parse_kml, parse_kql};
+    use async_trait::async_trait;
     use serde_json::json;
 
     #[test]
@@ -1123,5 +1118,384 @@ mod tests {
             warnings.unwrap_err().contains("name"),
             "Should warn about 'name' placeholder"
         );
+    }
+
+    // --- Mock Executor for async execute tests ---
+
+    #[derive(Debug)]
+    struct MockExecutor;
+
+    #[async_trait]
+    impl Executor for MockExecutor {
+        async fn execute(&self, command: Command, _dry_run: bool) -> Response {
+            match command {
+                Command::Kql(query) => Response::Ok {
+                    result: json!({
+                        "type": "kql",
+                        "find_count": query.find_clause.expressions.len()
+                    }),
+                    next_cursor: None,
+                    ignore: None,
+                },
+                Command::Kml(_) => Response::ok(json!({"type": "kml", "upserted": 1})),
+                Command::Meta(_) => Response::ok(json!({"type": "meta"})),
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailingExecutor;
+
+    #[async_trait]
+    impl Executor for FailingExecutor {
+        async fn execute(&self, _command: Command, _dry_run: bool) -> Response {
+            Response::err(ErrorObject {
+                code: "KIP_3001".to_string(),
+                message: "Not found".to_string(),
+                hint: Some("Check that the referenced concept exists.".to_string()),
+                data: None,
+            })
+        }
+    }
+
+    // --- Single command execute tests ---
+
+    #[tokio::test]
+    async fn test_execute_single_kql_command() {
+        let executor = MockExecutor;
+        let request = Request {
+            command: r#"FIND(?drug.name) WHERE { ?drug {type: "Drug"} } LIMIT 10"#.to_string(),
+            ..Default::default()
+        };
+
+        let (cmd_type, response) = request.execute(&executor).await;
+        assert_eq!(cmd_type, CommandType::Kql);
+        match response {
+            Response::Ok {
+                result,
+                next_cursor,
+                ignore,
+            } => {
+                assert_eq!(result["type"], "kql");
+                assert_eq!(result["find_count"], 1);
+                assert!(next_cursor.is_none());
+                assert!(ignore.is_none());
+            }
+            _ => panic!("Expected Ok response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_single_kml_command() {
+        let executor = MockExecutor;
+        let request = Request {
+            command: r#"UPSERT { CONCEPT ?d { {type: "Drug", name: "Aspirin"} } }"#.to_string(),
+            ..Default::default()
+        };
+
+        let (cmd_type, response) = request.execute(&executor).await;
+        assert_eq!(cmd_type, CommandType::Kml);
+        match response {
+            Response::Ok { result, .. } => {
+                assert_eq!(result["type"], "kml");
+                assert_eq!(result["upserted"], 1);
+            }
+            _ => panic!("Expected Ok response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_single_meta_command() {
+        let executor = MockExecutor;
+        let request = Request {
+            command: "DESCRIBE PRIMER".to_string(),
+            ..Default::default()
+        };
+
+        let (cmd_type, response) = request.execute(&executor).await;
+        assert_eq!(cmd_type, CommandType::Meta);
+        match response {
+            Response::Ok { result, .. } => {
+                assert_eq!(result["type"], "meta");
+            }
+            _ => panic!("Expected Ok response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_single_command_with_params() {
+        let executor = MockExecutor;
+        let mut parameters = Map::new();
+        parameters.insert("name".to_string(), Json::String("Aspirin".to_string()));
+        parameters.insert("limit".to_string(), Json::Number(5.into()));
+
+        let request = Request {
+            command: r#"FIND(?drug) WHERE { ?drug {name: :name} } LIMIT :limit"#.to_string(),
+            parameters,
+            ..Default::default()
+        };
+
+        let (cmd_type, response) = request.execute(&executor).await;
+        assert_eq!(cmd_type, CommandType::Kql);
+        assert!(matches!(response, Response::Ok { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_execute_single_command_syntax_error() {
+        let executor = MockExecutor;
+        let request = Request {
+            command: "INVALID COMMAND SYNTAX".to_string(),
+            ..Default::default()
+        };
+
+        let (cmd_type, response) = request.execute(&executor).await;
+        assert_eq!(cmd_type, CommandType::Unknown);
+        match response {
+            Response::Err { error, .. } => {
+                assert!(error.code.starts_with("KIP_1"));
+            }
+            _ => panic!("Expected Err response for syntax error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_single_command_syntax_error_with_placeholder_hint() {
+        let executor = MockExecutor;
+        let mut parameters = Map::new();
+        parameters.insert("name".to_string(), Json::String("test".to_string()));
+
+        let request = Request {
+            command: r#"FIND(?x) WHERE { ?x {name: "Hello :name"} }"#.to_string(),
+            parameters,
+            ..Default::default()
+        };
+
+        let (cmd_type, response) = request.execute(&executor).await;
+        assert_eq!(cmd_type, CommandType::Unknown);
+        match response {
+            Response::Err { error, .. } => {
+                assert!(error.code.starts_with("KIP_1"));
+                assert!(error.hint.as_ref().unwrap().contains("name"));
+            }
+            _ => panic!("Expected Err response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_single_command_executor_error() {
+        let executor = FailingExecutor;
+        let request = Request {
+            command: r#"FIND(?drug) WHERE { ?drug {type: "Drug"} }"#.to_string(),
+            ..Default::default()
+        };
+
+        let (cmd_type, response) = request.execute(&executor).await;
+        assert_eq!(cmd_type, CommandType::Kql);
+        match response {
+            Response::Err { error, .. } => {
+                assert_eq!(error.code, "KIP_3001");
+                assert_eq!(error.message, "Not found");
+            }
+            _ => panic!("Expected Err response from failing executor"),
+        }
+    }
+
+    // --- Batch command execute tests ---
+
+    #[tokio::test]
+    async fn test_execute_batch_all_success() {
+        let executor = MockExecutor;
+        let request = Request {
+            commands: vec![
+                CommandItem::Simple("DESCRIBE PRIMER".to_string()),
+                CommandItem::Simple(
+                    r#"FIND(?t.name) WHERE { ?t {type: "$ConceptType"} } LIMIT 50"#.to_string(),
+                ),
+            ],
+            ..Default::default()
+        };
+
+        let (cmd_type, response) = request.execute(&executor).await;
+        assert_eq!(cmd_type, CommandType::Kql);
+        match response {
+            Response::Ok { result, .. } => {
+                let arr = result.as_array().unwrap();
+                assert_eq!(arr.len(), 2);
+                // First result is META
+                assert_eq!(arr[0]["result"]["type"], "meta");
+                // Second result is KQL
+                assert_eq!(arr[1]["result"]["type"], "kql");
+            }
+            _ => panic!("Expected Ok response for batch"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_batch_with_params() {
+        let executor = MockExecutor;
+        let mut shared_params = Map::new();
+        shared_params.insert("limit".to_string(), Json::Number(10.into()));
+
+        let mut cmd_params = Map::new();
+        cmd_params.insert("name".to_string(), Json::String("TestDrug".to_string()));
+
+        let request = Request {
+            commands: vec![
+                CommandItem::Simple("DESCRIBE PRIMER".to_string()),
+                CommandItem::WithParams {
+                    command: r#"UPSERT { CONCEPT ?d { {type: "Drug", name: :name} } }"#.to_string(),
+                    parameters: cmd_params,
+                },
+            ],
+            parameters: shared_params,
+            ..Default::default()
+        };
+
+        let (cmd_type, response) = request.execute(&executor).await;
+        assert_eq!(cmd_type, CommandType::Kml);
+        match response {
+            Response::Ok { result, .. } => {
+                let arr = result.as_array().unwrap();
+                assert_eq!(arr.len(), 2);
+                assert_eq!(arr[0]["result"]["type"], "meta");
+                assert_eq!(arr[1]["result"]["type"], "kml");
+            }
+            _ => panic!("Expected Ok response for batch with params"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_batch_stops_on_syntax_error() {
+        let executor = MockExecutor;
+        let request = Request {
+            commands: vec![
+                CommandItem::Simple("DESCRIBE PRIMER".to_string()),
+                CommandItem::Simple("INVALID SYNTAX HERE".to_string()),
+                CommandItem::Simple(r#"FIND(?t) WHERE { ?t {type: "$ConceptType"} }"#.to_string()),
+            ],
+            ..Default::default()
+        };
+
+        let (_cmd_type, response) = request.execute(&executor).await;
+        match response {
+            Response::Ok { result, .. } => {
+                let arr = result.as_array().unwrap();
+                // Should have 2 results: first success, second error, third not executed
+                assert_eq!(arr.len(), 2);
+                // First result is success
+                assert!(arr[0]["result"].is_object());
+                // Second result is error
+                assert!(arr[1]["error"].is_object());
+                assert!(
+                    arr[1]["error"]["code"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("KIP_1")
+                );
+            }
+            _ => panic!("Expected Ok response wrapping batch results"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_batch_stops_on_executor_error() {
+        let executor = FailingExecutor;
+        let request = Request {
+            commands: vec![
+                CommandItem::Simple(r#"FIND(?t) WHERE { ?t {type: "$ConceptType"} }"#.to_string()),
+                CommandItem::Simple("DESCRIBE PRIMER".to_string()),
+            ],
+            ..Default::default()
+        };
+
+        let (_cmd_type, response) = request.execute(&executor).await;
+        match response {
+            Response::Ok { result, .. } => {
+                let arr = result.as_array().unwrap();
+                // First command fails, stops immediately
+                assert_eq!(arr.len(), 1);
+                assert!(arr[0]["error"].is_object());
+                assert_eq!(arr[0]["error"]["code"], "KIP_3001");
+            }
+            _ => panic!("Expected Ok response wrapping batch results"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_batch_mixed_command_types() {
+        let executor = MockExecutor;
+        let request = Request {
+            commands: vec![
+                CommandItem::Simple("DESCRIBE PRIMER".to_string()),
+                CommandItem::Simple(r#"FIND(?d) WHERE { ?d {type: "Drug"} } LIMIT 5"#.to_string()),
+                CommandItem::Simple(
+                    r#"UPSERT { CONCEPT ?d { {type: "Drug", name: "NewDrug"} } }"#.to_string(),
+                ),
+            ],
+            ..Default::default()
+        };
+
+        let (cmd_type, response) = request.execute(&executor).await;
+        // KML takes precedence once encountered
+        assert_eq!(cmd_type, CommandType::Kml);
+        match response {
+            Response::Ok { result, .. } => {
+                let arr = result.as_array().unwrap();
+                assert_eq!(arr.len(), 3);
+                assert_eq!(arr[0]["result"]["type"], "meta");
+                assert_eq!(arr[1]["result"]["type"], "kql");
+                assert_eq!(arr[2]["result"]["type"], "kml");
+            }
+            _ => panic!("Expected Ok response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_batch_empty_commands() {
+        let executor = MockExecutor;
+        let request = Request {
+            commands: vec![],
+            ..Default::default()
+        };
+
+        // Empty commands means is_batch() is false, falls to single command mode
+        assert!(!request.is_batch());
+        let (cmd_type, response) = request.execute(&executor).await;
+        // Empty command string is a syntax error
+        assert_eq!(cmd_type, CommandType::Unknown);
+        assert!(matches!(response, Response::Err { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_execute_batch_syntax_error_with_placeholder_hint() {
+        let executor = MockExecutor;
+        let mut params = Map::new();
+        params.insert("name".to_string(), Json::String("test".to_string()));
+
+        let request = Request {
+            commands: vec![
+                CommandItem::Simple("DESCRIBE PRIMER".to_string()),
+                CommandItem::WithParams {
+                    command: r#"FIND(?x) WHERE { ?x {name: "Hello :name"} }"#.to_string(),
+                    parameters: params,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let (_cmd_type, response) = request.execute(&executor).await;
+        match response {
+            Response::Ok { result, .. } => {
+                let arr = result.as_array().unwrap();
+                assert_eq!(arr.len(), 2);
+                // First succeeds
+                assert!(arr[0]["result"].is_object());
+                // Second has error with placeholder hint
+                let error = &arr[1]["error"];
+                assert!(error["code"].as_str().unwrap().starts_with("KIP_1"));
+                assert!(error["hint"].as_str().unwrap().contains("name"));
+            }
+            _ => panic!("Expected Ok response wrapping batch results"),
+        }
     }
 }

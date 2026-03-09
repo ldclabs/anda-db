@@ -2347,6 +2347,9 @@ impl CognitiveNexus {
                     .await
             }
             FilterOperand::Literal(value) => Ok(Some(value.into())),
+            FilterOperand::List(values) => Ok(Some(Json::Array(
+                values.into_iter().map(Json::from).collect(),
+            ))),
         }
     }
 
@@ -2759,47 +2762,97 @@ impl CognitiveNexus {
         bindings_snapshot: &mut FxHashMap<String, Vec<EntityID>>,
         bindings_cursor: &mut FxHashMap<String, EntityID>,
     ) -> Result<Option<bool>, KipError> {
-        if args.len() != 2 {
-            return Err(KipError::invalid_syntax(
-                "Filter functions require exactly 2 arguments".to_string(),
-            ));
-        }
-
-        let pattern_arg = args.pop().unwrap();
-        let str_arg = args.pop().unwrap();
-        let str_val = match self
-            .evaluate_filter_operand(ctx, str_arg, bindings_snapshot, bindings_cursor)
-            .await?
-        {
-            Some(val) => val,
-            None => return Ok(None),
-        };
-        let pattern_val = match self
-            .evaluate_filter_operand(ctx, pattern_arg, bindings_snapshot, bindings_cursor)
-            .await?
-        {
-            Some(val) => val,
-            None => return Ok(None),
-        };
-
-        let string = str_val.as_str().unwrap_or("");
-        let pattern = pattern_val.as_str().unwrap_or("");
-
         match func {
-            FilterFunction::Contains => Ok(Some(string.contains(pattern))),
-            FilterFunction::StartsWith => Ok(Some(string.starts_with(pattern))),
-            FilterFunction::EndsWith => Ok(Some(string.ends_with(pattern))),
-            FilterFunction::Regex => {
-                let rt = if let Some(compiled) = ctx.regex_cache.get(pattern) {
-                    compiled.is_match(string)
-                } else {
-                    let compiled = regex::Regex::new(pattern)
-                        .map_err(|e| KipError::invalid_syntax(format!("Invalid regex: {e:?}")))?;
-                    let rt = compiled.is_match(string);
-                    ctx.regex_cache.insert(pattern.to_string(), compiled);
-                    rt
+            FilterFunction::IsNull | FilterFunction::IsNotNull => {
+                if args.len() != 1 {
+                    return Err(KipError::invalid_syntax(format!(
+                        "{func:?} requires exactly 1 argument"
+                    )));
+                }
+                let arg = args.pop().unwrap();
+                let val = self
+                    .evaluate_filter_operand(ctx, arg, bindings_snapshot, bindings_cursor)
+                    .await?;
+                match func {
+                    FilterFunction::IsNull => Ok(val.map(|v| v.is_null())),
+                    FilterFunction::IsNotNull => Ok(val.map(|v| !v.is_null())),
+                    _ => unreachable!(),
+                }
+            }
+            FilterFunction::In => {
+                if args.len() != 2 {
+                    return Err(KipError::invalid_syntax(
+                        "IN requires exactly 2 arguments".to_string(),
+                    ));
+                }
+                let list_arg = args.pop().unwrap();
+                let expr_arg = args.pop().unwrap();
+                let expr_val = match self
+                    .evaluate_filter_operand(ctx, expr_arg, bindings_snapshot, bindings_cursor)
+                    .await?
+                {
+                    Some(val) => val,
+                    None => return Ok(None),
                 };
-                Ok(Some(rt))
+                let list_val = match self
+                    .evaluate_filter_operand(ctx, list_arg, bindings_snapshot, bindings_cursor)
+                    .await?
+                {
+                    Some(val) => val,
+                    None => return Ok(None),
+                };
+                match list_val {
+                    Json::Array(arr) => Ok(Some(arr.contains(&expr_val))),
+                    _ => Err(KipError::invalid_syntax(
+                        "IN second argument must be a list".to_string(),
+                    )),
+                }
+            }
+            _ => {
+                if args.len() != 2 {
+                    return Err(KipError::invalid_syntax(
+                        "Filter functions require exactly 2 arguments".to_string(),
+                    ));
+                }
+                let pattern_arg = args.pop().unwrap();
+                let str_arg = args.pop().unwrap();
+                let str_val = match self
+                    .evaluate_filter_operand(ctx, str_arg, bindings_snapshot, bindings_cursor)
+                    .await?
+                {
+                    Some(val) => val,
+                    None => return Ok(None),
+                };
+                let pattern_val = match self
+                    .evaluate_filter_operand(ctx, pattern_arg, bindings_snapshot, bindings_cursor)
+                    .await?
+                {
+                    Some(val) => val,
+                    None => return Ok(None),
+                };
+
+                let string = str_val.as_str().unwrap_or("");
+                let pattern = pattern_val.as_str().unwrap_or("");
+
+                match func {
+                    FilterFunction::Contains => Ok(Some(string.contains(pattern))),
+                    FilterFunction::StartsWith => Ok(Some(string.starts_with(pattern))),
+                    FilterFunction::EndsWith => Ok(Some(string.ends_with(pattern))),
+                    FilterFunction::Regex => {
+                        let rt = if let Some(compiled) = ctx.regex_cache.get(pattern) {
+                            compiled.is_match(string)
+                        } else {
+                            let compiled = regex::Regex::new(pattern).map_err(|e| {
+                                KipError::invalid_syntax(format!("Invalid regex: {e:?}"))
+                            })?;
+                            let rt = compiled.is_match(string);
+                            ctx.regex_cache.insert(pattern.to_string(), compiled);
+                            rt
+                        };
+                        Ok(Some(rt))
+                    }
+                    _ => unreachable!(),
+                }
             }
         }
     }
@@ -4298,5 +4351,139 @@ mod tests {
         let (result1, result2) = tokio::try_join!(task1, task2).unwrap();
         assert!(result1.is_ok());
         assert!(result2.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_kql_filter_in() {
+        let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+        setup_test_data(&nexus).await.unwrap();
+
+        // IN 匹配 - 名称在列表中
+        let kql = r#"
+        FIND(?symptom.name)
+        WHERE {
+            ?symptom {type: "Symptom"}
+            FILTER(IN(?symptom.name, ["Headache", "Migraine"]))
+        }
+        "#;
+        let query = parse_kql(kql).unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        assert_eq!(result, json!(["Headache"]));
+
+        // IN 匹配 - 数值在列表中
+        let kql = r#"
+        FIND(?drug.name)
+        WHERE {
+            ?drug {type: "Drug"}
+            FILTER(IN(?drug.attributes.risk_level, [1, 2, 3]))
+        }
+        "#;
+        let query = parse_kql(kql).unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        assert_eq!(result, json!(["Aspirin"]));
+
+        // IN 不匹配 - 值不在列表中
+        let kql = r#"
+        FIND(?drug.name)
+        WHERE {
+            ?drug {type: "Drug"}
+            FILTER(IN(?drug.attributes.risk_level, [5, 6, 7]))
+        }
+        "#;
+        let query = parse_kql(kql).unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        assert_eq!(result, json!([]));
+    }
+
+    #[tokio::test]
+    async fn test_kql_filter_is_null() {
+        let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+        setup_test_data(&nexus).await.unwrap();
+
+        // IS_NULL - 字段不存在（视为 null）
+        let kql = r#"
+        FIND(?drug.name)
+        WHERE {
+            ?drug {type: "Drug"}
+            FILTER(IS_NULL(?drug.attributes.nonexistent_field))
+        }
+        "#;
+        let query = parse_kql(kql).unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        assert_eq!(result, json!(["Aspirin"]));
+
+        // IS_NULL - 字段存在（不为 null）
+        let kql = r#"
+        FIND(?drug.name)
+        WHERE {
+            ?drug {type: "Drug"}
+            FILTER(IS_NULL(?drug.attributes.risk_level))
+        }
+        "#;
+        let query = parse_kql(kql).unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        assert_eq!(result, json!([]));
+    }
+
+    #[tokio::test]
+    async fn test_kql_filter_is_not_null() {
+        let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+        setup_test_data(&nexus).await.unwrap();
+
+        // IS_NOT_NULL - 字段存在
+        let kql = r#"
+        FIND(?drug.name)
+        WHERE {
+            ?drug {type: "Drug"}
+            FILTER(IS_NOT_NULL(?drug.attributes.risk_level))
+        }
+        "#;
+        let query = parse_kql(kql).unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        assert_eq!(result, json!(["Aspirin"]));
+
+        // IS_NOT_NULL - 字段不存在
+        let kql = r#"
+        FIND(?drug.name)
+        WHERE {
+            ?drug {type: "Drug"}
+            FILTER(IS_NOT_NULL(?drug.attributes.nonexistent_field))
+        }
+        "#;
+        let query = parse_kql(kql).unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        assert_eq!(result, json!([]));
+    }
+
+    #[tokio::test]
+    async fn test_kql_filter_new_functions_combined() {
+        let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+        setup_test_data(&nexus).await.unwrap();
+
+        // 组合使用: IS_NOT_NULL && IN
+        let kql = r#"
+        FIND(?symptom.name)
+        WHERE {
+            ?symptom {type: "Symptom"}
+            FILTER(IS_NOT_NULL(?symptom.attributes.severity) && IN(?symptom.name, ["Headache", "Fever"]))
+        }
+        "#;
+        let query = parse_kql(kql).unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        // Headache has severity, Fever does not
+        assert_eq!(result, json!(["Headache"]));
+
+        // 组合使用: IS_NULL || IN
+        let kql = r#"
+        FIND(?symptom.name)
+        WHERE {
+            ?symptom {type: "Symptom"}
+            FILTER(IS_NULL(?symptom.attributes.severity) || IN(?symptom.name, ["Headache"]))
+        }
+        "#;
+        let query = parse_kql(kql).unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        // Fever has no severity (IS_NULL true), Headache matches IN
+        assert_eq!(result, json!(["Headache", "Fever"]));
     }
 }

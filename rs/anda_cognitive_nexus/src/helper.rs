@@ -339,6 +339,6 @@ impl FilterExpressionExt for FilterExpression {
 fn operand_has_unbound(op: &FilterOperand, bound: &FxHashMap<String, EntityID>) -> bool {
     match op {
         FilterOperand::Variable(dot_path) => !bound.contains_key(&dot_path.var),
-        FilterOperand::Literal(_) => false,
+        FilterOperand::Literal(_) | FilterOperand::List(_) => false,
     }
 }
