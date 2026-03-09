@@ -50,7 +50,7 @@ pub type IndexedFieldValues = BTreeMap<usize, FieldValue>;
 ///
 /// Supports various basic types (U64, I64, F64, F32, Bf16, Bytes, Text, Bool, Json)
 /// and composite types (Array, Map, Option)
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FieldType {
     /// Boolean value
     Bool,
@@ -1238,7 +1238,7 @@ impl FieldValue {
 ///
 /// Contains field name, type, constraints, and index information
 /// Field names are renamed in serialization to save storage space
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FieldEntry {
     /// Field name, must:
     /// - Be unique in document schema

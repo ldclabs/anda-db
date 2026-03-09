@@ -5,17 +5,31 @@ use crate::{FieldEntry, FieldType, IndexedFieldValues, Resource, SchemaError};
 
 /// Schema represents Anda DB document schema definition.
 /// It contains a collection of fields and their indexes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Schema {
     /// Set of field indexes for quick lookup
     idx: BTreeSet<usize>,
     /// Map of field names to field entries
     fields: BTreeMap<String, FieldEntry>,
+    /// Schema version for schema evolution support.
+    /// A higher version indicates a newer schema definition.
+    version: u64,
 }
 
 impl Schema {
     /// The key name for the ID field. it is a special u64 field used as an internal unique identifier in a collection. It is always present in the schema with idx 0.
     pub const ID_KEY: &str = "_id";
+
+    /// Returns the schema version.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// Returns `true` if `self` has a higher version than `other`,
+    /// indicating that a schema migration is needed.
+    pub fn needs_upgrade(&self, other: &Schema) -> bool {
+        self.version > other.version
+    }
 
     /// Creates a new SchemaBuilder instance.
     ///
@@ -115,11 +129,14 @@ impl Schema {
 #[derive(Debug, Clone, Serialize)]
 struct SchemaRef<'a> {
     fields: Vec<&'a FieldEntry>,
+    version: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct SchemaOwned {
     fields: Vec<FieldEntry>,
+    #[serde(default)]
+    version: u64,
 }
 
 impl Serialize for Schema {
@@ -129,6 +146,7 @@ impl Serialize for Schema {
     {
         let val = SchemaRef {
             fields: self.fields.values().collect(),
+            version: self.version,
         };
         val.serialize(serializer)
     }
@@ -201,7 +219,11 @@ impl<'de> Deserialize<'de> for Schema {
             )));
         }
 
-        Ok(Schema { idx, fields })
+        Ok(Schema {
+            idx,
+            fields,
+            version: val.version,
+        })
     }
 }
 
@@ -211,6 +233,7 @@ impl<'de> Deserialize<'de> for Schema {
 pub struct SchemaBuilder {
     idx: usize,
     fields: BTreeMap<String, FieldEntry>,
+    version: u64,
 }
 
 impl Default for SchemaBuilder {
@@ -227,6 +250,7 @@ impl SchemaBuilder {
     pub fn new() -> SchemaBuilder {
         SchemaBuilder {
             idx: 0,
+            version: 0,
             fields: BTreeMap::from([(
                 Schema::ID_KEY.to_string(),
                 FieldEntry::new(Schema::ID_KEY.to_string(), FieldType::U64)
@@ -239,6 +263,12 @@ impl SchemaBuilder {
                     )),
             )]),
         }
+    }
+
+    /// Sets the schema version.
+    pub fn with_version(&mut self, version: u64) -> &mut Self {
+        self.version = version;
+        self
     }
 
     pub fn with_resource(&mut self, field: &str, required: bool) -> Result<&mut Self, SchemaError> {
@@ -308,19 +338,10 @@ impl SchemaBuilder {
         Ok(Schema {
             idx: self.fields.values().map(|f| f.idx()).collect(),
             fields: self.fields,
+            version: self.version,
         })
     }
 }
-
-impl PartialEq for Schema {
-    /// Compares two Schema instances for equality.
-    /// Two schemas are equal if they have the same fields.
-    fn eq(&self, other: &Schema) -> bool {
-        self.fields == other.fields
-    }
-}
-
-impl Eq for Schema {}
 
 #[cfg(test)]
 mod tests {
@@ -567,5 +588,71 @@ mod tests {
             id_field["t"] = json!("Text");
         }
         assert!(serde_json::from_value::<Schema>(id_wrong_type).is_err());
+    }
+
+    #[test]
+    fn test_schema_version() {
+        // 默认 version 为 0
+        let mut builder = SchemaBuilder::new();
+        builder
+            .add_field(Fe::new("name".to_string(), Ft::Text).unwrap())
+            .unwrap();
+        let schema_v0 = builder.build().unwrap();
+        assert_eq!(schema_v0.version(), 0);
+
+        // 设置 version
+        let mut builder = SchemaBuilder::new();
+        builder.with_version(2);
+        builder
+            .add_field(Fe::new("name".to_string(), Ft::Text).unwrap())
+            .unwrap();
+        let schema_v2 = builder.build().unwrap();
+        assert_eq!(schema_v2.version(), 2);
+
+        // needs_upgrade: 高版本 → 低版本 = true
+        assert!(schema_v2.needs_upgrade(&schema_v0));
+        // needs_upgrade: 低版本 → 高版本 = false
+        assert!(!schema_v0.needs_upgrade(&schema_v2));
+        // needs_upgrade: 相同版本 = false
+        assert!(!schema_v0.needs_upgrade(&schema_v0));
+
+        // 不同 version 的 schema 不相等
+        assert_ne!(schema_v0, schema_v2);
+    }
+
+    #[test]
+    fn test_schema_version_serde_roundtrip() {
+        let mut builder = SchemaBuilder::new();
+        builder.with_version(3);
+        builder
+            .add_field(Fe::new("name".to_string(), Ft::Text).unwrap())
+            .unwrap();
+        let schema = builder.build().unwrap();
+        assert_eq!(schema.version(), 3);
+
+        let v = serde_json::to_value(&schema).unwrap();
+        assert_eq!(v.get("version").unwrap().as_u64().unwrap(), 3);
+
+        let schema2: Schema = serde_json::from_value(v).unwrap();
+        assert_eq!(schema, schema2);
+        assert_eq!(schema2.version(), 3);
+    }
+
+    #[test]
+    fn test_schema_version_defaults_to_zero_on_deserialize() {
+        // 模拟旧版本序列化数据（无 version 字段）
+        let mut builder = SchemaBuilder::new();
+        builder
+            .add_field(Fe::new("name".to_string(), Ft::Text).unwrap())
+            .unwrap();
+        let schema = builder.build().unwrap();
+
+        let mut v = serde_json::to_value(&schema).unwrap();
+        // 移除 version 字段，模拟旧数据
+        v.as_object_mut().unwrap().remove("version");
+
+        let schema2: Schema = serde_json::from_value(v).unwrap();
+        assert_eq!(schema2.version(), 0);
+        assert_eq!(schema, schema2);
     }
 }
