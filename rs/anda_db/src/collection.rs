@@ -253,7 +253,12 @@ impl Collection {
     ///
     /// # Returns
     /// The opened Collection instance or an error if opening fails
-    pub(crate) async fn open<F>(db: AndaDB, name: String, f: F) -> Result<Self, DBError>
+    pub(crate) async fn open<F>(
+        db: AndaDB,
+        name: String,
+        schema: Option<Schema>,
+        f: F,
+    ) -> Result<Self, DBError>
     where
         F: AsyncFnOnce(&mut Collection) -> Result<(), DBError>,
     {
@@ -302,11 +307,15 @@ impl Collection {
         collection.load_indexes().await?;
         let fixed = collection.auto_repair_indexes().await?;
         if fixed > 0 {
-            log::info!(
+            log::warn!(
                 action = "auto_repair_indexes",
                 collection = collection.name;
                 "Auto-repaired {fixed} documents",
             );
+        }
+
+        if let Some(schema) = schema {
+            collection.try_upgrade_schema(schema).await?;
         }
 
         f(&mut collection).await?;
@@ -401,7 +410,7 @@ impl Collection {
 
                     if consecutive_misses >= limit {
                         if fixed > 0 || (id < maybe_max_document_id && consecutive_misses > 1) {
-                            log::info!(
+                            log::warn!(
                                 action = "auto_repair_indexes",
                                 collection = self.name,
                                 id = id;
@@ -491,6 +500,28 @@ impl Collection {
         Ok(fixed)
     }
 
+    async fn try_upgrade_schema(&mut self, mut new_schema: Schema) -> Result<(), DBError> {
+        if !new_schema.needs_upgrade(&self.schema) {
+            return Ok(());
+        }
+
+        new_schema.upgrade_with(&self.schema)?;
+        self.schema = Arc::new(new_schema.clone());
+        self.update_metadata(|m| {
+            m.schema = new_schema;
+            m.stats.version += 1;
+        });
+
+        log::warn!(
+            action = "upgrade_schema",
+            collection = self.name,
+            version = self.schema.version();
+            "Schema upgraded to version {}",
+            self.schema.version()
+        );
+        Ok(())
+    }
+
     /// Sets the collection to read-only mode.
     ///
     /// # Arguments
@@ -517,7 +548,7 @@ impl Collection {
         let elapsed = start.elapsed();
         match rt {
             Ok(_) => {
-                log::info!(
+                log::warn!(
                     action = "close",
                     collection = self.name,
                     elapsed = elapsed.as_millis();
@@ -592,7 +623,7 @@ impl Collection {
         // delete metadata, ids, indexes and others
         self.storage.drop_data().await?;
         let elapsed = start.elapsed();
-        log::info!(
+        log::warn!(
             action = "drop_data",
             collection = self.name,
             deleted = total,

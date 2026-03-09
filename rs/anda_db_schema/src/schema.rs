@@ -31,6 +31,59 @@ impl Schema {
         self.version > other.version
     }
 
+    /// Upgrades this schema using field indexes from an older persisted schema.
+    ///
+    /// The new schema (self) is typically built from program code where field indexes
+    /// are assigned sequentially. The old schema comes from persistent storage with
+    /// fixed indexes. This method ensures index consistency by:
+    ///
+    /// 1. For fields present in both schemas: inherits the `idx` from the old schema,
+    ///    and verifies the field type has not changed (type changes are not allowed).
+    /// 2. For new fields (in self but not in old): assigns fresh indexes starting
+    ///    from `max(old indexes) + 1`, ensuring no conflicts with any old index.
+    /// 3. For removed fields (in old but not in self): their indexes are simply not
+    ///    reused, preventing data corruption.
+    ///
+    /// # Arguments
+    /// * `old` - The old schema loaded from persistent storage.
+    ///
+    /// # Errors
+    /// - If `self.version` is not greater than `old.version`.
+    /// - If a field that exists in both schemas has a different type.
+    pub fn upgrade_with(&mut self, old: &Schema) -> Result<(), SchemaError> {
+        if !self.needs_upgrade(old) {
+            return Err(SchemaError::Schema(format!(
+                "new schema version {} must be greater than old version {}",
+                self.version, old.version
+            )));
+        }
+
+        // Find the maximum index used in the old schema to allocate new indexes after it.
+        let mut next_idx = old.idx.iter().copied().max().unwrap_or(0) + 1;
+
+        for (name, field) in self.fields.iter_mut() {
+            if let Some(old_field) = old.fields.get(name) {
+                // Field exists in both: verify type compatibility and inherit idx.
+                if field.r#type() != old_field.r#type() {
+                    return Err(SchemaError::Schema(format!(
+                        "field {name:?} type changed from {:?} to {:?}, type changes are not allowed",
+                        old_field.r#type(),
+                        field.r#type()
+                    )));
+                }
+                *field = field.clone().with_idx(old_field.idx());
+            } else {
+                // New field: assign the next available index.
+                *field = field.clone().with_idx(next_idx);
+                next_idx += 1;
+            }
+        }
+
+        // Rebuild the idx set from the updated fields.
+        self.idx = self.fields.values().map(|f| f.idx()).collect();
+        Ok(())
+    }
+
     /// Creates a new SchemaBuilder instance.
     ///
     /// # Returns
@@ -654,5 +707,128 @@ mod tests {
         let schema2: Schema = serde_json::from_value(v).unwrap();
         assert_eq!(schema2.version(), 0);
         assert_eq!(schema, schema2);
+    }
+
+    #[test]
+    fn test_upgrade_with_inherits_old_idx() {
+        // old schema v1: _id(0), name(1), age(2)
+        let mut old_builder = SchemaBuilder::new();
+        old_builder.with_version(1);
+        old_builder
+            .add_field(Fe::new("name".to_string(), Ft::Text).unwrap())
+            .unwrap();
+        old_builder
+            .add_field(Fe::new("age".to_string(), Ft::Option(Box::new(Ft::U64))).unwrap())
+            .unwrap();
+        let old = old_builder.build().unwrap();
+        assert_eq!(old.get_field("name").unwrap().idx(), 1);
+        assert_eq!(old.get_field("age").unwrap().idx(), 2);
+
+        // new schema v2: _id, name, age, email (builder assigns idx 1,2,3)
+        let mut new_builder = SchemaBuilder::new();
+        new_builder.with_version(2);
+        new_builder
+            .add_field(Fe::new("name".to_string(), Ft::Text).unwrap())
+            .unwrap();
+        new_builder
+            .add_field(Fe::new("age".to_string(), Ft::Option(Box::new(Ft::U64))).unwrap())
+            .unwrap();
+        new_builder
+            .add_field(Fe::new("email".to_string(), Ft::Option(Box::new(Ft::Text))).unwrap())
+            .unwrap();
+        let mut new_schema = new_builder.build().unwrap();
+
+        // Before upgrade_with, builder-assigned idx
+        assert_eq!(new_schema.get_field("email").unwrap().idx(), 3);
+
+        // After upgrade_with, old fields keep their idx, new field gets next_idx=3
+        new_schema.upgrade_with(&old).unwrap();
+        assert_eq!(new_schema.get_field("_id").unwrap().idx(), 0);
+        assert_eq!(new_schema.get_field("name").unwrap().idx(), 1);
+        assert_eq!(new_schema.get_field("age").unwrap().idx(), 2);
+        assert_eq!(new_schema.get_field("email").unwrap().idx(), 3);
+    }
+
+    #[test]
+    fn test_upgrade_with_removed_field_idx_not_reused() {
+        // old schema v1: _id(0), name(1), age(2), bio(3)
+        let mut old_builder = SchemaBuilder::new();
+        old_builder.with_version(1);
+        old_builder
+            .add_field(Fe::new("name".to_string(), Ft::Text).unwrap())
+            .unwrap();
+        old_builder
+            .add_field(Fe::new("age".to_string(), Ft::Option(Box::new(Ft::U64))).unwrap())
+            .unwrap();
+        old_builder
+            .add_field(Fe::new("bio".to_string(), Ft::Option(Box::new(Ft::Text))).unwrap())
+            .unwrap();
+        let old = old_builder.build().unwrap();
+        assert_eq!(old.get_field("bio").unwrap().idx(), 3);
+
+        // new schema v2: remove "bio", add "email"
+        // builder assigns: name=1, age=2, email=3
+        let mut new_builder = SchemaBuilder::new();
+        new_builder.with_version(2);
+        new_builder
+            .add_field(Fe::new("name".to_string(), Ft::Text).unwrap())
+            .unwrap();
+        new_builder
+            .add_field(Fe::new("age".to_string(), Ft::Option(Box::new(Ft::U64))).unwrap())
+            .unwrap();
+        new_builder
+            .add_field(Fe::new("email".to_string(), Ft::Option(Box::new(Ft::Text))).unwrap())
+            .unwrap();
+        let mut new_schema = new_builder.build().unwrap();
+        new_schema.upgrade_with(&old).unwrap();
+
+        // name and age keep old idx
+        assert_eq!(new_schema.get_field("name").unwrap().idx(), 1);
+        assert_eq!(new_schema.get_field("age").unwrap().idx(), 2);
+        // email gets idx=4 (max old idx was 3, so next is 4), NOT reusing bio's 3
+        assert_eq!(new_schema.get_field("email").unwrap().idx(), 4);
+    }
+
+    #[test]
+    fn test_upgrade_with_rejects_type_change() {
+        let mut old_builder = SchemaBuilder::new();
+        old_builder.with_version(1);
+        old_builder
+            .add_field(Fe::new("name".to_string(), Ft::Text).unwrap())
+            .unwrap();
+        let old = old_builder.build().unwrap();
+
+        // Try changing "name" from Text to U64
+        let mut new_builder = SchemaBuilder::new();
+        new_builder.with_version(2);
+        new_builder
+            .add_field(Fe::new("name".to_string(), Ft::U64).unwrap())
+            .unwrap();
+        let mut new_schema = new_builder.build().unwrap();
+
+        let err = new_schema.upgrade_with(&old).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("type changed"),
+            "expected type change error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_upgrade_with_rejects_lower_version() {
+        let mut old_builder = SchemaBuilder::new();
+        old_builder.with_version(3);
+        old_builder
+            .add_field(Fe::new("name".to_string(), Ft::Text).unwrap())
+            .unwrap();
+        let old = old_builder.build().unwrap();
+
+        let mut new_builder = SchemaBuilder::new();
+        new_builder.with_version(2);
+        new_builder
+            .add_field(Fe::new("name".to_string(), Ft::Text).unwrap())
+            .unwrap();
+        let mut new_schema = new_builder.build().unwrap();
+
+        assert!(new_schema.upgrade_with(&old).is_err());
     }
 }

@@ -258,7 +258,7 @@ impl AndaDB {
     /// * `read_only` - Whether to enable read-only mode
     pub fn set_read_only(&self, read_only: bool) {
         self.inner.read_only.store(read_only, Ordering::Release);
-        log::info!(
+        log::warn!(
             action = "set_read_only",
             database = self.inner.name;
             "Database is set to read-only: {read_only}"
@@ -295,7 +295,7 @@ impl AndaDB {
         match self.flush_self(unix_ms()).await {
             Ok(_) => {
                 let elapsed = start.elapsed();
-                log::info!(
+                log::warn!(
                     action = "close",
                     database = self.inner.name,
                     elapsed = elapsed.as_millis();
@@ -359,7 +359,7 @@ impl AndaDB {
             match self.flush().await {
                 Ok(_) => {
                     let elapsed = start.elapsed();
-                    log::info!(
+                    log::warn!(
                         action = "auto_flush",
                         database = self.inner.name,
                         elapsed = elapsed.as_millis();
@@ -453,7 +453,7 @@ impl AndaDB {
         collection.flush(now).await?;
         self.flush_self(now).await?;
         let elapsed = start.elapsed();
-        log::info!(
+        log::warn!(
             action = "create_collection",
             database = self.inner.name,
             collection = collection.name(),
@@ -469,8 +469,13 @@ impl AndaDB {
     /// If the collection doesn't exist, it creates a new one with the provided
     /// schema and configuration.
     ///
+    /// When opening an existing collection, the method compares the provided
+    /// schema's version with the stored schema's version. If the provided schema
+    /// has a higher version, the collection's schema will be upgraded automatically
+    /// before executing the callback `f`.
+    ///
     /// # Arguments
-    /// * `schema` - The schema to use if creating a new collection
+    /// * `schema` - The schema to use for creating or upgrading the collection
     /// * `config` - The collection configuration
     /// * `f` - A function to execute on the collection during opening/creation
     ///
@@ -526,7 +531,8 @@ impl AndaDB {
             }
         }
 
-        self.open_collection(config.name, f).await
+        self.open_collection_with_schema(config.name, Some(schema), f)
+            .await
     }
 
     /// Opens an existing collection.
@@ -541,6 +547,20 @@ impl AndaDB {
     /// # Returns
     /// A Result containing either the Collection or an error
     pub async fn open_collection<F>(&self, name: String, f: F) -> Result<Arc<Collection>, DBError>
+    where
+        F: AsyncFnOnce(&mut Collection) -> Result<(), DBError>,
+    {
+        self.open_collection_with_schema(name, None, f).await
+    }
+
+    /// Opens an existing collection, upgrading its schema if the provided schema
+    /// has a higher version than the stored one.
+    async fn open_collection_with_schema<F>(
+        &self,
+        name: String,
+        schema: Option<Schema>,
+        f: F,
+    ) -> Result<Arc<Collection>, DBError>
     where
         F: AsyncFnOnce(&mut Collection) -> Result<(), DBError>,
     {
@@ -572,7 +592,7 @@ impl AndaDB {
             }
         }
 
-        let collection = Collection::open(self.clone(), name, f).await?;
+        let collection = Collection::open(self.clone(), name, schema, f).await?;
         let collection = Arc::new(collection);
         {
             let mut collections = self.inner.collections.write();
