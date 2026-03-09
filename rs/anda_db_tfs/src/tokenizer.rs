@@ -108,6 +108,10 @@ pub fn collect_tokens<T: Tokenizer>(
     let mut stream = tokenizer.token_stream(text);
     let mut tokens = HashMap::new();
     while let Some(token) = stream.next() {
+        if token.text.len() <= 1 {
+            continue;
+        }
+
         if let Some(inclusive) = inclusive
             && !inclusive.contains_key(&token.text)
         {
