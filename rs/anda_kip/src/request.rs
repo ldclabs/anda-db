@@ -12,7 +12,7 @@ use std::borrow::Cow;
 use crate::{
     CommandType, Json, Map,
     error::KipError,
-    executor::{Executor, execute_kip},
+    executor::{Executor, execute_kip, execute_readonly},
 };
 
 /// Represents a single command item in the batch `commands` array.
@@ -95,6 +95,10 @@ pub struct Request {
     /// No changes will be persisted to the knowledge graph.
     #[serde(default)]
     pub dry_run: bool,
+
+    /// If true, only read-only commands (KQL and META) are allowed.
+    #[serde(default)]
+    pub readonly: bool,
 }
 
 impl Request {
@@ -264,6 +268,11 @@ impl Request {
         }
     }
 
+    pub fn readonly(&mut self) -> &mut Self {
+        self.readonly = true;
+        self
+    }
+
     /// Executes the KIP command(s) using the provided executor
     ///
     /// For single command mode, executes the single command and returns its result.
@@ -278,7 +287,11 @@ impl Request {
             self.execute_batch(nexus).await
         } else {
             let command = self.to_command();
-            let (cmd_type, response) = execute_kip(nexus, &command, self.dry_run).await;
+            let (cmd_type, response) = if self.readonly {
+                execute_readonly(nexus, &command, self.dry_run).await
+            } else {
+                execute_kip(nexus, &command, self.dry_run).await
+            };
 
             // If there's an error and we have parameters, check for placeholder misuse
             if let Response::Err { ref error, .. } = response
@@ -316,7 +329,11 @@ impl Request {
 
         for (cmd, params) in self.iter_commands() {
             let substituted = Self::substitute_params(&cmd, &params);
-            let (cmd_type, response) = execute_kip(nexus, &substituted, self.dry_run).await;
+            let (cmd_type, response) = if self.readonly {
+                execute_readonly(nexus, &substituted, self.dry_run).await
+            } else {
+                execute_kip(nexus, &substituted, self.dry_run).await
+            };
             if command_type != CommandType::Kml && cmd_type != CommandType::Unknown {
                 command_type = cmd_type;
             }
@@ -931,7 +948,7 @@ mod tests {
             command: "FIND(?x) WHERE { ?x {name: :name} }".to_string(),
             commands: vec![],
             parameters: parameters.clone(),
-            dry_run: false,
+            ..Default::default()
         };
 
         assert!(!request.is_batch());
@@ -971,7 +988,7 @@ mod tests {
                 },
             ],
             parameters: shared_params,
-            dry_run: false,
+            ..Default::default()
         };
 
         assert!(request.is_batch());
@@ -1022,6 +1039,7 @@ mod tests {
             ],
             parameters: shared_params,
             dry_run: true,
+            readonly: true,
         };
 
         let json_str = serde_json::to_string(&request).unwrap();
@@ -1030,6 +1048,7 @@ mod tests {
         assert!(parsed.is_batch());
         assert_eq!(parsed.commands.len(), 2);
         assert!(parsed.dry_run);
+        assert!(parsed.readonly);
     }
 
     #[test]

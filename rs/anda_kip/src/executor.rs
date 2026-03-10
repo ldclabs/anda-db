@@ -174,6 +174,36 @@ pub async fn execute_kip(
     }
 }
 
+/// High-level convenience function for executing KIP commands in read-only mode.
+///
+/// This function is similar to `execute_kip` but enforces that only read-only commands
+/// (KQL queries and META commands) are executed. If a KML command is detected, an error is returned
+/// indicating that only KQL and META commands are allowed in read-only mode.
+///
+pub async fn execute_readonly(
+    executor: &impl Executor,
+    command: &str,
+    dry_run: bool,
+) -> (CommandType, Response) {
+    // Parse the raw command string into a structured Command AST
+    match parse_kip(command) {
+        Ok(cmd) => {
+            if matches!(cmd, Command::Kml(_)) {
+                return (
+                    CommandType::Kml,
+                    Response::err(crate::KipError::invalid_syntax(
+                        "Only KQL and META commands are allowed in read-only mode".to_string(),
+                    )),
+                );
+            }
+            // Delegate execution to the provided executor
+            let ty = CommandType::from(&cmd);
+            (ty, executor.execute(cmd, dry_run).await)
+        }
+        Err(err) => (CommandType::Unknown, err.into()),
+    }
+}
+
 #[async_trait]
 impl Executor for Box<dyn Executor> {
     async fn execute(&self, command: Command, dry_run: bool) -> Response {
