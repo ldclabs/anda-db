@@ -25,6 +25,12 @@ impl Schema {
         self.version
     }
 
+    /// Sets the schema version.
+    pub fn with_version(&mut self, version: u64) -> &mut Self {
+        self.version = version;
+        self
+    }
+
     /// Returns `true` if `self` has a higher version than `other`,
     /// indicating that a schema migration is needed.
     pub fn needs_upgrade(&self, other: &Schema) -> bool {

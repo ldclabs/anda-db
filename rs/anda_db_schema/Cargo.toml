@@ -1,6 +1,6 @@
 [package]
 name = "anda_db_schema"
-version = "0.4.6"
+version = "0.4.7"
 description = "Anda DB schema library for Rust."
 keywords = ["database", "vector", "search", "embedding", "ai"]
 categories = ["database", "data-structures", "text-processing"]
