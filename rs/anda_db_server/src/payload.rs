@@ -23,8 +23,8 @@ pub enum ContentType {
 }
 
 impl ContentType {
-    /// Detect content type from Content-Type header.
-    pub fn from_content_type(headers: &HeaderMap) -> Self {
+    /// Detect content type from Content-Type header, falling back to Accept header.
+    pub fn from_header(headers: &HeaderMap) -> Self {
         headers
             .get(header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
@@ -35,7 +35,7 @@ impl ContentType {
                     ContentType::Json
                 }
             })
-            .unwrap_or(ContentType::Json)
+            .unwrap_or_else(|| Self::from_accept(headers))
     }
 
     /// Detect preferred response format from Accept header.
@@ -75,7 +75,7 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for Accept {
         parts: &mut axum::http::request::Parts,
         _state: &S,
     ) -> Result<Self, Self::Rejection> {
-        Ok(Accept(ContentType::from_accept(&parts.headers)))
+        Ok(Accept(ContentType::from_header(&parts.headers)))
     }
 }
 

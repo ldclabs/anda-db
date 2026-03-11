@@ -17,7 +17,7 @@ use crate::{
     collection::{Collection, CollectionConfig},
     error::DBError,
     schema::*,
-    storage::{Storage, StorageConfig},
+    storage::{Storage, StorageConfig, StorageStats},
     unix_ms,
 };
 
@@ -88,6 +88,10 @@ pub struct DBMetadata {
 
     /// Set of collection names in this database
     pub collections: BTreeSet<String>,
+
+    /// User-defined lightweight extension data persisted with database metadata.
+    #[serde(default)]
+    pub extensions: BTreeMap<String, FieldValue>,
 }
 
 impl Debug for AndaDB {
@@ -99,6 +103,11 @@ impl Debug for AndaDB {
 impl AndaDB {
     /// Path where database metadata is stored
     const METADATA_PATH: &'static str = "db_meta.cbor";
+
+    /// Returns storage statistics for the database.
+    pub fn stats(&self) -> StorageStats {
+        self.inner.storage.stats()
+    }
 
     /// Creates a new database with the given configuration.
     ///
@@ -128,6 +137,7 @@ impl AndaDB {
         let metadata = DBMetadata {
             config,
             collections: BTreeSet::new(),
+            extensions: BTreeMap::new(),
         };
 
         match storage.create(Self::METADATA_PATH, &metadata).await {
@@ -213,6 +223,7 @@ impl AndaDB {
                 let metadata = DBMetadata {
                     config,
                     collections: BTreeSet::new(),
+                    extensions: BTreeMap::new(),
                 };
 
                 match storage.create(Self::METADATA_PATH, &metadata).await {
@@ -666,6 +677,37 @@ impl AndaDB {
         Ok(())
     }
 
+    /// Gets the value of a user-defined extension key.
+    pub fn get_extension(&self, key: &str) -> Option<FieldValue> {
+        self.inner.metadata.read().extensions.get(key).cloned()
+    }
+
+    /// Sets a user-defined extension key-value pair.
+    /// The change is persisted on the next `flush()`.
+    /// The extensions should not be large, as they are stored in the same object as database metadata which size is expected to be small (<= 1MB) and loaded frequently.
+    pub fn set_extension(&self, key: String, value: FieldValue) {
+        self.inner.metadata.write().extensions.insert(key, value);
+    }
+
+    /// Sets a user-defined extension key-value pair and immediately persists the change.
+    /// The extensions should not be large, as they are stored in the same object as database metadata which size is expected to be small (<= 1MB) and loaded frequently.
+    pub async fn save_extension(&self, key: String, value: FieldValue) -> Result<(), DBError> {
+        {
+            self.inner.metadata.write().extensions.insert(key, value);
+        }
+        self.flush_self(unix_ms()).await
+    }
+
+    /// Removes a user-defined extension key and immediately persists the change.
+    /// Returns the previous value if the key existed.
+    pub async fn remove_extension(&self, key: &str) -> Result<Option<FieldValue>, DBError> {
+        let old = { self.inner.metadata.write().extensions.remove(key) };
+        if old.is_some() {
+            self.flush_self(unix_ms()).await?;
+        }
+        Ok(old)
+    }
+
     /// Returns a clone of the object store.
     ///
     /// This method is used internally by collections to access the object store.
@@ -677,7 +719,7 @@ impl AndaDB {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{Fe, Ft, Schema};
+    use crate::schema::{Fe, FieldValue, Ft, Schema};
     use object_store::memory::InMemory;
 
     #[tokio::test]
@@ -914,5 +956,102 @@ mod tests {
             .await
             .unwrap();
         assert!(db.metadata().collections.contains("test_collection"));
+    }
+
+    #[tokio::test]
+    async fn test_db_extension_get_set_remove() {
+        let object_store = Arc::new(InMemory::new());
+        let config = DBConfig::default();
+        let db = AndaDB::create(object_store, config).await.unwrap();
+
+        // 初始状态：无扩展数据
+        assert!(db.get_extension("key1").is_none());
+        assert!(db.metadata().extensions.is_empty());
+
+        // set_extension：设置后可以 get 到
+        db.set_extension("key1".into(), FieldValue::Text("hello".into()));
+        assert_eq!(
+            db.get_extension("key1"),
+            Some(FieldValue::Text("hello".into()))
+        );
+
+        // 支持不同类型
+        db.set_extension("count".into(), FieldValue::U64(42));
+        db.set_extension("flag".into(), FieldValue::Bool(true));
+        assert_eq!(db.get_extension("count"), Some(FieldValue::U64(42)));
+        assert_eq!(db.get_extension("flag"), Some(FieldValue::Bool(true)));
+
+        // 覆盖已有 key
+        db.set_extension("key1".into(), FieldValue::I64(-1));
+        assert_eq!(db.get_extension("key1"), Some(FieldValue::I64(-1)));
+
+        // metadata() 中也能看到 extensions
+        let meta = db.metadata();
+        assert_eq!(meta.extensions.len(), 3);
+        assert_eq!(meta.extensions.get("key1"), Some(&FieldValue::I64(-1)));
+
+        // remove_extension：移除存在的 key
+        let old = db.remove_extension("count").await.unwrap();
+        assert_eq!(old, Some(FieldValue::U64(42)));
+        assert!(db.get_extension("count").is_none());
+
+        // remove_extension：移除不存在的 key 返回 None
+        let old = db.remove_extension("nonexistent").await.unwrap();
+        assert!(old.is_none());
+
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_db_extension_save_and_persist() {
+        let object_store = Arc::new(InMemory::new());
+        let config = DBConfig::default();
+
+        // 创建数据库并 save_extension
+        {
+            let db = AndaDB::create(object_store.clone(), config.clone())
+                .await
+                .unwrap();
+            db.save_extension("persist_key".into(), FieldValue::Text("persisted".into()))
+                .await
+                .unwrap();
+            assert_eq!(
+                db.get_extension("persist_key"),
+                Some(FieldValue::Text("persisted".into()))
+            );
+        }
+
+        // 重新 connect，验证扩展数据仍然存在
+        let db = AndaDB::connect(object_store, config).await.unwrap();
+        assert_eq!(
+            db.get_extension("persist_key"),
+            Some(FieldValue::Text("persisted".into()))
+        );
+
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_db_extension_flush_persist() {
+        let object_store = Arc::new(InMemory::new());
+        let config = DBConfig::default();
+
+        // 创建数据库，set_extension + flush
+        {
+            let db = AndaDB::create(object_store.clone(), config.clone())
+                .await
+                .unwrap();
+            db.set_extension("lazy_key".into(), FieldValue::Bytes(vec![1, 2, 3]));
+            db.flush().await.unwrap();
+        }
+
+        // 重新 connect，验证扩展数据仍然存在
+        let db = AndaDB::connect(object_store, config).await.unwrap();
+        assert_eq!(
+            db.get_extension("lazy_key"),
+            Some(FieldValue::Bytes(vec![1, 2, 3]))
+        );
+
+        db.close().await.unwrap();
     }
 }

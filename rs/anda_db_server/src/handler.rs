@@ -156,7 +156,7 @@ where
     F: FnOnce(String, Fv) -> Fut,
     Fut: std::future::Future<Output = Result<Fv, RpcError>>,
 {
-    let req_ct = ContentType::from_content_type(&headers);
+    let req_ct = ContentType::from_header(&headers);
     let result = match parse_request(&body, req_ct) {
         Ok((method, params)) => dispatch(method, params).await,
         Err(err) => Err(err),

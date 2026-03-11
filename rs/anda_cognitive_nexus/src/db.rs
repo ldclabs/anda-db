@@ -58,9 +58,9 @@ use crate::{entity::*, helper::*, types::*};
 /// multiple concept and proposition updates across collections.
 #[derive(Clone, Debug)]
 pub struct CognitiveNexus {
-    db: Arc<AndaDB>,
-    concepts: Arc<Collection>,
-    propositions: Arc<Collection>,
+    pub db: Arc<AndaDB>,
+    pub concepts: Arc<Collection>,
+    pub propositions: Arc<Collection>,
     /// Read-write lock for KML execution consistency.
     /// KQL/Meta commands acquire read lock; KML commands acquire write lock.
     kml_lock: Arc<RwLock<()>>,

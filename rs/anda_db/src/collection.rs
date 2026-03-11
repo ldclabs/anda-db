@@ -101,6 +101,10 @@ pub struct CollectionMetadata {
 
     /// Collection statistics.
     pub stats: CollectionStats,
+
+    /// User-defined lightweight extension data persisted with collection metadata.
+    #[serde(default)]
+    pub extensions: BTreeMap<String, FieldValue>,
 }
 
 /// Statistics about the collection's usage and state.
@@ -208,6 +212,7 @@ impl Collection {
             bm25_indexes: BTreeMap::new(),
             hnsw_indexes: BTreeMap::new(),
             stats,
+            extensions: BTreeMap::new(),
         };
 
         let metadata_version = storage.create(Self::METADATA_PATH, &metadata).await?;
@@ -819,6 +824,48 @@ impl Collection {
     /// Creates a new empty document with the collection's schema.
     pub fn new_document(&self) -> Document {
         Document::new(self.schema.clone())
+    }
+
+    /// Gets the value of a user-defined extension key.
+    pub fn get_extension(&self, key: &str) -> Option<FieldValue> {
+        self.metadata.read().extensions.get(key).cloned()
+    }
+
+    /// Sets a user-defined extension key-value pair.
+    /// The change is persisted on the next `flush()`.
+    /// The extensions should not be large, as they are stored in the same object as collection metadata which size is expected to be small (<= 1MB) and loaded frequently.
+    pub fn set_extension(&self, key: String, value: FieldValue) {
+        self.update_metadata(|meta| {
+            meta.extensions.insert(key, value);
+            meta.stats.version += 1;
+        });
+    }
+
+    /// Sets a user-defined extension key-value pair and immediately persists the change.
+    /// The extensions should not be large, as they are stored in the same object as collection metadata which size is expected to be small (<= 1MB) and loaded frequently.
+    pub async fn save_extension(&self, key: String, value: FieldValue) -> Result<(), DBError> {
+        self.update_metadata(|meta| {
+            meta.extensions.insert(key, value);
+            meta.stats.version += 1;
+        });
+        self.store_metadata(unix_ms()).await.map(|_| ())
+    }
+
+    /// Removes a user-defined extension key and immediately persists the change.
+    /// Returns the previous value if the key existed.
+    pub async fn remove_extension(&self, key: &str) -> Result<Option<FieldValue>, DBError> {
+        let old = self.update_metadata(|meta| {
+            let old = meta.extensions.remove(key);
+            if old.is_some() {
+                meta.stats.version += 1;
+            }
+            old
+        });
+
+        if old.is_some() {
+            let _ = self.store_metadata(unix_ms()).await?;
+        }
+        Ok(old)
     }
 
     /// Tokenizes the given text using the collection's tokenizer.
@@ -1980,12 +2027,12 @@ impl Collection {
     ///
     /// # Arguments
     /// * `f` - A function that modifies the collection metadata
-    fn update_metadata<F>(&self, f: F)
+    fn update_metadata<F, R>(&self, f: F) -> R
     where
-        F: FnOnce(&mut CollectionMetadata),
+        F: FnOnce(&mut CollectionMetadata) -> R,
     {
         let mut metadata = self.metadata.write();
-        f(&mut metadata);
+        f(&mut metadata)
     }
 }
 
@@ -3044,6 +3091,136 @@ mod tests {
         // 验证统计信息已更新
         let stats = collection.stats();
         assert_eq!(stats.update_count, 3); // 初始更新 + 部分更新 + 元数据更新，只读失败不计数
+
+        db.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_extension_get_set_remove() -> Result<(), DBError> {
+        let db = setup_test_db().await?;
+        let collection = create_test_collection(&db, async |_| Ok(())).await?;
+
+        // 初始状态：无扩展数据
+        assert!(collection.get_extension("key1").is_none());
+        assert!(collection.metadata().extensions.is_empty());
+
+        // set_extension：设置后可以 get 到
+        let version_before = collection.stats().version;
+        collection.set_extension("key1".into(), FieldValue::Text("hello".into()));
+        assert_eq!(
+            collection.get_extension("key1"),
+            Some(FieldValue::Text("hello".into()))
+        );
+        assert!(collection.stats().version > version_before);
+
+        // 支持不同类型
+        collection.set_extension("count".into(), FieldValue::U64(42));
+        collection.set_extension("flag".into(), FieldValue::Bool(true));
+        assert_eq!(collection.get_extension("count"), Some(FieldValue::U64(42)));
+        assert_eq!(
+            collection.get_extension("flag"),
+            Some(FieldValue::Bool(true))
+        );
+
+        // 覆盖已有 key
+        collection.set_extension("key1".into(), FieldValue::I64(-1));
+        assert_eq!(
+            collection.get_extension("key1"),
+            Some(FieldValue::I64(-1))
+        );
+
+        // metadata() 中也能看到 extensions
+        let meta = collection.metadata();
+        assert_eq!(meta.extensions.len(), 3);
+        assert_eq!(
+            meta.extensions.get("key1"),
+            Some(&FieldValue::I64(-1))
+        );
+
+        // remove_extension：移除存在的 key
+        let version_before = collection.stats().version;
+        let old = collection.remove_extension("count").await?;
+        assert_eq!(old, Some(FieldValue::U64(42)));
+        assert!(collection.get_extension("count").is_none());
+        assert!(collection.stats().version > version_before);
+
+        // remove_extension：移除不存在的 key 返回 None，version 不变
+        let version_before = collection.stats().version;
+        let old = collection.remove_extension("nonexistent").await?;
+        assert!(old.is_none());
+        assert_eq!(collection.stats().version, version_before);
+
+        db.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_extension_save_and_persist() -> Result<(), DBError> {
+        let db = setup_test_db().await?;
+        let collection = create_test_collection(&db, async |_| Ok(())).await?;
+
+        // save_extension 会立即持久化
+        collection
+            .save_extension("persist_key".into(), FieldValue::Text("persisted".into()))
+            .await?;
+        assert_eq!(
+            collection.get_extension("persist_key"),
+            Some(FieldValue::Text("persisted".into()))
+        );
+
+        // 验证 last_saved 已被更新（save_extension 调用了 store_metadata）
+        let stats = collection.stats();
+        assert!(stats.last_saved > 0);
+
+        // 关闭后重新打开，验证扩展数据仍然存在
+        collection.close().await?;
+        drop(collection);
+
+        let schema = TestDoc::schema()?;
+        let collection_config = CollectionConfig {
+            name: "test_collection".to_string(),
+            description: "Test collection".to_string(),
+        };
+        let collection = db
+            .open_or_create_collection(schema, collection_config, async |_| Ok(()))
+            .await?;
+
+        assert_eq!(
+            collection.get_extension("persist_key"),
+            Some(FieldValue::Text("persisted".into()))
+        );
+
+        db.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_extension_flush_persist() -> Result<(), DBError> {
+        let db = setup_test_db().await?;
+        let collection = create_test_collection(&db, async |_| Ok(())).await?;
+
+        // 使用 set_extension（不立即持久化），再 flush
+        collection.set_extension("lazy_key".into(), FieldValue::Bytes(vec![1, 2, 3]));
+        collection.flush(unix_ms()).await?;
+
+        // 重新打开验证
+        collection.close().await?;
+        drop(collection);
+
+        let schema = TestDoc::schema()?;
+        let collection_config = CollectionConfig {
+            name: "test_collection".to_string(),
+            description: "Test collection".to_string(),
+        };
+        let collection = db
+            .open_or_create_collection(schema, collection_config, async |_| Ok(()))
+            .await?;
+
+        assert_eq!(
+            collection.get_extension("lazy_key"),
+            Some(FieldValue::Bytes(vec![1, 2, 3]))
+        );
 
         db.close().await?;
         Ok(())
