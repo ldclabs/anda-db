@@ -270,7 +270,7 @@ impl AndaDB {
     pub fn set_read_only(&self, read_only: bool) {
         self.inner.read_only.store(read_only, Ordering::Release);
         log::warn!(
-            action = "set_read_only",
+            action = "AndaDB::set_read_only",
             database = self.inner.name;
             "Database is set to read-only: {read_only}"
         );
@@ -298,7 +298,7 @@ impl AndaDB {
             .collect::<Vec<_>>();
         let _ = stream::iter(collections.into_iter())
             .map(|collection| async move { collection.close().await })
-            .buffer_unordered(32) // 限制最多 32 个并发
+            .buffer_unordered(8) // 限制最多 8 个并发
             .collect::<Vec<_>>()
             .await;
 
@@ -307,7 +307,7 @@ impl AndaDB {
             Ok(_) => {
                 let elapsed = start.elapsed();
                 log::warn!(
-                    action = "close",
+                    action = "AndaDB::close",
                     database = self.inner.name,
                     elapsed = elapsed.as_millis();
                     "Database closed successfully in {elapsed:?}",
@@ -316,7 +316,7 @@ impl AndaDB {
             Err(err) => {
                 let elapsed = start.elapsed();
                 log::error!(
-                    action = "close",
+                    action = "AndaDB::close",
                     database = self.inner.name,
                     elapsed = elapsed.as_millis();
                     "Failed to close database: {err:?}",
@@ -339,7 +339,7 @@ impl AndaDB {
 
         let _ = stream::iter(collections.into_iter())
             .map(|collection| async move { collection.flush(unix_ms()).await })
-            .buffer_unordered(16) // 限制最多 16 个并发
+            .buffer_unordered(8) // 限制最多 8 个并发
             .collect::<Vec<_>>()
             .await;
 
@@ -371,7 +371,7 @@ impl AndaDB {
                 Ok(_) => {
                     let elapsed = start.elapsed();
                     log::warn!(
-                        action = "auto_flush",
+                        action = "AndaDB::auto_flush",
                         database = self.inner.name,
                         elapsed = elapsed.as_millis();
                         "Database flushed successfully in {elapsed:?}",
@@ -380,7 +380,7 @@ impl AndaDB {
                 Err(err) => {
                     let elapsed = start.elapsed();
                     log::error!(
-                        action = "auto_flush",
+                        action = "AndaDB::auto_flush",
                         database = self.inner.name,
                         elapsed = elapsed.as_millis();
                         "Failed to flush database: {err:?}",
@@ -465,7 +465,7 @@ impl AndaDB {
         self.flush_self(now).await?;
         let elapsed = start.elapsed();
         log::warn!(
-            action = "create_collection",
+            action = "AndaDB::create_collection",
             database = self.inner.name,
             collection = collection.name(),
             elapsed = elapsed.as_millis();
@@ -689,6 +689,21 @@ impl AndaDB {
         self.inner.metadata.write().extensions.insert(key, value);
     }
 
+    /// Updates a user-defined extension key using a function that takes the current value (if any) and returns the new value.
+    /// If the function returns `None`, no change is made to the extensions.
+    /// The change is persisted on the next `flush()`.
+    pub fn set_extension_with<F>(&self, key: String, f: F)
+    where
+        F: FnOnce(Option<&FieldValue>) -> Option<FieldValue>,
+    {
+        let mut meta = self.inner.metadata.write();
+        let old_value = meta.extensions.get(&key);
+        let new_value = f(old_value);
+        if let Some(value) = new_value {
+            meta.extensions.insert(key, value);
+        }
+    }
+
     /// Sets a user-defined extension key-value pair and immediately persists the change.
     /// The extensions should not be large, as they are stored in the same object as database metadata which size is expected to be small (<= 1MB) and loaded frequently.
     pub async fn save_extension(&self, key: String, value: FieldValue) -> Result<(), DBError> {
@@ -706,6 +721,14 @@ impl AndaDB {
             self.flush_self(unix_ms()).await?;
         }
         Ok(old)
+    }
+
+    /// Provides access to the entire extensions map for advanced use cases.
+    pub fn extensions_with<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&BTreeMap<String, FieldValue>) -> R,
+    {
+        f(&self.inner.metadata.read().extensions)
     }
 
     /// Returns a clone of the object store.

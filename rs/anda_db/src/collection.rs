@@ -313,7 +313,7 @@ impl Collection {
         let fixed = collection.auto_repair_indexes().await?;
         if fixed > 0 {
             log::warn!(
-                action = "auto_repair_indexes",
+                action = "Collection::auto_repair_indexes",
                 collection = collection.name;
                 "Auto-repaired {fixed} documents",
             );
@@ -416,7 +416,7 @@ impl Collection {
                     if consecutive_misses >= limit {
                         if fixed > 0 || (id < maybe_max_document_id && consecutive_misses > 1) {
                             log::warn!(
-                                action = "auto_repair_indexes",
+                                action = "Collection::auto_repair_indexes",
                                 collection = self.name,
                                 id = id;
                                 "Stopping repair scan after {consecutive_misses} consecutive misses",
@@ -450,7 +450,7 @@ impl Collection {
                             }
                             if let Err(err) = index.insert(id, &fv, now_ms) {
                                 log::warn!(
-                                    action = "auto_repair_indexes",
+                                    action = "Collection::auto_repair_indexes",
                                     collection = self.name,
                                     doc_id = id,
                                     index = index.name();
@@ -465,7 +465,7 @@ impl Collection {
                             && let Err(err) = index.insert(id, &text, now_ms)
                         {
                             log::warn!(
-                                action = "auto_repair_indexes",
+                                action = "Collection::auto_repair_indexes",
                                 collection = self.name,
                                 doc_id = id,
                                 index = index.name();
@@ -479,7 +479,7 @@ impl Collection {
                             && let Err(err) = index.insert(id, vector.into_owned(), now_ms)
                         {
                             log::warn!(
-                                action = "auto_repair_indexes",
+                                action = "Collection::auto_repair_indexes",
                                 collection = self.name,
                                 doc_id = id,
                                 index = index.name();
@@ -518,7 +518,7 @@ impl Collection {
         });
 
         log::warn!(
-            action = "upgrade_schema",
+            action = "Collection::upgrade_schema",
             collection = self.name,
             version = self.schema.version();
             "Schema upgraded to version {}",
@@ -534,7 +534,7 @@ impl Collection {
     pub fn set_read_only(&self, read_only: bool) {
         self.read_only.store(read_only, Ordering::Release);
         log::info!(
-            action = "set_read_only",
+            action = "Collection::set_read_only",
             collection = self.name;
             "Collection is set to read-only: {read_only}",
         );
@@ -554,7 +554,7 @@ impl Collection {
         match rt {
             Ok(_) => {
                 log::warn!(
-                    action = "close",
+                    action = "Collection::close",
                     collection = self.name,
                     elapsed = elapsed.as_millis();
                     "Collection closed successfully in {elapsed:?}",
@@ -563,7 +563,7 @@ impl Collection {
             }
             Err(err) => {
                 log::error!(
-                    action = "close",
+                    action = "Collection::close",
                     collection = self.name,
                     elapsed = elapsed.as_millis();
                     "Failed to close collection: {err:?}",
@@ -629,7 +629,7 @@ impl Collection {
         self.storage.drop_data().await?;
         let elapsed = start.elapsed();
         log::warn!(
-            action = "drop_data",
+            action = "Collection::drop_data",
             collection = self.name,
             deleted = total,
             elapsed = elapsed.as_millis();
@@ -841,6 +841,21 @@ impl Collection {
         });
     }
 
+    /// Updates a user-defined extension key using a function that takes the current value (if any) and returns the new value.
+    /// If the function returns `None`, no change is made to the extensions.
+    /// The change is persisted on the next `flush()`.
+    pub fn set_extension_with<F>(&self, key: String, f: F)
+    where
+        F: FnOnce(Option<&FieldValue>) -> Option<FieldValue>,
+    {
+        let mut meta = self.metadata.write();
+        let old_value = meta.extensions.get(&key);
+        let new_value = f(old_value);
+        if let Some(value) = new_value {
+            meta.extensions.insert(key, value);
+        }
+    }
+
     /// Sets a user-defined extension key-value pair and immediately persists the change.
     /// The extensions should not be large, as they are stored in the same object as collection metadata which size is expected to be small (<= 1MB) and loaded frequently.
     pub async fn save_extension(&self, key: String, value: FieldValue) -> Result<(), DBError> {
@@ -866,6 +881,14 @@ impl Collection {
             let _ = self.store_metadata(unix_ms()).await?;
         }
         Ok(old)
+    }
+
+    /// Provides access to the entire extensions map for advanced use cases.
+    pub fn extensions_with<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&BTreeMap<String, FieldValue>) -> R,
+    {
+        f(&self.metadata.read().extensions)
     }
 
     /// Tokenizes the given text using the collection's tokenizer.
@@ -3125,18 +3148,12 @@ mod tests {
 
         // 覆盖已有 key
         collection.set_extension("key1".into(), FieldValue::I64(-1));
-        assert_eq!(
-            collection.get_extension("key1"),
-            Some(FieldValue::I64(-1))
-        );
+        assert_eq!(collection.get_extension("key1"), Some(FieldValue::I64(-1)));
 
         // metadata() 中也能看到 extensions
         let meta = collection.metadata();
         assert_eq!(meta.extensions.len(), 3);
-        assert_eq!(
-            meta.extensions.get("key1"),
-            Some(&FieldValue::I64(-1))
-        );
+        assert_eq!(meta.extensions.get("key1"), Some(&FieldValue::I64(-1)));
 
         // remove_extension：移除存在的 key
         let version_before = collection.stats().version;
