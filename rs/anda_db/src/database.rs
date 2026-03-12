@@ -689,10 +689,22 @@ impl AndaDB {
         self.inner.metadata.write().extensions.insert(key, value);
     }
 
-    /// Updates a user-defined extension key using a function that takes the current value (if any) and returns the new value.
-    /// If the function returns `None`, no change is made to the extensions.
-    /// The change is persisted on the next `flush()`.
-    pub fn set_extension_with<F>(&self, key: String, f: F)
+    /// Updates a user-defined extension using a functional approach.
+    ///
+    /// This method retrieves the current value for the given key (if any) and computes
+    /// a new value using the provided function. If the function returns `None`,
+    /// no change is made to the extensions.
+    ///
+    /// # Arguments
+    /// * `key` - The name of the extension key to update.
+    /// * `f` - An update function that takes `Option<&FieldValue>` and returns `Option<FieldValue>`.
+    ///
+    /// # Returns
+    /// Returns the previous value `Option<FieldValue>` if a change was made.
+    ///
+    /// # Notes
+    /// The change is persisted to storage on the next `flush()` call.
+    pub fn set_extension_with<F>(&self, key: String, f: F) -> Option<FieldValue>
     where
         F: FnOnce(Option<&FieldValue>) -> Option<FieldValue>,
     {
@@ -700,7 +712,9 @@ impl AndaDB {
         let old_value = meta.extensions.get(&key);
         let new_value = f(old_value);
         if let Some(value) = new_value {
-            meta.extensions.insert(key, value);
+            meta.extensions.insert(key, value)
+        } else {
+            None
         }
     }
 
@@ -1074,6 +1088,40 @@ mod tests {
             db.get_extension("lazy_key"),
             Some(FieldValue::Bytes(vec![1, 2, 3]))
         );
+
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_db_set_extension_with() {
+        let object_store = Arc::new(InMemory::new());
+        let config = DBConfig::default();
+        let db = AndaDB::create(object_store, config).await.unwrap();
+
+        let key = "test_key".to_string();
+
+        // 1. Initial state: None
+        let old = db.set_extension_with(key.clone(), |val| {
+            assert!(val.is_none());
+            Some(FieldValue::U64(100))
+        });
+        assert!(old.is_none());
+        assert_eq!(db.get_extension(&key), Some(FieldValue::U64(100)));
+
+        // 2. Update existing value: 100 -> 200
+        let old = db.set_extension_with(key.clone(), |val| {
+            if let Some(FieldValue::U64(v)) = val {
+                return Some(FieldValue::U64(v + 100));
+            }
+            None
+        });
+        assert_eq!(old, Some(FieldValue::U64(100)));
+        assert_eq!(db.get_extension(&key), Some(FieldValue::U64(200)));
+
+        // 3. Return None: No change
+        let old = db.set_extension_with(key.clone(), |_| None);
+        assert!(old.is_none());
+        assert_eq!(db.get_extension(&key), Some(FieldValue::U64(200)));
 
         db.close().await.unwrap();
     }
