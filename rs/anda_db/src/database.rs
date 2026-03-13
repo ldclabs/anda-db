@@ -250,6 +250,59 @@ impl AndaDB {
         }
     }
 
+    /// Connects to an existing database with the given configuration.
+    /// This method fails if the database doesn't exist.
+    pub async fn open(
+        object_store: Arc<dyn ObjectStore>,
+        config: DBConfig,
+    ) -> Result<Self, DBError> {
+        validate_field_name(config.name.as_str())?;
+
+        let storage = Storage::connect(
+            config.name.clone(),
+            object_store.clone(),
+            config.storage.clone(),
+        )
+        .await?;
+
+        match storage.fetch::<DBMetadata>(Self::METADATA_PATH).await {
+            Ok((metadata, _)) => {
+                let set_lock = match (&metadata.config.lock, config.lock) {
+                    (None, Some(lock)) => Some(lock),
+                    (Some(existing_lock), lock) => {
+                        if lock.as_ref() != Some(existing_lock) {
+                            return Err(DBError::Storage {
+                                name: config.name.clone(),
+                                source: "Database lock mismatch".into(),
+                            });
+                        }
+                        None
+                    }
+                    _ => None,
+                };
+
+                let this = Self {
+                    inner: Arc::new(InnerDB {
+                        name: metadata.config.name.clone(),
+                        object_store,
+                        storage,
+                        metadata: RwLock::new(metadata),
+                        collections: RwLock::new(BTreeMap::new()),
+                        read_only: AtomicBool::new(false),
+                        dropping_collections: RwLock::new(BTreeSet::new()),
+                    }),
+                };
+
+                if let Some(lock) = set_lock {
+                    this.set_lock(lock).await?;
+                }
+
+                Ok(this)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     /// Returns the name of the database.
     pub fn name(&self) -> &str {
         &self.inner.name
@@ -756,7 +809,7 @@ impl AndaDB {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{Fe, FieldValue, Ft, Schema};
+    use crate::schema::{ByteBufB64, Fe, FieldValue, Ft, Schema};
     use object_store::memory::InMemory;
 
     #[tokio::test]
@@ -789,6 +842,92 @@ mod tests {
         // Then connect to it
         let db = AndaDB::connect(object_store, config).await.unwrap();
         assert_eq!(db.name(), "test_db");
+    }
+
+    #[tokio::test]
+    async fn test_database_open() {
+        let object_store = Arc::new(InMemory::new());
+        let config = DBConfig {
+            name: "test_open_db".to_string(),
+            description: "Test Open Database".to_string(),
+            storage: StorageConfig::default(),
+            lock: None,
+        };
+
+        // open 不存在的数据库应返回 NotFound
+        let err = AndaDB::open(object_store.clone(), config.clone())
+            .await
+            .unwrap_err();
+        match err {
+            DBError::NotFound { .. } => {}
+            _ => panic!("Expected NotFound when opening a non-existent database"),
+        }
+
+        // 创建后应可以正常 open
+        let _db = AndaDB::create(object_store.clone(), config.clone())
+            .await
+            .unwrap();
+        let db = AndaDB::open(object_store, config).await.unwrap();
+        assert_eq!(db.name(), "test_open_db");
+    }
+
+    #[tokio::test]
+    async fn test_database_open_lock_mismatch() {
+        let object_store = Arc::new(InMemory::new());
+
+        let create_config = DBConfig {
+            name: "test_open_lock_db".to_string(),
+            description: "Test Open Lock Database".to_string(),
+            storage: StorageConfig::default(),
+            lock: Some(ByteBufB64(vec![1, 2, 3])),
+        };
+
+        // 先创建带锁的数据库
+        let _db = AndaDB::create(object_store.clone(), create_config)
+            .await
+            .unwrap();
+
+        // 使用不匹配的 lock 打开应失败
+        let open_config = DBConfig {
+            name: "test_open_lock_db".to_string(),
+            description: "Test Open Lock Database".to_string(),
+            storage: StorageConfig::default(),
+            lock: Some(ByteBufB64(vec![9, 9, 9])),
+        };
+        let err = AndaDB::open(object_store, open_config).await.unwrap_err();
+
+        match err {
+            DBError::Storage { .. } => {}
+            _ => panic!("Expected Storage error for lock mismatch"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_database_open_with_matching_lock() {
+        let object_store = Arc::new(InMemory::new());
+        let lock = ByteBufB64(vec![7, 8, 9]);
+
+        let create_config = DBConfig {
+            name: "test_open_match_lock_db".to_string(),
+            description: "Test Open Match Lock Database".to_string(),
+            storage: StorageConfig::default(),
+            lock: Some(lock.clone()),
+        };
+
+        // 先创建带锁数据库
+        let _db = AndaDB::create(object_store.clone(), create_config)
+            .await
+            .unwrap();
+
+        // 使用相同 lock 打开应成功
+        let open_config = DBConfig {
+            name: "test_open_match_lock_db".to_string(),
+            description: "Test Open Match Lock Database".to_string(),
+            storage: StorageConfig::default(),
+            lock: Some(lock),
+        };
+        let db = AndaDB::open(object_store, open_config).await.unwrap();
+        assert_eq!(db.name(), "test_open_match_lock_db");
     }
 
     #[tokio::test]
