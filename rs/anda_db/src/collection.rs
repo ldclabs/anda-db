@@ -877,7 +877,7 @@ impl Collection {
             meta.extensions.insert(key, value);
             meta.stats.version += 1;
         });
-        self.store_metadata(unix_ms()).await.map(|_| ())
+        self.flush(unix_ms()).await.map(|_| ())
     }
 
     /// Removes a user-defined extension key and immediately persists the change.
@@ -892,7 +892,7 @@ impl Collection {
         });
 
         if old.is_some() {
-            let _ = self.store_metadata(unix_ms()).await?;
+            let _ = self.flush(unix_ms()).await?;
         }
         Ok(old)
     }

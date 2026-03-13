@@ -303,7 +303,7 @@ impl AndaDB {
             .await;
 
         let start = Instant::now();
-        match self.flush_self(unix_ms()).await {
+        match self.flush_metadata(unix_ms()).await {
             Ok(_) => {
                 let elapsed = start.elapsed();
                 log::warn!(
@@ -343,7 +343,7 @@ impl AndaDB {
             .collect::<Vec<_>>()
             .await;
 
-        self.flush_self(unix_ms()).await
+        self.flush_metadata(unix_ms()).await
     }
 
     /// Automatically flushes the database at regular intervals.
@@ -462,7 +462,7 @@ impl AndaDB {
 
         let now = unix_ms();
         collection.flush(now).await?;
-        self.flush_self(now).await?;
+        self.flush_metadata(now).await?;
         let elapsed = start.elapsed();
         log::warn!(
             action = "AndaDB::create_collection",
@@ -634,7 +634,7 @@ impl AndaDB {
                 .insert(name.to_string());
         }
 
-        self.flush_self(unix_ms()).await?;
+        self.flush_metadata(unix_ms()).await?;
         if let Some(col) = { self.inner.collections.write().remove(name) } {
             let _ = col.drop_data().await;
         }
@@ -666,7 +666,7 @@ impl AndaDB {
     ///
     /// # Returns
     /// A Result indicating success or an error
-    async fn flush_self(&self, now_ms: u64) -> Result<(), DBError> {
+    pub async fn flush_metadata(&self, now_ms: u64) -> Result<(), DBError> {
         let metadata = self.metadata();
 
         self.inner
@@ -724,7 +724,7 @@ impl AndaDB {
         {
             self.inner.metadata.write().extensions.insert(key, value);
         }
-        self.flush_self(unix_ms()).await
+        self.flush_metadata(unix_ms()).await
     }
 
     /// Removes a user-defined extension key and immediately persists the change.
@@ -732,7 +732,7 @@ impl AndaDB {
     pub async fn remove_extension(&self, key: &str) -> Result<Option<FieldValue>, DBError> {
         let old = { self.inner.metadata.write().extensions.remove(key) };
         if old.is_some() {
-            self.flush_self(unix_ms()).await?;
+            self.flush_metadata(unix_ms()).await?;
         }
         Ok(old)
     }
