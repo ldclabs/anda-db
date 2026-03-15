@@ -208,28 +208,40 @@ impl QueryType {
     ///
     /// A vector of string slices resulting from the split
     fn split_top_level<'a>(s: &'a str, delimiter: &str) -> Vec<&'a str> {
+        // Delimiters (" OR ", " AND ") are pure ASCII, so byte-level comparison
+        // is correct and inherently avoids UTF-8 char boundary issues.
+        debug_assert!(delimiter.is_ascii());
+
         let mut result = Vec::new();
         let mut start = 0;
-        let mut paren_count = 0;
-        let mut chars = s.char_indices();
+        let mut paren_count: u32 = 0;
+        let bytes = s.as_bytes();
+        let delim_bytes = delimiter.as_bytes();
+        let delim_len = delim_bytes.len();
+        let mut i = 0;
 
-        while let Some((i, c)) = chars.next() {
-            if c == '(' {
-                paren_count += 1;
-            } else if c == ')' {
-                if paren_count > 0 {
-                    paren_count -= 1;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'(' => {
+                    paren_count += 1;
+                    i += 1;
                 }
-                // 注意：如果paren_count已经为0，我们忽略多余的右括号
-            } else if paren_count == 0
-                && i + delimiter.len() <= s.len()
-                && &s[i..i + delimiter.len()] == delimiter
-            {
-                result.push(s[start..i].trim());
-                start = i + delimiter.len();
-                // Skip remaining characters of the delimiter
-                for _ in 1..delimiter.len() {
-                    chars.next();
+                b')' => {
+                    paren_count = paren_count.saturating_sub(1);
+                    i += 1;
+                }
+                _ if paren_count == 0
+                    && i + delim_len <= bytes.len()
+                    && bytes[i..i + delim_len] == *delim_bytes =>
+                {
+                    // Safety: start and i are always at ASCII boundaries,
+                    // which are valid UTF-8 char boundaries.
+                    result.push(s[start..i].trim());
+                    i += delim_len;
+                    start = i;
+                }
+                _ => {
+                    i += 1;
                 }
             }
         }
@@ -335,6 +347,62 @@ mod tests {
                     Box::new(QueryType::Term("world".to_string())),
                     Box::new(QueryType::Term("rust".to_string()))
                 ]))
+            ])
+        );
+    }
+
+    /// Tests that multi-byte UTF-8 characters don't cause panic in split_top_level
+    #[test]
+    fn test_multibyte_utf8_query() {
+        // 纯中文词，不应 panic
+        assert_eq!(
+            QueryType::parse("巨蟹"),
+            QueryType::Term("巨蟹".to_string())
+        );
+
+        // 中文词 AND 英文词
+        assert_eq!(
+            QueryType::parse("巨蟹 AND rust"),
+            QueryType::And(vec![
+                Box::new(QueryType::Term("巨蟹".to_string())),
+                Box::new(QueryType::Term("rust".to_string()))
+            ])
+        );
+
+        // 中文词 OR 中文词
+        assert_eq!(
+            QueryType::parse("巨蟹 OR 天蝎"),
+            QueryType::Or(vec![
+                Box::new(QueryType::Term("巨蟹".to_string())),
+                Box::new(QueryType::Term("天蝎".to_string()))
+            ])
+        );
+
+        // 带括号的中文表达式
+        assert_eq!(
+            QueryType::parse("(巨蟹 AND 座) OR 天蝎"),
+            QueryType::Or(vec![
+                Box::new(QueryType::And(vec![
+                    Box::new(QueryType::Term("巨蟹".to_string())),
+                    Box::new(QueryType::Term("座".to_string()))
+                ])),
+                Box::new(QueryType::Term("天蝎".to_string()))
+            ])
+        );
+
+        // NOT + 中文词
+        assert_eq!(
+            QueryType::parse("NOT 巨蟹"),
+            QueryType::Not(Box::new(QueryType::Term("巨蟹".to_string())))
+        );
+
+        // 多个中文词（默认 OR 关系）
+        assert_eq!(
+            QueryType::parse("巨蟹 天蝎 双鱼"),
+            QueryType::Or(vec![
+                Box::new(QueryType::Term("巨蟹".to_string())),
+                Box::new(QueryType::Term("天蝎".to_string())),
+                Box::new(QueryType::Term("双鱼".to_string()))
             ])
         );
     }
