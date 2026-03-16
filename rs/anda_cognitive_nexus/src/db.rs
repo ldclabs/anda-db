@@ -884,9 +884,7 @@ impl CognitiveNexus {
             .first()
             .ok_or_else(|| KipError::not_found(format!("Concept {matcher} not found")))?;
         let me = self
-            .try_get_concept_with(&cache, *me_id, |concept| {
-                extract_concept_field_value(concept, &[])
-            })
+            .try_get_concept_with(&cache, *me_id, |concept| Ok(concept.to_concept_node()))
             .await?;
 
         let mut domain_map: Vec<DomainInfo> = Vec::with_capacity(domain_ids.len());
@@ -906,7 +904,7 @@ impl CognitiveNexus {
                                 info.key_concept_types.push(ConceptTypeInfo::from(concept));
                             } else if concept.r#type == META_PROPOSITION_TYPE {
                                 info.key_proposition_types
-                                    .push(PropositionTypeInfo::from(concept));
+                                    .push(ConceptTypeInfo::from(concept));
                             }
                             Ok(())
                         })
@@ -931,9 +929,7 @@ impl CognitiveNexus {
         let mut result: Vec<Json> = Vec::with_capacity(ids.len());
         for id in ids {
             let concept = self
-                .try_get_concept_with(&cache, id, |concept| {
-                    extract_concept_field_value(concept, &[])
-                })
+                .try_get_concept_with(&cache, id, |concept| Ok(concept.to_concept_node()))
                 .await?;
             result.push(concept);
         }
@@ -971,7 +967,7 @@ impl CognitiveNexus {
             .ok_or_else(|| KipError::not_found(format!("Concept type {name:?} not found")))?;
         let result = self
             .try_get_concept_with(&QueryCache::default(), *id, |concept| {
-                extract_concept_field_value(concept, &[])
+                Ok(concept.to_concept_node())
             })
             .await?;
         Ok(result)
@@ -1008,7 +1004,7 @@ impl CognitiveNexus {
             .ok_or_else(|| KipError::not_found(format!("Proposition type {name:?} not found")))?;
         let result = self
             .try_get_concept_with(&QueryCache::default(), *id, |concept| {
-                extract_concept_field_value(concept, &[])
+                Ok(concept.to_concept_node())
             })
             .await?;
         Ok(result)

@@ -443,18 +443,12 @@ impl<'de> Deserialize<'de> for EntityID {
 /// domain-specific reasoning, query optimization, and knowledge organization.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct DomainInfo {
-    /// Name of the knowledge domain.
-    ///
-    /// A human-readable identifier for the domain, used in user interfaces
-    /// and domain selection. Should be descriptive and unique within the system.
-    pub domain_name: String,
+    pub r#type: String,
 
-    /// Detailed description of the domain.
-    ///
-    /// Explains the scope, purpose, and content of this knowledge domain.
-    /// Helps users understand what types of knowledge and relationships
-    /// are covered within this domain.
-    pub description: String,
+    pub name: String,
+
+    /// Key-value attributes associated with the domain.
+    pub attributes: Map<String, Json>,
 
     /// Key concept types in this domain.
     ///
@@ -468,7 +462,7 @@ pub struct DomainInfo {
     /// Lists the primary relationship types (predicates) that are commonly
     /// used in this domain, along with their semantic descriptions.
     /// This guides relationship modeling and query construction.
-    pub key_proposition_types: Vec<PropositionTypeInfo>,
+    pub key_proposition_types: Vec<ConceptTypeInfo>,
 }
 
 impl DomainInfo {
@@ -483,12 +477,9 @@ impl DomainInfo {
     /// A new `DomainInfo` instance with basic information extracted from the concept.
     pub fn from(domain: &Concept) -> Self {
         Self {
-            domain_name: domain.name.clone(),
-            description: domain
-                .attributes
-                .get("description")
-                .map(|v| v.as_str().unwrap_or_default().to_string())
-                .unwrap_or_default(),
+            name: domain.name.clone(),
+            r#type: domain.r#type.clone(),
+            attributes: domain.attributes.clone(),
             key_concept_types: Vec::new(),
             key_proposition_types: Vec::new(),
         }
@@ -502,24 +493,12 @@ impl DomainInfo {
 /// helps with concept classification, discovery, and domain understanding.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ConceptTypeInfo {
-    /// Name of the concept type.
-    ///
-    /// The canonical name for this category of concepts. Should be clear,
-    /// descriptive, and follow consistent naming conventions within the domain.
-    pub type_name: String,
+    pub r#type: String,
 
-    /// Detailed description of the concept type.
-    ///
-    /// Explains what kinds of entities belong to this type, their common
-    /// characteristics, and how they relate to other types in the domain.
-    pub description: String,
+    pub name: String,
 
-    /// Representative instances of this concept type.
-    ///
-    /// A list of well-known or important examples of concepts that belong
-    /// to this type. These serve as prototypes and help users understand
-    /// the scope and nature of the type.
-    pub key_instances: Vec<String>,
+    /// Key-value attributes associated with the concept type.
+    pub attributes: Map<String, Json>,
 }
 
 impl ConceptTypeInfo {
@@ -534,69 +513,9 @@ impl ConceptTypeInfo {
     /// A new `ConceptTypeInfo` instance with information extracted from the concept.
     pub fn from(concept: &Concept) -> Self {
         Self {
-            type_name: concept.name.clone(),
-            description: concept
-                .attributes
-                .get("description")
-                .map(|v| v.as_str().unwrap_or_default().to_string())
-                .unwrap_or_default(),
-            key_instances: concept
-                .attributes
-                .get("key_instances")
-                .map(|v| {
-                    v.as_array()
-                        .map(|v| {
-                            v.iter()
-                                .map(|v| v.as_str().unwrap_or_default().to_string())
-                                .collect()
-                        })
-                        .unwrap_or_default()
-                })
-                .unwrap_or_default(),
-        }
-    }
-}
-
-/// Information about a proposition type.
-///
-/// Describes a category of relationships (predicates) that can exist between
-/// entities in the knowledge graph. Each proposition type defines a specific
-/// semantic relationship with its own meaning and usage patterns.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct PropositionTypeInfo {
-    /// Name of the predicate.
-    ///
-    /// The canonical identifier for this relationship type. Should use
-    /// consistent naming conventions (e.g., camelCase verbs) and be
-    /// semantically clear and unambiguous.
-    pub predicate_name: String,
-
-    /// Detailed description of the proposition type.
-    ///
-    /// Explains the semantic meaning of this relationship, when it should
-    /// be used, and how it relates to other proposition types. Should
-    /// include examples of typical subject-object pairs.
-    pub description: String,
-}
-
-impl PropositionTypeInfo {
-    /// Creates proposition type information from a concept.
-    ///
-    /// # Arguments
-    ///
-    /// * `concept` - The concept representing the proposition type
-    ///
-    /// # Returns
-    ///
-    /// A new `PropositionTypeInfo` instance with information extracted from the concept.
-    pub fn from(concept: &Concept) -> Self {
-        Self {
-            predicate_name: concept.name.clone(),
-            description: concept
-                .attributes
-                .get("description")
-                .map(|v| v.as_str().unwrap_or_default().to_string())
-                .unwrap_or_default(),
+            r#type: concept.r#type.clone(),
+            name: concept.name.clone(),
+            attributes: concept.attributes.clone(),
         }
     }
 }
