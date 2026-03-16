@@ -21,12 +21,6 @@ use std::{collections::BTreeMap, sync::Arc};
 use tokio::sync::RwLock;
 use tower::ServiceExt;
 
-const PARSE_ERROR: i64 = -32700;
-const METHOD_NOT_FOUND: i64 = -32601;
-const INVALID_PARAMS: i64 = -32602;
-const NOT_FOUND: i64 = -32001;
-const ALREADY_EXISTS: i64 = -32002;
-
 async fn test_app() -> Router {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let storage = StorageConfig {
@@ -193,7 +187,7 @@ async fn test_root_create_and_list_databases() {
     assert_eq!(rpc_result(&create)["config"]["name"], "tenant_a");
 
     let dup = rpc_call_root(&app, "create_database", Some(json!({"name": "tenant_a"}))).await;
-    assert_eq!(rpc_error(&dup)["code"], ALREADY_EXISTS);
+    assert_eq!(rpc_error(&dup)["message"], "database exists: tenant_a");
 }
 
 #[tokio::test]
@@ -207,7 +201,10 @@ async fn test_db_scoped_metadata_and_flush() {
     assert_eq!(rpc_result(&flush)["result"], "flushed");
 
     let missing = rpc_call_db(&app, "not_exists", "get_db_metadata", None).await;
-    assert_eq!(rpc_error(&missing)["code"], NOT_FOUND);
+    assert_eq!(
+        rpc_error(&missing)["message"],
+        "database not found: not_exists"
+    );
 }
 
 #[tokio::test]
@@ -433,7 +430,11 @@ async fn test_cross_database_document_access_returns_not_found() {
         Some(json!({"collection": "articles", "_id": doc_id})),
     )
     .await;
-    assert_eq!(rpc_error(&wrong_db_get)["code"], NOT_FOUND);
+    assert!(
+        rpc_error(&wrong_db_get)["message"]
+            .to_string()
+            .contains("not found")
+    );
 
     let right_db_get = rpc_call_db(
         &app,
@@ -538,10 +539,20 @@ async fn test_rpc_parse_and_method_errors() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let parsed = body_json(resp.into_body()).await;
-    assert_eq!(rpc_error(&parsed)["code"], PARSE_ERROR);
+    println!("Parse error response: {parsed:?}");
+    assert!(
+        rpc_error(&parsed)["message"]
+            .to_string()
+            .contains("failed to parse JSON")
+    );
 
     let method_missing = rpc_call_root(&app, "unknown_method", None).await;
-    assert_eq!(rpc_error(&method_missing)["code"], METHOD_NOT_FOUND);
+    println!("Method missing response: {method_missing:?}");
+    assert!(
+        rpc_error(&method_missing)["message"]
+            .to_string()
+            .contains("method not found")
+    );
 
     let bad_params = rpc_call_db(
         &app,
@@ -550,7 +561,12 @@ async fn test_rpc_parse_and_method_errors() {
         Some(json!({"collection": "articles"})),
     )
     .await;
-    assert_eq!(rpc_error(&bad_params)["code"], INVALID_PARAMS);
+    println!("Bad params response: {bad_params:?}");
+    assert!(
+        rpc_error(&bad_params)["message"]
+            .to_string()
+            .contains("Invalid field value")
+    );
 }
 
 #[tokio::test]

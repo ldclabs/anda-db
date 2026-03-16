@@ -8,12 +8,12 @@
 //! - `Accept: application/json` (default) for JSON responses
 
 use axum::{
+    Json,
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use ciborium::Value as CborValue;
-use serde::{Deserialize, Serialize};
-use serde_json::Value as JsonValue;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::Value;
 
 /// Content format for request/response payloads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +60,24 @@ impl ContentType {
             ContentType::Cbor => HeaderValue::from_static("application/cbor"),
         }
     }
+
+    /// Parse the request body according to the content type.
+    pub fn parse_body<T>(&self, body: &[u8]) -> Result<T, RpcError>
+    where
+        T: DeserializeOwned,
+    {
+        match self {
+            ContentType::Json => serde_json::from_slice(body)
+                .map_err(|e| RpcError::new(format!("parse JSON error: {e}"))),
+            ContentType::Cbor => ciborium::de::from_reader(body)
+                .map_err(|e| RpcError::new(format!("parse CBOR error: {e}"))),
+        }
+    }
+
+    /// Create a response with the given data and this content type.
+    pub fn response<T: Serialize>(&self, data: T) -> AppResponse<T> {
+        AppResponse::new(data, *self)
+    }
 }
 
 /// Extracts the preferred response format from the `Accept` header.
@@ -81,19 +99,8 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for Accept {
 
 // ─── RPC Types ────────────────────────────────────────────────────────────────
 
-/// Common RPC error codes (JSON-RPC code space).
-pub const PARSE_ERROR: i32 = -32700;
-pub const INVALID_REQUEST: i32 = -32600;
-pub const METHOD_NOT_FOUND: i32 = -32601;
-pub const INVALID_PARAMS: i32 = -32602;
-pub const INTERNAL_ERROR: i32 = -32603;
-
-/// Application-specific RPC error codes (-32000 to -32099).
-pub const NOT_FOUND: i32 = -32001;
-pub const ALREADY_EXISTS: i32 = -32002;
-pub const PAYLOAD_TOO_LARGE: i32 = -32003;
-
 /// RPC request object.
+#[allow(unused)]
 #[derive(Debug, Deserialize)]
 pub struct RpcRequest<T> {
     pub method: String,
@@ -101,18 +108,17 @@ pub struct RpcRequest<T> {
 }
 
 /// RPC response object.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 pub struct RpcResponse<T> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<T>,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<RpcError>,
-}
 
-pub type JsonRpcRequest = RpcRequest<JsonValue>;
-pub type CborRpcRequest = RpcRequest<CborValue>;
-pub type JsonRpcResponse = RpcResponse<JsonValue>;
-pub type CborRpcResponse = RpcResponse<CborValue>;
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
 
 impl<T> RpcResponse<T> {
     /// Create a successful RPC response.
@@ -120,14 +126,17 @@ impl<T> RpcResponse<T> {
         Self {
             result: Some(result),
             error: None,
+            next_cursor: None,
         }
     }
 
     /// Create an error RPC response.
+    #[allow(unused)]
     pub fn error(error: RpcError) -> Self {
         Self {
             result: None,
             error: Some(error),
+            next_cursor: None,
         }
     }
 }
@@ -135,40 +144,70 @@ impl<T> RpcResponse<T> {
 /// RPC error object.
 #[derive(Debug, Serialize)]
 pub struct RpcError {
-    pub code: i32,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub data: Option<JsonValue>,
+    pub data: Option<Value>,
 }
 
 impl RpcError {
     /// Create a new RPC error with the given code and message.
-    pub fn new(code: i32, message: impl Into<String>) -> Self {
+    pub fn new(message: impl Into<String>) -> Self {
         Self {
-            code,
             message: message.into(),
             data: None,
         }
     }
-}
 
-impl From<anda_db::error::DBError> for RpcError {
-    fn from(e: anda_db::error::DBError) -> Self {
-        let code = match &e {
-            anda_db::error::DBError::NotFound { .. } => NOT_FOUND,
-            anda_db::error::DBError::AlreadyExists { .. } => ALREADY_EXISTS,
-            anda_db::error::DBError::PayloadTooLarge { .. } => PAYLOAD_TOO_LARGE,
-            anda_db::error::DBError::Serialization { .. }
-            | anda_db::error::DBError::Schema { .. } => INVALID_PARAMS,
-            _ => INTERNAL_ERROR,
-        };
-        RpcError::new(code, e.to_string())
+    pub fn into_response(self, code: Option<StatusCode>) -> Response {
+        (
+            code.unwrap_or(StatusCode::OK),
+            Json(RpcResponse::<()>::error(self)),
+        )
+            .into_response()
     }
 }
 
-impl From<anda_db_schema::SchemaError> for RpcError {
-    fn from(e: anda_db_schema::SchemaError) -> Self {
-        RpcError::new(INVALID_PARAMS, e.to_string())
+// ─── App Error ────────────────────────────────────────────────────────────────
+
+/// A typed error that converts to an HTTP response via `IntoResponse`.
+pub struct AppError {
+    pub status: StatusCode,
+    pub message: String,
+}
+
+impl AppError {
+    pub fn unauthorized() -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: "authentication failed".into(),
+        }
+    }
+
+    pub fn bad_request(e: impl std::fmt::Debug) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("{e:?}"),
+        }
+    }
+
+    pub fn not_found(e: impl std::fmt::Debug) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            message: format!("{e:?}"),
+        }
+    }
+
+    pub fn internal_error(e: impl std::fmt::Debug) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!("{e:?}"),
+        }
+    }
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        RpcError::new(self.message).into_response(Some(self.status))
     }
 }
 
@@ -223,5 +262,42 @@ impl<T: Serialize> IntoResponse for AppResponse<T> {
                 }
             }
         }
+    }
+}
+
+impl From<anda_db::error::DBError> for RpcError {
+    fn from(e: anda_db::error::DBError) -> Self {
+        RpcError::new(e.to_string())
+    }
+}
+
+impl From<anda_db_schema::SchemaError> for RpcError {
+    fn from(e: anda_db_schema::SchemaError) -> Self {
+        RpcError::new(e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ContentType;
+    use axum::http::{HeaderMap, header};
+
+    #[test]
+    fn content_type_from_header_prefers_content_type() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, "application/cbor".parse().unwrap());
+        headers.insert(header::ACCEPT, "application/json".parse().unwrap());
+
+        assert_eq!(ContentType::from_header(&headers), ContentType::Cbor);
+    }
+
+    #[test]
+    fn content_type_from_accept_and_default() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ACCEPT, "application/json".parse().unwrap());
+        assert_eq!(ContentType::from_accept(&headers), ContentType::Json);
+
+        let headers = HeaderMap::new();
+        assert_eq!(ContentType::from_accept(&headers), ContentType::Json);
     }
 }
