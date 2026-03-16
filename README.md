@@ -36,6 +36,7 @@ Anda DB features a highly modular design, with each crate providing a distinct c
 -   `anda_db_btree`: The B-Tree index implementation.
 -   `anda_db_tfs`: The full-text search (BM25) implementation.
 -   `anda_db_hnsw`: The Hierarchical Navigable Small World (HNSW) vector index implementation.
+-   `anda_db_shard_proxy`: A PostgreSQL-backed reverse proxy for routing database traffic to sharded `anda_db_server` backends.
 
 ## Getting Started
 
@@ -241,6 +242,39 @@ curl -sS http://127.0.0.1:8080/kip \
         }
     }' | jq
 ```
+
+### Run with Shard Routing: `anda_db_shard_proxy`
+
+If you deploy multiple `anda_db_server` instances and want a single stable entrypoint, use the shard proxy crate:
+
+-   Source: [rs/anda_db_shard_proxy](./rs/anda_db_shard_proxy)
+-   Docs: [rs/anda_db_shard_proxy/README.md](./rs/anda_db_shard_proxy/README.md)
+-   Purpose: resolve `db_name -> shard_id -> backend_addr` and forward HTTP requests to the correct shard backend
+
+Start the proxy:
+
+```bash
+export DATABASE_URL="postgres://user:pass@localhost/shard_proxy"
+export API_KEY="my-secret"
+
+cargo run -p anda_db_shard_proxy -- --addr 127.0.0.1:8080
+```
+
+Register a backend and assign a tenant:
+
+```bash
+curl -X PUT http://127.0.0.1:8080/_admin/shard_backends \
+    -H 'Content-Type: application/json' \
+    -H 'Authorization: Bearer my-secret' \
+    -d '{"shard_id":1,"backend_addr":"http://127.0.0.1:9001","read_only":false}'
+
+curl -X PUT http://127.0.0.1:8080/_admin/db_shards \
+    -H 'Content-Type: application/json' \
+    -H 'Authorization: Bearer my-secret' \
+    -d '{"db_name":"tenant_a","shard_id":1}'
+```
+
+After that, client traffic sent to `POST /tenant_a` or `POST /v1/tenant_a/...` will be proxied to the configured backend. The proxy can also route directly by shard when clients provide `Shard-ID` or `X-Shard` headers.
 
 ## Building and Testing
 

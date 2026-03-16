@@ -1,0 +1,36 @@
+[package]
+name = "anda_db_shard_proxy"
+version = "0.1.0"
+description = "A reverse proxy service for Anda DB shard routing"
+readme = "README.md"
+repository.workspace = true
+homepage.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+axum = { workspace = true }
+bytes = { workspace = true }
+clap = { workspace = true }
+dashmap = { workspace = true }
+dotenv = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+structured-logger = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true }
+hyper = "1"
+hyper-util = { version = "0.1", features = [
+  "client-legacy",
+  "http1",
+  "http2",
+  "tokio",
+] }
+http-body-util = "0.1"
+sqlx = { version = "0.8", features = [
+  "runtime-tokio",
+  "tls-rustls",
+  "postgres",
+] }

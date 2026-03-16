@@ -13,6 +13,7 @@ members = [
   "rs/anda_db_utils",
   "rs/anda_kip",
   "rs/anda_object_store",
+  "rs/anda_db_shard_proxy",
   "py/anda_cognitive_nexus_py",
 ]
 # Python binding package (anda_cognitive_nexus_py) is excluded from workspace testing
