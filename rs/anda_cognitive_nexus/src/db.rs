@@ -740,6 +740,48 @@ impl CognitiveNexus {
         Ok(())
     }
 
+    /// Resolves a FIND variable, checking entity bindings first, then predicate bindings.
+    ///
+    /// Predicate variables (bound via triple patterns like `(?s, ?p, ?o)`) are stored
+    /// separately from entity variables. This method handles both cases.
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_find_var(
+        &self,
+        ctx: &QueryContext,
+        bindings: &FxHashMap<String, Vec<EntityID>>,
+        var: &str,
+        fields: &[String],
+        order_by: &[OrderByCondition],
+        cursor: Option<&EntityID>,
+        limit: usize,
+    ) -> Result<(Vec<Json>, Option<String>), KipError> {
+        if bindings.contains_key(var) {
+            return self
+                .resolve_result(&ctx.cache, bindings, var, fields, order_by, cursor, limit)
+                .await;
+        }
+
+        // Check if it's a predicate variable
+        if let Some(predicates) = ctx.predicates.get(var) {
+            let values: Vec<Json> = predicates.iter().map(|p| Json::String(p.clone())).collect();
+            let next_cursor = if limit > 0 && limit < values.len() {
+                Some(limit.to_string())
+            } else {
+                None
+            };
+            let limited = if limit > 0 && limit < values.len() {
+                values[..limit].to_vec()
+            } else {
+                values
+            };
+            return Ok((limited, next_cursor));
+        }
+
+        Err(KipError::reference_error(format!(
+            "Unbound variable: {var:?}"
+        )))
+    }
+
     async fn execute_find_clause(
         &self,
         ctx: &mut QueryContext,
@@ -768,8 +810,8 @@ impl CognitiveNexus {
                     match &group_var {
                         Some((var, fields)) if var != &dot_path.var => {
                             let (col, cur) = self
-                                .resolve_result(
-                                    &ctx.cache,
+                                .resolve_find_var(
+                                    ctx,
                                     &bindings,
                                     var,
                                     fields,
@@ -806,8 +848,8 @@ impl CognitiveNexus {
                     // 处理之前的 group_var
                     if let Some((var, fields)) = &group_var {
                         let (col, cur) = self
-                            .resolve_result(
-                                &ctx.cache,
+                            .resolve_find_var(
+                                ctx,
                                 &bindings,
                                 var,
                                 fields,
@@ -826,8 +868,8 @@ impl CognitiveNexus {
                     }
 
                     let (col, _) = self
-                        .resolve_result(
-                            &ctx.cache,
+                        .resolve_find_var(
+                            ctx,
                             &bindings,
                             &var.var,
                             &[var.to_pointer_or("id")],
@@ -845,8 +887,8 @@ impl CognitiveNexus {
         // 处理最后的 group_var
         if let Some((var, fields)) = &group_var {
             let (col, cur) = self
-                .resolve_result(
-                    &ctx.cache,
+                .resolve_find_var(
+                    ctx,
                     &bindings,
                     var,
                     fields,
@@ -4481,5 +4523,73 @@ mod tests {
         let (result, _) = nexus.execute_kql(query).await.unwrap();
         // Fever has no severity (IS_NULL true), Headache matches IN
         assert_eq!(result, json!(["Headache", "Fever"]));
+    }
+
+    #[tokio::test]
+    async fn test_kql_find_predicate_variable() {
+        let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+        setup_test_data(&nexus).await.unwrap();
+
+        // Test 1: FIND with predicate variable ?p alongside entity variables
+        let kql = r#"
+        FIND(?n, ?p, ?o)
+        WHERE {
+            ?n {name: "Aspirin"}
+            (?n, ?p, ?o)
+        }
+        "#;
+        let query = parse_kql(kql).unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        let arr = result.as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        // ?n should have Aspirin concept
+        assert!(!arr[0].as_array().unwrap().is_empty());
+        // ?p should have predicate strings (e.g., "treats")
+        let predicates = arr[1].as_array().unwrap();
+        assert!(!predicates.is_empty());
+        assert!(predicates.iter().any(|p| p.as_str() == Some("treats")));
+        // ?o should have matched objects (Headache, Fever)
+        assert!(!arr[2].as_array().unwrap().is_empty());
+
+        // Test 2: FIND with only predicate variable
+        let kql = r#"
+        FIND(?p)
+        WHERE {
+            ?drug {type: "Drug", name: "Aspirin"}
+            (?drug, ?p, ?symptom)
+        }
+        "#;
+        let query = parse_kql(kql).unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        let predicates = result.as_array().unwrap();
+        assert!(!predicates.is_empty());
+        assert!(predicates.iter().any(|p| p.as_str() == Some("treats")));
+
+        // Test 3: FIND with literal predicate (not a variable) should still work
+        let kql = r#"
+        FIND(?drug.name, ?symptom.name)
+        WHERE {
+            ?drug {type: "Drug"}
+            (?drug, "treats", ?symptom)
+        }
+        "#;
+        let query = parse_kql(kql).unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        assert_eq!(result, json!([["Aspirin"], ["Headache", "Fever"]]));
+
+        // Test 4: Unbound variable should still produce an error
+        let kql = r#"
+        FIND(?unbound)
+        WHERE {
+            ?drug {type: "Drug"}
+        }
+        "#;
+        let query = parse_kql(kql).unwrap();
+        let result = nexus.execute_kql(query).await;
+        assert!(result.is_err());
+        if let Err(err) = result {
+            assert!(matches!(err.code, KipErrorCode::ReferenceError));
+            assert!(err.message.contains("Unbound variable"));
+        }
     }
 }

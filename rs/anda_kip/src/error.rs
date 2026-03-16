@@ -112,7 +112,7 @@ impl KipErrorCode {
             Self::InvalidValueType => "Correct the JSON value type.",
             // 3xxx: Logic & Data
             Self::ReferenceError => {
-                "Ensure the `CONCEPT` block defining the handle is placed before subsequent clauses referencing it in `UPSERT`."
+                "Ensure the variable is defined and bound in the WHERE clause (for KQL) or the CONCEPT block is placed before referencing clauses (for KML)."
             }
             Self::NotFound => {
                 "Target may have been deleted or never created. Try `SEARCH` or `FIND` to confirm existence first."
