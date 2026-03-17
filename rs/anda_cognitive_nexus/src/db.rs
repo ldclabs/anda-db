@@ -225,47 +225,68 @@ impl CognitiveNexus {
             kml_lock: Arc::new(RwLock::new(())),
         };
 
-        if !this
-            .has_concept(&ConceptPK::Object {
-                r#type: META_CONCEPT_TYPE.to_string(),
-                name: META_CONCEPT_TYPE.to_string(),
-            })
-            .await
+        let ver = this.capsule_version();
+
+        if ver == 0
+            || !this
+                .has_concept(&ConceptPK::Object {
+                    r#type: META_CONCEPT_TYPE.to_string(),
+                    name: META_CONCEPT_TYPE.to_string(),
+                })
+                .await
         {
             this.execute_kml(parse_kml(GENESIS_KIP)?, false).await?;
         }
 
-        if !this
-            .has_concept(&ConceptPK::Object {
-                r#type: META_CONCEPT_TYPE.to_string(),
-                name: PERSON_TYPE.to_string(),
-            })
-            .await
+        if ver == 0
+            || !this
+                .has_concept(&ConceptPK::Object {
+                    r#type: META_CONCEPT_TYPE.to_string(),
+                    name: PERSON_TYPE.to_string(),
+                })
+                .await
         {
             this.execute_kml(parse_kml(PERSON_KIP)?, false).await?;
         }
 
-        if !this
-            .has_concept(&ConceptPK::Object {
-                r#type: META_CONCEPT_TYPE.to_string(),
-                name: EVENT_TYPE.to_string(),
-            })
-            .await
+        if ver == 0
+            || !this
+                .has_concept(&ConceptPK::Object {
+                    r#type: META_CONCEPT_TYPE.to_string(),
+                    name: PREFERENCE_TYPE.to_string(),
+                })
+                .await
+        {
+            this.execute_kml(parse_kml(PREFERENCE_KIP)?, false).await?;
+        }
+
+        if ver == 0
+            || !this
+                .has_concept(&ConceptPK::Object {
+                    r#type: META_CONCEPT_TYPE.to_string(),
+                    name: EVENT_TYPE.to_string(),
+                })
+                .await
         {
             this.execute_kml(parse_kml(EVENT_KIP)?, false).await?;
         }
 
-        if !this
-            .has_concept(&ConceptPK::Object {
-                r#type: META_CONCEPT_TYPE.to_string(),
-                name: SLEEP_TASK_TYPE.to_string(),
-            })
-            .await
+        if ver == 0
+            || !this
+                .has_concept(&ConceptPK::Object {
+                    r#type: META_CONCEPT_TYPE.to_string(),
+                    name: SLEEP_TASK_TYPE.to_string(),
+                })
+                .await
         {
             this.execute_kml(parse_kml(SLEEP_TASK_KIP)?, false).await?;
         }
 
         f(&this).await?;
+
+        if ver == 0 {
+            this.save_capsule_version(1).await?;
+        }
         Ok(this)
     }
 
@@ -286,6 +307,20 @@ impl CognitiveNexus {
     /// Returns the name of the underlying database.
     pub fn name(&self) -> &str {
         self.db.name()
+    }
+
+    pub fn capsule_version(&self) -> u64 {
+        self.concepts
+            .get_extension("capsule_version")
+            .and_then(|v| u64::try_from(v).ok())
+            .unwrap_or(0)
+    }
+
+    pub async fn save_capsule_version(&self, version: u64) -> Result<(), KipError> {
+        self.concepts
+            .save_extension("capsule_version".to_string(), version.into())
+            .await
+            .map_err(db_to_kip_error)
     }
 
     /// Checks whether a concept exists in the database.
@@ -3251,7 +3286,7 @@ mod tests {
             result,
             json!([{
                 "_type":"ConceptNode",
-                "id":"C:16",
+                "id":"C:23",
                 "type":"Drug",
                 "name":"Aspirin",
                 "attributes":{"dosage":"325mg","molecular_formula":"C9H8O4","risk_level":2},

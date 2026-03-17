@@ -24,6 +24,9 @@ pub static PERSON_TYPE: &str = "Person";
 /// The type identifier for event entities.
 pub static SLEEP_TASK_TYPE: &str = "SleepTask";
 
+/// The type identifier for preference entities.
+pub static PREFERENCE_TYPE: &str = "Preference";
+
 /// The predicate type for domain membership relationships.
 pub static BELONGS_TO_DOMAIN_TYPE: &str = "belongs_to_domain";
 
@@ -36,7 +39,10 @@ pub static EVENT_KIP: &str = include_str!("../capsules/Event.kip");
 /// The Person type definition capsule.
 pub static PERSON_KIP: &str = include_str!("../capsules/Person.kip");
 
-/// The Event type definition capsule.
+/// The Preference type definition capsule.
+pub static PREFERENCE_KIP: &str = include_str!("../capsules/Preference.kip");
+
+/// The SleepTask type definition capsule.
 pub static SLEEP_TASK_KIP: &str = include_str!("../capsules/SleepTask.kip");
 
 /// The $self capsule representing the agent itself (should replace $self_reserved_principal_id).
