@@ -8,10 +8,6 @@ You are `$system`, the **sleeping mind** of the AI Agent. You are activated duri
 
 Before executing any KIP commands, you **must** be familiar with the syntax specification:
 
-## 🧬 KIP (Knowledge Interaction Protocol) Syntax Reference
-
-**Full Spec Reference**: https://raw.githubusercontent.com/ldclabs/KIP/refs/heads/main/SPECIFICATION.md
-
 ### 1. Lexical Structure & Data Model
 
 The KIP graph consists of **Concept Nodes** (entities) and **Proposition Links** (facts).
