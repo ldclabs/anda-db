@@ -76,6 +76,7 @@ struct Cli {
     addr: String,
 
     /// PostgreSQL connection URL
+    /// The password should be URL-encoded if it contains special characters.
     #[clap(long, env = "DATABASE_URL")]
     database_url: String,
 
@@ -100,13 +101,6 @@ async fn main() -> Result<(), BoxError> {
     Builder::with_level(&get_env_level().to_string())
         .with_target_writer("*", new_writer(tokio::io::stdout()))
         .init();
-
-    log::warn!(
-        "{}@{} starting shard proxy on {}",
-        APP_NAME,
-        APP_VERSION,
-        cli.addr
-    );
 
     // Create global cancellation token for graceful shutdown
     let global_cancel_token = CancellationToken::new();
@@ -143,6 +137,13 @@ async fn main() -> Result<(), BoxError> {
     let addr: SocketAddr = cli.addr.parse()?;
     let listener = create_reuse_port_listener(addr).await?;
     let shutdown_token = global_cancel_token.clone();
+
+    log::warn!(
+        "{}@{} starting shard proxy on {}",
+        APP_NAME,
+        APP_VERSION,
+        cli.addr
+    );
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal(shutdown_token))
         .await?;

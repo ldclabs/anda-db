@@ -16,7 +16,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 /// Mapping from database name to its assigned shard ID.
-/// Once established, this binding is permanent.
+/// This binding can be updated by administrators when needed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbShard {
     /// Logical database name used by clients.
@@ -77,7 +77,7 @@ enum BackendEvent {
 /// Persistent shard routing store backed by PostgreSQL with in-memory DashMap caches.
 ///
 /// Two-table design:
-/// - `db_shards`: db_name → shard_id (large, immutable once set)
+/// - `db_shards`: db_name → shard_id (large, mostly stable; can be updated)
 /// - `shard_backends`: shard_id → backend_addr (small, mutable for upgrades)
 ///
 /// Uses PostgreSQL `LISTEN/NOTIFY` so that multiple proxy instances stay in sync.
@@ -240,16 +240,15 @@ impl ShardStore {
             .collect()
     }
 
-    // ── db_shards mutations (permanent bindings) ────────────────────────────
+    // ── db_shards mutations ───────────────────────────────────────────────────
 
     /// Assign a database to a shard.
     ///
-    /// The insert is idempotent: if the database already exists, the existing
-    /// binding is kept and no reassignment is performed.
+    /// If the database already exists, its shard binding is updated.
     pub async fn assign_db(&self, db_name: &str, shard_id: u32) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT INTO db_shards (db_name, shard_id) VALUES ($1, $2) \
-             ON CONFLICT (db_name) DO NOTHING",
+             ON CONFLICT (db_name) DO UPDATE SET shard_id = EXCLUDED.shard_id",
         )
         .bind(db_name)
         .bind(shard_id as i32)
@@ -402,7 +401,10 @@ impl ShardStore {
             loop {
                 if let Err(e) = self.listen_loop(&cancel).await {
                     log::error!("pg listener error, reconnecting: {}", e);
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                        _ = cancel.cancelled() => return,
+                    }
                 }
                 if cancel.is_cancelled() {
                     return;
