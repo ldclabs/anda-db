@@ -16,5 +16,5 @@ pub mod router;
 pub mod store;
 
 // Re-export key types for library usage.
-pub use proxy::{AppState, DbNameExtractor};
+pub use proxy::{AppState, DbShardExtractor};
 pub use store::ShardStore;

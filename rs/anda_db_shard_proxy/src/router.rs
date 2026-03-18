@@ -1,40 +1,39 @@
 //! Helpers for turning an incoming HTTP request into a shard-routing key.
 //!
-//! The default extractor prefers a database name encoded in the request path.
-//! If no database name is present, it falls back to shard identifiers supplied
-//! through request headers.
+//! The default extractor first tries shard identifiers supplied through
+//! request headers, then falls back to a database name encoded in the request
+//! path.
 
-/// Extracts the database name or shard ID from the request URL path or headers.
-///
-/// Resolution order:
-/// 1. Path formats:
-///    - `/{db_name}/...` → `db_name`
-///    - `/v1/{db_name}/...` → `db_name`
-/// 2. `Shard-ID` or `X-Shard` header value
-pub fn extract_db_name(
-    uri: &axum::http::Uri,
-    headers: &axum::http::HeaderMap,
-) -> (Option<String>, Option<u32>) {
-    // Try extracting from the URL path: /{db_name}/... or /v1/{db_name}/...
-    let mut segments = uri.path().split('/').filter(|segment| !segment.is_empty());
-    let db_name = match (segments.next(), segments.next()) {
-        (Some("v1"), Some(db_name)) => Some(db_name),
-        (Some("v1"), None) => None,
-        (Some(db_name), _) => Some(db_name),
-        (None, _) => None,
-    };
+use crate::proxy::DbShardExtractor;
 
-    if let Some(db_name) = db_name {
-        return (Some(db_name.to_string()), None);
-    }
+pub struct PrefixExtractor {
+    pub prefix: String,
+}
 
-    if let Some(v) = headers.get("Shard-ID").or_else(|| headers.get("X-Shard"))
-        && let Ok(shard_id) = v.to_str()
-            && let Ok(id) = shard_id.parse::<u32>() {
-                return (None, Some(id));
+impl DbShardExtractor for PrefixExtractor {
+    fn extract(
+        &self,
+        uri: &axum::http::Uri,
+        headers: &axum::http::HeaderMap,
+    ) -> (Option<u32>, Option<String>) {
+        // Prefer shard-id headers when present.
+        if let Some(v) = headers.get("Shard-ID").or_else(|| headers.get("X-Shard"))
+            && let Ok(shard_id) = v.to_str()
+            && let Ok(id) = shard_id.parse::<u32>()
+        {
+            return (Some(id), None);
+        }
+
+        // Fall back to extracting from path: prefix{db_name}/...
+        if let Some(path) = uri.path().strip_prefix(&self.prefix)
+            && let Some(db_name) = path.split('/').next()
+                && !db_name.is_empty()
+            {
+                return (None, Some(db_name.to_string()));
             }
 
-    (None, None)
+        (None, None)
+    }
 }
 
 #[cfg(test)]
@@ -43,51 +42,89 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue, Uri};
 
     #[test]
-    fn extract_from_path() {
+    fn prefix_extractor_extracts_db_from_root_prefix() {
+        let extractor = PrefixExtractor {
+            prefix: "/".to_string(),
+        };
+
         let uri: Uri = "/mydb/some/path".parse().unwrap();
         let headers = HeaderMap::new();
-        assert_eq!(extract_db_name(&uri, &headers), (Some("mydb".into()), None));
+        assert_eq!(
+            extractor.extract(&uri, &headers),
+            (None, Some("mydb".into()))
+        );
 
         let uri: Uri = "/mydb".parse().unwrap();
-        let headers = HeaderMap::new();
-        assert_eq!(extract_db_name(&uri, &headers), (Some("mydb".into()), None));
+        assert_eq!(
+            extractor.extract(&uri, &headers),
+            (None, Some("mydb".into()))
+        );
     }
 
     #[test]
-    fn extract_from_v1_path() {
-        let uri: Uri = "/v1/mydb/some/path".parse().unwrap();
-        let headers = HeaderMap::new();
-        assert_eq!(extract_db_name(&uri, &headers), (Some("mydb".into()), None));
+    fn prefix_extractor_extracts_db_from_custom_prefix() {
+        let extractor = PrefixExtractor {
+            prefix: "/db/".to_string(),
+        };
 
-        let uri: Uri = "/v1/mydb".parse().unwrap();
+        let uri: Uri = "/db/mydb/some/path".parse().unwrap();
         let headers = HeaderMap::new();
-        assert_eq!(extract_db_name(&uri, &headers), (Some("mydb".into()), None));
+        assert_eq!(
+            extractor.extract(&uri, &headers),
+            (None, Some("mydb".into()))
+        );
 
-        let uri: Uri = "/v1".parse().unwrap();
-        let headers = HeaderMap::new();
-        assert_eq!(extract_db_name(&uri, &headers), (None, None));
+        let uri: Uri = "/db/mydb".parse().unwrap();
+        assert_eq!(
+            extractor.extract(&uri, &headers),
+            (None, Some("mydb".into()))
+        );
     }
 
     #[test]
-    fn extract_from_header() {
-        let uri: Uri = "/".parse().unwrap();
+    fn prefix_extractor_falls_back_to_shard_header_when_path_missing() {
+        let extractor = PrefixExtractor {
+            prefix: "/db/".to_string(),
+        };
+
+        let uri: Uri = "/other-path".parse().unwrap();
         let mut headers = HeaderMap::new();
         headers.insert("Shard-ID", HeaderValue::from_static("42"));
-        assert_eq!(extract_db_name(&uri, &headers), (None, Some(42)));
+        assert_eq!(extractor.extract(&uri, &headers), (Some(42), None));
     }
 
     #[test]
-    fn extract_none_when_missing() {
+    fn prefix_extractor_returns_none_when_path_and_headers_missing() {
+        let extractor = PrefixExtractor {
+            prefix: "/db/".to_string(),
+        };
+
         let uri: Uri = "/".parse().unwrap();
         let headers = HeaderMap::new();
-        assert_eq!(extract_db_name(&uri, &headers), (None, None));
+        assert_eq!(extractor.extract(&uri, &headers), (None, None));
     }
 
     #[test]
-    fn v1_without_db_falls_back_to_header() {
-        let uri: Uri = "/v1/".parse().unwrap();
+    fn prefix_extractor_falls_back_to_x_shard_header() {
+        let extractor = PrefixExtractor {
+            prefix: "/db/".to_string(),
+        };
+
+        let uri: Uri = "/db/".parse().unwrap();
         let mut headers = HeaderMap::new();
         headers.insert("X-Shard", HeaderValue::from_static("88"));
-        assert_eq!(extract_db_name(&uri, &headers), (None, Some(88)));
+        assert_eq!(extractor.extract(&uri, &headers), (Some(88), None));
+    }
+
+    #[test]
+    fn prefix_extractor_prefers_header_over_path() {
+        let extractor = PrefixExtractor {
+            prefix: "/db/".to_string(),
+        };
+
+        let uri: Uri = "/db/mydb/query".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("Shard-ID", HeaderValue::from_static("7"));
+        assert_eq!(extractor.extract(&uri, &headers), (Some(7), None));
     }
 }

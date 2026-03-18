@@ -17,17 +17,18 @@ use hyper_util::client::legacy::Client;
 use std::sync::Arc;
 use tokio::time::{Duration, timeout};
 
-use crate::store::ShardStore;
+use crate::store::{ResolvedRoute, ShardStore};
 
 const KEEP_ALIVE_HEADER: HeaderName = HeaderName::from_static("keep-alive");
 const SHARD_ID_HEADER: HeaderName = HeaderName::from_static("shard-id");
 
-/// A function that extracts the database name or shard ID from the incoming request.
+/// A pluggable extractor that resolves either database name or shard id
+/// from an incoming request.
 ///
-/// Takes the request URI and headers, returns `(Option<db_name>, Option<shard_id>)` on success.
-/// A default implementation is provided by [`router::extract_db_name`].
-pub type DbNameExtractor =
-    Arc<dyn Fn(&Uri, &HeaderMap) -> (Option<String>, Option<u32>) + Send + Sync>;
+/// A default implementation is provided by [`router::PrefixExtractor`].
+pub trait DbShardExtractor: Send + Sync {
+    fn extract(&self, uri: &Uri, headers: &HeaderMap) -> (Option<u32>, Option<String>);
+}
 
 /// Shared application state passed to all handlers.
 #[derive(Clone)]
@@ -38,11 +39,13 @@ pub struct AppState {
     pub client: Arc<Client<hyper_util::client::legacy::connect::HttpConnector, Body>>,
     /// Optional bearer token required for management endpoints.
     pub api_key: Arc<Option<String>>,
-    /// Custom function to extract the database name or shard ID from a request.
-    /// Defaults to [`router::extract_db_name`].
-    pub db_name_extractor: DbNameExtractor,
+    /// Custom extractor to read the database name or shard ID from requests.
+    /// Defaults to [`router::PrefixExtractor`].
+    pub db_name_extractor: Arc<dyn DbShardExtractor>,
     /// Upper bound for a proxied backend request.
     pub proxy_request_timeout: Duration,
+    /// Default backend address to use if no shard mapping is found.
+    pub default_backend: Option<ResolvedRoute>,
 }
 
 /// The catch-all reverse proxy handler.
@@ -55,18 +58,13 @@ pub async fn proxy_handler(
     mut req: Request<Body>,
 ) -> Result<Response<Body>, impl IntoResponse> {
     let original_uri = req.uri().clone();
-    let route = match (state.db_name_extractor)(req.uri(), req.headers()) {
-        (Some(name), _) => state.store.resolve(&name).await,
-        (_, id) => state.store.resolve_by_shard(id.unwrap_or(0)).await,
+    let route = match state.db_name_extractor.extract(req.uri(), req.headers()) {
+        (Some(id), _) => state.store.resolve_by_shard(id).await,
+        (_, Some(name)) => state.store.resolve(&name).await,
+        _ => state.default_backend.clone(),
     };
 
-    let route = route.ok_or({
-        (
-            StatusCode::NOT_FOUND,
-            "no shard mapping found for database name or shard ID",
-        )
-    })?;
-
+    let route = route.ok_or((StatusCode::NOT_FOUND, "No backend found"))?;
     *req.uri_mut() = build_target_uri(&route.backend_addr, &original_uri)
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "invalid backend URI"))?;
 

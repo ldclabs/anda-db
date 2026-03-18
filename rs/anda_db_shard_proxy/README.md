@@ -83,8 +83,8 @@ curl -X PUT http://127.0.0.1:8080/_admin/shard_backends \
 
 Requests are resolved in this order:
 
-1. Try to extract `db_name` from the request path.
-2. If no database name is present, try `Shard-ID` or `X-Shard`.
+1. Try `Shard-ID` or `X-Shard`.
+2. If no shard id is present, try to extract `db_name` from the request path.
 3. Resolve the target shard and backend from the local cache.
 4. On a database cache miss, query PostgreSQL and populate the cache.
 5. Rewrite the target URI and forward the request.
@@ -97,9 +97,11 @@ The proxy strips hop-by-hop headers before forwarding and adds a `Shard-ID` head
 | ----------------------- | ------------------------------------------------------ | ---------------- |
 | `ADDR`                  | Listen address for the proxy                           | `127.0.0.1:8080` |
 | `DATABASE_URL`          | PostgreSQL connection string used for routing metadata | none             |
+| `PATH_PREFIX`           | Optional path prefix used to extract `db_name`         | `/`              |
 | `API_KEY`               | Optional bearer token for admin endpoints              | none             |
 | `PG_MAX_CONNECTIONS`    | Maximum PostgreSQL connections in the shared pool      | `5`              |
 | `PROXY_REQUEST_TIMEOUT` | Upstream request timeout in seconds                    | `300`            |
+| `DEFAULT_BACKEND_ADDR`  | Optional default backend URL for unmatched requests    | none             |
 
 The same values can also be passed as CLI flags:
 
@@ -107,6 +109,7 @@ The same values can also be passed as CLI flags:
 cargo run -p anda_db_shard_proxy -- \
   --addr 0.0.0.0:8080 \
   --database-url postgres://user:pass@localhost/shard_proxy \
+  --path-prefix /db/ \
   --api-key my-secret \
   --pg-max-connections 10 \
   --proxy-request-timeout 60
@@ -125,6 +128,7 @@ Example startup:
 ```bash
 export DATABASE_URL="postgres://user:pass@localhost/shard_proxy"
 export API_KEY="my-secret"
+export PATH_PREFIX="/db/"
 
 cargo run -p anda_db_server -- --addr 127.0.0.1:9001
 cargo run -p anda_db_server -- --addr 127.0.0.1:9002
@@ -153,7 +157,7 @@ The crate also exposes reusable pieces for embedding the proxy in another Rust a
 
 - `ShardStore` for PostgreSQL-backed routing metadata
 - `AppState` for proxy runtime state
-- `DbNameExtractor` for custom request-routing strategies
+- `DbShardExtractor` for custom request-routing strategies
 - `build_router` for constructing the Axum router
 
 ## Testing

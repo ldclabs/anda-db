@@ -52,10 +52,6 @@
 //! cargo run -p anda_db_shard_proxy -- --addr 0.0.0.0:8080
 //! ```
 
-use anda_db_shard_proxy::handler::build_router;
-use anda_db_shard_proxy::proxy::AppState;
-use anda_db_shard_proxy::router;
-use anda_db_shard_proxy::store::ShardStore;
 use axum::{BoxError, body::Body};
 use clap::Parser;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
@@ -64,6 +60,11 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use structured_logger::{Builder, async_json::new_writer, get_env_level};
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
+
+use anda_db_shard_proxy::handler::build_router;
+use anda_db_shard_proxy::proxy::AppState;
+use anda_db_shard_proxy::router;
+use anda_db_shard_proxy::store::{ResolvedRoute, ShardStore};
 
 const APP_NAME: &str = env!("CARGO_PKG_NAME");
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -80,6 +81,11 @@ struct Cli {
     #[clap(long, env = "DATABASE_URL")]
     database_url: String,
 
+    /// Optional path prefix to strip when extracting the database name from the URL.
+    /// For example, with `--path-prefix /db/`, a request to `/db/mydb/query` would extract `mydb` as the database name.
+    #[clap(long, env = "PATH_PREFIX", default_value = "/")]
+    path_prefix: String,
+
     /// API key for management endpoints (optional but recommended)
     #[clap(long, env = "API_KEY")]
     api_key: Option<String>,
@@ -91,6 +97,10 @@ struct Cli {
     /// Maximum timeout for proxy requests in seconds
     #[clap(long, env = "PROXY_REQUEST_TIMEOUT", default_value = "300")]
     proxy_request_timeout: u32,
+
+    /// Default backend address to use if no shard mapping is found
+    #[clap(long, env = "DEFAULT_BACKEND_ADDR")]
+    default_backend_addr: Option<String>,
 }
 
 #[tokio::main]
@@ -129,8 +139,16 @@ async fn main() -> Result<(), BoxError> {
         store,
         client: Arc::new(http_client),
         api_key: Arc::new(cli.api_key),
-        db_name_extractor: Arc::new(router::extract_db_name),
+        db_name_extractor: Arc::new(router::PrefixExtractor {
+            prefix: cli.path_prefix.clone(),
+        }),
         proxy_request_timeout: Duration::from_secs(cli.proxy_request_timeout as u64),
+        default_backend: cli.default_backend_addr.map(|addr| ResolvedRoute {
+            db_name: None,
+            shard_id: 0,
+            backend_addr: addr,
+            read_only: true,
+        }),
     };
 
     let app = build_router(state);
