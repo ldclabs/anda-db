@@ -85,7 +85,6 @@ pub async fn post_kip(
             Ok(Json(anda_kip::Response::Ok {
                 result: json!(logs),
                 next_cursor,
-                ignore: None,
             }))
         }
         _ => Err((

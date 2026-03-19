@@ -17,7 +17,7 @@ use anda_db_tfs::jieba_tokenizer;
 use anda_db_utils::UniqueVec;
 use anda_kip::*;
 use async_trait::async_trait;
-use futures::try_join as try_join_await;
+use futures::try_join;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::json;
 use std::{
@@ -103,7 +103,6 @@ impl Executor for CognitiveNexus {
                     Ok(result) => Response::Ok {
                         result,
                         next_cursor: None,
-                        ignore: Some(true),
                     },
                     Err(error) => Response::err(error),
                 }
@@ -952,7 +951,7 @@ impl CognitiveNexus {
 
         // Query identity and domains in parallel
         let domain_matcher = ConceptMatcher::Type(DOMAIN_TYPE.to_string());
-        let (me_ids, domain_ids) = try_join_await!(
+        let (me_ids, domain_ids) = try_join!(
             self.query_concept_ids(&matcher),
             self.query_concept_ids(&domain_matcher)
         )?;
@@ -1564,7 +1563,7 @@ impl CognitiveNexus {
 
         if !dry_run {
             let now_ms = unix_ms();
-            try_join_await!(self.concepts.flush(now_ms), self.propositions.flush(now_ms))
+            try_join!(self.concepts.flush(now_ms), self.propositions.flush(now_ms))
                 .map_err(db_to_kip_error)?;
         }
 
@@ -1765,7 +1764,7 @@ impl CognitiveNexus {
 
         if !dry_run {
             let now_ms = unix_ms();
-            try_join_await!(self.concepts.flush(now_ms), self.propositions.flush(now_ms))
+            try_join!(self.concepts.flush(now_ms), self.propositions.flush(now_ms))
                 .map_err(db_to_kip_error)?;
         }
 

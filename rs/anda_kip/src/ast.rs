@@ -468,6 +468,33 @@ pub enum FindExpression {
     },
 }
 
+impl fmt::Display for FindExpression {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FindExpression::Variable(var) => write!(f, "{}", var),
+            FindExpression::Aggregation {
+                func,
+                var,
+                distinct,
+            } => {
+                let func_name = match func {
+                    AggregationFunction::Count => "COUNT",
+                    AggregationFunction::Sum => "SUM",
+                    AggregationFunction::Avg => "AVG",
+                    AggregationFunction::Min => "MIN",
+                    AggregationFunction::Max => "MAX",
+                };
+
+                if *distinct {
+                    write!(f, "{}(DISTINCT {})", func_name, var)
+                } else {
+                    write!(f, "{}({})", func_name, var)
+                }
+            }
+        }
+    }
+}
+
 /// Represents a dot notation path for accessing nested data.
 /// Syntax: `?var.field` or `?var.attributes.key` or `?var.metadata.key`
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -501,6 +528,16 @@ impl DotPathVar {
         }
 
         self.to_pointer()
+    }
+}
+
+impl fmt::Display for DotPathVar {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.path.is_empty() {
+            write!(f, "?{}", self.var)
+        } else {
+            write!(f, "?{}.{}", self.var, self.path.join("."))
+        }
     }
 }
 
@@ -932,5 +969,48 @@ pub fn compare_json(left: &Json, right: &Json) -> Option<Ordering> {
             Some(a.cmp(b))
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AggregationFunction, DotPathVar, FindExpression};
+
+    #[test]
+    fn find_expression_display_variable() {
+        let expr = FindExpression::Variable(DotPathVar {
+            var: "drug".to_string(),
+            path: vec!["attributes".to_string(), "risk_level".to_string()],
+        });
+
+        assert_eq!(expr.to_string(), "?drug.attributes.risk_level");
+    }
+
+    #[test]
+    fn find_expression_display_aggregation_without_distinct() {
+        let expr = FindExpression::Aggregation {
+            func: AggregationFunction::Count,
+            var: DotPathVar {
+                var: "drug".to_string(),
+                path: vec![],
+            },
+            distinct: false,
+        };
+
+        assert_eq!(expr.to_string(), "COUNT(?drug)");
+    }
+
+    #[test]
+    fn find_expression_display_aggregation_with_distinct() {
+        let expr = FindExpression::Aggregation {
+            func: AggregationFunction::Sum,
+            var: DotPathVar {
+                var: "drug".to_string(),
+                path: vec!["score".to_string()],
+            },
+            distinct: true,
+        };
+
+        assert_eq!(expr.to_string(), "SUM(DISTINCT ?drug.score)");
     }
 }
