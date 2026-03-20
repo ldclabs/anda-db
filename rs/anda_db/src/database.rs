@@ -802,10 +802,11 @@ impl AndaDB {
         let old_value = meta.extensions.get(&key);
         let new_value = f(old_value.and_then(|v| v.clone().deserialized().ok()));
         if let Some(value) = new_value
-            && let Ok(field_value) = FieldValue::serialized(&value, None) {
-                meta.extensions.insert(key, field_value);
-                return Some(value);
-            }
+            && let Ok(value) = FieldValue::serialized(&value, None)
+        {
+            let old = meta.extensions.insert(key, value);
+            return old.and_then(|v| v.deserialized().ok());
+        }
         None
     }
 
