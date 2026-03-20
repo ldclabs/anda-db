@@ -831,6 +831,15 @@ impl Collection {
         self.metadata.read().extensions.get(key).cloned()
     }
 
+    /// Gets the value of a user-defined extension key and deserializes it into the specified type.
+    pub fn get_extension_as<T>(&self, key: &str) -> Option<T>
+    where
+        T: DeserializeOwned,
+    {
+        self.get_extension(key)
+            .and_then(|v| v.clone().deserialized().ok())
+    }
+
     /// Sets a user-defined extension key-value pair.
     /// The change is persisted on the next `flush()`.
     /// The extensions should not be large, as they are stored in the same object as collection metadata which size is expected to be small (<= 1MB) and loaded frequently.
@@ -839,6 +848,16 @@ impl Collection {
             meta.extensions.insert(key, value);
             meta.stats.version += 1;
         });
+    }
+
+    /// Sets a user-defined extension key-value pair with a serializable value.
+    pub fn set_extension_from<T>(&self, key: String, value: T)
+    where
+        T: Serialize,
+    {
+        if let Ok(value) = FieldValue::serialized(&value, None) {
+            self.set_extension(key, value);
+        }
     }
 
     /// Updates a user-defined extension using a functional approach.
@@ -870,6 +889,23 @@ impl Collection {
         }
     }
 
+    /// Updates a user-defined extension with a serializable value using a functional approach.
+    pub fn set_extension_from_with<F, T>(&self, key: String, f: F) -> Option<T>
+    where
+        F: FnOnce(Option<T>) -> Option<T>,
+        T: Serialize + DeserializeOwned,
+    {
+        let mut meta = self.metadata.write();
+        let old_value = meta.extensions.get(&key);
+        let new_value = f(old_value.and_then(|v| v.clone().deserialized().ok()));
+        if let Some(value) = new_value
+            && let Ok(field_value) = FieldValue::serialized(&value, None) {
+                meta.extensions.insert(key, field_value);
+                return Some(value);
+            }
+        None
+    }
+
     /// Sets a user-defined extension key-value pair and immediately persists the change.
     /// The extensions should not be large, as they are stored in the same object as collection metadata which size is expected to be small (<= 1MB) and loaded frequently.
     pub async fn save_extension(&self, key: String, value: FieldValue) -> Result<(), DBError> {
@@ -878,6 +914,15 @@ impl Collection {
             meta.stats.version += 1;
         });
         self.flush(unix_ms()).await.map(|_| ())
+    }
+
+    /// Sets a user-defined extension key-value pair with a serializable value and immediately persists the change.
+    pub async fn save_extension_from<T>(&self, key: String, value: &T) -> Result<(), DBError>
+    where
+        T: Serialize,
+    {
+        let field_value = FieldValue::serialized(value, None)?;
+        self.save_extension(key, field_value).await
     }
 
     /// Removes a user-defined extension key and immediately persists the change.
