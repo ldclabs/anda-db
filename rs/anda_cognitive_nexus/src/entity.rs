@@ -501,21 +501,22 @@ pub struct ConceptTypeInfo {
     pub attributes: Map<String, Json>,
 }
 
-impl ConceptTypeInfo {
-    /// Creates concept type information from a concept.
-    ///
-    /// # Arguments
-    ///
-    /// * `concept` - The concept representing the type
-    ///
-    /// # Returns
-    ///
-    /// A new `ConceptTypeInfo` instance with information extracted from the concept.
-    pub fn from(concept: &Concept) -> Self {
+impl From<&Concept> for ConceptTypeInfo {
+    fn from(concept: &Concept) -> Self {
         Self {
             r#type: concept.r#type.clone(),
             name: concept.name.clone(),
             attributes: concept.attributes.clone(),
+        }
+    }
+}
+
+impl From<Concept> for ConceptTypeInfo {
+    fn from(concept: Concept) -> Self {
+        Self {
+            r#type: concept.r#type,
+            name: concept.name,
+            attributes: concept.attributes,
         }
     }
 }

@@ -964,7 +964,8 @@ impl CognitiveNexus {
             .await?;
 
         let mut domain_map: Vec<DomainInfo> = Vec::with_capacity(domain_ids.len());
-        for id in domain_ids {
+        let total_domains = domain_ids.len();
+        for id in domain_ids.into_iter().take(100) {
             let mut info = self
                 .try_get_concept_with(&cache, id, |concept| Ok(DomainInfo::from(concept)))
                 .await?;
@@ -994,6 +995,7 @@ impl CognitiveNexus {
         Ok(json!({
             "identity": me,
             "domain_map": domain_map,
+            "total_domains": total_domains,
         }))
     }
 
@@ -1002,10 +1004,10 @@ impl CognitiveNexus {
             .query_concept_ids(&ConceptMatcher::Type(DOMAIN_TYPE.to_string()))
             .await?;
         let cache = QueryCache::default();
-        let mut result: Vec<Json> = Vec::with_capacity(ids.len());
+        let mut result: Vec<ConceptTypeInfo> = Vec::with_capacity(ids.len());
         for id in ids {
             let concept = self
-                .try_get_concept_with(&cache, id, |concept| Ok(concept.to_concept_node()))
+                .try_get_concept_with(&cache, id, |concept| Ok(ConceptTypeInfo::from(concept)))
                 .await?;
             result.push(concept);
         }
@@ -1043,10 +1045,10 @@ impl CognitiveNexus {
             .ok_or_else(|| KipError::not_found(format!("Concept type {name:?} not found")))?;
         let result = self
             .try_get_concept_with(&QueryCache::default(), *id, |concept| {
-                Ok(concept.to_concept_node())
+                Ok(ConceptTypeInfo::from(concept))
             })
             .await?;
-        Ok(result)
+        Ok(json!(result))
     }
 
     async fn execute_describe_proposition_types(
@@ -1080,13 +1082,14 @@ impl CognitiveNexus {
             .ok_or_else(|| KipError::not_found(format!("Proposition type {name:?} not found")))?;
         let result = self
             .try_get_concept_with(&QueryCache::default(), *id, |concept| {
-                Ok(concept.to_concept_node())
+                Ok(ConceptTypeInfo::from(concept))
             })
             .await?;
-        Ok(result)
+        Ok(json!(result))
     }
 
     async fn execute_search(&self, command: SearchCommand) -> Result<Json, KipError> {
+        let limit = Some(command.limit.unwrap_or(100).min(100));
         match command.target {
             SearchTarget::Concept => {
                 let result: Vec<Concept> = self
@@ -1100,7 +1103,7 @@ impl CognitiveNexus {
                         filter: command.in_type.map(|v| {
                             Filter::Field(("type".to_string(), RangeQuery::Eq(Fv::Text(v))))
                         }),
-                        limit: command.limit,
+                        limit,
                     })
                     .await
                     .map_err(db_to_kip_error)?;
@@ -1108,7 +1111,7 @@ impl CognitiveNexus {
                 Ok(json!(
                     result
                         .into_iter()
-                        .map(|c| c.into_concept_node())
+                        .map(ConceptTypeInfo::from)
                         .collect::<Vec<_>>()
                 ))
             }
@@ -1125,7 +1128,7 @@ impl CognitiveNexus {
                         filter: command.in_type.map(|v| {
                             Filter::Field(("predicates".to_string(), RangeQuery::Eq(Fv::Text(v))))
                         }),
-                        limit: command.limit,
+                        limit,
                     })
                     .await
                     .map_err(db_to_kip_error)?;
@@ -4165,11 +4168,11 @@ mod tests {
             .execute_meta(parse_meta("DESCRIBE DOMAINS").unwrap())
             .await
             .unwrap();
-        let domains: Vec<ConceptNode> = serde_json::from_value(result).unwrap();
+        let domains = result.as_array().unwrap();
         // println!("{:#?}", domains);
         assert_eq!(domains.len(), 3);
-        assert_eq!(domains[0].r#type, "Domain");
-        assert_eq!(domains[0].name, "CoreSchema");
+        assert_eq!(domains[0]["type"], "Domain");
+        assert_eq!(domains[0]["name"], "CoreSchema");
     }
 
     #[tokio::test]
@@ -4197,9 +4200,8 @@ mod tests {
             .execute_meta(parse_meta("DESCRIBE CONCEPT TYPE \"Drug\"").unwrap())
             .await
             .unwrap();
-        let concept: ConceptNode = serde_json::from_value(result).unwrap();
-        assert_eq!(concept.r#type, "$ConceptType");
-        assert_eq!(concept.name, "Drug");
+        assert_eq!(result["type"], "$ConceptType");
+        assert_eq!(result["name"], "Drug");
 
         let res = nexus
             .execute_meta(parse_meta("DESCRIBE CONCEPT TYPE \"drug\"").unwrap())
@@ -4225,9 +4227,8 @@ mod tests {
             .execute_meta(parse_meta("DESCRIBE PROPOSITION TYPE \"belongs_to_domain\"").unwrap())
             .await
             .unwrap();
-        let concept: ConceptNode = serde_json::from_value(result).unwrap();
-        assert_eq!(concept.r#type, "$PropositionType");
-        assert_eq!(concept.name, "belongs_to_domain");
+        assert_eq!(result["type"], "$PropositionType");
+        assert_eq!(result["name"], "belongs_to_domain");
 
         let res = nexus
             .execute_meta(parse_meta("DESCRIBE PROPOSITION TYPE \"treats1\"").unwrap())
@@ -4245,23 +4246,23 @@ mod tests {
             .execute_meta(parse_meta(r#"SEARCH CONCEPT "aspirin""#).unwrap())
             .await
             .unwrap();
-        let result: Vec<ConceptNode> = serde_json::from_value(result).unwrap();
+        let result = result.as_array().unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].name, "Aspirin");
+        assert_eq!(result[0]["name"], "Aspirin");
 
         let (result, _) = nexus
             .execute_meta(parse_meta(r#"SEARCH CONCEPT "C9H8O4""#).unwrap())
             .await
             .unwrap();
-        let result: Vec<ConceptNode> = serde_json::from_value(result).unwrap();
+        let result = result.as_array().unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].name, "Aspirin");
+        assert_eq!(result[0]["name"], "Aspirin");
 
         let (result, _) = nexus
             .execute_meta(parse_meta(r#"SEARCH CONCEPT "test_data""#).unwrap())
             .await
             .unwrap();
-        let result: Vec<ConceptNode> = serde_json::from_value(result).unwrap();
+        let result = result.as_array().unwrap();
         // println!("{:#?}", result);
         assert_eq!(result.len(), 6);
 
@@ -4269,7 +4270,7 @@ mod tests {
             .execute_meta(parse_meta(r#"SEARCH CONCEPT "test_data" LIMIT 5"#).unwrap())
             .await
             .unwrap();
-        let result: Vec<ConceptNode> = serde_json::from_value(result).unwrap();
+        let result = result.as_array().unwrap();
         assert_eq!(result.len(), 5);
 
         let (result, _) = nexus
@@ -4278,21 +4279,21 @@ mod tests {
             )
             .await
             .unwrap();
-        let result: Vec<ConceptNode> = serde_json::from_value(result).unwrap();
+        let result = result.as_array().unwrap();
         assert_eq!(result.len(), 1);
 
         let (result, _) = nexus
             .execute_meta(parse_meta(r#"SEARCH PROPOSITION "test_data""#).unwrap())
             .await
             .unwrap();
-        let result: Vec<PropositionLink> = serde_json::from_value(result).unwrap();
+        let result = result.as_array().unwrap();
         assert_eq!(result.len(), 2);
 
         let (result, _) = nexus
             .execute_meta(parse_meta(r#"SEARCH PROPOSITION "test_data" LIMIT 5"#).unwrap())
             .await
             .unwrap();
-        let result: Vec<PropositionLink> = serde_json::from_value(result).unwrap();
+        let result = result.as_array().unwrap();
         assert_eq!(result.len(), 2);
 
         let (result, _) = nexus
@@ -4301,7 +4302,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let result: Vec<PropositionLink> = serde_json::from_value(result).unwrap();
+        let result = result.as_array().unwrap();
         assert_eq!(result.len(), 2);
     }
 
