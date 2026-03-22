@@ -513,11 +513,14 @@ where
             // Mark as dirty, needs to be persisted
             bucket.mark_dirty();
             for (token, size) in val {
-                if bucket.tokens.is_empty() || bucket.size + size < self.config.bucket_overload_size
+                if bucket.tokens.contains(&token) {
+                    // Token already tracked in this bucket; just account for the new posting entry.
+                    bucket.size += size;
+                } else if bucket.tokens.is_empty()
+                    || bucket.size + size < self.config.bucket_overload_size
                 {
-                    if bucket.tokens.push(token) {
-                        bucket.size += size;
-                    }
+                    bucket.tokens.push(token);
+                    bucket.size += size;
                 } else {
                     tokens_to_migrate.push((bid, token, size));
                 }
@@ -930,6 +933,104 @@ where
     /// Returns whether there are dirty buckets pending persistence.
     pub fn has_dirty_buckets(&self) -> bool {
         self.buckets.iter().any(|b| b.is_dirty())
+    }
+
+    /// Compacts fragmented buckets by re-binning all tokens into fewer, properly-sized
+    /// buckets using a first-fit-decreasing bin-packing strategy.
+    ///
+    /// This is intended as a one-time repair after the bucket-splitting bug that created
+    /// many tiny buckets. After compaction all buckets are marked dirty and will be
+    /// persisted on the next [`flush`](Self::flush) call.
+    ///
+    /// # Returns
+    ///
+    /// `(old_bucket_count, new_bucket_count)`
+    pub fn compact_buckets(&self) -> (usize, usize) {
+        let old_count = self.buckets.len();
+        if old_count <= 1 {
+            return (old_count, old_count);
+        }
+
+        // Step 1: Estimate each token's serialized contribution.
+        let mut token_sizes: Vec<(String, usize)> = self
+            .postings
+            .iter()
+            .map(|entry| {
+                let size = estimate_cbor_size(&(entry.key(), entry.value())) + 2;
+                (entry.key().clone(), size)
+            })
+            .collect();
+
+        if token_sizes.is_empty() {
+            self.buckets.clear();
+            self.buckets.insert(
+                0,
+                Bucket {
+                    dirty_version: 1,
+                    ..Default::default()
+                },
+            );
+            self.max_bucket_id.store(0, Ordering::Relaxed);
+            self.update_metadata(|m| {
+                m.stats.version += 1;
+            });
+            return (old_count, 1);
+        }
+
+        // Step 2: Sort by size descending for better packing.
+        token_sizes.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+
+        // Step 3: First-fit-decreasing bin packing.
+        let limit = self.config.bucket_overload_size;
+        // Each bin: (accumulated_size, tokens)
+        let mut bins: Vec<(usize, Vec<String>)> = Vec::new();
+
+        for (token, size) in token_sizes {
+            if let Some(bin) = bins.iter_mut().find(|b| b.0 + size < limit) {
+                bin.0 += size;
+                bin.1.push(token);
+            } else {
+                bins.push((size, vec![token]));
+            }
+        }
+
+        // Step 4: Rebuild buckets.
+        self.buckets.clear();
+        let new_count = bins.len();
+        let max_id = new_count.saturating_sub(1) as u32;
+
+        for (i, (size, tokens)) in bins.into_iter().enumerate() {
+            let bucket_id = i as u32;
+
+            // Update posting references and collect doc_ids.
+            let mut doc_ids = FxHashSet::default();
+            for token in &tokens {
+                if let Some(mut posting) = self.postings.get_mut(token) {
+                    posting.0 = bucket_id;
+                    for (doc_id, _) in posting.1.iter() {
+                        doc_ids.insert(*doc_id);
+                    }
+                }
+            }
+
+            self.buckets.insert(
+                bucket_id,
+                Bucket {
+                    dirty_version: 1,
+                    saved_version: 0,
+                    size,
+                    tokens: tokens.into(),
+                    doc_ids,
+                },
+            );
+        }
+
+        self.max_bucket_id.store(max_id, Ordering::Relaxed);
+        self.update_metadata(|m| {
+            m.stats.version += 1;
+        });
+
+        (old_count, new_count)
     }
 
     /// Stores the index metadata to a writer in CBOR format.
@@ -1685,6 +1786,224 @@ mod tests {
             }
 
             println!("加载部分分桶测试通过！");
+        }
+    }
+
+    #[test]
+    fn test_no_excessive_small_buckets() {
+        // Regression test: existing tokens in a bucket must NOT trigger migration,
+        // otherwise each insert after the bucket reaches the limit creates many
+        // tiny new buckets.
+        let tokenizer = default_tokenizer();
+        let config = BM25Config {
+            bm25: BM25Params::default(),
+            bucket_overload_size: 200, // small limit to trigger splits quickly
+        };
+        let index = BM25Index::new("small_bucket_test".to_string(), tokenizer, Some(config));
+
+        // Insert many documents sharing common tokens
+        let docs = vec![
+            (1, "the quick brown fox"),
+            (2, "the lazy brown dog"),
+            (3, "the quick red cat"),
+            (4, "a lazy brown fox jumps"),
+            (5, "the brown dog runs fast"),
+            (6, "a quick fox hunts at night"),
+            (7, "the lazy cat sleeps all day"),
+            (8, "brown dogs and brown cats"),
+            (9, "quick movements help foxes"),
+            (10, "the fast dog chases the fox"),
+            (11, "lazy afternoons with brown dogs"),
+            (12, "quick brown fox returns again"),
+            (13, "the old brown dog rests"),
+            (14, "a new quick fox appears"),
+            (15, "brown and lazy describe the dog"),
+        ];
+
+        for (id, text) in &docs {
+            index.insert(*id, text, 0).unwrap();
+        }
+
+        let stats = index.stats();
+        let num_buckets = stats.max_bucket_id + 1;
+        println!(
+            "docs={}, buckets={}, max_bucket_id={}",
+            docs.len(),
+            num_buckets,
+            stats.max_bucket_id
+        );
+
+        // With 15 short documents and 200-byte limit, we expect a modest number
+        // of buckets — certainly not one per insert.
+        assert!(
+            (num_buckets as usize) < docs.len(),
+            "Too many buckets ({num_buckets}) for {} documents — \
+             existing tokens are likely being migrated incorrectly",
+            docs.len()
+        );
+
+        // Verify all documents are still searchable
+        for (id, text) in &docs {
+            let first_word = text.split_whitespace().find(|w| w.len() > 2).unwrap();
+            let results = index.search(first_word, 20, None);
+            assert!(
+                results.iter().any(|(rid, _)| *rid == *id),
+                "doc {} not found when searching for '{}'",
+                id,
+                first_word
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_compact_buckets() {
+        // Simulate the real-world scenario: the configured limit is large, but the old
+        // bucket-splitting bug created many tiny buckets anyway.
+        // We build the index with a tiny limit (to generate fragmentation), then
+        // serialize, reload with the correct large limit, and compact.
+        let tokenizer = default_tokenizer();
+        let small_config = BM25Config {
+            bm25: BM25Params::default(),
+            bucket_overload_size: 50, // tiny limit to force many buckets
+        };
+        let index = BM25Index::new("compact_test".to_string(), tokenizer, Some(small_config));
+
+        let docs = vec![
+            (1, "the quick brown fox jumps over the lazy dog"),
+            (2, "a fast brown fox runs past the lazy dog"),
+            (3, "the lazy dog sleeps all day long"),
+            (4, "quick brown foxes are rare in the wild"),
+            (5, "many foxes hunt at night when the moon is bright"),
+            (6, "dogs and cats are common pets in modern households"),
+            (7, "wild animals like foxes and wolves roam the countryside"),
+            (8, "the forest is home to many different species of animals"),
+        ];
+
+        for (id, text) in &docs {
+            index.insert(*id, text, 0).unwrap();
+        }
+
+        let bucket_count_before = index.stats().max_bucket_id + 1;
+        println!("Before compact: {} buckets", bucket_count_before);
+        assert!(
+            bucket_count_before > 3,
+            "should have many fragmented buckets"
+        );
+
+        // Serialize fragmented index
+        let mut metadata_buf = Vec::new();
+        let mut bucket_data: HashMap<u32, Vec<u8>> = HashMap::new();
+        index
+            .flush(&mut metadata_buf, 1, async |id: u32, data: &[u8]| {
+                bucket_data.insert(id, data.to_vec());
+                Ok(true)
+            })
+            .await
+            .unwrap();
+
+        // Reload with the correct (large) bucket limit
+        let mut loaded = BM25Index::load_metadata(default_tokenizer(), &metadata_buf[..]).unwrap();
+        loaded.config.bucket_overload_size = 1024 * 512;
+        loaded.metadata.write().config.bucket_overload_size = 1024 * 512;
+        loaded
+            .load_buckets(async |id| Ok(bucket_data.get(&id).cloned()))
+            .await
+            .unwrap();
+
+        let bucket_count_loaded = loaded.stats().max_bucket_id + 1;
+        assert_eq!(bucket_count_loaded, bucket_count_before);
+
+        // Capture search results before compaction
+        let queries = ["fox", "dog", "lazy brown", "quick OR fast"];
+        let results_before: Vec<Vec<(u64, f32)>> = queries
+            .iter()
+            .map(|q| {
+                if q.contains("OR") {
+                    loaded.search_advanced(q, 20, None)
+                } else {
+                    loaded.search(q, 20, None)
+                }
+            })
+            .collect();
+
+        // Compact!
+        let (old, new) = loaded.compact_buckets();
+        println!("Compacted: {} -> {} buckets", old, new);
+        assert!(
+            new < old,
+            "compaction should reduce bucket count significantly"
+        );
+        assert!(
+            new <= 3,
+            "with 512K limit all postings should fit in very few buckets, got {}",
+            new,
+        );
+
+        // Verify search results are unchanged
+        for (i, q) in queries.iter().enumerate() {
+            let results_after = if q.contains("OR") {
+                loaded.search_advanced(q, 20, None)
+            } else {
+                loaded.search(q, 20, None)
+            };
+            assert_eq!(
+                results_before[i].len(),
+                results_after.len(),
+                "query '{}' result count changed after compaction",
+                q
+            );
+
+            let mut before_sorted = results_before[i].clone();
+            let mut after_sorted = results_after.clone();
+            before_sorted.sort_by(|a, b| a.0.cmp(&b.0));
+            after_sorted.sort_by(|a, b| a.0.cmp(&b.0));
+            for j in 0..before_sorted.len() {
+                assert_eq!(before_sorted[j].0, after_sorted[j].0);
+                assert!(
+                    (before_sorted[j].1 - after_sorted[j].1).abs() < 0.001,
+                    "query '{}' scores diverged for doc {}",
+                    q,
+                    before_sorted[j].0
+                );
+            }
+        }
+
+        // Verify flush + reload works after compaction
+        let mut metadata_buf2 = Vec::new();
+        let mut bucket_data2: HashMap<u32, Vec<u8>> = HashMap::new();
+        loaded
+            .flush(&mut metadata_buf2, 200, async |id: u32, data: &[u8]| {
+                bucket_data2.insert(id, data.to_vec());
+                Ok(true)
+            })
+            .await
+            .unwrap();
+
+        let final_loaded =
+            BM25Index::load_all(default_tokenizer(), &metadata_buf2[..], async |id| {
+                Ok(bucket_data2.get(&id).cloned())
+            })
+            .await
+            .unwrap();
+        assert_eq!(final_loaded.len(), loaded.len());
+
+        for q in &queries {
+            let orig = if q.contains("OR") {
+                loaded.search_advanced(q, 20, None)
+            } else {
+                loaded.search(q, 20, None)
+            };
+            let reloaded = if q.contains("OR") {
+                final_loaded.search_advanced(q, 20, None)
+            } else {
+                final_loaded.search(q, 20, None)
+            };
+            assert_eq!(
+                orig.len(),
+                reloaded.len(),
+                "query '{}' mismatch after reload",
+                q
+            );
         }
     }
 }

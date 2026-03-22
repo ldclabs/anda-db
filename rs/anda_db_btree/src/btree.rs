@@ -477,9 +477,11 @@ where
         // Calculate the size increase for this insertion
         let mut is_new = false;
         let mut size_increase = 0;
+        let mut target_bucket = bucket;
         match self.postings.entry(field_value.clone()) {
             dashmap::Entry::Occupied(mut entry) => {
                 let posting = entry.get_mut();
+                target_bucket = posting.0;
 
                 // Unique index semantics: allow idempotent insert of the same (doc_id, field_value)
                 // while rejecting a different doc_id for an existing field_value.
@@ -517,11 +519,8 @@ where
             // Update bucket state
             let mut b = self
                 .buckets
-                .get_mut(&bucket)
-                .ok_or_else(|| BTreeError::Generic {
-                    name: self.name.clone(),
-                    source: format!("bucket {bucket} not found").into(),
-                })?;
+                .entry(target_bucket)
+                .or_insert_with(|| (0, false, UniqueVec::default(), 0));
 
             // Check if the bucket has enough space
             if b.2.is_empty() || b.0 + size_increase < self.config.bucket_overload_size {
@@ -757,38 +756,35 @@ where
         }
 
         // Phase 2: handle bucket overflow and updates
+        // Process each field value individually to avoid migrating existing values unnecessarily.
         // field_values_to_migrate: (old_bucket_id, field_value, size)
         let mut field_values_to_migrate: Vec<(u32, FV, usize)> = Vec::new();
-        for (bucket_id, (size_increase, field_values)) in bucket_updates {
+        for (bucket_id, (_size_increase, field_values)) in bucket_updates {
             let mut bucket_entry = self
                 .buckets
                 .entry(bucket_id)
                 .or_insert_with(|| (0, false, UniqueVec::default(), 0));
 
-            // Check if the bucket would overflow
-            if bucket_entry.2.is_empty()
-                || bucket_entry.0 + size_increase < self.config.bucket_overload_size
-            {
-                // Bucket has enough space, update directly
-                bucket_entry.0 += size_increase;
-                self.mark_bucket_dirty(&mut bucket_entry);
+            self.mark_bucket_dirty(&mut bucket_entry);
+            for fv in field_values {
+                let fv_size = if let Some(posting) = self.postings.get(&fv) {
+                    estimate_cbor_size(&posting) + 2
+                } else {
+                    continue;
+                };
 
-                // Update field values contained in the bucket
-                for fv in field_values {
+                if bucket_entry.2.contains(&fv) {
+                    // Field value already tracked in this bucket; just update the size.
+                    bucket_entry.0 = fv_size.max(bucket_entry.0);
+                } else if bucket_entry.2.is_empty()
+                    || bucket_entry.0 + fv_size < self.config.bucket_overload_size
+                {
+                    // Bucket has room, add directly
+                    bucket_entry.0 += fv_size;
                     bucket_entry.2.push(fv);
-                }
-            } else {
-                // Bucket doesn't have enough space, need to migrate these values to a new bucket
-                for fv in field_values {
-                    let size = if let Some(posting) = self.postings.get(&fv) {
-                        estimate_cbor_size(&posting) + 2
-                    } else {
-                        0
-                    };
-
-                    if size > 0 {
-                        field_values_to_migrate.push((bucket_id, fv, size));
-                    }
+                } else {
+                    // Bucket full, schedule migration for this new field value
+                    field_values_to_migrate.push((bucket_id, fv, fv_size));
                 }
             }
         }
@@ -1377,6 +1373,89 @@ where
     /// Returns whether there are dirty buckets pending persistence.
     pub fn has_dirty_buckets(&self) -> bool {
         self.dirty_bucket_count.load(Ordering::Acquire) > 0
+    }
+
+    /// Compacts fragmented buckets by re-binning all field values into fewer, properly-sized
+    /// buckets using a first-fit-decreasing bin-packing strategy.
+    ///
+    /// This is intended as a one-time repair after the bucket-splitting bug that created
+    /// many tiny buckets. After compaction all buckets are marked dirty and will be
+    /// persisted on the next [`flush`](Self::flush) call.
+    ///
+    /// # Returns
+    ///
+    /// `(old_bucket_count, new_bucket_count)`
+    pub fn compact_buckets(&self) -> (usize, usize) {
+        let old_count = self.buckets.len();
+        if old_count <= 1 {
+            return (old_count, old_count);
+        }
+
+        // Step 1: Estimate each field value's serialized contribution.
+        let mut fv_sizes: Vec<(FV, usize)> = self
+            .postings
+            .iter()
+            .map(|entry| {
+                let size = estimate_cbor_size(&(entry.key(), entry.value())) + 2;
+                (entry.key().clone(), size)
+            })
+            .collect();
+
+        if fv_sizes.is_empty() {
+            self.buckets.clear();
+            self.buckets.insert(0, (0, true, UniqueVec::default(), 1));
+            self.max_bucket_id.store(0, Ordering::Relaxed);
+            self.dirty_bucket_count.store(1, Ordering::Release);
+            self.update_metadata(|m| {
+                m.stats.version += 1;
+            });
+            return (old_count, 1);
+        }
+
+        // Step 2: Sort by size descending for better packing.
+        fv_sizes.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+
+        // Step 3: First-fit-decreasing bin packing.
+        let limit = self.config.bucket_overload_size;
+        // Each bin: (accumulated_size, field_values)
+        let mut bins: Vec<(usize, Vec<FV>)> = Vec::new();
+
+        for (fv, size) in fv_sizes {
+            if let Some(bin) = bins.iter_mut().find(|b| b.0 + size < limit) {
+                bin.0 += size;
+                bin.1.push(fv);
+            } else {
+                bins.push((size, vec![fv]));
+            }
+        }
+
+        // Step 4: Rebuild buckets.
+        self.buckets.clear();
+        let new_count = bins.len();
+        let max_id = new_count.saturating_sub(1) as u32;
+
+        for (i, (size, field_values)) in bins.into_iter().enumerate() {
+            let bucket_id = i as u32;
+
+            // Update posting references.
+            for fv in &field_values {
+                if let Some(mut posting) = self.postings.get_mut(fv) {
+                    posting.0 = bucket_id;
+                }
+            }
+
+            self.buckets
+                .insert(bucket_id, (size, true, field_values.into(), 1));
+        }
+
+        self.max_bucket_id.store(max_id, Ordering::Relaxed);
+        self.dirty_bucket_count
+            .store(new_count as u32, Ordering::Release);
+        self.update_metadata(|m| {
+            m.stats.version += 1;
+        });
+
+        (old_count, new_count)
     }
 
     /// Stores the index metadata to a writer
@@ -2575,8 +2654,6 @@ mod tests {
         let result = overflow_index.insert_array(1, large_values.clone(), now_ms());
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 20);
-        let stats = overflow_index.stats();
-        assert!(stats.max_bucket_id == 0);
 
         let result = overflow_index.insert_array(2, large_values.clone(), now_ms());
         assert!(result.is_ok());
@@ -3153,5 +3230,108 @@ mod tests {
         let results = index.range_query_with(query, |k, _| (true, vec![k.clone()]));
         // Should be deduplicated and sorted
         assert_eq!(results, vec!["apple", "banana", "cherry"]);
+    }
+
+    #[tokio::test]
+    async fn test_compact_buckets() {
+        // Create an index with a tiny bucket limit to force excessive splitting,
+        // simulating the fragmentation caused by the old bug.
+        let config = BTreeConfig {
+            bucket_overload_size: 50,
+            allow_duplicates: true,
+        };
+        let index: BTreeIndex<u64, String> =
+            BTreeIndex::new("compact_test".to_string(), Some(config));
+
+        let values: Vec<String> = (0..30).map(|i| format!("value_{i:03}")).collect();
+        for (i, v) in values.iter().enumerate() {
+            index.insert(i as u64, v.clone(), now_ms()).unwrap();
+        }
+
+        let before = index.stats();
+        let bucket_count_before = before.max_bucket_id + 1;
+        println!("Before compact: {} buckets", bucket_count_before);
+        assert!(bucket_count_before > 2, "should have multiple buckets");
+
+        // Serialize fragmented index
+        let mut metadata_buf = Vec::new();
+        let mut bucket_data: std::collections::HashMap<u32, Vec<u8>> =
+            std::collections::HashMap::new();
+        index
+            .flush(&mut metadata_buf, 1, async |id: u32, data: &[u8]| {
+                bucket_data.insert(id, data.to_vec());
+                Ok(true)
+            })
+            .await
+            .unwrap();
+
+        // Reload with a large bucket limit
+        let mut loaded: BTreeIndex<u64, String> =
+            BTreeIndex::load_metadata(&metadata_buf[..]).unwrap();
+        loaded.config.bucket_overload_size = 1024 * 512;
+        loaded.metadata.write().config.bucket_overload_size = 1024 * 512;
+        loaded
+            .load_buckets(async |id| Ok(bucket_data.get(&id).cloned()))
+            .await
+            .unwrap();
+
+        // Capture query results before compaction
+        let queries: Vec<&str> = vec!["value_000", "value_010", "value_020"];
+        let results_before: Vec<Option<Vec<u64>>> = queries
+            .iter()
+            .map(|q| loaded.query_with(&q.to_string(), |ids| Some(ids.to_vec())))
+            .collect();
+
+        // Compact
+        let (old, new) = loaded.compact_buckets();
+        println!("Compacted: {} -> {} buckets", old, new);
+        assert!(
+            new < old,
+            "compaction should reduce bucket count significantly"
+        );
+        assert!(
+            new <= 2,
+            "with 512K limit all postings should fit in 1-2 buckets, got {}",
+            new,
+        );
+
+        // Verify query results are unchanged
+        for (i, q) in queries.iter().enumerate() {
+            let result = loaded.query_with(&q.to_string(), |ids| Some(ids.to_vec()));
+            assert_eq!(
+                results_before[i], result,
+                "query '{}' result changed after compaction",
+                q
+            );
+        }
+
+        // Verify flush + reload works
+        let mut metadata_buf2 = Vec::new();
+        let mut bucket_data2: std::collections::HashMap<u32, Vec<u8>> =
+            std::collections::HashMap::new();
+        loaded
+            .flush(&mut metadata_buf2, 100, async |id: u32, data: &[u8]| {
+                bucket_data2.insert(id, data.to_vec());
+                Ok(true)
+            })
+            .await
+            .unwrap();
+
+        let final_loaded: BTreeIndex<u64, String> =
+            BTreeIndex::load_all(&metadata_buf2[..], async |id| {
+                Ok(bucket_data2.get(&id).cloned())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            final_loaded.stats().num_elements,
+            loaded.stats().num_elements
+        );
+        for q in &queries {
+            let orig = loaded.query_with(&q.to_string(), |ids| Some(ids.to_vec()));
+            let reloaded = final_loaded.query_with(&q.to_string(), |ids| Some(ids.to_vec()));
+            assert_eq!(orig, reloaded, "query '{}' mismatch after reload", q);
+        }
     }
 }
