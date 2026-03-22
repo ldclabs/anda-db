@@ -13,6 +13,7 @@ use crate::{
     error::DBError,
     schema::{DocumentId, Fe, Ft, Fv},
     storage::{ObjectVersion, PutMode, Storage},
+    unix_ms,
 };
 
 pub enum BTree {
@@ -642,6 +643,60 @@ impl BTree {
                     .collect(),
             },
         }
+    }
+
+    pub async fn compact_index(&self) -> Result<(), DBError> {
+        match self {
+            BTree::I64(btree) => {
+                let (old_bucket_count, new_bucket_count) = btree.index.compact_buckets();
+                if new_bucket_count < old_bucket_count {
+                    log::warn!(
+                        "Compacted BTree index '{}': {} -> {} buckets",
+                        btree.name,
+                        old_bucket_count,
+                        new_bucket_count
+                    );
+                    btree.flush(unix_ms()).await?;
+                }
+            }
+            BTree::U64(btree) => {
+                let (old_bucket_count, new_bucket_count) = btree.index.compact_buckets();
+                if new_bucket_count < old_bucket_count {
+                    log::warn!(
+                        "Compacted BTree index '{}': {} -> {} buckets",
+                        btree.name,
+                        old_bucket_count,
+                        new_bucket_count
+                    );
+                    btree.flush(unix_ms()).await?;
+                }
+            }
+            BTree::String(btree) => {
+                let (old_bucket_count, new_bucket_count) = btree.index.compact_buckets();
+                if new_bucket_count < old_bucket_count {
+                    log::warn!(
+                        "Compacted BTree index '{}': {} -> {} buckets",
+                        btree.name,
+                        old_bucket_count,
+                        new_bucket_count
+                    );
+                    btree.flush(unix_ms()).await?;
+                }
+            }
+            BTree::Bytes(btree) => {
+                let (old_bucket_count, new_bucket_count) = btree.index.compact_buckets();
+                if new_bucket_count < old_bucket_count {
+                    log::warn!(
+                        "Compacted BTree index '{}': {} -> {} buckets",
+                        btree.name,
+                        old_bucket_count,
+                        new_bucket_count
+                    );
+                    btree.flush(unix_ms()).await?;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub async fn flush(&self, now_ms: u64) -> Result<bool, DBError> {

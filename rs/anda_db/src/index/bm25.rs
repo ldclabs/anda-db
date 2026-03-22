@@ -13,6 +13,7 @@ use crate::{
     error::DBError,
     schema::DocumentId,
     storage::{ObjectVersion, PutMode, Storage},
+    unix_ms,
 };
 
 pub struct BM25 {
@@ -148,6 +149,20 @@ impl BM25 {
             .await?;
 
         Ok(meta_saved || had_dirty)
+    }
+
+    pub async fn compact_index(&self) -> Result<(), DBError> {
+        let (old_bucket_count, new_bucket_count) = self.index.compact_buckets();
+        if new_bucket_count < old_bucket_count {
+            log::warn!(
+                "Compacted BM25 index '{}': {} -> {} buckets",
+                self.name,
+                old_bucket_count,
+                new_bucket_count
+            );
+            self.flush(unix_ms()).await?;
+        }
+        Ok(())
     }
 
     pub fn has_pending_flush(&self) -> bool {

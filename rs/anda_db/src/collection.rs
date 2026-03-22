@@ -1250,6 +1250,18 @@ impl Collection {
         })
     }
 
+    /// Compacts the specified BM25 index to optimize storage and performance.
+    pub async fn compact_bm25_index(&self, fields: &[&str]) -> Result<(), DBError> {
+        let index = self.get_bm25_index(fields)?;
+        index.compact_index().await
+    }
+
+    /// Compacts the specified BTree index to optimize storage and performance.
+    pub async fn compact_btree_index(&self, fields: &[&str]) -> Result<(), DBError> {
+        let index = self.get_btree_index(fields)?;
+        index.compact_index().await
+    }
+
     /// Adds a new document to the collection.
     ///
     /// This method:
