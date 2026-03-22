@@ -40,6 +40,9 @@ pub enum DBError {
         _id: u64,
     },
 
+    #[error("Precondition failed at location {path}: {source:?}")]
+    Precondition { path: String, source: BoxError },
+
     #[error("Serialization error: {source:?}")]
     Serialization { name: String, source: BoxError },
 
@@ -66,6 +69,9 @@ impl From<object_store::Error> for DBError {
                 source,
                 _id: 0,
             },
+            object_store::Error::Precondition { path, source } => {
+                DBError::Precondition { path, source }
+            }
             err => DBError::Storage {
                 name: "unknown".to_string(),
                 source: err.into(),

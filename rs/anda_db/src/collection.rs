@@ -681,6 +681,10 @@ impl Collection {
                     Ordering::Relaxed,
                     Ordering::Relaxed,
                 );
+                if matches!(err, DBError::Precondition { .. }) {
+                    // If precondition failed, it means another concurrent writer has already saved a newer version.
+                    return Ok(None);
+                }
                 return Err(err);
             }
         };
@@ -690,6 +694,27 @@ impl Collection {
         });
 
         Ok(Some(meta.stats.max_document_id))
+    }
+
+    async fn flush_metadata(&self) -> Result<(), DBError> {
+        let meta = self.metadata();
+        let ver = { self.metadata_version.read().clone() };
+        let ver = match self
+            .storage
+            .put(Self::METADATA_PATH, &meta, Some(ver))
+            .await
+        {
+            Ok(ver) => ver,
+            Err(err) => {
+                if matches!(err, DBError::Precondition { .. }) {
+                    // If precondition failed, it means another concurrent writer has already saved a newer version.
+                    return Ok(());
+                }
+                return Err(err);
+            }
+        };
+        *self.metadata_version.write() = ver;
+        Ok(())
     }
 
     /// Stores document IDs bitmap to storage.
@@ -703,7 +728,17 @@ impl Collection {
             ids.serialize::<Portable>()
         };
         let ver = { self.ids_version.read().clone() };
-        let ver = self.storage.put(Self::IDS_PATH, &data, Some(ver)).await?;
+        let ver = match self.storage.put(Self::IDS_PATH, &data, Some(ver)).await {
+            Ok(ver) => ver,
+            Err(DBError::Precondition { .. }) => {
+                // If precondition failed, it means the document IDs have been updated by another concurrent writer.
+                return Ok(());
+            }
+            Err(err) => {
+                return Err(err);
+            }
+        };
+
         *self.ids_version.write() = ver;
         Ok(())
     }
@@ -846,7 +881,6 @@ impl Collection {
     pub fn set_extension(&self, key: String, value: FieldValue) {
         self.update_metadata(|meta| {
             meta.extensions.insert(key, value);
-            meta.stats.version += 1;
         });
     }
 
@@ -912,9 +946,8 @@ impl Collection {
     pub async fn save_extension(&self, key: String, value: FieldValue) -> Result<(), DBError> {
         self.update_metadata(|meta| {
             meta.extensions.insert(key, value);
-            meta.stats.version += 1;
         });
-        self.flush(unix_ms()).await.map(|_| ())
+        self.flush_metadata().await
     }
 
     /// Sets a user-defined extension key-value pair with a serializable value and immediately persists the change.
@@ -929,16 +962,9 @@ impl Collection {
     /// Removes a user-defined extension key and immediately persists the change.
     /// Returns the previous value if the key existed.
     pub async fn remove_extension(&self, key: &str) -> Result<Option<FieldValue>, DBError> {
-        let old = self.update_metadata(|meta| {
-            let old = meta.extensions.remove(key);
-            if old.is_some() {
-                meta.stats.version += 1;
-            }
-            old
-        });
-
+        let old = self.update_metadata(|meta| meta.extensions.remove(key));
         if old.is_some() {
-            let _ = self.flush(unix_ms()).await?;
+            self.flush_metadata().await?;
         }
         Ok(old)
     }
@@ -3189,13 +3215,11 @@ mod tests {
         assert!(collection.metadata().extensions.is_empty());
 
         // set_extension：设置后可以 get 到
-        let version_before = collection.stats().version;
         collection.set_extension("key1".into(), FieldValue::Text("hello".into()));
         assert_eq!(
             collection.get_extension("key1"),
             Some(FieldValue::Text("hello".into()))
         );
-        assert!(collection.stats().version > version_before);
 
         // 支持不同类型
         collection.set_extension("count".into(), FieldValue::U64(42));
@@ -3216,17 +3240,13 @@ mod tests {
         assert_eq!(meta.extensions.get("key1"), Some(&FieldValue::I64(-1)));
 
         // remove_extension：移除存在的 key
-        let version_before = collection.stats().version;
         let old = collection.remove_extension("count").await?;
         assert_eq!(old, Some(FieldValue::U64(42)));
         assert!(collection.get_extension("count").is_none());
-        assert!(collection.stats().version > version_before);
 
-        // remove_extension：移除不存在的 key 返回 None，version 不变
-        let version_before = collection.stats().version;
+        // remove_extension：移除不存在的 key 返回 None
         let old = collection.remove_extension("nonexistent").await?;
         assert!(old.is_none());
-        assert_eq!(collection.stats().version, version_before);
 
         db.close().await?;
         Ok(())
