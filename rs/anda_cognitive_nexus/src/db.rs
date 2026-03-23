@@ -965,7 +965,7 @@ impl CognitiveNexus {
 
         let mut domain_map: Vec<DomainInfo> = Vec::with_capacity(domain_ids.len());
         let total_domains = domain_ids.len();
-        for id in domain_ids.into_iter().take(100) {
+        for id in domain_ids.into_iter().take(1024) {
             let mut info = self
                 .try_get_concept_with(&cache, id, |concept| Ok(DomainInfo::from(concept)))
                 .await?;
