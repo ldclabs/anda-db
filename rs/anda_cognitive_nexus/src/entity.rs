@@ -268,6 +268,16 @@ impl Proposition {
             None => None,
         }
     }
+
+    pub fn to_info(&self, predicate: &str) -> Option<PropositionInfo> {
+        self.properties.get(predicate).map(|v| PropositionInfo {
+            id: self.entity_id(predicate.to_string()).to_string(),
+            subject: self.subject.to_string(),
+            object: self.object.to_string(),
+            predicate: predicate.to_string(),
+            attributes: v.attributes.clone(),
+        })
+    }
 }
 
 /// Properties container for storing attributes and metadata.
@@ -443,67 +453,61 @@ impl<'de> Deserialize<'de> for EntityID {
 /// domain-specific reasoning, query optimization, and knowledge organization.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct DomainInfo {
-    pub r#type: String,
-
     pub name: String,
-
-    /// Key-value attributes associated with the domain.
-    pub attributes: Map<String, Json>,
+    pub description: String,
 
     /// Key concept types in this domain.
-    ///
-    /// Lists the primary categories of concepts that are important in this
-    /// domain, along with their descriptions and example instances.
-    /// This helps with knowledge discovery and domain understanding.
-    pub key_concept_types: Vec<ConceptTypeInfo>,
+    pub key_concept_types: Vec<String>,
 
     /// Key proposition types in this domain.
-    ///
-    /// Lists the primary relationship types (predicates) that are commonly
-    /// used in this domain, along with their semantic descriptions.
-    /// This guides relationship modeling and query construction.
-    pub key_proposition_types: Vec<ConceptTypeInfo>,
+    pub key_proposition_types: Vec<String>,
 }
 
-impl DomainInfo {
-    /// Creates domain information from a domain concept.
-    ///
-    /// # Arguments
-    ///
-    /// * `domain` - The concept representing the domain
-    ///
-    /// # Returns
-    ///
-    /// A new `DomainInfo` instance with basic information extracted from the concept.
-    pub fn from(domain: &Concept) -> Self {
+impl From<&Concept> for DomainInfo {
+    fn from(concept: &Concept) -> Self {
         Self {
-            name: domain.name.clone(),
-            r#type: domain.r#type.clone(),
-            attributes: domain.attributes.clone(),
+            name: concept.name.clone(),
+            description: concept
+                .attributes
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
             key_concept_types: Vec::new(),
             key_proposition_types: Vec::new(),
         }
     }
 }
 
-/// Information about a concept type.
-///
-/// Describes a category or class of concepts within a knowledge domain,
-/// including its semantic meaning and representative instances. This metadata
-/// helps with concept classification, discovery, and domain understanding.
+impl From<Concept> for DomainInfo {
+    fn from(concept: Concept) -> Self {
+        Self {
+            name: concept.name,
+            description: concept
+                .attributes
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            key_concept_types: Vec::new(),
+            key_proposition_types: Vec::new(),
+        }
+    }
+}
+
+/// Simplified information about a concept.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ConceptTypeInfo {
+pub struct ConceptInfo {
+    pub id: String,
     pub r#type: String,
-
     pub name: String,
-
-    /// Key-value attributes associated with the concept type.
     pub attributes: Map<String, Json>,
 }
 
-impl From<&Concept> for ConceptTypeInfo {
+impl From<&Concept> for ConceptInfo {
     fn from(concept: &Concept) -> Self {
         Self {
+            id: concept.entity_id().to_string(),
             r#type: concept.r#type.clone(),
             name: concept.name.clone(),
             attributes: concept.attributes.clone(),
@@ -511,14 +515,24 @@ impl From<&Concept> for ConceptTypeInfo {
     }
 }
 
-impl From<Concept> for ConceptTypeInfo {
+impl From<Concept> for ConceptInfo {
     fn from(concept: Concept) -> Self {
         Self {
+            id: concept.entity_id().to_string(),
             r#type: concept.r#type,
             name: concept.name,
             attributes: concept.attributes,
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PropositionInfo {
+    pub id: String,
+    pub subject: String,
+    pub object: String,
+    pub predicate: String,
+    pub attributes: Map<String, Json>,
 }
 
 #[cfg(test)]

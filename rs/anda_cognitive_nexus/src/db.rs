@@ -960,7 +960,7 @@ impl CognitiveNexus {
             .first()
             .ok_or_else(|| KipError::not_found(format!("Concept {matcher} not found")))?;
         let me = self
-            .try_get_concept_with(&cache, *me_id, |concept| Ok(concept.to_concept_node()))
+            .try_get_concept_with(&cache, *me_id, |concept| Ok(ConceptInfo::from(concept)))
             .await?;
 
         let mut domain_map: Vec<DomainInfo> = Vec::with_capacity(domain_ids.len());
@@ -978,10 +978,9 @@ impl CognitiveNexus {
                     let _ = self
                         .try_get_concept_with(&cache, id, |concept| {
                             if concept.r#type == META_CONCEPT_TYPE {
-                                info.key_concept_types.push(ConceptTypeInfo::from(concept));
+                                info.key_concept_types.push(concept.name.clone());
                             } else if concept.r#type == META_PROPOSITION_TYPE {
-                                info.key_proposition_types
-                                    .push(ConceptTypeInfo::from(concept));
+                                info.key_proposition_types.push(concept.name.clone());
                             }
                             Ok(())
                         })
@@ -1004,10 +1003,10 @@ impl CognitiveNexus {
             .query_concept_ids(&ConceptMatcher::Type(DOMAIN_TYPE.to_string()))
             .await?;
         let cache = QueryCache::default();
-        let mut result: Vec<ConceptTypeInfo> = Vec::with_capacity(ids.len());
+        let mut result: Vec<ConceptInfo> = Vec::with_capacity(ids.len());
         for id in ids {
             let concept = self
-                .try_get_concept_with(&cache, id, |concept| Ok(ConceptTypeInfo::from(concept)))
+                .try_get_concept_with(&cache, id, |concept| Ok(ConceptInfo::from(concept)))
                 .await?;
             result.push(concept);
         }
@@ -1045,7 +1044,7 @@ impl CognitiveNexus {
             .ok_or_else(|| KipError::not_found(format!("Concept type {name:?} not found")))?;
         let result = self
             .try_get_concept_with(&QueryCache::default(), *id, |concept| {
-                Ok(ConceptTypeInfo::from(concept))
+                Ok(ConceptInfo::from(concept))
             })
             .await?;
         Ok(json!(result))
@@ -1082,7 +1081,7 @@ impl CognitiveNexus {
             .ok_or_else(|| KipError::not_found(format!("Proposition type {name:?} not found")))?;
         let result = self
             .try_get_concept_with(&QueryCache::default(), *id, |concept| {
-                Ok(ConceptTypeInfo::from(concept))
+                Ok(ConceptInfo::from(concept))
             })
             .await?;
         Ok(json!(result))
@@ -1111,7 +1110,7 @@ impl CognitiveNexus {
                 Ok(json!(
                     result
                         .into_iter()
-                        .map(ConceptTypeInfo::from)
+                        .map(ConceptInfo::from)
                         .collect::<Vec<_>>()
                 ))
             }
@@ -1149,10 +1148,9 @@ impl CognitiveNexus {
                                 }
                                 let texts = texts.join("\n");
                                 if tokens.iter().any(|t| texts.contains(t.as_str()))
-                                    && let Ok(val) =
-                                        extract_proposition_field_value(proposition, predicate, &[])
+                                    && let Some(val) = proposition.to_info(predicate)
                                 {
-                                    rt.push(val);
+                                    rt.push(json!(val));
                                 }
                             }
 
