@@ -511,18 +511,20 @@ impl CognitiveNexus {
         ctx: &mut QueryContext,
         clause: ConceptClause,
     ) -> Result<(), KipError> {
-        if ctx.entities.contains_key(&clause.variable) {
-            return Err(KipError::invalid_syntax(format!(
-                "Variable '{}' already exists in context",
-                clause.variable
-            )));
-        }
+        let concept_ids: FxHashSet<EntityID> = self
+            .query_concept_ids(&clause.matcher)
+            .await?
+            .into_iter()
+            .map(EntityID::Concept)
+            .collect();
 
-        let concept_ids = self.query_concept_ids(&clause.matcher).await?;
-        ctx.entities.insert(
-            clause.variable,
-            concept_ids.into_iter().map(EntityID::Concept).collect(),
-        );
+        if let Some(existing) = ctx.entities.get_mut(&clause.variable) {
+            // Variable already bound: filter (intersect) existing bindings
+            existing.retain(|id| concept_ids.contains(id));
+        } else {
+            ctx.entities
+                .insert(clause.variable, concept_ids.into_iter().collect());
+        }
 
         Ok(())
     }
@@ -532,14 +534,6 @@ impl CognitiveNexus {
         ctx: &mut QueryContext,
         clause: PropositionClause,
     ) -> Result<(), KipError> {
-        if let Some(var) = &clause.variable
-            && ctx.entities.contains_key(var)
-        {
-            return Err(KipError::invalid_syntax(format!(
-                "Variable '{var}' already exists in context",
-            )));
-        }
-
         let result = match clause.matcher {
             PropositionMatcher::ID(id) => {
                 let entity_id = EntityID::from_str(&id).map_err(KipError::invalid_syntax)?;
@@ -563,7 +557,13 @@ impl CognitiveNexus {
         if let TargetEntities::IDs(ids) = result
             && let Some(var) = clause.variable
         {
-            ctx.entities.insert(var, ids.into());
+            if let Some(existing) = ctx.entities.get_mut(&var) {
+                // Variable already bound: filter (intersect) existing bindings
+                let new_ids: FxHashSet<EntityID> = ids.into_iter().collect();
+                existing.retain(|id| new_ids.contains(id));
+            } else {
+                ctx.entities.insert(var, ids.into());
+            }
         }
 
         Ok(())
@@ -4624,5 +4624,113 @@ mod tests {
             assert!(matches!(err.code, KipErrorCode::ReferenceError));
             assert!(err.message.contains("Unbound variable"));
         }
+    }
+
+    #[tokio::test]
+    async fn test_kql_variable_rebind_as_filter() {
+        let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+        setup_test_data(&nexus).await.unwrap();
+
+        // Setup: create Person concepts and "working_on" propositions
+        let setup_kml = r#"
+        UPSERT {
+            CONCEPT ?alice {
+                {type: "Person", name: "Alice"}
+                SET ATTRIBUTES { "role": "researcher" }
+                SET PROPOSITIONS {
+                    ("working_on", {type: "Drug", name: "Aspirin"})
+                }
+            }
+            CONCEPT ?bob {
+                {type: "Person", name: "Bob"}
+                SET ATTRIBUTES { "role": "engineer" }
+            }
+        }
+        WITH METADATA {
+            "source": "test"
+        }
+        "#;
+        nexus
+            .execute_kml(parse_kml(setup_kml).unwrap(), false)
+            .await
+            .unwrap();
+
+        // Test 1: Concept clause rebind filters existing variable
+        // ?person is first bound by the proposition clause, then filtered by concept clause {type: "Person"}
+        let kql = r#"
+        FIND(?person.name, ?link)
+        WHERE {
+            ?drug {type: "Drug", name: "Aspirin"}
+            ?link (?person, "working_on", ?drug)
+            ?person {type: "Person"}
+        }
+        "#;
+        let query = parse_kql(kql).unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        let arr = result.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        // ?person should have Alice (the only Person working_on Aspirin)
+        let persons = arr[0].as_array().unwrap();
+        assert_eq!(persons.len(), 1);
+        assert_eq!(persons[0], "Alice");
+
+        // Test 2: Concept clause rebind with type filter that excludes all
+        // ?person bound by proposition, then filtered by {type: "Symptom"} — no match
+        let kql = r#"
+        FIND(?person.name)
+        WHERE {
+            ?drug {type: "Drug", name: "Aspirin"}
+            ?link (?person, "working_on", ?drug)
+            ?person {type: "Symptom"}
+        }
+        "#;
+        let query = parse_kql(kql).unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        let arr = result.as_array().unwrap();
+        assert!(arr.is_empty());
+
+        // Test 3: Concept clause used as initial bind (no prior variable) still works
+        let kql = r#"
+        FIND(?drug.name)
+        WHERE {
+            ?drug {type: "Drug"}
+        }
+        "#;
+        let query = parse_kql(kql).unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        let arr = result.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0], "Aspirin");
+
+        // Test 4: Proposition clause rebind filters existing variable
+        // ?symptom is first bound by concept clause, then filtered by proposition clause
+        let kql = r#"
+        FIND(?symptom.name)
+        WHERE {
+            ?symptom {type: "Symptom"}
+            ?drug {type: "Drug", name: "Aspirin"}
+            (?drug, "treats", ?symptom)
+        }
+        "#;
+        let query = parse_kql(kql).unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        let arr = result.as_array().unwrap();
+        // Both Headache and Fever are Symptom type and treated by Aspirin
+        assert_eq!(arr.len(), 2);
+
+        // Test 5: Multiple alternative predicates with variable rebind
+        let kql = r#"
+        FIND(?person.name)
+        WHERE {
+            ?drug {type: "Drug", name: "Aspirin"}
+            ?link (?person, "working_on" | "interested_in" | "expert_in", ?drug)
+            ?person {type: "Person"}
+        }
+        "#;
+        let query = parse_kql(kql).unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        let arr = result.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0], "Alice");
     }
 }
