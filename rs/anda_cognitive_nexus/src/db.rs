@@ -644,18 +644,18 @@ impl CognitiveNexus {
             }
         }
 
-        // 标准路径：对于复杂情况使用原有逻辑
+        // 标准路径
         let mut not_context = ctx.clone();
         for clause in clauses {
             Box::pin(self.execute_where_clause(&mut not_context, clause)).await?;
         }
 
-        for (var, ids) in not_context.entities {
+        for (var, ids) in &not_context.entities {
             if ids.is_empty() {
                 continue;
             }
             // 如果 NOT 子句中有变量绑定，则从当前上下文中移除这些绑定
-            if let Some(existing) = ctx.entities.get_mut(&var) {
+            if let Some(existing) = ctx.entities.get_mut(var) {
                 existing.retain(|id| !ids.contains(id));
             }
         }
@@ -670,6 +670,15 @@ impl CognitiveNexus {
             }
         }
 
+        // 清理 groups 中被排除的实体
+        for ((gvar, _), group_map) in ctx.groups.iter_mut() {
+            if let Some(excluded_ids) = not_context.entities.get(gvar)
+                && !excluded_ids.is_empty()
+            {
+                group_map.retain(|gid, _| !excluded_ids.contains(gid));
+            }
+        }
+
         Ok(())
     }
 
@@ -681,7 +690,6 @@ impl CognitiveNexus {
     /// 3. 从原始绑定中排除这些 subjects
     ///
     /// 复杂度：O(1) 数据库查询 + O(M) 内存操作
-    /// 相比原始实现的 O(N) 数据库查询有显著提升
     async fn execute_not_proposition_fast_path(
         &self,
         ctx: &mut QueryContext,
@@ -743,6 +751,14 @@ impl CognitiveNexus {
                 .extend(ids.into_vec());
         }
 
+        // 合并 OPTIONAL 子句的 groups
+        for (key, group_map) in optional_context.groups {
+            let entry = ctx.groups.entry(key).or_default();
+            for (gid, mids) in group_map {
+                entry.entry(gid).or_default().extend(mids.into_vec());
+            }
+        }
+
         Ok(())
     }
 
@@ -769,6 +785,13 @@ impl CognitiveNexus {
                 .entry(pred)
                 .or_default()
                 .extend(ids.into_vec());
+        }
+        // 合并 UNION 子句的 groups
+        for (key, group_map) in union_context.groups {
+            let entry = ctx.groups.entry(key).or_default();
+            for (gid, mids) in group_map {
+                entry.entry(gid).or_default().extend(mids.into_vec());
+            }
         }
 
         Ok(())
@@ -824,7 +847,6 @@ impl CognitiveNexus {
         cursor: Option<String>,
         limit: Option<usize>,
     ) -> Result<(Vec<Json>, Option<String>), KipError> {
-        let mut result: Vec<Json> = Vec::with_capacity(clause.expressions.len());
         let bindings: FxHashMap<String, Vec<EntityID>> = ctx
             .entities
             .iter()
@@ -833,7 +855,19 @@ impl CognitiveNexus {
 
         let order_by = order_by.unwrap_or_default();
         let limit = limit.unwrap_or(0);
+
+        // GROUP BY 检测：扫描 FIND 表达式，识别 Variable(X) + Aggregation(Y) 模式
+        // 其中 X ≠ Y 且 ctx.groups 存在 (X, Y) 映射
+        if let Some(grouped) = self
+            .detect_and_execute_grouped_find(ctx, &clause, &bindings, &order_by, &cursor, limit)
+            .await?
+        {
+            return Ok(grouped);
+        }
+
+        // 非分组模式
         let cursor: Option<EntityID> = BTree::from_cursor(&cursor).ok().flatten();
+        let mut result: Vec<Json> = Vec::with_capacity(clause.expressions.len());
         let mut next_cursor: Option<String> = None;
         let mut group_var: Option<(String, Vec<String>)> = None;
 
@@ -901,19 +935,36 @@ impl CognitiveNexus {
                         group_var = None;
                     }
 
-                    let (col, _) = self
-                        .resolve_find_var(
-                            ctx,
-                            &bindings,
-                            &var.var,
-                            &[var.to_pointer_or("id")],
-                            &[],
-                            None,
-                            0,
-                        )
-                        .await?;
+                    // COUNT 优化：直接从绑定 ID 计数，跳过完整实体 IO
+                    if matches!(func, AggregationFunction::Count) {
+                        let count = if let Some(ids) = bindings.get(&var.var) {
+                            // entity bindings: UniqueVec 已去重，distinct 无影响
+                            ids.len()
+                        } else if let Some(preds) = ctx.predicates.get(&var.var) {
+                            if distinct {
+                                preds.iter().collect::<FxHashSet<_>>().len()
+                            } else {
+                                preds.len()
+                            }
+                        } else {
+                            0
+                        };
+                        result.push(Json::from(count));
+                    } else {
+                        let (col, _) = self
+                            .resolve_find_var(
+                                ctx,
+                                &bindings,
+                                &var.var,
+                                &[var.to_pointer_or("id")],
+                                &[],
+                                None,
+                                0,
+                            )
+                            .await?;
 
-                    result.push(func.calculate(&col, distinct));
+                        result.push(func.calculate(&col, distinct));
+                    }
                 }
             }
         }
@@ -940,6 +991,280 @@ impl CognitiveNexus {
         }
 
         Ok((result, next_cursor))
+    }
+
+    /// GROUP BY 检测与执行：当 FIND 混合 Variable(X) + Aggregation(Y) 且存在分组关系时，
+    /// 按 X 分组计算每组的聚合值，返回索引对齐的列数组。
+    ///
+    /// 例如 `FIND(?d.name, COUNT(?n))` 其中 ctx.groups 有 ("d", "n") 映射，
+    /// 则对每个 ?d 实体查找其对应的 ?n 成员集合，计算 COUNT。
+    /// 返回 `[["Domain1", "Domain2", ...], [15, 3, ...]]`
+    #[allow(clippy::too_many_arguments)]
+    async fn detect_and_execute_grouped_find(
+        &self,
+        ctx: &mut QueryContext,
+        clause: &FindClause,
+        bindings: &FxHashMap<String, Vec<EntityID>>,
+        order_by: &[OrderByCondition],
+        cursor: &Option<String>,
+        limit: usize,
+    ) -> Result<Option<(Vec<Json>, Option<String>)>, KipError> {
+        // 收集所有 Variable 的基变量名和所有 Aggregation 的基变量名
+        let mut var_names: Vec<&str> = Vec::new();
+        let mut agg_vars: Vec<&str> = Vec::new();
+        let mut has_agg = false;
+
+        for expr in &clause.expressions {
+            match expr {
+                FindExpression::Variable(dot_path) => {
+                    if !var_names.contains(&&*dot_path.var) {
+                        var_names.push(&dot_path.var);
+                    }
+                }
+                FindExpression::Aggregation { var, .. } => {
+                    has_agg = true;
+                    if !agg_vars.contains(&&*var.var) {
+                        agg_vars.push(&var.var);
+                    }
+                }
+            }
+        }
+
+        // 需要同时存在 Variable 和 Aggregation，且它们引用不同变量
+        if !has_agg || var_names.is_empty() {
+            return Ok(None);
+        }
+
+        // 查找分组关系：Variable(X) → Aggregation(Y) 的 (X, Y) 映射
+        let mut group_key: Option<(&str, &str)> = None;
+        for &gvar in &var_names {
+            for &mvar in &agg_vars {
+                if gvar != mvar
+                    && ctx
+                        .groups
+                        .contains_key(&(gvar.to_string(), mvar.to_string()))
+                {
+                    group_key = Some((gvar, mvar));
+                    break;
+                }
+            }
+            if group_key.is_some() {
+                break;
+            }
+        }
+
+        let (gvar, mvar) = match group_key {
+            Some(k) => k,
+            None => return Ok(None),
+        };
+
+        // 获取 group variable 的实体 ID 列表
+        let group_ids = match bindings.get(gvar) {
+            Some(ids) => ids.clone(),
+            None => return Ok(None),
+        };
+
+        let groups_map = ctx
+            .groups
+            .get(&(gvar.to_string(), mvar.to_string()))
+            .cloned()
+            .unwrap_or_default();
+
+        // 构造每行数据：(group_entity_id, member_count, member_ids)
+        struct GroupRow {
+            gid: EntityID,
+            member_ids: Vec<EntityID>,
+        }
+        let mut rows: Vec<GroupRow> = Vec::with_capacity(group_ids.len());
+        for gid in &group_ids {
+            let member_ids = groups_map.get(gid).map(|v| v.to_vec()).unwrap_or_default();
+            rows.push(GroupRow {
+                gid: gid.clone(),
+                member_ids,
+            });
+        }
+
+        // 检查是否有聚合排序（ORDER BY 中引用了聚合变量的路径）
+        // 对于 ORDER BY COUNT(?n) ASC，解析器会生成对聚合结果的排序
+        let has_agg_order = order_by.iter().any(|o| o.is_aggregation());
+        let has_var_order = order_by
+            .iter()
+            .any(|o| !o.is_aggregation() && o.variable.var == gvar);
+
+        if has_agg_order {
+            // 按聚合值排序
+            let agg_direction = order_by
+                .iter()
+                .find(|o| o.is_aggregation())
+                .map(|o| &o.direction)
+                .unwrap_or(&OrderDirection::Asc);
+
+            rows.sort_by(|a, b| {
+                let ord = a.member_ids.len().cmp(&b.member_ids.len());
+                match agg_direction {
+                    OrderDirection::Asc => ord,
+                    OrderDirection::Desc => ord.reverse(),
+                }
+            });
+        } else if has_var_order {
+            // 按 group variable 字段排序 — 需要加载实体数据才能排序
+            // 这里延迟到 resolve 阶段处理
+        }
+
+        // 应用 cursor (基于 group entity ID)
+        let cursor_id: Option<EntityID> = BTree::from_cursor(cursor).ok().flatten();
+        if let Some(ref cid) = cursor_id
+            && let Some(pos) = rows.iter().position(|r| &r.gid == cid)
+        {
+            rows = rows.split_off(pos + 1);
+        }
+
+        // 应用 limit
+        let mut next_cursor: Option<String> = None;
+        if limit > 0 && rows.len() > limit {
+            rows.truncate(limit);
+            next_cursor = rows.last().and_then(|r| BTree::to_cursor(&r.gid));
+        }
+
+        // 生成结果列
+        let mut result: Vec<Json> = Vec::with_capacity(clause.expressions.len());
+
+        for expr in &clause.expressions {
+            match expr {
+                FindExpression::Variable(dot_path) => {
+                    if dot_path.var == gvar {
+                        // 按行顺序加载 group variable 的字段
+                        let field = dot_path.to_pointer();
+                        let mut col: Vec<Json> = Vec::with_capacity(rows.len());
+                        for row in &rows {
+                            let val = self.load_entity_field(&ctx.cache, &row.gid, &field).await?;
+                            col.push(val);
+                        }
+                        result.push(Json::Array(col));
+                    } else {
+                        // 非 group variable — 按全局绑定解析
+                        let eid_cursor: Option<EntityID> =
+                            BTree::from_cursor(cursor).ok().flatten();
+                        let (col, _) = self
+                            .resolve_find_var(
+                                ctx,
+                                bindings,
+                                &dot_path.var,
+                                &[dot_path.to_pointer()],
+                                order_by,
+                                eid_cursor.as_ref(),
+                                limit,
+                            )
+                            .await?;
+                        result.push(Json::Array(col));
+                    }
+                }
+                FindExpression::Aggregation {
+                    func,
+                    var: agg_dot_path,
+                    distinct,
+                } => {
+                    if agg_dot_path.var == mvar {
+                        // 分组聚合：对每个 group 的 member 集合计算聚合
+                        let mut col: Vec<Json> = Vec::with_capacity(rows.len());
+                        for row in &rows {
+                            let agg_val = self
+                                .compute_group_aggregation(
+                                    ctx,
+                                    func,
+                                    agg_dot_path,
+                                    &row.member_ids,
+                                    *distinct,
+                                )
+                                .await?;
+                            col.push(agg_val);
+                        }
+                        result.push(Json::Array(col));
+                    } else {
+                        // 非分组聚合变量 — 全局聚合
+                        if matches!(func, AggregationFunction::Count) {
+                            let count = bindings
+                                .get(&agg_dot_path.var)
+                                .map(|ids| ids.len())
+                                .unwrap_or(0);
+                            result.push(Json::from(count));
+                        } else {
+                            let (vals, _) = self
+                                .resolve_find_var(
+                                    ctx,
+                                    bindings,
+                                    &agg_dot_path.var,
+                                    &[agg_dot_path.to_pointer_or("id")],
+                                    &[],
+                                    None,
+                                    0,
+                                )
+                                .await?;
+                            result.push(func.calculate(&vals, *distinct));
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(Some((result, next_cursor)))
+    }
+
+    /// 为分组模式加载单个实体的指定字段值
+    async fn load_entity_field(
+        &self,
+        cache: &QueryCache,
+        eid: &EntityID,
+        field: &str,
+    ) -> Result<Json, KipError> {
+        match eid {
+            EntityID::Concept(id) => {
+                self.try_get_concept_with(cache, *id, |concept| {
+                    let val = extract_concept_field_value(concept, &[])?;
+                    if field.is_empty() {
+                        Ok(val)
+                    } else {
+                        Ok(val.pointer(field).cloned().unwrap_or(Json::Null))
+                    }
+                })
+                .await
+            }
+            EntityID::Proposition(id, predicate) => {
+                self.try_get_proposition_with(cache, *id, |prop| {
+                    let val = extract_proposition_field_value(prop, predicate, &[])?;
+                    if field.is_empty() {
+                        Ok(val)
+                    } else {
+                        Ok(val.pointer(field).cloned().unwrap_or(Json::Null))
+                    }
+                })
+                .await
+            }
+        }
+    }
+
+    /// 计算分组聚合值
+    async fn compute_group_aggregation(
+        &self,
+        ctx: &QueryContext,
+        func: &AggregationFunction,
+        agg_dot_path: &DotPathVar,
+        member_ids: &[EntityID],
+        distinct: bool,
+    ) -> Result<Json, KipError> {
+        // COUNT 优化：直接计数，无需加载实体数据
+        if matches!(func, AggregationFunction::Count) {
+            return Ok(Json::from(member_ids.len()));
+        }
+
+        // 其他聚合函数需要加载实体字段值
+        let field = agg_dot_path.to_pointer_or("id");
+        let mut values: Vec<Json> = Vec::with_capacity(member_ids.len());
+        for eid in member_ids {
+            let val = self.load_entity_field(&ctx.cache, eid, &field).await?;
+            values.push(val);
+        }
+        Ok(func.calculate(&values, distinct))
     }
 
     async fn execute_describe_primer(&self) -> Result<Json, KipError> {
@@ -2445,6 +2770,7 @@ impl CognitiveNexus {
             TargetTerm::Variable(var) => Some(var.clone()),
             _ => None,
         };
+        let subject_var_clone = subject_var.clone();
 
         let subjects = self.resolve_target_term_ids(ctx, subject).await?;
         let objects = self.resolve_target_term_ids(ctx, object).await?;
@@ -2492,13 +2818,33 @@ impl CognitiveNexus {
         };
 
         if let Some(var) = subject_var {
-            ctx.entities.insert(var, result.matched_subjects);
+            ctx.entities.insert(var.clone(), result.matched_subjects);
+
+            // Store group relationships: subject_var → object_var
+            if let Some(obj_var) = &object_var
+                && !result.subject_to_objects.is_empty()
+            {
+                let group_map = ctx.groups.entry((var, obj_var.clone())).or_default();
+                for (subj, objs) in result.subject_to_objects {
+                    group_map.entry(subj).or_default().extend(objs.into_vec());
+                }
+            }
         }
         if let Some(var) = predicate_var {
             ctx.predicates.insert(var, result.matched_predicates);
         }
         if let Some(var) = object_var {
-            ctx.entities.insert(var, result.matched_objects);
+            ctx.entities.insert(var.clone(), result.matched_objects);
+
+            // Store group relationships: object_var → subject_var
+            if let Some(subj_var) = &subject_var_clone
+                && !result.object_to_subjects.is_empty()
+            {
+                let group_map = ctx.groups.entry((var, subj_var.clone())).or_default();
+                for (obj, subjs) in result.object_to_subjects {
+                    group_map.entry(obj).or_default().extend(subjs.into_vec());
+                }
+            }
         }
 
         Ok(TargetEntities::IDs(result.matched_propositions.into()))
@@ -2520,7 +2866,9 @@ impl CognitiveNexus {
             .ok_or_else(|| KipError::reference_error(format!("Unbound variable: {var:?}")))?;
 
         let mut result = Vec::with_capacity(ids.len());
-        let has_order_by = order_by.iter().any(|v| v.variable.var == var);
+        let has_order_by = order_by
+            .iter()
+            .any(|v| !v.is_aggregation() && v.variable.var == var);
         for eid in ids {
             if !has_order_by && cursor.map(|v| eid <= v).unwrap_or(false) {
                 continue;
@@ -3857,14 +4205,13 @@ mod tests {
         FIND(?concept.name)
         WHERE {
             ?concept {type: "Drug"}
-            ?concept {type: "Symptom"}
+            ?concept {type: "Symptom"} // filter by multiple types, should return empty
         }
         "#;
 
         let query = parse_kql(kql).unwrap();
-        let res = nexus.execute_kql(query).await;
-        assert!(res.is_err());
-        assert!(matches!(res.unwrap_err().code, KipErrorCode::InvalidSyntax));
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        assert!(result.as_array().unwrap().is_empty());
 
         // 测试UNION子句
         let kql = r#"
@@ -4732,5 +5079,319 @@ mod tests {
         let arr = result.as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0], "Alice");
+    }
+
+    #[tokio::test]
+    async fn test_kql_grouped_find_count() {
+        let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+        setup_test_data(&nexus).await.unwrap();
+
+        // Add more drugs with varying symptom relationships
+        let more_drugs_kml = r#"
+        UPSERT {
+            CONCEPT ?ibuprofen {
+                {type: "Drug", name: "Ibuprofen"}
+                SET ATTRIBUTES {
+                    "risk_level": 3
+                }
+                SET PROPOSITIONS {
+                    ("treats", {type: "Symptom", name: "Headache"})
+                }
+            }
+            CONCEPT ?paracetamol {
+                {type: "Drug", name: "Paracetamol"}
+                SET ATTRIBUTES {
+                    "risk_level": 1
+                }
+                SET PROPOSITIONS {
+                    ("treats", {type: "Symptom", name: "Headache"})
+                    ("treats", {type: "Symptom", name: "Fever"})
+                }
+            }
+        }
+        "#;
+        nexus
+            .execute_kml(parse_kml(more_drugs_kml).unwrap(), false)
+            .await
+            .unwrap();
+
+        // Test: FIND(?symptom.name, COUNT(?drug)) — group by symptom, count drugs
+        // Headache is treated by Aspirin, Ibuprofen, Paracetamol (3)
+        // Fever is treated by Aspirin, Paracetamol (2)
+        let kql = r#"
+        FIND(?symptom.name, COUNT(?drug))
+        WHERE {
+            ?symptom {type: "Symptom"}
+            (?drug, "treats", ?symptom)
+        }
+        "#;
+
+        let query = parse_kql(kql).unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        // Should return row-mode: [["Headache", "Fever"], [3, 2]]
+        let arr = result.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        let names = arr[0].as_array().unwrap();
+        let counts = arr[1].as_array().unwrap();
+        assert_eq!(names.len(), counts.len());
+        // Verify each symptom has the correct count
+        for (i, name) in names.iter().enumerate() {
+            match name.as_str().unwrap() {
+                "Headache" => assert_eq!(counts[i], json!(3)),
+                "Fever" => assert_eq!(counts[i], json!(2)),
+                other => panic!("Unexpected symptom: {other}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_kql_grouped_find_order_by_count_asc() {
+        let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+        setup_test_data(&nexus).await.unwrap();
+
+        let more_drugs_kml = r#"
+        UPSERT {
+            CONCEPT ?ibuprofen {
+                {type: "Drug", name: "Ibuprofen"}
+                SET ATTRIBUTES {
+                    "risk_level": 3
+                }
+                SET PROPOSITIONS {
+                    ("treats", {type: "Symptom", name: "Headache"})
+                }
+            }
+        }
+        "#;
+        nexus
+            .execute_kml(parse_kml(more_drugs_kml).unwrap(), false)
+            .await
+            .unwrap();
+
+        // Headache: treated by Aspirin + Ibuprofen = 2
+        // Fever: treated by Aspirin = 1
+        // ORDER BY COUNT(?drug) ASC → Fever first, then Headache
+        let kql = r#"
+        FIND(?symptom.name, COUNT(?drug))
+        WHERE {
+            ?symptom {type: "Symptom"}
+            (?drug, "treats", ?symptom)
+        }
+        ORDER BY COUNT(?drug) ASC
+        "#;
+
+        let query = parse_kql(kql).unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        assert_eq!(result, json!([["Fever", "Headache"], [1, 2]]));
+    }
+
+    #[tokio::test]
+    async fn test_kql_grouped_find_order_by_count_desc() {
+        let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+        setup_test_data(&nexus).await.unwrap();
+
+        let more_drugs_kml = r#"
+        UPSERT {
+            CONCEPT ?ibuprofen {
+                {type: "Drug", name: "Ibuprofen"}
+                SET ATTRIBUTES {
+                    "risk_level": 3
+                }
+                SET PROPOSITIONS {
+                    ("treats", {type: "Symptom", name: "Headache"})
+                }
+            }
+        }
+        "#;
+        nexus
+            .execute_kml(parse_kml(more_drugs_kml).unwrap(), false)
+            .await
+            .unwrap();
+
+        // ORDER BY COUNT(?drug) DESC → Headache first (2), then Fever (1)
+        let kql = r#"
+        FIND(?symptom.name, COUNT(?drug))
+        WHERE {
+            ?symptom {type: "Symptom"}
+            (?drug, "treats", ?symptom)
+        }
+        ORDER BY COUNT(?drug) DESC
+        "#;
+
+        let query = parse_kql(kql).unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        assert_eq!(result, json!([["Headache", "Fever"], [2, 1]]));
+    }
+
+    #[tokio::test]
+    async fn test_kql_grouped_find_with_limit() {
+        let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+        setup_test_data(&nexus).await.unwrap();
+
+        let more_drugs_kml = r#"
+        UPSERT {
+            CONCEPT ?ibuprofen {
+                {type: "Drug", name: "Ibuprofen"}
+                SET ATTRIBUTES {
+                    "risk_level": 3
+                }
+                SET PROPOSITIONS {
+                    ("treats", {type: "Symptom", name: "Headache"})
+                }
+            }
+        }
+        "#;
+        nexus
+            .execute_kml(parse_kml(more_drugs_kml).unwrap(), false)
+            .await
+            .unwrap();
+
+        // ORDER BY COUNT(?drug) DESC LIMIT 1 → only Headache (has 2 drugs)
+        let kql = r#"
+        FIND(?symptom.name, COUNT(?drug))
+        WHERE {
+            ?symptom {type: "Symptom"}
+            (?drug, "treats", ?symptom)
+        }
+        ORDER BY COUNT(?drug) DESC
+        LIMIT 1
+        "#;
+
+        let query = parse_kql(kql).unwrap();
+        let (result, cursor) = nexus.execute_kql(query).await.unwrap();
+        assert_eq!(result, json!([["Headache"], [2]]));
+        assert!(cursor.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_kql_grouped_find_with_optional() {
+        let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+        setup_test_data(&nexus).await.unwrap();
+
+        // Add a drug without any "treats" propositions
+        let lone_drug_kml = r#"
+        UPSERT {
+            CONCEPT ?vitamin {
+                {type: "Drug", name: "VitaminC"}
+                SET ATTRIBUTES {
+                    "risk_level": 0
+                }
+            }
+        }
+        "#;
+        nexus
+            .execute_kml(parse_kml(lone_drug_kml).unwrap(), false)
+            .await
+            .unwrap();
+
+        // With OPTIONAL, VitaminC should appear with count 0
+        // Aspirin → treats [Headache, Fever] = 2
+        // VitaminC → treats [] = 0
+        let kql = r#"
+        FIND(?drug.name, COUNT(?symptom))
+        WHERE {
+            ?drug {type: "Drug"}
+            OPTIONAL {
+                (?drug, "treats", ?symptom)
+            }
+        }
+        ORDER BY COUNT(?symptom) ASC
+        "#;
+
+        let query = parse_kql(kql).unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        let arr = result.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        let names = arr[0].as_array().unwrap();
+        let counts = arr[1].as_array().unwrap();
+        // VitaminC should come first (0 symptoms), then Aspirin (2 symptoms)
+        assert_eq!(names[0], json!("VitaminC"));
+        assert_eq!(counts[0], json!(0));
+        assert_eq!(names[1], json!("Aspirin"));
+        assert_eq!(counts[1], json!(2));
+    }
+
+    #[tokio::test]
+    async fn test_kql_count_skip_io_optimization() {
+        let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+        setup_test_data(&nexus).await.unwrap();
+
+        // Plain COUNT without GROUP BY should also work correctly
+        // and should use skip-IO optimization (count from bindings directly)
+        let kql = r#"
+        FIND(COUNT(?drug))
+        WHERE {
+            ?drug {type: "Drug"}
+        }
+        "#;
+
+        let query = parse_kql(kql).unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        assert_eq!(result, json!(1));
+
+        // Add more drugs
+        let drugs_kml = r#"
+        UPSERT {
+            CONCEPT ?ibuprofen {
+                {type: "Drug", name: "Ibuprofen"}
+                SET ATTRIBUTES {
+                    "risk_level": 3
+                }
+            }
+            CONCEPT ?paracetamol {
+                {type: "Drug", name: "Paracetamol"}
+                SET ATTRIBUTES {
+                    "risk_level": 1
+                }
+            }
+        }
+        "#;
+        nexus
+            .execute_kml(parse_kml(drugs_kml).unwrap(), false)
+            .await
+            .unwrap();
+
+        let kql = r#"
+        FIND(COUNT(?drug))
+        WHERE {
+            ?drug {type: "Drug"}
+        }
+        "#;
+
+        let query = parse_kql(kql).unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        assert_eq!(result, json!(3));
+
+        // FIND with COUNT and another variable but same var (non-grouped)
+        let kql = r#"
+        FIND(COUNT(?drug), COUNT(DISTINCT ?drug))
+        WHERE {
+            ?drug {type: "Drug"}
+        }
+        "#;
+
+        let query = parse_kql(kql).unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        assert_eq!(result, json!([3, 3]));
+    }
+
+    #[tokio::test]
+    async fn test_kql_grouped_find_reverse_direction() {
+        let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+        setup_test_data(&nexus).await.unwrap();
+
+        // Test grouping in the other direction:
+        // FIND(?drug.name, COUNT(?symptom)) where drug is subject
+        // Aspirin → treats → [Headache, Fever] (count 2)
+        let kql = r#"
+        FIND(?drug.name, COUNT(?symptom))
+        WHERE {
+            ?drug {type: "Drug"}
+            (?drug, "treats", ?symptom)
+        }
+        "#;
+
+        let query = parse_kql(kql).unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        assert_eq!(result, json!([["Aspirin"], [2]]));
     }
 }

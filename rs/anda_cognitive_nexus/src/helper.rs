@@ -192,6 +192,10 @@ pub fn apply_order_by<'a>(
 ) -> Vec<(&'a EntityID, Json)> {
     values.sort_by(|(_, a), (_, b)| {
         for cond in order_by {
+            // Skip aggregation ORDER BY — handled in grouped execution path
+            if cond.is_aggregation() {
+                continue;
+            }
             if cond.variable.var != var {
                 continue; // Only process conditions for the current variable
             }

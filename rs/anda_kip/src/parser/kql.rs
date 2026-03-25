@@ -475,6 +475,10 @@ fn parse_order_by_clause(input: &str) -> VResult<'_, Vec<OrderByCondition>> {
 }
 
 fn parse_order_by_condition(input: &str) -> VResult<'_, OrderByCondition> {
+    alt((parse_order_by_aggregation, parse_order_by_variable)).parse(input)
+}
+
+fn parse_order_by_variable(input: &str) -> VResult<'_, OrderByCondition> {
     map(
         pair(
             dot_path_var,
@@ -486,6 +490,26 @@ fn parse_order_by_condition(input: &str) -> VResult<'_, OrderByCondition> {
         |(variable, direction)| OrderByCondition {
             variable,
             direction: direction.unwrap_or(OrderDirection::Asc),
+            aggregation: None,
+        },
+    )
+    .parse(input)
+}
+
+fn parse_order_by_aggregation(input: &str) -> VResult<'_, OrderByCondition> {
+    map(
+        (
+            parse_aggregation_function,
+            parenthesized_block(dot_path_var),
+            opt(alt((
+                map(ws(tag("ASC")), |_| OrderDirection::Asc),
+                map(ws(tag("DESC")), |_| OrderDirection::Desc),
+            ))),
+        ),
+        |(func, variable, direction)| OrderByCondition {
+            variable,
+            direction: direction.unwrap_or(OrderDirection::Asc),
+            aggregation: Some(func),
         },
     )
     .parse(input)
@@ -1699,5 +1723,116 @@ mod tests {
         assert_eq!(query.find_clause.expressions.len(), 2);
         assert_eq!(query.where_clauses.len(), 2);
         assert_eq!(query.limit, Some(10));
+    }
+
+    #[test]
+    fn test_parse_order_by_aggregation() {
+        // ORDER BY COUNT(?n) ASC
+        let input = r#"
+            FIND(?d.name, COUNT(?n))
+            WHERE {
+                ?d {type: "Domain"}
+                OPTIONAL {
+                    (?n, "belongs_to_domain", ?d)
+                }
+            }
+            ORDER BY COUNT(?n) ASC
+            LIMIT 20
+        "#;
+
+        let result = parse_kql_query(input);
+        assert!(result.is_ok());
+
+        let (_, query) = result.unwrap();
+        assert_eq!(query.find_clause.expressions.len(), 2);
+        assert!(query.order_by.is_some());
+        let order_by = query.order_by.unwrap();
+        assert_eq!(order_by.len(), 1);
+        assert!(order_by[0].is_aggregation());
+        assert_eq!(order_by[0].aggregation, Some(AggregationFunction::Count));
+        assert_eq!(order_by[0].variable.var, "n");
+        assert!(order_by[0].variable.path.is_empty());
+        assert_eq!(order_by[0].direction, OrderDirection::Asc);
+        assert_eq!(query.limit, Some(20));
+    }
+
+    #[test]
+    fn test_parse_order_by_aggregation_desc() {
+        // ORDER BY SUM(?item.price) DESC
+        let input = r#"
+            FIND(?category.name, SUM(?item.price))
+            WHERE {
+                ?category {type: "Category"}
+                (?item, "in_category", ?category)
+            }
+            ORDER BY SUM(?item.price) DESC
+        "#;
+
+        let result = parse_kql_query(input);
+        assert!(result.is_ok());
+
+        let (_, query) = result.unwrap();
+        let order_by = query.order_by.unwrap();
+        assert_eq!(order_by.len(), 1);
+        assert!(order_by[0].is_aggregation());
+        assert_eq!(order_by[0].aggregation, Some(AggregationFunction::Sum));
+        assert_eq!(order_by[0].variable.var, "item");
+        assert_eq!(order_by[0].variable.path, vec!["price".to_string()]);
+        assert_eq!(order_by[0].direction, OrderDirection::Desc);
+    }
+
+    #[test]
+    fn test_parse_order_by_mixed_aggregation_and_variable() {
+        // ORDER BY COUNT(?n) ASC, ?d.name DESC
+        let input = r#"
+            FIND(?d.name, COUNT(?n))
+            WHERE {
+                ?d {type: "Domain"}
+                (?n, "belongs_to_domain", ?d)
+            }
+            ORDER BY COUNT(?n) ASC, ?d.name DESC
+        "#;
+
+        let result = parse_kql_query(input);
+        assert!(result.is_ok());
+
+        let (_, query) = result.unwrap();
+        let order_by = query.order_by.unwrap();
+        assert_eq!(order_by.len(), 2);
+
+        // First: COUNT(?n) ASC
+        assert!(order_by[0].is_aggregation());
+        assert_eq!(order_by[0].aggregation, Some(AggregationFunction::Count));
+        assert_eq!(order_by[0].variable.var, "n");
+        assert_eq!(order_by[0].direction, OrderDirection::Asc);
+
+        // Second: ?d.name DESC
+        assert!(!order_by[1].is_aggregation());
+        assert_eq!(order_by[1].aggregation, None);
+        assert_eq!(order_by[1].variable.var, "d");
+        assert_eq!(order_by[1].variable.path, vec!["name".to_string()]);
+        assert_eq!(order_by[1].direction, OrderDirection::Desc);
+    }
+
+    #[test]
+    fn test_parse_order_by_aggregation_default_asc() {
+        // ORDER BY COUNT(?n) — should default to ASC
+        let input = r#"
+            FIND(?d.name, COUNT(?n))
+            WHERE {
+                ?d {type: "Domain"}
+                (?n, "belongs_to_domain", ?d)
+            }
+            ORDER BY COUNT(?n)
+        "#;
+
+        let result = parse_kql_query(input);
+        assert!(result.is_ok());
+
+        let (_, query) = result.unwrap();
+        let order_by = query.order_by.unwrap();
+        assert_eq!(order_by.len(), 1);
+        assert!(order_by[0].is_aggregation());
+        assert_eq!(order_by[0].direction, OrderDirection::Asc);
     }
 }

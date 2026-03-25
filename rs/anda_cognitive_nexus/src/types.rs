@@ -258,6 +258,15 @@ pub struct QueryContext {
     /// the variable's constraints in the current query context.
     pub predicates: FxHashMap<String, UniqueVec<String>>,
 
+    /// Group relationships between variables.
+    ///
+    /// Key: `(group_var, member_var)` — e.g., `("d", "n")` for the pattern
+    /// `(?n, "belongs_to_domain", ?d)` where each domain ?d groups its members ?n.
+    /// Value: maps each group entity ID to its related member entity IDs.
+    ///
+    /// This enables per-group aggregation in FIND clauses like `FIND(?d.name, COUNT(?n))`.
+    pub groups: FxHashMap<(String, String), FxHashMap<EntityID, UniqueVec<EntityID>>>,
+
     /// Shared cache for loaded entities
     ///
     /// Provides thread-safe caching of concepts and propositions to avoid
@@ -332,6 +341,10 @@ pub struct PropositionsMatchResult {
     pub matched_objects: UniqueVec<EntityID>,
     /// List of matched predicate strings
     pub matched_predicates: UniqueVec<String>,
+    /// Per-subject grouping: maps each subject to its matched objects
+    pub subject_to_objects: FxHashMap<EntityID, UniqueVec<EntityID>>,
+    /// Per-object grouping: maps each object to its matched subjects
+    pub object_to_subjects: FxHashMap<EntityID, UniqueVec<EntityID>>,
 }
 
 impl PropositionsMatchResult {
@@ -359,8 +372,18 @@ impl PropositionsMatchResult {
         predicates: Vec<String>,
         proposition_id: u64,
     ) {
-        self.matched_subjects.push(subject);
-        self.matched_objects.push(object);
+        self.matched_subjects.push(subject.clone());
+        self.matched_objects.push(object.clone());
+
+        // Track per-entity groupings
+        self.subject_to_objects
+            .entry(subject.clone())
+            .or_default()
+            .push(object.clone());
+        self.object_to_subjects
+            .entry(object)
+            .or_default()
+            .push(subject);
 
         for pred in predicates {
             let id = EntityID::Proposition(proposition_id, pred.clone());

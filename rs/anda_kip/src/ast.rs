@@ -738,10 +738,20 @@ pub enum FilterFunction {
 /// Represents an ORDER BY condition for result sorting.
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct OrderByCondition {
-    /// The variable to sort by
+    /// The variable to sort by (also used for aggregation variable)
     pub variable: DotPathVar,
     /// Sort direction (ascending or descending)
     pub direction: OrderDirection,
+    /// Optional aggregation function for ORDER BY aggregation expressions
+    /// e.g., `ORDER BY COUNT(?n) ASC`
+    pub aggregation: Option<AggregationFunction>,
+}
+
+impl OrderByCondition {
+    /// Returns true if this ORDER BY condition sorts by an aggregation expression.
+    pub fn is_aggregation(&self) -> bool {
+        self.aggregation.is_some()
+    }
 }
 
 /// Sort direction for ORDER BY clauses.

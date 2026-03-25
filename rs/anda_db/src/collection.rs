@@ -184,7 +184,7 @@ impl Collection {
     ) -> Result<Self, DBError> {
         validate_field_name(config.name.as_str())?;
 
-        let base_path = Path::from(db.name()).child(config.name.as_str());
+        let base_path = Path::from(db.name()).join(config.name.as_str());
         let db_metadata = db.metadata();
         if db_metadata.collections.contains(&config.name) {
             return Err(DBError::AlreadyExists {
@@ -268,7 +268,7 @@ impl Collection {
         F: AsyncFnOnce(&mut Collection) -> Result<(), DBError>,
     {
         validate_field_name(name.as_str())?;
-        let base_path = Path::from(db.name()).child(name.as_str());
+        let base_path = Path::from(db.name()).join(name.as_str());
         let db_metadata = db.metadata();
         let storage = Storage::connect(
             base_path.to_string(),
