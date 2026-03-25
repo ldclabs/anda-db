@@ -55,6 +55,7 @@
 use axum::{BoxError, body::Body};
 use clap::Parser;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+use mimalloc::MiMalloc;
 use sqlx::postgres::PgPoolOptions;
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use structured_logger::{Builder, async_json::new_writer, get_env_level};
@@ -68,6 +69,9 @@ use anda_db_shard_proxy::store::{ResolvedRoute, ShardStore};
 
 const APP_NAME: &str = env!("CARGO_PKG_NAME");
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 #[derive(Parser)]
 #[command(author, version, about = "Anda DB Shard Routing Proxy")]

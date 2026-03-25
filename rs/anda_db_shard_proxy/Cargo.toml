@@ -1,6 +1,6 @@
 [package]
 name = "anda_db_shard_proxy"
-version = "0.2.1"
+version = "0.2.2"
 description = "A reverse proxy service for Anda DB shard routing"
 readme = "README.md"
 repository.workspace = true
@@ -21,6 +21,7 @@ structured-logger = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true }
+mimalloc = { workspace = true }
 hyper = "1"
 hyper-util = { version = "0.1", features = [
   "client-legacy",

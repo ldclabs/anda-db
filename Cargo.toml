@@ -89,6 +89,7 @@ rustc-hash = "2"
 pyo3 = "0.20"
 pyo3-asyncio = "0.20"
 serde-pyobject = "0.2"
+mimalloc = { version = "*", features = ["v3"] }
 
 [workspace.metadata.cargo-shear]
 ignored = ["blas-src"]
