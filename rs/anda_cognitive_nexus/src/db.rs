@@ -511,7 +511,7 @@ impl CognitiveNexus {
         ctx: &mut QueryContext,
         clause: ConceptClause,
     ) -> Result<(), KipError> {
-        let concept_ids: FxHashSet<EntityID> = self
+        let concept_ids: Vec<EntityID> = self
             .query_concept_ids(&clause.matcher)
             .await?
             .into_iter()
@@ -522,8 +522,7 @@ impl CognitiveNexus {
             // Variable already bound: filter (intersect) existing bindings
             existing.retain(|id| concept_ids.contains(id));
         } else {
-            ctx.entities
-                .insert(clause.variable, concept_ids.into_iter().collect());
+            ctx.entities.insert(clause.variable, concept_ids.into());
         }
 
         Ok(())
