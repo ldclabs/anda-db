@@ -22,7 +22,7 @@ use crate::{
     index::*,
     query::*,
     schema::*,
-    storage::{ObjectVersion, Storage},
+    storage::{ObjectVersion, Storage, StorageStats},
     unix_ms,
 };
 
@@ -812,6 +812,11 @@ impl Collection {
         stats.read_only = self.read_only.load(Ordering::Relaxed);
 
         stats
+    }
+
+    /// Returns the storage-level I/O statistics for this collection.
+    pub fn storage_stats(&self) -> StorageStats {
+        self.storage.stats()
     }
 
     /// Returns the maximum document ID in the collection.

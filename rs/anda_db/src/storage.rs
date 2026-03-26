@@ -140,6 +140,28 @@ pub struct StorageStats {
     pub total_delete_count: u64,
 }
 
+impl StorageStats {
+    /// Accumulates counters from `other` into `self`.
+    ///
+    /// Summable counters (counts, bytes) are added.
+    pub fn merge(&mut self, other: &StorageStats) {
+        self.total_cache_get_count = self
+            .total_cache_get_count
+            .saturating_add(other.total_cache_get_count);
+        self.total_fetch_count = self
+            .total_fetch_count
+            .saturating_add(other.total_fetch_count);
+        self.total_fetch_bytes = self
+            .total_fetch_bytes
+            .saturating_add(other.total_fetch_bytes);
+        self.total_put_count = self.total_put_count.saturating_add(other.total_put_count);
+        self.total_put_bytes = self.total_put_bytes.saturating_add(other.total_put_bytes);
+        self.total_delete_count = self
+            .total_delete_count
+            .saturating_add(other.total_delete_count);
+    }
+}
+
 impl From<&StorageStatsAtomic> for StorageStats {
     /// Creates `StorageStats` from `StorageStatsAtomic` by loading atomic values.
     fn from(stats: &StorageStatsAtomic) -> Self {

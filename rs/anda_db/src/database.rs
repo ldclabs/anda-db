@@ -105,9 +105,14 @@ impl AndaDB {
     /// Path where database metadata is stored
     const METADATA_PATH: &'static str = "db_meta.cbor";
 
-    /// Returns storage statistics for the database.
+    /// Returns aggregated storage I/O statistics across the database and all
+    /// currently open collections.
     pub fn stats(&self) -> StorageStats {
-        self.inner.storage.stats()
+        let mut stats = self.inner.storage.stats();
+        for collection in self.inner.collections.read().values() {
+            stats.merge(&collection.storage_stats());
+        }
+        stats
     }
 
     /// Creates a new database with the given configuration.
