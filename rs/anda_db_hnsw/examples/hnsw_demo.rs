@@ -1,5 +1,5 @@
 use anda_db_hnsw::{HnswConfig, HnswIndex};
-use rand::Rng;
+use rand::RngExt;
 use std::io::{Read, Write};
 use tokio::time;
 

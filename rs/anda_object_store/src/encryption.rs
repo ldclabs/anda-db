@@ -7,7 +7,7 @@ use ciborium::{from_reader, into_writer};
 use futures::{StreamExt, TryStreamExt, stream::BoxStream};
 use moka::{future::Cache, ops::compute::Op};
 use object_store::{path::Path, *};
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteArray;
 use sha3::Digest;

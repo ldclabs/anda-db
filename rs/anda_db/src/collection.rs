@@ -1220,6 +1220,91 @@ impl Collection {
         }
     }
 
+    pub async fn remove_btree_index(&mut self, fields: &[&str]) -> Result<bool, DBError> {
+        if fields.is_empty() {
+            return Err(DBError::Schema {
+                name: self.name.clone(),
+                source: "BTree index requires at least one field".into(),
+            });
+        }
+
+        let name = virtual_field_name(fields);
+        let removed_index = self
+            .btree_indexes
+            .iter()
+            .position(|index| index.name() == name)
+            .map(|position| self.btree_indexes.remove(position))
+            .is_some();
+
+        let removed_metadata = {
+            let mut meta = self.metadata.write();
+            let removed = meta.btree_indexes.remove(&name).is_some();
+            if removed {
+                meta.stats.version += 1;
+            }
+            removed
+        };
+
+        Ok(removed_index || removed_metadata)
+    }
+
+    pub async fn remove_bm25_index(&mut self, fields: &[&str]) -> Result<bool, DBError> {
+        if fields.is_empty() {
+            return Err(DBError::Schema {
+                name: self.name.clone(),
+                source: "BM25 index requires at least one field".into(),
+            });
+        }
+
+        let name = virtual_field_name(fields);
+        let removed_index = self
+            .bm25_indexes
+            .iter()
+            .position(|index| index.name() == name)
+            .map(|position| self.bm25_indexes.remove(position))
+            .is_some();
+
+        let removed_metadata = {
+            let mut meta = self.metadata.write();
+            let removed = meta.bm25_indexes.remove(&name).is_some();
+            if removed {
+                meta.stats.version += 1;
+            }
+            removed
+        };
+
+        Ok(removed_index || removed_metadata)
+    }
+
+    pub async fn remove_hnsw_index(&mut self, field: &str) -> Result<bool, DBError> {
+        if field.is_empty() {
+            return Err(DBError::Schema {
+                name: self.name.clone(),
+                source: "HNSW index requires a non-empty field name".into(),
+            });
+        }
+
+        validate_field_name(field)?;
+
+        let removed_index = self
+            .hnsw_indexes
+            .iter()
+            .position(|index| index.field_name() == field)
+            .map(|position| self.hnsw_indexes.remove(position))
+            .is_some();
+
+        let removed_metadata = {
+            let mut meta = self.metadata.write();
+            let removed = meta.hnsw_indexes.remove(field).is_some();
+            if removed {
+                meta.stats.version += 1;
+            }
+            removed
+        };
+
+        Ok(removed_index || removed_metadata)
+    }
+
     pub fn get_btree_index(&self, fields: &[&str]) -> Result<&BTree, DBError> {
         let name = virtual_field_name(fields);
         if let Some(index) = self.btree_indexes.iter().find(|i| i.name() == name) {
@@ -2490,6 +2575,153 @@ mod tests {
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].name, "Bob");
+
+        db.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_remove_indexes() -> Result<(), DBError> {
+        let db = setup_test_db().await?;
+        let object_store = db.object_store();
+
+        {
+            let collection = create_test_collection(&db, async |collection| {
+                collection.create_btree_index_nx(&["name"]).await?;
+                collection
+                    .create_bm25_index_nx(&["name", "tags", "metadata"])
+                    .await?;
+                collection
+                    .create_hnsw_index_nx(
+                        "vector",
+                        HnswConfig {
+                            dimension: 10,
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                Ok(())
+            })
+            .await?;
+
+            assert!(collection.metadata().btree_indexes.contains_key("name"));
+            assert!(
+                collection
+                    .metadata()
+                    .bm25_indexes
+                    .contains_key("name-tags-metadata")
+            );
+            assert!(collection.metadata().hnsw_indexes.contains_key("vector"));
+            assert!(collection.get_btree_index(&["name"]).is_ok());
+            assert!(
+                collection
+                    .get_bm25_index(&["name", "tags", "metadata"])
+                    .is_ok()
+            );
+            assert!(collection.get_hnsw_index("vector").is_ok());
+        }
+
+        db.close().await?;
+        let db = AndaDB::connect(
+            object_store.clone(),
+            DBConfig {
+                name: "test_db".to_string(),
+                description: "Test database".to_string(),
+                storage: StorageConfig {
+                    compress_level: 0,
+                    ..Default::default()
+                },
+                lock: None,
+            },
+        )
+        .await?;
+
+        let collection = db
+            .open_collection("test_collection".to_string(), async |collection| {
+                assert!(collection.remove_btree_index(&["name"]).await?);
+                assert!(
+                    collection
+                        .remove_bm25_index(&["name", "tags", "metadata"])
+                        .await?
+                );
+                assert!(collection.remove_hnsw_index("vector").await?);
+
+                assert!(!collection.remove_btree_index(&["name"]).await?);
+                assert!(
+                    !collection
+                        .remove_bm25_index(&["name", "tags", "metadata"])
+                        .await?
+                );
+                assert!(!collection.remove_hnsw_index("vector").await?);
+
+                assert!(collection.get_btree_index(&["name"]).is_err());
+                assert!(
+                    collection
+                        .get_bm25_index(&["name", "tags", "metadata"])
+                        .is_err()
+                );
+                assert!(collection.get_hnsw_index("vector").is_err());
+
+                let meta = collection.metadata();
+                assert!(!meta.btree_indexes.contains_key("name"));
+                assert!(!meta.bm25_indexes.contains_key("name-tags-metadata"));
+                assert!(!meta.hnsw_indexes.contains_key("vector"));
+
+                collection.flush(unix_ms()).await?;
+                Ok(())
+            })
+            .await?;
+
+        assert!(collection.get_btree_index(&["name"]).is_err());
+        assert!(
+            collection
+                .get_bm25_index(&["name", "tags", "metadata"])
+                .is_err()
+        );
+        assert!(collection.get_hnsw_index("vector").is_err());
+        assert!(!collection.metadata().btree_indexes.contains_key("name"));
+        assert!(
+            !collection
+                .metadata()
+                .bm25_indexes
+                .contains_key("name-tags-metadata")
+        );
+        assert!(!collection.metadata().hnsw_indexes.contains_key("vector"));
+
+        db.close().await?;
+        let db = AndaDB::connect(
+            object_store,
+            DBConfig {
+                name: "test_db".to_string(),
+                description: "Test database".to_string(),
+                storage: StorageConfig {
+                    compress_level: 0,
+                    ..Default::default()
+                },
+                lock: None,
+            },
+        )
+        .await?;
+
+        let collection = db
+            .open_collection("test_collection".to_string(), async |_| Ok(()))
+            .await?;
+
+        assert!(collection.get_btree_index(&["name"]).is_err());
+        assert!(
+            collection
+                .get_bm25_index(&["name", "tags", "metadata"])
+                .is_err()
+        );
+        assert!(collection.get_hnsw_index("vector").is_err());
+        assert!(!collection.metadata().btree_indexes.contains_key("name"));
+        assert!(
+            !collection
+                .metadata()
+                .bm25_indexes
+                .contains_key("name-tags-metadata")
+        );
+        assert!(!collection.metadata().hnsw_indexes.contains_key("vector"));
 
         db.close().await?;
         Ok(())
