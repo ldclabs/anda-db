@@ -335,7 +335,7 @@ impl Request {
                 execute_kip(nexus, &substituted, self.dry_run).await
             };
             if command_type != CommandType::Kml && cmd_type != CommandType::Unknown {
-                command_type = cmd_type;
+                command_type = cmd_type.clone();
             }
 
             match response {
@@ -355,8 +355,10 @@ impl Request {
                     }
                     results.push(Response::err(error));
 
-                    // Stop on first error, return error response
-                    return (command_type, Response::ok(json!(results)));
+                    if cmd_type == CommandType::Kml {
+                        // Stop on first KML error, return error response
+                        return (cmd_type, Response::ok(json!(results)));
+                    }
                 }
             }
         }
