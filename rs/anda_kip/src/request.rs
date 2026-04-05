@@ -80,7 +80,8 @@ pub struct Request {
     /// **Mutually exclusive with `command`**.
     /// Each element can be a `String` (uses shared `parameters`) or an `Object` with
     /// `{command, parameters}` (independent parameters override shared).
-    /// Commands execute sequentially; **execution stops on first error**.
+    /// Commands execute sequentially; **execution stops on the first KML error**.
+    /// KQL, META, and syntax errors are recorded and execution continues.
     #[serde(default)]
     pub commands: Vec<CommandItem>,
 
@@ -276,8 +277,8 @@ impl Request {
     /// Executes the KIP command(s) using the provided executor
     ///
     /// For single command mode, executes the single command and returns its result.
-    /// For batch mode, executes commands sequentially and stops on first error,
-    /// returning an array of results for successfully executed commands.
+    /// For batch mode, executes commands sequentially and stops on the first KML error,
+    /// returning an array of per-command results collected up to that point.
     ///
     /// # Note
     /// If a parse error occurs, this method will check for common misuse patterns
@@ -321,8 +322,8 @@ impl Request {
 
     /// Executes batch commands sequentially
     ///
-    /// Commands are executed in order. Execution stops on first error.
-    /// Returns an array of results for all successfully executed commands.
+    /// Commands are executed in order. Execution stops on the first KML error.
+    /// KQL, META, and syntax errors are included in the result array and do not stop execution.
     async fn execute_batch(&self, nexus: &impl Executor) -> (CommandType, Response) {
         let mut results = Vec::with_capacity(self.commands.len());
         let mut command_type = CommandType::Unknown;
@@ -1170,6 +1171,25 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct KmlFailingExecutor;
+
+    #[async_trait]
+    impl Executor for KmlFailingExecutor {
+        async fn execute(&self, command: Command, _dry_run: bool) -> Response {
+            match command {
+                Command::Kql(_) => Response::ok(json!({"type": "kql"})),
+                Command::Meta(_) => Response::ok(json!({"type": "meta"})),
+                Command::Kml(_) => Response::err(ErrorObject {
+                    code: "KIP_4002".to_string(),
+                    message: "Write failed".to_string(),
+                    hint: Some("Check write constraints before retrying.".to_string()),
+                    data: None,
+                }),
+            }
+        }
+    }
+
     // --- Single command execute tests ---
 
     #[tokio::test]
@@ -1375,7 +1395,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_execute_batch_stops_on_syntax_error() {
+    async fn test_execute_batch_continues_on_syntax_error() {
         let executor = MockExecutor;
         let request = Request {
             commands: vec![
@@ -1390,8 +1410,8 @@ mod tests {
         match response {
             Response::Ok { result, .. } => {
                 let arr = result.as_array().unwrap();
-                // Should have 2 results: first success, second error, third not executed
-                assert_eq!(arr.len(), 2);
+                // Syntax errors are recorded and later commands still execute
+                assert_eq!(arr.len(), 3);
                 // First result is success
                 assert!(arr[0]["result"].is_object());
                 // Second result is error
@@ -1402,13 +1422,15 @@ mod tests {
                         .unwrap()
                         .starts_with("KIP_1")
                 );
+                // Third command still executes
+                assert_eq!(arr[2]["result"]["type"], "kql");
             }
             _ => panic!("Expected Ok response wrapping batch results"),
         }
     }
 
     #[tokio::test]
-    async fn test_execute_batch_stops_on_executor_error() {
+    async fn test_execute_batch_continues_on_non_kml_executor_error() {
         let executor = FailingExecutor;
         let request = Request {
             commands: vec![
@@ -1422,10 +1444,41 @@ mod tests {
         match response {
             Response::Ok { result, .. } => {
                 let arr = result.as_array().unwrap();
-                // First command fails, stops immediately
-                assert_eq!(arr.len(), 1);
+                // Non-KML executor errors are recorded and execution continues
+                assert_eq!(arr.len(), 2);
                 assert!(arr[0]["error"].is_object());
                 assert_eq!(arr[0]["error"]["code"], "KIP_3001");
+                assert!(arr[1]["error"].is_object());
+                assert_eq!(arr[1]["error"]["code"], "KIP_3001");
+            }
+            _ => panic!("Expected Ok response wrapping batch results"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_batch_stops_on_kml_error() {
+        let executor = KmlFailingExecutor;
+        let request = Request {
+            commands: vec![
+                CommandItem::Simple("DESCRIBE PRIMER".to_string()),
+                CommandItem::Simple(
+                    r#"UPSERT { CONCEPT ?d { {type: "Drug", name: "NewDrug"} } }"#.to_string(),
+                ),
+                CommandItem::Simple(r#"FIND(?d) WHERE { ?d {type: "Drug"} } LIMIT 5"#.to_string()),
+            ],
+            ..Default::default()
+        };
+
+        let (cmd_type, response) = request.execute(&executor).await;
+        assert_eq!(cmd_type, CommandType::Kml);
+        match response {
+            Response::Ok { result, .. } => {
+                let arr = result.as_array().unwrap();
+                // KML errors stop batch execution immediately
+                assert_eq!(arr.len(), 2);
+                assert_eq!(arr[0]["result"]["type"], "meta");
+                assert!(arr[1]["error"].is_object());
+                assert_eq!(arr[1]["error"]["code"], "KIP_4002");
             }
             _ => panic!("Expected Ok response wrapping batch results"),
         }
