@@ -226,7 +226,7 @@ impl CognitiveNexus {
 
         let ver = this.capsule_version();
 
-        if ver == 0
+        if ver <= 1
             || !this
                 .has_concept(&ConceptPK::Object {
                     r#type: META_CONCEPT_TYPE.to_string(),
@@ -281,10 +281,21 @@ impl CognitiveNexus {
             this.execute_kml(parse_kml(SLEEP_TASK_KIP)?, false).await?;
         }
 
+        if ver == 0
+            || !this
+                .has_concept(&ConceptPK::Object {
+                    r#type: META_CONCEPT_TYPE.to_string(),
+                    name: INSIGHT_TYPE.to_string(),
+                })
+                .await
+        {
+            this.execute_kml(parse_kml(INSIGHT_KIP)?, false).await?;
+        }
+
         f(&this).await?;
 
-        if ver == 0 {
-            this.save_capsule_version(1).await?;
+        if ver <= 1 {
+            this.save_capsule_version(2).await?;
         }
         Ok(this)
     }
@@ -1287,7 +1298,21 @@ impl CognitiveNexus {
             .try_get_concept_with(&cache, *me_id, |concept| Ok(ConceptInfo::from(concept)))
             .await?;
 
-        let mut domain_map: Vec<DomainInfo> = Vec::with_capacity(domain_ids.len());
+        let learned_ids = self
+            .find_propositions(&cache, &EntityID::Concept(*me_id), "learned", false)
+            .await?;
+        let total_learned = learned_ids.len();
+        let mut learned: Vec<ConceptInfo> = Vec::with_capacity(learned_ids.len().min(128));
+        for (_, id) in learned_ids.into_iter().take(128) {
+            if let EntityID::Concept(id) = id {
+                let insight = self
+                    .try_get_concept_with(&cache, id, |concept| Ok(ConceptInfo::from(concept)))
+                    .await?;
+                learned.push(insight);
+            }
+        }
+
+        let mut domain_map: Vec<DomainInfo> = Vec::with_capacity(domain_ids.len().min(1024));
         let total_domains = domain_ids.len();
         for id in domain_ids.into_iter().take(1024) {
             let mut info = self
@@ -1317,7 +1342,9 @@ impl CognitiveNexus {
 
         Ok(json!({
             "identity": me,
+            "learned": learned,
             "domain_map": domain_map,
+            "total_learned": total_learned,
             "total_domains": total_domains,
         }))
     }
@@ -3633,7 +3660,7 @@ mod tests {
             result,
             json!([{
                 "_type":"ConceptNode",
-                "id":"C:23",
+                "id":"C:25",
                 "type":"Drug",
                 "name":"Aspirin",
                 "attributes":{"dosage":"325mg","molecular_formula":"C9H8O4","risk_level":2},

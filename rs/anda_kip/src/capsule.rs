@@ -18,8 +18,10 @@ pub static DOMAIN_TYPE: &str = "Domain";
 /// The type identifier for event entities.
 pub static EVENT_TYPE: &str = "Event";
 
-/// The type identifier for person entities.
 pub static PERSON_TYPE: &str = "Person";
+
+/// The type identifier for Insight entities.
+pub static INSIGHT_TYPE: &str = "Insight";
 
 /// The type identifier for event entities.
 pub static SLEEP_TASK_TYPE: &str = "SleepTask";
@@ -35,6 +37,9 @@ pub static GENESIS_KIP: &str = include_str!("../capsules/Genesis.kip");
 
 /// The Event type definition capsule.
 pub static EVENT_KIP: &str = include_str!("../capsules/Event.kip");
+
+/// The Insight type definition capsule.
+pub static INSIGHT_KIP: &str = include_str!("../capsules/Insight.kip");
 
 /// The Person type definition capsule.
 pub static PERSON_KIP: &str = include_str!("../capsules/Person.kip");
