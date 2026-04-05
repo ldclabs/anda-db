@@ -1002,11 +1002,11 @@ There are two function callings provided:
 
 #### 6.2.2. Batch Command Response
 
-When using `commands` (batch execution), the response contains a `result` array corresponding to each command in order. **Execution stops on first error**, so the array length may be less than the number of commands submitted.
+When using `commands` (batch execution), the response contains a `result` array corresponding to each command in order. **Execution stops on the first KML error**. KQL, META, and syntax errors are returned inline, so the array may still include later command results after those errors. The array length is less than the number of submitted commands only when a KML error stops execution.
 
-| Key          | Type  | Required | Description                                                                                                                                                            |
-| :----------- | :---- | :------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **`result`** | Array | Yes      | An array of response objects, one per executed command, in order. Each element has the same structure as a single command response (`result`, `error`, `next_cursor`). |
+| Key          | Type  | Required | Description                                                                                                                                                                                                                                                                        |
+| :----------- | :---- | :------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`result`** | Array | Yes      | An array of response objects, one per executed command, in order. Each element has the same structure as a single command response (`result`, `error`, `next_cursor`). Batch execution continues past KQL, META, and syntax errors, but stops when a KML command returns an error. |
 
 **Example**:
 ```js

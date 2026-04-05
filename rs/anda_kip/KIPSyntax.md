@@ -467,7 +467,8 @@ Full-text search for entity resolution (Grounding).
   ]
 }
 ```
-Each element in `result` corresponds to one command. Execution stops on first error; subsequent commands are not executed.
+
+Each element in `result` corresponds to one command. Execution stops on the first KML error; KQL, META, and syntax errors are returned inline and subsequent commands continue executing.
 
 **Error**:
 ```json
