@@ -237,7 +237,7 @@ impl CognitiveNexus {
             this.execute_kml(parse_kml(GENESIS_KIP)?, false).await?;
         }
 
-        if ver == 0
+        if ver <= 1
             || !this
                 .has_concept(&ConceptPK::Object {
                     r#type: META_CONCEPT_TYPE.to_string(),
@@ -248,7 +248,7 @@ impl CognitiveNexus {
             this.execute_kml(parse_kml(PERSON_KIP)?, false).await?;
         }
 
-        if ver == 0
+        if ver <= 1
             || !this
                 .has_concept(&ConceptPK::Object {
                     r#type: META_CONCEPT_TYPE.to_string(),
@@ -259,7 +259,7 @@ impl CognitiveNexus {
             this.execute_kml(parse_kml(PREFERENCE_KIP)?, false).await?;
         }
 
-        if ver == 0
+        if ver <= 1
             || !this
                 .has_concept(&ConceptPK::Object {
                     r#type: META_CONCEPT_TYPE.to_string(),
@@ -270,7 +270,7 @@ impl CognitiveNexus {
             this.execute_kml(parse_kml(EVENT_KIP)?, false).await?;
         }
 
-        if ver == 0
+        if ver <= 1
             || !this
                 .has_concept(&ConceptPK::Object {
                     r#type: META_CONCEPT_TYPE.to_string(),
@@ -281,7 +281,7 @@ impl CognitiveNexus {
             this.execute_kml(parse_kml(SLEEP_TASK_KIP)?, false).await?;
         }
 
-        if ver == 0
+        if ver <= 1
             || !this
                 .has_concept(&ConceptPK::Object {
                     r#type: META_CONCEPT_TYPE.to_string(),
