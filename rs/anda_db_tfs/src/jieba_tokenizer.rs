@@ -1,4 +1,4 @@
-use tantivy::tokenizer::{LowerCaser, RemoveLongFilter, SimpleTokenizer};
+use tantivy::tokenizer::{LowerCaser, RemoveLongFilter, SimpleTokenizer, Stemmer};
 use tantivy_jieba::JiebaTokenizer;
 use tantivy_tokenizer_api::{Token, TokenFilter, TokenStream, Tokenizer};
 
@@ -10,6 +10,7 @@ pub fn jieba_tokenizer() -> TokenizerChain {
         .filter(JiebaMergeFilter::new())
         .filter(RemoveLongFilter::limit(32))
         .filter(LowerCaser)
+        .filter(Stemmer::default())
         .build()
 }
 
@@ -183,13 +184,13 @@ mod tests {
         assert!(tokens.contains_key("faubourg"));
         assert!(tokens.contains_key("saint"));
         assert!(tokens.contains_key("honoré"));
-        assert!(tokens.contains_key("paris"));
+        assert!(tokens.contains_key("pari"));
         assert!(tokens.contains_key("москва"));
         assert!(tokens.contains_key("красная"));
         assert!(tokens.contains_key("площадь"));
         assert!(tokens.contains_key("1600"));
         assert!(tokens.contains_key("pennsylvania"));
-        assert!(tokens.contains_key("avenue"));
+        assert!(tokens.contains_key("avenu"));
         assert!(tokens.contains_key("nw"));
         assert!(tokens.contains_key("washington"));
         // assert!(tokens.contains_key("d"));

@@ -389,15 +389,15 @@ WITH METADATA {
 
         let kml_statement = result.unwrap();
 
-        // 验证这是一个 UPSERT 语句
+        // Verify this is an UPSERT statement
         match kml_statement {
             KmlStatement::Upsert(blocks) => {
                 assert_eq!(blocks.len(), 1);
                 let ast::UpsertBlock { items, metadata } = &blocks[0];
-                // 验证有两个概念操作
+                // Verify there are two concept operations
                 assert_eq!(items.len(), 2);
 
-                // 验证第一个概念 (?cognizine)
+                // Verify the first concept (?cognizine)
                 let cognizine_op = &items[0];
                 match cognizine_op {
                     ast::UpsertItem::Concept(ast::ConceptBlock {
@@ -422,7 +422,7 @@ WITH METADATA {
                     _ => panic!("Expected Concept operation for first operation"),
                 }
 
-                // 验证第二个概念 (?neural_bloom)
+                // Verify the second concept (?neural_bloom)
                 let neural_bloom_op = &items[1];
                 match neural_bloom_op {
                     ast::UpsertItem::Concept(ast::ConceptBlock {
@@ -447,7 +447,7 @@ WITH METADATA {
                     _ => panic!("Expected Concept operation for second operation"),
                 }
 
-                // 验证全局元数据
+                // Verify global metadata
                 assert!(metadata.is_some());
                 let global_metadata = metadata.as_ref().unwrap();
                 assert_eq!(global_metadata.len(), 4);

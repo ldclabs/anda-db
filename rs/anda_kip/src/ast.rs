@@ -512,7 +512,7 @@ impl DotPathVar {
             return "".to_string(); // the whole document
         }
 
-        // 构建完整的 JSON Pointer 路径
+        // Build the full JSON Pointer path
         let mut pointer = String::new();
         for component in &self.path {
             pointer.push('/');
@@ -543,8 +543,8 @@ impl fmt::Display for DotPathVar {
 
 fn escape_json_pointer_token(token: &str) -> String {
     token
-        .replace('~', "~0") // 首先替换 '~' 为 '~0'
-        .replace('/', "~1") // 然后替换 '/' 为 '~1'
+        .replace('~', "~0") // First replace '~' with '~0'
+        .replace('/', "~1") // Then replace '/' with '~1'
 }
 
 /// Supported aggregation functions in KQL.

@@ -748,7 +748,7 @@ mod tests {
         };
 
         let result = request.to_command();
-        // 不存在的参数应该保持原样
+        // Non-existent parameters should remain unchanged
         assert_eq!(result, "FIND(?item) WHERE { ?item{name: :missing_param} }");
         assert!(parse_kql(&result).is_err());
     }
@@ -777,7 +777,7 @@ mod tests {
 
     #[test]
     fn test_to_command_complex_kip_example() {
-        // 测试一个符合 KIP 规范的完整示例
+        // Test a complete example conforming to KIP specification
         let mut parameters = Map::new();
         parameters.insert(
             "symptom_name".to_string(),

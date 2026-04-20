@@ -242,6 +242,7 @@ impl Storage {
 
     /// Constructs the full object store path for a given document path.
     fn full_path(&self, path: &str) -> Path {
+        // don't use Path::join to avoid percent encoded
         Path::from(format!("{}/{}", self.inner.base_path, path))
     }
 

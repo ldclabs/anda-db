@@ -24,3 +24,4 @@ structured-logger = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 object_store = { workspace = true, features = ["fs", "aws"] }
 log = { workspace = true }
+mimalloc = { workspace = true }

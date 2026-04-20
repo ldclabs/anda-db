@@ -5,6 +5,7 @@ use anda_db::{
 use anda_object_store::MetaStoreBuilder;
 use axum::{BoxError, Router, routing};
 use clap::{Parser, Subcommand};
+use mimalloc::MiMalloc;
 use object_store::{ObjectStore, aws::AmazonS3Builder, local::LocalFileSystem, memory::InMemory};
 use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};
 use structured_logger::{Builder, async_json::new_writer, get_env_level};
@@ -15,6 +16,9 @@ mod handler;
 mod nexus;
 
 use handler::*;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 const APP_NAME: &str = env!("CARGO_PKG_NAME");
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");

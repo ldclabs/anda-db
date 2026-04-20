@@ -70,7 +70,7 @@ pub fn dot_path_var(input: &str) -> VResult<'_, DotPathVar> {
     )
     .parse(input)?;
 
-    // 验证剩余输入不以点号开头（避免 "?var." 这种情况）
+    // Verify that remaining input doesn't start with a dot (avoiding "?var." situations)
     if remaining.starts_with('.') {
         return Err(nom::Err::Error(
             <VerboseError<&str> as ParseError<&str>>::from_error_kind(remaining, ErrorKind::Verify),
@@ -169,17 +169,17 @@ mod tests {
 
     #[test]
     fn test_ws_with_comments() {
-        // 测试注释后跟换行符
+        // Test comment followed by newline
         let input = "// comment\nvalue";
         let result = ws(tag::<&str, &str, VerboseError<_>>("value")).parse(input);
         assert!(result.is_ok());
 
-        // 测试多行注释和空白字符混合
+        // Test mixed multiline comments and whitespace
         let input = "  // comment1\n  // comment2\n  value";
         let result = ws(tag::<&str, &str, VerboseError<_>>("value")).parse(input);
         assert!(result.is_ok());
 
-        // 测试注释在末尾
+        // Test comment at end
         let input = "value  // comment";
         let result = ws(tag::<&str, &str, VerboseError<_>>("value")).parse(input);
         assert!(result.is_ok());
@@ -206,7 +206,7 @@ mod tests {
 
     #[test]
     fn test_dot_path_var() {
-        // 测试简单变量（无路径组件）
+        // Test simple variable (no path components)
         let result = dot_path_var("?var");
         assert!(result.is_ok());
         let (remaining, dot_path) = result.unwrap();
@@ -214,7 +214,7 @@ mod tests {
         assert_eq!(dot_path.var, "var");
         assert_eq!(dot_path.path, Vec::<String>::new());
 
-        // 测试带一个路径组件的变量
+        // Test variable with one path component
         let result = dot_path_var("?drug.name");
         assert!(result.is_ok());
         let (remaining, dot_path) = result.unwrap();
@@ -222,7 +222,7 @@ mod tests {
         assert_eq!(dot_path.var, "drug");
         assert_eq!(dot_path.path, vec!["name".to_string()]);
 
-        // 测试带多个路径组件的变量
+        // Test variable with multiple path components
         let result = dot_path_var("?drug.attributes.risk_level");
         assert!(result.is_ok());
         let (remaining, dot_path) = result.unwrap();
@@ -233,7 +233,7 @@ mod tests {
             vec!["attributes".to_string(), "risk_level".to_string()]
         );
 
-        // 测试更复杂的路径
+        // Test more complex path
         let result = dot_path_var("?entity.metadata.created_by.user_id");
         assert!(result.is_ok());
         let (remaining, dot_path) = result.unwrap();
@@ -248,7 +248,7 @@ mod tests {
             ]
         );
 
-        // 测试带下划线的变量名和路径
+        // Test underscore in variable name and path
         let result = dot_path_var("?my_var._private_field.sub_key");
         assert!(result.is_ok());
         let (remaining, dot_path) = result.unwrap();
@@ -259,7 +259,7 @@ mod tests {
             vec!["_private_field".to_string(), "sub_key".to_string()]
         );
 
-        // 测试带数字的标识符
+        // Test identifiers with numbers
         let result = dot_path_var("?var123.field456.key789");
         assert!(result.is_ok());
         let (remaining, dot_path) = result.unwrap();
@@ -270,7 +270,7 @@ mod tests {
             vec!["field456".to_string(), "key789".to_string()]
         );
 
-        // 测试解析停止在非标识符字符处
+        // Test that parsing stops at non-identifier characters
         let result = dot_path_var("?var.field extra");
         assert!(result.is_ok());
         let (remaining, dot_path) = result.unwrap();
@@ -278,7 +278,7 @@ mod tests {
         assert_eq!(dot_path.var, "var");
         assert_eq!(dot_path.path, vec!["field".to_string()]);
 
-        // 测试解析停止在特殊字符处
+        // Test that parsing stops at special characters
         let result = dot_path_var("?var.field,");
         assert!(result.is_ok());
         let (remaining, dot_path) = result.unwrap();
@@ -289,26 +289,26 @@ mod tests {
 
     #[test]
     fn test_dot_path_var_errors() {
-        // 测试缺少问号前缀
+        // Test missing question mark prefix
         assert!(dot_path_var("var.field").is_err());
 
-        // 测试只有问号
+        // Test only question mark
         assert!(dot_path_var("?").is_err());
 
-        // 测试问号后跟无效标识符
+        // Test question mark followed by invalid identifier
         assert!(dot_path_var("?123invalid").is_err());
 
-        // 测试点后没有标识符
+        // Test dot without identifier after
         assert!(dot_path_var("?var.").is_err());
         assert!(dot_path_var("?var..").is_err());
 
-        // 测试点后跟无效标识符
+        // Test dot followed by invalid identifier
         assert!(dot_path_var("?var.123invalid").is_err());
 
-        // 测试空输入
+        // Test empty input
         assert!(dot_path_var("").is_err());
 
-        // 测试连续的点
+        // Test consecutive dots
         assert!(dot_path_var("?var..field").is_err());
     }
 
@@ -540,13 +540,13 @@ mod tests {
 
     #[test]
     fn test_error_messages_with_context() {
-        // 测试未闭合字符串的错误信息应包含完整上下文
+        // Test that unclosed string error messages contain full context
         let input = r#"{ name: "test, age: 25 }"#;
         let result = json_value_map(input);
         assert!(result.is_err());
         if let Err(nom::Err::Failure(e)) = &result {
             let err_str = format!("{}", e);
-            // 验证错误信息包含 JSON string 和 KIP key-value map 的上下文
+            // Verify error message contains JSON string and KIP key-value map context
             assert!(
                 err_str.contains("JSON string"),
                 "Error should mention JSON string context"
@@ -559,7 +559,7 @@ mod tests {
             panic!("Expected Failure error, got {:?}", result);
         }
 
-        // 测试空值的错误信息
+        // Test empty value error message
         let input2 = r#"{ key: }"#;
         let result2 = json_value_map(input2);
         assert!(result2.is_err());

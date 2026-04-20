@@ -1,6 +1,6 @@
 [package]
 name = "anda_db"
-version = "0.7.25"
+version = "0.7.26"
 description = "Anda DB is a Rust library designed as a specialized database for AI Agents, focusing on knowledge & memory."
 keywords = ["database", "vector", "search", "embedding", "ai"]
 categories = ["database", "data-structures", "text-processing"]
@@ -18,15 +18,21 @@ anda_db_tfs = { path = "../anda_db_tfs", version = "0.5", features = ["full"] }
 bytes = { workspace = true }
 ciborium = { workspace = true }
 croaring = { workspace = true }
-futures = { workspace = true }
+futures = { workspace = true, features = ["std"] }
 log = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
-tokio = { workspace = true, features = ["sync", "parking_lot", "io-util"] }
+tokio = { workspace = true, features = [
+  "macros",
+  "sync",
+  "parking_lot",
+  "io-util",
+  "time",
+] }
 tokio-util = { workspace = true }
 ic_auth_types = { workspace = true, features = ["xid"] }
-object_store = { workspace = true }
+object_store = { workspace = true, features = ["tokio"] }
 moka = { workspace = true }
 zstd-safe = { workspace = true }
 async-compression = { workspace = true }

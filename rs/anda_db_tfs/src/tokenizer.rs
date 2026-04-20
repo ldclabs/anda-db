@@ -76,7 +76,7 @@ impl<T: Tokenizer> BoxableTokenizer for T {
     }
 }
 
-/// Creates a new `TokenizerChain` with `SimpleTokenizer` as the default tokenizer and `RemoveLongFilter`, `LowerCaser` and `Stemmer` as the default filters.
+/// Creates a new `TokenizerChain` with `SimpleTokenizer` as the default tokenizer and `RemoveLongFilter` and `LowerCaser` as the default filters.
 #[cfg(any(test, feature = "tantivy"))]
 pub fn default_tokenizer() -> TokenizerChain {
     use tantivy::tokenizer::{LowerCaser, RemoveLongFilter, SimpleTokenizer, Stemmer};

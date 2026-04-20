@@ -14,7 +14,7 @@ members = [
   "rs/anda_kip",
   "rs/anda_object_store",
   "rs/anda_db_shard_proxy",
-  "py/anda_cognitive_nexus_py",
+  # "py/anda_cognitive_nexus_py",
 ]
 # Python binding package (anda_cognitive_nexus_py) is excluded from workspace testing
 # because it requires Python library linking. Test it separately with:
@@ -38,7 +38,7 @@ license = "MIT"
 aes-gcm = "0.10"
 async-trait = "0.1"
 async-stream = "0.3"
-axum = { version = "0.8", features = [
+axum = { version = "0.8", default-features = false, features = [
   "http1",
   "http2",
   "json",
@@ -46,50 +46,75 @@ axum = { version = "0.8", features = [
   "matched-path",
   "tokio",
   "query",
-], default-features = true }
+] }
 bytes = "1"
 base64 = "0.22"
-clap = { version = "4.5", features = ["derive", "env"] }
+clap = { version = "4.6", default-features = false, features = [
+  "std",
+  "derive",
+  "env",
+] }
 dotenv = "0.15"
 hex = "0.4"
 croaring = "2.3"
-chrono = "0.4"
-futures = { version = "0.3" }
-tokio = { version = "1" }
-tokio-util = { version = "0.7" }
+chrono = { version = "0.4", default-features = false }
+futures = { version = "0.3", default-features = false, features = [
+  "async-await",
+] }
+tokio = { version = "1", default-features = false }
+tokio-util = { version = "0.7", default-features = false }
 ciborium = "0.2"
-dashmap = "6.1"
-rand = "0.10"
-ordered-float = "5"
-blas-src = { version = "0.11" }
-half = { version = "2.6", features = ["serde"] }
-serde = { version = "1", features = ["derive"] }
+dashmap = { version = "6.1", default-features = false }
+rand = { version = "0.10", default-features = false }
+ordered-float = { version = "5", default-features = false }
+blas-src = { version = "0.11", default-features = false }
+half = { version = "2.6", default-features = false, features = ["serde"] }
+serde = { version = "1", default-features = false, features = [
+  "std",
+  "derive",
+] }
 serde_bytes = "0.11"
-serde_json = "1"
-sha3 = "0.10"
-thiserror = "2"
+serde_json = { version = "1", default-features = false, features = ["std"] }
+sha3 = "0.11"
+thiserror = { version = "2", default-features = false }
 parking_lot = "0.12"
-papaya = { version = "0.2" }
-log = { version = "0.4", features = ["kv", "kv_serde"] }
-tantivy = "0.26"
-tantivy-tokenizer-api = "0.7"
-tantivy-jieba = "0.19"
-structured-logger = "1"
-smallvec = "1.15"
-criterion = "0.8"
-ic_auth_types = { version = "0.8" }
-object_store = { version = "0.13" }
-moka = { version = "0.12", features = ["future"] }
-zstd-safe = "7"
-async-compression = { version = "0.4", features = ["tokio", "zstd"] }
-nom = "8"
-nom-language = "0.1"
-regex = "1.11"
-rustc-hash = "2"
-pyo3 = "0.20"
-pyo3-asyncio = "0.20"
-serde-pyobject = "0.2"
-mimalloc = { version = "*", features = ["v3"] }
+papaya = { version = "0.2", default-features = false }
+log = { version = "0.4", default-features = false, features = [
+  "kv",
+  "kv_serde",
+] }
+tantivy = { version = "0.26", default-features = false }
+tantivy-tokenizer-api = { version = "0.7", default-features = false }
+tantivy-jieba = { version = "0.19", default-features = false }
+structured-logger = { version = "1", default-features = false }
+smallvec = { version = "1.15", default-features = false }
+criterion = { version = "0.8", default-features = false }
+ic_auth_types = { version = "0.8", default-features = false }
+object_store = { version = "0.13", default-features = false }
+moka = { version = "0.12", default-features = false, features = ["future"] }
+zstd-safe = { version = "7", default-features = false, features = [
+  "experimental",
+] }
+async-compression = { version = "0.4", default-features = false, features = [
+  "tokio",
+  "zstd",
+] }
+nom = { version = "8", default-features = false }
+nom-language = { version = "0.1", default-features = false }
+regex = { version = "1.11", default-features = false }
+rustc-hash = { version = "2", default-features = false }
+pyo3 = { version = "0.20", default-features = false }
+pyo3-asyncio = { version = "0.20", default-features = false }
+serde-pyobject = { version = "0.2", default-features = false }
+mimalloc = { version = "*", default-features = false, features = ["v3"] }
 
 [workspace.metadata.cargo-shear]
-ignored = ["blas-src"]
+ignored = []
+
+[profile.release]
+debug = false
+lto = true
+strip = true
+opt-level = 'z'
+codegen-units = 1
+panic = "abort"

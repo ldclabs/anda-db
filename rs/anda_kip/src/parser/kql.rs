@@ -197,7 +197,7 @@ fn parse_multi_hop_predicate(input: &str) -> VResult<'_, PredTerm> {
 // parse: {m,n} | {m,} | {m}
 fn parse_predicate_quantifier(input: &str) -> VResult<'_, (u16, Option<u16>)> {
     braced_block(ws(cut(alt((
-        // {m,n} 格式
+        // {m,n} format
         map_res(
             (
                 nom::character::complete::u16,
@@ -214,12 +214,12 @@ fn parse_predicate_quantifier(input: &str) -> VResult<'_, (u16, Option<u16>)> {
                 }
             },
         ),
-        // {m,} 格式（无上限）
+        // {m,} format (no upper bound)
         map(
             (nom::character::complete::u16, ws(char(','))),
             |(min, _)| (min, None),
         ),
-        // {m} 格式（精确匹配）
+        // {m} format (exact match)
         map(nom::character::complete::u16, |min| (min, Some(min))),
     )))))
     .parse(input)
@@ -288,7 +288,7 @@ fn parse_filter_expression(input: &str) -> VResult<'_, FilterExpression> {
     parse_logical_or_expression(input)
 }
 
-// 解析逻辑 OR 表达式（最低优先级）
+// Parses logical OR expression (lowest precedence)
 fn parse_logical_or_expression(input: &str) -> VResult<'_, FilterExpression> {
     let (input, left) = parse_logical_and_expression(input)?;
 
@@ -305,7 +305,7 @@ fn parse_logical_or_expression(input: &str) -> VResult<'_, FilterExpression> {
     .parse(input)
 }
 
-// 解析逻辑 AND 表达式
+// Parses logical AND expression
 fn parse_logical_and_expression(input: &str) -> VResult<'_, FilterExpression> {
     let (input, left) = parse_unary_expression(input)?;
 
@@ -322,7 +322,7 @@ fn parse_logical_and_expression(input: &str) -> VResult<'_, FilterExpression> {
     .parse(input)
 }
 
-// 解析一元表达式（NOT）
+// Parses unary expression (NOT)
 fn parse_unary_expression(input: &str) -> VResult<'_, FilterExpression> {
     alt((
         map(preceded(ws(char('!')), parse_primary_expression), |expr| {
@@ -333,20 +333,20 @@ fn parse_unary_expression(input: &str) -> VResult<'_, FilterExpression> {
     .parse(input)
 }
 
-// 解析基本表达式（比较、函数、括号）
+// Parses primary expression (comparison, function, parenthesized)
 fn parse_primary_expression(input: &str) -> VResult<'_, FilterExpression> {
     alt((
-        // 括号表达式
+        // Parenthesized expression
         parenthesized_block(parse_filter_expression),
-        // 函数调用
+        // Function call
         parse_function_expression,
-        // 比较表达式
+        // Comparison expression
         parse_comparison_expression,
     ))
     .parse(input)
 }
 
-// 解析比较表达式
+// Parses comparison expression
 fn parse_comparison_expression(input: &str) -> VResult<'_, FilterExpression> {
     context(
         "FILTER comparison: ?var == value, ?var != value, ?var < value, etc.",
@@ -366,7 +366,7 @@ fn parse_comparison_expression(input: &str) -> VResult<'_, FilterExpression> {
     .parse(input)
 }
 
-// 解析函数表达式
+// Parses function expression
 fn parse_function_expression(input: &str) -> VResult<'_, FilterExpression> {
     map(
         (
@@ -378,7 +378,7 @@ fn parse_function_expression(input: &str) -> VResult<'_, FilterExpression> {
     .parse(input)
 }
 
-// 解析过滤器操作数
+// Parses filter operand
 fn parse_filter_operand(input: &str) -> VResult<'_, FilterOperand> {
     context(
         "FILTER operand: ?variable.path, literal value, or [value, ...] list",
@@ -398,7 +398,7 @@ fn parse_filter_operand(input: &str) -> VResult<'_, FilterOperand> {
     .parse(input)
 }
 
-// 解析比较运算符
+// Parses comparison operator
 fn parse_comparison_operator(input: &str) -> VResult<'_, ComparisonOperator> {
     alt((
         map(tag("=="), |_| ComparisonOperator::Equal),
@@ -411,7 +411,7 @@ fn parse_comparison_operator(input: &str) -> VResult<'_, ComparisonOperator> {
     .parse(input)
 }
 
-// 解析过滤器函数
+// Parses filter function
 fn parse_filter_function(input: &str) -> VResult<'_, FilterFunction> {
     alt((
         map(tag("CONTAINS"), |_| FilterFunction::Contains),
@@ -810,11 +810,11 @@ mod tests {
     #[test]
     fn test_parse_quantified_predicate_path() {
         let test_cases = vec![
-            // {2,5} - 2到5跳
+            // {2,5} - 2 to 5 hops
             (r#"(?a, "follows"{2,5}, ?b)"#, 2, Some(5)),
-            // {3,} - 至少3跳
+            // {3,} - at least 3 hops
             (r#"(?a, "follows"{3,}, ?b)"#, 3, None),
-            // {4} - 精确4跳
+            // {4} - exactly 4 hops
             (r#"(?a, "follows"{4}, ?b)"#, 4, Some(4)),
         ];
 
@@ -873,12 +873,12 @@ mod tests {
     #[test]
     fn test_parse_predicate_path_error_cases() {
         let invalid_inputs = vec![
-            r#"(?a, "follows"{}, ?b)"#,    // 空量词
-            r#"(?a, "follows"{a,b}, ?b)"#, // 非数字量词
+            r#"(?a, "follows"{}, ?b)"#,    // Empty quantifier
+            r#"(?a, "follows"{a,b}, ?b)"#, // Non-numeric quantifier
             r#"(?a, "follows"{5,2}, ?b)"#, // min > max
-            r#"(?a, "follows"{ , }, ?b)"#, // 缺少数字
-            r#"(?a, | "follows", ?b)"#,    // 以 | 开始
-            r#"(?a, "follows" |, ?b)"#,    // 以 | 结束
+            r#"(?a, "follows"{ , }, ?b)"#, // Missing number
+            r#"(?a, | "follows", ?b)"#,    // Starts with |
+            r#"(?a, "follows" |, ?b)"#,    // Ends with |
         ];
 
         for input in invalid_inputs {
@@ -1371,7 +1371,7 @@ mod tests {
         let (_, query) = result.unwrap();
         match &query.where_clauses[1] {
             WhereClause::Filter(filter) => {
-                // 检查这是一个逻辑 AND 表达式
+                // Check that this is a logical AND expression
                 match &filter.expression {
                     FilterExpression::Logical {
                         left,
@@ -1380,7 +1380,7 @@ mod tests {
                     } => {
                         assert_eq!(*operator, LogicalOperator::And);
 
-                        // 左边应该是 CONTAINS 函数
+                        // Left side should be CONTAINS function
                         match left.as_ref() {
                             FilterExpression::Function { func, args } => {
                                 assert_eq!(*func, FilterFunction::Contains);
@@ -1402,7 +1402,7 @@ mod tests {
                             _ => panic!("Expected function expression on left side"),
                         }
 
-                        // 右边应该是比较表达式
+                        // Right side should be comparison expression
                         match right.as_ref() {
                             FilterExpression::Comparison {
                                 left,

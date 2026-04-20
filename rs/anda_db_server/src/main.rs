@@ -88,6 +88,9 @@ use tokio::signal;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 const APP_NAME: &str = env!("CARGO_PKG_NAME");
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 

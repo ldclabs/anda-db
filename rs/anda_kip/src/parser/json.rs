@@ -50,21 +50,21 @@ fn skip_ws_and_comments(input: &str) -> IResult<&str, (), VerboseError<&str>> {
     loop {
         let start_len = remaining.len();
 
-        // 跳过空白字符
+        // Skip whitespace characters
         let trimmed = remaining.trim_start_matches(|c: char| c.is_whitespace());
         remaining = trimmed;
 
-        // 跳过行注释
+        // Skip line comments
         if remaining.starts_with("//") {
             if let Some(newline_pos) = remaining.find('\n') {
                 remaining = &remaining[newline_pos + 1..];
             } else {
-                // 注释到文件末尾
+                // Comment extends to end of file
                 remaining = "";
             }
         }
 
-        // 如果没有更多内容被跳过，退出循环
+        // If nothing was skipped, exit loop
         if remaining.len() == start_len {
             break;
         }

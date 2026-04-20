@@ -2,7 +2,7 @@
 name = "anda_db_tfs"
 description = "A full-text search library using the BM25 ranking algorithm in Rust."
 repository = "https://github.com/ldclabs/anda_db/tree/main/rs/anda_db_tfs"
-version = "0.5.11"
+version = "0.5.12"
 publish = true
 edition.workspace = true
 keywords.workspace = true
@@ -15,7 +15,7 @@ ciborium = { workspace = true }
 dashmap = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
 tantivy-tokenizer-api = { workspace = true }
-tantivy = { workspace = true, optional = true }
+tantivy = { workspace = true, optional = true, features = ["stemmer"] }
 tantivy-jieba = { workspace = true, optional = true }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
