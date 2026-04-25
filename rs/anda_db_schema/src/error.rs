@@ -1,33 +1,42 @@
-//! Error types for schema module
+//! Error types used throughout the `anda_db_schema` crate.
 use thiserror::Error;
 
-/// A type alias for a boxed error that is thread-safe and sendable across threads.
-/// This is commonly used as a return type for functions that can return various error types.
+/// A boxed, thread-safe `std::error::Error`.
+///
+/// This is the canonical error type used by `TryFrom` conversions in this
+/// crate, where the conversion may fail for several unrelated reasons.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Schema related errors
+/// Errors produced when building, validating or (de)serializing a schema,
+/// a field entry, or a field value.
 #[derive(Error, Debug)]
 pub enum SchemaError {
+    /// The schema definition itself is invalid — for example a duplicate
+    /// field name, an out-of-range index, or an incompatible upgrade.
     #[error("Invalid schema: {0}")]
     Schema(String),
 
-    /// Invalid field type error
+    /// A `FieldType` declaration is malformed (e.g. an unsupported nested
+    /// type, an invalid `Map` key type, …).
     #[error("Invalid field type: {0}")]
     FieldType(String),
 
-    /// Invalid field value error
+    /// A `FieldValue` does not satisfy its declared `FieldType`.
     #[error("Invalid field value: {0}")]
     FieldValue(String),
 
-    /// Invalid field name error
+    /// A field name violates the rules enforced by
+    /// [`validate_field_name`](crate::validate_field_name).
     #[error("Invalid field name: {0}")]
     FieldName(String),
 
-    /// Field validation error
+    /// A document fails schema validation — usually because a required
+    /// field is missing or because a field appears that the schema does
+    /// not declare.
     #[error("Field validation failed: {0}")]
     Validation(String),
 
-    /// Serialization error
+    /// CBOR or serde (de)serialization failed.
     #[error("Serialization error: {0}")]
     Serialization(String),
 }

@@ -1,1200 +1,833 @@
-# anda_db_schema Technical Documentation
+# `anda_db_schema` — Technical Reference
 
-**Version**: 0.4
-**Last Updated**: 2026-04-21
+> Type system, schema definitions and document model used across all
+> [Anda DB](https://github.com/ldclabs/anda-db) sub-crates.
+
+|                 |                                                                                          |
+| :-------------- | :--------------------------------------------------------------------------------------- |
+| Crate           | [`anda_db_schema`](../rs/anda_db_schema/)                                                |
+| Version         | `0.4.x`                                                                                  |
+| Companion crate | [`anda_db_derive`](../rs/anda_db_derive/) (re-exported as `AndaDBSchema` / `FieldTyped`) |
 
 ---
 
-## Table of Contents
+## Contents
 
 1. [Overview](#1-overview)
-2. [Field Type System (FieldType)](#2-field-type-system-fieldtype)
-3. [Field Value (FieldValue)](#3-field-value-fieldvalue)
-4. [Field Entry (FieldEntry)](#4-field-entry-fieldentry)
-5. [Schema Definition](#5-schema-definition)
-6. [Document Model](#6-document-model)
-7. [Resource Type](#7-resource-type)
-8. [Derive Macros](#8-derive-macros)
-9. [Serialization and Deserialization](#9-serialization-and-deserialization)
-10. [Error Handling](#10-error-handling)
-11. [API Reference](#11-api-reference)
-12. [Usage Examples](#12-usage-examples)
+2. [Type system](#2-type-system)
+3. [Field values](#3-field-values)
+4. [Field entries](#4-field-entries)
+5. [Schemas and migration](#5-schemas-and-migration)
+6. [Documents](#6-documents)
+7. [Resource type](#7-resource-type)
+8. [Derive macros](#8-derive-macros)
+9. [Serialization](#9-serialization)
+10. [Errors](#10-errors)
+11. [API reference](#11-api-reference)
+12. [Cookbook](#12-cookbook)
 
 ---
 
 ## 1. Overview
 
-### 1.1 Module Responsibilities
+### 1.1 Responsibilities
 
-`anda_db_schema` is the core type system library for AndaDB, responsible for:
+`anda_db_schema` provides the foundational vocabulary of Anda DB:
 
-- Defining all supported field types (`FieldType`)
-- Storing actual field values (`FieldValue`)
-- Describing field metadata (`FieldEntry`)
-- Defining document structure (`Schema`)
-- Document serialization/deserialization
-- Field name validation
+- describe what a field looks like (`FieldType`),
+- carry actual runtime values (`FieldValue`),
+- bundle field metadata (`FieldEntry`),
+- compose them into a versioned `Schema`,
+- and represent persisted records as `Document` / `DocumentOwned`.
 
-### 1.2 Core Concept Hierarchy
+These primitives are designed for two concurrent goals:
 
-```
-Schema (Document Structure Definition)
-├── FieldEntry (Field Definition)
-│   ├── name: String
-│   ├── r#type: FieldType
-│   ├── description: String
-│   ├── unique: bool
-│   └── idx: usize
-├── ...
-│
-├── FieldType (Field Type Enum)
-│   ├── Bool, I64, U64, F64, F32, Bytes, Text, Json, Vector
-│   ├── Array(Vec<FieldType>)
-│   ├── Map(BTreeMap<FieldKey, FieldType>)
-│   └── Option(Box<FieldType>)
-│
-└── FieldValue (Field Value Enum)
-    ├── Bool(bool), I64(i64), U64(u64), F64(f64), F32(f32)
-    ├── Bytes(Vec<u8>), Text(String), Json(serde_json::Value)
-    ├── Vector(Vec<bf16>), Array(Vec<FieldValue>)
-    ├── Map(BTreeMap<FieldKey, FieldValue>)
-    └── Null
-```
+- **Compact, deterministic on-disk format** — values are normalized into
+  CBOR (via [`ciborium`](https://docs.rs/ciborium)), and `FieldEntry`/`Schema`
+  serialize their keys to single letters to keep records small.
+- **Self-describing dynamic typing** — the closed `FieldType` enum lets
+  the database accept arbitrary user structs while still validating every
+  field at write time.
 
-### 1.3 Module Structure
+### 1.2 Conceptual hierarchy
 
 ```
-anda_db_schema/
-├── src/
-│   ├── lib.rs           # Main entry, exports all public types
-│   ├── field.rs         # FieldType, FieldValue, FieldEntry, FieldKey
-│   ├── schema.rs        # Schema definition and SchemaBuilder
-│   ├── document.rs      # Document and DocumentOwned
-│   ├── resource.rs      # Resource type definition
-│   ├── value_serde.rs   # FieldValue serialization/deserialization
-│   └── error.rs         # SchemaError and BoxError
-│
-├── Cargo.toml
-└── README.md
+Schema ─────────────────────────── document layout (versioned)
+ ├── _id : FieldEntry (required, U64, idx = 0, unique)
+ ├── …  : FieldEntry
+ │        ├── name        — unique within a schema
+ │        ├── description — human / LLM facing
+ │        ├── type        — FieldType
+ │        ├── unique      — collection-level uniqueness flag
+ │        └── idx         — stable on-disk key
+ │
+ ├── FieldType  (closed enum)
+ │   ├── primitives        Bool I64 U64 F64 F32 Bytes Text Json Vector
+ │   └── composites        Array(Vec<Ft>)  Map(BTreeMap<FieldKey, Ft>)  Option(Box<Ft>)
+ │
+ └── FieldValue (closed enum)
+     ├── one variant per primitive type
+     ├── Vector(Vec<bf16>)
+     ├── Array(Vec<FieldValue>)
+     ├── Map(BTreeMap<FieldKey, FieldValue>)
+     └── Null   ← absent value of an Option(_) field
+```
+
+### 1.3 Source layout
+
+```text
+rs/anda_db_schema/src/
+├── lib.rs          # crate-level docs, re-exports, validate_field_name
+├── error.rs        # SchemaError, BoxError
+├── field.rs        # FieldType, FieldKey, FieldValue, FieldEntry
+├── schema.rs       # Schema, SchemaBuilder
+├── document.rs     # Document, DocumentOwned
+├── resource.rs     # Resource (predefined schema)
+└── value_serde.rs  # FieldKey/FieldValue Serialize / Deserialize
 ```
 
 ---
 
-## 2. Field Type System (FieldType)
+## 2. Type system
 
-### 2.1 Type Definition
-
-`FieldType` is an enum defining all field types supported by AndaDB:
+### 2.1 `FieldType`
 
 ```rust
 pub enum FieldType {
-    Bool,                    // Boolean value
-    I64,                     // 64-bit signed integer
-    U64,                     // 64-bit unsigned integer
-    F64,                     // 64-bit floating point
-    F32,                     // 32-bit floating point
-    Bytes,                   // Binary data
-    Text,                    // UTF-8 text
-    Json,                    // JSON value
-    Vector,                  // bf16 vector (Vec<bf16>)
-    Array(Vec<FieldType>),   // Array
-    Map(BTreeMap<FieldKey, FieldType>),  // Map
-    Option(Box<FieldType>),   // Optional type
+    // primitives
+    Bool, I64, U64, F64, F32, Bytes, Text, Json, Vector,
+    // composites
+    Array(Vec<FieldType>),
+    Map(BTreeMap<FieldKey, FieldType>),
+    Option(Box<FieldType>),
 }
 ```
 
-### 2.2 Type Aliases
+Aliases:
+
+| Alias    | Concrete type |
+| :------- | :------------ |
+| `Ft`     | `FieldType`   |
+| `Vector` | `Vec<bf16>`   |
+
+### 2.2 Primitive types and their Rust counterparts
+
+| `FieldType` | Rust source types accepted by `AndaDBSchema`                                           |
+| :---------- | :------------------------------------------------------------------------------------- |
+| `Bool`      | `bool`                                                                                 |
+| `I64`       | `i8`, `i16`, `i32`, `i64`, `isize`                                                     |
+| `U64`       | `u8`, `u16`, `u32`, `u64`, `usize`                                                     |
+| `F32`       | `f32`                                                                                  |
+| `F64`       | `f64`                                                                                  |
+| `Bytes`     | `Vec<u8>`, `[u8; N]`, `serde_bytes::*`, `ic_auth_types::ByteBufB64`, `ByteArrayB64<N>` |
+| `Text`      | `String`, `&str`                                                                       |
+| `Json`      | `serde_json::Value`                                                                    |
+| `Vector`    | `Vec<bf16>`, `[bf16; N]`                                                               |
+
+### 2.3 Composite types
+
+#### `Array`
+
+`FieldType::Array` carries a `Vec<FieldType>` whose length determines the
+shape:
+
+| `types.len()` | Semantics                                                                         |
+| :------------ | :-------------------------------------------------------------------------------- |
+| `0`           | Heterogeneous — values are accepted as-is (mostly for back-fill/ad-hoc data).     |
+| `1`           | Homogeneous array. Every element must satisfy the single inner type.              |
+| `N > 1`       | Tuple-like — `values.len()` must equal `N` and elements are matched positionally. |
+
+#### `Map`
+
+`FieldType::Map` is keyed by `FieldKey` (text or bytes). It supports two
+shapes:
+
+- **Wildcard map** — exactly one entry whose key is the wildcard
+  (`"*"` for text, `b"*"` for bytes). Any key is allowed at runtime, and
+  every value must match the wildcard's value type.
+- **Schema-bound map** — the keys present in the type are the only legal
+  keys in the value. Required keys are those whose value type is *not*
+  `Option`.
 
 ```rust
-pub type Ft = FieldType;   // Type alias
-pub type Vector = Vec<bf16>; // Vector type
+// Wildcard text map (≅ HashMap<String, U64>)
+Ft::Map([(TEXT_WILDCARD_KEY.clone(), Ft::U64)].into_iter().collect());
+
+// Schema-bound (only "title" and optional "subtitle" allowed)
+Ft::Map([
+    ("title".into(),    Ft::Text),
+    ("subtitle".into(), Ft::Option(Box::new(Ft::Text))),
+].into_iter().collect());
 ```
 
-### 2.3 Basic Types
+#### `Option`
 
-| FieldType | Rust Type | Description |
-|-----------|-----------|-------------|
-| `Bool` | `bool` | Boolean value |
-| `I64` | `i8`, `i16`, `i32`, `i64`, `isize` | Signed 64-bit integer |
-| `U64` | `u8`, `u16`, `u32`, `u64`, `usize` | Unsigned 64-bit integer |
-| `F64` | `f64` | 64-bit floating point |
-| `F32` | `f32` | 32-bit floating point |
-| `Bytes` | `Vec<u8>`, `[u8; N]`, `Bytes`, `ByteArray` | Byte array |
-| `Text` | `String`, `&str` | UTF-8 encoded text |
-| `Json` | `serde_json::Value`, `Json` | JSON value |
-| `Vector` | `Vec<bf16>`, `[bf16; N]` | bf16 vector |
+`FieldType::Option(Box<Ft>)` is the only way to declare a nullable field.
+A field whose type is *not* `Option` is treated as required by both
+`Schema::validate` and `FieldEntry::validate`.
 
-### 2.4 Composite Types
-
-#### Array (Array)
-
-Homogeneous array, all elements have the same type:
-
-```rust
-// String array
-FieldType::Array(vec![FieldType::Text])
-
-// Multi-dimensional vector (array of arrays)
-FieldType::Array(vec![FieldType::Array(vec![FieldType::F64])])
-```
-
-#### Map (Map)
-
-Key-value pair collection, supports two key types:
-
-```rust
-// Wildcard Map - all values have the same type
-FieldType::Map(BTreeMap::from([("*".into(), FieldType::U64)]))
-// Equivalent to Map<String, U64>
-
-// Bytes key Map
-FieldType::Map(BTreeMap::from([(b"*".as_slice().into(), FieldType::Text)]))
-// Equivalent to Map<Bytes, Text>
-```
-
-#### Option (Optional)
-
-Represents value can be null:
-
-```rust
-FieldType::Option(Box::new(FieldType::Text))
-// Equivalent to Option<String>
-```
-
-### 2.5 Field Name Validation
-
-Field names must satisfy the following rules:
-
-```rust
-pub fn validate_field_name(s: &str) -> Result<(), SchemaError> {
-    // 1. Cannot be empty
-    // 2. Cannot exceed 64 characters
-    // 3. Can only contain lowercase letters, numbers, and underscores
-}
-```
-
-**Valid Examples**:
-- `user_id`
-- `name`
-- `a1`
-- `a_1`
-
-**Invalid Examples**:
-- `UserId` (contains uppercase letters)
-- `user-id` (contains hyphen)
-- `user.id` (contains dot)
-- `user id` (contains space)
-
-### 2.6 FieldKey
-
-Map key type, supports two forms:
+### 2.4 `FieldKey`
 
 ```rust
 pub enum FieldKey {
-    Text(String),    // Text key
-    Bytes(Vec<u8>), // Bytes key
+    Text(String),
+    Bytes(Vec<u8>),
 }
 ```
 
-**Wildcard Keys**:
-```rust
-pub static TEXT_WILDCARD_KEY: LazyLock<FieldKey> = "*".into();
-pub static BYTES_WILDCARD_KEY: LazyLock<FieldKey> = b"*".into();
-```
-
-### 2.7 Type Methods
-
-#### allows_null()
-
-Check if type allows null values:
+Two pre-built constants are exposed for the wildcard convention:
 
 ```rust
-pub fn allows_null(&self) -> bool {
-    matches!(self, FieldType::Option(_))
-}
+pub static TEXT_WILDCARD_KEY:  LazyLock<FieldKey>; // "*"
+pub static BYTES_WILDCARD_KEY: LazyLock<FieldKey>; // b"*"
 ```
 
-#### extract()
+Convertible from `String`, `&str`, `Vec<u8>`, `[u8; N]`, `&[u8]`, and
+`ciborium::Value` (text or bytes).
 
-Extract specified type FieldValue from CBOR value:
+### 2.5 Field name rules
 
-```rust
-pub fn extract(&self, value: Cbor) -> Result<FieldValue, SchemaError>
-```
+`validate_field_name` enforces a strict ASCII vocabulary so that names
+remain stable across all storage backends:
 
-#### validate()
+- non-empty, at most **64 bytes**,
+- only `a`–`z`, `0`–`9`, and `_`.
 
-Validate if FieldValue matches this field type:
+`_id` is a valid field name; it is the **only** name reserved by the
+crate (assigned `idx = 0` and `unique`).
 
-```rust
-pub fn validate(&self, value: &FieldValue) -> Result<(), SchemaError>
-```
+### 2.6 Type-level methods
+
+| Method                   | Purpose                                              |
+| :----------------------- | :--------------------------------------------------- |
+| `FieldType::allows_null` | Returns `true` for `Option(_)` only.                 |
+| `FieldType::extract`     | CBOR → `FieldValue`, requiring CBOR to match `self`. |
+| `FieldType::validate`    | Checks an existing `FieldValue` against `self`.      |
+
+`extract` is type-driven (used when parsing structured input), while
+`FieldValue::try_from` is shape-driven (used when reading untyped CBOR).
 
 ---
 
-## 3. Field Value (FieldValue)
+## 3. Field values
 
-### 3.1 Type Definition
-
-`FieldValue` is an enum storing actual data values:
+### 3.1 `FieldValue`
 
 ```rust
 pub enum FieldValue {
-    Bool(bool),                            // Boolean value
-    I64(i64),                              // Signed 64-bit integer
-    U64(u64),                              // Unsigned 64-bit integer
-    F64(f64),                              // 64-bit floating point
-    F32(f32),                              // 32-bit floating point
-    Bytes(Vec<u8>),                        // Byte array
-    Text(String),                           // Text
-    Json(serde_json::Value),               // JSON value
-    Vector(Vec<bf16>),                     // bf16 vector
-    Array(Vec<FieldValue>),               // Array
-    Map(BTreeMap<FieldKey, FieldValue>),  // Map
-    Null,                                  // Null value
+    Bool(bool),  I64(i64),  U64(u64),  F64(f64),  F32(f32),
+    Bytes(Vec<u8>),  Text(String),  Json(serde_json::Value),
+    Vector(Vec<bf16>),
+    Array(Vec<FieldValue>),
+    Map(BTreeMap<FieldKey, FieldValue>),
+    Null,
 }
 ```
 
-### 3.2 Type Alias
+Alias: `Fv = FieldValue`.
+
+`FieldValue: PartialEq` is meaningful because `FieldValue::f64_from` /
+`f32_from` reject `NaN` when extracting from CBOR.
+
+### 3.2 Building values
+
+#### From owned Rust values
+
+`From` is implemented for every primitive plus the obvious collection
+types:
+
+| `From<T>`                                            | Result variant    |
+| :--------------------------------------------------- | :---------------- |
+| `bool` / `i64` / `u64` / `f64` / `f32`               | one-to-one        |
+| `Vec<u8>`                                            | `Bytes`           |
+| `String`                                             | `Text`            |
+| `serde_json::Value`                                  | `Json`            |
+| `Vec<bf16>`                                          | `Vector`          |
+| `Vec<T>` (where `T: Into<FieldValue>`)               | `Array`           |
+| `BTreeSet<T>`, `HashSet<T>`                          | `Array`           |
+| `BTreeMap<K, V>`, `HashMap<K, V>`, `serde_json::Map` | `Map`             |
+| `FieldKey`                                           | `Text` or `Bytes` |
+
+#### From any `Serialize` value
 
 ```rust
-pub type Fv = FieldValue;  // Field value type alias
+let fv = Fv::serialized(&my_struct, Some(&Ft::Array(vec![Ft::Vector])))?;
 ```
 
-### 3.3 Type Conversions
+`serialized` first encodes through CBOR, then either calls
+`FieldType::extract` (when a type hint is given) or falls back to
+`FieldValue::try_from`. The hint is required when sub-values cannot be
+inferred from CBOR alone — most notably for `Vector` (whose CBOR shape is
+indistinguishable from `Array<U64>`).
 
-#### From Trait Implementation
+### 3.3 Reading values
 
-The following types can be directly converted to FieldValue:
+`TryFrom` is implemented for every primitive both by-value and by
+reference, plus several collection forms:
+
+| Target                                 | Source variant                          |
+| :------------------------------------- | :-------------------------------------- |
+| `bool` / `i64` / `u64` / `f64` / `f32` | matching primitive                      |
+| `Vec<u8>` / `[u8; N]`                  | `Bytes`                                 |
+| `String` / `&str`                      | `Text`                                  |
+| `serde_json::Value`                    | `Json`                                  |
+| `Vec<bf16>` / `[bf16; N]`              | `Vector`                                |
+| `Vec<T>`                               | `Array` (when `T: TryFrom<FieldValue>`) |
+| `BTreeMap<FieldKey, T>`                | `Map`                                   |
+
+For arbitrary `DeserializeOwned` types, use:
 
 ```rust
-impl From<bool> for FieldValue
-impl From<i64> for FieldValue
-impl From<u64> for FieldValue
-impl From<f64> for FieldValue
-impl From<f32> for FieldValue
-impl From<Vec<u8>> for FieldValue
-impl From<String> for FieldValue
-impl From<Json> for FieldValue
-impl From<Vec<bf16>> for FieldValue
-
-// Collection types
-impl<T> From<Vec<T>> where T: Into<FieldValue>
-impl<T> From<BTreeSet<T>> where T: Into<FieldValue>
-impl<T> From<HashSet<T>> where T: Into<FieldValue>
-
-// Map types
-impl<K, V> From<BTreeMap<K, V>> where K: Into<FieldKey>, V: Into<FieldValue>
-impl<K, V> From<HashMap<K, V>> where K: Into<FieldKey>, V: Into<FieldValue>
+let user: MyUser = fv.deserialized()?;
 ```
 
-#### TryFrom Trait Implementation
+`deserialized` round-trips through CBOR and therefore handles every type
+serde can deserialize.
 
-The following types can be converted from FieldValue back to the original type:
+### 3.4 Convenience accessors
+
+`FieldValue::get_field_as<'a, T>(&'a self, key: &FieldKey) -> Option<&'a T>`
+shortcuts the `Fv::Map(_) → BTreeMap::get → TryFrom` chain when reading a
+nested map.
+
+### 3.5 Vector helpers
 
 ```rust
-impl TryFrom<FieldValue> for bool
-impl TryFrom<FieldValue> for i64
-impl TryFrom<FieldValue> for u64
-impl TryFrom<FieldValue> for f64
-impl TryFrom<FieldValue> for f32
-impl TryFrom<FieldValue> for Vec<u8>
-impl TryFrom<FieldValue> for [u8; N]  // Fixed-size array
-impl TryFrom<FieldValue> for String
-impl TryFrom<FieldValue> for Json
-impl TryFrom<FieldValue> for Vec<bf16>
-impl TryFrom<FieldValue> for [bf16; N]  // Fixed-size array
-
-// Collection types
-impl<T> TryFrom<FieldValue> for Vec<T> where T: TryFrom<FieldValue>
-impl<T> TryFrom<FieldValue> for BTreeMap<FieldKey, T>
+pub fn vector_from_f32(v: Vec<f32>) -> Vector;
+pub fn vector_from_f64(v: Vec<f64>) -> Vector;
 ```
 
-### 3.4 CBOR Conversion
-
-FieldValue can convert to/from CBOR format:
-
-```rust
-impl From<FieldValue> for Cbor
-
-impl TryFrom<Cbor> for FieldValue {
-    fn try_from(value: Cbor) -> Result<Self, SchemaError>
-}
-```
-
-**Conversion Rules**:
-- `FieldValue::Bool` ↔ `Cbor::Bool`
-- `FieldValue::I64/U64` ↔ `Cbor::Integer`
-- `FieldValue::F64/F32` ↔ `Cbor::Float`
-- `FieldValue::Bytes` ↔ `Cbor::Bytes`
-- `FieldValue::Text` ↔ `Cbor::Text`
-- `FieldValue::Vector` ↔ `Cbor::Array` (bf16 converted to u16 bits)
-- `FieldValue::Array` ↔ `Cbor::Array`
-- `FieldValue::Map` ↔ `Cbor::Map`
-- `FieldValue::Null` ↔ `Cbor::Null`
-
-### 3.5 JSON Serialization
-
-FieldValue implements full Serialize/Deserialize:
-
-```rust
-impl Serialize for FieldValue {
-    // Text → string
-    // Bytes → Base64 encoded (human-readable mode) or byte array
-    // Vector → u16 bits array
-    // Array → JSON array
-    // Map → JSON object
-}
-```
-
-**Bytes Base64 Encoding Example**:
-```json
-{"Kg==":"Kg=="}  // Base64 encoded {"*":"*}
-```
-
-### 3.6 Convenience Methods
-
-#### serialized()
-
-Convert any serializable type to FieldValue:
-
-```rust
-pub fn serialized<T: Serialize>(
-    value: &T,
-    ft: Option<&FieldType>
-) -> Result<Self, SchemaError>
-```
-
-#### deserialized()
-
-Deserialize FieldValue to specified type:
-
-```rust
-pub fn deserialized<T: DeserializeOwned>(self) -> Result<T, SchemaError>
-```
-
-#### get_field_as()
-
-Get field from Map-type FieldValue:
-
-```rust
-pub fn get_field_as<'a, T: ?Sized>(&'a self, field: &FieldKey) -> Option<&'a T>
-where
-    &'a T: TryFrom<&'a FieldValue>
-```
+Both perform lossy `bf16::from_f32` / `bf16::from_f64` element-wise.
 
 ---
 
-## 4. Field Entry (FieldEntry)
+## 4. Field entries
 
-### 4.1 Type Definition
-
-`FieldEntry` describes complete metadata for a field:
+### 4.1 Definition
 
 ```rust
 pub struct FieldEntry {
-    name: String,           // Field name
-    r#type: FieldType,      // Field type
-    description: String,    // Field description (for LLM understanding)
-    unique: bool,          // Whether unique
-    idx: usize,            // Field index (for storage optimization)
+    name: String,        // serialized as "n"
+    description: String, // serialized as "d"
+    r#type: FieldType,   // serialized as "t"
+    unique: bool,        // serialized as "u"
+    idx: usize,          // serialized as "i"
 }
 ```
 
-### 4.2 Serialization Format
+Long-form keys (`name`, `description`, `type`, `unique`, `index`) are
+accepted as `serde(alias = …)` for compatibility.
 
-Field names are abbreviated in serialization to save storage space:
-
-```rust
-pub struct FieldEntry {
-    #[serde(rename = "n", alias = "name")]
-    name: String,
-
-    #[serde(rename = "d", alias = "description")]
-    description: String,
-
-    #[serde(rename = "t", alias = "type")]
-    r#type: FieldType,
-
-    #[serde(rename = "u", alias = "unique")]
-    unique: bool,
-
-    #[serde(rename = "i", alias = "index")]
-    idx: usize,
-}
-```
-
-### 4.3 Builder Methods
+### 4.2 Builder
 
 ```rust
-// Create basic field entry
-let entry = FieldEntry::new("user_name".to_string(), FieldType::Text)?;
-
-// Set description
-entry.with_description("User's display name".to_string())
-
-// Mark as unique
-entry.with_unique()
-
-// Set index
-entry.with_idx(1)
+let entry = FieldEntry::new("title".into(), Ft::Text)?
+    .with_description("Article title".into())
+    .with_unique();          // optional
+// .with_idx(N)              ← rarely set by hand; the SchemaBuilder
+//                              assigns indexes automatically.
 ```
 
-### 4.4 Accessor Methods
+`new` runs `validate_field_name` immediately.
 
-```rust
-pub fn name(&self) -> &str           // Get field name
-pub fn r#type(&self) -> &FieldType  // Get field type
-pub fn required(&self) -> bool       // Whether required field
-pub fn unique(&self) -> bool         // Whether unique
-pub fn idx(&self) -> usize           // Get field index
-```
+### 4.3 Accessors
 
-### 4.5 Validation Methods
+| Method       | Returns                                |
+| :----------- | :------------------------------------- |
+| `name()`     | `&str`                                 |
+| `r#type()`   | `&FieldType`                           |
+| `required()` | `true` iff the type is not `Option(_)` |
+| `unique()`   | `bool`                                 |
+| `idx()`      | `usize`                                |
 
-#### extract()
+### 4.4 Mutators
 
-Extract and validate field value from CBOR value:
+| Method          | Purpose                                                            |
+| :-------------- | :----------------------------------------------------------------- |
+| `with_idx(idx)` | Builder-style; consumes self.                                      |
+| `set_idx(idx)`  | Mutates in place; used by `Schema::upgrade_with` to avoid cloning. |
 
-```rust
-pub fn extract(&self, val: Cbor, validate: bool) -> Result<FieldValue, SchemaError>
-```
+### 4.5 Validation
 
-#### validate()
+`FieldEntry::extract(cbor, validate)` chains `FieldType::extract` with an
+optional `validate` step, and `FieldEntry::validate` enforces:
 
-Validate if FieldValue meets this field's constraints:
-
-```rust
-pub fn validate(&self, value: &FieldValue) -> Result<(), SchemaError>
-```
-
-**Validation Rules**:
-1. Required fields (`FieldType::Option` excluded) cannot be `Null`
-2. Value type must match `FieldType`
-3. Array length must match declared type
-4. Map keys must all exist in type definition
+1. `Null` is only legal for `Option(_)` types.
+2. The value must satisfy `FieldType::validate`.
 
 ---
 
-## 5. Schema Definition
+## 5. Schemas and migration
 
-### 5.1 Type Definition
-
-`Schema` defines complete document structure:
+### 5.1 Definition
 
 ```rust
 pub struct Schema {
-    idx: BTreeSet<usize>,                    // Field index set
-    fields: BTreeMap<String, FieldEntry>,    // Field name → Field entry
-    version: u64,                           // Schema version number
+    idx:     BTreeSet<usize>,
+    fields:  BTreeMap<String, FieldEntry>,
+    version: u64,
 }
 ```
 
-### 5.2 Schema Characteristics
+Invariants enforced both by `SchemaBuilder` and by deserialization:
 
-- **ID Field Reserved**: `_id` field is mandatory, type must be `U64`, index is 0
-- **Max Field Count**: `u16::MAX + 1` (65536 fields)
-- **Index Compression**: Fields stored by index instead of name, saves space
-- **Version Support**: Supports schema evolution
+- `_id` is present, `U64`, `unique`, with `idx == 0`.
+- All field names pass `validate_field_name`.
+- All `idx` values are unique and `≤ u16::MAX` (so a schema can host
+  `u16::MAX + 1 = 65 536` fields including `_id`).
 
-### 5.3 SchemaBuilder
-
-Build Schema using Builder pattern:
+### 5.2 `SchemaBuilder`
 
 ```rust
 let schema = Schema::builder()
-    .with_version(1)  // Optional: set version number
-    .add_field(
-        FieldEntry::new("title".to_string(), FieldType::Text)?
-            .with_description("Document title")
-    )?
-    .add_field(
-        FieldEntry::new("content".to_string(), FieldType::Text)?
-            .with_description("Document content")
-    )?
+    .with_version(1)                                     // optional
+    .add_field(FieldEntry::new("title".into(), Ft::Text)?)?
+    .add_field(FieldEntry::new("views".into(), Ft::U64)?)?
+    .with_resource("thumbnail", /* required = */ false)? // optional helper
     .build()?;
 ```
 
-**Automatically Added Fields**:
-```rust
-Schema::builder() automatically adds:
-- _id: U64 (unique, index=0, description="\"_id\" is a u64 field, used as an internal unique identifier")
-```
+`add_field` assigns an `idx` automatically (`1`, `2`, … in insertion
+order). `_id` is added by `SchemaBuilder::new` with `idx = 0`.
 
-### 5.4 Schema Methods
+### 5.3 Inspection API
 
 ```rust
-pub fn version(&self) -> u64
-pub fn len(&self) -> usize
-pub fn is_empty(&self) -> bool
-pub fn get_field(&self, name: &str) -> Option<&FieldEntry>
-pub fn get_field_or_err(&self, name: &str) -> Result<&FieldEntry, SchemaError>
-pub fn iter(&self) -> impl Iterator<Item = &FieldEntry>
-pub fn validate(&self, values: &IndexedFieldValues) -> Result<(), SchemaError>
+schema.version()                  // u64
+schema.len() / is_empty()
+schema.get_field(name)            // Option<&FieldEntry>
+schema.get_field_or_err(name)?    // Result<&FieldEntry, SchemaError>
+schema.iter()                     // impl Iterator<Item = &FieldEntry>
+schema.validate(&values)?
 ```
 
-### 5.5 Schema Evolution (upgrade_with)
+`validate` checks both that every key in `values` has a matching field
+*and* that every required field appears.
 
-Use `upgrade_with` for gradual migration when application code changes but data already exists:
+### 5.4 Versioning and migration
+
+Schemas are versioned to support **gradual** migration. The new schema is
+typically built from code (`#[derive(AndaDBSchema)]`) with sequential
+indexes; the old schema is loaded from storage with whatever indexes were
+assigned before.
 
 ```rust
-pub fn upgrade_with(&mut self, old: &Schema) -> Result<(), SchemaError>
+new_schema.upgrade_with(&old_schema)?;
 ```
 
-**Migration Rules**:
-1. New Schema version must be greater than old version
-2. Existing fields inherit old index, type cannot change
-3. New fields assigned smallest available index
-4. Deleted field indices are never reused
+`upgrade_with` rules:
 
-**Example**:
+1. `new.version > old.version` is required.
+2. **Existing fields** keep their old `idx`; their `FieldType` must be
+   unchanged (type changes are explicitly rejected).
+3. **New fields** get fresh indexes starting at `max(old.idx) + 1`, so
+   the indexes of removed fields are *never* reused.
 
-```rust
-// Old Schema v1: _id(0), name(1), age(2)
-let old = Schema::builder()
-    .with_version(1)
-    .add_field(Fe::new("name".to_string(), Ft::Text)?)?
-    .add_field(Fe::new("age".to_string(), Ft::Option(Box::new(Ft::U64)))?)?
-    .build()?;
+This guarantees that any record persisted under the old schema can still
+be read after the upgrade.
 
-// New Schema v2: _id, name, age, email
-let mut new = Schema::builder()
-    .with_version(2)
-    .add_field(Fe::new("name".to_string(), Ft::Text)?)?
-    .add_field(Fe::new("age".to_string(), Ft::Option(Box::new(Ft::U64)))?)?
-    .add_field(Fe::new("email".to_string(), Ft::Option(Box::new(Ft::Text)))?)?
-    .build()?;
-
-// Execute migration
-new.upgrade_with(&old)?;
-
-// Result: _id(0), name(1), age(2), email(3)
-// Note: name and age keep their original indices
-```
-
-### 5.6 IndexedFieldValues
-
-Container for storing document field values, using field index as key:
+### 5.5 `IndexedFieldValues`
 
 ```rust
 pub type IndexedFieldValues = BTreeMap<usize, FieldValue>;
 ```
 
+The canonical container of a document's payload — keyed by `idx`, not
+by name.
+
 ---
 
-## 6. Document Model
+## 6. Documents
 
-### 6.1 Document Structure
+### 6.1 Two flavours
 
 ```rust
-pub struct Document {
-    fields: IndexedFieldValues,   // Field value collection
-    schema: Arc<Schema>,         // Reference to Schema
-}
-
-pub struct DocumentOwned {
-    pub fields: IndexedFieldValues,  // Field value collection (no Schema reference)
-}
-
-pub type DocumentId = u64;  // Document ID type alias
+pub struct Document      { fields: IndexedFieldValues, schema: Arc<Schema> }
+pub struct DocumentOwned { pub fields: IndexedFieldValues } // serializable
+pub type   DocumentId = u64;
 ```
 
-### 6.2 Creating Documents
+`Document` is the runtime API (it can validate field-by-field against
+its schema). `DocumentOwned` is the on-disk and over-the-wire shape; its
+serialized form is `{ "f": IndexedFieldValues }` — a single short key
+to keep records compact.
+
+### 6.2 Construction
 
 ```rust
-// Create empty document from Schema
-let doc = Document::new(schema.clone());
+// Empty:
+let mut doc = Document::new(schema.clone());
 
-// Convert from DocumentOwned
-let doc = Document::try_from_doc(schema.clone(), doc_owned)?;
+// From an existing payload (validated against the schema):
+let doc = Document::try_from_doc(schema.clone(), owned_doc)?;
 
-// Convert from any serializable type
+// From any Serialize value (validated):
 let doc = Document::try_from(schema.clone(), &my_struct)?;
 ```
 
-### 6.3 Accessing Fields
+### 6.3 Reading
 
 ```rust
-// Get document ID
-doc.id()
-
-// Get field value
-doc.get_field("name")           // Option<&Fv>
-doc.get_field_or_err("name")?  // Result<&Fv, SchemaError>
-
-// Get and deserialize
-doc.get_field_as::<String>("name")?
+doc.id();                                     // DocumentId
+doc.get_field("title");                       // Option<&Fv>
+doc.get_field_or_err("title")?;               // Result<&Fv, SchemaError>
+let title: String = doc.get_field_as("title")?;
+let user:  TestUser = doc.try_into()?;        // consumes the Document
 ```
 
-### 6.4 Modifying Fields
+`try_into` rebuilds a CBOR map from the document — substituting CBOR
+`Null` for absent optional fields — and lets serde do the rest.
+
+### 6.4 Mutating
 
 ```rust
-// Set field value
-doc.set_field("name", Fv::Text("John".to_string()))?;
-doc.set_field("age", Fv::U64(30))?;
-
-// Set and serialize
-doc.set_field_as("name", &"John".to_string())?;
-doc.set_field_as("age", &30u64)?;
-
-// Remove field
-doc.remove_field("name");  // Option<Fv>
-
-// Update document
-doc.set_doc(doc_owned)?;
+doc.set_id(42);
+doc.set_field("title", Fv::Text("Hi".into()))?;       // checks the type
+doc.set_field_as("views", &123u64)?;                  // serialize-then-store
+doc.remove_field("title");                            // Option<Fv>
+doc.set_doc(owned_doc)?;                              // bulk replace
 ```
 
-### 6.5 Type Conversions
+### 6.5 Conversion
 
 ```rust
-// Document → DocumentOwned
-let owned: DocumentOwned = doc.into();
-
-// Document → custom type
-let my_struct: MyStruct = doc.try_into()?;
+let owned: DocumentOwned = doc.into(); // drops the Schema reference
 ```
 
-### 6.6 Serialization
-
-Document implements Serialize trait, output format:
+### 6.6 Serialization shape
 
 ```json
-{
-  "f": {
-    "0": 99,
-    "1": "John Doe",
-    "2": 30
-  }
-}
+{ "f": { "0": 42, "1": "Hi", "2": 123 } }
 ```
+
+Top-level keys are field `idx` values rendered as decimal strings (this
+is JSON's only key form; CBOR uses native integer keys).
 
 ---
 
-## 7. Resource Type
+## 7. Resource type
 
-### 7.1 Type Definition
-
-`Resource` is a predefined Schema type for storing external resource references for AI Agents:
+`Resource` is a predefined struct describing an external asset — useful
+both as a stand-alone collection and as an embedded sub-document.
 
 ```rust
-#[derive(Debug, Default, Clone, Serialize, Deserialize, FieldTyped, PartialEq, AndaDBSchema)]
+#[derive(AndaDBSchema, FieldTyped, Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct Resource {
-    pub _id: u64,                              // Unique identifier
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tags: Option<Vec<String>>,            // Type tags
-
-    pub name: String,                          // Resource name
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,          // Description
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub uri: Option<String>,                  // URI
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mime_type: Option<String>,           // MIME type
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub blob: Option<ByteBufB64>,            // Binary data
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub size: Option<u64>,                    // Size in bytes
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hash: Option<ByteArrayB64<32>>,     // SHA3-256 hash
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<Map<String, Json>>, // Metadata
+    pub _id:         u64,                          // primary key
+    pub tags:        Vec<String>,                  // type tags, e.g. ["text", "md"]
+    pub name:        String,                       // human-readable name
+    pub description: Option<String>,
+    pub uri:         Option<String>,
+    pub mime_type:   Option<String>,
+    pub blob:        Option<ByteBufB64>,           // inline payload
+    pub size:        Option<u64>,
+    #[unique] pub hash: Option<ByteArrayB64<32>>,  // SHA3-256
+    pub metadata:    Option<Map<String, Json>>,
 }
 ```
 
-### 7.2 Using Resource Fields
-
-Use Resource in custom Schema:
+Embed it in any other schema:
 
 ```rust
 #[derive(AndaDBSchema)]
 struct Article {
     _id: u64,
     title: String,
-    thumbnail: Option<Resource>,  // Optional thumbnail resource
+    thumbnail: Option<Resource>, // expands to FieldType::Option(Resource::field_type())
 }
 ```
+
+The `Schema::with_resource(name, required)` builder helper does the same
+thing without needing a derive.
 
 ---
 
-## 8. Derive Macros
+## 8. Derive macros
 
-### 8.1 AndaDBSchema
-
-Automatically generate Schema definition from Rust struct:
+Both macros are re-exported from `anda_db_schema`:
 
 ```rust
-#[derive(AndaDBSchema)]
-struct MyDoc {
-    _id: u64,                    // Auto-recognized as ID field
-    title: String,              // → Text
-    content: String,            // → Text
-    age: Option<u64>,          // → Option(U64)
-    tags: Vec<String>,          // → Array(Text)
-    embedding: Vec<bf16>,     // → Vector
-    metadata: HashMap<String, Json>, // → Map(String, Json)
-}
+use anda_db_schema::{AndaDBSchema, FieldTyped};
 ```
 
-### 8.2 FieldTyped
+### 8.1 `AndaDBSchema`
 
-Generate `field_type()` method:
+Generates `MyStruct::schema() -> Result<Schema, SchemaError>`. The
+struct **must** declare `_id: u64` so the generated schema is valid.
 
-```rust
-#[derive(FieldTyped)]
-struct MyStruct {
-    name: String,
-    count: u64,
-}
+### 8.2 `FieldTyped`
 
-// Generated code:
-impl MyStruct {
-    pub fn field_type() -> FieldType {
-        FieldType::Map(vec![
-            ("name".into(), FieldType::Text),
-            ("count".into(), FieldType::U64),
-        ].into_iter().collect())
-    }
-}
-```
+Generates `MyStruct::field_type() -> FieldType`. The result is a
+`FieldType::Map` whose entries map `field_name` → `FieldType`. This is
+how nested user structs participate in schemas: `AndaDBSchema` calls the
+derived `field_type()` of any sub-struct it encounters.
 
 ### 8.3 Attributes
 
-#### #[field_type = "TypeName"]
+| Attribute                         | Effect                                            |
+| :-------------------------------- | :------------------------------------------------ |
+| `#[field_type = "FieldTypeExpr"]` | Override the inferred type (see below).           |
+| `#[unique]`                       | Mark a field as unique (requires `AndaDBSchema`). |
+| `#[serde(rename = "newName")]`    | Use `newName` as the schema field name.           |
+| `///` doc comment                 | Captured as the field's `description`.            |
 
-Override inferred type:
-
-```rust
-#[derive(AndaDBSchema)]
-struct MyDoc {
-    _id: u64,
-    #[field_type = "Bytes"]    // Override to Bytes type
-    custom_id: [u8; 16],
-}
-```
-
-#### #[unique]
-
-Mark field as unique:
+`#[field_type = "..."]` accepts a Rust expression that resolves to a
+`FieldType`, e.g.:
 
 ```rust
-#[derive(AndaDBSchema)]
-struct MyDoc {
-    _id: u64,
-    #[unique]
-    email: String,  // Unique field
-}
+#[field_type = "Bytes"]
+some_id: [u8; 16],
+
+#[field_type = "Array(vec![FieldType::F32])"]
+embedding_f32: Vec<f32>,
 ```
 
-#### #[serde(rename = "name")]
+### 8.4 Type inference table
 
-Use different Schema field name:
-
-```rust
-#[derive(AndaDBSchema, Serialize, Deserialize)]
-struct MyDoc {
-    _id: u64,
-    #[serde(rename = "userName")]
-    user_name: String,  // Named "userName" in Schema
-}
-```
-
-#### Doc Comments
-
-Doc comments automatically become field descriptions:
-
-```rust
-#[derive(AndaDBSchema)]
-struct MyDoc {
-    /// User's display name
-    name: String,  // description = "User's display name"
-}
-```
-
-### 8.4 Type Mapping Table
-
-| Rust Type | FieldType |
-|-----------|-----------|
-| `bool` | `Bool` |
-| `i8`, `i16`, `i32`, `i64`, `isize` | `I64` |
-| `u8`, `u16`, `u32`, `u64`, `usize` | `U64` |
-| `f32` | `F32` |
-| `f64` | `F64` |
-| `String`, `&str` | `Text` |
-| `Vec<u8>`, `[u8; N]`, `Bytes` | `Bytes` |
-| `Vec<bf16>`, `[bf16; N]` | `Vector` |
-| `serde_json::Value` | `Json` |
-| `Vec<T>`, `HashSet<T>`, `BTreeSet<T>` | `Array(T)` |
-| `HashMap<String, V>`, `BTreeMap<String, V>` | `Map(*, V)` |
-| `HashMap<Bytes, V>`, `BTreeMap<Bytes, V>` | `Map(b*, V)` |
-| `Option<T>` | `Option(T)` |
-| Custom struct | Recursively use its `field_type()` |
+| Rust source                                                   | Inferred `FieldType`                  |
+| :------------------------------------------------------------ | :------------------------------------ |
+| `bool`                                                        | `Bool`                                |
+| `i8` … `i64`, `isize`                                         | `I64`                                 |
+| `u8` … `u64`, `usize`                                         | `U64`                                 |
+| `f32` / `f64`                                                 | `F32` / `F64`                         |
+| `String`, `&str`                                              | `Text`                                |
+| `Vec<u8>`, `[u8; N]`, `Bytes`, `ByteArrayB64`, `ByteBufB64`   | `Bytes`                               |
+| `Vec<bf16>`, `[bf16; N]`                                      | `Vector`                              |
+| `serde_json::Value`                                           | `Json`                                |
+| `Vec<T>`, `HashSet<T>`, `BTreeSet<T>`                         | `Array(vec![T])`                      |
+| `HashMap<K, V>`, `BTreeMap<K, V>`, `Map<K, V>` (`K = String`) | `Map({"*": V})`                       |
+| `HashMap<K, V>` etc. with byte-string keys                    | `Map({b"*": V})`                      |
+| `Option<T>`                                                   | `Option(T)`                           |
+| any other path `Foo`                                          | `Foo::field_type()` (must be derived) |
 
 ---
 
-## 9. Serialization and Deserialization
+## 9. Serialization
 
-### 9.1 CBOR Format
+### 9.1 Two formats, one model
 
-Internal storage uses CBOR format with compact binary representation:
+`FieldValue` and `FieldKey` have hand-written `Serialize` /
+`Deserialize` impls that branch on `is_human_readable()`:
 
-```rust
-use ciborium::{cbor, from_reader, into_writer};
+|                             | Human-readable (JSON, …)              | Binary (CBOR, MessagePack, …) |
+| :-------------------------- | :------------------------------------ | :---------------------------- |
+| `Bytes` / `FieldKey::Bytes` | URL-safe Base64 string                | native byte string            |
+| `Vector`                    | array of `u16` (bf16 bits)            | same                          |
+| `Json`                      | JSON delegated to `serde_json::Value` | same                          |
+| `Null`                      | `null` / unit                         | `null`                        |
 
-// Serialize
-let field_value = Fv::Array(vec![Fv::U64(1), Fv::Text("hello".to_string())]);
-let mut serialized = Vec::new();
-into_writer(&field_value, &mut serialized).unwrap();
-// Output: 82016568656c6c6f
+When deserializing in human-readable mode, a textual value that
+successfully decodes as URL-safe Base64 is *promoted* to `Bytes`. This
+matches the convention used by `ic_auth_types::ByteBufB64`.
 
-// Deserialize
-let deserialized: Fv = from_reader(serialized.as_slice()).unwrap();
+### 9.2 CBOR examples
+
+```
+Fv::Null                  → f6
+Fv::Bool(true)            → f5
+Fv::U64(42)               → 18 2a
+Fv::I64(-42)              → 38 29
+Fv::Text("hello")         → 65 68 65 6c 6c 6f
+Fv::Bytes([1,2,3,4])      → 44 01 02 03 04
+Fv::Array([U64(1), Text("hello")])
+                          → 82 01 65 68 65 6c 6c 6f
 ```
 
-### 9.2 JSON Format
+### 9.3 Full round-trip with type hints
 
-Used for human-readable serialization and API transmission:
-
-```rust
-use serde_json;
-
-// Serialize
-let field_value = Fv::Text("hello".to_string());
-let json = serde_json::to_string(&field_value).unwrap();
-// Output: "hello"
-
-// Deserialize
-let deserialized: Fv = serde_json::from_str(&json).unwrap();
-```
-
-### 9.3 Bytes Base64 Encoding
-
-In JSON human-readable mode, Bytes type uses Base64 encoding:
+CBOR alone cannot distinguish a `Vector` from an `Array<U64>` (both are
+sequences of small integers), so when serializing arbitrary user data
+into a `FieldValue` you can supply a `FieldType` hint:
 
 ```rust
-let bytes = Fv::Bytes(vec![1, 2, 3, 4]);
-let json = serde_json::to_string(&bytes).unwrap();
-// Output: "AQIDBA=="
+let vv = vec![[bf16::from_f32(1.0), bf16::from_f32(1.1)]];
 
-let decoded: Fv = serde_json::from_str(&json).unwrap();
+let fv = Fv::serialized(&vv, None)?;
+// → Array([Array([U64(16256), U64(16269)])])
+
+let fv = Fv::serialized(&vv, Some(&Ft::Array(vec![Ft::Vector])))?;
+// → Array([Vector([1.0, 1.1])])
 ```
 
-### 9.4 Vector Serialization
-
-bf16 vector serializes to u16 bits array:
-
-```rust
-let vector = Fv::Vector(vec![bf16::from_f32(1.0), bf16::from_f32(1.1)]);
-let cbor: Cbor = vector.clone().into();
-// Stored as [16256, 16269] (各自的 bits)
-
-// Deserialize
-let restored: Fv = FieldValue::try_from(cbor).unwrap();
-```
+Both representations deserialize back into `Vec<[bf16; 2]>` thanks to
+`half`'s serde impl, but only the typed form preserves the original
+shape on disk.
 
 ---
 
-## 10. Error Handling
-
-### 10.1 SchemaError Enum
+## 10. Errors
 
 ```rust
 pub enum SchemaError {
-    #[error("Invalid schema: {0}")]
-    Schema(String),
-
-    #[error("Invalid field type: {0}")]
-    FieldType(String),
-
-    #[error("Invalid field value: {0}")]
-    FieldValue(String),
-
-    #[error("Invalid field name: {0}")]
-    FieldName(String),
-
-    #[error("Field validation failed: {0}")]
-    Validation(String),
-
-    #[error("Serialization error: {0}")]
-    Serialization(String),
+    Schema(String),       // schema-level invariant violated
+    FieldType(String),    // malformed FieldType
+    FieldValue(String),   // value does not satisfy its FieldType
+    FieldName(String),    // illegal field name
+    Validation(String),   // document fails Schema::validate
+    Serialization(String) // CBOR / serde error
 }
-```
 
-### 10.2 BoxError Type Alias
-
-```rust
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 ```
 
-### 10.3 Common Error Scenarios
-
-| Scenario | Error Type |
-|----------|------------|
-| Invalid field name | `FieldName` |
-| Type mismatch | `FieldType` |
-| Value validation failed | `FieldValue` |
-| Missing required field | `Validation` |
-| CBOR serialization failed | `Serialization` |
-| Invalid Schema structure | `Schema` |
+`BoxError` is the error type returned by all `TryFrom<FieldValue>` impls.
 
 ---
 
-## 11. API Reference
+## 11. API reference
 
-### 11.1 Type Aliases
+### 11.1 Type aliases (re-exported from the crate root)
+
+| Alias                | Concrete type                              |
+| :------------------- | :----------------------------------------- |
+| `Ft`                 | `FieldType`                                |
+| `Fv`                 | `FieldValue`                               |
+| `Fe`                 | `FieldEntry`                               |
+| `Cbor`               | `ciborium::Value`                          |
+| `Json`               | `serde_json::Value`                        |
+| `Map<K, V>`          | `serde_json::Map<K, V>`                    |
+| `Vector`             | `Vec<bf16>`                                |
+| `DocumentId`         | `u64`                                      |
+| `IndexedFieldValues` | `BTreeMap<usize, FieldValue>`              |
+| `BoxError`           | `Box<dyn std::error::Error + Send + Sync>` |
+
+### 11.2 Public types
+
+| Type            | Notes                                      |
+| :-------------- | :----------------------------------------- |
+| `FieldType`     | Closed type enum.                          |
+| `FieldKey`      | Map key (`Text` / `Bytes`).                |
+| `FieldValue`    | Runtime value.                             |
+| `FieldEntry`    | Field metadata, persists with each schema. |
+| `Schema`        | Versioned set of `FieldEntry`.             |
+| `SchemaBuilder` | Construction helper for `Schema`.          |
+| `Document`      | Schema-bound document.                     |
+| `DocumentOwned` | Standalone serializable document.          |
+| `Resource`      | Predefined schema for external assets.     |
+| `SchemaError`   | Crate's error enum.                        |
+
+### 11.3 Free functions
 
 ```rust
-pub type Ft = FieldType;           // Field type
-pub type Fv = FieldValue;         // Field value
-pub type Fe = FieldEntry;          // Field entry
-pub type Json = serde_json::Value; // JSON value
-pub type Cbor = ciborium::Value;   // CBOR value
-pub type Vector = Vec<bf16>;       // Vector type
-pub type Map<K, V> = serde_json::Map<K, V>; // JSON Map
-pub type BoxError = Box<dyn std::error::Error + Send + Sync>; // Error type
-pub type DocumentId = u64;         // Document ID
-pub type IndexedFieldValues = BTreeMap<usize, FieldValue>; // Field value index map
+pub fn validate_field_name(s: &str) -> Result<(), SchemaError>;
+pub fn vector_from_f32(v: Vec<f32>) -> Vector;
+pub fn vector_from_f64(v: Vec<f64>) -> Vector;
 ```
 
-### 11.2 Main Structs
+### 11.4 Constants and statics
 
-| Struct | Description |
-|--------|-------------|
-| `FieldType` | Field type enum |
-| `FieldValue` | Field value enum |
-| `FieldEntry` | Field definition |
-| `FieldKey` | Map key type |
-| `Schema` | Document structure definition |
-| `SchemaBuilder` | Schema builder |
-| `Document` | Document (with Schema reference) |
-| `DocumentOwned` | Document (without Schema reference) |
-| `Resource` | Resource type |
-
-### 11.3 Main Functions
-
-```rust
-// Field name validation
-pub fn validate_field_name(s: &str) -> Result<(), SchemaError>
-
-// Vector conversion
-pub fn vector_from_f32(v: Vec<f32>) -> Vector
-pub fn vector_from_f64(v: Vec<f64>) -> Vector
-```
+| Item                 | Value                   |
+| :------------------- | :---------------------- |
+| `Schema::ID_KEY`     | `"_id"`                 |
+| `TEXT_WILDCARD_KEY`  | `FieldKey::Text("*")`   |
+| `BYTES_WILDCARD_KEY` | `FieldKey::Bytes(b"*")` |
 
 ---
 
-## 12. Usage Examples
+## 12. Cookbook
 
-### 12.1 Basic Schema Definition
+### 12.1 Minimal schema, hand-built
 
 ```rust
-use anda_db_schema::{
-    Schema, SchemaBuilder, FieldEntry, FieldType as Ft,
-    FieldValue as Fv, Document, DocumentOwned,
-};
+use anda_db_schema::{Fe, Ft, Schema};
 use std::sync::Arc;
 
 let schema = Schema::builder()
-    .add_field(
-        FieldEntry::new("title".to_string(), Ft::Text)?
-            .with_description("Document title")
-    )?
-    .add_field(
-        FieldEntry::new("content".to_string(), Ft::Text)?
-            .with_description("Document body text")
-    )?
-    .add_field(
-        FieldEntry::new("views".to_string(), Ft::U64)?
-            .with_description("View count")
-    )?
+    .add_field(Fe::new("title".into(),   Ft::Text)?
+        .with_description("Document title".into()))?
+    .add_field(Fe::new("content".into(), Ft::Text)?)?
+    .add_field(Fe::new("views".into(),   Ft::U64)?)?
     .build()?;
-
 let schema = Arc::new(schema);
 ```
 
-### 12.2 Using Derive Macro
+### 12.2 Same schema via the derive macro
 
 ```rust
-use anda_db_schema::{Schema, AndaDBSchema, FieldType, Document};
-use anda_db_derive::AndaDBSchema;
+use anda_db_schema::{AndaDBSchema, Schema};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use serde::{Serialize, Deserialize};
 
-#[derive(AndaDBSchema, Serialize, Deserialize, Debug)]
+#[derive(Debug, Serialize, Deserialize, AndaDBSchema)]
 struct Article {
-    /// Article unique identifier
+    /// Document primary key
     _id: u64,
-    /// Article title
+    /// Document title
     title: String,
-    /// Article content
+    /// Document body
     content: String,
     /// View count
     views: u64,
-    /// Optional tags
-    tags: Option<Vec<String>>,
-    /// Embedding vector for semantic search
-    embedding: Vec<bf16>,
 }
 
-let schema = Arc::new(Article::schema().unwrap());
+let schema = Arc::new(Article::schema()?);
 ```
 
-### 12.3 Creating and Manipulating Documents
+### 12.3 Building and reading a document
 
 ```rust
 use anda_db_schema::{Document, Fv};
 
-let doc = Document::new(schema.clone());
-
-// Set ID
+let mut doc = Document::new(schema.clone());
 doc.set_id(1);
+doc.set_field("title",   Fv::Text("Hello".into()))?;
+doc.set_field("content", Fv::Text("World".into()))?;
+doc.set_field("views",   Fv::U64(42))?;
 
-// Set fields
-doc.set_field("title", Fv::Text("Hello World".to_string()))?;
-doc.set_field("content", Fv::Text("This is my first article".to_string()))?;
-doc.set_field("views", Fv::U64(100))?;
-
-// Get field
-if let Some(Fv::Text(title)) = doc.get_field("title") {
-    println!("Title: {}", title);
-}
-
-// Convert to DocumentOwned
+let title = doc.get_field_as::<String>("title")?;
 let owned: DocumentOwned = doc.into();
 ```
 
-### 12.4 Creating Documents from Structs
+### 12.4 From a struct, with full validation
 
 ```rust
-use serde::{Serialize, Deserialize};
-
-#[derive(Serialize, Deserialize)]
-struct ArticleInput {
-    _id: u64,
-    title: String,
-    content: String,
-    views: u64,
-}
-
-let input = ArticleInput {
+let article = Article {
     _id: 1,
-    title: "Hello".to_string(),
-    content: "World".to_string(),
+    title: "Hello".into(),
+    content: "World".into(),
     views: 42,
 };
-
-let doc = Document::try_from(schema.clone(), &input)?;
-println!("Document ID: {}", doc.id());
+let doc = Document::try_from(schema.clone(), &article)?;
+let back: Article = doc.try_into()?;
 ```
 
-### 12.5 Schema Validation
+### 12.5 Schema migration
 
 ```rust
-use anda_db_schema::{IndexedFieldValues, Fv};
-
-// Create valid field values
-let mut values = IndexedFieldValues::new();
-values.insert(0, Fv::U64(1));        // _id
-values.insert(1, Fv::Text("Title".to_string()));  // title
-values.insert(2, Fv::Text("Content".to_string())); // content
-values.insert(3, Fv::U64(0));        // views
-
-// Validate
-schema.validate(&values)?;  // Ok(())
-
-// Create invalid field values (type mismatch)
-let mut invalid_values = IndexedFieldValues::new();
-invalid_values.insert(0, Fv::Text("not_u64".to_string())); // Should be U64
-invalid_values.insert(1, Fv::Text("Title".to_string()));
-
-schema.validate(&invalid_values);  // Err(...)
-```
-
-### 12.6 Schema Evolution
-
-```rust
-// Old Schema (loaded from storage)
-let old_schema = Schema::builder()
+// Persisted v1 schema:
+let old = Schema::builder()
     .with_version(1)
-    .add_field(Fe::new("name".to_string(), Ft::Text)?)?
-    .add_field(Fe::new("age".to_string(), Ft::U64)?)?
+    .add_field(Fe::new("name".into(), Ft::Text)?)?
+    .add_field(Fe::new("age".into(),  Ft::Option(Box::new(Ft::U64)))?)?
     .build()?;
 
-// New Schema (application code)
-let mut new_schema = Schema::builder()
+// New code defines v2 with an additional `email` field:
+let mut new = Schema::builder()
     .with_version(2)
-    .add_field(Fe::new("name".to_string(), Ft::Text)?)?
-    .add_field(Fe::new("age".to_string(), Ft::U64)?)?
-    .add_field(Fe::new("email".to_string(), Ft::Option(Box::new(Ft::Text)))?)?
+    .add_field(Fe::new("name".into(),  Ft::Text)?)?
+    .add_field(Fe::new("age".into(),   Ft::Option(Box::new(Ft::U64)))?)?
+    .add_field(Fe::new("email".into(), Ft::Option(Box::new(Ft::Text)))?)?
     .build()?;
 
-// Execute migration
-new_schema.upgrade_with(&old_schema)?;
+new.upgrade_with(&old)?;
+
+// `name` keeps idx=1, `age` keeps idx=2, `email` gets idx=3.
 ```
 
----
-
-## Appendix A: CBOR Serialization Format Reference
-
-| FieldValue | CBOR Encoding | Example |
-|------------|---------------|---------|
-| `Null` | `f6` | `Null` |
-| `Bool(true)` | `f5` | `true` |
-| `Bool(false)` | `f4` | `false` |
-| `U64(42)` | `18 2a` | `42` |
-| `I64(-42)` | `39 0029` | `-42` |
-| `F64(3.14)` | `fb 40091eb851eb851f` | `3.14` |
-| `Text("hello")` | `65 hello` | `"hello"` |
-| `Bytes([1,2,3,4])` | `44 01020304` | `01 02 03 04` |
-| `Array([U64(1), Text("hello")])` | `82 01 65 hello` | `[1, "hello"]` |
-| `Map({"key": Text("value")})` | `a1 63key 65value` | `{"key": "value"}` |
-
----
-
-## Appendix B: Integration with Other Libraries
-
-### B.1 serde
-
-anda_db_schema is fully serde-compatible:
+### 12.6 Embedding a `Resource`
 
 ```rust
-use serde::{Serialize, Deserialize};
+use anda_db_schema::{AndaDBSchema, Resource};
 
-#[derive(Serialize, Deserialize)]
-struct MyStruct {
-    field: String,
+#[derive(AndaDBSchema)]
+struct Article {
+    _id: u64,
+    title: String,
+    thumbnail: Option<Resource>, // recursive use of Resource::field_type()
 }
 ```
 
-### B.2 ciborium
-
-Used for CBOR serialization:
-
-```rust
-use ciborium::{cbor, from_reader, into_writer};
-
-let value: Fv = from_reader(data.as_slice())?;
-into_writer(&value, &mut output)?;
-```
-
-### B.3 half
-
-Used for bf16 type:
-
-```rust
-use half::bf16;
-
-let vec = vec![bf16::from_f32(1.0), bf16::from_f32(2.0)];
-let fv = Fv::Vector(vec);
-```
-
 ---
 
-*Document generated: 2026-04-21*
+*Document maintained alongside `rs/anda_db_schema/`. Update both when the
+public API changes.*

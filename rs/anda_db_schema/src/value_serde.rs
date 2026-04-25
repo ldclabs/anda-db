@@ -1,3 +1,14 @@
+//! Hand-written `serde` implementations for [`FieldKey`] and [`FieldValue`].
+//!
+//! `FieldValue` cannot use the derived `Deserialize` because it must be
+//! reconstructable from any self-describing serde data model (CBOR, JSON).
+//! The visitor in this module walks the data model directly
+//! and chooses the most precise variant for the input.
+//!
+//! In *human-readable* formats (e.g. JSON), [`FieldValue::Bytes`] and
+//! [`FieldKey::Bytes`] are encoded as URL-safe Base64 strings. On the way
+//! back, a textual value that successfully decodes as Base64 is treated as
+//! `Bytes`. This is the same trick used by `ic_auth_types::ByteBufB64`.
 use base64::{Engine, prelude::BASE64_URL_SAFE};
 use serde::{
     de,

@@ -1,3 +1,5 @@
+//! The [`Resource`] type — a reusable schema describing a binary asset or
+//! external reference attached to a document.
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -6,7 +8,16 @@ use crate::{
 };
 
 /// Represents a resource for AI Agents.
-/// It can be a file, a URL, or any other type of resource.
+///
+/// A `Resource` is a generic descriptor for any external piece of data an
+/// agent may need to reference: an inline blob, a remote file, a URL, etc.
+/// Every field except `_id`, `tags` and `name` is optional, so the same
+/// type can describe both lightweight references (`uri` only) and fully
+/// inlined assets (`blob` plus `mime_type` and `hash`).
+///
+/// The struct derives [`AndaDBSchema`] and [`FieldTyped`], so it can be
+/// embedded as a sub-document in any other Anda DB schema by simply using
+/// `Resource` (or `Option<Resource>`) as a field type.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, FieldTyped, PartialEq, AndaDBSchema)]
 pub struct Resource {
     /// The unique identifier for this resource in the Anda DB collection.

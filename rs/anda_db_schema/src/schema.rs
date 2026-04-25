@@ -1,18 +1,41 @@
+//! [`Schema`] and [`SchemaBuilder`] — the document layout description
+//! consumed by all higher-level Anda DB collections.
+//!
+//! A [`Schema`] is an ordered, versioned collection of [`FieldEntry`]
+//! values. The mandatory `_id: U64` field is reserved as the document
+//! primary key and always carries `idx = 0`. Schemas are forward-compatible
+//! and can be migrated with [`Schema::upgrade_with`].
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{FieldEntry, FieldType, IndexedFieldValues, Resource, SchemaError};
 
-/// Schema represents Anda DB document schema definition.
-/// It contains a collection of fields and their indexes.
+/// Document schema definition for Anda DB.
+///
+/// A `Schema` describes:
+///
+/// - which fields a document may contain (by name and type),
+/// - their stable on-disk indexes (`FieldEntry::idx`), and
+/// - a monotonic `version` used to coordinate schema migrations.
+///
+/// Every schema implicitly contains the reserved `_id` field of type
+/// [`FieldType::U64`] with `idx == 0` (see [`Schema::ID_KEY`]). It is added
+/// automatically by [`SchemaBuilder::new`].
+///
+/// `Schema` is `Serialize` / `Deserialize` and round-trips through both
+/// JSON and CBOR. Deserialization re-validates every invariant (`_id`
+/// presence, unique field names and indexes, valid field name characters,
+/// `idx <= u16::MAX`) so it is safe to load schemas coming from untrusted
+/// storage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Schema {
-    /// Set of field indexes for quick lookup
+    /// Set of field indexes for O(log n) membership tests during
+    /// validation.
     idx: BTreeSet<usize>,
-    /// Map of field names to field entries
+    /// Field definitions keyed by field name for fast name-based lookup.
     fields: BTreeMap<String, FieldEntry>,
-    /// Schema version for schema evolution support.
-    /// A higher version indicates a newer schema definition.
+    /// Monotonic schema version. A higher value indicates a newer schema.
+    /// Used by [`Schema::upgrade_with`] to authorize migrations.
     version: u64,
 }
 
@@ -77,10 +100,10 @@ impl Schema {
                         field.r#type()
                     )));
                 }
-                *field = field.clone().with_idx(old_field.idx());
+                field.set_idx(old_field.idx());
             } else {
                 // New field: assign the next available index.
-                *field = field.clone().with_idx(next_idx);
+                field.set_idx(next_idx);
                 next_idx += 1;
             }
         }
@@ -330,6 +353,16 @@ impl SchemaBuilder {
         self
     }
 
+    /// Add a [`Resource`]-typed field to the schema.
+    ///
+    /// This is a convenience wrapper around [`add_field`](Self::add_field)
+    /// that derives its `FieldType` from [`Resource::field_type`] and wraps
+    /// it in [`FieldType::Option`] when `required` is `false`.
+    ///
+    /// # Arguments
+    /// * `field` - Name to register the resource under.
+    /// * `required` - When `true`, the field must always be present;
+    ///   otherwise it becomes optional.
     pub fn with_resource(&mut self, field: &str, required: bool) -> Result<&mut Self, SchemaError> {
         let ft = Resource::field_type();
         let ft = if required {

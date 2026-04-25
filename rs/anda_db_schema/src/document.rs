@@ -1,27 +1,48 @@
+//! [`Document`] and [`DocumentOwned`] — the runtime and on-disk
+//! representations of an Anda DB document.
 use ciborium::Value;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::sync::Arc;
 
 use super::{Cbor, Fv, IndexedFieldValues, Schema, SchemaError};
 
-/// Type alias for a document identifier.
+/// The unique identifier for a document within a collection.
+///
+/// Document IDs are 64-bit unsigned integers stored under the reserved
+/// `_id` field with [`FieldEntry::idx`](crate::FieldEntry::idx) `== 0`.
 pub type DocumentId = u64;
 
-/// Document represents a single document in the Anda DB.
+/// A single Anda DB document together with its [`Schema`].
+///
+/// `Document` keeps an [`Arc<Schema>`] reference so that field accessors
+/// and mutators can validate and translate field names into stable on-disk
+/// indexes. Use [`Document::new`] to start an empty document, or one of
+/// the `try_from_*` constructors to build one from existing data.
+///
+/// `Document` is [`Serialize`] but not [`Deserialize`]: in order to be
+/// loaded back from storage you must combine a [`DocumentOwned`] with a
+/// `Schema`, see [`Document::try_from_doc`].
 #[derive(Clone, Debug)]
 pub struct Document {
-    /// Collection of field values indexed by their position in the schema
+    /// Field values indexed by their stable schema-assigned `idx`.
     fields: IndexedFieldValues,
-    /// Reference to the schema that defines the document structure
+    /// Reference to the schema that defines the document structure.
     schema: Arc<Schema>,
 }
 
-/// DocumentOwned represents a standalone document without schema reference.
-/// It can be serialized and deserialized for storage or transmission.
+/// A standalone document without an attached [`Schema`].
+///
+/// `DocumentOwned` is the on-disk and over-the-wire representation: it
+/// carries only the field values keyed by `idx`. To validate or to access
+/// fields by name, pair it with a `Schema` via
+/// [`Document::try_from_doc`].
+///
+/// The serialized layout is `{ "f": IndexedFieldValues }`. The single key
+/// `f` is intentionally short to keep records compact.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DocumentOwned {
-    /// Collection of field values indexed by their position in the schema.
-    /// It should include the ID field.
+    /// Field values indexed by their stable schema-assigned `idx`.
+    /// The `_id` field (`idx == 0`) is required.
     #[serde(rename = "f")]
     pub fields: IndexedFieldValues,
 }

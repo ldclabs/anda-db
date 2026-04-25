@@ -1,12 +1,22 @@
-//! Field type and value definitions for Anda DB, stored in CBOR format.
+//! Field type and value definitions for Anda DB.
 //!
-//! This module defines the field type system for Anda DB, including:
-//! - [`FieldType`] or [`Ft`]: Field type definitions, supporting basic types, composite types, and optional types
-//! - [`FieldValue`] or [`Fv`]: Field value definitions, corresponding to actual values of various types
-//! - [`FieldEntry`] or [`Fe`]: Field entry definitions, containing field name, type, constraints, and other information
+//! This module is the heart of the crate's type system and exposes three
+//! tightly related concepts:
 //!
-//! All data is serialized into CBOR format for storage to improve storage efficiency and cross-platform compatibility.
+//! - [`FieldType`] / [`Ft`] — the *declared* type of a field. It is a closed
+//!   enum covering primitives (`Bool`, `I64`, `U64`, `F64`, `F32`, `Bytes`,
+//!   `Text`, `Json`, `Vector`) plus three composites: `Array`, `Map` and
+//!   `Option`.
+//! - [`FieldValue`] / [`Fv`] — the *runtime* value of a field. Each variant
+//!   matches a `FieldType`, plus a dedicated [`FieldValue::Null`] representing
+//!   the absence of a value for [`FieldType::Option`].
+//! - [`FieldEntry`] / [`Fe`] — the metadata that ties a field name to its
+//!   `FieldType` together with description, uniqueness and a stable numeric
+//!   index used for compact storage.
 //!
+//! Values round-trip through CBOR (via [`Cbor`](ciborium::Value)) for
+//! persistence and through JSON for human-readable APIs. In JSON mode,
+//! [`FieldValue::Bytes`] is encoded as a Base64 (URL-safe) string.
 use base64::{Engine, prelude::BASE64_URL_SAFE};
 use ciborium::Value;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -43,13 +53,29 @@ pub type Cbor = ciborium::Value;
 /// Type alias for serde_json::Value
 pub type Json = serde_json::Value;
 
-/// Type alias for BTreeMap<usize, FieldValue>, used to store indexed field values
+/// Type alias for [`BTreeMap<usize, FieldValue>`], the canonical container
+/// for a document's field values.
+///
+/// Keys are the stable [`FieldEntry::idx`] values from the document's schema,
+/// not field names. This keeps records compact on disk and makes lookups
+/// constant in space regardless of name length.
 pub type IndexedFieldValues = BTreeMap<usize, FieldValue>;
 
-/// Field type definitions for Anda DB
+/// The type of a field declared in a [`Schema`](crate::Schema).
 ///
-/// Supports various basic types (U64, I64, F64, F32, Bf16, Bytes, Text, Bool, Json)
-/// and composite types (Array, Map, Option)
+/// `FieldType` is the closed enum of every type supported by Anda DB.
+/// It is purely descriptive: a value of this enum is metadata, never
+/// payload. The matching payload type is [`FieldValue`].
+///
+/// Composite variants:
+/// - [`FieldType::Array`] holds either zero, one, or several inner types.
+///   With one inner type the array is *homogeneous* (every element must
+///   match it). With several inner types it is a fixed-size *tuple-like*
+///   array.
+/// - [`FieldType::Map`] declares per-key types. A wildcard map
+///   (`{ "*": T }` or `{ b"*": T }`) matches any key with values of type
+///   `T`. See [`TEXT_WILDCARD_KEY`] / [`BYTES_WILDCARD_KEY`].
+/// - [`FieldType::Option`] makes a field nullable.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FieldType {
     /// Boolean value
@@ -100,18 +126,25 @@ impl fmt::Debug for FieldType {
 }
 
 impl FieldType {
-    /// Check if this field type allows null values
+    /// Returns `true` if this type accepts [`FieldValue::Null`], i.e. it is an
+    /// [`Option`](FieldType::Option) variant.
     pub fn allows_null(&self) -> bool {
         matches!(self, FieldType::Option(_))
     }
 
-    /// Extract a FieldValue from a CBOR value according to this field type
+    /// Coerce a CBOR value into a [`FieldValue`] that conforms to this type.
+    ///
+    /// This is more strict than [`FieldValue::try_from`]: instead of inferring
+    /// a value from the CBOR shape, `extract` requires the CBOR to match
+    /// `self`. For [`Option`](FieldType::Option), CBOR `null` produces
+    /// [`FieldValue::Null`].
     ///
     /// # Arguments
-    /// * `value` - The CBOR value to extract from
+    /// * `value` - The CBOR value to convert.
     ///
-    /// # Returns
-    /// * `Result<FieldValue, SchemaError>` - The extracted field value or an error message
+    /// # Errors
+    /// Returns [`SchemaError::FieldValue`] when the CBOR shape does not
+    /// match `self` (e.g. extracting a `Text` from CBOR `Bytes`).
     pub fn extract(&self, value: Cbor) -> Result<FieldValue, SchemaError> {
         match &self {
             FieldType::Bool => FieldValue::bool_from(value),
@@ -134,13 +167,18 @@ impl FieldType {
         }
     }
 
-    /// Validate if a FieldValue matches this field type
+    /// Validate that `value` is acceptable for this type.
     ///
-    /// # Arguments
-    /// * `value` - The FieldValue to validate
+    /// `Vector` accepts both [`FieldValue::Vector`] and an
+    /// [`Array`](FieldValue::Array) of `U64` (the latter is how a `Vector`
+    /// is observed when it is read back through generic CBOR without type
+    /// information). `Json` accepts any value because JSON is itself
+    /// dynamically typed.
     ///
-    /// # Returns
-    /// * `Result<(), SchemaError>` - Ok if valid, or an error message if invalid
+    /// `Option(T)` accepts [`FieldValue::Null`]; non-`Option` types reject it.
+    ///
+    /// # Errors
+    /// Returns [`SchemaError::FieldValue`] describing the first mismatch.
     pub fn validate(&self, value: &FieldValue) -> Result<(), SchemaError> {
         match (self, value) {
             (FieldType::Bool, FieldValue::Bool(_)) => Ok(()),
@@ -233,19 +271,35 @@ impl FieldType {
     }
 }
 
+/// A key in a [`FieldType::Map`] / [`FieldValue::Map`].
+///
+/// Map keys may be either UTF-8 [`FieldKey::Text`] or arbitrary
+/// [`FieldKey::Bytes`]. The two are kept distinct in CBOR so that a `Bytes`
+/// key is never confused with the textual representation of the same
+/// payload.
+///
+/// In JSON serialization, a `Bytes` key is rendered as a URL-safe Base64
+/// string. On the way back, a `Text` value that successfully decodes as
+/// Base64 is treated as a `Bytes` key.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum FieldKey {
+    /// A UTF-8 text key.
     Text(String),
+    /// An arbitrary byte-string key.
     Bytes(Vec<u8>),
 }
 
+/// The wildcard text key (`"*"`) used to express a homogeneous `Map<Text, T>`.
 pub static TEXT_WILDCARD_KEY: std::sync::LazyLock<FieldKey> =
     std::sync::LazyLock::new(|| "*".into());
 
+/// The wildcard byte key (`b"*"`) used to express a homogeneous `Map<Bytes, T>`.
 pub static BYTES_WILDCARD_KEY: std::sync::LazyLock<FieldKey> =
     std::sync::LazyLock::new(|| b"*".into());
 
 impl FieldKey {
+    /// Returns the [`FieldType`] that the key itself uses
+    /// ([`FieldType::Text`] for `Text`, [`FieldType::Bytes`] for `Bytes`).
     pub fn field_type(&self) -> FieldType {
         match self {
             FieldKey::Text(_) => FieldType::Text,
@@ -253,6 +307,7 @@ impl FieldKey {
         }
     }
 
+    /// Borrow the raw bytes of this key, regardless of variant.
     pub fn as_bytes(&self) -> &[u8] {
         match self {
             FieldKey::Text(s) => s.as_bytes(),
@@ -320,9 +375,16 @@ impl std::fmt::Display for FieldKey {
     }
 }
 
-/// Field value definitions for Anda DB
+/// The runtime value of a field.
 ///
-/// Corresponds to the various field types, storing actual data values
+/// Each variant corresponds 1:1 to a [`FieldType`] variant, with the
+/// addition of [`FieldValue::Null`] which represents an absent value for
+/// [`FieldType::Option`]. All variants serialize losslessly to and from
+/// CBOR via [`From<FieldValue> for Cbor`] and [`FieldValue::try_from`].
+///
+/// `FieldValue` derives `PartialEq`, but float values are required to be
+/// non-NaN (enforced by [`FieldValue::f64_from`] / [`FieldValue::f32_from`]
+/// when extracting from CBOR) so that equality is reflexive in practice.
 #[derive(Clone, PartialEq)]
 pub enum FieldValue {
     /// Boolean value
@@ -831,26 +893,6 @@ where
     }
 }
 
-// impl<'a, T> TryFrom<&'a FieldValue> for BTreeMap<&'a String, &'a T>
-// where
-//     &'a T: TryFrom<&'a FieldValue, Error = BoxError>,
-// {
-//     type Error = BoxError;
-
-//     fn try_from(value: &'a FieldValue) -> Result<Self, Self::Error> {
-//         match value {
-//             FieldValue::Map(map) => {
-//                 let mut rt = BTreeMap::new();
-//                 for (k, v) in map {
-//                     rt.insert(k, v.try_into()?);
-//                 }
-//                 Ok(rt)
-//             }
-//             _ => Err(SchemaError::FieldValue(format!("expected Map, got {value:?}")).into()),
-//         }
-//     }
-// }
-
 impl fmt::Debug for FieldValue {
     /// Debug formatting for FieldValue
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1234,36 +1276,46 @@ impl FieldValue {
     }
 }
 
-/// Field entry definition for Anda DB
+/// Metadata for a single field in a [`Schema`](crate::Schema).
 ///
-/// Contains field name, type, constraints, and index information
-/// Field names are renamed in serialization to save storage space
+/// `FieldEntry` ties a textual `name` to a [`FieldType`] together with an
+/// optional human-readable description, an `unique` flag (used by
+/// collection-level uniqueness indexes) and a stable numeric `idx`.
+///
+/// The numeric `idx` is assigned by the schema builder and is what gets
+/// persisted alongside each field value: documents are stored as
+/// `BTreeMap<idx, FieldValue>` rather than `BTreeMap<name, FieldValue>` to
+/// keep records compact. Schema migrations preserve `idx` values for
+/// fields that exist in both the old and new schemas.
+///
+/// On the wire, every key is renamed to a single letter (`n`, `d`, `t`,
+/// `u`, `i`) for the same reason. Long-form names are accepted on input
+/// via `serde(alias = ...)`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FieldEntry {
-    /// Field name, must:
-    /// - Be unique in document schema
-    /// - Not be empty
-    /// - Not exceed 64 characters
-    /// - Contain only lowercase letters, numbers, and underscores
+    /// Field name. Must be unique within a schema and conform to the rules
+    /// enforced by [`validate_field_name`].
     #[serde(rename = "n", alias = "name")]
     name: String,
 
-    /// Field description
-    /// This can be used by clients to improve the LLM's understanding of available fields
-    /// and their expected values.
+    /// Human-readable description of the field.
+    ///
+    /// Used as documentation for tools and as context for LLM clients that
+    /// inspect the schema to decide how to populate or query a field.
     #[serde(rename = "d", alias = "description")]
     description: String,
 
-    /// Field type
+    /// Declared type of the field.
     #[serde(rename = "t", alias = "type")]
     r#type: FieldType,
 
-    /// Whether the field value must be unique in the collection
+    /// Whether the field value must be unique across all documents in the
+    /// collection. Enforcement is performed at the collection layer.
     #[serde(rename = "u", alias = "unique")]
     unique: bool,
 
-    /// Field index value - field names are not stored with each record,
-    /// but are referenced by index to save storage space
+    /// Stable numeric index used as the persistent key for this field's
+    /// values. The `_id` field always has `idx == 0`.
     #[serde(rename = "i", alias = "index")]
     idx: usize,
 }
@@ -1317,6 +1369,21 @@ impl FieldEntry {
     /// # Returns
     /// * `Self` - The modified field entry
     pub fn with_idx(mut self, idx: usize) -> Self {
+        self.idx = idx;
+        self
+    }
+
+    /// Set the field index in place.
+    ///
+    /// Useful when you need to update the index of an existing entry without
+    /// cloning all of its other data (e.g. during schema migration).
+    ///
+    /// # Arguments
+    /// * `idx` - Field index value
+    ///
+    /// # Returns
+    /// * `&mut Self` - The modified field entry
+    pub fn set_idx(&mut self, idx: usize) -> &mut Self {
         self.idx = idx;
         self
     }
@@ -1411,16 +1478,21 @@ impl FieldEntry {
     }
 }
 
-/// Convert a Vec<f32> to Vector
+/// Convert a `Vec<f32>` into a [`Vector`] (i.e. `Vec<bf16>`) by lossy
+/// conversion of every element.
 pub fn vector_from_f32(v: Vec<f32>) -> Vector {
     v.into_iter().map(bf16::from_f32).collect()
 }
 
-/// Convert a Vec<f64> to Vector
+/// Convert a `Vec<f64>` into a [`Vector`] (i.e. `Vec<bf16>`) by lossy
+/// conversion of every element.
 pub fn vector_from_f64(v: Vec<f64>) -> Vector {
     v.into_iter().map(bf16::from_f64).collect()
 }
 
+/// If `m` describes a *wildcard* map — i.e. it has exactly one entry whose
+/// key is [`TEXT_WILDCARD_KEY`] or [`BYTES_WILDCARD_KEY`] — return the value
+/// type of that entry. Otherwise return `None`.
 fn as_wildcard_map(m: &BTreeMap<FieldKey, FieldType>) -> Option<&FieldType> {
     match m.len() {
         1 => m
