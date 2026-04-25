@@ -31,38 +31,50 @@ use crate::{entity::*, helper::*, types::*};
 
 /// Core database structure for the cognitive nexus system.
 ///
-/// `CognitiveNexus` manages a knowledge graph consisting of concepts and propositions,
-/// providing high-level operations for querying and manipulating the knowledge base.
-/// It implements the Knowledge Interchange Protocol (KIP) executor interface.
+/// `CognitiveNexus` manages a knowledge graph composed of concepts and
+/// propositions, providing high-level operations for querying and
+/// manipulating the knowledge base. It implements the
+/// [`anda_kip::Executor`] trait so any frontend that produces a KIP
+/// [`Command`] (KQL query, KML mutation, or META introspection) can run
+/// against it without further glue code.
 ///
 /// # Architecture
 ///
-/// - **Database Layer**: Built on top of AndaDB for persistent storage
-/// - **Collections**: Separate collections for concepts and propositions with optimized indexes
-/// - **Caching**: Thread-safe caching for improved query performance
-/// - **Protocol Support**: Full KIP implementation with KQL, KML, and Meta commands
-///
-/// Core database structure for the cognitive nexus system.
-///
-/// `CognitiveNexus` manages a knowledge graph consisting of concepts and propositions,
-/// providing high-level operations for querying and manipulating the knowledge base.
-/// It implements the Knowledge Interchange Protocol (KIP) executor interface.
+/// - **Storage** — built on top of [`AndaDB`]. Two collections are used:
+///   `concepts` (one row per concept node) and `propositions` (one row
+///   per `(subject, object)` pair, holding all predicates that connect
+///   them).
+/// - **Indexes** — see [`CognitiveNexus::connect`] for the exact set of
+///   B-Tree and BM25 indexes that are created on first run.
+/// - **Caching** — every query/META call instantiates a fresh
+///   [`QueryCache`] inside its [`QueryContext`] to avoid loading the same
+///   row twice during a single execution. The cache is *not* shared
+///   across calls; KML write paths invalidate cached rows on update.
+/// - **KIP support** — full KIP v1.0-RC6 (KQL/KML/META).
 ///
 /// # Concurrency
 ///
-/// The struct uses an async read-write lock (`RwLock`) to ensure KML execution consistency:
-/// - **Read lock**: Acquired for KQL queries and Meta commands (allows concurrent reads)
-/// - **Write lock**: Acquired for KML mutations (ensures exclusive access during data modifications)
+/// The struct uses a [`tokio::sync::RwLock`] (`kml_lock`) to guarantee KML
+/// execution consistency:
 ///
-/// This prevents race conditions during complex KML transactions that may involve
-/// multiple concept and proposition updates across collections.
+/// - **Read lock** — acquired for KQL queries and META commands; allows
+///   any number of concurrent readers.
+/// - **Write lock** — acquired for KML mutations; ensures exclusive
+///   access during data modifications.
+///
+/// This prevents race conditions during complex KML transactions that may
+/// involve multiple concept and proposition updates across collections.
 #[derive(Clone, Debug)]
 pub struct CognitiveNexus {
+    /// Underlying Anda DB instance shared with any other collections the
+    /// host application may register.
     pub db: Arc<AndaDB>,
+    /// `concepts` collection — one row per [`Concept`].
     pub concepts: Arc<Collection>,
+    /// `propositions` collection — one row per [`Proposition`].
     pub propositions: Arc<Collection>,
-    /// Read-write lock for KML execution consistency.
-    /// KQL/Meta commands acquire read lock; KML commands acquire write lock.
+    /// Read-write lock for KML execution consistency. KQL/META acquire
+    /// the read lock; KML acquires the write lock.
     kml_lock: Arc<RwLock<()>>,
 }
 
@@ -319,6 +331,14 @@ impl CognitiveNexus {
         self.db.name()
     }
 
+    /// Returns the persisted **capsule schema version** stored alongside
+    /// the `concepts` collection.
+    ///
+    /// The capsule version is a monotonically-increasing integer used by
+    /// [`CognitiveNexus::connect`] to decide whether the bundled Genesis
+    /// capsules ([`GENESIS_KIP`], [`PERSON_KIP`], …) need to be re-applied.
+    /// A return value of `0` means no version has been recorded yet (a
+    /// fresh database).
     pub fn capsule_version(&self) -> u64 {
         self.concepts
             .get_extension("capsule_version")
@@ -326,6 +346,10 @@ impl CognitiveNexus {
             .unwrap_or(0)
     }
 
+    /// Persists the capsule schema version. Called automatically by
+    /// [`CognitiveNexus::connect`] after the bundled Genesis capsules
+    /// have been applied; downstream applications can call it to record
+    /// their own migration steps.
     pub async fn save_capsule_version(&self, version: u64) -> Result<(), KipError> {
         self.concepts
             .save_extension("capsule_version".to_string(), version.into())
@@ -399,8 +423,19 @@ impl CognitiveNexus {
         self.concepts.get_as(id).await.map_err(db_to_kip_error)
     }
 
-    /// Retrieves an existing concept or initializes a new one if it does not exist.
-    /// Caller should ensure the concept type is existing and the name is not empty.
+    /// Retrieves an existing concept or initialises a new one if it does
+    /// not yet exist.
+    ///
+    /// This is a convenience helper used by callers that want
+    /// idempotent insertion semantics outside of the regular KML
+    /// `UPSERT` path. The caller is responsible for guaranteeing that:
+    ///
+    /// - `r#type` already exists as a `$ConceptType` instance, and
+    /// - `name` is non-empty.
+    ///
+    /// No type-existence check is performed here — for the protocol
+    /// path use [`execute_kml`](Self::execute_kml) with an `UPSERT`
+    /// statement.
     pub async fn get_or_init_concept(
         &self,
         r#type: String,
@@ -430,6 +465,20 @@ impl CognitiveNexus {
         }
     }
 
+    /// Executes a KQL `FIND` query and returns its result tuple.
+    ///
+    /// The result is `(value, next_cursor)`:
+    ///
+    /// - When the `FIND` clause has a single expression, `value` is its
+    ///   raw payload (object / array / scalar). When it has more than one
+    ///   expression, `value` is a JSON array of column arrays — one per
+    ///   `FIND` expression — preserving column alignment across rows.
+    /// - `next_cursor` is `Some` when `LIMIT` truncated the result and
+    ///   the caller should resume by passing the cursor back via
+    ///   `CURSOR "…"`.
+    ///
+    /// This method acquires the KML read lock so multiple queries may run
+    /// concurrently against a stable snapshot.
     pub async fn execute_kql(&self, command: KqlQuery) -> Result<(Json, Option<String>), KipError> {
         let mut ctx = QueryContext::default();
 
@@ -456,6 +505,21 @@ impl CognitiveNexus {
         }
     }
 
+    /// Executes a KML statement (`UPSERT` or `DELETE …`).
+    ///
+    /// When `dry_run` is `true`:
+    ///
+    /// - `UPSERT` validates that all referenced concept / proposition
+    ///   types exist and that all variable handles can be resolved, but
+    ///   does **not** create or update any row.
+    /// - `DELETE CONCEPT` still performs the `KIP_3004` protected-scope
+    ///   pre-flight check so agents can probe for safety without side
+    ///   effects.
+    /// - Other delete variants short-circuit and return zeroed counters.
+    ///
+    /// On success the returned JSON is shaped per RC6 §4.1 — for upserts
+    /// an [`UpsertResult`], for deletes a `{"deleted_*": N, "updated_*":
+    /// N}` map. KML acquires the write lock so it executes exclusively.
     pub async fn execute_kml(
         &self,
         command: KmlStatement,
@@ -471,6 +535,13 @@ impl CognitiveNexus {
         }
     }
 
+    /// Executes a META command (`DESCRIBE …` or `SEARCH …`).
+    ///
+    /// META commands are read-only schema-introspection helpers; they
+    /// acquire the KML read lock and return `(value, next_cursor)` with
+    /// the same conventions as [`execute_kql`](Self::execute_kql).
+    /// `DESCRIBE PRIMER` and `DESCRIBE DOMAINS` return non-paginated
+    /// payloads (`next_cursor == None`).
     pub async fn execute_meta(
         &self,
         command: MetaCommand,
@@ -1597,6 +1668,9 @@ impl CognitiveNexus {
     }
 
     // 处理主体和客体都是具体ID的匹配
+    //
+    // 优化：将 N×M 个 (subject, object) 串行查询合并为单个
+    // `(subject,object)` 虚拟字段 OR 查询，避免多次索引查找。
     async fn handle_subject_object_ids_matching(
         &self,
         ctx: &QueryContext,
@@ -1605,35 +1679,44 @@ impl CognitiveNexus {
         predicate: PredTerm,
     ) -> Result<PropositionsMatchResult, KipError> {
         let mut result = PropositionsMatchResult::default();
+        if subject_ids.is_empty() || object_ids.is_empty() {
+            return Ok(result);
+        }
 
+        let virtual_name = virtual_field_name(&["subject", "object"]);
+        let mut variants: Vec<Box<RangeQuery<Fv>>> =
+            Vec::with_capacity(subject_ids.len() * object_ids.len());
         for subject_id in &subject_ids {
             for object_id in &object_ids {
-                let virtual_name = virtual_field_name(&["subject", "object"]);
                 let virtual_val = virtual_field_value(&[
                     Some(&Fv::Text(subject_id.to_string())),
                     Some(&Fv::Text(object_id.to_string())),
                 ])
                 .unwrap();
+                variants.push(Box::new(RangeQuery::Eq(virtual_val)));
+            }
+        }
 
-                let ids = self
-                    .propositions
-                    .query_ids(
-                        Filter::Field((virtual_name, RangeQuery::Eq(virtual_val))),
-                        None,
-                    )
-                    .await
-                    .map_err(db_to_kip_error)?;
+        let range = if variants.len() == 1 {
+            *variants.into_iter().next().unwrap()
+        } else {
+            RangeQuery::Or(variants)
+        };
 
-                for id in ids {
-                    if let Some((subj, preds, obj)) = self
-                        .try_get_proposition_with(&ctx.cache, id, |proposition| {
-                            match_predicate_against_proposition(proposition, &predicate)
-                        })
-                        .await?
-                    {
-                        result.add_match(subj, obj, preds, id);
-                    }
-                }
+        let ids = self
+            .propositions
+            .query_ids(Filter::Field((virtual_name, range)), None)
+            .await
+            .map_err(db_to_kip_error)?;
+
+        for id in ids {
+            if let Some((subj, preds, obj)) = self
+                .try_get_proposition_with(&ctx.cache, id, |proposition| {
+                    match_predicate_against_proposition(proposition, &predicate)
+                })
+                .await?
+            {
+                result.add_match(subj, obj, preds, id);
             }
         }
 
@@ -1641,6 +1724,8 @@ impl CognitiveNexus {
     }
 
     // 处理主体ID和任意对象的匹配
+    //
+    // 优化：将多个 subject 查询合并为单个 `subject IN [...]` OR 查询。
     async fn handle_subject_ids_any_matching(
         &self,
         ctx: &QueryContext,
@@ -1649,32 +1734,38 @@ impl CognitiveNexus {
         any_propositions: bool,
     ) -> Result<PropositionsMatchResult, KipError> {
         let mut result = PropositionsMatchResult::default();
+        if subject_ids.is_empty() {
+            return Ok(result);
+        }
 
-        for subject_id in &subject_ids {
-            let ids = self
-                .propositions
-                .query_ids(
-                    Filter::Field((
-                        "subject".to_string(),
-                        RangeQuery::Eq(Fv::Text(subject_id.to_string())),
-                    )),
-                    None,
-                )
-                .await
-                .map_err(db_to_kip_error)?;
+        let range = if subject_ids.len() == 1 {
+            RangeQuery::Eq(Fv::Text(subject_ids[0].to_string()))
+        } else {
+            RangeQuery::Or(
+                subject_ids
+                    .iter()
+                    .map(|id| Box::new(RangeQuery::Eq(Fv::Text(id.to_string()))))
+                    .collect(),
+            )
+        };
 
-            for id in ids {
-                if let Some((subj, preds, obj)) = self
-                    .try_get_proposition_with(&ctx.cache, id, |proposition| {
-                        if any_propositions && matches!(proposition.object, EntityID::Concept(_)) {
-                            return Ok(None);
-                        }
-                        match_predicate_against_proposition(proposition, &predicate)
-                    })
-                    .await?
-                {
-                    result.add_match(subj, obj, preds, id);
-                }
+        let ids = self
+            .propositions
+            .query_ids(Filter::Field(("subject".to_string(), range)), None)
+            .await
+            .map_err(db_to_kip_error)?;
+
+        for id in ids {
+            if let Some((subj, preds, obj)) = self
+                .try_get_proposition_with(&ctx.cache, id, |proposition| {
+                    if any_propositions && matches!(proposition.object, EntityID::Concept(_)) {
+                        return Ok(None);
+                    }
+                    match_predicate_against_proposition(proposition, &predicate)
+                })
+                .await?
+            {
+                result.add_match(subj, obj, preds, id);
             }
         }
 
@@ -1682,6 +1773,8 @@ impl CognitiveNexus {
     }
 
     // 处理任意主体和对象ID的匹配
+    //
+    // 优化：将多个 object 查询合并为单个 `object IN [...]` OR 查询。
     async fn handle_any_to_object_ids_matching(
         &self,
         ctx: &QueryContext,
@@ -1690,32 +1783,38 @@ impl CognitiveNexus {
         any_propositions: bool,
     ) -> Result<PropositionsMatchResult, KipError> {
         let mut result = PropositionsMatchResult::default();
+        if object_ids.is_empty() {
+            return Ok(result);
+        }
 
-        for object_id in &object_ids {
-            let ids = self
-                .propositions
-                .query_ids(
-                    Filter::Field((
-                        "object".to_string(),
-                        RangeQuery::Eq(Fv::Text(object_id.to_string())),
-                    )),
-                    None,
-                )
-                .await
-                .map_err(db_to_kip_error)?;
+        let range = if object_ids.len() == 1 {
+            RangeQuery::Eq(Fv::Text(object_ids[0].to_string()))
+        } else {
+            RangeQuery::Or(
+                object_ids
+                    .iter()
+                    .map(|id| Box::new(RangeQuery::Eq(Fv::Text(id.to_string()))))
+                    .collect(),
+            )
+        };
 
-            for id in ids {
-                if let Some((subj, preds, obj)) = self
-                    .try_get_proposition_with(&ctx.cache, id, |proposition| {
-                        if any_propositions && matches!(proposition.subject, EntityID::Concept(_)) {
-                            return Ok(None);
-                        }
-                        match_predicate_against_proposition(proposition, &predicate)
-                    })
-                    .await?
-                {
-                    result.add_match(subj, obj, preds, id);
-                }
+        let ids = self
+            .propositions
+            .query_ids(Filter::Field(("object".to_string(), range)), None)
+            .await
+            .map_err(db_to_kip_error)?;
+
+        for id in ids {
+            if let Some((subj, preds, obj)) = self
+                .try_get_proposition_with(&ctx.cache, id, |proposition| {
+                    if any_propositions && matches!(proposition.subject, EntityID::Concept(_)) {
+                        return Ok(None);
+                    }
+                    match_predicate_against_proposition(proposition, &predicate)
+                })
+                .await?
+            {
+                result.add_match(subj, obj, preds, id);
             }
         }
 
@@ -1955,8 +2054,8 @@ impl CognitiveNexus {
                     .await
             {
                 return Err(KipError::not_found(format!(
-                    "Concept type {} not found",
-                    r#type
+                    "Concept type {ty} not found",
+                    ty = r#type
                 )));
             }
         }
@@ -2017,8 +2116,7 @@ impl CognitiveNexus {
                 .await
             {
                 return Err(KipError::not_found(format!(
-                    "Proposition type {} not found",
-                    r#predicate
+                    "Proposition type {predicate} not found"
                 )));
             }
         }
@@ -2074,6 +2172,28 @@ impl CognitiveNexus {
             .await?;
 
         Ok(entity_id)
+    }
+
+    /// Returns true if the concept identified by `(type, name)` is system-protected
+    /// per KIP v1.0-RC6 §4.2.4 (DELETE CONCEPT) — meta-type definition nodes
+    /// (`$ConceptType`, `$PropositionType`), system actor identity tuples
+    /// (`$self`, `$system`), and core domains (e.g. `CoreSchema`).
+    fn is_protected_concept(r#type: &str, name: &str) -> bool {
+        // Meta-type definition nodes themselves.
+        if r#type == META_CONCEPT_TYPE
+            && (name == META_CONCEPT_TYPE || name == META_PROPOSITION_TYPE)
+        {
+            return true;
+        }
+        // System actor identity tuples.
+        if r#type == PERSON_TYPE && (name == META_SELF_NAME || name == META_SYSTEM_NAME) {
+            return true;
+        }
+        // Core domains. The spec lists `CoreSchema` as a representative example.
+        if r#type == DOMAIN_TYPE && name == "CoreSchema" {
+            return true;
+        }
+        false
     }
 
     async fn execute_delete(
@@ -2171,6 +2291,10 @@ impl CognitiveNexus {
                                 .await
                                 .is_ok()
                         {
+                            // Invalidate stale cache entry so subsequent
+                            // iterations on the same id (rare for concepts,
+                            // but defensive) re-read the freshest version.
+                            ctx.cache.concepts.write().remove(id);
                             updated_concepts += 1;
                         }
                     }
@@ -2199,6 +2323,12 @@ impl CognitiveNexus {
                                 .await
                                 .is_ok()
                         {
+                            // A single proposition may appear multiple times
+                            // in target_entities (one (id, predicate) per
+                            // predicate). Invalidate the cache so the next
+                            // iteration sees the post-update state and does
+                            // not resurrect already-removed attributes.
+                            ctx.cache.propositions.write().remove(id);
                             updated_propositions += 1;
                         }
                     }
@@ -2260,6 +2390,7 @@ impl CognitiveNexus {
                                 .await
                                 .is_ok()
                         {
+                            ctx.cache.concepts.write().remove(id);
                             updated_concepts += 1;
                         }
                     }
@@ -2288,6 +2419,10 @@ impl CognitiveNexus {
                                 .await
                                 .is_ok()
                         {
+                            // See execute_delete_attributes for rationale:
+                            // the same proposition id may appear under
+                            // multiple predicates in target_entities.
+                            ctx.cache.propositions.write().remove(id);
                             updated_propositions += 1;
                         }
                     }
@@ -2340,6 +2475,7 @@ impl CognitiveNexus {
                         // If no predicates left, delete the proposition
                         if proposition.predicates.is_empty() {
                             if self.propositions.remove(*id).await.is_ok() {
+                                ctx.cache.propositions.write().remove(id);
                                 deleted_propositions += 1;
                             }
                         } else {
@@ -2356,6 +2492,13 @@ impl CognitiveNexus {
                                 .await
                                 .is_ok()
                             {
+                                // CRITICAL: a single proposition row may be
+                                // listed under multiple predicates in the
+                                // target set. Without invalidating the cache,
+                                // the next iteration would read the pre-update
+                                // state and write back removed predicates,
+                                // resurrecting them.
+                                ctx.cache.propositions.write().remove(id);
                                 deleted_propositions += 1;
                             }
                         }
@@ -2375,12 +2518,6 @@ impl CognitiveNexus {
         where_clauses: Vec<WhereClause>,
         dry_run: bool,
     ) -> Result<Json, KipError> {
-        if dry_run {
-            return Ok(json!({
-                "deleted_propositions": 0,
-                "deleted_concepts": 0
-            }));
-        }
         let mut ctx = QueryContext::default();
         for clause in where_clauses {
             self.execute_where_clause(&mut ctx, clause).await?;
@@ -2389,46 +2526,104 @@ impl CognitiveNexus {
         let target_entities = ctx.entities.get(&target).cloned().ok_or_else(|| {
             KipError::reference_error(format!("Target term '{}' not found in context", target))
         })?;
-        let mut deleted_propositions: u64 = 0;
-        let mut deleted_concepts: u64 = 0;
+
+        // Collect target concept ids and pre-flight protected-scope check (KIP_3004).
+        // We must reject *before* performing any destructive work so the operation is
+        // atomic w.r.t. protected nodes — and the same check applies to dry runs so
+        // agents can probe for safety without side effects.
+        let mut concept_ids: Vec<u64> = Vec::new();
         for entity_id in target_entities.as_ref() {
-            match &entity_id {
-                EntityID::Concept(id) => {
-                    let mut propositions_ids: BTreeSet<u64> = BTreeSet::new();
-                    let eid: Fv = entity_id.to_string().into();
-                    if let Ok(ids) = self
-                        .propositions
-                        .query_ids(
-                            Filter::Or(vec![
-                                Box::new(Filter::Field((
-                                    "subject".to_string(),
-                                    RangeQuery::Eq(eid.clone()),
-                                ))),
-                                Box::new(Filter::Field((
-                                    "object".to_string(),
-                                    RangeQuery::Eq(eid),
-                                ))),
-                            ]),
-                            None,
-                        )
+            if let EntityID::Concept(id) = entity_id {
+                if let Ok((ty, name)) = self
+                    .try_get_concept_with(&ctx.cache, *id, |c| {
+                        Ok((c.r#type.clone(), c.name.clone()))
+                    })
+                    .await
+                    && Self::is_protected_concept(&ty, &name)
+                {
+                    return Err(KipError::immutable_target(format!(
+                        "Concept {{type: \"{ty}\", name: \"{name}\"}} is system-protected and cannot be deleted",
+                    )));
+                }
+                concept_ids.push(*id);
+            }
+            // EntityID::Proposition is silently ignored (DELETE CONCEPT only deletes
+            // concepts; proposition targets must use DELETE PROPOSITIONS).
+        }
+
+        if dry_run {
+            return Ok(json!({
+                "deleted_propositions": 0,
+                "deleted_concepts": 0
+            }));
+        }
+
+        // Compute the transitive cascade closure: every proposition whose subject
+        // or object refers (directly or via higher-order chains) to one of the
+        // concepts being deleted must also be removed so no dangling references
+        // remain after a DETACH (KIP v1.0-RC6 §4.2.4).
+        let mut to_delete_proposition_ids: BTreeSet<u64> = BTreeSet::new();
+        let mut frontier: Vec<EntityID> = concept_ids
+            .iter()
+            .map(|id| EntityID::Concept(*id))
+            .collect();
+
+        while !frontier.is_empty() {
+            let mut filters: Vec<Box<Filter>> = Vec::with_capacity(frontier.len() * 2);
+            for eid in &frontier {
+                let v: Fv = eid.to_string().into();
+                filters.push(Box::new(Filter::Field((
+                    "subject".to_string(),
+                    RangeQuery::Eq(v.clone()),
+                ))));
+                filters.push(Box::new(Filter::Field((
+                    "object".to_string(),
+                    RangeQuery::Eq(v),
+                ))));
+            }
+            let filter = if filters.len() == 1 {
+                *filters.into_iter().next().unwrap()
+            } else {
+                Filter::Or(filters)
+            };
+
+            let ids = self
+                .propositions
+                .query_ids(filter, None)
+                .await
+                .unwrap_or_default();
+
+            let mut next: Vec<EntityID> = Vec::new();
+            for id in ids {
+                if to_delete_proposition_ids.insert(id)
+                    && let Ok(predicates) = self
+                        .try_get_proposition_with(&ctx.cache, id, |p| {
+                            Ok(p.predicates.iter().cloned().collect::<Vec<_>>())
+                        })
                         .await
-                    {
-                        propositions_ids.extend(ids);
-                    }
-
-                    for id in propositions_ids {
-                        if self.propositions.remove(id).await.is_ok() {
-                            deleted_propositions += 1;
-                        }
-                    }
-
-                    if self.concepts.remove(*id).await.is_ok() {
-                        deleted_concepts += 1;
+                {
+                    // Newly discovered proposition — enqueue all of its EntityID
+                    // forms (one per predicate) so higher-order propositions that
+                    // reference it can be picked up on the next iteration.
+                    for pred in predicates {
+                        next.push(EntityID::Proposition(id, pred));
                     }
                 }
-                EntityID::Proposition(_, _) => {
-                    // ignore
-                }
+            }
+            frontier = next;
+        }
+
+        let mut deleted_propositions: u64 = 0;
+        for id in to_delete_proposition_ids {
+            if self.propositions.remove(id).await.is_ok() {
+                deleted_propositions += 1;
+            }
+        }
+
+        let mut deleted_concepts: u64 = 0;
+        for id in concept_ids {
+            if self.concepts.remove(id).await.is_ok() {
+                deleted_concepts += 1;
             }
         }
 
@@ -3033,7 +3228,7 @@ impl CognitiveNexus {
             None => {
                 // 如果当前游标没有绑定，尝试从快照中获取
                 let ids = bindings_snapshot.get_mut(&dot_path.var).ok_or_else(|| {
-                    KipError::reference_error(format!("Unbound variable1: {:?}", dot_path.var))
+                    KipError::reference_error(format!("Unbound variable: {:?}", dot_path.var))
                 })?;
 
                 let id = match ids.pop() {
@@ -5419,5 +5614,190 @@ mod tests {
         let query = parse_kql(kql).unwrap();
         let (result, _) = nexus.execute_kql(query).await.unwrap();
         assert_eq!(result, json!([["Aspirin"], [2]]));
+    }
+
+    #[tokio::test]
+    async fn test_kml_delete_concept_protected_scope_returns_kip_3004() {
+        let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+
+        // The default bootstrap loads $ConceptType / $PropositionType meta-types
+        // and the CoreSchema domain. Bring up $self / $system as well so we can
+        // exercise every category of protected node from KIP v1.0-RC6 §4.2.4.
+        nexus
+            .execute_kml(parse_kml(PERSON_SELF_KIP).unwrap(), false)
+            .await
+            .unwrap();
+        nexus
+            .execute_kml(parse_kml(PERSON_SYSTEM_KIP).unwrap(), false)
+            .await
+            .unwrap();
+
+        let cases = [
+            r#"DELETE CONCEPT ?x DETACH WHERE { ?x {type: "$ConceptType", name: "$ConceptType"} }"#,
+            r#"DELETE CONCEPT ?x DETACH WHERE { ?x {type: "$ConceptType", name: "$PropositionType"} }"#,
+            r#"DELETE CONCEPT ?x DETACH WHERE { ?x {type: "Person", name: "$self"} }"#,
+            r#"DELETE CONCEPT ?x DETACH WHERE { ?x {type: "Person", name: "$system"} }"#,
+            r#"DELETE CONCEPT ?x DETACH WHERE { ?x {type: "Domain", name: "CoreSchema"} }"#,
+        ];
+        for kml in cases {
+            let stmt = parse_kml(kml).unwrap();
+            // dry_run = false: must error before any side effects.
+            let err = nexus.execute_kml(stmt.clone(), false).await.unwrap_err();
+            assert!(
+                matches!(err.code, KipErrorCode::ImmutableTarget),
+                "expected KIP_3004 for {kml}, got {:?}",
+                err.code
+            );
+            // dry_run = true: still must error so agents can probe safely.
+            let err = nexus.execute_kml(stmt, true).await.unwrap_err();
+            assert!(
+                matches!(err.code, KipErrorCode::ImmutableTarget),
+                "expected KIP_3004 (dry_run) for {kml}, got {:?}",
+                err.code
+            );
+        }
+
+        // Sanity: protected $self is still present after the rejected deletes.
+        assert!(
+            nexus
+                .has_concept(&ConceptPK::Object {
+                    r#type: PERSON_TYPE.to_string(),
+                    name: META_SELF_NAME.to_string(),
+                })
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_kml_delete_concept_cascade_is_transitive() {
+        let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+        setup_test_data(&nexus).await.unwrap();
+
+        // Build a higher-order chain rooted at an ordinary Drug concept:
+        //   (Aspirin, "treats", Headache)               — first-order
+        //   (TestActor, "stated", <above proposition>)  — higher-order
+        // Deleting Aspirin must cascade through both so no dangling reference
+        // remains after the DETACH.
+        let bootstrap = r#"
+        UPSERT {
+            CONCEPT ?actor_type {
+                {type: "$ConceptType", name: "Actor"}
+                SET ATTRIBUTES { description: "Test actor type" }
+            }
+            CONCEPT ?stated_type {
+                {type: "$PropositionType", name: "stated"}
+                SET ATTRIBUTES { description: "Higher-order: an actor stated a proposition" }
+            }
+            CONCEPT ?actor {
+                {type: "Actor", name: "TestActor"}
+            }
+            PROPOSITION ?claim {
+                ({type: "Actor", name: "TestActor"},
+                 "stated",
+                 ({type: "Drug", name: "Aspirin"}, "treats", {type: "Symptom", name: "Headache"}))
+            }
+        }
+        "#;
+        nexus
+            .execute_kml(parse_kml(bootstrap).unwrap(), false)
+            .await
+            .unwrap();
+
+        let delete = r#"
+        DELETE CONCEPT ?d DETACH
+        WHERE { ?d {type: "Drug", name: "Aspirin"} }
+        "#;
+        let res = nexus
+            .execute_kml(parse_kml(delete).unwrap(), false)
+            .await
+            .unwrap();
+
+        // We expect at least 2 propositions cascaded: the first-order "treats"
+        // edge and the higher-order "stated" edge that referenced it.
+        assert_eq!(res["deleted_concepts"], json!(1));
+        let cascaded = res["deleted_propositions"].as_u64().unwrap();
+        assert!(
+            cascaded >= 2,
+            "expected transitive cascade to delete >=2 propositions, got {cascaded}"
+        );
+
+        // Confirm Aspirin is gone.
+        assert!(
+            !nexus
+                .has_concept(&ConceptPK::Object {
+                    r#type: "Drug".to_string(),
+                    name: "Aspirin".to_string(),
+                })
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_kml_delete_propositions_multi_predicate_no_resurrection() {
+        // Regression: previously, a single Proposition row carrying multiple
+        // predicates could have already-removed predicates "resurrected" when
+        // the same row appeared again in the target set under another
+        // predicate, because the per-query QueryCache returned the stale
+        // pre-update Proposition.
+        let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+        setup_test_data(&nexus).await.unwrap();
+
+        // Add a second predicate type and a proposition that carries both
+        // "treats" and "alleviates" between Aspirin and Headache (so a single
+        // Proposition row holds both predicates simultaneously).
+        let bootstrap = r#"
+        UPSERT {
+            CONCEPT ?alleviates_pred {
+                {type: "$PropositionType", name: "alleviates"}
+            }
+            PROPOSITION ?p {
+                ({type: "Drug", name: "Aspirin"}, "alleviates", {type: "Symptom", name: "Headache"})
+            }
+        }
+        "#;
+        nexus
+            .execute_kml(parse_kml(bootstrap).unwrap(), false)
+            .await
+            .unwrap();
+
+        // Sanity: the Aspirin → Headache row now carries both predicates.
+        let kql = r#"
+        FIND(?link)
+        WHERE {
+            ?link ({type: "Drug", name: "Aspirin"}, ?p, {type: "Symptom", name: "Headache"})
+        }
+        "#;
+        let (result, _) = nexus.execute_kql(parse_kql(kql).unwrap()).await.unwrap();
+        let links = result.as_array().unwrap();
+        let predicates: BTreeSet<String> = links
+            .iter()
+            .map(|v| v["predicate"].as_str().unwrap().to_string())
+            .collect();
+        assert!(predicates.contains("treats"));
+        assert!(predicates.contains("alleviates"));
+
+        // Delete BOTH predicates in a single statement. The target set
+        // expands to two EntityID::Proposition entries that share the same
+        // underlying _id but differ in predicate.
+        let delete = r#"
+        DELETE PROPOSITIONS ?link
+        WHERE {
+            ?link ({type: "Drug", name: "Aspirin"}, ?p, {type: "Symptom", name: "Headache"})
+        }
+        "#;
+        nexus
+            .execute_kml(parse_kml(delete).unwrap(), false)
+            .await
+            .unwrap();
+
+        // After the cache fix, BOTH predicates must be gone. Without the fix,
+        // the second iteration would have re-added the predicate removed by
+        // the first iteration.
+        let (result, _) = nexus.execute_kql(parse_kql(kql).unwrap()).await.unwrap();
+        let links = result.as_array().unwrap();
+        assert!(
+            links.is_empty(),
+            "expected all Aspirin→Headache predicates to be gone, got {links:?}"
+        );
     }
 }
