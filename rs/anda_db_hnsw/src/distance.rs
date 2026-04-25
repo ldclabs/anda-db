@@ -4,30 +4,32 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::HnswError;
 
-/// Distance metric types.
+/// Distance metric used for similarity computation.
+///
+/// All variants return **smaller values for more similar vectors**, which keeps
+/// the downstream nearest-neighbor logic uniform. In particular
+/// [`DistanceMetric::InnerProduct`] returns `−dot(a, b)` so that "higher inner
+/// product" maps to "smaller distance".
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DistanceMetric {
-    /// Euclidean distance (L2 norm).
+    /// Euclidean distance — √Σ (aᵢ − bᵢ)².
     Euclidean,
-    /// Cosine distance (1 - cosine similarity).
+    /// Cosine distance — 1 − cos(θ). Returns `1.0` when either vector is (near-)zero.
     Cosine,
-    /// Negative inner product (dot product).
+    /// Negative inner product — −Σ aᵢ bᵢ.
     InnerProduct,
-    /// Manhattan distance (L1 norm).
+    /// Manhattan distance — Σ |aᵢ − bᵢ|.
     Manhattan,
 }
 
 impl DistanceMetric {
-    /// Compute the distance between two vectors using the selected metric.
+    /// Computes the distance between two `bf16` vectors.
     ///
-    /// # Arguments
+    /// Internally promotes each element to `f32` before accumulating; the
+    /// result is returned as `f32`.
     ///
-    /// * `a` - First vector
-    /// * `b` - Second vector
-    ///
-    /// # Returns
-    ///
-    /// * `Result<f32, HnswError>` - The computed distance or an error if the dimensions don't match.
+    /// # Errors
+    /// Returns [`HnswError::DimensionMismatch`] if `a.len() != b.len()`.
     pub fn compute(&self, a: &[bf16], b: &[bf16]) -> Result<f32, HnswError> {
         if a.len() != b.len() {
             return Err(HnswError::DimensionMismatch {
@@ -45,6 +47,13 @@ impl DistanceMetric {
         }
     }
 
+    /// Computes the distance between two `f32` vectors.
+    ///
+    /// Useful for callers that want to avoid the `bf16` round-trip at
+    /// evaluation time (e.g. during offline evaluation).
+    ///
+    /// # Errors
+    /// Returns [`HnswError::DimensionMismatch`] if `a.len() != b.len()`.
     pub fn compute_f32(&self, a: &[f32], b: &[f32]) -> Result<f32, HnswError> {
         if a.len() != b.len() {
             return Err(HnswError::DimensionMismatch {
@@ -63,10 +72,12 @@ impl DistanceMetric {
     }
 }
 
-/// Random layer generator for HNSW
+/// Random layer generator for HNSW.
 ///
-/// Provides functionality for generating random layers for nodes in the HNSW graph.
-/// Uses an exponential distribution to ensure upper layers are sparse and lower layers are dense.
+/// Draws a layer index from a truncated exponential distribution so that the
+/// expected number of nodes at layer `ℓ` decays as `M^{-ℓ}`, where `M` is
+/// [`HnswConfig::max_connections`]. This reproduces the behavior of the
+/// reference HNSW paper.
 #[derive(Debug)]
 pub struct LayerGen {
     /// Uniform distribution sampler
@@ -128,10 +139,10 @@ impl LayerGen {
         let mut r = rng();
         let val = r.sample(self.uniform);
 
-        // 使用指数分布计算层级
+        // Sample l = ⌊−ln(u) · scale⌋ from an exponential distribution.
         let level = (-val.ln() * self.scale).floor() as u8;
 
-        // 确保层级在有效范围内
+        // Clamp into the valid range; never skip more than one layer at a time.
         level.min(current_max_layer + 1).min(self.max_level - 1)
     }
 }
@@ -239,7 +250,7 @@ mod tests {
         let lg = LayerGen::new(10, 16);
         let mut counts = [0; 16];
 
-        // 生成大量样本以验证分布
+        // Sample many layers and check the empirical distribution.
         const SAMPLES: usize = 100_000;
         let mut current_max_layer = 0;
         for _ in 0..SAMPLES {
@@ -249,12 +260,12 @@ mod tests {
         }
         println!("Max layer: {current_max_layer}");
 
-        // 验证层级分布是递减的
+        // The histogram must be monotonically non-increasing.
         for i in 1..16 {
             assert!(counts[i] <= counts[i - 1]);
         }
 
-        // 验证最底层占比合理
+        // The bottom layer should hold the majority of the samples.
         let bottom_ratio = counts[0] as f64 / SAMPLES as f64;
         println!("Bottom layer ratio: {bottom_ratio}");
         assert!(bottom_ratio >= 0.5);
@@ -277,7 +288,7 @@ mod tests {
             let norm_a: f32 = a.iter().map(|x| x.powi(2)).sum::<f32>().sqrt();
             let norm_b: f32 = b.iter().map(|x| x.powi(2)).sum::<f32>().sqrt();
             if norm_a == 0.0 || norm_b == 0.0 {
-                return 1.0; // 零向量的余弦距离默认为1.0
+                return 1.0; // Cosine distance for zero vectors defaults to 1.0.
             }
             1.0 - (dot_product / (norm_a * norm_b))
         }
@@ -290,7 +301,7 @@ mod tests {
             a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).sum()
         }
 
-        // 创建随机测试向量
+        // Build random reference vectors.
         let dims = 128;
         let mut v1: Vec<f32> = Vec::with_capacity(dims);
         let mut v2: Vec<f32> = Vec::with_capacity(dims);
@@ -300,36 +311,36 @@ mod tests {
             v2.push(rng.random::<f32>());
         }
 
-        // 测试欧几里得距离
+        // Euclidean.
         let impl_euclidean = euclidean_distance_f32(&v1, &v2);
         let scalar_euclidean = euclidean_distance_scalar(&v1, &v2);
         assert!(
             (impl_euclidean - scalar_euclidean).abs() < 1e-4,
-            "欧几里得距离: impl={impl_euclidean}, 标量={scalar_euclidean}"
+            "euclidean: impl={impl_euclidean}, scalar={scalar_euclidean}"
         );
 
-        // 测试余弦距离
+        // Cosine.
         let impl_cosine = cosine_distance_f32(&v1, &v2);
         let scalar_cosine = cosine_distance_scalar(&v1, &v2);
         assert!(
             (impl_cosine - scalar_cosine).abs() < 1e-4,
-            "余弦距离: impl={impl_cosine}, 标量={scalar_cosine}"
+            "cosine: impl={impl_cosine}, scalar={scalar_cosine}"
         );
 
-        // 测试内积
+        // Inner product.
         let impl_inner = inner_product_f32(&v1, &v2);
         let scalar_inner = inner_product_scalar(&v1, &v2);
         assert!(
             (impl_inner - scalar_inner).abs() < 1e-4,
-            "内积: impl={impl_inner}, 标量={scalar_inner}"
+            "inner: impl={impl_inner}, scalar={scalar_inner}"
         );
 
-        // 测试曼哈顿距离
+        // Manhattan.
         let impl_manhattan = manhattan_distance_f32(&v1, &v2);
         let scalar_manhattan = manhattan_distance_scalar(&v1, &v2);
         assert!(
             (impl_manhattan - scalar_manhattan).abs() < 1e-4,
-            "曼哈顿距离: impl={impl_manhattan}, 标量={scalar_manhattan}"
+            "manhattan: impl={impl_manhattan}, scalar={scalar_manhattan}"
         );
     }
 }
