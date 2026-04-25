@@ -1,7 +1,7 @@
-# anda_db_derive Technical Documentation
+# `anda_db_derive` Technical Documentation
 
-**Version**: 0.4
-**Last Updated**: 2026-04-21
+**Crate version**: 0.4
+**Last updated**: 2026-04-25
 
 ---
 
@@ -9,49 +9,64 @@
 
 1. [Overview](#1-overview)
 2. [Derive Macros](#2-derive-macros)
-3. [Attribute Details](#3-attribute-details)
-4. [Type Mapping](#4-type-mapping)
-5. [Usage Examples](#5-usage-examples)
-6. [Internal Implementation](#6-internal-implementation)
+3. [Attributes](#3-attributes)
+4. [Type Inference Rules](#4-type-inference-rules)
+5. [The `field_type` DSL](#5-the-field_type-dsl)
+6. [Usage Examples](#6-usage-examples)
+7. [Internal Implementation](#7-internal-implementation)
+8. [Diagnostics](#8-diagnostics)
 
 ---
 
 ## 1. Overview
 
-### 1.1 Module Responsibilities
+### 1.1 Purpose
 
-`anda_db_derive` provides two procedural macros for auto-generating AndaDB Schema-related code from Rust structs:
+`anda_db_derive` is a procedural-macro crate that generates AndaDB schema
+glue code from ordinary Rust structs. Two derives are exported and re-exported
+through `anda_db_schema`:
 
-- `FieldTyped` - Generates `field_type()` method
-- `AndaDBSchema` - Generates complete `schema()` method
+| Macro          | Generated method                                 |
+| -------------- | ------------------------------------------------ |
+| `FieldTyped`   | `pub fn field_type() -> FieldType`               |
+| `AndaDBSchema` | `pub fn schema() -> Result<Schema, SchemaError>` |
 
-### 1.2 Module Structure
+Both macros operate on structs with named fields. Tuple structs, unit
+structs, enums and unions are rejected with a `compile_error!`.
+
+### 1.2 Crate layout
 
 ```
-anda_db_derive/
+rs/anda_db_derive/
 ├── src/
-│   ├── lib.rs           # Macro definition entry
-│   ├── schema.rs        # AndaDBSchema macro implementation
-│   ├── field_typed.rs   # FieldTyped macro implementation
-│   └── common.rs        # Shared utility functions
+│   ├── lib.rs           # public macro entry points
+│   ├── schema.rs        # AndaDBSchema implementation
+│   ├── field_typed.rs   # FieldTyped implementation
+│   └── common.rs        # shared parsing / type-inference helpers
 ├── Cargo.toml
 └── README.md
 ```
+
+### 1.3 Required scope
+
+Generated code references `FieldType`, `FieldKey`, `FieldEntry`, `Schema` and
+`SchemaError` by bare name. The recommended pattern is to import them via the
+`anda_db_schema` prelude (or a glob import) at the call site.
 
 ---
 
 ## 2. Derive Macros
 
-### 2.1 FieldTyped
-
-Generates `field_type()` function returning the struct's type mapping:
+### 2.1 `FieldTyped`
 
 ```rust
 #[proc_macro_derive(FieldTyped, attributes(field_type))]
-pub fn field_typed_derive(input: TokenStream) -> TokenStream
 ```
 
-**Usage Example**:
+For each named field, the macro emits one `(key, FieldType)` tuple and packs
+them into a `FieldType::Map`. The resulting `field_type()` is what
+`AndaDBSchema` (and `determine_field_type`) call when they encounter a
+nested user-defined struct.
 
 ```rust
 use anda_db_schema::{FieldType, FieldTyped};
@@ -63,32 +78,36 @@ struct User {
     age: u32,
 }
 
-// Generates:
+// Expanded:
 impl User {
     pub fn field_type() -> FieldType {
-        FieldType::Map(vec![
-            ("id".into(), FieldType::U64),
-            ("name".into(), FieldType::Text),
-            ("age".into(), FieldType::U64),
-        ].into_iter().collect())
+        FieldType::Map(
+            vec![
+                ("id".into(),   FieldType::U64),
+                ("name".into(), FieldType::Text),
+                ("age".into(),  FieldType::U64),
+            ]
+            .into_iter()
+            .collect(),
+        )
     }
 }
 ```
 
-### 2.2 AndaDBSchema
-
-Generates complete `schema()` function for creating AndaDB Schema:
+### 2.2 `AndaDBSchema`
 
 ```rust
 #[proc_macro_derive(AndaDBSchema, attributes(field_type, unique))]
-pub fn anda_db_schema_derive(input: TokenStream) -> TokenStream
 ```
 
-**Usage Example**:
+Builds a complete `Schema` via `Schema::builder()`. The `_id: u64` field is
+**mandatory** — the macro validates its type at compile time and skips it
+during code generation, since the builder injects the primary-key column
+itself.
 
 ```rust
-use anda_db_schema::{Schema, SchemaError, AndaDBSchema};
 use anda_db_derive::AndaDBSchema;
+use anda_db_schema::{FieldEntry, FieldType, Schema, SchemaError};
 
 #[derive(AndaDBSchema)]
 struct Article {
@@ -102,24 +121,22 @@ struct Article {
     views: u64,
 }
 
-// Generates:
+// Expanded (abbreviated):
 impl Article {
     pub fn schema() -> Result<Schema, SchemaError> {
         let mut builder = Schema::builder();
-
         builder.add_field(
             FieldEntry::new("title".to_string(), FieldType::Text)?
-                .with_description("Article title")
+                .with_description("Article title".to_string()),
         )?;
         builder.add_field(
             FieldEntry::new("content".to_string(), FieldType::Text)?
-                .with_description("Article content")
+                .with_description("Article content".to_string()),
         )?;
         builder.add_field(
             FieldEntry::new("views".to_string(), FieldType::U64)?
-                .with_description("View count")
+                .with_description("View count".to_string()),
         )?;
-
         builder.build()
     }
 }
@@ -127,240 +144,205 @@ impl Article {
 
 ---
 
-## 3. Attribute Details
+## 3. Attributes
 
-### 3.1 #[field_type = "TypeName"]
+| Attribute                   | Applies to                   | Effect                                                                                              |
+| --------------------------- | ---------------------------- | --------------------------------------------------------------------------------------------------- |
+| `#[field_type = "..."]`     | `FieldTyped`, `AndaDBSchema` | Override the inferred field type using the [DSL](#5-the-field_type-dsl).                            |
+| `#[unique]`                 | `AndaDBSchema` only          | Adds `FieldEntry::with_unique()` to the generated entry.                                            |
+| `#[serde(rename = "name")]` | both                         | Use the renamed identifier as the schema field name. Other serde keys are ignored.                  |
+| `/// doc comment`           | `AndaDBSchema` only          | All `///` lines on a field are joined with a space and emitted as `FieldEntry::with_description()`. |
 
-Override auto-inferred field type:
+Notes:
 
-```rust
-#[derive(AndaDBSchema)]
-struct MyDoc {
-    _id: u64,
-    #[field_type = "Bytes"]    // Override to Bytes type
-    custom_id: [u8; 16],
-    #[field_type = "Option<Text>"]  // Override to optional text
-    nickname: Option<String>,
-}
+- `#[unique]` is silently ignored by `FieldTyped` because that macro does not
+  generate a `Schema`.
+- Multiple `///` lines are concatenated; empty doc lines are dropped before
+  joining.
+- Only the first `serde(rename = "...")` is honoured; other serde syntax that
+  fails to parse is skipped without raising an error.
+
+---
+
+## 4. Type Inference Rules
+
+When `#[field_type]` is **not** present, the macros walk the field's Rust
+type and produce a `FieldType` token stream.
+
+### 4.1 Primitives
+
+| Rust type                          | `FieldType` |
+| ---------------------------------- | ----------- |
+| `bool`                             | `Bool`      |
+| `i8`, `i16`, `i32`, `i64`, `isize` | `I64`       |
+| `u8`, `u16`, `u32`, `u64`, `usize` | `U64`       |
+| `f32`                              | `F32`       |
+| `f64`                              | `F64`       |
+
+### 4.2 Strings and bytes
+
+| Rust type                                                              | `FieldType` |
+| ---------------------------------------------------------------------- | ----------- |
+| `String`, `&str`                                                       | `Text`      |
+| `Vec<u8>`, `[u8; N]`                                                   | `Bytes`     |
+| `Bytes`, `ByteArray`, `ByteBuf`                                        | `Bytes`     |
+| `BytesB64`, `ByteArrayB64`, `ByteBufB64`                               | `Bytes`     |
+| `serde_bytes::Bytes`, `serde_bytes::ByteArray`, `serde_bytes::ByteBuf` | `Bytes`     |
+
+### 4.3 Vectors and JSON
+
+| Rust type                   | `FieldType` |
+| --------------------------- | ----------- |
+| `Vec<bf16>`, `[bf16; N]`    | `Vector`    |
+| `Json`, `serde_json::Value` | `Json`      |
+
+> Bare `bf16` (or `half::bf16`) is **not** a valid field type. Wrap it in
+> a `Vec` to obtain `Vector`, or annotate the field with `#[field_type =
+> "F32"]` if a scalar is desired.
+
+### 4.4 Collections
+
+| Rust type                                               | `FieldType`       |
+| ------------------------------------------------------- | ----------------- |
+| `Vec<T>`, `HashSet<T>`, `BTreeSet<T>`                   | `Array(T)`        |
+| `[T; N]` (with `T` a supported non-byte/non-bf16 type)  | `Array(T)`        |
+| `HashMap<K, V>`, `BTreeMap<K, V>`, `serde_json::Map<…>` | `Map({"*" => V})` |
+
+For maps the key `K` must be one of:
+
+- a string-like type (`String`, `&str`) → wildcard text key `"*"`
+- a bytes-like type (`Vec<u8>`, `Bytes`, `ByteArray`, `ByteBuf`, `*B64`) →
+  wildcard bytes key `b"*"`
+
+Any other key type is a compile error.
+
+### 4.5 Optionality and user-defined types
+
+| Rust type                             | `FieldType`                                        |
+| ------------------------------------- | -------------------------------------------------- |
+| `Option<T>`                           | `Option(T)`                                        |
+| Any other path (single segment) `Foo` | `Foo::field_type()` — **must** derive `FieldTyped` |
+
+Selected fully qualified paths are recognised explicitly even if the leading
+segment is not the type name:
+
+- `serde_bytes::Bytes` / `ByteArray` / `ByteBuf` → `Bytes`
+- `serde_json::Value` → `Json`
+- `half::bf16` → compile error (with guidance)
+
+---
+
+## 5. The `field_type` DSL
+
+The string passed to `#[field_type = "..."]` is parsed by
+`parse_field_type_str` and accepts the grammar below (whitespace anywhere
+is ignored):
+
+```text
+type        := primitive | array | option | map
+primitive   := "Bytes" | "Text" | "U64" | "I64"
+             | "F64"   | "F32"  | "Bool" | "Json" | "Vector"
+array       := "Array<" type ">"
+option      := "Option<" type ">"
+map         := "Map<" map_key "," type ">"
+map_key     := "String" | "Text" | "Bytes"
 ```
 
-**Supported Type Strings**:
+### 5.1 String / Text equivalence
 
-| String | FieldType |
-|--------|-----------|
-| `"Bytes"` | `FieldType::Bytes` |
-| `"Text"` | `FieldType::Text` |
-| `"U64"` | `FieldType::U64` |
-| `"I64"` | `FieldType::I64` |
-| `"F64"` | `FieldType::F64` |
-| `"F32"` | `FieldType::F32` |
-| `"Bool"` | `FieldType::Bool` |
-| `"Json"` | `FieldType::Json` |
-| `"Vector"` | `FieldType::Vector` |
-| `"Array<T>"` | `FieldType::Array(vec![T])` |
-| `"Option<T>"` | `FieldType::Option(Box::new(T))` |
-| `"Map<String, T>"` | `FieldType::Map({*: T})` |
-| `"Map<Bytes, T>"` | `FieldType::Map({b*: T})` |
-
-### 3.2 #[unique]
-
-Mark field as having a unique constraint:
+`String` and `Text` are **synonyms** for map keys: `FieldType` only has a
+`Text` variant, but `Map<String, T>` reads more naturally for users coming
+from `HashMap<String, _>`. Both:
 
 ```rust
-#[derive(AndaDBSchema)]
-struct User {
-    _id: u64,
-    #[unique]
-    email: String,  // Unique constraint
-}
+#[field_type = "Map<String, Json>"]
+#[field_type = "Map<Text, Json>"]
 ```
 
-**Generated Code**:
+expand to the same wildcard `Map({"*" => Json})`.
 
-```rust
-builder.add_field(
-    FieldEntry::new("email".to_string(), FieldType::Text)?
-        .with_unique()
-)?;
+### 5.2 Examples
+
+| DSL string                  | `FieldType`                  |
+| --------------------------- | ---------------------------- |
+| `"Bytes"`                   | `Bytes`                      |
+| `"Array<U64>"`              | `Array(U64)`                 |
+| `"Option<Text>"`            | `Option(Text)`               |
+| `"Map<String, Json>"`       | `Map({"*" => Json})`         |
+| `"Map<Text, Array<U64>>"`   | `Map({"*" => Array(U64)})`   |
+| `"Map<Bytes, F64>"`         | `Map({b"*" => F64})`         |
+| `"Option<Map<Bytes, F64>>"` | `Option(Map({b"*" => F64}))` |
+
+### 5.3 Diagnostic guarantees
+
+Unrecognised input produces a `compile_error!` at the original macro span:
+
+```text
+Unsupported field type: '...'. Supported types: Bytes, Text, U64, I64,
+F64, F32, Bool, Json, Vector, Array<T>, Option<T>, Map<String, T>,
+Map<Text, T>, Map<Bytes, T>
 ```
 
-### 3.3 #[serde(rename = "name")]
-
-Use serde's rename attribute to use a different name in Schema:
-
-```rust
-#[derive(AndaDBSchema, Serialize, Deserialize)]
-struct User {
-    _id: u64,
-    #[serde(rename = "userName")]
-    user_name: String,  // Field named "userName" in Schema
-}
+```text
+Unsupported Map key type: '...'. Expected 'String', 'Text' or 'Bytes'.
 ```
 
-### 3.4 Doc Comments (///)
-
-Doc comments are automatically extracted as field descriptions:
-
-```rust
-#[derive(AndaDBSchema)]
-struct User {
-    /// User's unique email address
-    email: String,
-    /// User's display name in the system
-    display_name: String,
-}
-```
-
-**Generated Code**:
-
-```rust
-builder.add_field(
-    FieldEntry::new("email".to_string(), FieldType::Text)?
-        .with_description("User's unique email address")
-)?;
-builder.add_field(
-    FieldEntry::new("display_name".to_string(), FieldType::Text)?
-        .with_description("User's display name in the system")
-)?;
+```text
+Invalid Map field type: '...'. Expected 'Map<KeyType, ValueType>'.
 ```
 
 ---
 
-## 4. Type Mapping
+## 6. Usage Examples
 
-### 4.1 Basic Types
-
-| Rust Type | FieldType |
-|-----------|-----------|
-| `bool` | `Bool` |
-| `i8`, `i16`, `i32`, `i64`, `isize` | `I64` |
-| `u8`, `u16`, `u32`, `u64`, `usize` | `U64` |
-| `f32` | `F32` |
-| `f64` | `F64` |
-
-### 4.2 String and Bytes
-
-| Rust Type | FieldType |
-|-----------|-----------|
-| `String`, `&str` | `Text` |
-| `Vec<u8>`, `[u8; N]` | `Bytes` |
-| `Bytes`, `ByteArray`, `ByteBuf` | `Bytes` |
-| `ByteArrayB64`, `ByteBufB64` | `Bytes` |
-| `serde_bytes::ByteArray`, `serde_bytes::ByteBuf`, `serde_bytes::Bytes` | `Bytes` |
-
-### 4.3 Vector Types
-
-| Rust Type | FieldType |
-|-----------|-----------|
-| `Vec<bf16>`, `[bf16; N]` | `Vector` |
-| `half::bf16` | `Bf16` (internally mapped to Vector) |
-
-### 4.4 JSON
-
-| Rust Type | FieldType |
-|-----------|-----------|
-| `serde_json::Value`, `Json` | `Json` |
-
-### 4.5 Collection Types
-
-| Rust Type | FieldType |
-|-----------|-----------|
-| `Vec<T>` | `Array(T)` |
-| `HashSet<T>`, `BTreeSet<T>` | `Array(T)` |
-
-**Inner element type mapping**: See basic type mapping rules.
-
-### 4.6 Map Types
-
-| Rust Type | FieldType |
-|-----------|-----------|
-| `HashMap<String, V>`, `BTreeMap<String, V>` | `Map({*: V})` |
-| `Map<String, V>` | `Map({*: V})` |
-| `HashMap<Bytes, V>`, `BTreeMap<Bytes, V>` | `Map({b*: V})` |
-
-### 4.7 Optional Types
-
-| Rust Type | FieldType |
-|-----------|-----------|
-| `Option<T>` | `Option(T)` |
-
-### 4.8 Custom Types
-
-For custom structs that implement `FieldTyped`:
+### 6.1 Full schema with mixed features
 
 ```rust
-#[derive(FieldTyped)]
-struct Address {
-    street: String,
-    city: String,
-}
-
-#[derive(AndaDBSchema)]
-struct User {
-    _id: u64,
-    address: Address,  // Uses Address::field_type()
-}
-```
-
----
-
-## 5. Usage Examples
-
-### 5.1 Complete Example
-
-```rust
-use anda_db_schema::{Schema, FieldEntry, FieldType, Document, AndaDBSchema, Fv};
 use anda_db_derive::AndaDBSchema;
-use serde::{Serialize, Deserialize};
+use anda_db_schema::{Document, FieldEntry, FieldType, Fv, Schema, SchemaError, bf16};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use bf16::bf16;
 
 #[derive(AndaDBSchema, Serialize, Deserialize, Debug)]
 struct Article {
-    /// Article unique identifier
+    /// AndaDB-managed primary key
     _id: u64,
-    /// Article title
+    /// Article title (uniquely indexed)
+    #[unique]
     title: String,
-    /// Article content
+    /// Article body
     content: String,
-    /// View count
+    /// Cumulative view counter
     views: u64,
-    /// Whether article is published
+    /// Publication flag
     published: bool,
-    /// Optional tags
+    /// Optional list of tags
     tags: Option<Vec<String>>,
-    /// Author metadata
+    /// Free-form author metadata
     author_meta: Option<serde_json::Value>,
     /// Embedding vector
     embedding: Vec<bf16>,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Create Schema
+fn main() -> Result<(), SchemaError> {
     let schema = Arc::new(Article::schema()?);
-    println!("Schema: {:#?}", schema);
 
-    // Create document
     let mut doc = Document::new(schema.clone());
     doc.set_id(1);
-    doc.set_field("title", Fv::Text("Hello World".to_string()))?;
-    doc.set_field("content", Fv::Text("This is content".to_string()))?;
-    doc.set_field("views", Fv::U64(0))?;
+    doc.set_field("title",     Fv::Text("Hello World".into()))?;
+    doc.set_field("content",   Fv::Text("This is the body".into()))?;
+    doc.set_field("views",     Fv::U64(0))?;
     doc.set_field("published", Fv::Bool(true))?;
     doc.set_field("embedding", Fv::Vector(vec![bf16::from_f32(0.1); 512]))?;
-
-    println!("Document: {:#?}", doc);
-    println!("Title: {:?}", doc.get_field("title"));
-
     Ok(())
 }
 ```
 
-### 5.2 Example with Custom Types
+### 6.2 Nesting a `FieldTyped` struct
 
 ```rust
-use anda_db_schema::{Schema, FieldType, AndaDBSchema, FieldTyped};
-use anda_db_derive::AndaDBSchema;
+use anda_db_derive::{AndaDBSchema, FieldTyped};
+use anda_db_schema::FieldType;
 
 #[derive(FieldTyped, Debug)]
 struct GeoLocation {
@@ -372,104 +354,103 @@ struct GeoLocation {
 struct Place {
     _id: u64,
     name: String,
-    location: GeoLocation,  // Uses custom type's field_type()
+    /// `GeoLocation::field_type()` is invoked at expansion time.
+    location: GeoLocation,
 }
 ```
 
-### 5.3 Example with Type Overrides
+### 6.3 Overriding inferred types
 
 ```rust
-use anda_db_schema::{Schema, AndaDBSchema};
 use anda_db_derive::AndaDBSchema;
 use ic_auth_types::Xid;
 
 #[derive(AndaDBSchema)]
 struct Transaction {
     _id: u64,
-    #[field_type = "Bytes"]  // Use Xid as byte array
+    /// Treat the `Xid` newtype as a fixed-length byte field.
+    #[field_type = "Bytes"]
     tx_id: Xid,
+    /// Optional list of byte ids — three nested DSL constructs in one go.
+    #[field_type = "Option<Array<Bytes>>"]
+    inputs: Option<Vec<Xid>>,
     amount: u64,
 }
 ```
 
 ---
 
-## 6. Internal Implementation
+## 7. Internal Implementation
 
-### 6.1 common.rs - Shared Logic
+### 7.1 `common.rs`
 
-#### find_rename_attr()
+| Symbol                 | Responsibility                                                |
+| ---------------------- | ------------------------------------------------------------- |
+| `find_rename_attr`     | Extract `serde(rename = "...")`.                              |
+| `find_field_type_attr` | Extract and parse `#[field_type = "..."]`.                    |
+| `parse_field_type_str` | Compile the `field_type` DSL into a `FieldType` token stream. |
+| `determine_field_type` | Infer `FieldType` directly from a `syn::Type`.                |
+| `is_u8_type`           | Predicate for `u8`.                                           |
+| `is_string_type`       | Predicate for `String` / `str`.                               |
+| `is_bytes_type`        | Predicate for the supported byte container types.             |
+| `is_bf16_type`         | Predicate for `bf16`.                                         |
+| `is_u64_type`          | Predicate used to validate the `_id: u64` requirement.        |
 
-Extract rename from serde attribute:
+#### Map parsing details
 
-```rust
-pub fn find_rename_attr(attrs: &[Attribute]) -> Option<String>
-```
+`parse_field_type_str` finds the **top-level** comma inside `Map<...>` by
+counting angle-bracket depth. This is what allows nested types such as
+`Map<Text, Array<U64>>` or `Option<Map<Bytes, F64>>` to parse correctly.
+Whitespace is trimmed on both sides of every separator, so writes like
+`Map< Text , Array<U64> >` are also accepted.
 
-#### find_field_type_attr()
+### 7.2 `schema.rs`
 
-Extract field_type attribute value:
+Pipeline executed by `anda_db_schema_derive`:
 
-```rust
-pub fn find_field_type_attr(attrs: &[Attribute]) -> Option<TokenStream>
-```
+1. Parse the input as `DeriveInput`.
+2. Reject anything that is not a struct with named fields.
+3. For every field:
+   - read the (optional) serde rename;
+   - extract `///` doc comments (joined with spaces);
+   - resolve the field type via `find_field_type_attr` *or*
+     `determine_field_type`;
+   - if the field is `_id`, verify it is `u64` and skip code generation;
+   - look for `#[unique]` and choose between four `FieldEntry` builder
+     templates (with/without description × with/without unique).
+4. Emit `impl <Struct> { pub fn schema() -> Result<Schema, SchemaError> { … } }`.
 
-#### parse_field_type_str()
+### 7.3 `field_typed.rs`
 
-Parse type string to TokenStream:
+Same parse / validation prelude as `schema.rs`. For each field the macro
+produces a `(rename_or_name.into(), <field_type>)` tuple and collects them
+into a single `FieldType::Map`.
 
-```rust
-pub fn parse_field_type_str(type_str: &str) -> TokenStream
-```
-
-#### determine_field_type()
-
-Infer FieldType from Rust type:
-
-```rust
-pub fn determine_field_type(ty: &Type) -> Result<TokenStream, String>
-```
-
-### 6.2 schema.rs - AndaDBSchema Implementation
-
-Key steps:
-1. Parse DeriveInput
-2. Iterate through all named fields
-3. Extract attributes (rename, field_type, unique, doc comments)
-4. Determine field type
-5. Generate SchemaBuilder code
-
-### 6.3 field_typed.rs - FieldTyped Implementation
-
-Key steps:
-1. Parse DeriveInput
-2. Iterate through all named fields
-3. Generate `field_type()` method body
-
-### 6.4 Code Generation Example
+### 7.4 Worked example
 
 Input:
+
 ```rust
 #[derive(AndaDBSchema)]
 struct User {
+    _id: u64,
     /// User's email
     #[unique]
     email: String,
 }
 ```
 
-Generated:
+Expansion:
+
 ```rust
 impl User {
     pub fn schema() -> Result<Schema, SchemaError> {
         let mut builder = Schema::builder();
-
         builder.add_field(
             FieldEntry::new("email".to_string(), FieldType::Text)?
-                .with_description("User's email")
-                .with_unique()
+                .with_description("User's email".to_string())
+                .with_unique(),
         )?;
-
         builder.build()
     }
 }
@@ -477,27 +458,36 @@ impl User {
 
 ---
 
-## Appendix A: Error Messages
+## 8. Diagnostics
 
-### A.1 Compile-Time Errors
+### 8.1 Compile-time errors
 
-| Error Message | Cause |
-|--------------|-------|
-| `FieldTyped only supports structs with named fields` | Tuple struct or unit struct not supported |
-| `AndaDBSchema only supports structs` | Enum or union not supported |
-| `The '_id' field must be of type u64` | _id field type is incorrect |
-| `Unsupported type: '...'` | Unsupported Rust type |
-| `Invalid map type` | Map key type is not String or Bytes |
-| `Unable to determine Vec element type` | Vec type argument is incomplete |
+| Message                                                                           | Cause                                                                          |
+| --------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| `FieldTyped only supports structs`                                                | Applied to an enum or union.                                                   |
+| `FieldTyped only supports structs with named fields`                              | Applied to a tuple or unit struct.                                             |
+| `AndaDBSchema only supports structs`                                              | Applied to an enum or union.                                                   |
+| `AndaDBSchema only supports structs with named fields`                            | Applied to a tuple or unit struct.                                             |
+| `The '_id' field must be of type u64`                                             | The struct declares `_id` with a type other than `u64`.                        |
+| `Unsupported field type: '...'. Supported types: …`                               | DSL string in `#[field_type]` was not recognised.                              |
+| `Unsupported Map key type: '...'. Expected 'String', 'Text' or 'Bytes'.`          | Unsupported key in `Map<K, V>` DSL.                                            |
+| `Invalid Map field type: '...'. Expected 'Map<KeyType, ValueType>'.`              | DSL `Map<…>` string lacks a comma-separated key/value pair.                    |
+| `Unsupported type: '...'. Consider: …`                                            | Inference failed (references, tuples, trait objects, etc.).                    |
+| `Unable to determine Vec element type for: ...`                                   | Generic argument missing on a `Vec` / `HashSet` / `BTreeSet`.                  |
+| `Map key type must be String or bytes (e.g., Vec<u8>, [u8; N]), found: ...`       | `HashMap`/`BTreeMap` key inferred as something neither string- nor bytes-like. |
+| `Standalone \`half::bf16\` is not supported as a field type. Use \`Vec<bf16>\` …` | Bare `bf16` field without `Vec`/override.                                      |
 
-### A.2 Runtime Errors
+### 8.2 Runtime errors
 
-| Error Type | Description |
-|-----------|-------------|
-| `SchemaError::FieldName` | Invalid field name |
-| `SchemaError::FieldType` | Invalid field type |
-| `SchemaError::Validation` | Schema validation failed |
+`schema()` ultimately calls into `Schema::builder().build()`, which can fail
+with:
+
+| Variant                   | Description                     |
+| ------------------------- | ------------------------------- |
+| `SchemaError::FieldName`  | Invalid field name.             |
+| `SchemaError::FieldType`  | Invalid field type.             |
+| `SchemaError::Validation` | Schema-level validation failed. |
 
 ---
 
-*Document generated: 2026-04-21*
+*Document generated: 2026-04-25*

@@ -116,3 +116,39 @@ fn field_typed_derive_works() {
         )
     );
 }
+
+#[derive(Debug, Serialize, Deserialize, FieldTyped)]
+struct MapKeyAliases {
+    // 通过 field_type 字符串使用 Text 关键字声明字符串键 Map(等价于 String)
+    #[field_type = "Map<Text, Text>"]
+    by_text: HashMap<String, String>,
+    // 也允许带额外空格 / 嵌套类型
+    #[field_type = "Map< Text , Array<U64> >"]
+    nested: HashMap<String, Vec<u64>>,
+}
+
+#[test]
+fn map_text_alias_works() {
+    let ft = MapKeyAliases::field_type();
+    let expected = FieldType::Map(
+        vec![
+            (
+                "by_text".into(),
+                FieldType::Map(std::collections::BTreeMap::from([(
+                    "*".into(),
+                    FieldType::Text,
+                )])),
+            ),
+            (
+                "nested".into(),
+                FieldType::Map(std::collections::BTreeMap::from([(
+                    "*".into(),
+                    FieldType::Array(vec![FieldType::U64]),
+                )])),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    assert_eq!(ft, expected);
+}

@@ -1,8 +1,19 @@
+//! Internal helpers shared by the `FieldTyped` and `AndaDBSchema` derive macros.
+//!
+//! The functions in this module work on `syn` AST nodes and emit
+//! `proc_macro2::TokenStream` fragments that reference items from
+//! `anda_db_schema` (`FieldType`, `FieldKey`, ...). Generated code therefore
+//! requires those names to be in scope at the call site.
+
 use proc_macro2::TokenStream;
 use quote::quote;
 use syn::{Attribute, Expr, GenericArgument, Lit, Meta, PathArguments, Type, ext::IdentExt};
 
-/// 查找并解析 serde 的 rename 属性
+/// Extract the value of a `#[serde(rename = "...")]` attribute, if any.
+///
+/// Only the first `rename` encountered is returned; other serde options are
+/// ignored. Attributes that fail to parse are skipped silently so that
+/// unrelated serde syntax does not break schema generation.
 pub fn find_rename_attr(attrs: &[Attribute]) -> Option<String> {
     for attr in attrs {
         if !attr.path().is_ident("serde") {
@@ -15,7 +26,7 @@ pub fn find_rename_attr(attrs: &[Attribute]) -> Option<String> {
             Err(_) => continue,
         };
 
-        // 遍历所有参数，查找 rename 属性
+        // Walk all serde meta items and pick out `rename = "..."`.
         for meta in args {
             if let Meta::NameValue(name_value) = meta
                 && name_value.path.is_ident("rename")
@@ -29,11 +40,14 @@ pub fn find_rename_attr(attrs: &[Attribute]) -> Option<String> {
     None
 }
 
-/// 查找并解析 field_type 属性
+/// Locate a `#[field_type = "..."]` attribute and parse its string payload
+/// into a `FieldType` token stream.
+///
+/// Returns `None` when no such attribute is present, in which case callers
+/// should fall back to [`determine_field_type`].
 pub fn find_field_type_attr(attrs: &[Attribute]) -> Option<TokenStream> {
     for attr in attrs {
         if attr.path().is_ident("field_type") {
-            // 尝试访问属性的参数
             if let Ok(meta_name_value) = attr.meta.require_name_value()
                 && let Expr::Lit(expr_lit) = &meta_name_value.value
                 && let Lit::Str(lit_str) = &expr_lit.lit
@@ -45,10 +59,31 @@ pub fn find_field_type_attr(attrs: &[Attribute]) -> Option<TokenStream> {
     None
 }
 
-/// 解析类型字符串为 TokenStream
+/// Parse the textual DSL used inside `#[field_type = "..."]` and emit the
+/// corresponding `FieldType` constructor as a token stream.
+///
+/// Grammar (whitespace is ignored everywhere):
+///
+/// ```text
+/// type        := primitive | array | option | map
+/// primitive   := "Bytes" | "Text" | "U64" | "I64"
+///              | "F64"   | "F32"  | "Bool" | "Json" | "Vector"
+/// array       := "Array<" type ">"
+/// option      := "Option<" type ">"
+/// map         := "Map<" map_key "," type ">"
+/// map_key     := "String" | "Text" | "Bytes"
+/// ```
+///
+/// `String` and `Text` are accepted as synonymous map keys: `FieldType` only
+/// has a `Text` variant, but `Map<String, T>` reads more naturally and is
+/// kept for backwards compatibility.
+///
+/// Unrecognised input expands to a `compile_error!(...)` invocation so that
+/// the user gets a precise diagnostic at the original macro call site.
 pub fn parse_field_type_str(type_str: &str) -> TokenStream {
-    match type_str {
-        // 基本类型
+    let trimmed = type_str.trim();
+    match trimmed {
+        // Primitive types.
         "Bytes" => quote! { FieldType::Bytes },
         "Text" => quote! { FieldType::Text },
         "U64" => quote! { FieldType::U64 },
@@ -59,45 +94,77 @@ pub fn parse_field_type_str(type_str: &str) -> TokenStream {
         "Json" => quote! { FieldType::Json },
         "Vector" => quote! { FieldType::Vector },
 
-        // 复合类型 - 支持 Array 和 Option
+        // Compound wrappers: Array<T>, Option<T>.
         s if s.starts_with("Array<") && s.ends_with(">") => {
-            let inner = &s[6..s.len() - 1];
+            let inner = s[6..s.len() - 1].trim();
             let inner_type = parse_field_type_str(inner);
             quote! { FieldType::Array(vec![#inner_type]) }
         }
         s if s.starts_with("Option<") && s.ends_with(">") => {
-            let inner = &s[7..s.len() - 1];
+            let inner = s[7..s.len() - 1].trim();
             let inner_type = parse_field_type_str(inner);
             quote! { FieldType::Option(Box::new(#inner_type)) }
         }
 
-        // 添加对 Map<String, Type> 的支持
-        s if s.starts_with("Map<String,") && s.ends_with(">") => {
-            let inner = &s[11..s.len() - 1];
-            let inner_type = parse_field_type_str(inner.trim());
-            quote! {
-                FieldType::Map(std::collections::BTreeMap::from([(
-                    "*".into(),
-                    #inner_type
-                )]))
+        // Map<String, T> / Map<Text, T> / Map<Bytes, T>.
+        //
+        // `FieldType` represents string keys as `Text`, but `String` is
+        // accepted as well so that the DSL can mirror plain Rust signatures.
+        s if s.starts_with("Map<") && s.ends_with(">") => {
+            let inner = s[4..s.len() - 1].trim();
+            // Find the first top-level comma, skipping commas nested inside
+            // angle brackets so that types like `Map<Text, Array<U64>>` parse
+            // correctly.
+            let mut depth: i32 = 0;
+            let mut split_at: Option<usize> = None;
+            for (i, ch) in inner.char_indices() {
+                match ch {
+                    '<' => depth += 1,
+                    '>' => depth -= 1,
+                    ',' if depth == 0 => {
+                        split_at = Some(i);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let Some(idx) = split_at else {
+                let error_msg = format!(
+                    "Invalid Map field type: '{}'. Expected 'Map<KeyType, ValueType>'.",
+                    type_str
+                );
+                return quote! { compile_error!(#error_msg) };
+            };
+            let key = inner[..idx].trim();
+            let value = inner[idx + 1..].trim();
+            let value_type = parse_field_type_str(value);
+            match key {
+                "String" | "Text" => quote! {
+                    FieldType::Map(std::collections::BTreeMap::from([(
+                        FieldKey::from("*"),
+                        #value_type
+                    )]))
+                },
+                "Bytes" => quote! {
+                    FieldType::Map(std::collections::BTreeMap::from([(
+                        FieldKey::from(b"*"),
+                        #value_type
+                    )]))
+                },
+                other => {
+                    let error_msg = format!(
+                        "Unsupported Map key type: '{}'. Expected 'String', 'Text' or 'Bytes'.",
+                        other
+                    );
+                    quote! { compile_error!(#error_msg) }
+                }
             }
         }
 
-        s if s.starts_with("Map<Bytes,") && s.ends_with(">") => {
-            let inner = &s[10..s.len() - 1];
-            let inner_type = parse_field_type_str(inner.trim());
-            quote! {
-                FieldType::Map(std::collections::BTreeMap::from([(
-                    b"*".into(),
-                    #inner_type
-                )]))
-            }
-        }
-
-        // 默认或不支持的类型
+        // Anything else is rejected at compile time.
         _ => {
             let error_msg = format!(
-                "Unsupported field type: '{}'. Supported types: Bytes, Text, U64, I64, F64, F32, Bool, Json, Vector, Array<T>, Option<T>, Map<String, T>, Map<Bytes, T>",
+                "Unsupported field type: '{}'. Supported types: Bytes, Text, U64, I64, F64, F32, Bool, Json, Vector, Array<T>, Option<T>, Map<String, T>, Map<Text, T>, Map<Bytes, T>",
                 type_str
             );
             quote! { compile_error!(#error_msg) }
@@ -105,7 +172,25 @@ pub fn parse_field_type_str(type_str: &str) -> TokenStream {
     }
 }
 
-/// 根据 Rust 类型确定对应的 FieldType
+/// Infer the AndaDB [`FieldType`] for a Rust type.
+///
+/// This drives automatic schema generation when no explicit
+/// `#[field_type = "..."]` override is provided. The mapping mirrors
+/// `parse_field_type_str` for primitives and adds idiomatic Rust patterns:
+///
+/// - `Vec<u8>` / `[u8; N]` / `Bytes` / `ByteArray` / `ByteBuf` -> `Bytes`
+/// - `Vec<bf16>` / `[bf16; N]` -> `Vector`
+/// - `Vec<T>` / `HashSet<T>` / `BTreeSet<T>` -> `Array(T)`
+/// - `HashMap<K, V>` / `BTreeMap<K, V>` -> `Map({*: V})` (key must be a
+///   string- or bytes-like type)
+/// - `Option<T>` -> `Option(T)`
+/// - `serde_json::Value`, `serde_bytes::*` recognised by full path
+/// - Any other path type is treated as a user-defined struct and resolved by
+///   calling its `field_type()` associated function (i.e. it must derive
+///   [`crate::FieldTyped`])
+///
+/// On failure, a human-readable message is returned so the caller can emit a
+/// `compile_error!` at the original span.
 pub fn determine_field_type(ty: &Type) -> Result<TokenStream, String> {
     match ty {
         Type::Path(type_path) if !type_path.path.segments.is_empty() => {
@@ -153,7 +238,7 @@ pub fn determine_field_type(ty: &Type) -> Result<TokenStream, String> {
                 "Json" => Ok(quote! { FieldType::Json }),
                 "Vector" => Ok(quote! { FieldType::Vector }),
                 "HashMap" | "BTreeMap" | "Map" => {
-                    // 处理 HashMap 和 BTreeMap 类型
+                    // Handle HashMap / BTreeMap / serde_json::Map.
                     if let PathArguments::AngleBracketed(args) = &segment.arguments
                         && args.args.len() >= 2
                     {
@@ -199,7 +284,8 @@ pub fn determine_field_type(ty: &Type) -> Result<TokenStream, String> {
                 }
                 _ => {
                     if path.segments.len() > 1 {
-                        // 尝试检查完整路径
+                        // Multi-segment paths: match a few well-known fully
+                        // qualified types from external crates.
                         let full_path = path
                             .segments
                             .iter()
@@ -208,18 +294,26 @@ pub fn determine_field_type(ty: &Type) -> Result<TokenStream, String> {
                             .join("::");
 
                         match full_path.as_str() {
-                            "half::bf16" => return Ok(quote! { FieldType::Bf16 }),
                             "serde_bytes::ByteArray"
                             | "serde_bytes::ByteBuf"
                             | "serde_bytes::Bytes" => {
                                 return Ok(quote! { FieldType::Bytes });
                             }
                             "serde_json::Value" => return Ok(quote! { FieldType::Json }),
+                            "half::bf16" => {
+                                return Err(
+                                    "Standalone `half::bf16` is not supported as a field type. \
+                                     Use `Vec<bf16>` (mapped to FieldType::Vector), \
+                                     or annotate with `#[field_type = \"F32\"]`."
+                                        .to_string(),
+                                );
+                            }
                             _ => {}
                         }
                     }
 
-                    // 处理自定义结构体类型 - 尝试使用该结构体的 field_type 方法
+                    // Fallback: assume a user-defined struct that derives
+                    // `FieldTyped`, and call its `field_type()` accessor.
                     let type_ident =
                         proc_macro2::Ident::new(&type_name, proc_macro2::Span::call_site());
                     Ok(quote! {
@@ -235,7 +329,7 @@ pub fn determine_field_type(ty: &Type) -> Result<TokenStream, String> {
             Ok(quote! { FieldType::Array(vec![#inner_type]) })
         }
         _ => {
-            // 对于未知类型，提供更详细的错误信息
+            // Reference, tuple, trait object, etc. -- not representable.
             let error_msg = format!(
                 "Unsupported type: '{:?}'. Consider:\n1. Using a supported primitive type\n2. Adding #[field_type = \"SupportedType\"] attribute\n3. Implementing FieldTyped for this type",
                 ty
@@ -245,7 +339,7 @@ pub fn determine_field_type(ty: &Type) -> Result<TokenStream, String> {
     }
 }
 
-/// 检查类型是否为 u8
+/// Returns `true` if `ty` is the primitive `u8`.
 pub fn is_u8_type(ty: &Type) -> bool {
     if let Type::Path(type_path) = ty
         && let Some(segment) = type_path.path.segments.first()
@@ -255,7 +349,7 @@ pub fn is_u8_type(ty: &Type) -> bool {
     false
 }
 
-/// 检查类型是否为 String 或 &str
+/// Returns `true` if `ty` is `String` or `str`.
 pub fn is_string_type(ty: &Type) -> bool {
     if let Type::Path(type_path) = ty
         && let Some(segment) = type_path.path.segments.first()
@@ -265,13 +359,14 @@ pub fn is_string_type(ty: &Type) -> bool {
     false
 }
 
+/// Returns `true` if `ty` is one of the supported byte container types.
+///
+/// Recognised types: `Vec<u8>`, `Bytes`, `ByteBuf`, `ByteArray`,
+/// `BytesB64`, `ByteBufB64`, `ByteArrayB64`.
+///
+/// Note: bare `[u8; N]` arrays are intentionally **not** treated as bytes
+/// here for `Map` keys -- prefer `ByteArray` / `ByteArrayB64` instead.
 pub fn is_bytes_type(ty: &Type) -> bool {
-    // should use ByteArray / ByteArrayB64 instead of [u8; N]
-    // if let Type::Array(arr) = ty {
-    //     println!("is_bytes_type: Type::Array {:?}", arr.elem);
-    //     return is_u8_type(&arr.elem);
-    // }
-
     if let Type::Path(type_path) = ty
         && let Some(segment) = type_path.path.segments.first()
     {
@@ -283,7 +378,7 @@ pub fn is_bytes_type(ty: &Type) -> bool {
             return is_u8_type(inner_ty);
         }
 
-        // 其它 bytes/buf 类型
+        // Other byte/buffer wrappers.
         return segment.ident == "Bytes"
             || segment.ident == "ByteBuf"
             || segment.ident == "ByteArray"
@@ -294,7 +389,7 @@ pub fn is_bytes_type(ty: &Type) -> bool {
     false
 }
 
-/// 检查类型是否为 bf16
+/// Returns `true` if `ty` is `bf16` (the `half::bf16` short name).
 pub fn is_bf16_type(ty: &Type) -> bool {
     if let Type::Path(type_path) = ty
         && let Some(segment) = type_path.path.segments.first()
@@ -304,7 +399,8 @@ pub fn is_bf16_type(ty: &Type) -> bool {
     false
 }
 
-/// 检查类型是否为 u64
+/// Returns `true` if `ty` is the primitive `u64`. Used to validate the
+/// mandatory `_id: u64` field on structs deriving [`crate::AndaDBSchema`].
 pub fn is_u64_type(ty: &Type) -> bool {
     if let Type::Path(type_path) = ty
         && let Some(segment) = type_path.path.segments.first()

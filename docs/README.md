@@ -33,16 +33,16 @@ AndaDB is an embedded Rust database designed for AI Agents, focusing on knowledg
 
 ### 1.2 Core Features
 
-| Feature | Description |
-|---------|-------------|
-| **Multi-modal Indexing** | B-Tree (exact match), BM25 (full-text search), HNSW (vector search) |
-| **Hybrid Retrieval** | Combine multiple retrieval methods using RRF (Reciprocal Rank Fusion) |
-| **Knowledge Graph** | Concept nodes and proposition links via KIP protocol |
-| **Flexible Schema** | Schema evolution and field type validation |
-| **Object Storage** | Local filesystem, S3-compatible, in-memory storage |
-| **Optional Encryption** | AES-256-GCM data encryption at rest |
-| **Async Design** | Built on Tokio async runtime |
-| **Compressed Storage** | Zstd compression support |
+| Feature                  | Description                                                           |
+| ------------------------ | --------------------------------------------------------------------- |
+| **Multi-modal Indexing** | B-Tree (exact match), BM25 (full-text search), HNSW (vector search)   |
+| **Hybrid Retrieval**     | Combine multiple retrieval methods using RRF (Reciprocal Rank Fusion) |
+| **Knowledge Graph**      | Concept nodes and proposition links via KIP protocol                  |
+| **Flexible Schema**      | Schema evolution and field type validation                            |
+| **Object Storage**       | Local filesystem, S3-compatible, in-memory storage                    |
+| **Optional Encryption**  | AES-256-GCM data encryption at rest                                   |
+| **Async Design**         | Built on Tokio async runtime                                          |
+| **Compressed Storage**   | Zstd compression support                                              |
 
 ### 1.3 Design Goals
 
@@ -169,20 +169,20 @@ Defines document structure and field types.
 
 **Supported Field Types**:
 
-| Rust Type | AndaDB Type | Description |
-|-----------|------------|-------------|
-| `String`, `&str` | `Text` | Text |
-| `bool` | `Bool` | Boolean |
-| `i8-i64`, `isize` | `I64` | 64-bit signed integer |
-| `u8-u64`, `usize` | `U64` | 64-bit unsigned integer |
-| `f32` | `F32` | 32-bit floating point |
-| `f64` | `F64` | 64-bit floating point |
-| `Vec<u8>` | `Bytes` | Byte array |
-| `Vec<bf16>` | `Vector` | BF16 vector |
-| `Vec<T>` | `Array` | Array |
-| `HashMap<String, T>` | `Map` | Map |
-| `Option<T>` | `Option` | Optional value |
-| `Json` | `Json` | JSON object |
+| Rust Type            | AndaDB Type | Description             |
+| -------------------- | ----------- | ----------------------- |
+| `String`, `&str`     | `Text`      | Text                    |
+| `bool`               | `Bool`      | Boolean                 |
+| `i8-i64`, `isize`    | `I64`       | 64-bit signed integer   |
+| `u8-u64`, `usize`    | `U64`       | 64-bit unsigned integer |
+| `f32`                | `F32`       | 32-bit floating point   |
+| `f64`                | `F64`       | 64-bit floating point   |
+| `Vec<u8>`            | `Bytes`     | Byte array              |
+| `Vec<bf16>`          | `Vector`    | BF16 vector             |
+| `Vec<T>`             | `Array`     | Array                   |
+| `HashMap<String, T>` | `Map`       | Map                     |
+| `Option<T>`          | `Option`    | Optional value          |
+| `Json`               | `Json`      | JSON object             |
 
 **Derive Macro Usage**:
 
@@ -348,12 +348,12 @@ struct HnswConfig {
 
 **Distance Metrics**:
 
-| Metric | Description |
-|--------|-------------|
-| `Euclidean` | Euclidean distance (L2) |
-| `Cosine` | Cosine distance (1 - cos similarity) |
-| `InnerProduct` | Inner product (negative) |
-| `Manhattan` | Manhattan distance (L1) |
+| Metric         | Description                          |
+| -------------- | ------------------------------------ |
+| `Euclidean`    | Euclidean distance (L2)              |
+| `Cosine`       | Cosine distance (1 - cos similarity) |
+| `InnerProduct` | Inner product (negative)             |
+| `Manhattan`    | Manhattan distance (L1)              |
 
 **Usage Example**:
 
@@ -502,9 +502,9 @@ HTTP RPC server based on Axum.
 
 **Endpoints**:
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST /` | Root methods | Server info, create database, etc. |
+| Method            | Path             | Description                                  |
+| ----------------- | ---------------- | -------------------------------------------- |
+| `POST /`          | Root methods     | Server info, create database, etc.           |
 | `POST /{db_name}` | Database methods | Collection operations, document CRUD, search |
 
 **Request Format**:
@@ -541,12 +541,12 @@ Client → Shard Proxy → [Shard A | Shard B | Shard C]
 
 **Admin API**:
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/_admin/db_shards/{db_name}` | Get database-shard mapping |
-| PUT | `/_admin/db_shards` | Create/update shard mapping |
-| DELETE | `/_admin/db_shards` | Delete shard mapping |
-| PUT | `/_admin/shard_backends` | Create/update shard backend |
+| Method | Path                          | Description                 |
+| ------ | ----------------------------- | --------------------------- |
+| GET    | `/_admin/db_shards/{db_name}` | Get database-shard mapping  |
+| PUT    | `/_admin/db_shards`           | Create/update shard mapping |
+| DELETE | `/_admin/db_shards`           | Delete shard mapping        |
+| PUT    | `/_admin/shard_backends`      | Create/update shard backend |
 
 ---
 
@@ -585,11 +585,11 @@ KIP (Knowledge Interaction Protocol) is a protocol for AI Agents to interact wit
 
 ### 10.1 Protocol Components
 
-| Language | Purpose | Operation Type |
-|---------|---------|----------------|
-| KQL | Knowledge Query | Read-only |
-| KML | Knowledge Manipulation | Read-write |
-| META | Meta Operations | Administration |
+| Language | Purpose                | Operation Type |
+| -------- | ---------------------- | -------------- |
+| KQL      | Knowledge Query        | Read-only      |
+| KML      | Knowledge Manipulation | Read-write     |
+| META     | Meta Operations        | Administration |
 
 ### 10.2 KQL Example
 
@@ -788,43 +788,43 @@ curl -X POST http://127.0.0.1:8080/test_db \
 
 ### 12.1 AndaDB API
 
-| Method | Return Type | Description |
-|--------|-------------|-------------|
-| `create(config, f)` | `Result<Self>` | Create new database |
-| `connect(config)` | `Result<Self>` | Connect or create database |
-| `open(config)` | `Result<Self>` | Open existing database |
-| `flush()` | `Result<()>` | Flush all data to storage |
-| `close()` | `Result<()>` | Close database |
-| `create_collection(schema, config, f)` | `Result<Collection>` | Create collection |
-| `open_collection(name, f)` | `Result<Collection>` | Open collection |
-| `delete_collection(name)` | `Result<()>` | Delete collection |
-| `metadata()` | `DBMetadata` | Get database metadata |
-| `stats()` | `StorageStats` | Get storage statistics |
-| `set_read_only(bool)` | `Result<()>` | Set read-only mode |
+| Method                                 | Return Type          | Description                |
+| -------------------------------------- | -------------------- | -------------------------- |
+| `create(config, f)`                    | `Result<Self>`       | Create new database        |
+| `connect(config)`                      | `Result<Self>`       | Connect or create database |
+| `open(config)`                         | `Result<Self>`       | Open existing database     |
+| `flush()`                              | `Result<()>`         | Flush all data to storage  |
+| `close()`                              | `Result<()>`         | Close database             |
+| `create_collection(schema, config, f)` | `Result<Collection>` | Create collection          |
+| `open_collection(name, f)`             | `Result<Collection>` | Open collection            |
+| `delete_collection(name)`              | `Result<()>`         | Delete collection          |
+| `metadata()`                           | `DBMetadata`         | Get database metadata      |
+| `stats()`                              | `StorageStats`       | Get storage statistics     |
+| `set_read_only(bool)`                  | `Result<()>`         | Set read-only mode         |
 
 ### 12.2 Collection API
 
-| Method | Return Type | Description |
-|--------|-------------|-------------|
-| `add(doc)` | `Result<u64>` | Add document |
-| `add_from(value)` | `Result<u64>` | Add from JSON value |
-| `get(id)` | `Result<Doc>` | Get document |
-| `update(id, fields)` | `Result<()>` | Update fields |
-| `upsert(doc)` | `Result<u64>` | Insert or update |
-| `remove(id)` | `Result<()>` | Delete document |
-| `len()` | `usize` | Document count |
-| `search_as::<T>(query)` | `Result<Vec<T>>` | Search documents |
-| `create_hnsw_index(field, config)` | `Result<()>` | Create HNSW index |
+| Method                             | Return Type      | Description         |
+| ---------------------------------- | ---------------- | ------------------- |
+| `add(doc)`                         | `Result<u64>`    | Add document        |
+| `add_from(value)`                  | `Result<u64>`    | Add from JSON value |
+| `get(id)`                          | `Result<Doc>`    | Get document        |
+| `update(id, fields)`               | `Result<()>`     | Update fields       |
+| `upsert(doc)`                      | `Result<u64>`    | Insert or update    |
+| `remove(id)`                       | `Result<()>`     | Delete document     |
+| `len()`                            | `usize`          | Document count      |
+| `search_as::<T>(query)`            | `Result<Vec<T>>` | Search documents    |
+| `create_hnsw_index(field, config)` | `Result<()>`     | Create HNSW index   |
 
 ### 12.3 Error Codes
 
-| Code | Name | Description |
-|------|------|-------------|
-| 1001 | `InvalidSyntax` | Syntax error |
-| 2001 | `TypeMismatch` | Type mismatch |
-| 3001 | `ReferenceError` | Reference error |
-| 3002 | `NotFound` | Not found |
-| 4001 | `ExecutionTimeout` | Execution timeout |
+| Code | Name                | Description        |
+| ---- | ------------------- | ------------------ |
+| 1001 | `InvalidSyntax`     | Syntax error       |
+| 2001 | `TypeMismatch`      | Type mismatch      |
+| 3001 | `ReferenceError`    | Reference error    |
+| 3002 | `NotFound`          | Not found          |
+| 4001 | `ExecutionTimeout`  | Execution timeout  |
 | 4002 | `ResourceExhausted` | Resource exhausted |
 
 ---
@@ -833,19 +833,19 @@ curl -X POST http://127.0.0.1:8080/test_db \
 
 ### 13.1 HNSW Parameter Tuning
 
-| Parameter | Default | Tuning Suggestions |
-|-----------|---------|-------------------|
-| `ef_construction` | 200 | Increase for better build quality, decrease for faster build |
-| `ef_search` | 50 | Increase for better search accuracy, decrease for lower latency |
-| `max_connections` | 32 | Increase for better graph quality, increases memory usage |
-| `max_layers` | 16 | Adjust based on data scale |
+| Parameter         | Default | Tuning Suggestions                                              |
+| ----------------- | ------- | --------------------------------------------------------------- |
+| `ef_construction` | 200     | Increase for better build quality, decrease for faster build    |
+| `ef_search`       | 50      | Increase for better search accuracy, decrease for lower latency |
+| `max_connections` | 32      | Increase for better graph quality, increases memory usage       |
+| `max_layers`      | 16      | Adjust based on data scale                                      |
 
 ### 13.2 BM25 Parameter Tuning
 
-| Parameter | Default | Tuning Suggestions |
-|-----------|---------|-------------------|
-| `k1` | 1.2 | Term frequency saturation, range [1.2, 2.0] |
-| `b` | 0.75 | Document length normalization, range [0.0, 1.0] |
+| Parameter | Default | Tuning Suggestions                              |
+| --------- | ------- | ----------------------------------------------- |
+| `k1`      | 1.2     | Term frequency saturation, range [1.2, 2.0]     |
+| `b`       | 0.75    | Document length normalization, range [0.0, 1.0] |
 
 ### 13.3 Storage Configuration
 
@@ -935,32 +935,32 @@ Includes:
 
 ## Appendix A: Crate Index
 
-| Crate | Version | Description |
-|-------|---------|-------------|
-| `anda_db` | 0.7.26 | Core database |
-| `anda_db_server` | 0.7 | HTTP RPC server |
-| `anda_db_schema` | 0.4 | Schema type system |
-| `anda_db_btree` | 0.5.9 | B-Tree index |
-| `anda_db_tfs` | 0.4 | BM25 full-text search |
-| `anda_db_hnsw` | 0.4.10 | HNSW vector index |
-| `anda_db_utils` | - | Utility functions |
-| `anda_db_derive` | 0.4 | Derive macros |
-| `anda_object_store` | 0.3.1 | Object storage + encryption |
-| `anda_kip` | 0.7.9 | Knowledge interaction protocol |
-| `anda_cognitive_nexus` | 0.7 | Cognitive nexus implementation |
-| `anda_cognitive_nexus_server` | 0.1 | Cognitive server |
-| `anda_db_shard_proxy` | - | Shard proxy |
+| Crate                         | Version | Description                    |
+| ----------------------------- | ------- | ------------------------------ |
+| `anda_db`                     | 0.7.26  | Core database                  |
+| `anda_db_server`              | 0.7     | HTTP RPC server                |
+| `anda_db_schema`              | 0.4     | Schema type system             |
+| `anda_db_btree`               | 0.5.9   | B-Tree index                   |
+| `anda_db_tfs`                 | 0.4     | BM25 full-text search          |
+| `anda_db_hnsw`                | 0.4.10  | HNSW vector index              |
+| `anda_db_utils`               | -       | Utility functions              |
+| `anda_db_derive`              | 0.4     | Derive macros                  |
+| `anda_object_store`           | 0.3.1   | Object storage + encryption    |
+| `anda_kip`                    | 0.7.9   | Knowledge interaction protocol |
+| `anda_cognitive_nexus`        | 0.7     | Cognitive nexus implementation |
+| `anda_cognitive_nexus_server` | 0.1     | Cognitive server               |
+| `anda_db_shard_proxy`         | -       | Shard proxy                    |
 
 ---
 
 ## Appendix B: Feature Flags
 
-| Feature | Description |
-|---------|-------------|
-| `default` | No extra features |
-| `full` | Enable Tantivy BM25 and jieba |
-| `tantivy` | Enable Tantivy dependency |
-| `tantivy-jieba` | Enable Chinese tokenization |
+| Feature         | Description                   |
+| --------------- | ----------------------------- |
+| `default`       | No extra features             |
+| `full`          | Enable Tantivy BM25 and jieba |
+| `tantivy`       | Enable Tantivy dependency     |
+| `tantivy-jieba` | Enable Chinese tokenization   |
 
 ---
 

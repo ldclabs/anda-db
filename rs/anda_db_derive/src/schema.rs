@@ -4,14 +4,23 @@ use syn::{Attribute, Data, DeriveInput, Expr, Fields, Lit, ext::IdentExt, parse_
 
 use crate::common::{determine_field_type, find_field_type_attr, find_rename_attr, is_u64_type};
 
-/// A derive macro that generates a `schema()` function for structs.
-/// This generates an AndaDB Schema definition based on the struct fields.
+/// Implementation of `#[derive(AndaDBSchema)]`.
+///
+/// For each named field of the input struct this function produces an
+/// `impl <Struct> { pub fn schema() -> Result<Schema, SchemaError> { ... } }`
+/// block that builds an `anda_db_schema::Schema` via `Schema::builder()`.
+///
+/// The `_id: u64` field is recognised specially: it must exist with the
+/// correct type (the schema builder injects the entry automatically) and is
+/// otherwise skipped during code generation. Unique constraints, doc-comment
+/// descriptions, custom `field_type` overrides and serde renames are all
+/// honoured here -- see the crate-level docs for the full attribute list.
 pub fn anda_db_schema_derive(input: TokenStream) -> TokenStream {
-    // Parse the input tokens into a syntax tree
+    // Parse the input tokens into a syntax tree.
     let input = parse_macro_input!(input as DeriveInput);
     let name = &input.ident.unraw();
 
-    // Process struct fields
+    // Only structs with named fields are supported.
     let fields = if let Data::Struct(data_struct) = &input.data {
         match &data_struct.fields {
             Fields::Named(fields_named) => &fields_named.named,
@@ -27,28 +36,27 @@ pub fn anda_db_schema_derive(input: TokenStream) -> TokenStream {
         });
     };
 
-    // Generate field entries for schema builder
+    // Build one `builder.add_field(...)` invocation per field (except `_id`).
     let field_entries = fields.iter().filter_map(|field| {
         let field_name = field.ident.as_ref().unwrap().unraw();
         let field_name_str = field_name.to_string();
 
-        // Get renamed field from serde attribute if present
+        // Honour `#[serde(rename = "...")]` for the schema field name.
         let rename_attr = find_rename_attr(&field.attrs).unwrap_or_else(|| field_name_str.clone());
 
-        // Check for field description from doc comments
+        // Doc comments become the schema field description.
         let description = extract_doc_comments(&field.attrs);
 
-        // Check if there's a custom field_type attribute
+        // `#[field_type = "..."]` wins over auto-inference.
         let custom_field_type = find_field_type_attr(&field.attrs);
 
-        // Determine the field type
         let field_type = if let Some(field_type) = custom_field_type {
             quote! { #field_type }
         } else {
             match determine_field_type(&field.ty) {
                 Ok(field_type) => field_type,
                 Err(err_msg) => {
-                    // Generate a compile error for unsupported types
+                    // Surface the inference failure as a compile error.
                     return Some(quote! {
                         compile_error!(#err_msg);
                     });
@@ -56,9 +64,9 @@ pub fn anda_db_schema_derive(input: TokenStream) -> TokenStream {
             }
         };
 
-        // Skip the '_id' field as it's automatically added by SchemaBuilder
+        // The `_id` column is provided automatically by `SchemaBuilder`.
         if field_name_str == "_id" {
-            // Check if _id field is u64 type by examining the actual Rust type
+            // ...but the user-declared type must still match `u64`.
             if !is_u64_type(&field.ty) {
                 return Some(quote! {
                     compile_error!("The '_id' field must be of type u64");
@@ -68,7 +76,7 @@ pub fn anda_db_schema_derive(input: TokenStream) -> TokenStream {
             return None;
         }
 
-        // Check if field is unique (from unique attribute)
+        // `#[unique]` adds a unique constraint to the generated entry.
         let is_unique = has_unique_attr(&field.attrs);
 
         // Generate field entry creation
@@ -116,12 +124,13 @@ pub fn anda_db_schema_derive(input: TokenStream) -> TokenStream {
     TokenStream::from(expanded)
 }
 
-/// 检查是否有 unique 属性
+/// Returns `true` if any of the supplied attributes is `#[unique]`.
 fn has_unique_attr(attrs: &[Attribute]) -> bool {
     attrs.iter().any(|attr| attr.path().is_ident("unique"))
 }
 
-/// 提取文档注释作为描述
+/// Concatenate all `///` doc comments on a field into a single description
+/// string, separated by spaces. Empty comments are dropped.
 fn extract_doc_comments(attrs: &[Attribute]) -> String {
     let mut doc_comments = Vec::new();
 

@@ -4,15 +4,41 @@ mod common;
 mod field_typed;
 mod schema;
 
-/// A derive macro that generates a `field_type()` function for structs.
+/// A derive macro that generates a `field_type()` associated function for a
+/// struct.
 ///
-/// This macro analyzes the struct fields and their types, mapping them to the
-/// appropriate `FieldType` enum variants. It supports common Rust types and
-/// handles Option<T> wrappers.
+/// The generated method returns a `FieldType::Map` whose keys are the
+/// (possibly serde-renamed) field names and whose values are the inferred or
+/// explicitly overridden [`anda_db_schema::FieldType`] for each field. It is
+/// the building block used by `AndaDBSchema` for nested user-defined types.
 ///
 /// # Attributes
 ///
-/// - `field_type = "TypeName"`: Override the inferred type with a specific FieldType
+/// - `#[field_type = "TypeName"]` -- override the inferred type. The string
+///   accepts a small DSL: primitives (`Bytes`, `Text`, `U64`, ...), as well
+///   as `Array<T>`, `Option<T>`, `Map<String, T>`, `Map<Text, T>` and
+///   `Map<Bytes, T>` (where `T` is itself any supported type, including
+///   nested wrappers).
+/// - `#[serde(rename = "name")]` -- use the renamed identifier as the
+///   schema field name. Other serde options are ignored.
+///
+/// # Type inference
+///
+/// When `#[field_type]` is absent, the type is inferred from the Rust type:
+///
+/// - `String` / `&str` -> `Text`
+/// - integers / floats / `bool` -> their numeric `FieldType`
+/// - `Vec<u8>`, `[u8; N]`, `Bytes`, `ByteBuf`, `ByteArray`, `*B64` -> `Bytes`
+/// - `Vec<bf16>`, `[bf16; N]` -> `Vector`
+/// - `Vec<T>` / `HashSet<T>` / `BTreeSet<T>` -> `Array(T)`
+/// - `HashMap<K, V>` / `BTreeMap<K, V>` (string- or bytes-like key) -> `Map`
+/// - `Option<T>` -> `Option(T)`
+/// - `serde_json::Value`, `Json` -> `Json`
+/// - any other path -> the type's `field_type()` function (so the type must
+///   itself derive `FieldTyped`)
+///
+/// Standalone `bf16` values are intentionally rejected -- vectors, not
+/// scalars, are the supported abstraction.
 ///
 /// # Example
 ///
@@ -28,26 +54,34 @@ mod schema;
 ///     age: u32,
 /// }
 /// ```
-///
-/// This will generate a `field_type()` method that returns a `FieldType::Map`
-/// containing the type information for each field.
 #[proc_macro_derive(FieldTyped, attributes(field_type))]
 pub fn field_typed_derive(input: TokenStream) -> TokenStream {
     field_typed::field_typed_derive(input)
 }
 
-/// A derive macro that generates a `schema()` function for structs.
+/// A derive macro that generates a `schema()` associated function for a
+/// struct.
 ///
-/// This macro creates an AndaDB Schema definition based on the struct fields.
-/// It automatically handles field type mapping and supports various attributes
-/// for customization.
+/// The generated method builds a fully-formed [`anda_db_schema::Schema`]
+/// using `Schema::builder()`, with one `FieldEntry` per field (excluding the
+/// mandatory `_id: u64`, which is provided by the builder itself).
 ///
 /// # Attributes
 ///
-/// - `field_type = "TypeName"`: Override the inferred type with a specific FieldType
-/// - `unique`: Mark the field as unique in the collection
-/// - `serde(rename = "new_name")`: Use a different name in the schema
-/// - Doc comments (`///`) are used as field descriptions
+/// - `#[field_type = "TypeName"]` -- override the inferred type. Same DSL as
+///   for `FieldTyped`; see that macro's docs for the full grammar.
+/// - `#[unique]` -- mark the field as having a unique constraint
+///   (`FieldEntry::with_unique`).
+/// - `#[serde(rename = "name")]` -- use the renamed identifier as the schema
+///   field name.
+/// - Doc comments (`/// ...`) are concatenated and used as the field
+///   description (`FieldEntry::with_description`).
+///
+/// # Special fields
+///
+/// The struct **must** declare `_id: u64`. The field is validated at compile
+/// time but skipped during code generation -- AndaDB manages the primary
+/// key automatically.
 ///
 /// # Example
 ///
@@ -57,6 +91,8 @@ pub fn field_typed_derive(input: TokenStream) -> TokenStream {
 ///
 /// #[derive(AndaDBSchema)]
 /// struct User {
+///     /// AndaDB-managed primary key
+///     _id: u64,
 ///     /// User's unique identifier
 ///     #[field_type = "Bytes"]
 ///     #[unique]
@@ -72,11 +108,12 @@ pub fn field_typed_derive(input: TokenStream) -> TokenStream {
 /// }
 /// ```
 ///
-/// This will generate:
+/// Expands to:
+///
 /// ```rust,ignore
 /// impl User {
 ///     pub fn schema() -> Result<Schema, SchemaError> {
-///         // ... generated schema creation code
+///         // ... generated schema construction code
 ///     }
 /// }
 /// ```

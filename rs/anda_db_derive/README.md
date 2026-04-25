@@ -37,9 +37,20 @@ The `FieldTyped` derive macro analyzes struct fields and their types, mapping th
 | `Vec<T>`, `HashSet<T>`, `BTreeSet<T>`              | `FieldType::Array`      |
 | `Option<T>`                                        | `FieldType::Option`     |
 | `HashMap<String, T>`, `BTreeMap<String, T>`        | `FieldType::Map`        |
-| `bf16`, `half::bf16`                               | `FieldType::Bf16`       |
 | `Json`, `serde_json::Value`                        | `FieldType::Json`       |
 | Custom structs                                     | Nested `FieldType::Map` |
+
+> Note: A standalone `bf16` is not a valid field type — only `Vec<bf16>` (i.e. an embedding) maps to `FieldType::Vector`.
+
+#### `field_type` attribute syntax
+
+The `#[field_type = "..."]` attribute accepts the following grammar:
+
+- Primitives: `Bytes`, `Text`, `U64`, `I64`, `F64`, `F32`, `Bool`, `Json`, `Vector`
+- `Array<T>` — wraps any supported type
+- `Option<T>` — wraps any supported type
+- `Map<String, T>` / `Map<Text, T>` — string-keyed map (both keys are accepted; they are equivalent because `FieldType` represents text as `Text`)
+- `Map<Bytes, T>` — bytes-keyed map
 
 #### Attributes
 
