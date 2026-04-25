@@ -102,7 +102,7 @@ async-compression = { version = "0.4", default-features = false, features = [
 nom = { version = "8", default-features = false }
 nom-language = { version = "0.1", default-features = false }
 regex = { version = "1.11", default-features = false }
-rustc-hash = { version = "2", default-features = false }
+rustc-hash = { version = "2", default-features = false, features = ["std"] }
 pyo3 = { version = "0.20", default-features = false }
 pyo3-asyncio = { version = "0.20", default-features = false }
 serde-pyobject = { version = "0.2", default-features = false }

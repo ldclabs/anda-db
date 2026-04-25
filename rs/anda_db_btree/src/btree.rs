@@ -1,15 +1,84 @@
 //! # Anda-DB B-tree Index Library
 //!
-//! This module provides a B-tree based index implementation for Anda-DB.
-//! It supports indexing fields of various types including u64, i64, String, and binary data.
-//! The implementation is optimized for concurrent access and efficient range queries.
+//! A thread-safe, bucket-based B-tree index for Anda-DB. It maps every indexed
+//! field value to the set of primary keys (document ids) that contain it, and
+//! supports both exact and range lookups.
+//!
+//! ## Data Model
+//!
+//! Conceptually the index is an inverted map:
+//!
+//! ```text
+//! field_value (FV)  →  Posting { bucket_id, version, Vec<primary_key (PK)> }
+//! ```
+//!
+//! Field values are additionally kept in an in-memory [`std::collections::BTreeSet`]
+//! to enable sorted range iteration. To scale persistence, postings are grouped
+//! into **buckets** of a target size (configurable via
+//! [`BTreeConfig::bucket_overload_size`]). Each bucket is serialized/loaded as
+//! a single CBOR blob, which makes incremental flush cheap: only buckets whose
+//! content changed since the last `flush` are rewritten.
+//!
+//! ## In-memory State
+//!
+//! The [`BTreeIndex`] struct keeps four coordinated collections:
+//!
+//! | Field       | Type                                    | Purpose                                                    |
+//! |-------------|-----------------------------------------|------------------------------------------------------------|
+//! | `postings`  | `DashMap<FV, PostingValue<PK>>`         | Per-field-value posting list, enables concurrent point ops |
+//! | `btree`     | `RwLock<BTreeSet<FV>>`                  | Ordered key set for range / prefix queries                 |
+//! | `buckets`   | `DashMap<u32, (size, dirty, FVs, ver)>` | Packing metadata used to schedule incremental flushes      |
+//! | `metadata`  | `RwLock<BTreeMetadata>`                 | Name, config and aggregate statistics                      |
+//!
+//! ## Concurrency Model
+//!
+//! - All mutating operations take only *fine-grained* locks: DashMap shards for
+//!   postings / buckets, and the `btree` `RwLock` only while inserting or
+//!   removing a key from the ordered set.
+//! - Uniqueness (when `allow_duplicates == false`) is re-checked inside the
+//!   `postings` entry lock to avoid TOCTOU races against concurrent writers.
+//! - When a posting is removed, the empty-check is re-run inside the entry
+//!   lock so a concurrent `insert` cannot have the key silently deleted.
+//! - Flush is lock-friendly: bucket contents are snapshotted inside the lock,
+//!   then the caller's async writer runs **after** the lock is released.
+//!
+//! ## Persistence Model
+//!
+//! The library never writes to disk itself — callers supply async closures:
+//!
+//! 1. [`BTreeIndex::store_metadata`] writes the small, versioned
+//!    [`BTreeMetadata`] blob.
+//! 2. [`BTreeIndex::store_dirty_buckets`] iterates buckets with `is_dirty =
+//!    true` and hands each `(bucket_id, cbor_bytes)` to the caller.
+//! 3. [`BTreeIndex::flush`] is a convenience wrapper over the two above.
+//!
+//! Each bucket carries a `dirty_version` counter. After the caller persists a
+//! bucket, the bucket is marked clean **only if** its `dirty_version` has not
+//! changed during the I/O — this preserves correctness when concurrent writers
+//! mutate the same bucket while it is being written out.
+//!
+//! ## Durability Guarantees
+//!
+//! - Metadata and bucket files together form a consistent snapshot:
+//!   `max_bucket_id` in metadata bounds the valid bucket id space when
+//!   replaying via [`BTreeIndex::load_all`] / [`BTreeIndex::load_buckets`].
+//! - A posting migration across buckets marks both the source and destination
+//!   buckets dirty, so a crash cannot resurrect a moved posting from a stale
+//!   source file.
 //!
 //! ## Features
-//! - Thread-safe concurrent access
-//! - Efficient range queries
-//! - Support for various data types
-//! - Bucket-based storage for better incremental persistent
-//! - Efficient serialization and deserialization in CBOR format
+//!
+//! - Point lookup ([`BTreeIndex::query_with`]) and range queries
+//!   ([`BTreeIndex::range_query_with`] with [`RangeQuery::Eq`] /
+//!   [`RangeQuery::Gt`] / [`RangeQuery::Ge`] / [`RangeQuery::Lt`] /
+//!   [`RangeQuery::Le`] / [`RangeQuery::Between`] / [`RangeQuery::Include`] /
+//!   [`RangeQuery::And`] / [`RangeQuery::Or`] / [`RangeQuery::Not`]).
+//! - String prefix queries via [`BTreeIndex::prefix_query_with`].
+//! - Batch variants ([`BTreeIndex::insert_array`],
+//!   [`BTreeIndex::remove_array`], [`BTreeIndex::batch_update`]) with reduced
+//!   lock contention.
+//! - [`BTreeIndex::compact_buckets`] re-packs fragmented buckets using
+//!   first-fit-decreasing bin packing.
 
 use anda_db_utils::{UniqueVec, estimate_cbor_size};
 use dashmap::DashMap;
@@ -27,10 +96,31 @@ use std::{
 
 use crate::{BTreeError, BoxError};
 
-/// B-tree index for efficient key-value lookups
+/// Thread-safe, bucket-based B-tree index with range query support.
 ///
-/// This structure provides a thread-safe B-tree index implementation
-/// that supports concurrent reads and writes, as well as efficient range queries.
+/// `PK` is the primary key type (typically the document id) and `FV` is the
+/// indexed field value type. The index maintains an inverted mapping
+/// `FV → Vec<PK>` together with an ordered `BTreeSet<FV>` to serve range and
+/// prefix queries efficiently.
+///
+/// See the [crate-level documentation](crate) for architecture, concurrency
+/// model, and persistence details.
+///
+/// # Type parameters
+///
+/// - `PK`: primary key. Must be `Ord + Eq + Hash + Clone + Serialize +
+///   DeserializeOwned + Debug`.
+/// - `FV`: field value. Same bounds as `PK`.
+///
+/// # Invariants
+///
+/// 1. Every key in `btree` has a corresponding entry in `postings`, and vice
+///    versa. Empty postings are removed together with their btree key.
+/// 2. Each posting is tracked by exactly one bucket. Migrations mark both the
+///    source and destination bucket dirty.
+/// 3. `max_bucket_id` is monotonic. It may exceed the actual largest populated
+///    bucket id transiently during concurrent inserts; `load_buckets` tolerates
+///    sparse bucket ids up to `max_bucket_id`.
 pub struct BTreeIndex<PK, FV>
 where
     PK: Ord + Debug + Clone + Serialize + DeserializeOwned,
@@ -42,42 +132,51 @@ where
     /// Index configuration
     config: BTreeConfig,
 
-    /// Buckets store information about where posting entries are stored and their current state
-    /// The mapping is: bucket_id -> (bucket_size, is_dirty, vec<field_values>, dirty_version)
-    /// - bucket_size: Current size of the bucket in bytes
-    /// - is_dirty: Indicates if the bucket has new data that needs to be persisted
-    /// - field_values: List of field values stored in this bucket
-    /// - dirty_version: Monotonic counter increased on every bucket mutation
+    /// Packing metadata for each on-disk bucket.
+    ///
+    /// `bucket_id → (bucket_size, is_dirty, field_values, dirty_version)`:
+    ///
+    /// - `bucket_size`  — estimated CBOR size (bytes) of the bucket payload.
+    ///   Used to decide when to spill into a fresh bucket.
+    /// - `is_dirty`     — `true` if there are unpersisted changes.
+    /// - `field_values` — the set of `FV` whose posting lives in this bucket.
+    /// - `dirty_version`— monotonic counter, bumped on every mutation. It is
+    ///   sampled before an async write and re-checked after it, so that a
+    ///   concurrent mutation during persistence keeps the bucket dirty.
     buckets: DashMap<u32, (usize, bool, UniqueVec<FV>, u64)>,
 
-    /// Inverted index mapping field values to posting values
+    /// Inverted index: field value → posting list. See [`PostingValue`].
     postings: DashMap<FV, PostingValue<PK>>,
 
-    /// B-tree set for efficient range queries
+    /// Ordered key set backing all range/prefix queries.
     btree: RwLock<BTreeSet<FV>>,
 
-    /// Index metadata
+    /// Index metadata (name, config, stats).
     metadata: RwLock<BTreeMetadata>,
 
-    /// Maximum bucket ID currently in use
+    /// Highest bucket id currently in use (monotonic).
     max_bucket_id: AtomicU32,
 
-    /// Number of query operations performed
+    /// Cumulative number of query operations performed.
     query_count: AtomicU64,
 
-    /// Last saved version of the index
+    /// Version of the last successfully persisted metadata.
+    /// Prevents re-serializing identical metadata.
     last_saved_version: AtomicU64,
 
     /// Number of dirty buckets pending persistence.
     ///
-    /// Used to make `flush()` and `store_dirty_buckets()` fast when there is nothing to persist.
+    /// Used as a fast-path guard in [`BTreeIndex::flush`] /
+    /// [`BTreeIndex::store_dirty_buckets`] to avoid scanning `buckets` when
+    /// nothing is dirty.
     dirty_bucket_count: AtomicU32,
 }
 
-/// Type alias for posting values: (bucket id, update version, Vec<document id>)
-/// - bucket_id: The bucket where this posting is stored
-/// - update_version: Version number that increases with each update
-/// - document_ids: List of document IDs associated with this field value
+/// Posting list for a single field value: `(bucket_id, update_version, doc_ids)`.
+///
+/// - `bucket_id`      — the bucket currently storing this posting.
+/// - `update_version` — monotonic counter bumped on every doc-id add/remove.
+/// - `doc_ids`        — unique, insertion-ordered list of primary keys.
 type PostingValue<PK> = (u32, u64, UniqueVec<PK>);
 
 /// Configuration parameters for the B-tree index
@@ -185,7 +284,19 @@ where
     postings: &'a FxHashMap<&'a FV, dashmap::mapref::one::Ref<'a, FV, PostingValue<PK>>>,
 }
 
-/// Range query specification for flexible querying
+/// Range query specification for flexible querying.
+///
+/// Queries compose: logical combinators (`And`, `Or`, `Not`) may contain any
+/// other variants, enabling arbitrary boolean predicates over field values.
+///
+/// Ordering semantics:
+///
+/// - `Gt`, `Ge`, `Between`, `Include`, `And`, `Or`, `Not` emit results in
+///   ascending key order.
+/// - `Lt` and `Le` iterate in *descending* key order internally so that
+///   early-termination (via the callback's `continue` flag) keeps the
+///   *closest-to-upper-bound* keys; the final result is re-ordered ascending,
+///   with per-key output preserved.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RangeQuery<FV> {
     /// Equal to a specific key
@@ -203,23 +314,33 @@ pub enum RangeQuery<FV> {
     /// Less than or equal to a specific key
     Le(FV),
 
-    /// Between two keys (inclusive)
+    /// Between two keys (inclusive on both ends).
+    ///
+    /// Empty result when `start > end`.
     Between(FV, FV),
 
-    /// Include specific keys
+    /// Include specific keys (duplicates are deduplicated, results sorted).
     Include(Vec<FV>),
 
-    /// A logical OR query that requires at least one subquery to match
+    /// A logical OR query that returns the union of all subquery results
+    /// (deduplicated, in ascending key order).
     Or(Vec<Box<RangeQuery<FV>>>),
 
-    /// A logical AND query that requires all subqueries to match
+    /// A logical AND query that returns the intersection of all subquery
+    /// results.
     And(Vec<Box<RangeQuery<FV>>>),
 
-    /// A logical NOT query that negates the result of its subquery
+    /// A logical NOT query that returns every indexed key not matched by the
+    /// inner subquery.
     Not(Box<RangeQuery<FV>>),
 }
 
 impl<FV> RangeQuery<FV> {
+    /// Translates a `RangeQuery<FV1>` into a `RangeQuery<FV>` by applying a
+    /// `TryFrom<FV1>` conversion to every key.
+    ///
+    /// Useful for adapting user-facing typed queries (e.g. JSON values) to the
+    /// storage-level field value type without rewriting query shape.
     pub fn try_convert_from<FV1>(value: RangeQuery<FV1>) -> Result<Self, BoxError>
     where
         FV: Ord,
@@ -273,6 +394,12 @@ where
     PK: Ord + Eq + Hash + Debug + Clone + Serialize + DeserializeOwned,
     FV: Ord + Eq + Hash + Debug + Clone + Serialize + DeserializeOwned,
 {
+    /// Marks a bucket as dirty and bumps its `dirty_version`.
+    ///
+    /// The `dirty_version` counter is sampled by [`Self::store_dirty_buckets`]
+    /// before writing the bucket, and re-checked after the async write
+    /// completes; if it has changed, the bucket remains dirty, ensuring
+    /// concurrent mutations during persistence are not lost.
     fn mark_bucket_dirty(&self, bucket: &mut (usize, bool, UniqueVec<FV>, u64)) {
         bucket.3 = bucket.3.wrapping_add(1);
         if !bucket.1 {
@@ -648,20 +775,40 @@ where
         removed
     }
 
-    /// Inserts document_id-field_values to the index
+    /// Batch-inserts `(doc_id, field_value)` pairs sharing the same `doc_id`.
     ///
-    /// This method is more efficient than calling insert() multiple times
-    /// as it can optimize bucket allocation and reduce lock contention.
+    /// This is materially more efficient than calling [`Self::insert`] in a
+    /// loop: bucket size tracking and B-tree key insertion are amortised, and
+    /// the posting lock is acquired once per field value.
+    ///
+    /// The operation proceeds in three phases:
+    ///
+    /// 1. **Posting update** — for each field value, either append `doc_id` to
+    ///    the existing posting or create a fresh one. Per-bucket size deltas
+    ///    are accumulated.
+    /// 2. **Bucket accounting** — for every affected bucket, apply the
+    ///    aggregate delta. Newly created postings remain in the bucket when it
+    ///    still has room, otherwise they are scheduled for migration.
+    /// 3. **Migration** — postings that no longer fit are moved to freshly
+    ///    allocated buckets; both source and destination buckets are marked
+    ///    dirty so a crash cannot resurrect stale data.
     ///
     /// # Arguments
     ///
     /// * `doc_id` - Document identifier
-    /// * `field_values` - Array of field values to index for this document
+    /// * `field_values` - Field values to index for this document. Duplicates
+    ///   are coalesced.
     /// * `now_ms` - Current timestamp in milliseconds
     ///
     /// # Returns
     ///
-    /// * `Result<usize, BTreeError>` - Number of items successfully inserted or error
+    /// Number of new `(doc_id, field_value)` associations actually created.
+    /// Idempotent calls return `0`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BTreeError::AlreadyExists`] when `allow_duplicates` is `false`
+    /// and one of the field values already maps to a different `doc_id`.
     pub fn insert_array(
         &self,
         doc_id: PK,
@@ -759,31 +906,40 @@ where
         // Process each field value individually to avoid migrating existing values unnecessarily.
         // field_values_to_migrate: (old_bucket_id, field_value, size)
         let mut field_values_to_migrate: Vec<(u32, FV, usize)> = Vec::new();
-        for (bucket_id, (_size_increase, field_values)) in bucket_updates {
+        for (bucket_id, (size_delta, field_values)) in bucket_updates {
             let mut bucket_entry = self
                 .buckets
                 .entry(bucket_id)
                 .or_insert_with(|| (0, false, UniqueVec::default(), 0));
 
             self.mark_bucket_dirty(&mut bucket_entry);
+            // Apply the aggregate delta computed in Phase 1. This covers both:
+            //   * full posting size for newly-created postings, and
+            //   * the per-doc_id growth for postings already living in this bucket.
+            // Per-fv branches below only deal with placement of new postings.
+            bucket_entry.0 = bucket_entry.0.saturating_add(size_delta);
+
             for fv in field_values {
+                if bucket_entry.2.contains(&fv) {
+                    // Existing posting whose growth was already accounted for above.
+                    continue;
+                }
+
+                // Newly-created posting; decide whether it stays in this bucket or migrates.
                 let fv_size = if let Some(posting) = self.postings.get(&fv) {
                     estimate_cbor_size(&posting) + 2
                 } else {
+                    // Posting was concurrently removed; nothing more to do.
                     continue;
                 };
 
-                if bucket_entry.2.contains(&fv) {
-                    // Field value already tracked in this bucket; just update the size.
-                    bucket_entry.0 = fv_size.max(bucket_entry.0);
-                } else if bucket_entry.2.is_empty()
-                    || bucket_entry.0 + fv_size < self.config.bucket_overload_size
-                {
-                    // Bucket has room, add directly
-                    bucket_entry.0 += fv_size;
+                if bucket_entry.2.is_empty() || bucket_entry.0 < self.config.bucket_overload_size {
+                    // Bucket has room (size already includes this fv via size_delta).
                     bucket_entry.2.push(fv);
                 } else {
-                    // Bucket full, schedule migration for this new field value
+                    // Bucket is over the soft limit; migrate this fv to a fresh bucket.
+                    // Roll back the size we tentatively added for it.
+                    bucket_entry.0 = bucket_entry.0.saturating_sub(fv_size);
                     field_values_to_migrate.push((bucket_id, fv, fv_size));
                 }
             }
@@ -1351,7 +1507,25 @@ where
         results
     }
 
-    /// Stores the index metadata and dirty buckets to persistent storage.
+    /// Persists both the index metadata and all dirty buckets in one call.
+    ///
+    /// Equivalent to calling [`Self::store_metadata`] followed by
+    /// [`Self::store_dirty_buckets`], with a fast-path short-circuit when
+    /// neither has anything new to write.
+    ///
+    /// # Arguments
+    ///
+    /// * `metadata` - writer that receives the CBOR-encoded metadata blob.
+    /// * `now_ms`   - current unix-ms timestamp, recorded into `stats.last_saved`.
+    /// * `f`        - async callback that receives `(bucket_id, cbor_bytes)`
+    ///   for each dirty bucket. Return `Ok(true)` to continue, `Ok(false)` to
+    ///   stop early (remaining dirty buckets stay dirty and will be retried
+    ///   on the next call).
+    ///
+    /// # Returns
+    ///
+    /// `true` if anything was written (metadata and/or at least one bucket),
+    /// `false` if the index was already fully persisted.
     pub async fn flush<W: Write, F>(
         &self,
         metadata: W,
@@ -1509,19 +1683,25 @@ where
         Ok(true)
     }
 
-    /// Stores dirty buckets to persistent storage using the provided async function
+    /// Serializes and hands every dirty bucket to the caller-supplied async
+    /// writer.
     ///
-    /// This method iterates through all buckets and persists those that have been modified
-    /// since the last save operation.
+    /// The method snapshots the list of dirty bucket ids up-front, then for
+    /// each bucket it:
+    ///
+    /// 1. Samples the bucket's `dirty_version` while building the CBOR payload.
+    /// 2. Releases the bucket lock **before** awaiting the caller's writer
+    ///    (so I/O does not block other shards).
+    /// 3. Re-acquires the lock and clears the dirty flag only if the bucket
+    ///    has not been mutated in the meantime (same `dirty_version`).
+    ///
+    /// If the caller returns `Ok(false)`, iteration stops; unwritten dirty
+    /// buckets remain dirty for a later call.
     ///
     /// # Arguments
     ///
-    /// * `f` - Async function that writes bucket data to persistent storage
-    ///   The function takes a bucket ID and serialized data, and returns whether to continue
-    ///
-    /// # Returns
-    ///
-    /// * `Result<(), BTreeError>` - Success or error
+    /// * `f` — async callback `(bucket_id, cbor_bytes) -> Result<bool, _>`.
+    ///   Returning `Ok(true)` continues, `Ok(false)` stops.
     pub async fn store_dirty_buckets<F>(&self, mut f: F) -> Result<(), BTreeError>
     where
         F: AsyncFnMut(u32, &[u8]) -> Result<bool, BoxError>,
@@ -3230,6 +3410,49 @@ mod tests {
         let results = index.range_query_with(query, |k, _| (true, vec![k.clone()]));
         // Should be deduplicated and sorted
         assert_eq!(results, vec!["apple", "banana", "cherry"]);
+    }
+
+    #[test]
+    fn test_insert_array_grows_bucket_size_for_existing_postings() {
+        // Regression test: insert_array must accumulate the per-doc_id size delta
+        // for existing postings into the bucket size; otherwise buckets silently
+        // exceed bucket_overload_size and never split.
+        let config = BTreeConfig {
+            bucket_overload_size: 1024,
+            allow_duplicates: true,
+        };
+        let index: BTreeIndex<u64, String> =
+            BTreeIndex::new("size_growth".to_string(), Some(config));
+
+        // Seed three field values into bucket 0.
+        index
+            .insert_array(
+                1,
+                vec!["a".to_string(), "b".to_string(), "c".to_string()],
+                now_ms(),
+            )
+            .unwrap();
+        let initial_size = index.buckets.get(&0).unwrap().0;
+        assert!(initial_size > 0);
+
+        // Add many additional doc_ids to all three EXISTING postings via insert_array.
+        for doc_id in 2u64..50 {
+            index
+                .insert_array(
+                    doc_id,
+                    vec!["a".to_string(), "b".to_string(), "c".to_string()],
+                    now_ms(),
+                )
+                .unwrap();
+        }
+
+        let grown_size = index.buckets.get(&0).unwrap().0;
+        // Bucket size must reflect the new doc_ids, not stay flat.
+        assert!(
+            grown_size > initial_size,
+            "bucket size should grow when doc_ids are appended via insert_array \
+             (initial={initial_size}, after={grown_size})"
+        );
     }
 
     #[tokio::test]
