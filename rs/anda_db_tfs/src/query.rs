@@ -2,6 +2,22 @@
 /// Supports Term, Or, And, and Not operations for building complex search expressions.
 /// Operator precedence: OR < AND < NOT.
 ///
+/// # Grammar (informal)
+///
+/// ```text
+/// expr    := or_expr
+/// or_expr := and_expr ( " OR " and_expr )*
+/// and_expr := not_expr ( " AND " not_expr )*
+/// not_expr := "NOT " term | term
+/// term    := "(" or_expr ")" | word ( whitespace word )*
+/// ```
+///
+/// Whitespace-separated words at the `term` level default to an implicit `OR`
+/// between them, matching the behaviour of [`BM25Index::search`].
+///
+/// The parser is intentionally lenient: unbalanced parentheses are treated as
+/// part of the surrounding text so that user input never causes a parse error.
+///
 /// # Examples
 ///
 /// ```
@@ -9,6 +25,8 @@
 ///
 /// let query = QueryType::parse("(hello AND world) OR (rust AND NOT java)");
 /// ```
+///
+/// [`BM25Index::search`]: crate::BM25Index::search
 #[derive(Debug, Clone, PartialEq)]
 pub enum QueryType {
     /// A simple term query that matches a single word or phrase

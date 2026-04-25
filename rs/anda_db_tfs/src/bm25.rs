@@ -1,4 +1,8 @@
-//! # Anda-DB BM25 Full-Text Search Library
+//! # BM25 index implementation
+//!
+//! This module contains [`BM25Index`], the concurrent, bucket-sharded BM25
+//! index that backs the crate. See the crate-level documentation for a
+//! high-level overview.
 
 use anda_db_utils::{UniqueVec, estimate_cbor_size};
 use dashmap::DashMap;
@@ -14,7 +18,23 @@ use crate::error::*;
 use crate::query::*;
 use crate::tokenizer::*;
 
-/// BM25 search index with customizable tokenization
+/// Concurrent, bucket-sharded full-text index using BM25 scoring.
+///
+/// The index keeps its in-memory state in a handful of `DashMap`s so that
+/// inserts, deletes and searches can run concurrently from many threads.
+/// Persistence is split into two parts:
+///
+/// * **Metadata** — name, configuration, statistics and the current bucket/
+///   document id watermarks. Serialized in CBOR by [`store_metadata`].
+/// * **Buckets** — the actual postings and per-document token counts. Each
+///   token is assigned to exactly one *bucket*, a self-contained CBOR blob
+///   whose serialized size is bounded by [`BM25Config::bucket_overload_size`].
+///   Only buckets whose `dirty_version` has advanced past their
+///   `saved_version` are re-written on [`flush`], which makes repeated flushes
+///   cheap even for large indices.
+///
+/// [`flush`]: Self::flush
+/// [`store_metadata`]: Self::store_metadata
 pub struct BM25Index<T: Tokenizer + Clone> {
     /// Index name
     name: String,
@@ -82,10 +102,22 @@ impl Bucket {
     }
 }
 
-/// Parameters for the BM25 ranking algorithm
+/// Parameters controlling the BM25 scoring formula.
 ///
-/// - `k1`: Controls term frequency saturation. Higher values give more weight to term frequency.
-/// - `b`: Controls document length normalization. 0.0 means no normalization, 1.0 means full normalization.
+/// BM25 ranks a document `d` against a multi-term query `q` as:
+///
+/// ```text
+/// score(d, q) = Σ_{t ∈ q} idf(t) · (tf · (k1 + 1))
+///                                 / (tf + k1 · (1 − b + b · |d| / avgdl))
+/// ```
+///
+/// - `k1` controls **term frequency saturation**. Larger values give more
+///   weight to repeated occurrences of a term. Typical values: `1.2..=2.0`.
+/// - `b` controls **document length normalization**. `0.0` disables length
+///   normalization; `1.0` applies full normalization. Typical value: `0.75`.
+///
+/// Values outside their natural ranges are clamped at scoring time
+/// (`k1` to `>= 0`, `b` to `[0, 1]`) to avoid producing `NaN`/`inf` scores.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BM25Params {
     pub k1: f32,
@@ -93,16 +125,21 @@ pub struct BM25Params {
 }
 
 impl Default for BM25Params {
-    /// Returns default BM25 parameters (k1=1.2, b=0.75) which work well for most use cases
+    /// Returns default BM25 parameters (`k1 = 1.2`, `b = 0.75`) which work well
+    /// for most use cases.
     fn default() -> Self {
         BM25Params { k1: 1.2, b: 0.75 }
     }
 }
 
-/// Configuration parameters for the BM25 index
+/// Top-level configuration of a [`BM25Index`].
 ///
-/// - `bm25`: BM25 algorithm parameters
-/// - `bucket_overload_size`: Maximum size of a bucket before creating a new one (in bytes)
+/// * `bm25` — the scoring parameters, see [`BM25Params`].
+/// * `bucket_overload_size` — the soft upper bound, in bytes of the serialized
+///   CBOR payload, of a single bucket. When inserting a new token would push a
+///   bucket past this limit the token is routed to a fresh bucket instead.
+///   Smaller values produce more, smaller buckets (cheaper incremental flushes
+///   but more I/O per full reload); larger values do the opposite.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BM25Config {
     pub bm25: BM25Params,
@@ -113,7 +150,8 @@ pub struct BM25Config {
 }
 
 impl Default for BM25Config {
-    /// Returns default BM25 parameters (k1=1.2, b=0.75) which work well for most use cases
+    /// Returns a default configuration with [`BM25Params::default`] and a
+    /// 512 KiB bucket size limit.
     fn default() -> Self {
         BM25Config {
             bm25: BM25Params::default(),
@@ -252,18 +290,24 @@ where
         }
     }
 
-    /// Loads an index from metadata reader and closure for loading documents and postings.
+    /// Loads a complete index (metadata and all buckets) in one call.
+    ///
+    /// This is a convenience wrapper around [`load_metadata`](Self::load_metadata)
+    /// followed by [`load_buckets`](Self::load_buckets).
     ///
     /// # Arguments
     ///
-    /// * `tokenizer` - Tokenizer to use for processing text
-    /// * `metadata` - Metadata reader
-    /// * `f1` - Closure for loading documents
-    /// * `f2` - Closure for loading postings
+    /// * `tokenizer` — tokenizer to attach to the loaded index. It does not
+    ///   need to be identical to the one originally used, but queries will
+    ///   only be meaningful if the tokenization is compatible.
+    /// * `metadata` — reader positioned at the start of the CBOR metadata blob.
+    /// * `f` — async function invoked with each bucket id in `0..=max_bucket_id`;
+    ///   return `Ok(Some(bytes))` for present buckets or `Ok(None)` to skip.
     ///
     /// # Returns
     ///
-    /// * `Result<Self, HnswError>` - Loaded index or error.
+    /// The fully-loaded index, or a [`BM25Error`] if metadata could not be
+    /// parsed or a bucket failed to load.
     pub async fn load_all<R: Read, F>(tokenizer: T, metadata: R, f: F) -> Result<Self, BM25Error>
     where
         F: AsyncFnMut(u32) -> Result<Option<Vec<u8>>, BoxError>,
@@ -273,17 +317,12 @@ where
         Ok(index)
     }
 
-    /// Loads an index from a reader
-    /// This only loads metadata, you need to call [`Self::load_buckets`] to load the actual posting data.
+    /// Loads only the index metadata, returning an empty shell.
     ///
-    /// # Arguments
-    ///
-    /// * `tokenizer` - Tokenizer to use with the loaded index
-    /// * `r` - Any type implementing the [`Read`] trait
-    ///
-    /// # Returns
-    ///
-    /// * `Result<(), BM25Error>` - Success or error.
+    /// The returned index contains the correct configuration, statistics and
+    /// id watermarks, but no postings or `doc_tokens`. Call
+    /// [`load_buckets`](Self::load_buckets) afterwards to populate the inverted
+    /// index (possibly on demand, or only for a subset of buckets).
     pub fn load_metadata<R: Read>(tokenizer: T, r: R) -> Result<Self, BM25Error> {
         let index: BM25IndexOwned =
             ciborium::from_reader(r).map_err(|err| BM25Error::Serialization {
@@ -313,21 +352,15 @@ where
         })
     }
 
-    /// Loads data from buckets using the provided async function
-    /// This function should be called during database startup to load all document data
-    /// and form a complete document index
+    /// Populates the inverted index from previously persisted buckets.
     ///
-    /// # Arguments
+    /// Intended to be called right after [`load_metadata`](Self::load_metadata).
+    /// `f` is invoked once per bucket id in `0..=max_bucket_id`; returning
+    /// `Ok(None)` leaves that bucket empty, which is useful for partial loads
+    /// (e.g. lazy-loading buckets on first access).
     ///
-    /// * `f` - Async function that reads posting data from a specified bucket.
-    ///   `F: AsyncFn(u64) -> Result<Option<Vec<u8>>, BTreeError>`
-    ///   The function should take a bucket ID as input and return a vector of bytes
-    ///   containing the serialized bucket data. If the bucket does not exist,
-    ///   it should return `Ok(None)`.
-    ///
-    /// # Returns
-    ///
-    /// * `Result<(), BTreeError>` - Success or error
+    /// After this call, `total_tokens` and `avg_doc_tokens` are recomputed
+    /// from the documents that were actually loaded.
     pub async fn load_buckets<F>(&mut self, mut f: F) -> Result<(), BM25Error>
     where
         F: AsyncFnMut(u32) -> Result<Option<Vec<u8>>, BoxError>,
@@ -418,26 +451,30 @@ where
         stats
     }
 
-    /// Inserts a document to the index
+    /// Inserts a document into the index.
+    ///
+    /// The text is tokenized with a clone of the index's tokenizer; token
+    /// frequencies and the document length (total token count) are then used
+    /// to update both the posting list and the running `avg_doc_tokens`
+    /// statistic. Updates to buckets are staged and then applied in a second
+    /// phase so that at most one bucket is marked dirty per affected bucket.
     ///
     /// # Arguments
     ///
-    /// * `id` - Unique document identifier
-    /// * `text` - Segment text content
-    /// * `now_ms` - Current timestamp in milliseconds
+    /// * `id` — unique, caller-assigned document identifier.
+    /// * `text` — document text to index.
+    /// * `now_ms` — wall-clock time in milliseconds, stored in
+    ///   `stats.last_inserted`.
     ///
-    /// # Returns
+    /// # Errors
     ///
-    /// * `Ok(())` if the document was successfully added
-    /// * `Err(BM25Error)` if failed
+    /// * [`BM25Error::TokenizeFailed`] if the tokenizer produces no tokens.
+    /// * [`BM25Error::AlreadyExists`] if `id` is already present.
+    ///
+    /// # Concurrency
+    ///
+    /// Safe to call concurrently with other `insert`/`remove`/`search` calls.
     pub fn insert(&self, id: u64, text: &str, now_ms: u64) -> Result<(), BM25Error> {
-        if self.doc_tokens.contains_key(&id) {
-            return Err(BM25Error::AlreadyExists {
-                name: self.name.clone(),
-                id,
-            });
-        }
-
         // Tokenize the document
         let token_freqs = {
             let mut tokenizer = self.tokenizer.clone();
@@ -453,11 +490,8 @@ where
             });
         }
 
-        let _ = self.max_document_id.fetch_max(id, Ordering::Relaxed);
-
         // Phase 1: Update the postings collection
         let bucket_id = self.max_bucket_id.load(Ordering::Acquire);
-        let prev_docs = self.doc_tokens.len();
         let tokens: usize = token_freqs.values().sum();
         // buckets_to_update: BTreeMap<bucketid, FxHashMap<token, size_increase>>
         let mut buckets_to_update: FxHashMap<u32, FxHashMap<String, usize>> = FxHashMap::default();
@@ -470,14 +504,19 @@ where
             }
             dashmap::Entry::Vacant(v) => {
                 v.insert(tokens);
+                let _ = self.max_document_id.fetch_max(id, Ordering::Relaxed);
 
                 {
-                    // Calculate new average document length
-                    let prev_total = self
+                    // Recalculate average document length using consistent snapshots.
+                    // Reading `doc_tokens.len()` AFTER inserting the entry above ensures
+                    // it reflects this insertion. Concurrent inserts may make the avg
+                    // briefly approximate, but it converges as updates settle.
+                    let new_total = self
                         .total_tokens
-                        .fetch_add(tokens as u64, Ordering::Relaxed);
-                    let new_avg = (prev_total + tokens as u64) as f32 / (prev_docs + 1) as f32;
-                    *self.avg_doc_tokens.write() = new_avg;
+                        .fetch_add(tokens as u64, Ordering::Relaxed)
+                        + tokens as u64;
+                    let doc_count = self.doc_tokens.len().max(1) as f32;
+                    *self.avg_doc_tokens.write() = new_total as f32 / doc_count;
                 }
 
                 // Update inverted index
@@ -592,18 +631,25 @@ where
         Ok(())
     }
 
-    /// Removes a document from the index
+    /// Removes a document from the index.
+    ///
+    /// The caller must provide the *original text* that was used on
+    /// [`insert`](Self::insert); it is re-tokenized to identify which posting
+    /// lists should drop this document. If the text does not match, postings
+    /// may retain stale entries — searches still skip them because scoring
+    /// filters by `doc_tokens` membership, but the index will grow until a
+    /// [`compact_buckets`](Self::compact_buckets) is performed.
     ///
     /// # Arguments
     ///
-    /// * `id` - Segment identifier to remove
-    /// * `text` - Original document text (needed to identify tokens to remove)
-    /// * `now_ms` - Current timestamp in milliseconds
+    /// * `id` — identifier of the document to remove.
+    /// * `text` — original text of the document.
+    /// * `now_ms` — wall-clock time, stored in `stats.last_deleted`.
     ///
     /// # Returns
     ///
-    /// * `true` if the document was found and removed
-    /// * `false` if the document was not found
+    /// * `true` if a document with the given id was found and removed.
+    /// * `false` otherwise.
     pub fn remove(&self, id: u64, text: &str, now_ms: u64) -> bool {
         let removed_tokens = match self.doc_tokens.remove(&id) {
             Some((_k, v)) => v,
@@ -688,16 +734,21 @@ where
         true
     }
 
-    /// Searches the index for documents matching the query
+    /// Searches the index and returns the highest-scoring documents.
+    ///
+    /// The query is tokenized with the index's tokenizer. Multiple tokens are
+    /// treated as a disjunction (OR). Use [`search_advanced`](Self::search_advanced)
+    /// for boolean expressions with `AND` / `OR` / `NOT` and parentheses.
     ///
     /// # Arguments
     ///
-    /// * `query` - Search query text
-    /// * `top_k` - Maximum number of results to return
+    /// * `query` — raw query text.
+    /// * `top_k` — maximum number of results to return; `0` yields an empty vector.
+    /// * `params` — override the default [`BM25Params`] for this call only.
     ///
     /// # Returns
     ///
-    /// A vector of (document_id, score) pairs, sorted by descending score
+    /// A vector of `(document_id, score)` pairs sorted by descending score.
     pub fn search(&self, query: &str, top_k: usize, params: Option<BM25Params>) -> Vec<(u64, f32)> {
         let params = params.as_ref().unwrap_or(&self.config.bm25);
         let scored_docs = self.score_term(query.trim(), params);
@@ -706,17 +757,22 @@ where
         Self::top_k_results(scored_docs, top_k)
     }
 
-    /// Searches the index for documents matching the query expression
+    /// Searches the index with a boolean query expression.
+    ///
+    /// Unlike [`search`](Self::search), the query string is first parsed by
+    /// [`QueryType::parse`] and may contain `AND`, `OR`, `NOT` operators and
+    /// parentheses. Operator precedence is `OR < AND < NOT`; multiple bare
+    /// terms default to `OR`.
     ///
     /// # Arguments
     ///
-    /// * `query` - Search query text, which can include boolean operators (OR, AND, NOT), example:
-    ///   `(hello AND world) OR (rust AND NOT java)`
-    /// * `top_k` - Maximum number of results to return
+    /// * `query` — e.g. `"(hello AND world) OR (rust AND NOT java)"`.
+    /// * `top_k` — maximum number of results to return.
+    /// * `params` — optional BM25 parameters override.
     ///
     /// # Returns
     ///
-    /// A vector of (document_id, score) pairs, sorted by descending score
+    /// A vector of `(document_id, score)` pairs sorted by descending score.
     pub fn search_advanced(
         &self,
         query: &str,
@@ -789,35 +845,35 @@ where
 
         for query_token in query_terms.keys() {
             if let Some(postings) = self.postings.get(query_token) {
-                // Two-pass approach: first count valid docs for IDF, then compute scores.
-                // This avoids allocating an intermediate Vec per query term.
-                // Filter out deleted / not-loaded documents.
+                // Single-pass: collect (doc_id, tf, doc_len) for valid documents in one
+                // sweep over the postings. Avoids two DashMap lookups per posting entry.
+                // Filter out deleted / not-loaded documents:
                 // `remove()` depends on the caller providing original text; if they don't,
                 // postings can become stale. Also, when only part of buckets are loaded,
                 // postings might contain docs missing in `doc_tokens`.
-                let mut doc_freq: usize = 0;
-                for (doc_id, _) in postings.1.iter() {
-                    if self.doc_tokens.contains_key(doc_id) {
-                        doc_freq += 1;
-                    }
-                }
+                let valid: Vec<(u64, f32, f32)> = postings
+                    .1
+                    .iter()
+                    .filter_map(|(doc_id, token_freq)| {
+                        self.doc_tokens
+                            .get(doc_id)
+                            .map(|v| (*doc_id, *token_freq as f32, *v as f32))
+                    })
+                    .collect();
 
-                if doc_freq == 0 || doc_count == 0.0 {
+                if valid.is_empty() || doc_count == 0.0 {
                     continue;
                 }
 
                 // Classic Okapi BM25: ln(1 + (N - df + 0.5)/(df + 0.5))
-                let df = doc_freq as f32;
+                let df = valid.len() as f32;
                 let idf = ((doc_count - df + 0.5) / (df + 0.5) + 1.0).ln();
 
                 // Compute BM25 score for each valid document
-                for (doc_id, token_freq) in postings.1.iter() {
-                    if let Some(doc_len) = self.doc_tokens.get(doc_id).map(|v| *v as f32) {
-                        let tf = *token_freq as f32;
-                        let tf_component = (tf * (k1 + 1.0))
-                            / (tf + k1 * (1.0 - b + b * doc_len / avg_doc_tokens));
-                        *scores.entry(*doc_id).or_default() += idf * tf_component;
-                    }
+                for (doc_id, tf, doc_len) in valid {
+                    let tf_component =
+                        (tf * (k1 + 1.0)) / (tf + k1 * (1.0 - b + b * doc_len / avg_doc_tokens));
+                    *scores.entry(doc_id).or_default() += idf * tf_component;
                 }
             }
         }
@@ -910,7 +966,25 @@ where
         result
     }
 
-    /// Stores the index metadata, IDs and nodes to persistent storage.
+    /// Persists metadata and every currently-dirty bucket.
+    ///
+    /// This is a convenience wrapper that calls [`store_metadata`](Self::store_metadata)
+    /// followed by [`store_dirty_buckets`](Self::store_dirty_buckets). The
+    /// closure `f` is invoked once per dirty bucket with `(bucket_id, cbor_bytes)`;
+    /// returning `Ok(false)` from `f` aborts the bucket loop without producing
+    /// an error (useful for co-operative shutdown).
+    ///
+    /// # Arguments
+    ///
+    /// * `metadata` — writer that receives the CBOR-encoded metadata blob.
+    /// * `now_ms` — wall-clock time stored in `stats.last_saved`.
+    /// * `f` — async function used to persist each dirty bucket.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(true)` if anything — metadata, buckets, or both — was written.
+    /// * `Ok(false)` if the index is already fully persisted.
+    /// * `Err` on serialization or I/O failure.
     pub async fn flush<W: Write, F>(
         &self,
         metadata: W,
@@ -935,16 +1009,27 @@ where
         self.buckets.iter().any(|b| b.is_dirty())
     }
 
-    /// Compacts fragmented buckets by re-binning all tokens into fewer, properly-sized
-    /// buckets using a first-fit-decreasing bin-packing strategy.
+    /// Repacks all tokens into a minimal set of buckets.
     ///
-    /// This is intended as a one-time repair after the bucket-splitting bug that created
-    /// many tiny buckets. After compaction all buckets are marked dirty and will be
-    /// persisted on the next [`flush`](Self::flush) call.
+    /// Over the lifetime of an index — especially before bug fixes that tuned
+    /// the bucket splitting logic — repeated inserts and removes can leave
+    /// behind many under-filled buckets. `compact_buckets` estimates each
+    /// posting's serialized CBOR size and performs a Best-Fit-Decreasing bin
+    /// packing with [`BM25Config::bucket_overload_size`] as the bin capacity.
+    ///
+    /// After compaction:
+    ///
+    /// * bucket ids are reassigned to a contiguous `0..new_count` range;
+    /// * every resulting bucket is marked dirty so the next
+    ///   [`flush`](Self::flush) will rewrite the full on-disk layout.
+    ///
+    /// The operation runs in `O(n log n)` over the number of distinct tokens
+    /// and is safe to call at any time from a single thread; it should not be
+    /// interleaved with concurrent writes.
     ///
     /// # Returns
     ///
-    /// `(old_bucket_count, new_bucket_count)`
+    /// `(old_bucket_count, new_bucket_count)`.
     pub fn compact_buckets(&self) -> (usize, usize) {
         let old_count = self.buckets.len();
         if old_count <= 1 {
@@ -980,17 +1065,42 @@ where
         // Step 2: Sort by size descending for better packing.
         token_sizes.sort_unstable_by(|a, b| b.1.cmp(&a.1));
 
-        // Step 3: First-fit-decreasing bin packing.
+        // Step 3: Best-fit-decreasing bin packing in O(n log n).
+        // `by_remaining` maps remaining-capacity -> bin indices. We pick the bin with the
+        // smallest remaining capacity that still fits the token (best fit), which keeps
+        // bucket count low without scanning all bins per token.
         let limit = self.config.bucket_overload_size;
         // Each bin: (accumulated_size, tokens)
         let mut bins: Vec<(usize, Vec<String>)> = Vec::new();
+        // remaining_capacity -> bin indices with that capacity
+        let mut by_remaining: std::collections::BTreeMap<usize, Vec<usize>> =
+            std::collections::BTreeMap::new();
 
         for (token, size) in token_sizes {
-            if let Some(bin) = bins.iter_mut().find(|b| b.0 + size < limit) {
-                bin.0 += size;
-                bin.1.push(token);
-            } else {
-                bins.push((size, vec![token]));
+            // Find smallest remaining capacity >= size + 1 (preserve `<` limit semantics).
+            let needed = size.saturating_add(1);
+            let chosen = by_remaining
+                .range_mut(needed..)
+                .next()
+                .and_then(|(_, idxs)| idxs.pop().map(|i| (i, idxs.is_empty())));
+
+            match chosen {
+                Some((idx, bucket_now_empty)) => {
+                    let old_remaining = limit.saturating_sub(bins[idx].0);
+                    if bucket_now_empty {
+                        by_remaining.remove(&old_remaining);
+                    }
+                    bins[idx].0 += size;
+                    bins[idx].1.push(token);
+                    let new_remaining = limit.saturating_sub(bins[idx].0);
+                    by_remaining.entry(new_remaining).or_default().push(idx);
+                }
+                None => {
+                    let idx = bins.len();
+                    bins.push((size, vec![token]));
+                    let new_remaining = limit.saturating_sub(size);
+                    by_remaining.entry(new_remaining).or_default().push(idx);
+                }
             }
         }
 

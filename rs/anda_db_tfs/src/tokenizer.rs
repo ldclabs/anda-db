@@ -2,7 +2,27 @@ use std::collections::HashMap;
 
 pub use tantivy_tokenizer_api::*;
 
-/// A chain of tokenizers and filters implemented Tokenizer trait.
+/// A type-erased pipeline of a base [`Tokenizer`] followed by zero or more
+/// [`TokenFilter`]s.
+///
+/// Build a chain with [`TokenizerChain::builder`] and one `.filter(...)` call
+/// per stage. The resulting value is `Clone` and implements [`Tokenizer`],
+/// so it can be stored in a [`crate::BM25Index`] alongside any other tokenizer.
+///
+/// # Example
+///
+/// ```
+/// # #[cfg(feature = "tantivy")] {
+/// use anda_db_tfs::TokenizerChain;
+/// use tantivy::tokenizer::{LowerCaser, RemoveLongFilter, SimpleTokenizer, Stemmer};
+///
+/// let tokenizer = TokenizerChain::builder(SimpleTokenizer::default())
+///     .filter(RemoveLongFilter::limit(32))
+///     .filter(LowerCaser)
+///     .filter(Stemmer::default())
+///     .build();
+/// # }
+/// ```
 pub struct TokenizerChain {
     tokenizer: Box<dyn BoxableTokenizer>,
 }
@@ -76,7 +96,12 @@ impl<T: Tokenizer> BoxableTokenizer for T {
     }
 }
 
-/// Creates a new `TokenizerChain` with `SimpleTokenizer` as the default tokenizer and `RemoveLongFilter` and `LowerCaser` as the default filters.
+/// Creates a default English-friendly tokenizer chain.
+///
+/// The pipeline is: `SimpleTokenizer` → `RemoveLongFilter` (max 32 chars)
+/// → `LowerCaser` → `Stemmer` (Porter English).
+/// Suitable for most Latin-script text; for Chinese content use
+/// [`crate::jieba_tokenizer`] (enabled by the `tantivy-jieba` feature).
 #[cfg(any(test, feature = "tantivy"))]
 pub fn default_tokenizer() -> TokenizerChain {
     use tantivy::tokenizer::{LowerCaser, RemoveLongFilter, SimpleTokenizer, Stemmer};
