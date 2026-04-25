@@ -1,6 +1,6 @@
 [package]
 name = "anda_object_store"
-version = "0.3.1"
+version = "0.3.2"
 description = "A Rust library that extends the functionality of the object_store crate with metadata management and encryption."
 keywords = ["database", "object_store", "encryption", "anda", "AndaDB"]
 categories = ["database", "data-structures", "text-processing"]
@@ -28,4 +28,4 @@ async-stream = { workspace = true }
 [dev-dependencies]
 tempfile = "3.1.0"
 tokio = { workspace = true, features = ["full"] }
-object_store = { workspace = true, features = ["integration", "rand"] }
+object_store = { workspace = true, features = ["fs", "integration", "rand"] }

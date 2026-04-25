@@ -75,38 +75,70 @@ pub struct EncryptedStore<T: ObjectStore> {
     inner: Arc<EncryptedStoreBuilder<T>>,
 }
 
-/// Builder for configuring and creating an `EncryptedStore` instance.
+/// Builder for configuring and creating an [`EncryptedStore`] instance.
 ///
-/// This struct provides methods to customize the behavior of the encryption store,
-/// such as chunk size, conditional put operations, and more.
+/// All optional knobs (chunk size, conditional put, custom metadata cache)
+/// have sensible defaults; only the underlying store, metadata cache
+/// capacity and AES-256-GCM key need to be supplied.
 pub struct EncryptedStoreBuilder<T: ObjectStore> {
+    /// The underlying object store that holds ciphertext and metadata.
     store: T,
+    /// Shared AES-256-GCM cipher used for both encryption and decryption.
     cipher: Arc<Aes256Gcm>,
+    /// Plaintext chunk size in bytes. Each chunk is encrypted independently
+    /// with its own derived nonce and authentication tag.
     chunk_size: u64,
+    /// When true, expose the content-addressable e_tag and honour
+    /// `PutMode::Update`/`if_match`/`if_none_match` preconditions even on
+    /// backends (such as the local filesystem) that don't support them
+    /// natively.
     conditional_put: bool,
+    /// Path prefix for the encrypted data objects (default: `"data"`).
     data_prefix: Path,
+    /// Path prefix for the per-object metadata objects (default: `"meta"`).
     meta_prefix: Path,
+    /// In-memory metadata cache to avoid round-trips on hot paths.
     meta_cache: Cache<Path, Arc<Metadata>>,
 }
 
-/// Metadata structure for storing encryption details.
+/// Per-object encryption metadata stored alongside the ciphertext.
+///
+/// Serialized as compact CBOR (single-letter field names) and persisted at
+/// `meta/<location>`. The corresponding ciphertext lives at `data/<location>`
+/// and is laid out as `ceil(size / chunk_size)` fixed-size encrypted chunks.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Metadata {
+    /// Size of the ciphertext in bytes (also the plaintext size, since
+    /// AES-256-GCM in this implementation is length-preserving and the
+    /// authentication tags are stored out-of-band in [`Metadata::aes_tags`]).
     #[serde(rename = "s")]
     size: u64,
 
+    /// Content-addressable ETag computed as the URL-safe Base64 encoding of
+    /// SHA3-256 over the *ciphertext*. Exposed to callers as the object's
+    /// ETag whenever conditional-put mode is enabled.
     #[serde(rename = "e")]
     e_tag: Option<String>,
 
+    /// ETag returned by the underlying storage when the ciphertext was
+    /// written. Used to translate `if_match`/`if_none_match` preconditions.
     #[serde(rename = "o")]
     original_tag: Option<String>,
 
-    /// A nonce with AES256-GCM encryption
+    /// Version returned by the underlying storage on the most recent put,
+    /// when the backend supports object versioning.
+    #[serde(rename = "v")]
+    original_version: Option<String>,
+
+    /// 12-byte base nonce, randomly generated per object. The per-chunk GCM
+    /// nonce is derived as `derive_gcm_nonce(base_nonce, chunk_index)` so
+    /// that every chunk uses a unique nonce under the shared key.
     #[serde(rename = "n")]
     aes_nonce: ByteArray<12>,
 
-    /// A set of tags with AES256-GCM encryption
-    /// Each part of the object has its own tag
+    /// 16-byte AES-GCM authentication tag for each ciphertext chunk, in
+    /// chunk-index order. The number of entries equals
+    /// `ceil(size / chunk_size)`.
     #[serde(rename = "t")]
     aes_tags: Vec<ByteArray<16>>,
 }
@@ -276,13 +308,15 @@ impl<T: ObjectStore> EncryptedStoreBuilder<T> {
             store: "EncryptedStore",
             source: format!("Failed to serialize Metadata: {err:?}").into(),
         })?;
-        self.meta_cache
-            .insert(location.clone(), Arc::new(meta))
-            .await;
+        // Persist first, then cache. Avoids leaving a non-persisted entry
+        // visible to readers if the underlying put fails.
         let rt = self
             .store
             .put_opts(&meta_path, data.into(), PutOptions::default())
             .await?;
+        self.meta_cache
+            .insert(location.clone(), Arc::new(meta))
+            .await;
         Ok(rt)
     }
 
@@ -323,10 +357,14 @@ impl<T: ObjectStore> EncryptedStoreBuilder<T> {
         self.meta_cache.remove(location).await;
     }
 
-    async fn get_chunk(&self, location: &Path, idx: u64) -> Result<Vec<u8>> {
+    async fn get_chunk(&self, location: &Path, idx: u64, total_size: u64) -> Result<Vec<u8>> {
         let full_path = self.full_path(location);
-        let range = (idx * self.chunk_size)..((idx + 1) * self.chunk_size);
-        let data = self.store.get_range(&full_path, range).await?;
+        let start = idx * self.chunk_size;
+        let end = ((idx + 1) * self.chunk_size).min(total_size);
+        if start >= end {
+            return Ok(Vec::new());
+        }
+        let data = self.store.get_range(&full_path, start..end).await?;
         Ok(data.into())
     }
 }
@@ -392,6 +430,7 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
                     size: data.len() as u64,
                     e_tag: Some(BASE64_URL_SAFE.encode(hash)),
                     original_tag: None,
+                    original_version: None,
                     aes_nonce: base_nonce.into(),
                     aes_tags,
                 };
@@ -402,7 +441,8 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
                     .put_opts(&full_path, data.into(), opts)
                     .await?;
 
-                meta.original_tag = rt.e_tag.clone();
+                meta.original_tag = rt.e_tag;
+                meta.original_version = rt.version;
                 Ok(meta)
             })
             .await?;
@@ -410,18 +450,12 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
         if self.inner.conditional_put {
             Ok(PutResult {
                 e_tag: rt.e_tag.clone(),
-                version: None,
+                version: rt.original_version.clone(),
             })
         } else {
             Ok(PutResult {
                 e_tag: rt.original_tag.clone(),
-                version: self
-                    .inner
-                    .store
-                    .head(&self.inner.full_path(location))
-                    .await
-                    .ok()
-                    .and_then(|m| m.version),
+                version: rt.original_version.clone(),
             })
         }
     }
@@ -464,7 +498,8 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
             }
         }
 
-        // 原始 range
+        // Resolve the caller-supplied (plaintext) range, defaulting to the
+        // full object when no range is specified.
         let range = if let Some(r) = &options.range {
             r.as_range(meta.size)
                 .map_err(|source| object_store::Error::Generic {
@@ -475,7 +510,9 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
             0..meta.size
         };
 
-        // 调整 range，确保读取到包含原始 range 的完整的 chunks，用于解密
+        // Expand the request to whole-chunk boundaries: AES-GCM is not a
+        // streaming cipher, so we must read each chunk in full to verify its
+        // authentication tag before yielding the (possibly trimmed) plaintext.
         let rr = (range.start / self.inner.chunk_size) * self.inner.chunk_size
             ..meta.size.min(
                 (1 + range.end.saturating_sub(1) / self.inner.chunk_size) * self.inner.chunk_size,
@@ -565,7 +602,10 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
                         })?;
 
                         let nonce = derive_gcm_nonce(&meta.aes_nonce, idx as u64);
-                        let mut chunk = self.inner.get_chunk(location, idx as u64).await?;
+                        let mut chunk = self
+                            .inner
+                            .get_chunk(location, idx as u64, meta.size)
+                            .await?;
                         self.inner
                             .cipher
                             .decrypt_in_place_detached(
@@ -598,7 +638,8 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
     ) -> BoxStream<'static, Result<Path>> {
         let inner = self.inner.clone();
 
-        // 1) 删除 data（使用 inner store 的 delete_stream）
+        // 1) Delete the encrypted data via the inner store's delete_stream,
+        //    rewriting each logical path to its `data/` full path.
         let data_locations = locations
             .map_ok({
                 let inner = inner.clone();
@@ -608,7 +649,8 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
 
         let data_deleted = inner.store.delete_stream(data_locations);
 
-        // 2) 将 data 的 full path 映射回逻辑路径，再删除 meta（同样使用 delete_stream）
+        // 2) Map each successfully deleted data path back to its logical path,
+        //    then delete the corresponding metadata object via delete_stream.
         let meta_locations = data_deleted
             .map_ok({
                 let inner = inner.clone();
@@ -621,7 +663,8 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
 
         let meta_deleted = inner.store.delete_stream(meta_locations);
 
-        // 3) 忽略 meta NotFound，清理缓存，并返回逻辑路径
+        // 3) Suppress NotFound on metadata, invalidate the cache, and return
+        //    the logical path.
         meta_deleted
             .map({
                 let inner = inner.clone();
@@ -635,7 +678,8 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
                                 Ok(location)
                             }
                             Err(Error::NotFound { path, .. }) => {
-                                // 元数据不存在时忽略，但仍然返回对应的逻辑路径
+                                // Tolerate missing metadata; still return the
+                                // corresponding logical path.
                                 let location = inner.strip_meta_prefix(Path::from(path.as_str()));
                                 inner.remove_meta_cache(&location).await;
                                 Ok(location)
@@ -674,7 +718,7 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
                     Ok::<ObjectMeta, Error>(obj)
                 }
             })
-            .try_buffered(8) // 并发获取 meta
+            .try_buffered(8) // fetch metadata concurrently
             .boxed()
     }
 
@@ -708,7 +752,7 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
                     Ok::<ObjectMeta, Error>(obj)
                 }
             })
-            .try_buffered(8) // 并发获取 meta
+            .try_buffered(8) // fetch metadata concurrently
             .boxed()
     }
 
@@ -751,7 +795,7 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
             .try_collect::<Vec<_>>()
             .await?;
 
-        // 按索引恢复顺序
+        // Restore the original listing order based on the captured index.
         indexed.sort_by_key(|(idx, _)| *idx);
         let objects = indexed.into_iter().map(|(_, obj)| obj).collect();
 
@@ -799,21 +843,32 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
     }
 }
 
+/// Streaming multipart-upload handler for [`EncryptedStore`].
+///
+/// Buffers caller-supplied parts until at least one full plaintext chunk is
+/// available, then encrypts the chunk in place, records its authentication
+/// tag, and forwards the ciphertext to the underlying multipart upload. The
+/// final, possibly short, tail chunk is flushed by [`MultipartUpload::complete`].
 pub struct EncryptedStoreUploader<T: ObjectStore> {
+    /// Plaintext bytes that have not yet been packed into a full chunk.
     buf: Vec<u8>,
-    /// Hasher for calculating the content hash
+    /// Running SHA3-256 hasher over the *ciphertext*. Provides the
+    /// content-addressable e_tag for the finished object.
     hasher: sha3::Sha3_256,
-    /// Total size of the uploaded content
+    /// Total number of plaintext bytes accepted so far.
     size: usize,
+    /// Per-chunk AES-GCM authentication tags, in chunk-index order.
     aes_tags: Vec<ByteArray<16>>,
+    /// 12-byte base nonce, randomly generated when the upload starts. Each
+    /// chunk uses `derive_gcm_nonce(aes_nonce, chunk_index)`.
     aes_nonce: [u8; 12],
-    /// Chunk index for tracking the current chunk
+    /// Index of the next chunk to encrypt, used as the GCM nonce counter.
     chunk_index: u64,
-    /// Logical path of the object
+    /// Logical (caller-visible) path of the object being uploaded.
     location: Path,
-    /// Reference to the MetaStoreBuilder
+    /// Shared reference back to the configured store builder.
     store: Arc<EncryptedStoreBuilder<T>>,
-    /// Underlying multipart upload handler
+    /// Underlying multipart upload handler against the inner store.
     inner: Box<dyn MultipartUpload>,
 }
 
@@ -910,6 +965,7 @@ impl<T: ObjectStore> MultipartUpload for EncryptedStoreUploader<T> {
             size: self.size as u64,
             e_tag: Some(BASE64_URL_SAFE.encode(hash)),
             original_tag: obj.e_tag,
+            original_version: obj.version,
             aes_nonce: self.aes_nonce.into(),
             aes_tags: self.aes_tags.clone(),
         };
@@ -926,6 +982,22 @@ impl<T: ObjectStore> MultipartUpload for EncryptedStoreUploader<T> {
     }
 }
 
+/// Builds a [`BoxStream`] of plaintext bytes from the underlying ciphertext
+/// stream returned by `inner.store.get_opts(...)`.
+///
+/// The stream re-buffers incoming bytes into chunk-sized blocks, decrypts
+/// each block in place using the supplied per-chunk authentication tag, and
+/// trims the leading and trailing bytes so the consumer only sees the
+/// caller's requested plaintext range:
+///
+/// - `start_idx` — index of the first chunk that intersects the request.
+/// - `start_offset` — byte offset within the first chunk to begin yielding.
+/// - `size` — total number of plaintext bytes to yield before completing.
+///
+/// The function expects the upstream stream to deliver every requested
+/// ciphertext chunk in full; partial trailing data is decrypted in the
+/// post-loop fallback so short last chunks (length < `chunk_size`) are
+/// handled correctly.
 #[allow(clippy::too_many_arguments)]
 fn create_decryption_stream(
     res: GetResult,
@@ -940,7 +1012,8 @@ fn create_decryption_stream(
 ) -> BoxStream<'static, Result<Bytes>> {
     try_stream! {
         let mut stream = res.into_stream();
-        // 预分配足够大的缓冲区以减少重新分配次数
+        // Pre-allocate enough capacity to absorb at least two chunks before
+        // hitting a reallocation in the steady state.
         let mut buf = Vec::with_capacity(chunk_size * 2);
         let mut idx = start_idx;
         let mut remaining = size;
@@ -948,7 +1021,7 @@ fn create_decryption_stream(
         while let Some(data) = stream.next().await {
             let data = data?;
             if remaining == 0 {
-                // 已满足请求大小，提前结束
+                // Caller has received everything they asked for; stop early.
                 break;
             }
             buf.extend_from_slice(&data);
@@ -972,7 +1045,7 @@ fn create_decryption_stream(
                     store: "EncryptedStore",
                     source: format!("AES256 decrypt failed for path {location}: {err:?}").into(),
                 })?;
-                // 首块去掉起始偏移
+                // Trim the leading offset on the first chunk.
                 if idx == start_idx && start_offset > 0 {
                     chunk.drain(..start_offset);
                 }
@@ -986,7 +1059,7 @@ fn create_decryption_stream(
 
                 idx += 1;
                 if remaining == 0 {
-                    // 已满足请求大小，提前结束
+                    // Requested size satisfied; stop early.
                     return;
                 }
             }
@@ -1019,6 +1092,8 @@ fn create_decryption_stream(
     }.boxed()
 }
 
+/// Validates that every range in `ranges` fits within an object of length
+/// `len`. Returns a generic error otherwise.
 fn ranges_is_valid(ranges: &[Range<u64>], len: u64) -> Result<()> {
     for range in ranges {
         if range.start >= len {
@@ -1043,6 +1118,7 @@ fn ranges_is_valid(ranges: &[Range<u64>], len: u64) -> Result<()> {
     Ok(())
 }
 
+/// Generates `N` cryptographically-strong random bytes using the OS RNG.
 fn rand_bytes<const N: usize>() -> [u8; N] {
     let mut rng = rand::rng();
     let mut bytes = [0u8; N];
@@ -1050,7 +1126,14 @@ fn rand_bytes<const N: usize>() -> [u8; N] {
     bytes
 }
 
-// 为每个分块从基准 nonce 派生唯一的 GCM nonce（后 8 字节作为计数器）
+/// Derives a unique 96-bit AES-GCM nonce for chunk `idx` from a per-object
+/// `base` nonce.
+///
+/// The first 4 bytes of `base` are kept as a random salt; the trailing 8
+/// bytes are interpreted as a little-endian counter and incremented by `idx`.
+/// Because each object has its own random `base`, distinct chunks of distinct
+/// objects always produce distinct nonces under the shared key, satisfying
+/// AES-GCM's nonce-uniqueness requirement.
 fn derive_gcm_nonce(base: &[u8; 12], idx: u64) -> [u8; 12] {
     let mut nonce = *base;
     let mut ctr = [0u8; 8];

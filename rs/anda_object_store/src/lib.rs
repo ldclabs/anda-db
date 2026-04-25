@@ -1,3 +1,27 @@
+//! # anda_object_store
+//!
+//! `anda_object_store` extends the [`object_store`] crate with two composable
+//! wrappers that are used as the storage substrate for AndaDB and the AI memory
+//! brain:
+//!
+//! - [`MetaStore`] — augments any [`ObjectStore`] backend with side-car
+//!   metadata (object size, content hash, original backend ETag/version).
+//!   This enables a uniform, content-addressable ETag and conditional
+//!   `PutMode::Update` semantics on top of backends that lack them natively
+//!   (notably [`object_store::local::LocalFileSystem`]).
+//! - [`EncryptedStore`] — provides transparent, chunked AES-256-GCM
+//!   encryption-at-rest. Objects are split into fixed-size chunks, each
+//!   encrypted with a per-chunk nonce derived from a random per-object base
+//!   nonce. Encryption metadata (base nonce, per-chunk authentication tags)
+//!   is stored alongside content metadata.
+//!
+//! Both wrappers implement [`ObjectStore`] and place data and metadata under
+//! two distinct path prefixes (`data/` and `meta/` by default) on the
+//! underlying backend, so they can be layered on top of any compliant store
+//! (in-memory, local filesystem, S3, GCS, Azure Blob, …).
+//!
+//! See [`docs/anda_object_store.md`] for the full design document.
+
 use async_trait::async_trait;
 use base64::{Engine, prelude::BASE64_URL_SAFE};
 use bytes::Bytes;
@@ -9,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use sha3::Digest;
 use std::{fmt::Debug, ops::Range, sync::Arc, time::Duration};
 
-/// An object store implementation that provides transparent AES-256-GCM encryption and decryption for stored objects.
+/// Transparent AES-256-GCM encryption-at-rest layer for any [`ObjectStore`].
 pub mod encryption;
 
 pub use encryption::{EncryptedStore, EncryptedStoreBuilder, EncryptedStoreUploader};
@@ -61,20 +85,33 @@ pub struct MetaStoreBuilder<T: ObjectStore> {
 
 /// Metadata structure for objects stored in `MetaStore`.
 ///
-/// This structure is serialized and stored alongside each object.
+/// Serialized as compact CBOR (single-letter field names) and stored at
+/// `meta/<location>` alongside the data object at `data/<location>`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct Metadata {
-    /// Size of the object in bytes
+    /// Size of the (logical) object in bytes.
     #[serde(rename = "s")]
     size: u64,
 
-    /// E-Tag (hash) of the object content
+    /// Content-addressable ETag produced by [`sha3_256`] over the payload,
+    /// encoded as URL-safe Base64 (without padding). This ETag is what
+    /// [`MetaStore`] exposes to callers via [`ObjectStore`] APIs and uses
+    /// for `PutMode::Update` precondition checks.
     #[serde(rename = "e")]
     e_tag: Option<String>,
 
-    /// Original E-Tag from the underlying storage
+    /// ETag returned by the underlying storage when the data object was
+    /// written. Used to translate caller-provided `if_match`/`if_none_match`
+    /// preconditions on [`MetaStore::get_opts`] into a request the inner
+    /// store understands.
     #[serde(rename = "o")]
     original_tag: Option<String>,
+
+    /// Version returned by the underlying storage on the most recent put,
+    /// when the backend supports object versioning. Forwarded back to the
+    /// caller via [`PutResult::version`].
+    #[serde(rename = "v")]
+    original_version: Option<String>,
 }
 
 impl<T: ObjectStore> std::fmt::Display for MetaStore<T> {
@@ -183,13 +220,16 @@ impl<T: ObjectStore> MetaStoreBuilder<T> {
             store: "MetaStore",
             source: format!("Failed to serialize Metadata for path {location}: {err:?}").into(),
         })?;
-        self.meta_cache
-            .insert(location.clone(), Arc::new(meta))
-            .await;
+        // Persist to the underlying store first, then update cache.
+        // If we cached before the put and the put failed, readers would
+        // observe a non-persisted metadata until the cache entry expired.
         let rt = self
             .store
             .put_opts(&meta_path, data.into(), PutOptions::default())
             .await?;
+        self.meta_cache
+            .insert(location.clone(), Arc::new(meta))
+            .await;
         Ok(rt)
     }
 
@@ -272,6 +312,7 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
                     size: payload.len() as u64,
                     e_tag: Some(BASE64_URL_SAFE.encode(hash)),
                     original_tag: None,
+                    original_version: None,
                 };
 
                 let rt = self
@@ -280,13 +321,14 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
                     .put_opts(&full_path, payload.into(), opts)
                     .await?;
                 meta.original_tag = rt.e_tag;
+                meta.original_version = rt.version;
                 Ok(meta)
             })
             .await?;
 
         Ok(PutResult {
             e_tag: rt.e_tag.clone(),
-            version: None, // not used
+            version: rt.original_version.clone(),
         })
     }
 
@@ -343,7 +385,8 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
     ) -> BoxStream<'static, Result<Path>> {
         let inner = self.inner.clone();
 
-        // 1) 删除 data（使用 inner store 的 delete_stream）
+        // 1) Delete the data objects via the underlying store's delete_stream,
+        //    rewriting each logical path into its `data/` full path.
         let data_locations = locations
             .map_ok({
                 let inner = inner.clone();
@@ -353,7 +396,8 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
 
         let data_deleted = inner.store.delete_stream(data_locations);
 
-        // 2) 将 data 的 full path 映射回逻辑路径，再删除 meta（同样使用 delete_stream）
+        // 2) Map each successfully deleted data path back to its logical path,
+        //    then delete the corresponding metadata object.
         let meta_locations = data_deleted
             .map_ok({
                 let inner = inner.clone();
@@ -366,7 +410,8 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
 
         let meta_deleted = inner.store.delete_stream(meta_locations);
 
-        // 3) 忽略 meta NotFound，清理缓存，并返回逻辑路径
+        // 3) Suppress NotFound on metadata (data deletion is the source of
+        //    truth), invalidate the cache, and surface the logical path.
         meta_deleted
             .map({
                 let inner = inner.clone();
@@ -380,7 +425,8 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
                                 Ok(location)
                             }
                             Err(Error::NotFound { path, .. }) => {
-                                // 元数据不存在时忽略，但仍然返回对应的逻辑路径
+                                // Tolerate missing metadata; still return the
+                                // corresponding logical path for the caller.
                                 let location = inner.strip_meta_prefix(Path::from(path.as_str()));
                                 inner.remove_meta_cache(&location).await;
                                 Ok(location)
@@ -410,7 +456,7 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
                     Ok::<ObjectMeta, Error>(obj)
                 }
             })
-            .try_buffered(8) // 并发获取 meta
+            .try_buffered(8) // fetch metadata concurrently
             .boxed()
     }
 
@@ -435,7 +481,7 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
                     Ok::<ObjectMeta, Error>(obj)
                 }
             })
-            .try_buffered(8) // 并发获取 meta
+            .try_buffered(8) // fetch metadata concurrently
             .boxed()
     }
 
@@ -457,7 +503,8 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
             })
             .collect::<Vec<_>>();
 
-        // 并发获取各对象的 meta（保持原有顺序）
+        // Fetch the metadata for each object concurrently while preserving
+        // the original listing order.
         let inner = self.inner.clone();
         let mut indexed =
             futures::stream::iter(objects.into_iter().enumerate().map(move |(idx, mut obj)| {
@@ -472,7 +519,7 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
             .try_collect::<Vec<_>>()
             .await?;
 
-        // 按索引恢复顺序
+        // Restore the original order based on the captured index.
         indexed.sort_by_key(|(idx, _)| *idx);
         let objects = indexed.into_iter().map(|(_, obj)| obj).collect();
 
@@ -567,6 +614,7 @@ impl<T: ObjectStore> MultipartUpload for MetaStoreUploader<T> {
             size: self.size as u64,
             e_tag: Some(BASE64_URL_SAFE.encode(hash)),
             original_tag: obj.e_tag,
+            original_version: obj.version,
         };
         rt.e_tag = meta.e_tag.clone();
         self.store.put_meta(&self.location, meta).await?;
@@ -578,12 +626,24 @@ impl<T: ObjectStore> MultipartUpload for MetaStoreUploader<T> {
     }
 }
 
+/// Computes the SHA3-256 hash of `data` and returns it as a 32-byte array.
+///
+/// Used by [`MetaStore`] to derive a content-addressable ETag, and by
+/// [`crate::encryption::EncryptedStore`] to hash the produced ciphertext.
 fn sha3_256(data: &[u8]) -> [u8; 32] {
     let mut hasher = sha3::Sha3_256::new();
     hasher.update(data);
     hasher.finalize().into()
 }
 
+/// Re-clones an [`Arc<Error>`] returned from a `moka` shared computation
+/// (e.g. [`Cache::try_get_with`]) into an owned [`Error`].
+///
+/// `moka` deduplicates concurrent loaders by returning the same `Arc<Error>`
+/// to every waiter. Because [`object_store::Error`] is not [`Clone`], we must
+/// reconstruct an equivalent variant by hand. Variants that carry a `path`
+/// are reconstructed with their `path` and a stringified `source`; everything
+/// else collapses into [`Error::Generic`].
 fn map_arc_error(err: Arc<Error>) -> Error {
     match err.as_ref() {
         Error::NotFound { path, source } => Error::NotFound {
