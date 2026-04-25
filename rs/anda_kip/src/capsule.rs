@@ -1,5 +1,21 @@
 //! # KIP Genesis Capsules
 //!
+//! Static, version-controlled KIP source for the Bootstrapping Model defined in
+//! the KIP specification. Loading these capsules brings a fresh Cognitive Nexus
+//! up to a self-describing state where every legal concept type and proposition
+//! predicate is itself a queryable concept node.
+//!
+//! - [`GENESIS_KIP`] defines the meta-types `$ConceptType` / `$PropositionType`,
+//!   the `Domain` type, and the `CoreSchema` core domain.
+//! - The remaining `*_KIP` constants define standard concept types
+//!   (`Person`, `Event`, `Insight`, `Preference`, `SleepTask`).
+//! - [`PERSON_SELF_KIP`] / [`PERSON_SYSTEM_KIP`] materialize the system actors
+//!   `$self` (waking persona) and `$system` (sleeping persona).
+//!
+//! The string constants below name the well-known concept type / predicate names
+//! that executors must guard against accidental modification (see the protected
+//! scope rules in KIP §4.2.4 and `KIP_3004`).
+
 /// The absolute root type of all knowledge concepts.
 pub static META_CONCEPT_TYPE: &str = "$ConceptType";
 

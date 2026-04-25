@@ -266,8 +266,9 @@ fn format_verbose_error(input: &str, ve: VerboseError<&str>) -> String {
         })
         .collect();
 
-    // 2. Find the deepest (most specific) error entry
-    let deepest = ve.errors.first();
+    // 2. Find the error entry that made the most progress through the input.
+    // This is usually the most actionable location for LLM self-correction.
+    let deepest = select_primary_error(input, &ve);
 
     // 3. Check if error is at the start of input (top-level parse failure)
     let is_at_start = deepest
@@ -358,8 +359,15 @@ fn format_verbose_error(input: &str, ve: VerboseError<&str>) -> String {
                 _ => format!("Parser {:?} failed", e),
             },
         };
+        msg.push_str("Error summary: ");
         msg.push_str(&error_desc);
         msg.push('\n');
+
+        if let Some(expected) = expected_syntax_for_context(&contexts, deepest) {
+            msg.push_str("Expected here: ");
+            msg.push_str(&expected);
+            msg.push('\n');
+        }
 
         // 6. Show precise location (line:column) and context window
         let offset = input.len() - slice.len();
@@ -373,13 +381,101 @@ fn format_verbose_error(input: &str, ve: VerboseError<&str>) -> String {
     }
 
     // 8. Add recovery suggestions based on context
-    if let Some(suggestion) = generate_recovery_suggestion(&contexts, deepest, is_at_start) {
-        msg.push_str("\nSuggestion: ");
+    if let Some(suggestion) = generate_recovery_suggestion(input, &contexts, deepest, is_at_start) {
+        msg.push_str("\nRepair hint: ");
         msg.push_str(&suggestion);
         msg.push('\n');
     }
 
     msg
+}
+
+fn select_primary_error<'a>(
+    input: &str,
+    ve: &'a VerboseError<&'a str>,
+) -> Option<&'a (&'a str, VerboseErrorKind)> {
+    ve.errors
+        .iter()
+        .max_by_key(|(slice, _)| input.len().saturating_sub(slice.len()))
+}
+
+fn expected_syntax_for_context(
+    contexts: &[&str],
+    deepest: Option<&(&str, VerboseErrorKind)>,
+) -> Option<String> {
+    if context_contains(contexts, "KQL predicate term") {
+        return Some(
+            "a predicate as \"snake_case\", a predicate variable like ?predicate, alternatives \"p1\" | \"p2\", or a path \"p\"{m,n}".to_string(),
+        );
+    }
+
+    if context_contains(contexts, "KQL proposition matcher") {
+        return Some("(subject, \"predicate\", object) or (id: \"proposition_id\")".to_string());
+    }
+
+    if context_contains(contexts, "KQL concept matcher") {
+        return Some(
+            "{id: \"...\"}, {type: \"Type\"}, {name: \"Name\"}, or {type: \"Type\", name: \"Name\"}".to_string(),
+        );
+    }
+
+    if context_contains(contexts, "FILTER") {
+        return Some(
+            "FILTER(?path == value), FILTER(expr && expr), or FILTER(IN(?path, [value, ...]))"
+                .to_string(),
+        );
+    }
+
+    if context_contains(contexts, "WHERE clause item") || context_is(contexts, "WHERE { ... }") {
+        return Some(
+            "one WHERE item: ?var {type: \"Type\"}, (?s, \"predicate\", ?o), FILTER(...), OPTIONAL {...}, NOT {...}, or UNION {...}".to_string(),
+        );
+    }
+
+    if context_is(contexts, "FIND( ... )")
+        || context_contains(contexts, "FIND expression")
+        || context_contains(contexts, "KQL aggregation expression")
+    {
+        return Some("FIND(?var[, ?var2 | COUNT(?var) ...]) followed by WHERE { ... }".to_string());
+    }
+
+    if context_contains(contexts, "CONCEPT [?local_handle]") {
+        return Some(
+            "CONCEPT [?handle] { {type: \"Type\", name: \"Name\"} [SET ATTRIBUTES {...}] [SET PROPOSITIONS {...}] }".to_string(),
+        );
+    }
+
+    if context_contains(contexts, "PROPOSITION [?local_handle]") {
+        return Some(
+            "PROPOSITION [?handle] { (?subject, \"predicate\", ?object) [SET ATTRIBUTES {...}] }"
+                .to_string(),
+        );
+    }
+
+    if context_contains(contexts, "WITH METADATA") {
+        return Some("WITH METADATA { source: \"...\", confidence: 0.9, ... }".to_string());
+    }
+
+    if context_contains(contexts, "KIP key-value map")
+        || context_contains(contexts, "JSON object")
+        || context_contains(contexts, "key-value pair")
+    {
+        return Some("a JSON-like object: { key: value, key2: value2 }".to_string());
+    }
+
+    if let Some((_, VerboseErrorKind::Char(c))) = deepest {
+        return Some(format!("the character `{c}`"));
+    }
+
+    None
+}
+
+fn context_contains(contexts: &[&str], needle: &str) -> bool {
+    contexts.iter().any(|ctx| ctx.contains(needle))
+}
+
+fn context_is(contexts: &[&str], expected: &str) -> bool {
+    contexts.contains(&expected)
 }
 
 /// Compute 1-based line and column from byte offset
@@ -424,10 +520,15 @@ fn format_error_context_window(input: &str, offset: usize) -> String {
 
 /// Generate a recovery suggestion based on the parsing context and error
 fn generate_recovery_suggestion(
+    input: &str,
     contexts: &[&str],
     deepest: Option<&(&str, VerboseErrorKind)>,
     is_at_start: bool,
 ) -> Option<String> {
+    if let Some(hint) = detect_common_llm_mistake(input, contexts) {
+        return Some(hint);
+    }
+
     // If error is at the start of input, always give top-level guidance
     if is_at_start {
         return Some(
@@ -571,7 +672,7 @@ fn generate_recovery_suggestion(
         return Some(
             "FILTER syntax: FILTER(expression). \
              Comparisons: ?var == value, ?var != value, ?var < value, ?var > value, ?var <= value, ?var >= value. \
-             Functions: CONTAINS(?var, \"text\"), STARTS_WITH(?var, \"prefix\"), ENDS_WITH(?var, \"suffix\"), REGEX(?var, \"pattern\"). \
+             Functions: CONTAINS(?var, \"text\"), STARTS_WITH(?var, \"prefix\"), ENDS_WITH(?var, \"suffix\"), REGEX(?var, \"pattern\"), IN(?var, [values]), IS_NULL(?var), IS_NOT_NULL(?var). \
              Logical: expr && expr, expr || expr, !(expr)."
                 .to_string(),
         );
@@ -640,7 +741,140 @@ fn generate_recovery_suggestion(
     None
 }
 
+fn detect_common_llm_mistake(input: &str, contexts: &[&str]) -> Option<String> {
+    let trimmed = input.trim_start();
+
+    if let Some((actual, expected)) = lowercase_keyword_correction(trimmed) {
+        return Some(format!(
+            "KIP keywords are case-sensitive. Replace `{actual}` with `{expected}`."
+        ));
+    }
+
+    if trimmed.starts_with("FIND") && !contains_keyword(trimmed, "WHERE") {
+        return Some(
+            "A FIND query must include a WHERE block: FIND(...) WHERE { ... }. Add WHERE { <concept/proposition clauses> }."
+                .to_string(),
+        );
+    }
+
+    if context_contains(contexts, "KQL predicate term") {
+        return Some(
+            "In a proposition pattern, the predicate is usually a quoted string: (?subject, \"predicate_name\", ?object). If you intended a variable predicate, prefix it with `?`."
+                .to_string(),
+        );
+    }
+
+    if context_contains(contexts, "FILTER") && contains_standalone_equals(input) {
+        return Some(
+            "FILTER equality uses `==`, not `=`. For example: FILTER(?drug.name == \"Aspirin\")."
+                .to_string(),
+        );
+    }
+
+    if context_contains(contexts, "KQL concept matcher")
+        || context_contains(contexts, "KIP key-value map")
+        || context_contains(contexts, "JSON object")
+    {
+        return Some(
+            "Check object fields for missing commas and JSON value syntax. Concept matchers use commas, e.g. {type: \"Drug\", name: \"Aspirin\"}."
+                .to_string(),
+        );
+    }
+
+    None
+}
+
+fn lowercase_keyword_correction(input: &str) -> Option<(&str, &'static str)> {
+    let token = input
+        .split(|ch: char| ch.is_whitespace() || ch == '(' || ch == '{')
+        .next()?;
+    let expected = match token.to_ascii_lowercase().as_str() {
+        "find" => "FIND",
+        "where" => "WHERE",
+        "upsert" => "UPSERT",
+        "delete" => "DELETE",
+        "describe" => "DESCRIBE",
+        "search" => "SEARCH",
+        "filter" => "FILTER",
+        "optional" => "OPTIONAL",
+        "not" => "NOT",
+        "union" => "UNION",
+        _ => return None,
+    };
+
+    if token != expected {
+        Some((token, expected))
+    } else {
+        None
+    }
+}
+
+fn contains_keyword(input: &str, keyword: &str) -> bool {
+    input
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .any(|token| token == keyword)
+}
+
+fn contains_standalone_equals(input: &str) -> bool {
+    let bytes = input.as_bytes();
+    for (idx, byte) in bytes.iter().enumerate() {
+        if *byte != b'=' {
+            continue;
+        }
+
+        let prev = idx.checked_sub(1).and_then(|i| bytes.get(i)).copied();
+        let next = bytes.get(idx + 1).copied();
+        if !matches!(prev, Some(b'=' | b'!' | b'<' | b'>')) && next != Some(b'=') {
+            return true;
+        }
+    }
+
+    false
+}
+
 /// Take the first n characters of a string (avoids mid-byte truncation)
 fn take_first_chars(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::parse_kip;
+
+    fn parse_error_message(input: &str) -> String {
+        parse_kip(input).unwrap_err().message
+    }
+
+    #[test]
+    fn parse_error_suggests_uppercase_keyword() {
+        let message = parse_error_message(r#"find(?x) WHERE { ?x {type: "Drug"} }"#);
+
+        assert!(message.contains("Error summary"));
+        assert!(message.contains("Replace `find` with `FIND`"));
+    }
+
+    #[test]
+    fn parse_error_suggests_missing_where_block() {
+        let message = parse_error_message("FIND(?x)");
+
+        assert!(message.contains("WHERE block"));
+        assert!(message.contains("FIND(...) WHERE { ... }"));
+    }
+
+    #[test]
+    fn parse_error_suggests_quoted_predicate() {
+        let message = parse_error_message(r#"FIND(?x) WHERE { (?x, treats, ?y) }"#);
+
+        assert!(message.contains("predicate"));
+        assert!(message.contains("quoted string"));
+    }
+
+    #[test]
+    fn parse_error_suggests_double_equals_in_filter() {
+        let message = parse_error_message(
+            r#"FIND(?x) WHERE { ?x {type: "Drug"} FILTER(?x.name = "Aspirin") }"#,
+        );
+
+        assert!(message.contains("FILTER equality uses `==`, not `=`"));
+    }
 }

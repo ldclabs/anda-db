@@ -31,7 +31,7 @@ pub fn parse_kml_statement(input: &str) -> VResult<'_, KmlStatement> {
 fn parse_with_metadata(input: &str) -> VResult<'_, Map<String, Json>> {
     context(
         "WITH METADATA { ... }",
-        preceded(ws(tag("WITH METADATA")), json_value_map),
+        preceded(ws(keywords(&["WITH", "METADATA"])), json_value_map),
     )
     .parse(input)
 }
@@ -41,7 +41,7 @@ fn parse_upsert_blocks(input: &str) -> VResult<'_, Vec<UpsertBlock>> {
         "UPSERT { ... }",
         many1(map(
             preceded(
-                ws(tag("UPSERT")),
+                ws(keyword("UPSERT")),
                 cut((
                     braced_block(many1(ws(parse_upsert_item))),
                     opt(parse_with_metadata),
@@ -69,17 +69,17 @@ fn parse_concept_block(input: &str) -> VResult<'_, ConceptBlock> {
         "CONCEPT [?local_handle] { ... }",
         map(
             (
-                preceded(ws(tag("CONCEPT")), opt(ws(variable))),
+                preceded(ws(keyword("CONCEPT")), opt(ws(variable))),
                 cut(braced_block((
                     ws(parse_concept_matcher),
                     opt(context(
                         "SET ATTRIBUTES { ... }",
-                        ws(preceded(tag("SET ATTRIBUTES"), json_value_map)),
+                        ws(preceded(keywords(&["SET", "ATTRIBUTES"]), json_value_map)),
                     )),
                     opt(context(
                         "SET PROPOSITIONS { ... }",
                         ws(preceded(
-                            tag("SET PROPOSITIONS"),
+                            keywords(&["SET", "PROPOSITIONS"]),
                             braced_block(many1(ws(parse_set_proposition))),
                         )),
                     )),
@@ -125,12 +125,12 @@ fn parse_proposition_block(input: &str) -> VResult<'_, PropositionBlock> {
         "PROPOSITION [?local_handle] { ... }",
         map(
             (
-                preceded(ws(tag("PROPOSITION")), opt(ws(variable))),
+                preceded(ws(keyword("PROPOSITION")), opt(ws(variable))),
                 cut(braced_block((
                     ws(parse_prop_mather),
                     opt(context(
                         "SET ATTRIBUTES { ... }",
-                        ws(preceded(tag("SET ATTRIBUTES"), json_value_map)),
+                        ws(preceded(keywords(&["SET", "ATTRIBUTES"]), json_value_map)),
                     )),
                 ))),
                 opt(ws(parse_with_metadata)),
@@ -150,7 +150,7 @@ fn parse_proposition_block(input: &str) -> VResult<'_, PropositionBlock> {
 
 fn parse_delete_statement(input: &str) -> VResult<'_, DeleteStatement> {
     preceded(
-        ws(tag("DELETE ")),
+        ws(keyword("DELETE")),
         cut(context(
             "DELETE target: ATTRIBUTES | METADATA | PROPOSITIONS | CONCEPT",
             alt((
@@ -923,5 +923,21 @@ mod tests {
         }
         "#;
         assert!(parse_kml_statement(input3).is_err());
+    }
+
+    #[test]
+    fn test_keywords_accept_arbitrary_whitespace() {
+        // Newlines/tabs separating multi-word keywords (WITH METADATA, SET ATTRIBUTES,
+        // SET PROPOSITIONS) must parse identically to a literal space.
+        let input = "UPSERT {\n  CONCEPT ?d {\n    {type: \"Drug\", name: \"X\"}\n    SET\n    ATTRIBUTES { a: 1 }\n    SET\nPROPOSITIONS {\n      (\"is_a\", {type: \"DrugClass\", name: \"NSAID\"})\n    }\n  }\n  WITH\n\tMETADATA { source: \"t\" }\n}\nWITH\n  METADATA { author: \"u\" }\n";
+        let result = parse_kml_statement(input).expect("parses with newlines between keywords");
+        match result.1 {
+            KmlStatement::Upsert(blocks) => {
+                assert_eq!(blocks.len(), 1);
+                assert!(blocks[0].metadata.is_some());
+                assert_eq!(blocks[0].items.len(), 1);
+            }
+            _ => panic!("expected UPSERT"),
+        }
     }
 }

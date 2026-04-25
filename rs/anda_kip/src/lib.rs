@@ -94,6 +94,11 @@ pub static SYSTEM_INSTRUCTIONS: &str = include_str!("../SystemInstructions.md");
 pub static KIP_FUNCTION_DEFINITION: LazyLock<Json> =
     LazyLock::new(|| serde_json::from_str(include_str!("../FunctionDefinition.json")).unwrap());
 
+/// JSON schema definition for the `execute_kip_readonly` function
+pub static KIP_READONLY_FUNCTION_DEFINITION: LazyLock<Json> = LazyLock::new(|| {
+    serde_json::from_str(include_str!("../FunctionDefinitionReadonly.json")).unwrap()
+});
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,6 +111,16 @@ mod tests {
         assert_eq!(
             json.get("name"),
             Some(&Json::String("execute_kip".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_readonly_function() {
+        let json = KIP_READONLY_FUNCTION_DEFINITION.clone();
+        assert!(json.is_object());
+        assert_eq!(
+            json.get("name"),
+            Some(&Json::String("execute_kip_readonly".to_string()))
         );
     }
 }

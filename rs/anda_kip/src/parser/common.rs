@@ -2,7 +2,7 @@ use nom::{
     IResult, Parser,
     branch::alt,
     bytes::complete::{tag, tag_no_case},
-    character::complete::{alpha1, alphanumeric1, char},
+    character::complete::{alpha1, alphanumeric1, char, multispace1},
     combinator::{cut, map, opt, recognize, value},
     error::{ErrorKind, ParseError, context},
     multi::{many0, separated_list1},
@@ -35,6 +35,36 @@ where
     F: Parser<&'a str, Output = O, Error = VerboseError<&'a str>>,
 {
     delimited(ws(char('(')), f, ws(char(')')))
+}
+
+/// Matches a single uppercase keyword that must be followed by at least one
+/// whitespace character (space, tab, newline, ...). This is more robust than
+/// `tag("KEYWORD ")` which only accepts a literal ASCII space and breaks on
+/// `\n` / `\t` separators that are common in formatted KIP commands.
+pub fn keyword<'a>(
+    word: &'static str,
+) -> impl Parser<&'a str, Output = &'a str, Error = VerboseError<&'a str>> {
+    terminated(tag(word), multispace1)
+}
+
+/// Matches a sequence of uppercase keywords separated by required whitespace
+/// (e.g., `ORDER BY`, `CONCEPT TYPES`, `WITH METADATA`). Whitespace is only
+/// mandatory *between* tokens; trailing whitespace after the final keyword is
+/// the caller's responsibility (typically via `ws(keywords(...))`).
+pub fn keywords<'a>(
+    words: &'static [&'static str],
+) -> impl Parser<&'a str, Output = (), Error = VerboseError<&'a str>> {
+    move |mut input: &'a str| {
+        for (idx, w) in words.iter().enumerate() {
+            let (rest, _) = tag(*w).parse(input)?;
+            input = rest;
+            if idx + 1 < words.len() {
+                let (rest, _) = multispace1(input)?;
+                input = rest;
+            }
+        }
+        Ok((input, ()))
+    }
 }
 
 /// Parses a valid identifier (e.g., for variables, types, predicates).

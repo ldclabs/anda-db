@@ -171,30 +171,131 @@ impl Request {
 
     /// Substitutes parameters into a command string
     ///
-    /// Replaces all `:key_name` placeholders in the command with corresponding values
-    /// from the parameters map.
+    /// Replaces `:key_name` placeholder tokens in the command with corresponding values
+    /// from the parameters map. Replacement is token-aware: placeholders inside quoted
+    /// strings are left untouched and later rejected by request validation.
     ///
     /// # Warning
     /// Placeholders must occupy a full JSON value position (e.g., `name: :param`).
     /// Do NOT embed placeholders inside quoted strings (e.g., `"Hello :name"`),
-    /// because string values will be JSON-serialized with quotes, causing syntax errors.
+    /// because string values will be JSON-serialized with quotes.
     fn substitute_params(command: &str, parameters: &Map<String, Json>) -> String {
         if parameters.is_empty() {
             return command.to_string();
         }
 
-        let mut result = command.to_string();
-        for (key, value) in parameters {
-            let placeholder = format!(":{}", key);
-            let replacement = match value {
-                Json::Number(n) => n.to_string(),
-                Json::Bool(b) => b.to_string(),
-                Json::Null => "null".to_string(),
-                _ => serde_json::to_string(value).unwrap_or_else(|_| "null".to_string()),
-            };
-            result = result.replace(&placeholder, &replacement);
+        let mut result = String::with_capacity(command.len());
+        let bytes = command.as_bytes();
+        let mut index = 0;
+        let mut in_string = false;
+        let mut escaped = false;
+
+        while index < command.len() {
+            let ch = command[index..]
+                .chars()
+                .next()
+                .expect("valid char boundary");
+            let ch_len = ch.len_utf8();
+
+            if in_string {
+                result.push_str(&command[index..index + ch_len]);
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    in_string = false;
+                }
+                index += ch_len;
+                continue;
+            }
+
+            if ch == '"' {
+                in_string = true;
+                result.push(ch);
+                index += ch_len;
+                continue;
+            }
+
+            if ch == ':' {
+                let name_start = index + 1;
+                if name_start < command.len() && Self::is_identifier_start_byte(bytes[name_start]) {
+                    let mut name_end = name_start + 1;
+                    while name_end < command.len()
+                        && Self::is_identifier_continue_byte(bytes[name_end])
+                    {
+                        name_end += 1;
+                    }
+
+                    let name = &command[name_start..name_end];
+                    if let Some(value) = parameters.get(name) {
+                        result.push_str(&Self::parameter_replacement(value));
+                        index = name_end;
+                        continue;
+                    }
+                }
+            }
+
+            result.push_str(&command[index..index + ch_len]);
+            index += ch_len;
         }
+
         result
+    }
+
+    fn is_identifier_start_byte(byte: u8) -> bool {
+        byte.is_ascii_alphabetic() || byte == b'_'
+    }
+
+    fn is_identifier_continue_byte(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || byte == b'_'
+    }
+
+    fn parameter_replacement(value: &Json) -> String {
+        match value {
+            Json::Number(n) => n.to_string(),
+            Json::Bool(b) => b.to_string(),
+            Json::Null => "null".to_string(),
+            _ => serde_json::to_string(value).unwrap_or_else(|_| "null".to_string()),
+        }
+    }
+
+    fn placeholder_usage_error(extra_hint: String) -> ErrorObject {
+        ErrorObject {
+            code: "KIP_1001".to_string(),
+            message: "Invalid parameter placeholder usage".to_string(),
+            hint: Some(extra_hint),
+            data: None,
+        }
+    }
+
+    fn validate_placeholder_usage(
+        command: &str,
+        parameters: &Map<String, Json>,
+    ) -> Result<(), ErrorObject> {
+        if parameters.is_empty() {
+            return Ok(());
+        }
+
+        Self::find_placeholders_in_strings(command, parameters)
+            .map_err(Self::placeholder_usage_error)
+    }
+
+    fn validate_request_mode(&self) -> Option<ErrorObject> {
+        if !self.command.trim().is_empty() && !self.commands.is_empty() {
+            return Some(ErrorObject {
+                code: "KIP_1001".to_string(),
+                message: "Invalid request: `command` and `commands` are mutually exclusive"
+                    .to_string(),
+                hint: Some(
+                    "Provide either a single `command` string or a batch `commands` array, not both."
+                        .to_string(),
+                ),
+                data: None,
+            });
+        }
+
+        None
     }
 
     /// Core implementation that checks for placeholders inside quoted strings.
@@ -206,33 +307,50 @@ impl Request {
     ) -> Result<(), String> {
         let mut warnings = Vec::new();
 
-        for key in parameters.keys() {
-            let placeholder = format!(":{}", key);
-            let mut search_start = 0;
+        let mut chars = command.char_indices().peekable();
+        let mut in_string = false;
+        let mut escaped = false;
 
-            while let Some(pos) = command[search_start..].find(&placeholder) {
-                let abs_pos = search_start + pos;
+        while let Some((pos, ch)) = chars.next() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
 
-                // Check if this placeholder is inside a quoted string
-                // by counting unescaped quotes before this position
-                let before = &command[..abs_pos];
-                let mut in_string = false;
-                let mut chars = before.chars().peekable();
+                if ch == '\\' {
+                    escaped = true;
+                    continue;
+                }
 
-                while let Some(ch) = chars.next() {
-                    if ch == '\\' {
-                        // Skip escaped character
-                        chars.next();
-                    } else if ch == '"' {
-                        in_string = !in_string;
+                if ch == '"' {
+                    in_string = false;
+                    continue;
+                }
+
+                if ch == ':'
+                    && let Some((_, next_ch)) = chars.peek().copied()
+                    && next_ch.is_ascii()
+                    && Self::is_identifier_start_byte(next_ch as u8)
+                {
+                    let mut name = String::new();
+                    while let Some((_, ident_ch)) = chars.peek().copied() {
+                        if ident_ch.is_ascii() && Self::is_identifier_continue_byte(ident_ch as u8)
+                        {
+                            name.push(ident_ch);
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+
+                    if parameters.contains_key(&name) {
+                        warnings.push((name, pos));
                     }
                 }
-
-                if in_string {
-                    warnings.push((key.clone(), abs_pos));
-                }
-
-                search_start = abs_pos + placeholder.len();
+            } else if ch == '"' {
+                in_string = true;
+                escaped = false;
             }
         }
 
@@ -269,6 +387,11 @@ impl Request {
         }
     }
 
+    /// Marks this request as read-only.
+    ///
+    /// When set, [`Self::execute`] dispatches through `execute_readonly`, which
+    /// rejects KML commands (UPSERT/DELETE) with `KIP_1001` so callers can route
+    /// untrusted or query-only traffic through a guaranteed non-mutating path.
     pub fn readonly(&mut self) -> &mut Self {
         self.readonly = true;
         self
@@ -284,9 +407,17 @@ impl Request {
     /// If a parse error occurs, this method will check for common misuse patterns
     /// (like placeholders inside quoted strings) and include helpful hints in the error.
     pub async fn execute(&self, nexus: &impl Executor) -> (CommandType, Response) {
+        if let Some(error) = self.validate_request_mode() {
+            return (CommandType::Unknown, Response::err(error));
+        }
+
         if self.is_batch() {
             self.execute_batch(nexus).await
         } else {
+            if let Err(error) = Self::validate_placeholder_usage(&self.command, &self.parameters) {
+                return (CommandType::Unknown, Response::err(error));
+            }
+
             let command = self.to_command();
             let (cmd_type, response) = if self.readonly {
                 execute_readonly(nexus, &command, self.dry_run).await
@@ -329,6 +460,11 @@ impl Request {
         let mut command_type = CommandType::Unknown;
 
         for (cmd, params) in self.iter_commands() {
+            if let Err(error) = Self::validate_placeholder_usage(&cmd, &params) {
+                results.push(Response::err(error));
+                continue;
+            }
+
             let substituted = Self::substitute_params(&cmd, &params);
             let (cmd_type, response) = if self.readonly {
                 execute_readonly(nexus, &substituted, self.dry_run).await
@@ -357,7 +493,7 @@ impl Request {
                     results.push(Response::err(error));
 
                     if cmd_type == CommandType::Kml {
-                        // Stop on first KML error, return error response
+                        // Stop on first write error.
                         return (cmd_type, Response::ok(json!(results)));
                     }
                 }
@@ -402,6 +538,7 @@ pub enum Response {
 }
 
 impl Response {
+    /// Constructs a successful response wrapping `result`, with no pagination cursor.
     pub fn ok(result: Json) -> Self {
         Self::Ok {
             result,
@@ -409,6 +546,9 @@ impl Response {
         }
     }
 
+    /// Constructs an error response from anything convertible into [`ErrorObject`]
+    /// (e.g. [`KipError`]). No partial result is attached; use the `Response::Err`
+    /// variant directly if you need to surface partial data alongside an error.
     pub fn err(error: impl Into<ErrorObject>) -> Self {
         Self::Err {
             error: error.into(),
@@ -416,6 +556,8 @@ impl Response {
         }
     }
 
+    /// Consumes the response and converts it into a `Result`, discarding the
+    /// pagination cursor and any partial result attached to an error.
     pub fn into_result(self) -> Result<Json, ErrorObject> {
         match self {
             Self::Ok { result, .. } => Ok(result),
@@ -477,9 +619,9 @@ pub struct ErrorObject {
 impl From<String> for ErrorObject {
     fn from(message: String) -> Self {
         ErrorObject {
-            code: "KIP_4000".to_string(),
+            code: "KIP_4003".to_string(),
             message,
-            hint: None,
+            hint: Some("Contact system administrator or retry later.".to_string()),
             data: None,
         }
     }
@@ -729,6 +871,27 @@ mod tests {
         assert_eq!(
             result,
             "FIND(?drug1, ?drug2) WHERE { ?drug1 {type: \"Analgesic\"} ?drug2 {type: \"Analgesic\"} }"
+        );
+        assert!(parse_kql(&result).is_ok());
+    }
+
+    #[test]
+    fn test_to_command_parameter_name_prefix_collision() {
+        let mut parameters = Map::new();
+        parameters.insert("name".to_string(), Json::String("Short".to_string()));
+        parameters.insert("name_long".to_string(), Json::String("Long".to_string()));
+
+        let request = Request {
+            command: "FIND(?item) WHERE { ?item {name: :name_long} FILTER(?item.attributes.alias == :name) }"
+                .to_string(),
+            parameters,
+            ..Default::default()
+        };
+
+        let result = request.to_command();
+        assert_eq!(
+            result,
+            "FIND(?item) WHERE { ?item {name: \"Long\"} FILTER(?item.attributes.alias == \"Short\") }"
         );
         assert!(parse_kql(&result).is_ok());
     }
@@ -1410,7 +1573,7 @@ mod tests {
         match response {
             Response::Ok { result, .. } => {
                 let arr = result.as_array().unwrap();
-                // Syntax errors are recorded and later commands still execute
+                // Syntax errors are recorded and later commands still execute.
                 assert_eq!(arr.len(), 3);
                 // First result is success
                 assert!(arr[0]["result"].is_object());
@@ -1424,6 +1587,41 @@ mod tests {
                 );
                 // Third command still executes
                 assert_eq!(arr[2]["result"]["type"], "kql");
+            }
+            _ => panic!("Expected Ok response wrapping batch results"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_batch_continues_on_placeholder_syntax_error() {
+        let executor = MockExecutor;
+        let mut params = Map::new();
+        params.insert("name".to_string(), Json::String("test".to_string()));
+
+        let request = Request {
+            commands: vec![
+                CommandItem::WithParams {
+                    command: r#"FIND(?x) WHERE { ?x {name: "Hello :name"} }"#.to_string(),
+                    parameters: params,
+                },
+                CommandItem::Simple("DESCRIBE PRIMER".to_string()),
+            ],
+            ..Default::default()
+        };
+
+        let (_cmd_type, response) = request.execute(&executor).await;
+        match response {
+            Response::Ok { result, .. } => {
+                let arr = result.as_array().unwrap();
+                assert_eq!(arr.len(), 2);
+                assert!(arr[0]["error"].is_object());
+                assert!(
+                    arr[0]["error"]["code"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("KIP_1")
+                );
+                assert_eq!(arr[1]["result"]["type"], "meta");
             }
             _ => panic!("Expected Ok response wrapping batch results"),
         }

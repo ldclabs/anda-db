@@ -5,7 +5,7 @@ use nom::{
     character::complete::{char, multispace1},
     combinator::{cut, map, map_res, opt},
     error::context,
-    multi::{fold, many1, separated_list1},
+    multi::{fold, many0, many1, separated_list1},
     sequence::{delimited, pair, preceded, separated_pair, terminated},
 };
 
@@ -162,19 +162,18 @@ fn parse_predicate_path(input: &str) -> VResult<'_, PredTerm> {
     let (input, first) = parse_multi_hop_predicate(input)?;
 
     match first {
-        PredTerm::Literal(predicate) if input.contains('|') => map(
-            fold(
-                0..,
-                preceded(ws(char('|')), quoted_string),
-                move || vec![predicate.clone()],
-                |mut acc, next| {
-                    acc.push(next);
-                    acc
-                },
-            ),
-            PredTerm::Alternative,
-        )
-        .parse(input),
+        PredTerm::Literal(predicate) => {
+            let (remaining, alternatives) =
+                many0(preceded(ws(char('|')), quoted_string)).parse(input)?;
+            if alternatives.is_empty() {
+                Ok((remaining, PredTerm::Literal(predicate)))
+            } else {
+                let mut predicates = Vec::with_capacity(alternatives.len() + 1);
+                predicates.push(predicate);
+                predicates.extend(alternatives);
+                Ok((remaining, PredTerm::Alternative(predicates)))
+            }
+        }
         _ => Ok((input, first)),
     }
 }
@@ -368,14 +367,48 @@ fn parse_comparison_expression(input: &str) -> VResult<'_, FilterExpression> {
 
 // Parses function expression
 fn parse_function_expression(input: &str) -> VResult<'_, FilterExpression> {
-    map(
-        (
-            parse_filter_function,
-            parenthesized_block(separated_list1(ws(char(',')), parse_filter_operand)),
+    context(
+        "FILTER function call: CONTAINS(?str, \"sub\") | STARTS_WITH(?str, \"prefix\") | ENDS_WITH(?str, \"suffix\") | REGEX(?str, \"pattern\") | IN(?expr, [values]) | IS_NULL(?expr) | IS_NOT_NULL(?expr)",
+        map_res(
+            (
+                parse_filter_function,
+                parenthesized_block(separated_list1(ws(char(',')), parse_filter_operand)),
+            ),
+            |(func, args)| validate_filter_function_args(func, args),
         ),
-        |(func, args)| FilterExpression::Function { func, args },
     )
     .parse(input)
+}
+
+fn validate_filter_function_args(
+    func: FilterFunction,
+    args: Vec<FilterOperand>,
+) -> Result<FilterExpression, String> {
+    match func {
+        FilterFunction::Contains
+        | FilterFunction::StartsWith
+        | FilterFunction::EndsWith
+        | FilterFunction::Regex => {
+            if args.len() != 2 {
+                return Err("string filter functions require exactly 2 arguments".to_string());
+            }
+        }
+        FilterFunction::In => {
+            if args.len() != 2 {
+                return Err("IN requires exactly 2 arguments: IN(?expr, [values])".to_string());
+            }
+            if !matches!(args.get(1), Some(FilterOperand::List(_))) {
+                return Err("IN requires a literal list as its second argument".to_string());
+            }
+        }
+        FilterFunction::IsNull | FilterFunction::IsNotNull => {
+            if args.len() != 1 {
+                return Err("IS_NULL and IS_NOT_NULL require exactly 1 argument".to_string());
+            }
+        }
+    }
+
+    Ok(FilterExpression::Function { func, args })
 }
 
 // Parses filter operand
@@ -464,11 +497,8 @@ fn parse_order_by_clause(input: &str) -> VResult<'_, Vec<OrderByCondition>> {
     context(
         "ORDER BY ?variable [ASC|DESC], ...",
         preceded(
-            ws(tag("ORDER ")),
-            preceded(
-                ws(tag("BY ")),
-                cut(separated_list1(ws(char(',')), parse_order_by_condition)),
-            ),
+            ws(keywords(&["ORDER", "BY"])),
+            cut(separated_list1(ws(char(',')), parse_order_by_condition)),
         ),
     )
     .parse(input)
@@ -519,7 +549,7 @@ pub fn parse_limit_clause(input: &str) -> VResult<'_, usize> {
     context(
         "KQL LIMIT clause",
         preceded(
-            ws(tag("LIMIT ")),
+            ws(keyword("LIMIT")),
             map(nom::character::complete::usize, |n| n),
         ),
     )
@@ -527,7 +557,7 @@ pub fn parse_limit_clause(input: &str) -> VResult<'_, usize> {
 }
 
 pub fn parse_cursor_clause(input: &str) -> VResult<'_, String> {
-    preceded(ws(tag("CURSOR ")), quoted_string).parse(input)
+    preceded(ws(keyword("CURSOR")), quoted_string).parse(input)
 }
 
 #[cfg(test)]
@@ -867,6 +897,24 @@ mod tests {
                 assert_eq!(paths[2], "mark");
             }
             _ => panic!("Expected alternative predicate path"),
+        }
+    }
+
+    #[test]
+    fn test_parse_literal_predicate_when_later_string_contains_pipe() {
+        let input = r#"(?a, "follows", {name: "A|B"})"#;
+        let result = parse_prop_mather(input);
+        assert!(result.is_ok());
+
+        let (_, matcher) = result.unwrap();
+        match matcher {
+            PropositionMatcher::Object {
+                predicate: PredTerm::Literal(predicate),
+                ..
+            } => {
+                assert_eq!(predicate, "follows");
+            }
+            _ => panic!("Expected literal predicate path"),
         }
     }
 
@@ -1289,6 +1337,11 @@ mod tests {
             "FILTER(UNKNOWN_FUNC(?a))", // Unknown function
             "FILTER(?a ===== ?b)",      // Invalid operator
             "FILTER(!)",                // NOT without expression
+            "FILTER(IN(?a))",           // IN requires two arguments
+            "FILTER(IN(?a, ?b))",       // IN requires a literal list as second argument
+            "FILTER(IS_NULL(?a, ?b))",  // IS_NULL requires one argument
+            "FILTER(IS_NOT_NULL())",    // IS_NOT_NULL requires one argument
+            "FILTER(CONTAINS(?a))",     // String functions require two arguments
         ];
 
         for input in invalid_inputs {

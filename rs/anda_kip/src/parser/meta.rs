@@ -28,7 +28,7 @@ pub fn parse_meta_command(input: &str) -> VResult<'_, MetaCommand> {
 
 fn parse_describe_command(input: &str) -> VResult<'_, DescribeTarget> {
     preceded(
-        ws(tag("DESCRIBE ")),
+        ws(keyword("DESCRIBE")),
         ws(alt((
             context(
                 "DESCRIBE PRIMER",
@@ -42,7 +42,7 @@ fn parse_describe_command(input: &str) -> VResult<'_, DescribeTarget> {
                 "DESCRIBE CONCEPT TYPES",
                 map(
                     preceded(
-                        ws(tag("CONCEPT TYPES")),
+                        ws(keywords(&["CONCEPT", "TYPES"])),
                         (opt(ws(parse_limit_clause)), opt(ws(parse_cursor_clause))),
                     ),
                     |(limit, cursor)| DescribeTarget::ConceptTypes { limit, cursor },
@@ -51,7 +51,7 @@ fn parse_describe_command(input: &str) -> VResult<'_, DescribeTarget> {
             context(
                 "DESCRIBE CONCEPT TYPE \"<TypeName>\"",
                 map(
-                    preceded(tag("CONCEPT TYPE "), ws(quoted_string)),
+                    preceded(keywords(&["CONCEPT", "TYPE"]), ws(quoted_string)),
                     DescribeTarget::ConceptType,
                 ),
             ),
@@ -59,7 +59,7 @@ fn parse_describe_command(input: &str) -> VResult<'_, DescribeTarget> {
                 "DESCRIBE PROPOSITION TYPES",
                 map(
                     preceded(
-                        ws(tag("PROPOSITION TYPES")),
+                        ws(keywords(&["PROPOSITION", "TYPES"])),
                         (opt(ws(parse_limit_clause)), opt(ws(parse_cursor_clause))),
                     ),
                     |(limit, cursor)| DescribeTarget::PropositionTypes { limit, cursor },
@@ -68,7 +68,7 @@ fn parse_describe_command(input: &str) -> VResult<'_, DescribeTarget> {
             context(
                 "DESCRIBE PROPOSITION TYPE \"<predicate>\"",
                 map(
-                    preceded(tag("PROPOSITION TYPE "), ws(quoted_string)),
+                    preceded(keywords(&["PROPOSITION", "TYPE"]), ws(quoted_string)),
                     DescribeTarget::PropositionType,
                 ),
             ),
@@ -83,15 +83,18 @@ fn parse_search_command(input: &str) -> VResult<'_, SearchCommand> {
         "SEARCH CONCEPT|PROPOSITION \"<term>\" [WITH TYPE \"<Type>\"] [LIMIT N]",
         map(
             preceded(
-                ws(tag("SEARCH ")),
+                ws(keyword("SEARCH")),
                 (
                     ws(alt((
-                        value(SearchTarget::Concept, tag("CONCEPT ")),
-                        value(SearchTarget::Proposition, tag("PROPOSITION ")),
+                        value(SearchTarget::Concept, keyword("CONCEPT")),
+                        value(SearchTarget::Proposition, keyword("PROPOSITION")),
                     ))),
                     ws(quoted_string),
-                    opt(preceded(tag("WITH TYPE "), ws(quoted_string))),
-                    opt(preceded(tag("LIMIT "), ws(nom::character::complete::usize))),
+                    opt(preceded(keywords(&["WITH", "TYPE"]), ws(quoted_string))),
+                    opt(preceded(
+                        keyword("LIMIT"),
+                        ws(nom::character::complete::usize),
+                    )),
                 ),
             ),
             |(target, term, in_type, limit)| SearchCommand {
@@ -323,5 +326,39 @@ mod tests {
 
         // Test invalid search command
         assert!(parse_search_command("SEARCH INVALID").is_err());
+    }
+
+    #[test]
+    fn test_keywords_accept_arbitrary_whitespace() {
+        // Newlines and tabs between multi-word keywords (DESCRIBE / CONCEPT TYPES / WITH TYPE)
+        // must be accepted just like a literal space.
+        assert_eq!(
+            parse_describe_command("DESCRIBE\n  CONCEPT\tTYPES   LIMIT 10"),
+            Ok((
+                "",
+                DescribeTarget::ConceptTypes {
+                    limit: Some(10),
+                    cursor: None,
+                }
+            ))
+        );
+
+        assert_eq!(
+            parse_describe_command("DESCRIBE\nPROPOSITION\nTYPE\n\"treats\""),
+            Ok(("", DescribeTarget::PropositionType("treats".to_string())))
+        );
+
+        assert_eq!(
+            parse_search_command("SEARCH\nCONCEPT\n\"aspirin\"\nWITH\nTYPE\n\"Drug\"\nLIMIT\n5"),
+            Ok((
+                "",
+                SearchCommand {
+                    target: SearchTarget::Concept,
+                    term: "aspirin".to_string(),
+                    in_type: Some("Drug".to_string()),
+                    limit: Some(5),
+                }
+            ))
+        );
     }
 }
