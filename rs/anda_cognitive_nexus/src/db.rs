@@ -2068,13 +2068,13 @@ impl CognitiveNexus {
             .set_attributes
             .map(|val| val.into_iter().collect())
             .unwrap_or_default();
-        let metadata = concept_block
-            .metadata
-            .map(|val| val.into_iter().collect())
-            .unwrap_or_else(|| default_metadata.clone());
+        let mut metadata = default_metadata.clone();
+        if let Some(local) = concept_block.metadata {
+            metadata.extend(local.into_iter());
+        }
 
         let entity_id = self
-            .upsert_concept(concept_pk, attributes, metadata)
+            .upsert_concept(concept_pk, attributes, metadata.clone())
             .await?;
 
         if let Some(handle) = concept_block.handle {
@@ -2084,11 +2084,7 @@ impl CognitiveNexus {
         if let Some(propositions) = concept_block.set_propositions {
             for set_prop in propositions {
                 self.execute_set_proposition(
-                    &entity_id,
-                    set_prop,
-                    default_metadata,
-                    handle_map,
-                    cached_pks,
+                    &entity_id, set_prop, &metadata, handle_map, cached_pks,
                 )
                 .await?;
             }
@@ -2129,10 +2125,11 @@ impl CognitiveNexus {
             .set_attributes
             .map(|val| val.into_iter().collect())
             .unwrap_or_default();
-        let metadata = proposition_block
-            .metadata
-            .map(|val| val.into_iter().collect())
-            .unwrap_or_else(|| default_metadata.clone());
+
+        let mut metadata = default_metadata.clone();
+        if let Some(local) = proposition_block.metadata {
+            metadata.extend(local.into_iter());
+        }
 
         let entity_id = self
             .upsert_proposition(proposition_pk, attributes, metadata, cached_pks)
@@ -2162,10 +2159,11 @@ impl CognitiveNexus {
             predicate: set_prop.predicate,
             object: Box::new(object_id.clone().into()),
         };
-        let metadata = set_prop
-            .metadata
-            .map(|val| val.into_iter().collect())
-            .unwrap_or_else(|| default_metadata.clone());
+
+        let mut metadata = default_metadata.clone();
+        if let Some(local) = set_prop.metadata {
+            metadata.extend(local.into_iter());
+        }
 
         let entity_id = self
             .upsert_proposition(proposition_pk, Map::new(), metadata, cached_pks)

@@ -1,6 +1,6 @@
 [package]
 name = "anda_cognitive_nexus"
-version = "0.7.14"
+version = "0.7.15"
 description = "A Rust implementation of KIP (Knowledge Interaction Protocol) base on Anda DB."
 keywords = [
   "KIP",
@@ -34,7 +34,7 @@ tokio = { workspace = true, features = ["sync"] }
 [dev-dependencies]
 anda_object_store = { path = "../anda_object_store", version = "0.3" }
 tokio = { workspace = true, features = ["full"] }
-object_store = { workspace = true }
+object_store = { workspace = true, features = ["fs"] }
 structured-logger = { workspace = true }
 
 [[example]]
