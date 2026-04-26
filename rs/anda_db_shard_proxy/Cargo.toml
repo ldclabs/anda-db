@@ -3,6 +3,7 @@ name = "anda_db_shard_proxy"
 version = "0.2.2"
 description = "A reverse proxy service for Anda DB shard routing"
 readme = "README.md"
+publish = false
 repository.workspace = true
 homepage.workspace = true
 edition.workspace = true

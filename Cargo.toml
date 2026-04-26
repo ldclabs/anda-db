@@ -106,7 +106,7 @@ rustc-hash = { version = "2", default-features = false, features = ["std"] }
 pyo3 = { version = "0.20", default-features = false }
 pyo3-asyncio = { version = "0.20", default-features = false }
 serde-pyobject = { version = "0.2", default-features = false }
-mimalloc = { version = "*", default-features = false, features = ["v3"] }
+mimalloc = { version = "0.1", features = ["v3"] }
 
 [workspace.metadata.cargo-shear]
 ignored = []
