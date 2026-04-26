@@ -1,143 +1,52 @@
-# `anda_cognitive_nexus_server`
+# anda_cognitive_nexus_server
 
-`anda_cognitive_nexus_server` is a high-performance server implementation of the **Knowledge Interaction Protocol (KIP)**, built on top of [Anda DB](../anda_db). It serves as a **Cognitive Nexus**, providing AI agents with a structured, persistent, and verifiable long-term memory system.
+`anda_cognitive_nexus_server` is the HTTP/JSON-RPC deployment layer for the
+Cognitive Nexus. It exposes KIP execution over the network so non-Rust clients,
+agent frameworks, and service integrations can use the reference AI-memory
+runtime without embedding the Rust crates directly.
 
-## Features
+## What This Crate Provides
 
-- **KIP Implementation**: Full support for Knowledge Interaction Protocol (KQL/KML) for managing Concept Nodes and Proposition Links.
-- **Memory Persistence**: Leverages Anda DB for efficient storage and retrieval of knowledge capsules.
-- **JSON-RPC API**: Simple and extensible interface for executing KIP commands and querying logs.
-- **Security**: Optional API Key authentication via Bearer tokens.
-- **Flexible Storage**: Supports local file system and in-memory storage backends.
+- an HTTP server for KIP execution
+- JSON-RPC-style request handling for `execute_kip` and related operations
+- optional bearer-token authentication
+- local filesystem and in-memory deployment modes
+- a service wrapper around `anda_cognitive_nexus`
 
-## Getting Started
+## When to Use It
 
-### Prerequisites
+Use `anda_cognitive_nexus_server` when you want:
 
-- [Rust](https://www.rust-lang.org/) (latest stable version)
-- [Docker](https://www.docker.com/) (optional, for containerized deployment)
+- KIP over HTTP instead of in-process Rust calls
+- a deployable memory service for agent platforms
+- a bridge for non-Rust clients into the Cognitive Nexus runtime
+- a standalone entrypoint for persistent graph-shaped AI memory
 
-### Running with Cargo
+## Quick Start
 
-To start the server with a local database:
+Run with a local database path:
 
 ```bash
 cargo run -p anda_cognitive_nexus_server -- local --db ./db
 ```
 
-### Running with Docker
+Default endpoints:
 
-You can use the official Docker image:
+- `GET /` for service information
+- `POST /kip` for KIP request execution and log-related methods
 
-```bash
-docker run -d \
-  --name anda_kip \
-  -p 8080:8080 \
-  -e API_KEY=your_secret_key \
-  -v $(pwd)/db:/app/db \
-  ghcr.io/ldclabs/anda_cognitive_nexus_server_amd64:latest \
-  local --db /app/db
+If you set `API_KEY`, clients must send:
+
+```text
+Authorization: Bearer <API_KEY>
 ```
 
-## Configuration
+## Related Crates
 
-The server can be configured via command-line arguments or environment variables:
-
-| Argument    | Environment Variable | Description                                      | Default          |
-| ----------- | -------------------- | ------------------------------------------------ | ---------------- |
-| `--addr`    | `ADDR`               | Port to listen on                                | `127.0.0.1:8080` |
-| `--api-key` | `API_KEY`            | Optional API key for authentication              | None             |
-| `--db`      | `LOCAL_DB_PATH`      | Path to the local database (for `local` command) | `./db`           |
-
-## API Reference
-
-### 1. Get Server Information
-**Endpoint:** `GET /`
-
-**Response:**
-```json
-{
-  "name": "anda_cognitive_nexus_server",
-  "version": "0.1.0"
-}
-```
-
-### 2. KIP Interface
-**Endpoint:** `POST /kip`
-
-**Headers:**
-- `Content-Type: application/json`
-- `Authorization: Bearer <API_KEY>` (if configured)
-
-**Request Body (JSON-RPC):**
-
-#### Execute KIP
-Executes a KIP request (KQL or KML).
-
-```json
-{
-  "method": "execute_kip",
-  "params": {
-    "command": "DESCRIBE PRIMER",
-    "parameters": {},
-    "dry_run": false
-  }
-}
-```
-
-**`execute_kip` Parameters** (matches `anda_kip::Request`):
-
-| Parameter    | Type    | Required | Description                                                                                                                                                                                                                                                                                 |
-| :----------- | :------ | :------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `command`    | String  | No       | A complete KIP command text. **Mutually exclusive with `commands`**.                                                                                                                                                                                                                        |
-| `commands`   | Array   | No       | Batch execution. **Mutually exclusive with `command`**. Each element can be a `String` (uses shared `parameters`) or an `Object` with `{command, parameters}` (command-specific params override shared). Commands execute sequentially; **execution stops on first error**.                 |
-| `parameters` | Object  | No       | Placeholder substitution map. Placeholders like `:name` are replaced before execution. Placeholders must occupy a full JSON value position (e.g. `name: :symptom_name`) and must not be embedded inside quoted strings (e.g. `"Hello :name"`), because replacement uses JSON serialization. |
-| `dry_run`    | Boolean | No       | If `true`, validates syntax/logic only (no execution / no persistence).                                                                                                                                                                                                                     |
-
-Batch execution is also supported via `commands`:
-
-```json
-{
-  "method": "execute_kip",
-  "params": {
-    "commands": [
-      "DESCRIBE PRIMER",
-      {
-        "command": "UPSERT { CONCEPT ?e { {type: \"Event\", name: :name} } }",
-        "parameters": { "name": "MyEvent" }
-      }
-    ],
-    "parameters": {},
-    "dry_run": false
-  }
-}
-```
-
-**Response structure** (matches `anda_kip::Response`):
-
-| Key           | Type             | Required | Description                                                                                |
-| :------------ | :--------------- | :------- | :----------------------------------------------------------------------------------------- |
-| `result`      | Object/Array/etc | No       | **Must** exist when the request succeeds; structure depends on the KIP command.            |
-| `error`       | Object           | No       | **Must** exist when the request fails; contains structured error details.                  |
-| `next_cursor` | String           | No       | Opaque pagination cursor; if present, more results may be available.                       |
-| `ignore`      | Boolean          | No       | If `true`, the client should ignore this response (used by some commands/implementations). |
-
-#### List Logs
-Retrieves the history of KIP executions.
-
-```json
-{
-  "method": "list_logs",
-  "params": {
-    "cursor": null,
-    "limit": 10
-  }
-}
-```
+- `anda_cognitive_nexus` for the reference KIP executor
+- `anda_kip` for the protocol model
+- `anda_db` for the embedded storage core
 
 ## License
-Copyright © 2026 [LDC Labs](https://github.com/ldclabs).
 
-`ldclabs/anda-db` is licensed under the MIT License. See the [MIT license][license] for the full license text.
-
-[license]: ../../LICENSE
+MIT. See [LICENSE](../../LICENSE).

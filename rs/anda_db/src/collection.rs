@@ -1673,28 +1673,37 @@ impl Collection {
             });
         }
 
-        let now_ms = unix_ms();
-        {
-            // Keep lock ordering consistent with add()/auto_repair_indexes():
-            // doc_ids -> doc_ids_index, to avoid potential deadlocks.
-            let mut doc_ids = self.doc_ids.write();
-            let mut doc_ids_index = self.doc_ids_index.write();
-            if !doc_ids_index.remove(&id) {
-                return Ok(None);
-            }
-            doc_ids.remove(id);
+        // Membership check is non-authoritative; the bitmap mutation below
+        // serializes concurrent removes and is the source of truth.
+        if !self.doc_ids.read().contains(id) {
+            return Ok(None);
         }
 
-        self.update_metadata(|meta| {
-            meta.stats.last_deleted = now_ms;
-            meta.stats.version += 1;
-            meta.stats.delete_count += 1;
-        });
+        let now_ms = unix_ms();
+        let path = Self::doc_path(id);
 
-        if let Ok((doc, _)) = self.storage.get::<DocumentOwned>(&Self::doc_path(id)).await {
-            let doc = Document::try_from_doc(self.schema(), doc)?;
+        // Best-effort fetch to drive index cleanup. If the document has already
+        // been deleted from storage we still want to clear the in-memory state
+        // (treat as a normal removal) but cannot retire stale index entries.
+        let doc = match self.storage.get::<DocumentOwned>(&path).await {
+            Ok((doc, _)) => Some(Document::try_from_doc(self.schema(), doc)?),
+            Err(DBError::NotFound { .. }) => None,
+            Err(err) => {
+                log::warn!(
+                    action = "Collection::remove",
+                    collection = self.name,
+                    doc_id = id;
+                    "Failed to fetch document for removal, aborting: {err:?}",
+                );
+                return Err(err);
+            }
+        };
+
+        // Phase 1: remove index entries while we still hold the original
+        // contents. These removes are infallible by design.
+        if let Some(doc) = &doc {
             for index in &self.btree_indexes {
-                if let Some(fv) = self.index_hooks.btree_index_value(index, &doc)
+                if let Some(fv) = self.index_hooks.btree_index_value(index, doc)
                     && fv.as_ref() != &FieldValue::Null
                 {
                     index.remove(id, &fv, now_ms);
@@ -1702,21 +1711,53 @@ impl Collection {
             }
 
             for index in &self.bm25_indexes {
-                if let Some(text) = self.index_hooks.bm25_index_value(index, &doc) {
+                if let Some(text) = self.index_hooks.bm25_index_value(index, doc) {
                     index.remove(id, &text, now_ms);
                 }
             }
 
             for index in &self.hnsw_indexes {
-                if self.index_hooks.hnsw_index_value(index, &doc).is_some() {
+                if self.index_hooks.hnsw_index_value(index, doc).is_some() {
                     index.remove(id, now_ms);
                 }
             }
-            let _ = self.storage.delete(&Self::doc_path(id)).await;
-            return Ok(Some(doc));
         }
 
-        Ok(None)
+        // Phase 2: delete the document object before the bitmap so that a
+        // failure here keeps the document visible (and recoverable) rather
+        // than producing an orphan beyond the auto-repair scan window.
+        if doc.is_some()
+            && let Err(err) = self.storage.delete(&path).await {
+                log::error!(
+                    action = "Collection::remove",
+                    collection = self.name,
+                    doc_id = id;
+                    "Failed to delete document from storage: {err:?}",
+                );
+                return Err(err);
+            }
+
+        // Phase 3: finalise by updating the in-memory bitmap. Locks are taken
+        // in the same order as add()/auto_repair_indexes() to avoid deadlocks.
+        let removed = {
+            let mut doc_ids = self.doc_ids.write();
+            let mut doc_ids_index = self.doc_ids_index.write();
+            let removed = doc_ids_index.remove(&id);
+            if removed {
+                doc_ids.remove(id);
+            }
+            removed
+        };
+
+        if removed {
+            self.update_metadata(|meta| {
+                meta.stats.last_deleted = now_ms;
+                meta.stats.version += 1;
+                meta.stats.delete_count += 1;
+            });
+        }
+
+        Ok(doc)
     }
 
     /// Searches for documents matching the given query and returns them.

@@ -355,11 +355,27 @@ impl AndaDB {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        let _ = stream::iter(collections.into_iter())
+        let results: Vec<Result<(), DBError>> = stream::iter(collections.into_iter())
             .map(|collection| async move { collection.close().await })
             .buffer_unordered(8) // 限制最多 8 个并发
-            .collect::<Vec<_>>()
+            .collect()
             .await;
+        // Log per-collection failures but continue closing the database to flush
+        // metadata for the remaining successful collections, then surface the
+        // first error so callers can react.
+        let mut first_err: Option<DBError> = None;
+        for r in results {
+            if let Err(err) = r {
+                log::error!(
+                    action = "AndaDB::close",
+                    database = self.inner.name;
+                    "Collection close failed: {err:?}",
+                );
+                if first_err.is_none() {
+                    first_err = Some(err);
+                }
+            }
+        }
 
         let start = Instant::now();
         match self.flush_metadata(unix_ms()).await {
@@ -383,6 +399,9 @@ impl AndaDB {
                 return Err(err);
             }
         }
+        if let Some(err) = first_err {
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -396,13 +415,31 @@ impl AndaDB {
             .cloned()
             .collect::<Vec<_>>();
 
-        let _ = stream::iter(collections.into_iter())
+        let results: Vec<Result<bool, DBError>> = stream::iter(collections.into_iter())
             .map(|collection| async move { collection.flush(unix_ms()).await })
             .buffer_unordered(8) // 限制最多 8 个并发
-            .collect::<Vec<_>>()
+            .collect()
             .await;
 
-        self.flush_metadata(unix_ms()).await
+        let mut first_err: Option<DBError> = None;
+        for r in results {
+            if let Err(err) = r {
+                log::error!(
+                    action = "AndaDB::flush",
+                    database = self.inner.name;
+                    "Collection flush failed: {err:?}",
+                );
+                if first_err.is_none() {
+                    first_err = Some(err);
+                }
+            }
+        }
+
+        self.flush_metadata(unix_ms()).await?;
+        if let Some(err) = first_err {
+            return Err(err);
+        }
+        Ok(())
     }
 
     /// Automatically flushes the database at regular intervals.
@@ -694,11 +731,39 @@ impl AndaDB {
         }
 
         self.flush_metadata(unix_ms()).await?;
-        if let Some(col) = { self.inner.collections.write().remove(name) } {
-            let _ = col.drop_data().await;
-        }
+
+        // Take any in-memory handle; if not loaded, lazily open it so we can
+        // safely drop on-disk data instead of orphaning storage objects.
+        let col = { self.inner.collections.write().remove(name) };
+        let drop_result = match col {
+            Some(col) => col.drop_data().await,
+            None => {
+                match crate::collection::Collection::open(
+                    self.clone(),
+                    name.to_string(),
+                    None,
+                    async |_| Ok(()),
+                )
+                .await
+                {
+                    Ok(col) => col.drop_data().await,
+                    // If metadata files are already gone, treat as success.
+                    Err(DBError::NotFound { .. }) => Ok(()),
+                    Err(err) => Err(err),
+                }
+            }
+        };
 
         self.inner.dropping_collections.write().remove(name);
+        if let Err(err) = drop_result {
+            log::error!(
+                action = "AndaDB::delete_collection",
+                database = self.inner.name,
+                collection = name;
+                "Failed to drop collection data: {err:?}",
+            );
+            return Err(err);
+        }
         Ok(())
     }
 

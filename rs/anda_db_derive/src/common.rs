@@ -47,14 +47,13 @@ pub fn find_rename_attr(attrs: &[Attribute]) -> Option<String> {
 /// should fall back to [`determine_field_type`].
 pub fn find_field_type_attr(attrs: &[Attribute]) -> Option<TokenStream> {
     for attr in attrs {
-        if attr.path().is_ident("field_type") {
-            if let Ok(meta_name_value) = attr.meta.require_name_value()
+        if attr.path().is_ident("field_type")
+            && let Ok(meta_name_value) = attr.meta.require_name_value()
                 && let Expr::Lit(expr_lit) = &meta_name_value.value
                 && let Lit::Str(lit_str) = &expr_lit.lit
             {
                 return Some(parse_field_type_str(&lit_str.value()));
             }
-        }
     }
     None
 }

@@ -1003,14 +1003,72 @@ fn try_decompress(data: Bytes, max_size: u64) -> Bytes {
                 }
             }
         }
-        // Unknown size => 目前仍返回原数据（保持旧语义），但标注改进点
-        Ok(None) => {
-            log::debug!("Unknown decompressed size (zstd frame). Consider streaming fallback.");
-            data
-        }
+        // Unknown decompressed size: fall back to streaming decompression with a
+        // growing output buffer, capped by `max_size` to mitigate decompression
+        // bombs. Returning the still-compressed bytes (the previous behaviour)
+        // would silently corrupt downstream deserialization.
+        Ok(None) => match streaming_decompress(&data, max_size) {
+            Ok(buf) => buf.into(),
+            Err(err) => {
+                log::error!("Failed to streaming-decompress: {err}");
+                data
+            }
+        },
         Err(err) => {
             log::error!("find_decompressed_size error: {err:?}");
             data
+        }
+    }
+}
+
+/// Streaming decompression with a doubling output buffer, capped at `max_size`.
+fn streaming_decompress(data: &[u8], max_size: u64) -> Result<Vec<u8>, String> {
+    let mut dctx = zstd_safe::DCtx::create();
+    dctx.init().map_err(|e| format!("DCtx::init: {e:?}"))?;
+
+    // Start with a reasonable guess; we'll grow as needed.
+    let initial = (data.len().saturating_mul(4)).clamp(64 * 1024, 4 * 1024 * 1024);
+    let mut out: Vec<u8> = Vec::with_capacity(initial);
+    let mut in_buf = zstd_safe::InBuffer::around(data);
+
+    loop {
+        // Ensure spare capacity to write into.
+        if out.capacity() == out.len() {
+            // Grow geometrically, but never beyond max_size.
+            let new_cap = out.capacity().saturating_mul(2).max(64 * 1024);
+            let cap = (new_cap as u64).min(max_size.saturating_add(1)) as usize;
+            if cap <= out.len() {
+                return Err(format!("decompressed output exceeds max_size {max_size}",));
+            }
+            out.reserve(cap - out.len());
+        }
+
+        let cur_len = out.len();
+        let mut out_buf = zstd_safe::OutBuffer::around_pos(&mut out, cur_len);
+        let hint = dctx
+            .decompress_stream(&mut out_buf, &mut in_buf)
+            .map_err(|e| format!("decompress_stream: {e:?}"))?;
+        // out is implicitly extended via out_buf.dst length tracking; ensure len
+        // reflects the bytes written.
+        let written = out_buf.pos();
+        // Safety: zstd-safe's OutBuffer writes into the spare capacity and
+        // exposes the new logical length via pos(); reflect it on the Vec.
+        unsafe {
+            out.set_len(written);
+        }
+
+        if (out.len() as u64) > max_size {
+            return Err(format!("decompressed output exceeds max_size {max_size}",));
+        }
+
+        // Done when zstd reports a complete frame (hint == 0) and input drained.
+        if hint == 0 && in_buf.pos() == data.len() {
+            return Ok(out);
+        }
+        // No forward progress and input fully consumed: avoid infinite loop.
+        if hint == 0 && in_buf.pos() < data.len() {
+            // Trailing data after a frame — treat as success and return what we got.
+            return Ok(out);
         }
     }
 }

@@ -1,6 +1,6 @@
 # `anda_kip` — Technical Reference
 
-> A pure-Rust SDK for the **Knowledge Interaction Protocol (KIP)** — the
+> A pure-Rust SDK for the [**Knowledge Interaction Protocol (KIP)**](https://github.com/ldclabs/kip) — the
 > declarative protocol that lets Large Language Models query, evolve and
 > introspect a long-lived knowledge graph (the *Cognitive Nexus*).
 
