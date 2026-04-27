@@ -211,9 +211,11 @@ impl TryFrom<TargetTerm> for EntityPK {
     /// * `Err(KipError)` - If the target term is invalid or unsupported
     fn try_from(value: TargetTerm) -> Result<Self, Self::Error> {
         match value {
-            TargetTerm::Concept(value) => Ok(EntityPK::Concept(ConceptPK::try_from(value)?)),
-            TargetTerm::Proposition(value) => {
-                Ok(EntityPK::Proposition(PropositionPK::try_from(*value)?))
+            TargetTerm::Concept { matcher, .. } => {
+                Ok(EntityPK::Concept(ConceptPK::try_from(matcher)?))
+            }
+            TargetTerm::Proposition { matcher, .. } => {
+                Ok(EntityPK::Proposition(PropositionPK::try_from(*matcher)?))
             }
             _ => Err(KipError::invalid_syntax(format!(
                 "TargetTerm must be either Concept or Proposition, got: {value:?}"

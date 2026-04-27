@@ -398,10 +398,22 @@ pub enum PropositionMatcher {
 pub enum TargetTerm {
     /// A variable (e.g., `?drug`)
     Variable(String),
-    /// A reference to an existing concept node (via ConceptClause)
-    Concept(ConceptMatcher),
-    /// A nested proposition clause
-    Proposition(Box<PropositionMatcher>),
+    /// A reference to an existing concept node (via ConceptClause), optionally
+    /// bound to a variable in the same position (e.g., `?y {type: "Person", name: "Yan"}`).
+    Concept {
+        /// Optional variable to bind the matched concept to (e.g., `?y`).
+        variable: Option<String>,
+        /// The concept matcher used to identify the concept node.
+        matcher: ConceptMatcher,
+    },
+    /// A nested proposition clause, optionally bound to a variable in the same
+    /// position (e.g., `?link (?s, "p", ?o)`).
+    Proposition {
+        /// Optional variable to bind the matched proposition to (e.g., `?link`).
+        variable: Option<String>,
+        /// The proposition matcher used to identify the proposition link.
+        matcher: Box<PropositionMatcher>,
+    },
 }
 
 /// Represents a predicate term in a proposition.

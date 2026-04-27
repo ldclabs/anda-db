@@ -434,19 +434,25 @@ mod tests {
                         assert_eq!(props[0].predicate, "is_class_of");
                         assert_eq!(
                             props[0].object,
-                            TargetTerm::Concept(ConceptMatcher::Object {
-                                r#type: "DrugClass".to_string(),
-                                name: "Nootropic".to_string(),
-                            })
+                            TargetTerm::Concept {
+                                variable: None,
+                                matcher: ConceptMatcher::Object {
+                                    r#type: "DrugClass".to_string(),
+                                    name: "Nootropic".to_string(),
+                                },
+                            }
                         );
 
                         assert_eq!(props[1].predicate, "treats");
                         assert_eq!(
                             props[1].object,
-                            TargetTerm::Concept(ConceptMatcher::Object {
-                                r#type: "Symptom".to_string(),
-                                name: "Brain Fog".to_string(),
-                            })
+                            TargetTerm::Concept {
+                                variable: None,
+                                matcher: ConceptMatcher::Object {
+                                    r#type: "Symptom".to_string(),
+                                    name: "Brain Fog".to_string(),
+                                },
+                            }
                         );
 
                         assert_eq!(props[2].predicate, "has_side_effect");
@@ -529,14 +535,18 @@ mod tests {
                         assert_eq!(
                             prop.proposition,
                             PropositionMatcher::Object {
-                                subject: TargetTerm::Concept(ConceptMatcher::Name(
-                                    "Zhang San".to_string()
-                                )),
+                                subject: TargetTerm::Concept {
+                                    variable: None,
+                                    matcher: ConceptMatcher::Name("Zhang San".to_string()),
+                                },
                                 predicate: PredTerm::Literal("stated".to_string()),
-                                object: TargetTerm::Concept(ConceptMatcher::Object {
-                                    r#type: "Paper".to_string(),
-                                    name: "paper_doi".to_string(),
-                                }),
+                                object: TargetTerm::Concept {
+                                    variable: None,
+                                    matcher: ConceptMatcher::Object {
+                                        r#type: "Paper".to_string(),
+                                        name: "paper_doi".to_string(),
+                                    },
+                                },
                             }
                         );
 
@@ -758,13 +768,15 @@ mod tests {
                         assert_eq!(
                             prop.proposition,
                             PropositionMatcher::Object {
-                                subject: TargetTerm::Concept(ConceptMatcher::ID(
-                                    "drug_001".to_string()
-                                )),
+                                subject: TargetTerm::Concept {
+                                    variable: None,
+                                    matcher: ConceptMatcher::ID("drug_001".to_string()),
+                                },
                                 predicate: PredTerm::Literal("interacts_with".to_string()),
-                                object: TargetTerm::Concept(ConceptMatcher::ID(
-                                    "drug_002".to_string()
-                                )),
+                                object: TargetTerm::Concept {
+                                    variable: None,
+                                    matcher: ConceptMatcher::ID("drug_002".to_string()),
+                                },
                             }
                         );
                         let metadata = prop.metadata.as_ref().unwrap();

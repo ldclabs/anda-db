@@ -2979,6 +2979,14 @@ impl CognitiveNexus {
     ) -> Result<TargetEntities, KipError> {
         let subject_var = match &subject {
             TargetTerm::Variable(var) => Some(var.clone()),
+            TargetTerm::Concept {
+                variable: Some(var),
+                ..
+            } => Some(var.clone()),
+            TargetTerm::Proposition {
+                variable: Some(var),
+                ..
+            } => Some(var.clone()),
             _ => None,
         };
         let predicate_var = match &predicate {
@@ -2987,6 +2995,14 @@ impl CognitiveNexus {
         };
         let object_var = match &object {
             TargetTerm::Variable(var) => Some(var.clone()),
+            TargetTerm::Concept {
+                variable: Some(var),
+                ..
+            } => Some(var.clone()),
+            TargetTerm::Proposition {
+                variable: Some(var),
+                ..
+            } => Some(var.clone()),
             _ => None,
         };
         let subject_var_clone = subject_var.clone();
@@ -3175,14 +3191,31 @@ impl CognitiveNexus {
                     Ok(TargetEntities::Any)
                 }
             }
-            TargetTerm::Concept(concept_matcher) => {
-                let ids = self.query_concept_ids(&concept_matcher).await?;
-                Ok(TargetEntities::IDs(
-                    ids.into_iter().map(EntityID::Concept).collect(),
-                ))
+            TargetTerm::Concept {
+                variable,
+                matcher: concept_matcher,
+            } => {
+                let mut ids: Vec<EntityID> = self
+                    .query_concept_ids(&concept_matcher)
+                    .await?
+                    .into_iter()
+                    .map(EntityID::Concept)
+                    .collect();
+                // If a variable is bound to this position and already has
+                // bindings, intersect them so the matcher acts as a constraint.
+                if let Some(var) = variable
+                    && let Some(existing) = ctx.entities.get(&var)
+                {
+                    let existing: FxHashSet<&EntityID> = existing.iter().collect();
+                    ids.retain(|id| existing.contains(id));
+                }
+                Ok(TargetEntities::IDs(ids))
             }
-            TargetTerm::Proposition(proposition_matcher) => {
-                match *proposition_matcher {
+            TargetTerm::Proposition {
+                variable,
+                matcher: proposition_matcher,
+            } => {
+                let mut result = match *proposition_matcher {
                     PropositionMatcher::ID(id) => {
                         let entity_id =
                             EntityID::from_str(&id).map_err(KipError::invalid_syntax)?;
@@ -3191,25 +3224,32 @@ impl CognitiveNexus {
                                 "Invalid proposition link ID: {id:?}"
                             )));
                         }
-                        Ok(TargetEntities::IDs(vec![entity_id]))
+                        TargetEntities::IDs(vec![entity_id])
                     }
                     PropositionMatcher::Object {
                         subject: TargetTerm::Variable(_),
                         predicate: PredTerm::Variable(_),
                         object: TargetTerm::Variable(_),
-                    } => Ok(TargetEntities::AnyPropositions),
+                    } => TargetEntities::AnyPropositions,
                     PropositionMatcher::Object {
                         subject,
                         predicate,
                         object,
                     } => {
                         // 递归查询命题
-                        let result =
-                            Box::pin(self.match_propositions(ctx, subject, predicate, object))
-                                .await?;
-                        Ok(result)
+                        Box::pin(self.match_propositions(ctx, subject, predicate, object)).await?
                     }
+                };
+
+                // If a variable is bound to this position and already has
+                // bindings, intersect concrete IDs with the existing set.
+                if let (Some(var), TargetEntities::IDs(ids)) = (variable, &mut result)
+                    && let Some(existing) = ctx.entities.get(&var)
+                {
+                    let existing: FxHashSet<&EntityID> = existing.iter().collect();
+                    ids.retain(|id| existing.contains(id));
                 }
+                Ok(result)
             }
         }
     }
@@ -3510,10 +3550,16 @@ impl CognitiveNexus {
                     )));
                 }
             }
-            TargetTerm::Concept(concept_matcher) => {
+            TargetTerm::Concept {
+                matcher: concept_matcher,
+                ..
+            } => {
                 let _ = ConceptPK::try_from(concept_matcher.clone())?;
             }
-            TargetTerm::Proposition(proposition_matcher) => {
+            TargetTerm::Proposition {
+                matcher: proposition_matcher,
+                ..
+            } => {
                 let _ = PropositionPK::try_from(*proposition_matcher.clone())?;
             }
         }
@@ -3532,12 +3578,18 @@ impl CognitiveNexus {
                 .get(&handle)
                 .cloned()
                 .ok_or_else(|| KipError::reference_error(format!("Undefined handle: {handle}"))),
-            TargetTerm::Concept(concept_matcher) => {
+            TargetTerm::Concept {
+                matcher: concept_matcher,
+                ..
+            } => {
                 let concept_pk = ConceptPK::try_from(concept_matcher)?;
                 self.resolve_entity_id(&EntityPK::Concept(concept_pk), cached_pks)
                     .await
             }
-            TargetTerm::Proposition(proposition_matcher) => {
+            TargetTerm::Proposition {
+                matcher: proposition_matcher,
+                ..
+            } => {
                 let proposition_pk = PropositionPK::try_from(*proposition_matcher)?;
                 self.resolve_entity_id(&EntityPK::Proposition(proposition_pk), cached_pks)
                     .await
@@ -3923,6 +3975,121 @@ mod tests {
         let query = parse_kql(kql).unwrap();
         let (result, _) = nexus.execute_kql(query).await.unwrap();
         assert_eq!(result, json!([[], []]));
+    }
+
+    #[tokio::test]
+    async fn test_kql_inline_concept_variable_binding() {
+        // Verifies that a `?var {matcher}` written inline inside a
+        // proposition (subject/object) both binds the variable AND constrains
+        // matches by the concept matcher.
+        let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+        setup_test_data(&nexus).await.unwrap();
+
+        // Inline binding in object position: should return only Headache
+        // because the matcher restricts ?symptom to {name: "Headache"}.
+        let kql = r#"
+        FIND(?drug.name, ?symptom.name)
+        WHERE {
+            ?drug {type: "Drug"}
+            (?drug, "treats", ?symptom {type: "Symptom", name: "Headache"})
+        }
+        "#;
+        let query = parse_kql(kql).unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        assert_eq!(result, json!([["Aspirin"], ["Headache"]]));
+
+        // Inline binding in subject position: should match any drug treating
+        // ?symptom (anonymous), and Aspirin must be the only result.
+        let kql = r#"
+        FIND(?d.name)
+        WHERE {
+            (?d {type: "Drug"}, "treats", {type: "Symptom", name: "Fever"})
+        }
+        "#;
+        let query = parse_kql(kql).unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        assert_eq!(result, json!(["Aspirin"]));
+
+        // The inline matcher must constrain even when the variable is
+        // pre-bound: here ?symptom is already constrained to Fever, so the
+        // proposition pattern that asks for {name: "Headache"} must yield no
+        // result.
+        let kql = r#"
+        FIND(?drug.name, ?symptom.name)
+        WHERE {
+            ?symptom {type: "Symptom", name: "Fever"}
+            (?drug {type: "Drug"}, "treats", ?symptom {type: "Symptom", name: "Headache"})
+        }
+        "#;
+        let query = parse_kql(kql).unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        assert_eq!(result, json!([[], []]));
+    }
+
+    #[tokio::test]
+    async fn test_kql_nested_proposition_variable_binding() {
+        // Verifies that a nested proposition can be bound to a variable,
+        // i.e. `?link (?s, "p", ?o)` in target term position.
+        let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+        setup_test_data(&nexus).await.unwrap();
+
+        // Create a higher-order proposition: Alice stated that
+        // (Aspirin treats Headache).
+        let higher_order_kml = r#"
+        UPSERT {
+            CONCEPT ?person_type {
+                {type: "$ConceptType", name: "Person"}
+            }
+            CONCEPT ?stated_pred {
+                {type: "$PropositionType", name: "stated"}
+            }
+            CONCEPT ?alice {
+                {type: "Person", name: "Alice"}
+            }
+            PROPOSITION ?fact {
+                ({type: "Person", name: "Alice"},
+                 "stated",
+                 ({type: "Drug", name: "Aspirin"},
+                  "treats",
+                  {type: "Symptom", name: "Headache"})
+                )
+            }
+        }
+        "#;
+        nexus
+            .execute_kml(parse_kml(higher_order_kml).unwrap(), false)
+            .await
+            .unwrap();
+
+        // Bind the inner proposition to ?inner and check that the outer
+        // pattern is satisfied. We just count to keep the assertion stable
+        // regardless of internal IDs.
+        let kql = r#"
+        FIND(COUNT(?person))
+        WHERE {
+            (?person {type: "Person", name: "Alice"},
+             "stated",
+             ?inner (?drug, "treats", ?symptom))
+        }
+        "#;
+        let query = parse_kql(kql).unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        assert_eq!(result, json!(1));
+
+        // ?inner must be usable as a normal variable in subsequent clauses;
+        // here we ask the engine to confirm that the bound link participates
+        // exactly once.
+        let kql = r#"
+        FIND(COUNT(?inner))
+        WHERE {
+            ({type: "Person", name: "Alice"},
+             "stated",
+             ?inner (?drug {type: "Drug", name: "Aspirin"}, "treats", ?symptom))
+        }
+        "#;
+        let query = parse_kql(kql).unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        assert_eq!(result, json!(1));
     }
 
     #[tokio::test]
