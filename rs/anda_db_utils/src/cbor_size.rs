@@ -2,33 +2,51 @@ use half::f16;
 use serde::{
     Serialize,
     ser::{
-        self, SerializeMap, SerializeSeq, SerializeStruct, SerializeStructVariant, SerializeTuple,
-        SerializeTupleStruct, SerializeTupleVariant,
+        self, Impossible, SerializeMap, SerializeSeq, SerializeStruct, SerializeStructVariant,
+        SerializeTuple, SerializeTupleStruct, SerializeTupleVariant,
     },
 };
 use std::fmt;
 
 /// 估算任意 `Serialize` 值经 CBOR 序列化后的字节大小（不实际写入字节）。
+///
+/// 如果自定义 `Serialize` 实现返回错误，本函数会 panic；需要显式处理错误时请使用
+/// [`try_estimate_cbor_size`]。
 pub fn estimate_cbor_size<T: ?Sized + Serialize>(value: &T) -> usize {
+    try_estimate_cbor_size(value).expect("CBOR size estimation failed")
+}
+
+/// 尝试估算任意 `Serialize` 值经 CBOR 序列化后的字节大小（不实际写入字节）。
+pub fn try_estimate_cbor_size<T: ?Sized + Serialize>(value: &T) -> Result<usize, CborSizeError> {
     let mut s = CborSizer { count: 0 };
-    // 忽略错误：本实现不会产生序列化错误，返回 Ok(())
-    let _ = value.serialize(&mut s);
-    s.count
+    value.serialize(&mut s)?;
+    Ok(s.count)
 }
 
 // ---- CBOR sizer 实现：仅依据 CBOR 头部规则与结构遍历累加大小 ----
-#[derive(Debug, Clone, Copy)]
-struct CborSizeError;
+/// CBOR 大小估算失败时返回的错误。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CborSizeError {
+    message: String,
+}
+
+impl CborSizeError {
+    fn new(message: impl fmt::Display) -> Self {
+        Self {
+            message: message.to_string(),
+        }
+    }
+}
 
 impl fmt::Display for CborSizeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("cbor size estimator error")
+        f.write_str(&self.message)
     }
 }
 impl std::error::Error for CborSizeError {}
 impl ser::Error for CborSizeError {
-    fn custom<T: fmt::Display>(_msg: T) -> Self {
-        CborSizeError
+    fn custom<T: fmt::Display>(msg: T) -> Self {
+        CborSizeError::new(msg)
     }
 }
 
@@ -38,140 +56,343 @@ struct CborSizer {
 
 impl CborSizer {
     #[inline]
-    fn add_head_len(&mut self, major: u8, len: u64) {
+    fn add_count(&mut self, len: usize) -> Result<(), CborSizeError> {
+        self.count = self
+            .count
+            .checked_add(len)
+            .ok_or_else(|| CborSizeError::new("CBOR size exceeds usize::MAX"))?;
+        Ok(())
+    }
+
+    #[inline]
+    fn add_head_len(&mut self, len: u64) -> Result<(), CborSizeError> {
         // CBOR 头部：1字节(主类型+附加信息) + 可能的长度扩展
         // <24: 1; <= u8: 2; <= u16: 3; <= u32: 5; 否则: 9
-        self.count += match len {
+        self.add_count(match len {
             0..=23 => 1,
             24..=0xFF => 2,
             0x100..=0xFFFF => 3,
             0x1_0000..=0xFFFF_FFFF => 5,
             _ => 9,
-        };
-        let _ = major; // 仅用于语义说明（主类型在首字节中，但不改变字节数）
+        })
     }
 
     #[inline]
-    fn add_uint(&mut self, v: u64) {
-        self.add_head_len(0, v);
+    fn add_uint(&mut self, v: u64) -> Result<(), CborSizeError> {
+        self.add_head_len(v)
     }
 
     #[inline]
-    fn add_nint_i64(&mut self, v: i64) {
+    fn add_nint_i64(&mut self, v: i64) -> Result<(), CborSizeError> {
         // 负整数编码：-1 - n 作为无符号整数长度
         let u = -1i128 - v as i128;
         let u = if u < 0 { 0 } else { u as u64 };
-        self.add_head_len(1, u);
+        self.add_head_len(u)
     }
 
     #[inline]
-    fn add_tag_small(&mut self, tag: u64) {
-        // Tag 主类型 6，tag 值一般很小（如 2/3，用于 bignum）
-        self.add_head_len(6, tag);
+    fn add_tag(&mut self, tag: u64) -> Result<(), CborSizeError> {
+        self.add_head_len(tag)
     }
 
     #[inline]
-    fn add_bytes(&mut self, len: usize) {
-        self.add_head_len(2, len as u64);
-        self.count += len;
+    fn add_bytes(&mut self, len: usize) -> Result<(), CborSizeError> {
+        self.add_head_len(len as u64)?;
+        self.add_count(len)
     }
 
     #[inline]
-    fn add_text(&mut self, len: usize) {
-        self.add_head_len(3, len as u64);
-        self.count += len;
+    fn add_text(&mut self, len: usize) -> Result<(), CborSizeError> {
+        self.add_head_len(len as u64)?;
+        self.add_count(len)
     }
 
     #[inline]
-    fn add_array_header(&mut self, len: Option<usize>) -> bool {
+    fn add_array_header(&mut self, len: Option<usize>) -> Result<bool, CborSizeError> {
         match len {
             Some(n) => {
-                self.add_head_len(4, n as u64);
-                false
+                self.add_head_len(n as u64)?;
+                Ok(false)
             }
             None => {
                 // 不定长数组起始 0x9f
-                self.count += 1;
-                true
+                self.add_count(1)?;
+                Ok(true)
             }
         }
     }
 
     #[inline]
-    fn end_indefinite(&mut self, indefinite: bool) {
+    fn end_indefinite(&mut self, indefinite: bool) -> Result<(), CborSizeError> {
         if indefinite {
             // break 0xff
-            self.count += 1;
+            self.add_count(1)?;
         }
+        Ok(())
     }
 
     #[inline]
-    fn add_map_header(&mut self, len: Option<usize>) -> bool {
+    fn add_map_header(&mut self, len: Option<usize>) -> Result<bool, CborSizeError> {
         match len {
             Some(n) => {
-                self.add_head_len(5, n as u64);
-                false
+                self.add_head_len(n as u64)?;
+                Ok(false)
             }
             None => {
                 // 不定长 map 起始 0xbf
-                self.count += 1;
-                true
+                self.add_count(1)?;
+                Ok(true)
             }
         }
     }
 
     #[inline]
-    fn add_f16(&mut self) {
-        self.count += 1 /* 头 */ + 2;
+    fn add_f16(&mut self) -> Result<(), CborSizeError> {
+        self.add_count(1 /* 头 */ + 2)
     }
 
     #[inline]
-    fn add_f32(&mut self) {
-        self.count += 1 /* 头 */ + 4;
+    fn add_f32(&mut self) -> Result<(), CborSizeError> {
+        self.add_count(1 /* 头 */ + 4)
     }
 
     #[inline]
-    fn add_f64(&mut self) {
-        self.count += 1 /* 头 */ + 8;
+    fn add_f64(&mut self) -> Result<(), CborSizeError> {
+        self.add_count(1 /* 头 */ + 8)
     }
 
     #[inline]
-    fn add_simple1(&mut self) {
+    fn add_simple1(&mut self) -> Result<(), CborSizeError> {
         // 单字节简单值（false/true/null/undefined）：各占 1 字节
-        self.count += 1;
+        self.add_count(1)
     }
 
     #[inline]
-    fn add_u128(&mut self, v: u128) {
+    fn add_u128(&mut self, v: u128) -> Result<(), CborSizeError> {
         if v <= u64::MAX as u128 {
-            self.add_uint(v as u64);
-            return;
+            return self.add_uint(v as u64);
         }
         // 超过 u64 范围，使用 bignum(tag: 2) + bytes
-        self.add_tag_small(2);
+        self.add_tag(2)?;
         let nbytes = (128 - v.leading_zeros()).div_ceil(8) as usize;
-        self.add_bytes(nbytes);
+        self.add_bytes(nbytes)
     }
 
     #[inline]
-    fn add_i128(&mut self, v: i128) {
+    fn add_i128(&mut self, v: i128) -> Result<(), CborSizeError> {
         if v >= i64::MIN as i128 && v <= i64::MAX as i128 {
             if v >= 0 {
-                self.add_uint(v as u64);
+                self.add_uint(v as u64)?;
             } else {
-                self.add_nint_i64(v as i64);
+                self.add_nint_i64(v as i64)?;
             }
-            return;
+            return Ok(());
         }
         // 负大整数使用 tag 3；按 CBOR 规则编码 abs(-1 - v) 的字节串
         if v >= 0 {
-            self.add_u128(v as u128);
+            self.add_u128(v as u128)
         } else {
-            self.add_tag_small(3);
+            self.add_tag(3)?;
             let mag = (-1i128 - v) as u128;
             let nbytes = (128 - mag.leading_zeros()).div_ceil(8) as usize;
-            self.add_bytes(nbytes);
+            self.add_bytes(nbytes)
         }
+    }
+}
+
+struct StrLenCounter {
+    count: usize,
+}
+
+impl fmt::Write for StrLenCounter {
+    #[inline]
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.count = self.count.checked_add(s.len()).ok_or(fmt::Error)?;
+        Ok(())
+    }
+}
+
+struct TagSerializer;
+
+#[inline]
+fn unsupported_tag<T>() -> Result<T, CborSizeError> {
+    Err(CborSizeError::new("expected unsigned integer CBOR tag"))
+}
+
+impl ser::Serializer for TagSerializer {
+    type Ok = u64;
+    type Error = CborSizeError;
+
+    type SerializeSeq = Impossible<u64, CborSizeError>;
+    type SerializeTuple = Impossible<u64, CborSizeError>;
+    type SerializeTupleStruct = Impossible<u64, CborSizeError>;
+    type SerializeTupleVariant = Impossible<u64, CborSizeError>;
+    type SerializeMap = Impossible<u64, CborSizeError>;
+    type SerializeStruct = Impossible<u64, CborSizeError>;
+    type SerializeStructVariant = Impossible<u64, CborSizeError>;
+
+    #[inline]
+    fn serialize_bool(self, _v: bool) -> Result<Self::Ok, Self::Error> {
+        unsupported_tag()
+    }
+    #[inline]
+    fn serialize_i8(self, _v: i8) -> Result<Self::Ok, Self::Error> {
+        unsupported_tag()
+    }
+    #[inline]
+    fn serialize_i16(self, _v: i16) -> Result<Self::Ok, Self::Error> {
+        unsupported_tag()
+    }
+    #[inline]
+    fn serialize_i32(self, _v: i32) -> Result<Self::Ok, Self::Error> {
+        unsupported_tag()
+    }
+    #[inline]
+    fn serialize_i64(self, _v: i64) -> Result<Self::Ok, Self::Error> {
+        unsupported_tag()
+    }
+    #[inline]
+    fn serialize_i128(self, _v: i128) -> Result<Self::Ok, Self::Error> {
+        unsupported_tag()
+    }
+    #[inline]
+    fn serialize_u8(self, v: u8) -> Result<Self::Ok, Self::Error> {
+        Ok(v.into())
+    }
+    #[inline]
+    fn serialize_u16(self, v: u16) -> Result<Self::Ok, Self::Error> {
+        Ok(v.into())
+    }
+    #[inline]
+    fn serialize_u32(self, v: u32) -> Result<Self::Ok, Self::Error> {
+        Ok(v.into())
+    }
+    #[inline]
+    fn serialize_u64(self, v: u64) -> Result<Self::Ok, Self::Error> {
+        Ok(v)
+    }
+    #[inline]
+    fn serialize_u128(self, _v: u128) -> Result<Self::Ok, Self::Error> {
+        unsupported_tag()
+    }
+    #[inline]
+    fn serialize_f32(self, _v: f32) -> Result<Self::Ok, Self::Error> {
+        unsupported_tag()
+    }
+    #[inline]
+    fn serialize_f64(self, _v: f64) -> Result<Self::Ok, Self::Error> {
+        unsupported_tag()
+    }
+    #[inline]
+    fn serialize_char(self, _v: char) -> Result<Self::Ok, Self::Error> {
+        unsupported_tag()
+    }
+    #[inline]
+    fn serialize_str(self, _v: &str) -> Result<Self::Ok, Self::Error> {
+        unsupported_tag()
+    }
+    #[inline]
+    fn serialize_bytes(self, _v: &[u8]) -> Result<Self::Ok, Self::Error> {
+        unsupported_tag()
+    }
+    #[inline]
+    fn serialize_none(self) -> Result<Self::Ok, Self::Error> {
+        unsupported_tag()
+    }
+    #[inline]
+    fn serialize_some<T: ?Sized + Serialize>(self, _value: &T) -> Result<Self::Ok, Self::Error> {
+        unsupported_tag()
+    }
+    #[inline]
+    fn serialize_unit(self) -> Result<Self::Ok, Self::Error> {
+        unsupported_tag()
+    }
+    #[inline]
+    fn serialize_unit_struct(self, _name: &'static str) -> Result<Self::Ok, Self::Error> {
+        unsupported_tag()
+    }
+    #[inline]
+    fn serialize_unit_variant(
+        self,
+        _name: &'static str,
+        _variant_index: u32,
+        _variant: &'static str,
+    ) -> Result<Self::Ok, Self::Error> {
+        unsupported_tag()
+    }
+    #[inline]
+    fn serialize_newtype_struct<T: ?Sized + Serialize>(
+        self,
+        _name: &'static str,
+        _value: &T,
+    ) -> Result<Self::Ok, Self::Error> {
+        unsupported_tag()
+    }
+    #[inline]
+    fn serialize_newtype_variant<T: ?Sized + Serialize>(
+        self,
+        _name: &'static str,
+        _variant_index: u32,
+        _variant: &'static str,
+        _value: &T,
+    ) -> Result<Self::Ok, Self::Error> {
+        unsupported_tag()
+    }
+    #[inline]
+    fn serialize_seq(self, _len: Option<usize>) -> Result<Self::SerializeSeq, Self::Error> {
+        unsupported_tag()
+    }
+    #[inline]
+    fn serialize_tuple(self, _len: usize) -> Result<Self::SerializeTuple, Self::Error> {
+        unsupported_tag()
+    }
+    #[inline]
+    fn serialize_tuple_struct(
+        self,
+        _name: &'static str,
+        _len: usize,
+    ) -> Result<Self::SerializeTupleStruct, Self::Error> {
+        unsupported_tag()
+    }
+    #[inline]
+    fn serialize_tuple_variant(
+        self,
+        _name: &'static str,
+        _variant_index: u32,
+        _variant: &'static str,
+        _len: usize,
+    ) -> Result<Self::SerializeTupleVariant, Self::Error> {
+        unsupported_tag()
+    }
+    #[inline]
+    fn serialize_map(self, _len: Option<usize>) -> Result<Self::SerializeMap, Self::Error> {
+        unsupported_tag()
+    }
+    #[inline]
+    fn serialize_struct(
+        self,
+        _name: &'static str,
+        _len: usize,
+    ) -> Result<Self::SerializeStruct, Self::Error> {
+        unsupported_tag()
+    }
+    #[inline]
+    fn serialize_struct_variant(
+        self,
+        _name: &'static str,
+        _variant_index: u32,
+        _variant: &'static str,
+        _len: usize,
+    ) -> Result<Self::SerializeStructVariant, Self::Error> {
+        unsupported_tag()
+    }
+    #[inline]
+    fn collect_str<T: ?Sized + fmt::Display>(self, _value: &T) -> Result<Self::Ok, Self::Error> {
+        unsupported_tag()
+    }
+    #[inline]
+    fn is_human_readable(&self) -> bool {
+        false
     }
 }
 
@@ -189,74 +410,74 @@ impl<'a> ser::Serializer for &'a mut CborSizer {
 
     #[inline]
     fn serialize_bool(self, _v: bool) -> Result<Self::Ok, Self::Error> {
-        self.add_simple1();
+        self.add_simple1()?;
         Ok(())
     }
     #[inline]
     fn serialize_i8(self, v: i8) -> Result<Self::Ok, Self::Error> {
         if v >= 0 {
-            self.add_uint(v as u64);
+            self.add_uint(v as u64)?;
         } else {
-            self.add_nint_i64(v as i64);
+            self.add_nint_i64(v as i64)?;
         }
         Ok(())
     }
     #[inline]
     fn serialize_i16(self, v: i16) -> Result<Self::Ok, Self::Error> {
         if v >= 0 {
-            self.add_uint(v as u64);
+            self.add_uint(v as u64)?;
         } else {
-            self.add_nint_i64(v as i64);
+            self.add_nint_i64(v as i64)?;
         }
         Ok(())
     }
     #[inline]
     fn serialize_i32(self, v: i32) -> Result<Self::Ok, Self::Error> {
         if v >= 0 {
-            self.add_uint(v as u64);
+            self.add_uint(v as u64)?;
         } else {
-            self.add_nint_i64(v as i64);
+            self.add_nint_i64(v as i64)?;
         }
         Ok(())
     }
     #[inline]
     fn serialize_i64(self, v: i64) -> Result<Self::Ok, Self::Error> {
         if v >= 0 {
-            self.add_uint(v as u64);
+            self.add_uint(v as u64)?;
         } else {
-            self.add_nint_i64(v);
+            self.add_nint_i64(v)?;
         }
         Ok(())
     }
     #[inline]
     fn serialize_i128(self, v: i128) -> Result<Self::Ok, Self::Error> {
-        self.add_i128(v);
+        self.add_i128(v)?;
         Ok(())
     }
 
     #[inline]
     fn serialize_u8(self, v: u8) -> Result<Self::Ok, Self::Error> {
-        self.add_uint(v as u64);
+        self.add_uint(v as u64)?;
         Ok(())
     }
     #[inline]
     fn serialize_u16(self, v: u16) -> Result<Self::Ok, Self::Error> {
-        self.add_uint(v as u64);
+        self.add_uint(v as u64)?;
         Ok(())
     }
     #[inline]
     fn serialize_u32(self, v: u32) -> Result<Self::Ok, Self::Error> {
-        self.add_uint(v as u64);
+        self.add_uint(v as u64)?;
         Ok(())
     }
     #[inline]
     fn serialize_u64(self, v: u64) -> Result<Self::Ok, Self::Error> {
-        self.add_uint(v);
+        self.add_uint(v)?;
         Ok(())
     }
     #[inline]
     fn serialize_u128(self, v: u128) -> Result<Self::Ok, Self::Error> {
-        self.add_u128(v);
+        self.add_u128(v)?;
         Ok(())
     }
 
@@ -271,11 +492,11 @@ impl<'a> ser::Serializer for &'a mut CborSizer {
         let n32 = v as f32;
         let vbits = v.to_bits();
         if f64::from(n16).to_bits() == vbits {
-            self.add_f16();
+            self.add_f16()?;
         } else if f64::from(n32).to_bits() == vbits {
-            self.add_f32();
+            self.add_f32()?;
         } else {
-            self.add_f64();
+            self.add_f64()?;
         };
         Ok(())
     }
@@ -287,20 +508,20 @@ impl<'a> ser::Serializer for &'a mut CborSizer {
 
     #[inline]
     fn serialize_str(self, v: &str) -> Result<Self::Ok, Self::Error> {
-        self.add_text(v.len());
+        self.add_text(v.len())?;
         Ok(())
     }
 
     #[inline]
     fn serialize_bytes(self, v: &[u8]) -> Result<Self::Ok, Self::Error> {
-        self.add_bytes(v.len());
+        self.add_bytes(v.len())?;
         Ok(())
     }
 
     #[inline]
     fn serialize_none(self) -> Result<Self::Ok, Self::Error> {
         // serde_cbor/ciborium 通常将 None 编码为 null
-        self.add_simple1();
+        self.add_simple1()?;
         Ok(())
     }
     #[inline]
@@ -312,7 +533,7 @@ impl<'a> ser::Serializer for &'a mut CborSizer {
     #[inline]
     fn serialize_unit(self) -> Result<Self::Ok, Self::Error> {
         // unit -> null
-        self.add_simple1();
+        self.add_simple1()?;
         Ok(())
     }
 
@@ -344,20 +565,24 @@ impl<'a> ser::Serializer for &'a mut CborSizer {
     #[inline]
     fn serialize_newtype_variant<T: ?Sized + Serialize>(
         self,
-        _name: &'static str,
+        name: &'static str,
         _variant_index: u32,
         variant: &'static str,
         value: &T,
     ) -> Result<Self::Ok, Self::Error> {
+        if name == "@@TAG@@" && variant == "@@UNTAGGED@@" {
+            return value.serialize(self);
+        }
+
         // { "Variant": value }
-        self.add_map_header(Some(1));
-        self.add_text(variant.len());
+        self.add_map_header(Some(1))?;
+        self.add_text(variant.len())?;
         value.serialize(self)
     }
 
     #[inline]
     fn serialize_seq(self, len: Option<usize>) -> Result<Self::SerializeSeq, Self::Error> {
-        let indefinite = self.add_array_header(len);
+        let indefinite = self.add_array_header(len)?;
         Ok(SeqSizer {
             s: self,
             indefinite,
@@ -366,7 +591,7 @@ impl<'a> ser::Serializer for &'a mut CborSizer {
 
     #[inline]
     fn serialize_tuple(self, len: usize) -> Result<Self::SerializeTuple, Self::Error> {
-        let indefinite = self.add_array_header(Some(len));
+        let indefinite = self.add_array_header(Some(len))?;
         Ok(SeqSizer {
             s: self,
             indefinite,
@@ -379,7 +604,7 @@ impl<'a> ser::Serializer for &'a mut CborSizer {
         _name: &'static str,
         len: usize,
     ) -> Result<Self::SerializeTupleStruct, Self::Error> {
-        let indefinite = self.add_array_header(Some(len));
+        let indefinite = self.add_array_header(Some(len))?;
         Ok(SeqSizer {
             s: self,
             indefinite,
@@ -389,24 +614,33 @@ impl<'a> ser::Serializer for &'a mut CborSizer {
     #[inline]
     fn serialize_tuple_variant(
         self,
-        _name: &'static str,
+        name: &'static str,
         _variant_index: u32,
         variant: &'static str,
         len: usize,
     ) -> Result<Self::SerializeTupleVariant, Self::Error> {
+        if name == "@@TAG@@" && variant == "@@TAGGED@@" {
+            return Ok(TupleVariantSizer {
+                s: self,
+                indefinite: false,
+                tag: true,
+            });
+        }
+
         // { "Variant": [ ... ] }
-        self.add_map_header(Some(1));
-        self.add_text(variant.len());
-        let indefinite = self.add_array_header(Some(len));
+        self.add_map_header(Some(1))?;
+        self.add_text(variant.len())?;
+        let indefinite = self.add_array_header(Some(len))?;
         Ok(TupleVariantSizer {
             s: self,
             indefinite,
+            tag: false,
         })
     }
 
     #[inline]
     fn serialize_map(self, len: Option<usize>) -> Result<Self::SerializeMap, Self::Error> {
-        let indefinite = self.add_map_header(len);
+        let indefinite = self.add_map_header(len)?;
         Ok(MapSizer {
             s: self,
             indefinite,
@@ -419,7 +653,7 @@ impl<'a> ser::Serializer for &'a mut CborSizer {
         _name: &'static str,
         len: usize,
     ) -> Result<Self::SerializeStruct, Self::Error> {
-        let indefinite = self.add_map_header(Some(len));
+        let indefinite = self.add_map_header(Some(len))?;
         Ok(StructSizer {
             s: self,
             indefinite,
@@ -435,13 +669,26 @@ impl<'a> ser::Serializer for &'a mut CborSizer {
         len: usize,
     ) -> Result<Self::SerializeStructVariant, Self::Error> {
         // { "Variant": { k:v, ... } }
-        self.add_map_header(Some(1));
-        self.add_text(variant.len());
-        let indefinite = self.add_map_header(Some(len));
+        self.add_map_header(Some(1))?;
+        self.add_text(variant.len())?;
+        let indefinite = self.add_map_header(Some(len))?;
         Ok(StructVariantSizer {
             s: self,
             indefinite,
         })
+    }
+
+    #[inline]
+    fn collect_str<T: ?Sized + fmt::Display>(self, value: &T) -> Result<Self::Ok, Self::Error> {
+        let mut counter = StrLenCounter { count: 0 };
+        fmt::write(&mut counter, format_args!("{value}"))
+            .map_err(|_| CborSizeError::new("failed to count formatted string length"))?;
+        self.add_text(counter.count)
+    }
+
+    #[inline]
+    fn is_human_readable(&self) -> bool {
+        false
     }
 }
 
@@ -458,8 +705,7 @@ impl SerializeSeq for SeqSizer<'_> {
     }
     #[inline]
     fn end(self) -> Result<(), Self::Error> {
-        self.s.end_indefinite(self.indefinite);
-        Ok(())
+        self.s.end_indefinite(self.indefinite)
     }
 }
 impl SerializeTuple for SeqSizer<'_> {
@@ -490,18 +736,24 @@ impl SerializeTupleStruct for SeqSizer<'_> {
 struct TupleVariantSizer<'a> {
     s: &'a mut CborSizer,
     indefinite: bool,
+    tag: bool,
 }
 impl SerializeTupleVariant for TupleVariantSizer<'_> {
     type Ok = ();
     type Error = CborSizeError;
     #[inline]
     fn serialize_field<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), Self::Error> {
+        if self.tag {
+            self.tag = false;
+            let tag = value.serialize(TagSerializer)?;
+            return self.s.add_tag(tag);
+        }
+
         value.serialize(&mut *self.s)
     }
     #[inline]
     fn end(self) -> Result<(), Self::Error> {
-        self.s.end_indefinite(self.indefinite);
-        Ok(())
+        self.s.end_indefinite(self.indefinite)
     }
 }
 
@@ -522,8 +774,7 @@ impl SerializeMap for MapSizer<'_> {
     }
     #[inline]
     fn end(self) -> Result<(), Self::Error> {
-        self.s.end_indefinite(self.indefinite);
-        Ok(())
+        self.s.end_indefinite(self.indefinite)
     }
 }
 
@@ -540,13 +791,12 @@ impl SerializeStruct for StructSizer<'_> {
         key: &'static str,
         value: &T,
     ) -> Result<(), Self::Error> {
-        self.s.add_text(key.len());
+        self.s.add_text(key.len())?;
         value.serialize(&mut *self.s)
     }
     #[inline]
     fn end(self) -> Result<(), Self::Error> {
-        self.s.end_indefinite(self.indefinite);
-        Ok(())
+        self.s.end_indefinite(self.indefinite)
     }
 }
 
@@ -563,21 +813,20 @@ impl SerializeStructVariant for StructVariantSizer<'_> {
         key: &'static str,
         value: &T,
     ) -> Result<(), Self::Error> {
-        self.s.add_text(key.len());
+        self.s.add_text(key.len())?;
         value.serialize(&mut *self.s)
     }
     #[inline]
     fn end(self) -> Result<(), Self::Error> {
-        self.s.end_indefinite(self.indefinite);
-        Ok(())
+        self.s.end_indefinite(self.indefinite)
     }
 }
 
-// ...existing code...
 #[cfg(test)]
 mod tests {
     use super::*;
     use ciborium::into_writer;
+    use ciborium::tag::{Accepted, Captured, Required};
     use serde::Serialize;
     use std::collections::BTreeMap;
 
@@ -615,6 +864,32 @@ mod tests {
     #[derive(Debug, Serialize)]
     enum NE {
         V(u64),
+    }
+
+    struct BinaryAware;
+
+    impl Serialize for BinaryAware {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            if serializer.is_human_readable() {
+                serializer.serialize_str("human readable")
+            } else {
+                serializer.serialize_bytes(&[1, 2, 3, 4])
+            }
+        }
+    }
+
+    struct FailingSerialize;
+
+    impl Serialize for FailingSerialize {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(serde::ser::Error::custom("intentional failure"))
+        }
     }
 
     #[test]
@@ -743,5 +1018,29 @@ mod tests {
         let near_min: i128 = i128::MIN + 1; // 仍远小于 i64::MIN
         assert_estimate_eq("i128:-1<<100", &big_neg);
         assert_estimate_eq("i128:near_min", &near_min);
+    }
+
+    #[test]
+    fn test_cbor_size_matches_binary_serializer_mode() {
+        assert_estimate_eq("binary-aware serialize", &BinaryAware);
+    }
+
+    #[test]
+    fn test_cbor_size_matches_ciborium_tags() {
+        let required = Required::<_, 42>("tagged");
+        let accepted = Accepted::<_, 0x1_0000>(123u64);
+        let captured_tagged = Captured(Some(7), vec![1u8, 2, 3]);
+        let captured_untagged = Captured(None, "plain");
+
+        assert_estimate_eq("tag::Required", &required);
+        assert_estimate_eq("tag::Accepted", &accepted);
+        assert_estimate_eq("tag::Captured(Some)", &captured_tagged);
+        assert_estimate_eq("tag::Captured(None)", &captured_untagged);
+    }
+
+    #[test]
+    fn test_try_cbor_size_propagates_serialize_errors() {
+        let err = try_estimate_cbor_size(&FailingSerialize).unwrap_err();
+        assert_eq!(err.to_string(), "intentional failure");
     }
 }

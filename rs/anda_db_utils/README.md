@@ -9,6 +9,8 @@ reusable building blocks used by indexing, persistence, and supporting code.
 - `UniqueVec<T>` for ordered unique collections
 - `Pipe` for lightweight functional-style chaining
 - `CountingWriter` for byte-counting during serialization workflows
+- `estimate_cbor_size` / `try_estimate_cbor_size` for CBOR size estimation
+	without buffers
 - small helper primitives reused by multiple workspace crates
 
 ## When to Use It

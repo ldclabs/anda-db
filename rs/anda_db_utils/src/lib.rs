@@ -4,11 +4,11 @@ use serde::{
     de::{Deserialize, DeserializeOwned, Deserializer},
     ser::{Serialize, Serializer},
 };
-use std::hash::Hash;
+use std::{borrow::Borrow, hash::Hash};
 
 mod cbor_size;
 
-pub use cbor_size::estimate_cbor_size;
+pub use cbor_size::{CborSizeError, estimate_cbor_size, try_estimate_cbor_size};
 
 /// A trait for functional-style method chaining.
 ///
@@ -88,14 +88,10 @@ where
     /// Creates a `UniqueVec` from a `Vec`.
     ///
     /// The extender is initialized with all the unique items from the vector.
-    fn from(vec: Vec<T>) -> Self {
-        let set: FxHashSet<T> = vec.iter().cloned().collect();
-        if set.len() == vec.len() {
-            return Self { set, vec };
-        };
-        let mut this = Self::default();
-        this.extend(vec);
-        this
+    fn from(mut vec: Vec<T>) -> Self {
+        let mut set = FxHashSet::with_capacity_and_hasher(vec.len(), FxBuildHasher);
+        vec.retain(|item| set.insert(item.clone()));
+        Self { set, vec }
     }
 }
 
@@ -151,7 +147,11 @@ where
     }
 
     /// Returns `true` if the `UniqueVec` contains the specified item.
-    pub fn contains(&self, item: &T) -> bool {
+    pub fn contains<Q>(&self, item: &Q) -> bool
+    where
+        T: Borrow<Q>,
+        Q: Eq + Hash + ?Sized,
+    {
         self.set.contains(item)
     }
 
@@ -179,11 +179,7 @@ where
     ///
     /// * `items` - An iterator providing the items to add.
     pub fn extend(&mut self, items: impl IntoIterator<Item = T>) {
-        self.vec.extend(
-            items
-                .into_iter()
-                .filter(|item| self.set.insert(item.clone())),
-        );
+        Extend::extend(self, items);
     }
 
     /// Retains only the elements specified by the predicate.
@@ -192,7 +188,8 @@ where
         F: FnMut(&T) -> bool,
     {
         self.vec.retain(&mut f);
-        self.set = self.vec.iter().cloned().collect();
+        self.set.clear();
+        self.set.extend(self.vec.iter().cloned());
     }
 
     /// Removes and returns the element at `index`.
@@ -233,9 +230,10 @@ where
     }
 
     /// Intersects the `UniqueVec` with another `UniqueVec`.
-    pub fn intersect_with<'a>(&'a mut self, other: &'a UniqueVec<T>) {
-        self.set = self.set.intersection(&other.set).cloned().collect();
-        self.vec.retain(|item| self.set.contains(item));
+    pub fn intersect_with(&mut self, other: &UniqueVec<T>) {
+        self.vec.retain(|item| other.set.contains(item));
+        self.set.clear();
+        self.set.extend(self.vec.iter().cloned());
     }
 
     /// Returns the inner `Vec` of the `UniqueVec`.
@@ -256,6 +254,19 @@ where
     /// Converts the `UniqueVec` to a `FxHashSet`.
     pub fn to_set(&self) -> FxHashSet<T> {
         self.set.clone()
+    }
+}
+
+impl<T> Extend<T> for UniqueVec<T>
+where
+    T: Eq + Hash + Clone,
+{
+    /// Extends the vector with items from an iterator that do not already exist.
+    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+        self.vec.extend(
+            iter.into_iter()
+                .filter(|item| self.set.insert(item.clone())),
+        );
     }
 }
 
@@ -283,6 +294,7 @@ where
 }
 
 /// Utility for counting the size of serialized CBOR data.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CountingWriter {
     count: usize,
 }
@@ -296,12 +308,12 @@ impl Default for CountingWriter {
 
 impl CountingWriter {
     /// Creates a new `CountingWriter`.
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         CountingWriter { count: 0 }
     }
 
     /// Returns the current count of bytes written.
-    pub fn size(&self) -> usize {
+    pub const fn size(&self) -> usize {
         self.count
     }
 }
@@ -311,7 +323,10 @@ impl std::io::Write for CountingWriter {
     /// This simply counts the bytes without actually writing them.
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let len = buf.len();
-        self.count += len;
+        self.count = self
+            .count
+            .checked_add(len)
+            .ok_or_else(|| std::io::Error::other("byte count overflow"))?;
         Ok(len)
     }
 
@@ -648,7 +663,16 @@ mod tests {
         uv.push("hello".to_string()); // Duplicate
 
         assert_eq!(uv.len(), 2);
-        assert!(uv.contains(&"hello".to_string()));
-        assert!(uv.contains(&"world".to_string()));
+        assert!(uv.contains("hello"));
+        assert!(uv.contains("world"));
+    }
+
+    #[test]
+    fn test_counting_writer_overflow() {
+        let mut writer = CountingWriter { count: usize::MAX };
+        let err = writer.write(b"x").unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert_eq!(writer.size(), usize::MAX);
     }
 }

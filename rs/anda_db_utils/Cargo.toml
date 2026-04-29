@@ -1,6 +1,6 @@
 [package]
 name = "anda_db_utils"
-version = "0.2.2"
+version = "0.2.3"
 description = "An utility Rust library for Anda DB."
 keywords = ["anda"]
 categories = ["database", "data-structures"]
