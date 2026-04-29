@@ -315,7 +315,7 @@ let idx = BM25Index::load_all(default_tokenizer(), metadata, async |id| {
 1. **Removal requires the original text**: `remove(id, text, now_ms)` relies on re-tokenizing the original text to locate postings. If the original text is unavailable, call `get_doc_tokens` first or keep your own metadata. Historical misuse does not affect search correctness, but it may leave redundant postings that can be cleaned up with `compact_buckets()`.
 2. **`top_k = 0`**: kept for API compatibility. It returns an empty set and does not trigger sorting.
 3. **Concurrent flush**: multithreaded `flush` is protected by `last_saved_version`, so metadata is not written twice, but the closure may still be called from multiple threads for different buckets. If the storage layer requires serialized writes, add mutual exclusion at the upper layer.
-4. **Search semantics under partial loading**: if `load_buckets` skips some buckets, those documents do not have `doc_tokens`, and `score_term` skips them automatically. The result is the natural subset of the loaded portion.
+4. **Search semantics under partial loading**: if `load_buckets` skips a posting bucket, terms owned by that bucket are unavailable. Loaded buckets also carry the document lengths needed to score their postings, so `len()` may include every document touched by those loaded terms even when other buckets are skipped. Search results remain the natural subset of the loaded postings.
 5. **Embedded-only**: this library is intended for in-process embedding inside AndaDB and does not provide HTTP or gRPC services. For remote access, use `anda_db_server` or `anda_db_shard_proxy`.
 
 ---

@@ -551,18 +551,24 @@ where
             let mut bucket = self.buckets.entry(bid).or_default();
             // Mark as dirty, needs to be persisted
             bucket.mark_dirty();
+            let mut bucket_contains_doc = false;
             for (token, size) in val {
                 if bucket.tokens.contains(&token) {
                     // Token already tracked in this bucket; just account for the new posting entry.
                     bucket.size += size;
+                    bucket_contains_doc = true;
                 } else if bucket.tokens.is_empty()
                     || bucket.size + size < self.config.bucket_overload_size
                 {
                     bucket.tokens.push(token);
                     bucket.size += size;
+                    bucket_contains_doc = true;
                 } else {
                     tokens_to_migrate.push((bid, token, size));
                 }
+            }
+            if bucket_contains_doc {
+                bucket.doc_ids.insert(id);
             }
         }
 
@@ -608,18 +614,9 @@ where
                     nb.mark_dirty();
                     nb.size += size;
                     nb.tokens.push(token.clone());
+                    nb.doc_ids.insert(id);
                 }
             }
-
-            self.buckets
-                .entry(next_bucket_id)
-                .or_default()
-                .doc_ids
-                .insert(id);
-        } else {
-            let mut b = self.buckets.entry(bucket_id).or_default();
-            b.mark_dirty();
-            b.doc_ids.insert(id);
         }
 
         self.update_metadata(|m| {
@@ -701,7 +698,6 @@ where
             self.postings.remove(token);
         }
 
-        let mut removed_id = false;
         for (bucket_id, val) in buckets_to_update {
             if let Some(mut b) = self.buckets.get_mut(&bucket_id) {
                 // Mark as dirty, needs to be persisted
@@ -712,16 +708,13 @@ where
                         b.tokens.swap_remove_if(|k| &token == k);
                     }
                 }
-                removed_id = removed_id || b.doc_ids.remove(&id);
+                b.doc_ids.remove(&id);
             }
         }
 
-        if !removed_id {
-            for mut bucket in self.buckets.iter_mut() {
-                if bucket.doc_ids.remove(&id) {
-                    bucket.mark_dirty();
-                    break;
-                }
+        for mut bucket in self.buckets.iter_mut() {
+            if bucket.doc_ids.remove(&id) {
+                bucket.mark_dirty();
             }
         }
 
@@ -750,10 +743,14 @@ where
     ///
     /// A vector of `(document_id, score)` pairs sorted by descending score.
     pub fn search(&self, query: &str, top_k: usize, params: Option<BM25Params>) -> Vec<(u64, f32)> {
+        self.search_count.fetch_add(1, Ordering::Relaxed);
+        if top_k == 0 {
+            return Vec::new();
+        }
+
         let params = params.as_ref().unwrap_or(&self.config.bm25);
         let scored_docs = self.score_term(query.trim(), params);
 
-        self.search_count.fetch_add(1, Ordering::Relaxed);
         Self::top_k_results(scored_docs, top_k)
     }
 
@@ -779,11 +776,15 @@ where
         top_k: usize,
         params: Option<BM25Params>,
     ) -> Vec<(u64, f32)> {
+        self.search_count.fetch_add(1, Ordering::Relaxed);
+        if top_k == 0 {
+            return Vec::new();
+        }
+
         let query_expr = QueryType::parse(query);
         let params = params.as_ref().unwrap_or(&self.config.bm25);
         let scored_docs = self.execute_query(&query_expr, params, false);
 
-        self.search_count.fetch_add(1, Ordering::Relaxed);
         Self::top_k_results(scored_docs, top_k)
     }
 
@@ -796,13 +797,17 @@ where
 
         let mut results: Vec<(u64, f32)> = scored_docs.into_iter().collect();
         if results.len() > top_k {
-            results.select_nth_unstable_by(top_k - 1, |a, b| {
-                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-            });
+            results.select_nth_unstable_by(top_k - 1, Self::compare_scored_docs);
             results.truncate(top_k);
         }
-        results.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_unstable_by(Self::compare_scored_docs);
         results
+    }
+
+    fn compare_scored_docs(a: &(u64, f32), b: &(u64, f32)) -> std::cmp::Ordering {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
     }
 
     /// Execute a query expression, returning a mapping of document IDs to scores
@@ -828,8 +833,17 @@ where
         }
 
         // Be defensive against invalid params to avoid NaNs/inf in ranking.
-        let k1 = params.k1.max(0.0);
-        let b = params.b.clamp(0.0, 1.0);
+        let defaults = BM25Params::default();
+        let k1 = if params.k1.is_finite() {
+            params.k1.max(0.0)
+        } else {
+            defaults.k1
+        };
+        let b = if params.b.is_finite() {
+            params.b.clamp(0.0, 1.0)
+        } else {
+            defaults.b
+        };
 
         let mut tokenizer = self.tokenizer.clone();
         let query_terms = collect_tokens(&mut tokenizer, term, None);
@@ -1362,6 +1376,61 @@ mod tests {
         assert!(!results.iter().any(|(id, _)| *id == 2));
     }
 
+    #[tokio::test]
+    async fn test_remove_with_wrong_text_does_not_resurrect_after_reload() {
+        let config = BM25Config {
+            bm25: BM25Params::default(),
+            bucket_overload_size: 64,
+        };
+        let index = BM25Index::new(
+            "remove_wrong_text_reload".to_string(),
+            default_tokenizer(),
+            Some(config),
+        );
+        let terms = [
+            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
+            "juliet", "kilo", "lima",
+        ];
+        let text = terms.join(" ");
+        index.insert(1, &text, 0).unwrap();
+        assert!(index.stats().max_bucket_id > 0);
+
+        let mut metadata: Vec<u8> = Vec::new();
+        let mut buckets: HashMap<u32, Vec<u8>> = HashMap::new();
+        index
+            .flush(&mut metadata, 1, async |id: u32, data: &[u8]| {
+                buckets.insert(id, data.to_vec());
+                Ok(true)
+            })
+            .await
+            .unwrap();
+
+        assert!(index.remove(1, "wrong text", 2));
+
+        metadata.clear();
+        index
+            .flush(&mut metadata, 3, async |id: u32, data: &[u8]| {
+                buckets.insert(id, data.to_vec());
+                Ok(true)
+            })
+            .await
+            .unwrap();
+
+        let loaded_index = BM25Index::load_all(default_tokenizer(), &metadata[..], async |id| {
+            Ok(buckets.get(&id).cloned())
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(loaded_index.len(), 0);
+        for term in terms {
+            assert!(
+                loaded_index.search(term, 10, None).is_empty(),
+                "removed document was found after reload for term '{term}'"
+            );
+        }
+    }
+
     #[test]
     fn test_search() {
         let index = create_test_index();
@@ -1505,6 +1574,23 @@ mod tests {
             }
         }
         assert!(scores_different);
+    }
+
+    #[test]
+    fn test_invalid_bm25_params_do_not_produce_non_finite_scores() {
+        let index = create_test_index();
+
+        let results = index.search(
+            "fox",
+            10,
+            Some(BM25Params {
+                k1: f32::NAN,
+                b: f32::INFINITY,
+            }),
+        );
+
+        assert!(!results.is_empty());
+        assert!(results.iter().all(|(_, score)| score.is_finite()));
     }
 
     #[test]
@@ -1877,15 +1963,16 @@ mod tests {
             .await
             .unwrap();
 
-            // 部分加载的索引应该只包含桶0中的文档
-            assert!(partial_index.len() < index.len());
+            // 部分加载会载入桶0 posting 需要的文档长度；如果桶0包含高频词，
+            // 它可能覆盖全部文档，但搜索结果仍不应超过完整索引。
+            assert!(partial_index.len() <= index.len());
 
             // 验证部分搜索结果
             let partial_results = partial_index.search("fox", 10, None);
             let full_results = index.search("fox", 10, None);
 
             // 部分结果应该是完整结果的子集
-            assert!(partial_results.len() < full_results.len());
+            assert!(partial_results.len() <= full_results.len());
 
             for (doc_id, _) in partial_results {
                 assert!(
@@ -1897,6 +1984,62 @@ mod tests {
 
             println!("加载部分分桶测试通过！");
         }
+    }
+
+    #[tokio::test]
+    async fn test_partial_load_keeps_doc_tokens_with_existing_token_bucket() {
+        let config = BM25Config {
+            bm25: BM25Params::default(),
+            bucket_overload_size: 64,
+        };
+        let index = BM25Index::new(
+            "partial_load_doc_tokens".to_string(),
+            default_tokenizer(),
+            Some(config),
+        );
+
+        index.insert(1, "alpha bravo", 0).unwrap();
+        let alpha_bucket = index.postings.get("alpha").unwrap().0;
+
+        let filler_docs = [
+            (2, "charlie delta echo foxtrot"),
+            (3, "golf hotel india juliet"),
+            (4, "kilo lima mike november"),
+            (5, "oscar papa quebec romeo"),
+            (6, "sierra tango uniform victor"),
+            (7, "whiskey xray yankee zulu"),
+        ];
+        for (id, text) in filler_docs {
+            index.insert(id, text, 0).unwrap();
+        }
+        assert!(index.stats().max_bucket_id > alpha_bucket);
+
+        index.insert(99, "alpha alpha", 0).unwrap();
+        assert_eq!(index.postings.get("alpha").unwrap().0, alpha_bucket);
+
+        let mut metadata: Vec<u8> = Vec::new();
+        let mut buckets: HashMap<u32, Vec<u8>> = HashMap::new();
+        index
+            .flush(&mut metadata, 1, async |id: u32, data: &[u8]| {
+                buckets.insert(id, data.to_vec());
+                Ok(true)
+            })
+            .await
+            .unwrap();
+
+        let partial_index = BM25Index::load_all(default_tokenizer(), &metadata[..], async |id| {
+            if id == alpha_bucket {
+                Ok(buckets.get(&id).cloned())
+            } else {
+                Ok(None)
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(partial_index.get_doc_tokens(99), Some(2));
+        let results = partial_index.search("alpha", 10, None);
+        assert!(results.iter().any(|(id, _)| *id == 99));
     }
 
     #[test]
