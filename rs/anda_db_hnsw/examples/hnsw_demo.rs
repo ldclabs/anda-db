@@ -46,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut inert_start = time::Instant::now();
     for i in 0..1_000 {
         let vector: Vec<f32> = (0..DIM).map(|_| rng.random::<f32>()).collect();
-        let _ = index.insert_f32(i as u64, vector, unix_ms())?;
+        index.insert_f32(i, vector, unix_ms())?;
         // println!("{} inserted vector {}", i, i);
 
         // 模拟搜索查询

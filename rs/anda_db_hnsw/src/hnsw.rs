@@ -19,7 +19,7 @@ use croaring::{Portable, Treemap};
 use half::bf16;
 use ordered_float::OrderedFloat;
 use papaya::HashMap as CoHashMap;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -61,6 +61,13 @@ pub struct HnswIndex {
 
     /// Layer generator that assigns a layer to each new node.
     layer_gen: LayerGen,
+
+    /// Serializes structural graph mutations.
+    ///
+    /// Search remains lock-free on the hot path, but insert/remove both clone
+    /// and rewrite adjacency lists. Without this mutex, concurrent writers can
+    /// overwrite each other's neighbor-list updates.
+    structural_lock: Mutex<()>,
 
     /// Lock-free id → node map backing the graph.
     ///
@@ -128,17 +135,88 @@ pub struct HnswConfig {
 }
 
 impl HnswConfig {
+    /// Minimum useful value for `max_layers`.
+    pub const MIN_MAX_LAYERS: u8 = 1;
+
+    /// Minimum useful value for `max_connections`.
+    pub const MIN_MAX_CONNECTIONS: u8 = 2;
+
     /// Creates a layer generator based on the configuration.
     ///
     /// # Returns
     ///
     /// * `LayerGen` - A layer generator with the configured parameters.
     pub fn layer_gen(&self) -> LayerGen {
+        let config = self.clone().normalized();
         LayerGen::new_with_scale(
-            self.max_connections,
-            self.scale_factor.unwrap_or(1.0),
-            self.max_layers,
+            config.max_connections,
+            config.scale_factor.unwrap_or(1.0),
+            config.max_layers,
         )
+    }
+
+    /// Returns a runtime-safe copy of the config.
+    ///
+    /// This keeps the infallible [`HnswIndex::new`] constructor backward
+    /// compatible while preventing invalid public config values from causing
+    /// panics in layer generation or zero-width searches.
+    pub fn normalized(mut self) -> Self {
+        self.max_layers = self.max_layers.max(Self::MIN_MAX_LAYERS);
+        self.max_connections = self.max_connections.max(Self::MIN_MAX_CONNECTIONS);
+        self.ef_construction = self.ef_construction.max(1);
+        self.ef_search = self.ef_search.max(1);
+        if !matches!(self.scale_factor, Some(scale_factor) if scale_factor.is_finite() && scale_factor > 0.0)
+        {
+            self.scale_factor = None;
+        }
+        self
+    }
+
+    /// Strictly validates the config without normalization.
+    pub fn validate(&self, name: &str) -> Result<(), HnswError> {
+        if self.dimension == 0 {
+            return Err(Self::invalid_config(
+                name,
+                "dimension must be greater than 0",
+            ));
+        }
+        if self.max_layers < Self::MIN_MAX_LAYERS {
+            return Err(Self::invalid_config(name, "max_layers must be at least 1"));
+        }
+        if self.max_connections < Self::MIN_MAX_CONNECTIONS {
+            return Err(Self::invalid_config(
+                name,
+                "max_connections must be at least 2",
+            ));
+        }
+        if self.ef_construction == 0 {
+            return Err(Self::invalid_config(
+                name,
+                "ef_construction must be greater than 0",
+            ));
+        }
+        if self.ef_search == 0 {
+            return Err(Self::invalid_config(
+                name,
+                "ef_search must be greater than 0",
+            ));
+        }
+        if let Some(scale_factor) = self.scale_factor
+            && (!scale_factor.is_finite() || scale_factor <= 0.0)
+        {
+            return Err(Self::invalid_config(
+                name,
+                "scale_factor must be finite and greater than 0",
+            ));
+        }
+        Ok(())
+    }
+
+    fn invalid_config(name: &str, message: impl Into<String>) -> HnswError {
+        HnswError::Generic {
+            name: name.to_string(),
+            source: format!("Invalid config: {}", message.into()).into(),
+        }
     }
 }
 
@@ -284,7 +362,18 @@ impl HnswIndex {
     ///
     /// * `HnswIndex` - New HNSW index instance
     pub fn new(name: String, config: Option<HnswConfig>) -> Self {
+        let config = config.unwrap_or_default().normalized();
+        Self::new_with_config(name, config)
+    }
+
+    /// Creates a new HNSW index after strictly validating the configuration.
+    pub fn try_new(name: String, config: Option<HnswConfig>) -> Result<Self, HnswError> {
         let config = config.unwrap_or_default();
+        config.validate(&name)?;
+        Ok(Self::new_with_config(name, config))
+    }
+
+    fn new_with_config(name: String, config: HnswConfig) -> Self {
         let layer_gen = config.layer_gen();
         let stats = HnswStats {
             version: 1,
@@ -294,6 +383,7 @@ impl HnswIndex {
             name: name.clone(),
             config: config.clone(),
             layer_gen,
+            structural_lock: Mutex::new(()),
             nodes: CoHashMap::new(),
             entry_point: RwLock::new((0, 0)),
             metadata: RwLock::new(HnswMetadata {
@@ -341,21 +431,30 @@ impl HnswIndex {
     ///
     /// * `Result<Self, HnswError>` - Loaded index or error.
     pub fn load_metadata<R: Read>(r: R) -> Result<Self, HnswError> {
-        let index: HnswIndexOwned =
+        let mut index: HnswIndexOwned =
             ciborium::from_reader(r).map_err(|err| HnswError::Serialization {
                 name: "unknown".to_string(),
                 source: err.into(),
             })?;
+        index.metadata.config = index.metadata.config.normalized();
         let layer_gen = index.metadata.config.layer_gen();
         let search_count = AtomicU64::new(index.metadata.stats.search_count);
         let last_saved_version = AtomicU64::new(index.metadata.stats.version);
+        let entry_point = (
+            index.entry_point.0,
+            index
+                .entry_point
+                .1
+                .min(index.metadata.config.max_layers.saturating_sub(1)),
+        );
 
         Ok(HnswIndex {
             name: index.metadata.name.clone(),
             config: index.metadata.config.clone(),
             layer_gen,
+            structural_lock: Mutex::new(()),
             nodes: CoHashMap::new(),
-            entry_point: RwLock::new(index.entry_point),
+            entry_point: RwLock::new(entry_point),
             metadata: RwLock::new(index.metadata),
             dirty_nodes: RwLock::new(BTreeSet::new()),
             ids: RwLock::new(Treemap::new()),
@@ -417,7 +516,14 @@ impl HnswIndex {
             return Ok(());
         }
 
+        enum LoadedNode {
+            Loaded(u64, HnswNode),
+            Missing(u64),
+        }
+
         let name = &self.name;
+        let dimension = self.config.dimension;
+        let max_layers = self.config.max_layers;
         let f_ref = &f;
         let mut stream = stream::iter(ids.into_iter())
             .map(|id| async move {
@@ -429,9 +535,10 @@ impl HnswIndex {
                                 source: err.into(),
                             }
                         })?;
-                        Ok::<_, HnswError>(Some((id, node)))
+                        Self::validate_loaded_node(name, id, dimension, max_layers, &node)?;
+                        Ok::<_, HnswError>(LoadedNode::Loaded(id, node))
                     }
-                    Ok(None) => Ok(None),
+                    Ok(None) => Ok(LoadedNode::Missing(id)),
                     Err(err) => Err(HnswError::Generic {
                         name: name.clone(),
                         source: err,
@@ -441,12 +548,97 @@ impl HnswIndex {
             .buffer_unordered(Self::LOAD_NODES_CONCURRENCY);
 
         let nodes = &self.nodes;
+        let mut missing_ids = Vec::new();
         while let Some(item) = stream.try_next().await? {
-            if let Some((id, node)) = item {
-                // Re-acquire the pin guard per item: papaya's LocalGuard contains
-                // raw pointers and is !Send, so it must not be held across .await.
-                nodes.pin().insert(id, node);
+            match item {
+                LoadedNode::Loaded(id, node) => {
+                    // Re-acquire the pin guard per item: papaya's LocalGuard contains
+                    // raw pointers and is !Send, so it must not be held across .await.
+                    nodes.pin().insert(id, node);
+                }
+                LoadedNode::Missing(id) => missing_ids.push(id),
             }
+        }
+
+        if !missing_ids.is_empty() {
+            {
+                let mut ids = self.ids.write();
+                for id in &missing_ids {
+                    ids.remove(*id);
+                }
+            }
+            let max_layer = self.repair_entry_point();
+            self.update_metadata(|metadata| {
+                metadata.stats.version = metadata.stats.version.saturating_add(1);
+                metadata.stats.delete_count = metadata
+                    .stats
+                    .delete_count
+                    .saturating_add(missing_ids.len() as u64);
+                metadata.stats.max_layer = max_layer;
+            });
+        } else {
+            let (entry_point, _) = *self.entry_point.read();
+            if entry_point != 0 && self.nodes.pin().get(&entry_point).is_none() {
+                let max_layer = self.repair_entry_point();
+                self.update_metadata(|metadata| {
+                    metadata.stats.version = metadata.stats.version.saturating_add(1);
+                    metadata.stats.max_layer = max_layer;
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_loaded_node(
+        name: &str,
+        expected_id: u64,
+        dimension: usize,
+        max_layers: u8,
+        node: &HnswNode,
+    ) -> Result<(), HnswError> {
+        if node.id != expected_id {
+            return Err(HnswError::Generic {
+                name: name.to_string(),
+                source: format!(
+                    "Loaded node id mismatch, expected {expected_id}, got {}",
+                    node.id
+                )
+                .into(),
+            });
+        }
+        if node.vector.len() != dimension {
+            return Err(HnswError::DimensionMismatch {
+                name: name.to_string(),
+                expected: dimension,
+                got: node.vector.len(),
+            });
+        }
+        if node.layer >= max_layers {
+            return Err(HnswError::Generic {
+                name: name.to_string(),
+                source: format!(
+                    "Loaded node {expected_id} has layer {} outside configured max_layers {max_layers}",
+                    node.layer
+                )
+                .into(),
+            });
+        }
+        let expected_neighbors = node.layer as usize + 1;
+        if node.neighbors.len() != expected_neighbors {
+            return Err(HnswError::Generic {
+                name: name.to_string(),
+                source: format!(
+                    "Loaded node {expected_id} has {} neighbor layers, expected {expected_neighbors}",
+                    node.neighbors.len()
+                )
+                .into(),
+            });
+        }
+        if node.vector.iter().any(|value| !value.is_finite()) {
+            return Err(HnswError::Generic {
+                name: name.to_string(),
+                source: format!("Loaded node {expected_id} contains NaN or infinity").into(),
+            });
         }
         Ok(())
     }
@@ -561,6 +753,7 @@ impl HnswIndex {
             });
         }
 
+        let _structural_guard = self.structural_lock.lock();
         let nodes = self.nodes.pin();
         // Check if ID already exists.
         if nodes.contains_key(&id) {
@@ -596,7 +789,7 @@ impl HnswIndex {
             self.dirty_nodes.write().insert(id); // Mark the node as dirty for persistence
 
             self.update_metadata(|m| {
-                m.stats.version = 1;
+                m.stats.version += 1;
                 m.stats.last_inserted = now_ms;
                 m.stats.max_layer = layer;
                 m.stats.insert_count += 1;
@@ -834,17 +1027,44 @@ impl HnswIndex {
     /// * `true` if a node with `id` existed and was removed.
     /// * `false` otherwise.
     pub fn remove(&self, id: u64, now_ms: u64) -> bool {
+        let _structural_guard = self.structural_lock.lock();
         let nodes = self.nodes.pin();
-        let Some(node) = nodes.remove(&id) else {
+        let Some(node) = nodes.get(&id).cloned() else {
             return false;
         };
 
+        let previous_max_layer = self.metadata.read().stats.max_layer;
+        let entry_was_removed = self.entry_point.read().0 == id;
+        let replacement_entry = if entry_was_removed {
+            nodes
+                .iter()
+                .filter(|(node_id, _)| **node_id != id)
+                .max_by_key(|(_, node)| node.layer)
+                .map(|(_, node)| (node.id, node.layer))
+        } else {
+            None
+        };
+        if entry_was_removed {
+            *self.entry_point.write() = replacement_entry.unwrap_or((0, 0));
+        }
+
+        nodes.remove(&id);
+
         self.ids.write().remove(id);
-        self.try_update_entry_point(node);
+        let recalculated_max_layer = if entry_was_removed {
+            Some(replacement_entry.map_or(0, |(_, layer)| layer))
+        } else if node.layer >= previous_max_layer {
+            Some(nodes.iter().map(|(_, node)| node.layer).max().unwrap_or(0))
+        } else {
+            None
+        };
         self.update_metadata(|m| {
             m.stats.version += 1;
             m.stats.last_deleted = now_ms;
             m.stats.delete_count += 1;
+            if let Some(max_layer) = recalculated_max_layer {
+                m.stats.max_layer = max_layer;
+            }
         });
 
         // Only iterate the deleted node's known neighbors instead of scanning ALL nodes.
@@ -908,6 +1128,10 @@ impl HnswIndex {
                 expected: self.config.dimension,
                 got: query.len(),
             });
+        }
+
+        if top_k == 0 {
+            return Ok(Vec::new());
         }
 
         if self.nodes.is_empty() {
@@ -1001,12 +1225,14 @@ impl HnswIndex {
         ef: usize,
         distance_cache: &mut FxHashMap<u64, f32>,
     ) -> Result<Vec<(u64, f32, u8)>, HnswError> {
+        let ef = ef.max(1);
+        let heap_capacity = ef.saturating_mul(2);
         let mut visited: FxHashSet<u64> =
-            FxHashSet::with_capacity_and_hasher(ef * 2, FxBuildHasher);
+            FxHashSet::with_capacity_and_hasher(heap_capacity, FxBuildHasher);
         let mut candidates: BinaryHeap<(Reverse<OrderedFloat<f32>>, u64, u8)> =
-            BinaryHeap::with_capacity(ef * 2);
+            BinaryHeap::with_capacity(heap_capacity);
         let mut results: BinaryHeap<(OrderedFloat<f32>, u64, u8)> =
-            BinaryHeap::with_capacity(ef * 2);
+            BinaryHeap::with_capacity(heap_capacity);
 
         let nodes = self.nodes.pin();
         // Calculate distance to entry point
@@ -1043,40 +1269,38 @@ impl HnswIndex {
                 && let Some(neighbors) = node.neighbors.get(layer as usize)
             {
                 for &(neighbor, _) in neighbors {
-                    if !visited.contains(&neighbor) {
-                        visited.insert(neighbor);
-                        if let Some(neighbor_node) = nodes.get(&neighbor) {
-                            match self.get_distance_with_cache(distance_cache, query, neighbor_node)
-                            {
-                                Ok(dist) => {
-                                    // results always has ≥1 element (the entry point),
-                                    // so peek() always returns Some here.
-                                    if let Some((OrderedFloat(max_dist), _, _)) = results.peek()
-                                        && (&dist < max_dist || results.len() < ef)
-                                    {
-                                        candidates.push((
-                                            Reverse(OrderedFloat(dist)),
-                                            neighbor,
-                                            neighbor_node.layer,
-                                        ));
-                                        results.push((
-                                            OrderedFloat(dist),
-                                            neighbor,
-                                            neighbor_node.layer,
-                                        ));
+                    if visited.insert(neighbor)
+                        && let Some(neighbor_node) = nodes.get(&neighbor)
+                    {
+                        match self.get_distance_with_cache(distance_cache, query, neighbor_node) {
+                            Ok(dist) => {
+                                // results always has ≥1 element (the entry point),
+                                // so peek() always returns Some here.
+                                if let Some((OrderedFloat(max_dist), _, _)) = results.peek()
+                                    && (&dist < max_dist || results.len() < ef)
+                                {
+                                    candidates.push((
+                                        Reverse(OrderedFloat(dist)),
+                                        neighbor,
+                                        neighbor_node.layer,
+                                    ));
+                                    results.push((
+                                        OrderedFloat(dist),
+                                        neighbor,
+                                        neighbor_node.layer,
+                                    ));
 
-                                        // Prune distant results
-                                        if results.len() > ef {
-                                            results.pop();
-                                        }
+                                    // Prune distant results
+                                    if results.len() > ef {
+                                        results.pop();
                                     }
                                 }
-                                Err(e) => {
-                                    log::warn!("Distance calculation error: {e:?}");
-                                    distance_cache.insert(neighbor, f32::MAX);
-                                }
-                            };
-                        }
+                            }
+                            Err(e) => {
+                                log::warn!("Distance calculation error: {e:?}");
+                                distance_cache.insert(neighbor, f32::MAX);
+                            }
+                        };
                     }
                 }
             }
@@ -1108,6 +1332,9 @@ impl HnswIndex {
         strategy: SelectNeighborsStrategy,
         distance_cache: &mut FxHashMap<(u64, u64), f32>,
     ) -> Result<Vec<(u64, f32, u8)>, HnswError> {
+        if m == 0 {
+            return Ok(Vec::new());
+        }
         if candidates.len() <= m {
             return Ok(candidates);
         }
@@ -1117,7 +1344,8 @@ impl HnswIndex {
             SelectNeighborsStrategy::Simple => {
                 // Simple strategy: select m closest neighbors
                 let mut selected = candidates;
-                selected.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(cmp::Ordering::Equal));
+                selected
+                    .sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(cmp::Ordering::Equal));
                 selected.truncate(m);
                 Ok(selected)
             }
@@ -1126,7 +1354,8 @@ impl HnswIndex {
                 // Create candidate and result sets
                 let mut selected: Vec<(u64, f32, u8)> = Vec::with_capacity(m);
                 let mut remaining = candidates;
-                remaining.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(cmp::Ordering::Equal));
+                remaining
+                    .sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(cmp::Ordering::Equal));
 
                 // Add the first nearest neighbor
                 if !remaining.is_empty() {
@@ -1487,46 +1716,16 @@ impl HnswIndex {
         Ok(())
     }
 
-    /// Updates the entry point after a node deletion
-    ///
-    /// # Arguments
-    ///
-    /// * `deleted_node` - The node that was deleted
-    ///
-    /// # Returns
-    ///
-    /// * `Result<(), HnswError>` - Success or error
-    fn try_update_entry_point(&self, deleted_node: &HnswNode) {
-        let (_, mut max_layer) = {
-            let point = self.entry_point.read();
-            if point.0 != deleted_node.id {
-                return;
-            }
-            *point
-        };
-
+    /// Repairs the entry point by selecting the live node with the highest layer.
+    fn repair_entry_point(&self) -> u8 {
         let nodes = self.nodes.pin();
-        loop {
-            if let Some(neighbors) = deleted_node.neighbors.get(max_layer as usize) {
-                for &(neighbor, _) in neighbors {
-                    if let Some(neighbor_node) = nodes.get(&neighbor) {
-                        *self.entry_point.write() = (neighbor, neighbor_node.layer);
-                        return;
-                    }
-                }
-            }
-
-            if max_layer == 0 {
-                break;
-            }
-            max_layer -= 1;
-        }
-
-        if let Some((_, node)) = nodes.iter().next() {
+        let max_layer = if let Some((_, node)) = nodes.iter().max_by_key(|(_, node)| node.layer) {
             *self.entry_point.write() = (node.id, node.layer);
+            node.layer
         } else {
             *self.entry_point.write() = (0, 0);
-        }
+            0
+        };
 
         if log::log_enabled!(log::Level::Debug) {
             let entry_point = self.entry_point.read();
@@ -1536,6 +1735,8 @@ impl HnswIndex {
                 entry_point.1
             );
         }
+
+        max_layer
     }
 
     /// Updates the index metadata
@@ -1556,6 +1757,188 @@ impl HnswIndex {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn test_try_new_rejects_invalid_config() {
+        let result = HnswIndex::try_new(
+            "anda_db_hnsw".to_string(),
+            Some(HnswConfig {
+                dimension: 0,
+                ..Default::default()
+            }),
+        );
+        assert!(matches!(result, Err(HnswError::Generic { .. })));
+    }
+
+    #[test]
+    fn test_new_normalizes_runtime_config() {
+        let index = HnswIndex::new(
+            "anda_db_hnsw".to_string(),
+            Some(HnswConfig {
+                max_layers: 0,
+                max_connections: 1,
+                ef_construction: 0,
+                ef_search: 0,
+                scale_factor: Some(f64::NAN),
+                dimension: 2,
+                ..Default::default()
+            }),
+        );
+
+        let metadata = index.metadata();
+        assert_eq!(metadata.config.max_layers, 1);
+        assert_eq!(metadata.config.max_connections, 2);
+        assert_eq!(metadata.config.ef_construction, 1);
+        assert_eq!(metadata.config.ef_search, 1);
+        assert_eq!(metadata.config.scale_factor, None);
+        index.insert_f32(1, vec![1.0, 1.0], 0).unwrap();
+        assert_eq!(index.search_f32(&[1.0, 1.0], 1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_first_insert_advances_saved_empty_metadata_version() {
+        let config = HnswConfig {
+            dimension: 2,
+            ..Default::default()
+        };
+        let index = HnswIndex::new("anda_db_hnsw".to_string(), Some(config));
+
+        let mut metadata = Vec::new();
+        assert!(index.store_metadata(&mut metadata, 0).unwrap());
+        assert!(!index.store_metadata(Vec::new(), 0).unwrap());
+
+        index.insert_f32(1, vec![1.0, 1.0], 1).unwrap();
+
+        let mut metadata_after_insert = Vec::new();
+        assert!(index.store_metadata(&mut metadata_after_insert, 1).unwrap());
+        let loaded = HnswIndex::load_metadata(&metadata_after_insert[..]).unwrap();
+        assert_eq!(loaded.stats().version, 2);
+    }
+
+    #[tokio::test]
+    async fn test_load_nodes_removes_missing_ids() {
+        let config = HnswConfig {
+            dimension: 2,
+            ..Default::default()
+        };
+        let index = HnswIndex::new("anda_db_hnsw".to_string(), Some(config));
+        index.insert_f32(1, vec![1.0, 1.0], 0).unwrap();
+        index.insert_f32(2, vec![2.0, 2.0], 0).unwrap();
+
+        let mut metadata = Vec::new();
+        let mut ids = Vec::new();
+        let mut nodes: HashMap<u64, Vec<u8>> = HashMap::new();
+        index
+            .flush(&mut metadata, &mut ids, 0, async |id, data| {
+                nodes.insert(id, data.to_vec());
+                Ok(true)
+            })
+            .await
+            .unwrap();
+        nodes.remove(&2);
+
+        let loaded = HnswIndex::load_all(&metadata[..], &ids[..], async |id| {
+            Ok(nodes.get(&id).map(|data| data.to_vec()))
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded.node_ids(), vec![1]);
+        assert_eq!(loaded.search_f32(&[1.5, 1.5], 10).unwrap().len(), 1);
+        assert!(loaded.stats().version > index.stats().version);
+    }
+
+    #[test]
+    fn test_search_top_k_zero_is_fast_empty_result() {
+        let config = HnswConfig {
+            dimension: 2,
+            ..Default::default()
+        };
+        let index = HnswIndex::new("anda_db_hnsw".to_string(), Some(config));
+        index.insert_f32(1, vec![1.0, 1.0], 0).unwrap();
+
+        assert!(index.search_f32(&[1.0, 1.0], 0).unwrap().is_empty());
+        assert_eq!(index.stats().search_count, 0);
+    }
+
+    #[test]
+    fn test_remove_repairs_entry_point_and_max_layer() {
+        let config = HnswConfig {
+            dimension: 2,
+            ..Default::default()
+        };
+        let index = HnswIndex::new("anda_db_hnsw".to_string(), Some(config));
+        let nodes = index.nodes.pin();
+        nodes.insert(
+            1,
+            HnswNode {
+                id: 1,
+                layer: 3,
+                vector: vec![bf16::from_f32(1.0), bf16::from_f32(1.0)],
+                neighbors: vec![
+                    SmallVec::new(),
+                    SmallVec::new(),
+                    SmallVec::new(),
+                    SmallVec::new(),
+                ],
+                version: 1,
+            },
+        );
+        nodes.insert(
+            2,
+            HnswNode {
+                id: 2,
+                layer: 1,
+                vector: vec![bf16::from_f32(2.0), bf16::from_f32(2.0)],
+                neighbors: vec![SmallVec::new(), SmallVec::new()],
+                version: 1,
+            },
+        );
+        index.ids.write().add(1);
+        index.ids.write().add(2);
+        *index.entry_point.write() = (1, 3);
+        index.update_metadata(|metadata| metadata.stats.max_layer = 3);
+
+        assert!(index.remove(1, 0));
+        assert_eq!(*index.entry_point.read(), (2, 1));
+        assert_eq!(index.stats().max_layer, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_concurrent_duplicate_insert_only_one_succeeds() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Barrier;
+
+        let config = HnswConfig {
+            dimension: 2,
+            ..Default::default()
+        };
+        let index = Arc::new(HnswIndex::new("anda_db_hnsw".to_string(), Some(config)));
+        let barrier = Arc::new(Barrier::new(16));
+        let successes = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+
+        for _ in 0..16 {
+            let index = Arc::clone(&index);
+            let barrier = Arc::clone(&barrier);
+            let successes = Arc::clone(&successes);
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                if index.insert_f32(1, vec![1.0, 1.0], 0).is_ok() {
+                    successes.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+
+        for result in futures::future::join_all(handles).await {
+            result.unwrap();
+        }
+        assert_eq!(successes.load(Ordering::Relaxed), 1);
+        assert_eq!(index.len(), 1);
+        assert_eq!(index.stats().insert_count, 1);
+    }
 
     #[tokio::test]
     async fn test_hnsw_basic() {

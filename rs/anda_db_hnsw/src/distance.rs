@@ -115,6 +115,13 @@ impl LayerGen {
     ///
     /// * `LayerGen` - New layer generator
     pub fn new_with_scale(max_connections: u8, scale_factor: f64, max_level: u8) -> Self {
+        let max_connections = max_connections.max(2);
+        let max_level = max_level.max(1);
+        let scale_factor = if scale_factor.is_finite() && scale_factor > 0.0 {
+            scale_factor
+        } else {
+            1.0
+        };
         let base_scale = 1.0 / (max_connections as f64).ln();
         LayerGen {
             uniform: Uniform::<f64>::new(0.0, 1.0).unwrap(),
@@ -137,13 +144,15 @@ impl LayerGen {
     /// * `u8` - Generated layer
     pub fn generate(&self, current_max_layer: u8) -> u8 {
         let mut r = rng();
-        let val = r.sample(self.uniform);
+        let val = r.sample(self.uniform).max(f64::MIN_POSITIVE);
 
         // Sample l = ⌊−ln(u) · scale⌋ from an exponential distribution.
         let level = (-val.ln() * self.scale).floor() as u8;
 
         // Clamp into the valid range; never skip more than one layer at a time.
-        level.min(current_max_layer + 1).min(self.max_level - 1)
+        level
+            .min(current_max_layer.saturating_add(1))
+            .min(self.max_level.saturating_sub(1))
     }
 }
 
@@ -172,7 +181,7 @@ fn cosine_distance_f32(a: &[f32], b: &[f32]) -> f32 {
     if norm_a < f32::EPSILON || norm_b < f32::EPSILON {
         return 1.0;
     }
-    1.0 - (dot / (norm_a * norm_b))
+    1.0 - (dot / (norm_a * norm_b)).clamp(-1.0, 1.0)
 }
 
 #[inline]
@@ -220,7 +229,7 @@ fn cosine_distance_bf16(a: &[bf16], b: &[bf16]) -> f32 {
     if norm_a < f32::EPSILON || norm_b < f32::EPSILON {
         return 1.0;
     }
-    1.0 - (dot / (norm_a * norm_b))
+    1.0 - (dot / (norm_a * norm_b)).clamp(-1.0, 1.0)
 }
 
 #[inline]
