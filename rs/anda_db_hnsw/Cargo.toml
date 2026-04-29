@@ -12,7 +12,7 @@ license.workspace = true
 [dependencies]
 ciborium = { workspace = true }
 croaring = { workspace = true }
-futures = { workspace = true }
+futures = { workspace = true, features = ["alloc"] }
 rand = { workspace = true, features = ["thread_rng"] }
 ordered-float = { workspace = true }
 half = { workspace = true }
@@ -26,7 +26,6 @@ rustc-hash = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
-futures = { workspace = true, features = ["alloc"] }
 structured-logger = { workspace = true }
 # https://github.com/rust-ndarray/ndarray?tab=readme-ov-file#how-to-enable-blas-integration
 # ndarray = { workspace = true, features = ["blas"] }
