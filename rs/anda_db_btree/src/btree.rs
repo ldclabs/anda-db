@@ -408,6 +408,55 @@ where
         }
     }
 
+    fn remove_btree_key_if_posting_absent(&self, field_value: &FV) {
+        let mut btree = self.btree.write();
+        if !self.postings.contains_key(field_value) {
+            btree.remove(field_value);
+        }
+    }
+
+    fn range_query_seed_rank(query: &RangeQuery<FV>) -> u8 {
+        match query {
+            RangeQuery::Eq(_) => 0,
+            RangeQuery::Between(start_key, end_key) if start_key > end_key => 0,
+            RangeQuery::Include(keys) if keys.is_empty() => 0,
+            RangeQuery::Include(_) => 1,
+            RangeQuery::Between(_, _) => 2,
+            RangeQuery::Gt(_) | RangeQuery::Ge(_) | RangeQuery::Lt(_) | RangeQuery::Le(_) => 3,
+            RangeQuery::And(queries) => queries
+                .iter()
+                .map(|query| Self::range_query_seed_rank(query))
+                .min()
+                .unwrap_or(0),
+            RangeQuery::Or(_) => 4,
+            RangeQuery::Not(_) => 5,
+        }
+    }
+
+    fn range_key_matches_query(key: &FV, query: &RangeQuery<FV>) -> bool {
+        match query {
+            RangeQuery::Eq(value) => key == value,
+            RangeQuery::Gt(start_key) => key > start_key,
+            RangeQuery::Ge(start_key) => key >= start_key,
+            RangeQuery::Lt(end_key) => key < end_key,
+            RangeQuery::Le(end_key) => key <= end_key,
+            RangeQuery::Between(start_key, end_key) => {
+                start_key <= end_key && key >= start_key && key <= end_key
+            }
+            RangeQuery::Include(keys) => keys.iter().any(|value| value == key),
+            RangeQuery::Or(queries) => queries
+                .iter()
+                .any(|query| Self::range_key_matches_query(key, query)),
+            RangeQuery::And(queries) => {
+                !queries.is_empty()
+                    && queries
+                        .iter()
+                        .all(|query| Self::range_key_matches_query(key, query))
+            }
+            RangeQuery::Not(query) => !Self::range_key_matches_query(key, query),
+        }
+    }
+
     /// Creates a new empty B-tree index with the given configuration
     ///
     /// # Arguments
@@ -604,11 +653,13 @@ where
         // Calculate the size increase for this insertion
         let mut is_new = false;
         let mut size_increase = 0;
+        let mut previous_posting_size = 0;
         let mut target_bucket = bucket;
         match self.postings.entry(field_value.clone()) {
             dashmap::Entry::Occupied(mut entry) => {
                 let posting = entry.get_mut();
                 target_bucket = posting.0;
+                let posting_size_before_update = estimate_cbor_size(&*posting) + 2;
 
                 // Unique index semantics: allow idempotent insert of the same (doc_id, field_value)
                 // while rejecting a different doc_id for an existing field_value.
@@ -623,6 +674,7 @@ where
                 // Add doc_id if it doesn't exist
                 if posting.2.push(doc_id.clone()) {
                     size_increase = estimate_cbor_size(&doc_id) + 2;
+                    previous_posting_size = posting_size_before_update;
                     posting.1 += 1; // increment version
                 }
             }
@@ -658,20 +710,28 @@ where
                 b.2.push(field_value.clone());
             } else {
                 // If the current bucket is full, create a new one
-                let mut size_decrease = 0;
+                let mut source_size_decrease = 0;
                 new_bucket = self.max_bucket_id.fetch_add(1, Ordering::Relaxed) + 1;
                 {
                     if let Some(mut posting) = self.postings.get_mut(&field_value) {
                         // Update the posting's bucket ID
                         posting.0 = new_bucket;
-                        size_decrease = estimate_cbor_size(&posting) + 2;
-                        size_increase = size_decrease;
+                        let migrated_posting_size = estimate_cbor_size(&posting) + 2;
+                        source_size_decrease = if previous_posting_size > 0 {
+                            previous_posting_size
+                        } else {
+                            migrated_posting_size
+                        };
+                        size_increase = migrated_posting_size;
+                    } else {
+                        size_increase = 0;
+                        new_bucket = 0;
                     }
                 }
                 // Remove the current field value from the current bucket
                 // The freed space can still accommodate small growth in other field values
                 if b.2.swap_remove_if(|k| &field_value == k).is_some() {
-                    b.0 = b.0.saturating_sub(size_decrease);
+                    b.0 = b.0.saturating_sub(source_size_decrease);
                     // Source bucket must be marked dirty, otherwise stale on-disk
                     // entries may survive and be resurrected after restart.
                     self.mark_bucket_dirty(&mut b);
@@ -720,7 +780,8 @@ where
     /// * `bool` - `true` if the document_id-field_value pair was successfully removed, `false` otherwise
     pub fn remove(&self, doc_id: PK, field_value: FV, now_ms: u64) -> bool {
         let mut removed = false;
-        let mut size_decrease = 0;
+        let mut doc_size_decrease = 0;
+        let mut full_size_decrease = 0;
         let mut posting_empty = false;
         let mut bucket_id = 0;
 
@@ -732,27 +793,14 @@ where
                     removed = true;
                     posting.1 += 1; // increment version
                     posting_empty = posting.2.is_empty();
-                    size_decrease = if posting_empty {
-                        prev_posting_size
-                    } else {
-                        estimate_cbor_size(&doc_id) + 2
-                    };
+                    doc_size_decrease = estimate_cbor_size(&doc_id) + 2;
+                    full_size_decrease = prev_posting_size;
                 }
             }
         }
 
         if removed {
-            // Update the bucket state
-            if let Some(mut b) = self.buckets.get_mut(&bucket_id) {
-                b.0 = b.0.saturating_sub(size_decrease);
-                self.mark_bucket_dirty(&mut b);
-
-                if posting_empty {
-                    // remove FV from the bucket
-                    b.2.swap_remove_if(|k| &field_value == k);
-                }
-            }
-
+            let mut entry_removed = false;
             if posting_empty {
                 // Atomically check-and-remove: only remove if the posting is still empty.
                 // Between dropping the `get_mut` above and here, a concurrent `insert`
@@ -761,7 +809,34 @@ where
                     && entry.get().2.is_empty()
                 {
                     entry.remove();
-                    self.btree.write().remove(&field_value);
+                    entry_removed = true;
+                }
+
+                if entry_removed {
+                    self.remove_btree_key_if_posting_absent(&field_value);
+                }
+            }
+
+            let size_decrease = if entry_removed {
+                full_size_decrease
+            } else {
+                doc_size_decrease
+            };
+
+            // Update the bucket state
+            if let Some(mut b) = self.buckets.get_mut(&bucket_id) {
+                b.0 = b.0.saturating_sub(size_decrease);
+                self.mark_bucket_dirty(&mut b);
+
+                if entry_removed {
+                    // remove FV from the bucket
+                    let remove_from_bucket = match self.postings.get(&field_value) {
+                        Some(posting) => posting.0 != bucket_id,
+                        None => true,
+                    };
+                    if remove_from_bucket {
+                        b.2.swap_remove_if(|k| &field_value == k);
+                    }
                 }
             }
 
@@ -1039,15 +1114,15 @@ where
 
         // Track removal statistics
         let mut removed_count = 0;
-        // Track which buckets were modified
-        let mut bucket_updates: FxHashMap<u32, (usize, FxHashSet<FV>)> = FxHashMap::default();
-        // Track which field values are completely removed
-        let mut values_to_remove = Vec::new();
+        // Track removals until we know whether empty postings were fully removed
+        // or concurrently re-populated.
+        let mut pending_removals = Vec::new();
 
         // First pass: collect which postings to modify
         for field_value in field_values {
             let mut removed = false;
-            let mut size_decrease = 0;
+            let mut doc_size_decrease = 0;
+            let mut full_size_decrease = 0;
             let mut posting_empty = false;
             let mut bucket_id = 0;
 
@@ -1064,47 +1139,56 @@ where
                     posting_empty = posting.2.is_empty();
 
                     // Calculate size decrease based on whether this key is fully removed.
-                    size_decrease = if posting_empty {
-                        prev_posting_size
-                    } else {
-                        estimate_cbor_size(&doc_id) + 2
-                    };
+                    doc_size_decrease = estimate_cbor_size(&doc_id) + 2;
+                    full_size_decrease = prev_posting_size;
                 }
             }
 
             if removed {
-                // If posting is now empty, mark for removal
-                if posting_empty {
-                    values_to_remove.push(field_value.clone());
-                }
-
-                // Update bucket tracking
-                let bucket_entry = bucket_updates
-                    .entry(bucket_id)
-                    .or_insert_with(|| (0, FxHashSet::default()));
-                bucket_entry.0 += size_decrease;
-                bucket_entry.1.insert(field_value);
-
+                pending_removals.push((
+                    field_value,
+                    bucket_id,
+                    doc_size_decrease,
+                    full_size_decrease,
+                    posting_empty,
+                ));
                 removed_count += 1;
             }
         }
 
-        // Remove empty postings from the index and B-tree.
+        // Remove empty postings from the index.
         // Use atomic check-and-remove: a concurrent `insert` might have re-populated
         // a posting between the first pass and here, so only remove if still empty.
-        let mut actually_removed = FxHashSet::default();
-        for value in &values_to_remove {
-            if let dashmap::Entry::Occupied(entry) = self.postings.entry(value.clone())
+        let mut entries_removed = FxHashSet::default();
+        let mut bucket_updates: FxHashMap<u32, (usize, FxHashSet<FV>)> = FxHashMap::default();
+        for (field_value, bucket_id, doc_size_decrease, full_size_decrease, posting_empty) in
+            pending_removals
+        {
+            let mut entry_removed = false;
+            if posting_empty
+                && let dashmap::Entry::Occupied(entry) = self.postings.entry(field_value.clone())
                 && entry.get().2.is_empty()
             {
                 entry.remove();
-                actually_removed.insert(value.clone());
+                entry_removed = true;
+                entries_removed.insert(field_value.clone());
             }
+
+            let size_decrease = if entry_removed {
+                full_size_decrease
+            } else {
+                doc_size_decrease
+            };
+            let bucket_entry = bucket_updates
+                .entry(bucket_id)
+                .or_insert_with(|| (0, FxHashSet::default()));
+            bucket_entry.0 += size_decrease;
+            bucket_entry.1.insert(field_value);
         }
-        if !actually_removed.is_empty() {
-            let mut btree = self.btree.write();
-            for value in &actually_removed {
-                btree.remove(value);
+
+        if !entries_removed.is_empty() {
+            for value in &entries_removed {
+                self.remove_btree_key_if_posting_absent(value);
             }
         }
 
@@ -1116,8 +1200,14 @@ where
 
                 // Remove field values that are completely removed
                 for fv in &field_values {
-                    if actually_removed.contains(fv) {
-                        bucket.2.swap_remove_if(|k| k == fv);
+                    if entries_removed.contains(fv) {
+                        let remove_from_bucket = match self.postings.get(fv) {
+                            Some(posting) => posting.0 != bucket_id,
+                            None => true,
+                        };
+                        if remove_from_bucket {
+                            bucket.2.swap_remove_if(|k| k == fv);
+                        }
                     }
                 }
             }
@@ -1459,7 +1549,9 @@ where
                 );
             }
             RangeQuery::Between(start_key, end_key) => {
-                results.extend(self.btree.read().range(start_key..=end_key).cloned());
+                if start_key <= end_key {
+                    results.extend(self.btree.read().range(start_key..=end_key).cloned());
+                }
             }
             RangeQuery::Include(keys) => {
                 let keys = BTreeSet::from_iter(keys);
@@ -1467,21 +1559,29 @@ where
                 results.extend(keys.into_iter().filter(|k| btree.contains(k)));
             }
             RangeQuery::And(queries) => {
-                let mut iter = queries.into_iter();
-                if let Some(query) = iter.next() {
-                    let mut intersection: BTreeSet<FV> =
-                        self.range_keys(*query).into_iter().collect();
-
-                    for query in iter {
-                        let keys: FxHashSet<FV> = self.range_keys(*query).into_iter().collect();
-                        intersection.retain(|k| keys.contains(k));
-                        if intersection.is_empty() {
-                            return vec![];
-                        }
-                    }
-
-                    results.extend(intersection);
+                if queries.is_empty() {
+                    return results;
                 }
+
+                let mut queries = queries;
+                let seed_index = queries
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, query)| Self::range_query_seed_rank(query))
+                    .map(|(index, _)| index)
+                    .unwrap_or(0);
+                let seed_query = *queries.swap_remove(seed_index);
+                let mut intersection: BTreeSet<FV> =
+                    self.range_keys(seed_query).into_iter().collect();
+
+                for query in queries {
+                    intersection.retain(|key| Self::range_key_matches_query(key, &query));
+                    if intersection.is_empty() {
+                        return vec![];
+                    }
+                }
+
+                results.extend(intersection);
             }
             RangeQuery::Or(queries) => {
                 // Use BTreeSet to ensure keys are returned in global B-tree order,
@@ -2399,6 +2499,37 @@ mod tests {
         assert!(!keys.contains(&apple));
         assert!(keys.contains(&banana));
         assert!(keys.contains(&cherry));
+    }
+
+    #[test]
+    fn test_range_keys_invalid_between_inside_logical_queries() {
+        let index = create_populated_index();
+
+        let invalid_between = RangeQuery::Between("date".to_string(), "banana".to_string());
+
+        let results = index.range_query_with(
+            RangeQuery::Or(vec![
+                Box::new(invalid_between.clone()),
+                Box::new(RangeQuery::Eq("apple".to_string())),
+            ]),
+            |key, _| (true, vec![key.clone()]),
+        );
+        assert_eq!(results, vec!["apple"]);
+
+        let results = index.range_query_with(
+            RangeQuery::And(vec![
+                Box::new(RangeQuery::Ge("apple".to_string())),
+                Box::new(invalid_between.clone()),
+            ]),
+            |key, _| (true, vec![key.clone()]),
+        );
+        assert!(results.is_empty());
+
+        let results = index
+            .range_query_with(RangeQuery::Not(Box::new(invalid_between)), |key, _| {
+                (true, vec![key.clone()])
+            });
+        assert_eq!(results, index.keys(None, None));
     }
 
     #[test]
@@ -3453,6 +3584,44 @@ mod tests {
             "bucket size should grow when doc_ids are appended via insert_array \
              (initial={initial_size}, after={grown_size})"
         );
+    }
+
+    #[test]
+    fn test_insert_migration_subtracts_previous_posting_size_from_source_bucket() {
+        let config = BTreeConfig {
+            bucket_overload_size: 128,
+            allow_duplicates: true,
+        };
+        let index: BTreeIndex<u64, String> =
+            BTreeIndex::new("single_insert_migration_size".to_string(), Some(config));
+
+        index.insert(1, "anchor".to_string(), now_ms()).unwrap();
+        index.insert(1, "moving".to_string(), now_ms()).unwrap();
+
+        let moving_key = "moving".to_string();
+        let previous_posting_size = {
+            let posting = index.postings.get(&moving_key).unwrap();
+            estimate_cbor_size(&*posting) + 2
+        };
+
+        let forced_source_size = {
+            let mut bucket = index.buckets.get_mut(&0).unwrap();
+            bucket.0 = index.config.bucket_overload_size - 1;
+            bucket.0
+        };
+
+        index.insert(2, moving_key.clone(), now_ms()).unwrap();
+
+        let moved_posting = index.postings.get(&moving_key).unwrap();
+        assert_ne!(moved_posting.0, 0, "posting should migrate to a new bucket");
+
+        let source_bucket = index.buckets.get(&0).unwrap();
+        assert_eq!(
+            source_bucket.0,
+            forced_source_size.saturating_sub(previous_posting_size),
+            "source bucket must subtract the posting size before the appended doc_id"
+        );
+        assert!(!source_bucket.2.contains(&moving_key));
     }
 
     #[tokio::test]
