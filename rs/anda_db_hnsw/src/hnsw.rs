@@ -1566,6 +1566,13 @@ impl HnswIndex {
         !self.dirty_nodes.read().is_empty()
     }
 
+    /// Returns whether metadata has a newer logical version than the last
+    /// serialized metadata snapshot.
+    pub fn has_pending_metadata_flush(&self) -> bool {
+        let current_version = { self.metadata.read().stats.version };
+        self.last_saved_version.load(Ordering::Acquire) < current_version
+    }
+
     /// Stores the index metadata to a writer in CBOR format.
     ///
     /// # Arguments

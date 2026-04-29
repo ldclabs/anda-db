@@ -1727,15 +1727,16 @@ impl Collection {
         // failure here keeps the document visible (and recoverable) rather
         // than producing an orphan beyond the auto-repair scan window.
         if doc.is_some()
-            && let Err(err) = self.storage.delete(&path).await {
-                log::error!(
-                    action = "Collection::remove",
-                    collection = self.name,
-                    doc_id = id;
-                    "Failed to delete document from storage: {err:?}",
-                );
-                return Err(err);
-            }
+            && let Err(err) = self.storage.delete(&path).await
+        {
+            log::error!(
+                action = "Collection::remove",
+                collection = self.name,
+                doc_id = id;
+                "Failed to delete document from storage: {err:?}",
+            );
+            return Err(err);
+        }
 
         // Phase 3: finalise by updating the in-memory bitmap. Locks are taken
         // in the same order as add()/auto_repair_indexes() to avoid deadlocks.
@@ -1778,9 +1779,13 @@ impl Collection {
             })
             .buffered(8);
         while let Some(result) = stream.next().await {
-            if let Ok((doc, _)) = result {
-                let doc = Document::try_from_doc(schema.clone(), doc)?;
-                docs.push(doc);
+            match result {
+                Ok((doc, _)) => {
+                    let doc = Document::try_from_doc(schema.clone(), doc)?;
+                    docs.push(doc);
+                }
+                Err(DBError::NotFound { .. }) => {}
+                Err(err) => return Err(err),
             }
         }
         Ok(docs)
@@ -1933,9 +1938,13 @@ impl Collection {
             self.get_count.fetch_add(1, Ordering::Relaxed);
 
             let path = Self::doc_path(id);
-            if let Ok((doc, _)) = self.storage.get::<DocumentOwned>(&path).await {
-                let doc = Document::try_from_doc(self.schema(), doc)?;
-                return Ok(doc);
+            match self.storage.get::<DocumentOwned>(&path).await {
+                Ok((doc, _)) => {
+                    let doc = Document::try_from_doc(self.schema(), doc)?;
+                    return Ok(doc);
+                }
+                Err(DBError::NotFound { .. }) => {}
+                Err(err) => return Err(err),
             }
         }
 
@@ -2297,12 +2306,13 @@ mod tests {
         index::HnswConfig,
         query::{Filter, Query, RangeQuery, Search},
         schema::{AndaDBSchema, Document, Fv, Json, Schema, Vector},
-        storage::StorageConfig,
+        storage::{PutMode, StorageConfig},
     };
+    use bytes::Bytes;
     use ic_auth_types::ByteArrayB64;
     use object_store::memory::InMemory;
     use serde::{Deserialize, Serialize};
-    use std::{collections::BTreeMap, sync::Arc};
+    use std::{borrow::Cow, collections::BTreeMap, sync::Arc};
 
     // 测试用的文档结构
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, AndaDBSchema)]
@@ -2367,6 +2377,25 @@ mod tests {
                 .into_iter()
                 .map(bf16::from_f32)
                 .collect(),
+        }
+    }
+
+    struct BadArrayBTreeHooks;
+
+    impl IndexHooks for BadArrayBTreeHooks {
+        fn btree_index_value<'a>(&self, index: &BTree, doc: &'a Document) -> Option<Cow<'a, Fv>> {
+            if index.name() == "tags" {
+                return Some(Cow::Owned(Fv::Array(vec![
+                    Fv::Text("valid".to_string()),
+                    Fv::I64(42),
+                ])));
+            }
+
+            match index.virtual_field() {
+                [] => None,
+                [name] => doc.get_field(name).map(Cow::Borrowed),
+                _ => None,
+            }
         }
     }
 
@@ -3200,6 +3229,62 @@ mod tests {
             .await;
 
         assert!(result.is_err());
+
+        db.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_and_search_propagate_corrupt_document_errors() -> Result<(), DBError> {
+        let db = setup_test_db().await?;
+        let collection = create_test_collection(&db, async |_| Ok(())).await?;
+
+        let doc = create_test_doc(0, "Alice", 30, vec!["smart"]);
+        let id = collection.add_from(&doc).await?;
+        collection
+            .storage
+            .put_bytes(
+                &Collection::doc_path(id),
+                Bytes::from_static(b"not valid cbor"),
+                PutMode::Overwrite,
+            )
+            .await?;
+
+        let err = collection.get(id).await.unwrap_err();
+        assert!(matches!(err, DBError::Serialization { .. }));
+
+        let err = collection
+            .search(Query {
+                filter: Some(Filter::Field((
+                    Schema::ID_KEY.to_string(),
+                    RangeQuery::Eq(Fv::U64(id)),
+                ))),
+                limit: Some(1),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DBError::Serialization { .. }));
+
+        db.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_btree_array_index_rejects_mismatched_hook_values() -> Result<(), DBError> {
+        let db = setup_test_db().await?;
+        let collection = create_test_collection(&db, async |collection| {
+            collection.create_btree_index_nx(&["tags"]).await?;
+            collection.set_index_hooks(Arc::new(BadArrayBTreeHooks));
+            Ok(())
+        })
+        .await?;
+
+        let doc = create_test_doc(0, "Alice", 30, vec!["smart"]);
+        let doc = Document::try_from(collection.schema(), &doc)?;
+        let err = collection.add(doc).await.unwrap_err();
+        assert!(matches!(err, DBError::Index { .. }));
+        assert!(collection.is_empty());
 
         db.close().await?;
         Ok(())

@@ -1649,6 +1649,13 @@ where
         self.dirty_bucket_count.load(Ordering::Acquire) > 0
     }
 
+    /// Returns whether metadata has a newer logical version than the last
+    /// serialized metadata snapshot.
+    pub fn has_pending_metadata_flush(&self) -> bool {
+        let current_version = { self.metadata.read().stats.version };
+        self.last_saved_version.load(Ordering::Acquire) < current_version
+    }
+
     /// Compacts fragmented buckets by re-binning all field values into fewer, properly-sized
     /// buckets using a first-fit-decreasing bin-packing strategy.
     ///

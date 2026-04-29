@@ -11,7 +11,7 @@ pub use anda_db_btree::{BTreeConfig, BTreeMetadata, BTreeStats, RangeQuery};
 use super::from_virtual_field_name;
 use crate::{
     error::DBError,
-    schema::{DocumentId, Fe, Ft, Fv},
+    schema::{BoxError, DocumentId, Fe, Ft, Fv},
     storage::{ObjectVersion, PutMode, Storage},
     unix_ms,
 };
@@ -269,6 +269,23 @@ impl BTree {
         }
     }
 
+    fn convert_array_values<FV, I>(&self, field_values: I) -> Result<Vec<FV>, DBError>
+    where
+        I: IntoIterator<Item = Fv>,
+        FV: TryFrom<Fv, Error = BoxError>,
+    {
+        let name = self.name().to_string();
+        field_values
+            .into_iter()
+            .map(|val| {
+                FV::try_from(val).map_err(|source| DBError::Index {
+                    name: name.clone(),
+                    source,
+                })
+            })
+            .collect()
+    }
+
     pub fn insert(
         &self,
         doc_id: DocumentId,
@@ -325,40 +342,28 @@ impl BTree {
     ) -> Result<usize, DBError> {
         match &self {
             BTree::I64(btree) => {
-                let values: Vec<i64> = field_values
-                    .into_iter()
-                    .filter_map(|val| val.try_into().ok())
-                    .collect();
+                let values = self.convert_array_values::<i64, _>(field_values)?;
                 btree
                     .index
                     .insert_array(doc_id, values, now_ms)
                     .map_err(DBError::from)
             }
             BTree::U64(btree) => {
-                let values: Vec<u64> = field_values
-                    .into_iter()
-                    .filter_map(|val| val.try_into().ok())
-                    .collect();
+                let values = self.convert_array_values::<u64, _>(field_values)?;
                 btree
                     .index
                     .insert_array(doc_id, values, now_ms)
                     .map_err(DBError::from)
             }
             BTree::String(btree) => {
-                let values: Vec<String> = field_values
-                    .into_iter()
-                    .filter_map(|val| val.try_into().ok())
-                    .collect();
+                let values = self.convert_array_values::<String, _>(field_values)?;
                 btree
                     .index
                     .insert_array(doc_id, values, now_ms)
                     .map_err(DBError::from)
             }
             BTree::Bytes(btree) => {
-                let values: Vec<Vec<u8>> = field_values
-                    .into_iter()
-                    .filter_map(|val| val.try_into().ok())
-                    .collect();
+                let values = self.convert_array_values::<Vec<u8>, _>(field_values)?;
                 btree
                     .index
                     .insert_array(doc_id, values, now_ms)
@@ -458,31 +463,19 @@ impl BTree {
     ) -> Result<usize, DBError> {
         match &self {
             BTree::I64(btree) => {
-                let values: Vec<i64> = field_values
-                    .into_iter()
-                    .filter_map(|val| val.try_into().ok())
-                    .collect();
+                let values = self.convert_array_values::<i64, _>(field_values)?;
                 Ok(btree.index.remove_array(doc_id, values, now_ms))
             }
             BTree::U64(btree) => {
-                let values: Vec<u64> = field_values
-                    .into_iter()
-                    .filter_map(|val| val.try_into().ok())
-                    .collect();
+                let values = self.convert_array_values::<u64, _>(field_values)?;
                 Ok(btree.index.remove_array(doc_id, values, now_ms))
             }
             BTree::String(btree) => {
-                let values: Vec<String> = field_values
-                    .into_iter()
-                    .filter_map(|val| val.try_into().ok())
-                    .collect();
+                let values = self.convert_array_values::<String, _>(field_values)?;
                 Ok(btree.index.remove_array(doc_id, values, now_ms))
             }
             BTree::Bytes(btree) => {
-                let values: Vec<Vec<u8>> = field_values
-                    .into_iter()
-                    .filter_map(|val| val.try_into().ok())
-                    .collect();
+                let values = self.convert_array_values::<Vec<u8>, _>(field_values)?;
                 Ok(btree.index.remove_array(doc_id, values, now_ms))
             }
         }
@@ -497,53 +490,37 @@ impl BTree {
     ) -> Result<(usize, usize), DBError> {
         match &self {
             BTree::I64(btree) => {
-                let old_field_values: Vec<i64> = old_field_values
-                    .iter()
-                    .filter_map(|val| val.try_into().ok())
-                    .collect();
-                let new_field_values: Vec<i64> = new_field_values
-                    .iter()
-                    .filter_map(|val| val.try_into().ok())
-                    .collect();
+                let old_field_values =
+                    self.convert_array_values::<i64, _>(old_field_values.iter().cloned())?;
+                let new_field_values =
+                    self.convert_array_values::<i64, _>(new_field_values.iter().cloned())?;
                 Ok(btree
                     .index
                     .batch_update(doc_id, old_field_values, new_field_values, now_ms)?)
             }
             BTree::U64(btree) => {
-                let old_field_values: Vec<u64> = old_field_values
-                    .iter()
-                    .filter_map(|val| val.try_into().ok())
-                    .collect();
-                let new_field_values: Vec<u64> = new_field_values
-                    .iter()
-                    .filter_map(|val| val.try_into().ok())
-                    .collect();
+                let old_field_values =
+                    self.convert_array_values::<u64, _>(old_field_values.iter().cloned())?;
+                let new_field_values =
+                    self.convert_array_values::<u64, _>(new_field_values.iter().cloned())?;
                 Ok(btree
                     .index
                     .batch_update(doc_id, old_field_values, new_field_values, now_ms)?)
             }
             BTree::String(btree) => {
-                let old_field_values: Vec<String> = old_field_values
-                    .iter()
-                    .filter_map(|val| val.clone().try_into().ok())
-                    .collect();
-                let new_field_values: Vec<String> = new_field_values
-                    .iter()
-                    .filter_map(|val| val.clone().try_into().ok())
-                    .collect();
+                let old_field_values =
+                    self.convert_array_values::<String, _>(old_field_values.iter().cloned())?;
+                let new_field_values =
+                    self.convert_array_values::<String, _>(new_field_values.iter().cloned())?;
                 Ok(btree
                     .index
                     .batch_update(doc_id, old_field_values, new_field_values, now_ms)?)
             }
             BTree::Bytes(btree) => {
-                let old_field_values: Vec<Vec<u8>> = old_field_values
-                    .iter()
-                    .filter_map(|val| val.clone().try_into().ok())
-                    .collect();
-                let new_field_values: Vec<Vec<u8>> = new_field_values
-                    .iter()
-                    .filter_map(|val| val.clone().try_into().ok())
-                    .collect();
+                let old_field_values =
+                    self.convert_array_values::<Vec<u8>, _>(old_field_values.iter().cloned())?;
+                let new_field_values =
+                    self.convert_array_values::<Vec<u8>, _>(new_field_values.iter().cloned())?;
                 Ok(btree
                     .index
                     .batch_update(doc_id, old_field_values, new_field_values, now_ms)?)
@@ -813,7 +790,6 @@ where
             return true;
         }
 
-        let stats = self.index.stats();
-        stats.version > stats.last_saved
+        self.index.has_pending_metadata_flush()
     }
 }

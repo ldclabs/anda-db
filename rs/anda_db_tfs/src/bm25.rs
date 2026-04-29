@@ -1023,6 +1023,13 @@ where
         self.buckets.iter().any(|b| b.is_dirty())
     }
 
+    /// Returns whether metadata has a newer logical version than the last
+    /// serialized metadata snapshot.
+    pub fn has_pending_metadata_flush(&self) -> bool {
+        let current_version = { self.metadata.read().stats.version };
+        self.last_saved_version.load(Ordering::Acquire) < current_version
+    }
+
     /// Repacks all tokens into a minimal set of buckets.
     ///
     /// Over the lifetime of an index — especially before bug fixes that tuned

@@ -165,8 +165,7 @@ impl Hnsw {
             return true;
         }
 
-        let stats = self.index.stats();
-        stats.version > stats.last_saved
+        self.index.has_pending_metadata_flush()
     }
 
     pub fn name(&self) -> &str {
