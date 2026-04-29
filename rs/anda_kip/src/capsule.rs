@@ -82,8 +82,22 @@ mod tests {
         let genesis = parse_kip(GENESIS_KIP).expect("Failed to parse Genesis capsule");
         println!("Genesis Capsule: {:#?}", genesis);
 
+        let event_type = parse_kip(EVENT_KIP).expect("Failed to parse Event type capsule");
+        println!("Event Type Capsule: {:#?}", event_type);
+
+        let insight_type = parse_kip(INSIGHT_KIP).expect("Failed to parse Insight type capsule");
+        println!("Insight Type Capsule: {:#?}", insight_type);
+
         let person_type = parse_kip(PERSON_KIP).expect("Failed to parse Person type capsule");
         println!("Person Type Capsule: {:#?}", person_type);
+
+        let preference_type =
+            parse_kip(PREFERENCE_KIP).expect("Failed to parse Preference type capsule");
+        println!("Preference Type Capsule: {:#?}", preference_type);
+
+        let sleep_task_type =
+            parse_kip(SLEEP_TASK_KIP).expect("Failed to parse SleepTask type capsule");
+        println!("SleepTask Type Capsule: {:#?}", sleep_task_type);
 
         let person_self = parse_kip(PERSON_SELF_KIP).expect("Failed to parse Self person capsule");
         println!("Self Capsule: {:#?}", person_self);

@@ -189,6 +189,7 @@ impl Request {
         let mut index = 0;
         let mut in_string = false;
         let mut escaped = false;
+        let mut in_line_comment = false;
 
         while index < command.len() {
             let ch = command[index..]
@@ -196,6 +197,15 @@ impl Request {
                 .next()
                 .expect("valid char boundary");
             let ch_len = ch.len_utf8();
+
+            if in_line_comment {
+                result.push_str(&command[index..index + ch_len]);
+                if ch == '\n' {
+                    in_line_comment = false;
+                }
+                index += ch_len;
+                continue;
+            }
 
             if in_string {
                 result.push_str(&command[index..index + ch_len]);
@@ -206,6 +216,13 @@ impl Request {
                 } else if ch == '"' {
                     in_string = false;
                 }
+                index += ch_len;
+                continue;
+            }
+
+            if ch == '/' && bytes.get(index + 1) == Some(&b'/') {
+                in_line_comment = true;
+                result.push(ch);
                 index += ch_len;
                 continue;
             }
@@ -310,8 +327,16 @@ impl Request {
         let mut chars = command.char_indices().peekable();
         let mut in_string = false;
         let mut escaped = false;
+        let mut in_line_comment = false;
 
         while let Some((pos, ch)) = chars.next() {
+            if in_line_comment {
+                if ch == '\n' {
+                    in_line_comment = false;
+                }
+                continue;
+            }
+
             if in_string {
                 if escaped {
                     escaped = false;
@@ -348,6 +373,8 @@ impl Request {
                         warnings.push((name, pos));
                     }
                 }
+            } else if ch == '/' && chars.peek().is_some_and(|(_, next)| *next == '/') {
+                in_line_comment = true;
             } else if ch == '"' {
                 in_string = true;
                 escaped = false;
@@ -492,7 +519,7 @@ impl Request {
                     }
                     results.push(Response::err(error));
 
-                    if cmd_type == CommandType::Kml {
+                    if !self.readonly && cmd_type == CommandType::Kml {
                         // Stop on first write error.
                         return (cmd_type, Response::ok(json!(results)));
                     }
@@ -939,6 +966,29 @@ mod tests {
     }
 
     #[test]
+    fn test_to_command_ignores_placeholders_in_comments() {
+        let mut parameters = Map::new();
+        parameters.insert("name".to_string(), Json::String("Aspirin".to_string()));
+
+        let request = Request {
+            command: r#"
+                // Example placeholder :name and quoted text "Hello :name" stay as comments.
+                FIND(?drug)
+                WHERE { ?drug {name: :name} }
+            "#
+            .to_string(),
+            parameters,
+            ..Default::default()
+        };
+
+        let result = request.to_command();
+        assert!(result.contains("// Example placeholder :name"));
+        assert!(result.contains("quoted text \"Hello :name\""));
+        assert!(result.contains(r#"{name: "Aspirin"}"#));
+        assert!(parse_kql(&result).is_ok());
+    }
+
+    #[test]
     fn test_to_command_complex_kip_example() {
         // Test a complete example conforming to KIP specification
         let mut parameters = Map::new();
@@ -1294,6 +1344,28 @@ mod tests {
         assert!(
             warnings.unwrap_err().contains("name"),
             "Should warn about 'name' placeholder"
+        );
+    }
+
+    #[test]
+    fn test_validate_placeholder_usage_ignores_comments() {
+        let mut parameters = Map::new();
+        parameters.insert("name".to_string(), Json::String("John".to_string()));
+
+        let request = Request {
+            command: r#"
+                // This quoted comment mentions "Hello :name" but is ignored.
+                SET ATTRIBUTES { name: :name }
+            "#
+            .to_string(),
+            parameters,
+            ..Default::default()
+        };
+
+        let warnings = Request::find_placeholders_in_strings(&request.command, &request.parameters);
+        assert!(
+            warnings.is_ok(),
+            "Comments should not trigger placeholder warnings"
         );
     }
 
@@ -1679,6 +1751,35 @@ mod tests {
                 assert_eq!(arr[1]["error"]["code"], "KIP_4002");
             }
             _ => panic!("Expected Ok response wrapping batch results"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_readonly_batch_rejects_kml_and_continues() {
+        let executor = MockExecutor;
+        let request = Request {
+            commands: vec![
+                CommandItem::Simple("DESCRIBE PRIMER".to_string()),
+                CommandItem::Simple(
+                    r#"UPSERT { CONCEPT ?d { {type: "Drug", name: "NewDrug"} } }"#.to_string(),
+                ),
+                CommandItem::Simple(r#"FIND(?d) WHERE { ?d {type: "Drug"} } LIMIT 5"#.to_string()),
+            ],
+            readonly: true,
+            ..Default::default()
+        };
+
+        let (_cmd_type, response) = request.execute(&executor).await;
+        match response {
+            Response::Ok { result, .. } => {
+                let arr = result.as_array().unwrap();
+                assert_eq!(arr.len(), 3);
+                assert_eq!(arr[0]["result"]["type"], "meta");
+                assert!(arr[1]["error"].is_object());
+                assert_eq!(arr[1]["error"]["code"], "KIP_1001");
+                assert_eq!(arr[2]["result"]["type"], "kql");
+            }
+            _ => panic!("Expected Ok response wrapping readonly batch results"),
         }
     }
 
