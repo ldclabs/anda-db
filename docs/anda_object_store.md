@@ -277,13 +277,13 @@ that already provide strong CAS semantics (S3, GCS, Azure Blob).
 
 ### 4.7 Semantic guarantees (deltas vs `MetaStore`)
 
-| Aspect             | Behaviour                                                                                                                  |
-| ------------------ | -------------------------------------------------------------------------------------------------------------------------- |
-| Plaintext exposure | Plaintext never crosses the inner-store boundary.                                                                          |
-| Integrity          | Tampering with any ciphertext chunk fails decryption with `Error::Generic("AES256 decrypt failed …")`.                     |
-| Truncation attacks | A truncated object yields fewer ciphertext bytes than `meta.size` indicates and surfaces as a decrypt error or short read. |
-| Reordering         | Each chunk's nonce is bound to its index, so swapping two chunks fails authentication.                                     |
-| Random-access cost | One inner range get per request, decrypts only the touched chunks.                                                         |
+| Aspect             | Behaviour                                                                                                                           |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------- |
+| Plaintext exposure | Plaintext never crosses the inner-store boundary.                                                                                   |
+| Integrity          | Tampering with any ciphertext chunk fails decryption with `Error::Generic("AES256 decrypt failed …")`.                              |
+| Truncation attacks | A truncated object yields fewer ciphertext bytes than `meta.size` indicates and surfaces as a decrypt or explicit truncation error. |
+| Reordering         | Each chunk's nonce is bound to its index, so swapping two chunks fails authentication.                                              |
+| Random-access cost | One inner range get per request, decrypts only the touched chunks.                                                                  |
 
 ---
 

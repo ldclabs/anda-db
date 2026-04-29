@@ -208,7 +208,7 @@ impl<T: ObjectStore> MetaStoreBuilder<T> {
                 Ok(Arc::new(meta))
             })
             .await
-            .map_err(map_arc_error)?;
+            .map_err(|err| map_arc_error("MetaStore", err))?;
 
         Ok(meta.as_ref().clone())
     }
@@ -285,13 +285,7 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
                 if let PutMode::Update(v) = &opts.mode {
                     match meta {
                         Some(m) => {
-                            if m.e_tag != v.e_tag {
-                                return Err(Error::Precondition {
-                                    path: location.to_string(),
-                                    source: format!("{:?} does not match {:?}", m.e_tag, v.e_tag)
-                                        .into(),
-                                });
-                            }
+                            check_update_version(location, &m.e_tag, &m.original_version, v)?;
                         }
                         None => {
                             return Err(Error::Precondition {
@@ -356,12 +350,12 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
     async fn get_opts(&self, location: &Path, mut options: GetOptions) -> Result<GetResult> {
         let full_path = self.inner.full_path(location);
         let meta = self.inner.get_meta(location).await?;
-        if meta.e_tag == options.if_match {
-            options.if_match = meta.original_tag.clone();
-        }
-        if meta.e_tag == options.if_none_match {
-            options.if_none_match = meta.original_tag.clone();
-        }
+        apply_logical_etag_preconditions(
+            location,
+            &mut options,
+            meta.e_tag.as_deref(),
+            meta.original_tag.clone(),
+        )?;
 
         let mut res = self.inner.store.get_opts(&full_path, options).await?;
         res.meta.location = self.inner.strip_prefix(res.meta.location);
@@ -374,6 +368,9 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
         if ranges.is_empty() {
             return Ok(Vec::new());
         }
+
+        let meta = self.inner.get_meta(location).await?;
+        validate_ranges("MetaStore", ranges, meta.size)?;
 
         let full_path = self.inner.full_path(location);
         self.inner.store.get_ranges(&full_path, ranges).await
@@ -636,6 +633,94 @@ fn sha3_256(data: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+fn check_update_version(
+    location: &Path,
+    current_e_tag: &Option<String>,
+    current_version: &Option<String>,
+    update: &UpdateVersion,
+) -> Result<()> {
+    if current_e_tag != &update.e_tag {
+        return Err(Error::Precondition {
+            path: location.to_string(),
+            source: format!("{:?} does not match {:?}", current_e_tag, update.e_tag).into(),
+        });
+    }
+
+    if let Some(version) = &update.version
+        && current_version.as_ref() != Some(version)
+    {
+        return Err(Error::Precondition {
+            path: location.to_string(),
+            source: format!("{:?} does not match {:?}", current_version, update.version).into(),
+        });
+    }
+
+    Ok(())
+}
+
+fn apply_logical_etag_preconditions(
+    location: &Path,
+    options: &mut GetOptions,
+    logical_e_tag: Option<&str>,
+    original_tag: Option<String>,
+) -> Result<()> {
+    let e_tag = logical_e_tag.unwrap_or("*");
+
+    if let Some(if_match) = options.if_match.take() {
+        if if_match != "*" && if_match.split(',').map(str::trim).all(|tag| tag != e_tag) {
+            return Err(Error::Precondition {
+                path: location.to_string(),
+                source: format!("{e_tag} does not match {if_match}").into(),
+            });
+        }
+
+        options.if_match = if if_match == "*" {
+            Some(if_match)
+        } else {
+            original_tag
+        };
+    }
+
+    if let Some(if_none_match) = options.if_none_match.take()
+        && (if_none_match == "*"
+            || if_none_match
+                .split(',')
+                .map(str::trim)
+                .any(|tag| tag == e_tag))
+    {
+        return Err(Error::NotModified {
+            path: location.to_string(),
+            source: format!("{e_tag} matches {if_none_match}").into(),
+        });
+    }
+
+    Ok(())
+}
+
+pub(crate) fn validate_ranges(store: &'static str, ranges: &[Range<u64>], len: u64) -> Result<()> {
+    for range in ranges {
+        if range.start >= len {
+            return Err(Error::Generic {
+                store,
+                source: format!("start {} is larger than length {}", range.start, len).into(),
+            });
+        }
+        if range.end <= range.start {
+            return Err(Error::Generic {
+                store,
+                source: format!("end {} is less than start {}", range.end, range.start).into(),
+            });
+        }
+        if range.end > len {
+            return Err(Error::Generic {
+                store,
+                source: format!("end {} is larger than length {}", range.end, len).into(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Re-clones an [`Arc<Error>`] returned from a `moka` shared computation
 /// (e.g. [`Cache::try_get_with`]) into an owned [`Error`].
 ///
@@ -644,7 +729,7 @@ fn sha3_256(data: &[u8]) -> [u8; 32] {
 /// reconstruct an equivalent variant by hand. Variants that carry a `path`
 /// are reconstructed with their `path` and a stringified `source`; everything
 /// else collapses into [`Error::Generic`].
-fn map_arc_error(err: Arc<Error>) -> Error {
+fn map_arc_error(store: &'static str, err: Arc<Error>) -> Error {
     match err.as_ref() {
         Error::NotFound { path, source } => Error::NotFound {
             path: path.clone(),
@@ -671,7 +756,7 @@ fn map_arc_error(err: Arc<Error>) -> Error {
             source: source.to_string().into(),
         },
         err => Error::Generic {
-            store: "MetaStore",
+            store,
             source: err.to_string().into(),
         },
     }
@@ -715,6 +800,95 @@ mod tests {
 
         let storage = MetaStoreBuilder::new(InMemory::new(), 10000).build();
         stream_get(&storage).await;
+    }
+
+    #[tokio::test]
+    async fn get_ranges_requires_metadata() {
+        let inner = InMemory::new();
+        inner
+            .put(
+                &Path::from("data/missing-meta"),
+                Bytes::from_static(b"abc").into(),
+            )
+            .await
+            .unwrap();
+        let storage = MetaStoreBuilder::new(inner, 100).build();
+
+        let requested = 0..1;
+        let err = storage
+            .get_ranges(
+                &Path::from("missing-meta"),
+                std::slice::from_ref(&requested),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::NotFound { path, .. } if path.ends_with("meta/missing-meta")));
+    }
+
+    #[tokio::test]
+    async fn get_opts_accepts_comma_separated_logical_etags() {
+        let storage = MetaStoreBuilder::new(InMemory::new(), 100).build();
+        let location = Path::from("etag-list");
+        let put = storage
+            .put(&location, Bytes::from_static(b"abc").into())
+            .await
+            .unwrap();
+        let e_tag = put.e_tag.unwrap();
+
+        let bytes = storage
+            .get_opts(
+                &location,
+                GetOptions {
+                    if_match: Some(format!("other, {e_tag}")),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"abc"));
+
+        let err = storage
+            .get_opts(
+                &location,
+                GetOptions {
+                    if_none_match: Some(format!("other, {e_tag}")),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotModified { .. }));
+    }
+
+    #[tokio::test]
+    async fn put_update_rejects_stale_version() {
+        let storage = MetaStoreBuilder::new(InMemory::new(), 100).build();
+        let location = Path::from("stale-version");
+        let put = storage
+            .put(&location, Bytes::from_static(b"abc").into())
+            .await
+            .unwrap();
+
+        let err = storage
+            .put_opts(
+                &location,
+                Bytes::from_static(b"def").into(),
+                PutOptions {
+                    mode: PutMode::Update(UpdateVersion {
+                        e_tag: put.e_tag,
+                        version: Some("stale".to_string()),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::Precondition { .. }));
     }
 
     #[tokio::test]

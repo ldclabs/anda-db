@@ -13,7 +13,12 @@ use serde_bytes::ByteArray;
 use sha3::Digest;
 use std::{fmt::Debug, ops::Range, sync::Arc, time::Duration};
 
-use crate::{map_arc_error, sha3_256};
+use crate::{
+    apply_logical_etag_preconditions, check_update_version, map_arc_error, sha3_256,
+    validate_ranges,
+};
+
+const DEFAULT_CHUNK_SIZE: u64 = 256 * 1024;
 
 /// An object store implementation that provides transparent AES-256-GCM encryption and decryption
 /// for stored objects.
@@ -189,7 +194,7 @@ impl<T: ObjectStore> EncryptedStoreBuilder<T> {
         EncryptedStoreBuilder {
             store,
             cipher,
-            chunk_size: 256 * 1024,
+            chunk_size: DEFAULT_CHUNK_SIZE,
             conditional_put: false,
             data_prefix: Path::from("data"),
             meta_prefix: Path::from("meta"),
@@ -220,7 +225,8 @@ impl<T: ObjectStore> EncryptedStoreBuilder<T> {
     /// Sets the chunk size for encryption operations.
     ///
     /// Large objects are split into chunks of this size before encryption.
-    /// Each chunk is encrypted separately.
+    /// Each chunk is encrypted separately. Values smaller than 1 byte are
+    /// normalized to 1 byte.
     ///
     /// # Parameters
     /// - `chunk_size`: The size of each chunk in bytes, default is 256 KB
@@ -228,7 +234,10 @@ impl<T: ObjectStore> EncryptedStoreBuilder<T> {
     /// # Returns
     /// The builder with the updated chunk size
     pub fn with_chunk_size(self, chunk_size: u64) -> Self {
-        Self { chunk_size, ..self }
+        Self {
+            chunk_size: normalize_chunk_size(chunk_size),
+            ..self
+        }
     }
 
     /// Enables conditional put operations (Should enable with LocalFileSystem store).
@@ -296,7 +305,7 @@ impl<T: ObjectStore> EncryptedStoreBuilder<T> {
                 Ok(Arc::new(meta))
             })
             .await
-            .map_err(map_arc_error)?;
+            .map_err(|err| map_arc_error("EncryptedStore", err))?;
 
         Ok(meta.as_ref().clone())
     }
@@ -385,13 +394,7 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
                 {
                     match meta {
                         Some(m) => {
-                            if m.e_tag != v.e_tag {
-                                return Err(Error::Precondition {
-                                    path: location.to_string(),
-                                    source: format!("{:?} does not match {:?}", m.e_tag, v.e_tag)
-                                        .into(),
-                                });
-                            }
+                            check_update_version(location, &m.e_tag, &m.original_version, v)?;
                         }
                         None => {
                             return Err(Error::Precondition {
@@ -490,12 +493,12 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
         let meta = self.inner.get_meta(location).await?;
 
         if self.inner.conditional_put {
-            if meta.e_tag == options.if_match {
-                options.if_match = meta.original_tag.clone();
-            }
-            if meta.e_tag == options.if_none_match {
-                options.if_none_match = meta.original_tag.clone();
-            }
+            apply_logical_etag_preconditions(
+                location,
+                &mut options,
+                meta.e_tag.as_deref(),
+                meta.original_tag.clone(),
+            )?;
         }
 
         // Resolve the caller-supplied (plaintext) range, defaulting to the
@@ -513,10 +516,23 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
         // Expand the request to whole-chunk boundaries: AES-GCM is not a
         // streaming cipher, so we must read each chunk in full to verify its
         // authentication tag before yielding the (possibly trimmed) plaintext.
-        let rr = (range.start / self.inner.chunk_size) * self.inner.chunk_size
-            ..meta.size.min(
-                (1 + range.end.saturating_sub(1) / self.inner.chunk_size) * self.inner.chunk_size,
-            );
+        let rr = if range.start == range.end {
+            options.range = None;
+            options.head = true;
+            range.start..range.start
+        } else {
+            let rr_start = (range.start / self.inner.chunk_size) * self.inner.chunk_size;
+            let rr_end = range
+                .end
+                .saturating_sub(1)
+                .checked_div(self.inner.chunk_size)
+                .and_then(|idx| idx.checked_add(1))
+                .and_then(|idx| idx.checked_mul(self.inner.chunk_size))
+                .unwrap_or(u64::MAX)
+                .min(meta.size);
+
+            rr_start..rr_end
+        };
 
         if rr.end > rr.start {
             options.range = Some(GetRange::Bounded(rr.clone()));
@@ -562,7 +578,7 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
         }
 
         let meta = self.inner.get_meta(location).await?;
-        ranges_is_valid(ranges, meta.size)?;
+        validate_ranges("EncryptedStore", ranges, meta.size)?;
 
         let mut result: Vec<Bytes> = Vec::with_capacity(ranges.len());
         let mut chunk_cache: Option<(usize, Vec<u8>)> = None; // cache the last chunk read
@@ -1018,12 +1034,12 @@ fn create_decryption_stream(
         let mut idx = start_idx;
         let mut remaining = size;
 
+        if remaining == 0 {
+            return;
+        }
+
         while let Some(data) = stream.next().await {
             let data = data?;
-            if remaining == 0 {
-                // Caller has received everything they asked for; stop early.
-                break;
-            }
             buf.extend_from_slice(&data);
 
             while remaining > 0 && buf.len() >= chunk_size {
@@ -1083,39 +1099,50 @@ fn create_decryption_stream(
             })?;
 
             if idx == start_idx && start_offset > 0 {
+                if start_offset > buf.len() {
+                    Err(Error::Generic {
+                        store: "EncryptedStore",
+                        source: format!(
+                            "truncated encrypted data for path {location}: expected at least {start_offset} bytes in chunk {idx}, got {}",
+                            buf.len()
+                        )
+                        .into(),
+                    })?;
+                }
                 buf.drain(..start_offset);
             }
 
-            buf.truncate(remaining);
+            if buf.len() < remaining {
+                Err(Error::Generic {
+                    store: "EncryptedStore",
+                    source: format!(
+                        "truncated encrypted data for path {location}: expected {remaining} more bytes, got {}",
+                        buf.len()
+                    )
+                    .into(),
+                })?;
+            }
+
+            let final_len = remaining;
+            buf.truncate(final_len);
+            remaining = 0;
             yield Bytes::from(buf);
+        }
+
+        if remaining > 0 {
+            Err(Error::Generic {
+                store: "EncryptedStore",
+                source: format!(
+                    "truncated encrypted data for path {location}: expected {remaining} more bytes"
+                )
+                .into(),
+            })?;
         }
     }.boxed()
 }
 
-/// Validates that every range in `ranges` fits within an object of length
-/// `len`. Returns a generic error otherwise.
-fn ranges_is_valid(ranges: &[Range<u64>], len: u64) -> Result<()> {
-    for range in ranges {
-        if range.start >= len {
-            return Err(Error::Generic {
-                store: "EncryptedStore",
-                source: format!("start {} is larger than length {}", range.start, len).into(),
-            });
-        }
-        if range.end <= range.start {
-            return Err(Error::Generic {
-                store: "EncryptedStore",
-                source: format!("end {} is less than start {}", range.end, range.start).into(),
-            });
-        }
-        if range.end > len {
-            return Err(Error::Generic {
-                store: "EncryptedStore",
-                source: format!("end {} is larger than length {}", range.end, len).into(),
-            });
-        }
-    }
-    Ok(())
+fn normalize_chunk_size(chunk_size: u64) -> u64 {
+    chunk_size.clamp(1, usize::MAX as u64)
 }
 
 /// Generates `N` cryptographically-strong random bytes using the OS RNG.
@@ -1217,6 +1244,126 @@ mod tests {
             .with_conditional_put()
             .build();
         stream_get(&storage).await;
+    }
+
+    #[tokio::test]
+    async fn zero_chunk_size_is_normalized() {
+        let storage = EncryptedStoreBuilder::with_secret(InMemory::new(), 100, [0u8; 32])
+            .with_chunk_size(0)
+            .build();
+        let location = Path::from("zero-chunk-size");
+
+        storage
+            .put(&location, Bytes::from_static(b"abc").into())
+            .await
+            .unwrap();
+
+        let requested = 0..3;
+        let ranges = storage
+            .get_ranges(&location, std::slice::from_ref(&requested))
+            .await
+            .unwrap();
+        assert_eq!(ranges, vec![Bytes::from_static(b"abc")]);
+    }
+
+    #[tokio::test]
+    async fn conditional_get_opts_accepts_comma_separated_logical_etags() {
+        let storage = EncryptedStoreBuilder::with_secret(InMemory::new(), 100, [0u8; 32])
+            .with_conditional_put()
+            .build();
+        let location = Path::from("encrypted-etag-list");
+        let put = storage
+            .put(&location, Bytes::from_static(b"abc").into())
+            .await
+            .unwrap();
+        let e_tag = put.e_tag.unwrap();
+
+        let bytes = storage
+            .get_opts(
+                &location,
+                GetOptions {
+                    if_match: Some(format!("other, {e_tag}")),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"abc"));
+
+        let err = storage
+            .get_opts(
+                &location,
+                GetOptions {
+                    if_none_match: Some(format!("other, {e_tag}")),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotModified { .. }));
+    }
+
+    #[tokio::test]
+    async fn conditional_put_update_rejects_stale_version() {
+        let storage = EncryptedStoreBuilder::with_secret(InMemory::new(), 100, [0u8; 32])
+            .with_conditional_put()
+            .build();
+        let location = Path::from("encrypted-stale-version");
+        let put = storage
+            .put(&location, Bytes::from_static(b"abc").into())
+            .await
+            .unwrap();
+
+        let err = storage
+            .put_opts(
+                &location,
+                Bytes::from_static(b"def").into(),
+                PutOptions {
+                    mode: PutMode::Update(UpdateVersion {
+                        e_tag: put.e_tag,
+                        version: Some("stale".to_string()),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::Precondition { .. }));
+    }
+
+    #[tokio::test]
+    async fn truncated_ciphertext_errors_on_stream_read() {
+        let inner = InMemory::new();
+        let storage = EncryptedStoreBuilder::with_secret(inner.clone(), 100, [0u8; 32])
+            .with_chunk_size(4)
+            .build();
+        let location = Path::from("truncated");
+
+        storage
+            .put(&location, Bytes::from_static(b"abcdefgh").into())
+            .await
+            .unwrap();
+
+        let data_path = Path::from("data/truncated");
+        let ciphertext = inner.get(&data_path).await.unwrap().bytes().await.unwrap();
+        inner
+            .put(&data_path, ciphertext.slice(..4).into())
+            .await
+            .unwrap();
+
+        let err = storage
+            .get(&location)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("truncated encrypted data"));
     }
 
     #[tokio::test]
