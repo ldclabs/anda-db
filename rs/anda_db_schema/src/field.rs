@@ -383,7 +383,8 @@ impl std::fmt::Display for FieldKey {
 /// CBOR via [`From<FieldValue> for Cbor`] and [`FieldValue::try_from`].
 ///
 /// `FieldValue` derives `PartialEq`, but float values are required to be
-/// non-NaN (enforced by [`FieldValue::f64_from`] / [`FieldValue::f32_from`]
+/// non-NaN (we don't enforce this in the type system, but it is
+/// enforced by [`FieldValue::f64_from`] / [`FieldValue::f32_from`]
 /// when extracting from CBOR) so that equality is reflexive in practice.
 #[derive(Clone, PartialEq)]
 pub enum FieldValue {

@@ -1,6 +1,6 @@
 [package]
 name = "anda_db_schema"
-version = "0.4.9"
+version = "0.4.10"
 description = "Anda DB schema library for Rust."
 keywords = ["database", "vector", "search", "embedding", "ai"]
 categories = ["database", "data-structures", "text-processing"]
@@ -16,12 +16,9 @@ ciborium = { workspace = true }
 ic_auth_types = { workspace = true }
 half = { workspace = true }
 serde = { workspace = true }
-serde_bytes = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
 hex = { workspace = true }
-
-[package.metadata.cargo-shear]
-ignored = ["serde_bytes"]
+serde_bytes = { workspace = true }

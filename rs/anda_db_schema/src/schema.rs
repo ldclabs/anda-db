@@ -102,6 +102,18 @@ impl Schema {
                 }
                 field.set_idx(old_field.idx());
             } else {
+                if field.required() {
+                    return Err(SchemaError::Schema(format!(
+                        "new field {name:?} must be optional when upgrading schema"
+                    )));
+                }
+
+                if next_idx > u16::MAX as usize {
+                    return Err(SchemaError::Schema(
+                        "Schema has reached the maximum number of fields".to_string(),
+                    ));
+                }
+
                 // New field: assign the next available index.
                 field.set_idx(next_idx);
                 next_idx += 1;
@@ -826,6 +838,56 @@ mod tests {
         assert_eq!(new_schema.get_field("age").unwrap().idx(), 2);
         // email gets idx=4 (max old idx was 3, so next is 4), NOT reusing bio's 3
         assert_eq!(new_schema.get_field("email").unwrap().idx(), 4);
+    }
+
+    #[test]
+    fn test_upgrade_with_rejects_new_required_field() {
+        let mut old_builder = SchemaBuilder::new();
+        old_builder.with_version(1);
+        old_builder
+            .add_field(Fe::new("name".to_string(), Ft::Text).unwrap())
+            .unwrap();
+        let old = old_builder.build().unwrap();
+
+        let mut new_builder = SchemaBuilder::new();
+        new_builder.with_version(2);
+        new_builder
+            .add_field(Fe::new("name".to_string(), Ft::Text).unwrap())
+            .unwrap();
+        new_builder
+            .add_field(Fe::new("email".to_string(), Ft::Text).unwrap())
+            .unwrap();
+        let mut new_schema = new_builder.build().unwrap();
+
+        let err = new_schema.upgrade_with(&old).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("must be optional"),
+            "expected required field error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_upgrade_with_rejects_index_overflow() {
+        let mut old_builder = SchemaBuilder::new();
+        old_builder.with_version(1);
+        old_builder.idx = u16::MAX as usize - 1;
+        old_builder
+            .add_field(Fe::new("last".to_string(), Ft::Text).unwrap())
+            .unwrap();
+        let old = old_builder.build().unwrap();
+        assert_eq!(old.get_field("last").unwrap().idx(), u16::MAX as usize);
+
+        let mut new_builder = SchemaBuilder::new();
+        new_builder.with_version(2);
+        new_builder
+            .add_field(Fe::new("last".to_string(), Ft::Text).unwrap())
+            .unwrap();
+        new_builder
+            .add_field(Fe::new("next".to_string(), Ft::Option(Box::new(Ft::Text))).unwrap())
+            .unwrap();
+        let mut new_schema = new_builder.build().unwrap();
+
+        assert!(new_schema.upgrade_with(&old).is_err());
     }
 
     #[test]
