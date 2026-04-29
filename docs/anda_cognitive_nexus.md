@@ -222,7 +222,7 @@ rs/anda_cognitive_nexus/
 `concepts`:
 
 - BTree composite (virtual): `["type", "name"]` — the canonical concept lookup.
-- BTree singleton: `["type"]` — used for `DESCRIBE CONCEPT TYPES` and bulk-by-type scans.
+- BTree singleton: `["type"]` — used for meta-type scans (including `DESCRIBE ... TYPES`) and bulk-by-type scans.
 - BTree singleton: `["name"]` — used for handle-only resolution paths.
 - BM25 composite: `["name", "attributes", "metadata"]` — backs `SEARCH CONCEPT`.
 
@@ -230,7 +230,7 @@ rs/anda_cognitive_nexus/
 
 - BTree composite (virtual): `["subject", "object"]` — exact triple lookup.
 - BTree singleton: `["subject"]` and `["object"]` — fan-out from a node.
-- BTree singleton: `["predicates"]` — keyed by the *map key*, used to enumerate all rows that mention a given predicate (NOT-clauses, `DESCRIBE PROPOSITION TYPE[S]`).
+- BTree singleton: `["predicates"]` — keyed by the *map key*, used to enumerate all rows that mention a given predicate (NOT-clauses and predicate matching).
 - BM25 composite: `["properties"]` — backs `SEARCH PROPOSITION`.
 
 ### 3.3 Virtual composite fields
@@ -594,8 +594,10 @@ transaction.
 When the caller passes `dry_run = true`:
 
 - `UPSERT` validates referenced types and handle resolution **without**
-  writing anything; every variable binding still gets its conceptual id
-  so the response shape matches a real run.
+  writing anything. Local handles and literal references defined earlier
+  in the same `UPSERT` are tracked with in-memory placeholder ids so
+  later clauses can be validated, but the returned upsert id lists stay
+  empty because no rows were written.
 - `DELETE CONCEPT` runs the `KIP_3004` check (the most-likely user
   mistake) and reports the cascade scope as if it were going to
   execute, but performs no IO.
@@ -609,8 +611,10 @@ When the caller passes `dry_run = true`:
 | :----------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------- |
 | `DESCRIBE PRIMER`                    | `execute_describe_primer` — projects `(Person, $self)` plus core domain anchors. Returns a single JSON object; `next_cursor` is always `None`. |
 | `DESCRIBE DOMAINS`                   | `execute_describe_domains` — enumerates `Domain` concepts. `next_cursor` is always `None`.                                                     |
-| `DESCRIBE CONCEPT TYPE[S]`           | `execute_describe_concept_type[s]` — paginated by `_id`; each entry is a `ConceptInfo` projection (definition + member counts).                |
-| `DESCRIBE PROPOSITION TYPE[S]`       | Same shape as above but for `$PropositionType` definitions; uses the `predicates` BTree index to estimate cardinality.                         |
+| `DESCRIBE CONCEPT TYPES`             | `execute_describe_concept_types` — returns sorted registered `$ConceptType` names; the cursor is the last emitted name.                        |
+| `DESCRIBE CONCEPT TYPE "..."`        | `execute_describe_concept_type` — returns the `ConceptInfo` projection for one `$ConceptType` definition.                                      |
+| `DESCRIBE PROPOSITION TYPES`         | `execute_describe_proposition_types` — returns sorted registered `$PropositionType` names; the cursor is the last emitted name.                |
+| `DESCRIBE PROPOSITION TYPE "..."`    | `execute_describe_proposition_type` — returns the `ConceptInfo` projection for one `$PropositionType` definition.                              |
 | `SEARCH CONCEPT "..." [LIMIT N]`     | BM25 over `concepts.["name", "attributes", "metadata"]`. Results are deserialised through `Concept`, then projected.                           |
 | `SEARCH PROPOSITION "..." [LIMIT N]` | BM25 over `propositions.["properties"]`. Filters can post-prune by predicate / subject type / etc.                                             |
 

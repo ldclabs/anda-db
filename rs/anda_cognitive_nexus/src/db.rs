@@ -105,24 +105,15 @@ impl Executor for CognitiveNexus {
     ///
     async fn execute(&self, command: Command, dry_run: bool) -> Response {
         match command {
-            Command::Kql(command) => {
-                let _guard = self.kml_lock.read().await;
-                self.execute_kql(command).await.into()
-            }
-            Command::Kml(command) => {
-                let _guard = self.kml_lock.write().await;
-                match self.execute_kml(command, dry_run).await {
-                    Ok(result) => Response::Ok {
-                        result,
-                        next_cursor: None,
-                    },
-                    Err(error) => Response::err(error),
-                }
-            }
-            Command::Meta(command) => {
-                let _guard = self.kml_lock.read().await;
-                self.execute_meta(command).await.into()
-            }
+            Command::Kql(command) => self.execute_kql(command).await.into(),
+            Command::Kml(command) => match self.execute_kml(command, dry_run).await {
+                Ok(result) => Response::Ok {
+                    result,
+                    next_cursor: None,
+                },
+                Err(error) => Response::err(error),
+            },
+            Command::Meta(command) => self.execute_meta(command).await.into(),
         }
     }
 }
@@ -480,6 +471,14 @@ impl CognitiveNexus {
     /// This method acquires the KML read lock so multiple queries may run
     /// concurrently against a stable snapshot.
     pub async fn execute_kql(&self, command: KqlQuery) -> Result<(Json, Option<String>), KipError> {
+        let _guard = self.kml_lock.read().await;
+        self.execute_kql_inner(command).await
+    }
+
+    async fn execute_kql_inner(
+        &self,
+        command: KqlQuery,
+    ) -> Result<(Json, Option<String>), KipError> {
         let mut ctx = QueryContext::default();
 
         // 执行WHERE子句
@@ -525,6 +524,15 @@ impl CognitiveNexus {
         command: KmlStatement,
         dry_run: bool,
     ) -> Result<Json, KipError> {
+        let _guard = self.kml_lock.write().await;
+        self.execute_kml_inner(command, dry_run).await
+    }
+
+    async fn execute_kml_inner(
+        &self,
+        command: KmlStatement,
+        dry_run: bool,
+    ) -> Result<Json, KipError> {
         match command {
             KmlStatement::Upsert(upsert_blocks) => {
                 self.execute_upsert(upsert_blocks, dry_run).await
@@ -543,6 +551,14 @@ impl CognitiveNexus {
     /// `DESCRIBE PRIMER` and `DESCRIBE DOMAINS` return non-paginated
     /// payloads (`next_cursor == None`).
     pub async fn execute_meta(
+        &self,
+        command: MetaCommand,
+    ) -> Result<(Json, Option<String>), KipError> {
+        let _guard = self.kml_lock.read().await;
+        self.execute_meta_inner(command).await
+    }
+
+    async fn execute_meta_inner(
         &self,
         command: MetaCommand,
     ) -> Result<(Json, Option<String>), KipError> {
@@ -891,6 +907,7 @@ impl CognitiveNexus {
         fields: &[String],
         order_by: &[OrderByCondition],
         cursor: Option<&EntityID>,
+        raw_cursor: Option<&str>,
         limit: usize,
     ) -> Result<(Vec<Json>, Option<String>), KipError> {
         if bindings.contains_key(var) {
@@ -902,15 +919,20 @@ impl CognitiveNexus {
         // Check if it's a predicate variable
         if let Some(predicates) = ctx.predicates.get(var) {
             let values: Vec<Json> = predicates.iter().map(|p| Json::String(p.clone())).collect();
-            let next_cursor = if limit > 0 && limit < values.len() {
-                Some(limit.to_string())
+            let start = raw_cursor
+                .and_then(|cursor| cursor.parse::<usize>().ok())
+                .unwrap_or(0)
+                .min(values.len());
+            let remaining = &values[start..];
+            let next_cursor = if limit > 0 && limit < remaining.len() {
+                Some((start + limit).to_string())
             } else {
                 None
             };
-            let limited = if limit > 0 && limit < values.len() {
-                values[..limit].to_vec()
+            let limited = if limit > 0 && limit < remaining.len() {
+                remaining[..limit].to_vec()
             } else {
-                values
+                remaining.to_vec()
             };
             return Ok((limited, next_cursor));
         }
@@ -936,6 +958,7 @@ impl CognitiveNexus {
 
         let order_by = order_by.unwrap_or_default();
         let limit = limit.unwrap_or(0);
+        let raw_cursor = cursor.as_deref();
 
         // GROUP BY 检测：扫描 FIND 表达式，识别 Variable(X) + Aggregation(Y) 模式
         // 其中 X ≠ Y 且 ctx.groups 存在 (X, Y) 映射
@@ -966,6 +989,7 @@ impl CognitiveNexus {
                                     fields,
                                     &order_by,
                                     cursor.as_ref(),
+                                    raw_cursor,
                                     limit,
                                 )
                                 .await?;
@@ -1004,6 +1028,7 @@ impl CognitiveNexus {
                                 fields,
                                 &order_by,
                                 cursor.as_ref(),
+                                raw_cursor,
                                 limit,
                             )
                             .await?;
@@ -1040,6 +1065,7 @@ impl CognitiveNexus {
                                 &[var.to_pointer_or("id")],
                                 &[],
                                 None,
+                                None,
                                 0,
                             )
                             .await?;
@@ -1060,6 +1086,7 @@ impl CognitiveNexus {
                     fields,
                     &order_by,
                     cursor.as_ref(),
+                    raw_cursor,
                     limit,
                 )
                 .await?;
@@ -1234,6 +1261,7 @@ impl CognitiveNexus {
                                 &[dot_path.to_pointer()],
                                 order_by,
                                 eid_cursor.as_ref(),
+                                cursor.as_deref(),
                                 limit,
                             )
                             .await?;
@@ -1277,6 +1305,7 @@ impl CognitiveNexus {
                                     &agg_dot_path.var,
                                     &[agg_dot_path.to_pointer_or("id")],
                                     &[],
+                                    None,
                                     None,
                                     0,
                                 )
@@ -1440,17 +1469,8 @@ impl CognitiveNexus {
         limit: Option<usize>,
         cursor: Option<String>,
     ) -> Result<(Json, Option<String>), KipError> {
-        let index = self
-            .concepts
-            .get_btree_index(&["type"])
-            .map_err(db_to_kip_error)?;
-
-        let result = index.keys(cursor, limit);
-        if limit.map(|v| v > 0 && result.len() >= v).unwrap_or(false) {
-            let cursor = result.last().and_then(BTree::to_cursor);
-            return Ok((json!(result), cursor));
-        }
-        Ok((json!(result), None))
+        self.execute_describe_type_names(META_CONCEPT_TYPE, limit, cursor)
+            .await
     }
 
     async fn execute_describe_concept_type(&self, name: String) -> Result<Json, KipError> {
@@ -1477,17 +1497,52 @@ impl CognitiveNexus {
         limit: Option<usize>,
         cursor: Option<String>,
     ) -> Result<(Json, Option<String>), KipError> {
-        let index = self
-            .propositions
-            .get_btree_index(&["predicates"])
-            .map_err(db_to_kip_error)?;
+        self.execute_describe_type_names(META_PROPOSITION_TYPE, limit, cursor)
+            .await
+    }
 
-        let result = index.keys(cursor, limit);
-        if limit.map(|v| v > 0 && result.len() >= v).unwrap_or(false) {
-            let cursor = result.last().and_then(BTree::to_cursor);
-            return Ok((json!(result), cursor));
+    async fn execute_describe_type_names(
+        &self,
+        meta_type: &str,
+        limit: Option<usize>,
+        cursor: Option<String>,
+    ) -> Result<(Json, Option<String>), KipError> {
+        let ids = self
+            .query_concept_ids(&ConceptMatcher::Type(meta_type.to_string()))
+            .await?;
+        let cache = QueryCache::default();
+        let mut names = Vec::with_capacity(ids.len());
+
+        for id in ids {
+            let name = self
+                .try_get_concept_with(&cache, id, |concept| Ok(concept.name.clone()))
+                .await?;
+            names.push(name);
         }
-        Ok((json!(result), None))
+
+        names.sort();
+        names.dedup();
+
+        let start = cursor
+            .as_deref()
+            .map(|cursor| names.partition_point(|name| name.as_str() <= cursor))
+            .unwrap_or(0);
+        let mut page = if start < names.len() {
+            names[start..].to_vec()
+        } else {
+            Vec::new()
+        };
+
+        let mut next_cursor = None;
+        if let Some(limit) = limit
+            && limit > 0
+            && page.len() > limit
+        {
+            page.truncate(limit);
+            next_cursor = page.last().cloned();
+        }
+
+        Ok((json!(page), next_cursor))
     }
 
     async fn execute_describe_proposition_type(&self, name: String) -> Result<Json, KipError> {
@@ -2037,30 +2092,46 @@ impl CognitiveNexus {
         dry_run: bool,
     ) -> Result<Option<EntityID>, KipError> {
         let concept_pk = ConceptPK::try_from(concept_block.concept)?;
-        if let Some(propositions) = &concept_block.set_propositions {
-            for set_prop in propositions {
-                self.check_target_term_for_kml(&set_prop.object, handle_map)?;
+        match &concept_pk {
+            ConceptPK::ID(id) => {
+                if !self.concepts.contains(*id) {
+                    return Err(KipError::not_found(format!(
+                        "Concept {} not found",
+                        ConceptPK::ID(*id)
+                    )));
+                }
+            }
+            ConceptPK::Object { r#type, .. } => {
+                // 确保概念类型已经定义
+                if r#type != META_CONCEPT_TYPE
+                    && !self
+                        .has_concept(&ConceptPK::Object {
+                            r#type: META_CONCEPT_TYPE.to_string(),
+                            name: r#type.clone(),
+                        })
+                        .await
+                {
+                    return Err(KipError::not_found(format!(
+                        "Concept type {ty} not found",
+                        ty = r#type
+                    )));
+                }
             }
         }
 
-        if let ConceptPK::Object { r#type, .. } = &concept_pk {
-            // 确保概念类型已经定义
-            if r#type != META_CONCEPT_TYPE
-                && !self
-                    .has_concept(&ConceptPK::Object {
-                        r#type: META_CONCEPT_TYPE.to_string(),
-                        name: r#type.clone(),
-                    })
-                    .await
-            {
-                return Err(KipError::not_found(format!(
-                    "Concept type {ty} not found",
-                    ty = r#type
-                )));
+        if let Some(propositions) = &concept_block.set_propositions {
+            for set_prop in propositions {
+                self.validate_set_proposition_for_kml(set_prop, handle_map, cached_pks)
+                    .await?;
             }
         }
 
         if dry_run {
+            let entity_id = self.next_dry_run_entity_id(cached_pks, None);
+            cached_pks.insert(EntityPK::Concept(concept_pk), entity_id.clone());
+            if let Some(handle) = concept_block.handle {
+                handle_map.insert(handle, entity_id);
+            }
             return Ok(None);
         }
 
@@ -2070,12 +2141,14 @@ impl CognitiveNexus {
             .unwrap_or_default();
         let mut metadata = default_metadata.clone();
         if let Some(local) = concept_block.metadata {
-            metadata.extend(local.into_iter());
+            metadata.extend(local);
         }
 
+        let entity_pk = EntityPK::Concept(concept_pk.clone());
         let entity_id = self
             .upsert_concept(concept_pk, attributes, metadata.clone())
             .await?;
+        cached_pks.insert(entity_pk, entity_id.clone());
 
         if let Some(handle) = concept_block.handle {
             handle_map.insert(handle, entity_id.clone());
@@ -2101,23 +2174,21 @@ impl CognitiveNexus {
         cached_pks: &mut FxHashMap<EntityPK, EntityID>,
         dry_run: bool,
     ) -> Result<Option<EntityID>, KipError> {
-        let proposition_pk = PropositionPK::try_from(proposition_block.proposition)?;
-        if let PropositionPK::Object { predicate, .. } = &proposition_pk {
-            // 确保命题谓词已经定义
-            if !self
-                .has_concept(&ConceptPK::Object {
-                    r#type: META_PROPOSITION_TYPE.to_string(),
-                    name: predicate.clone(),
-                })
-                .await
-            {
-                return Err(KipError::not_found(format!(
-                    "Proposition type {predicate} not found"
-                )));
-            }
-        }
+        let proposition_pk = self
+            .resolve_kml_proposition_pk(proposition_block.proposition, handle_map, cached_pks)
+            .await?;
 
         if dry_run {
+            let predicate = match &proposition_pk {
+                PropositionPK::ID(_, predicate) | PropositionPK::Object { predicate, .. } => {
+                    predicate.clone()
+                }
+            };
+            let entity_id = self.next_dry_run_entity_id(cached_pks, Some(predicate));
+            cached_pks.insert(EntityPK::Proposition(proposition_pk), entity_id.clone());
+            if let Some(handle) = proposition_block.handle {
+                handle_map.insert(handle, entity_id);
+            }
             return Ok(None);
         }
 
@@ -2128,12 +2199,14 @@ impl CognitiveNexus {
 
         let mut metadata = default_metadata.clone();
         if let Some(local) = proposition_block.metadata {
-            metadata.extend(local.into_iter());
+            metadata.extend(local);
         }
 
+        let entity_pk = EntityPK::Proposition(proposition_pk.clone());
         let entity_id = self
             .upsert_proposition(proposition_pk, attributes, metadata, cached_pks)
             .await?;
+        cached_pks.insert(entity_pk, entity_id.clone());
 
         if let Some(handle) = proposition_block.handle {
             handle_map.insert(handle, entity_id.clone());
@@ -2150,6 +2223,8 @@ impl CognitiveNexus {
         handle_map: &FxHashMap<String, EntityID>,
         cached_pks: &mut FxHashMap<EntityPK, EntityID>,
     ) -> Result<EntityID, KipError> {
+        self.ensure_proposition_type(&set_prop.predicate).await?;
+
         let object_id = self
             .resolve_target_term(set_prop.object, handle_map, cached_pks)
             .await?;
@@ -2162,7 +2237,7 @@ impl CognitiveNexus {
 
         let mut metadata = default_metadata.clone();
         if let Some(local) = set_prop.metadata {
-            metadata.extend(local.into_iter());
+            metadata.extend(local);
         }
 
         let entity_id = self
@@ -2672,6 +2747,13 @@ impl CognitiveNexus {
         metadata: Map<String, Json>,
         cached_pks: &mut FxHashMap<EntityPK, EntityID>,
     ) -> Result<EntityID, KipError> {
+        let predicate_name = match &pk {
+            PropositionPK::ID(_, predicate) | PropositionPK::Object { predicate, .. } => {
+                predicate.as_str()
+            }
+        };
+        self.ensure_proposition_type(predicate_name).await?;
+
         match pk {
             PropositionPK::ID(id, predicate) => {
                 self.update_proposition(id, predicate.clone(), attributes, metadata)
@@ -3537,10 +3619,50 @@ impl CognitiveNexus {
         }
     }
 
-    fn check_target_term_for_kml(
+    async fn ensure_proposition_type(&self, predicate: &str) -> Result<(), KipError> {
+        if self
+            .has_concept(&ConceptPK::Object {
+                r#type: META_PROPOSITION_TYPE.to_string(),
+                name: predicate.to_string(),
+            })
+            .await
+        {
+            Ok(())
+        } else {
+            Err(KipError::not_found(format!(
+                "Proposition type {predicate} not found"
+            )))
+        }
+    }
+
+    fn next_dry_run_entity_id(
+        &self,
+        cached_pks: &FxHashMap<EntityPK, EntityID>,
+        predicate: Option<String>,
+    ) -> EntityID {
+        let id = u64::MAX.saturating_sub(cached_pks.len() as u64);
+        match predicate {
+            Some(predicate) => EntityID::Proposition(id, predicate),
+            None => EntityID::Concept(id),
+        }
+    }
+
+    async fn validate_set_proposition_for_kml(
+        &self,
+        set_prop: &SetProposition,
+        handle_map: &FxHashMap<String, EntityID>,
+        cached_pks: &mut FxHashMap<EntityPK, EntityID>,
+    ) -> Result<(), KipError> {
+        self.ensure_proposition_type(&set_prop.predicate).await?;
+        self.validate_target_term_for_kml(&set_prop.object, handle_map, cached_pks)
+            .await
+    }
+
+    async fn validate_target_term_for_kml(
         &self,
         target: &TargetTerm,
         handle_map: &FxHashMap<String, EntityID>,
+        cached_pks: &mut FxHashMap<EntityPK, EntityID>,
     ) -> Result<(), KipError> {
         match target {
             TargetTerm::Variable(handle) => {
@@ -3550,21 +3672,73 @@ impl CognitiveNexus {
                     )));
                 }
             }
-            TargetTerm::Concept {
-                matcher: concept_matcher,
-                ..
-            } => {
-                let _ = ConceptPK::try_from(concept_matcher.clone())?;
-            }
-            TargetTerm::Proposition {
-                matcher: proposition_matcher,
-                ..
-            } => {
-                let _ = PropositionPK::try_from(*proposition_matcher.clone())?;
+            TargetTerm::Concept { .. } | TargetTerm::Proposition { .. } => {
+                self.resolve_target_term(target.clone(), handle_map, cached_pks)
+                    .await?;
             }
         }
 
         Ok(())
+    }
+
+    async fn resolve_kml_proposition_pk(
+        &self,
+        matcher: PropositionMatcher,
+        handle_map: &FxHashMap<String, EntityID>,
+        cached_pks: &mut FxHashMap<EntityPK, EntityID>,
+    ) -> Result<PropositionPK, KipError> {
+        match matcher {
+            PropositionMatcher::ID(id) => {
+                let id = EntityID::from_str(&id).map_err(KipError::invalid_syntax)?;
+                match id {
+                    EntityID::Proposition(id, predicate) => {
+                        self.ensure_proposition_type(&predicate).await?;
+                        if !self.propositions.contains(id) {
+                            return Err(KipError::not_found(format!(
+                                "Proposition {} not found",
+                                PropositionPK::ID(id, predicate)
+                            )));
+                        }
+                        Ok(PropositionPK::ID(id, predicate))
+                    }
+                    _ => Err(KipError::invalid_syntax(format!(
+                        "PropositionMatcher::ID must be a Proposition ID, got: {id:?}"
+                    ))),
+                }
+            }
+            PropositionMatcher::Object {
+                subject,
+                predicate,
+                object,
+            } => {
+                let predicate = match predicate {
+                    PredTerm::Literal(value) => value,
+                    val => {
+                        return Err(KipError::invalid_syntax(format!(
+                            "PropositionMatcher::Object's predicate must be a literal string, got: {val:?}"
+                        )));
+                    }
+                };
+                self.ensure_proposition_type(&predicate).await?;
+
+                let subject_id =
+                    Box::pin(self.resolve_target_term(subject, handle_map, cached_pks)).await?;
+                let object_id =
+                    Box::pin(self.resolve_target_term(object, handle_map, cached_pks)).await?;
+                if subject_id == object_id {
+                    return Err(KipError::invalid_syntax(format!(
+                        "Subject and object cannot be the same: {}",
+                        subject_id
+                    )));
+                }
+
+                Ok(PropositionPK::Object {
+                    subject: Box::new(subject_id.into()),
+                    predicate,
+                    object: Box::new(object_id.into()),
+                })
+            }
+        }
     }
 
     async fn resolve_target_term(
@@ -3590,7 +3764,12 @@ impl CognitiveNexus {
                 matcher: proposition_matcher,
                 ..
             } => {
-                let proposition_pk = PropositionPK::try_from(*proposition_matcher)?;
+                let proposition_pk = Box::pin(self.resolve_kml_proposition_pk(
+                    *proposition_matcher,
+                    handle_map,
+                    cached_pks,
+                ))
+                .await?;
                 self.resolve_entity_id(&EntityPK::Proposition(proposition_pk), cached_pks)
                     .await
             }
@@ -3611,7 +3790,16 @@ impl CognitiveNexus {
 
         let id = match entity_pk {
             EntityPK::Concept(concept_pk) => match concept_pk {
-                ConceptPK::ID(id) => Ok(EntityID::Concept(*id)),
+                ConceptPK::ID(id) => {
+                    if self.concepts.contains(*id) {
+                        Ok(EntityID::Concept(*id))
+                    } else {
+                        Err(KipError::not_found(format!(
+                            "Concept {} not found",
+                            ConceptPK::ID(*id)
+                        )))
+                    }
+                }
                 ConceptPK::Object { r#type, name } => {
                     let id = self.query_concept_id(r#type, name).await?;
                     Ok(EntityID::Concept(id))
@@ -3619,7 +3807,23 @@ impl CognitiveNexus {
             },
             EntityPK::Proposition(proposition_pk) => match proposition_pk {
                 PropositionPK::ID(id, predicate) => {
-                    Ok(EntityID::Proposition(*id, predicate.clone()))
+                    if !self.propositions.contains(*id) {
+                        return Err(KipError::not_found(format!(
+                            "Proposition {} not found",
+                            PropositionPK::ID(*id, predicate.clone())
+                        )));
+                    }
+                    self.try_get_proposition_with(&QueryCache::default(), *id, |proposition| {
+                        if proposition.predicates.contains(predicate) {
+                            Ok(EntityID::Proposition(*id, predicate.clone()))
+                        } else {
+                            Err(KipError::not_found(format!(
+                                "proposition link not found: {}",
+                                PropositionPK::ID(*id, predicate.clone())
+                            )))
+                        }
+                    })
+                    .await
                 }
                 PropositionPK::Object {
                     subject,
@@ -3650,7 +3854,17 @@ impl CognitiveNexus {
                         .map_err(db_to_kip_error)?;
 
                     if let Some(id) = ids.first() {
-                        Ok(EntityID::Proposition(*id, predicate.clone()))
+                        self.try_get_proposition_with(&QueryCache::default(), *id, |proposition| {
+                            if proposition.predicates.contains(predicate) {
+                                Ok(EntityID::Proposition(*id, predicate.clone()))
+                            } else {
+                                Err(KipError::not_found(format!(
+                                    "proposition link not found: {}",
+                                    proposition_pk
+                                )))
+                            }
+                        })
+                        .await
                     } else {
                         Err(KipError::not_found(format!(
                             "proposition link not found: {}",
@@ -4846,6 +5060,63 @@ mod tests {
                 })
                 .await
         );
+
+        let valid_with_handles = r#"
+            UPSERT {
+                CONCEPT ?dry_drug {
+                    {type: "Drug", name: "DryDrug"}
+                }
+                CONCEPT ?dry_symptom {
+                    {type: "Symptom", name: "DrySymptom"}
+                }
+                PROPOSITION ?dry_fact {
+                    (?dry_drug, "treats", ?dry_symptom)
+                }
+            }
+            "#;
+
+        nexus
+            .execute_kml(parse_kml(valid_with_handles).unwrap(), true)
+            .await
+            .unwrap();
+        assert!(
+            !nexus
+                .has_concept(&ConceptPK::Object {
+                    r#type: "Drug".to_string(),
+                    name: "DryDrug".to_string(),
+                })
+                .await
+        );
+
+        let unknown_predicate = r#"
+            UPSERT {
+                CONCEPT ?bad_drug {
+                    {type: "Drug", name: "BadDrug"}
+                    SET PROPOSITIONS {
+                        ("not_registered", {type: "Symptom", name: "Headache"})
+                    }
+                }
+            }
+            "#;
+        let err = nexus
+            .execute_kml(parse_kml(unknown_predicate).unwrap(), true)
+            .await
+            .unwrap_err();
+        assert!(matches!(err.code, KipErrorCode::NotFound));
+
+        let err = nexus
+            .execute_kml(parse_kml(unknown_predicate).unwrap(), false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err.code, KipErrorCode::NotFound));
+        assert!(
+            !nexus
+                .has_concept(&ConceptPK::Object {
+                    r#type: "Drug".to_string(),
+                    name: "BadDrug".to_string(),
+                })
+                .await
+        );
     }
 
     #[tokio::test]
@@ -4911,21 +5182,62 @@ mod tests {
         let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
         setup_test_data(&nexus).await.unwrap();
 
+        nexus
+            .execute_kml(
+                parse_kml(
+                    r#"
+        UPSERT {
+            CONCEPT ?unused_type {
+                {type: "$ConceptType", name: "UnusedType"}
+            }
+        }
+        "#,
+                )
+                .unwrap(),
+                false,
+            )
+            .await
+            .unwrap();
+
         let (result, _) = nexus
             .execute_meta(parse_meta("DESCRIBE CONCEPT TYPES").unwrap())
             .await
             .unwrap();
 
-        assert_eq!(
-            result,
-            json!([
-                "$ConceptType",
-                "$PropositionType",
-                "Domain",
-                "Drug",
-                "Symptom",
-            ])
-        );
+        let types = result.as_array().unwrap();
+        let names: Vec<&str> = types.iter().filter_map(Json::as_str).collect();
+        for expected in [
+            "$ConceptType",
+            "$PropositionType",
+            "Domain",
+            "Drug",
+            "Event",
+            "Person",
+            "Symptom",
+            "UnusedType",
+        ] {
+            assert!(names.contains(&expected));
+        }
+        assert!(names.windows(2).all(|pair| pair[0] <= pair[1]));
+
+        let (page1, cursor) = nexus
+            .execute_meta(MetaCommand::Describe(DescribeTarget::ConceptTypes {
+                limit: Some(3),
+                cursor: None,
+            }))
+            .await
+            .unwrap();
+        assert!(cursor.is_some());
+        let (page2, _) = nexus
+            .execute_meta(MetaCommand::Describe(DescribeTarget::ConceptTypes {
+                limit: Some(3),
+                cursor,
+            }))
+            .await
+            .unwrap();
+        for item in page1.as_array().unwrap() {
+            assert!(!page2.as_array().unwrap().contains(item));
+        }
 
         let (result, _) = nexus
             .execute_meta(parse_meta("DESCRIBE CONCEPT TYPE \"Drug\"").unwrap())
@@ -4946,13 +5258,34 @@ mod tests {
         let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
         setup_test_data(&nexus).await.unwrap();
 
+        nexus
+            .execute_kml(
+                parse_kml(
+                    r#"
+        UPSERT {
+            CONCEPT ?unused_predicate {
+                {type: "$PropositionType", name: "unused_relation"}
+            }
+        }
+        "#,
+                )
+                .unwrap(),
+                false,
+            )
+            .await
+            .unwrap();
+
         let (result, _) = nexus
             .execute_meta(parse_meta("DESCRIBE PROPOSITION TYPES").unwrap())
             .await
             .unwrap();
 
-        // println!("{:#?}", result);
-        assert_eq!(result, json!(["belongs_to_domain", "treats",]));
+        let types = result.as_array().unwrap();
+        let names: Vec<&str> = types.iter().filter_map(Json::as_str).collect();
+        for expected in ["belongs_to_domain", "learned", "treats", "unused_relation"] {
+            assert!(names.contains(&expected));
+        }
+        assert!(names.windows(2).all(|pair| pair[0] <= pair[1]));
 
         let (result, _) = nexus
             .execute_meta(parse_meta("DESCRIBE PROPOSITION TYPE \"belongs_to_domain\"").unwrap())
@@ -5296,6 +5629,24 @@ mod tests {
         let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
         setup_test_data(&nexus).await.unwrap();
 
+        let extra_predicate_kml = r#"
+        UPSERT {
+            CONCEPT ?related_type {
+                {type: "$PropositionType", name: "related_to"}
+            }
+            CONCEPT ?aspirin {
+                {type: "Drug", name: "Aspirin"}
+                SET PROPOSITIONS {
+                    ("related_to", {type: "Symptom", name: "Headache"})
+                }
+            }
+        }
+        "#;
+        nexus
+            .execute_kml(parse_kml(extra_predicate_kml).unwrap(), false)
+            .await
+            .unwrap();
+
         // Test 1: FIND with predicate variable ?p alongside entity variables
         let kql = r#"
         FIND(?n, ?p, ?o)
@@ -5330,6 +5681,28 @@ mod tests {
         let predicates = result.as_array().unwrap();
         assert!(!predicates.is_empty());
         assert!(predicates.iter().any(|p| p.as_str() == Some("treats")));
+
+        // Test 2b: predicate-only pagination consumes the returned cursor
+        let page_kql = r#"
+        FIND(?p)
+        WHERE {
+            ?drug {type: "Drug", name: "Aspirin"}
+            (?drug, ?p, ?symptom)
+        }
+        LIMIT 1
+        "#;
+        let query = parse_kql(page_kql).unwrap();
+        let (page1, cursor) = nexus.execute_kql(query).await.unwrap();
+        assert!(cursor.is_some());
+        let page1 = page1.as_array().unwrap();
+        assert_eq!(page1.len(), 1);
+
+        let mut query = parse_kql(page_kql).unwrap();
+        query.cursor = cursor;
+        let (page2, _) = nexus.execute_kql(query).await.unwrap();
+        let page2 = page2.as_array().unwrap();
+        assert_eq!(page2.len(), 1);
+        assert_ne!(page1[0], page2[0]);
 
         // Test 3: FIND with literal predicate (not a variable) should still work
         let kql = r#"
@@ -5367,6 +5740,9 @@ mod tests {
         // Setup: create Person concepts and "working_on" propositions
         let setup_kml = r#"
         UPSERT {
+            CONCEPT ?working_on_type {
+                {type: "$PropositionType", name: "working_on"}
+            }
             CONCEPT ?alice {
                 {type: "Person", name: "Alice"}
                 SET ATTRIBUTES { "role": "researcher" }
