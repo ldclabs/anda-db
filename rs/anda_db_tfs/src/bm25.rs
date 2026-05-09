@@ -1084,7 +1084,7 @@ where
         }
 
         // Step 2: Sort by size descending for better packing.
-        token_sizes.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        token_sizes.sort_unstable_by_key(|b| std::cmp::Reverse(b.1));
 
         // Step 3: Best-fit-decreasing bin packing in O(n log n).
         // `by_remaining` maps remaining-capacity -> bin indices. We pick the bin with the
@@ -1525,8 +1525,8 @@ mod tests {
         let mut loaded_results = loaded_index.search("fox", 10, None);
 
         assert_eq!(original_results.len(), loaded_results.len());
-        original_results.sort_by(|a, b| a.0.cmp(&b.0));
-        loaded_results.sort_by(|a, b| a.0.cmp(&b.0));
+        original_results.sort_by_key(|a| a.0);
+        loaded_results.sort_by_key(|a| a.0);
         // 比较文档ID和分数（允许浮点数有小误差）
         for i in 0..original_results.len() {
             assert_eq!(original_results[i].0, loaded_results[i].0);
@@ -1896,8 +1896,8 @@ mod tests {
             // 按文档ID排序后比较
             let mut orig_sorted = original_results.clone();
             let mut loaded_sorted = loaded_results.clone();
-            orig_sorted.sort_by(|a, b| a.0.cmp(&b.0));
-            loaded_sorted.sort_by(|a, b| a.0.cmp(&b.0));
+            orig_sorted.sort_by_key(|a| a.0);
+            loaded_sorted.sort_by_key(|a| a.0);
 
             for i in 0..orig_sorted.len() {
                 assert_eq!(
@@ -2215,8 +2215,8 @@ mod tests {
 
             let mut before_sorted = results_before[i].clone();
             let mut after_sorted = results_after.clone();
-            before_sorted.sort_by(|a, b| a.0.cmp(&b.0));
-            after_sorted.sort_by(|a, b| a.0.cmp(&b.0));
+            before_sorted.sort_by_key(|a| a.0);
+            after_sorted.sort_by_key(|a| a.0);
             for j in 0..before_sorted.len() {
                 assert_eq!(before_sorted[j].0, after_sorted[j].0);
                 assert!(

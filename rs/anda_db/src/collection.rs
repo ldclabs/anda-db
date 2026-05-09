@@ -614,7 +614,7 @@ impl Collection {
         let start = Instant::now();
         let ids = self.ids();
         let total = ids.len();
-        let _ = futures::stream::iter(ids.into_iter())
+        let _ = futures::stream::iter(ids)
             .map(|id| {
                 let storage = self.storage.clone();
                 async move {

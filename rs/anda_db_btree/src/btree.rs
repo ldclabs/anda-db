@@ -1694,7 +1694,7 @@ where
         }
 
         // Step 2: Sort by size descending for better packing.
-        fv_sizes.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        fv_sizes.sort_unstable_by_key(|b| std::cmp::Reverse(b.1));
 
         // Step 3: First-fit-decreasing bin packing.
         let limit = self.config.bucket_overload_size;

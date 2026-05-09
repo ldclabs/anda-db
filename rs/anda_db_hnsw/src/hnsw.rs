@@ -525,7 +525,7 @@ impl HnswIndex {
         let dimension = self.config.dimension;
         let max_layers = self.config.max_layers;
         let f_ref = &f;
-        let mut stream = stream::iter(ids.into_iter())
+        let mut stream = stream::iter(ids)
             .map(|id| async move {
                 match f_ref(id).await {
                     Ok(Some(data)) => {

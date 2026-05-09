@@ -355,7 +355,7 @@ impl AndaDB {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        let results: Vec<Result<(), DBError>> = stream::iter(collections.into_iter())
+        let results: Vec<Result<(), DBError>> = stream::iter(collections)
             .map(|collection| async move { collection.close().await })
             .buffer_unordered(8) // 限制最多 8 个并发
             .collect()
@@ -415,7 +415,7 @@ impl AndaDB {
             .cloned()
             .collect::<Vec<_>>();
 
-        let results: Vec<Result<bool, DBError>> = stream::iter(collections.into_iter())
+        let results: Vec<Result<bool, DBError>> = stream::iter(collections)
             .map(|collection| async move { collection.flush(unix_ms()).await })
             .buffer_unordered(8) // 限制最多 8 个并发
             .collect()
