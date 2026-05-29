@@ -14,7 +14,7 @@
 use anda_db_utils::UniqueVec;
 use anda_kip::*;
 use parking_lot::RwLock;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::{fmt, hash::Hash, str::FromStr, sync::Arc};
 
 use crate::entity::*;
@@ -269,6 +269,16 @@ pub struct QueryContext {
     /// This enables per-group aggregation in FIND clauses like `FIND(?d.name, COUNT(?n))`.
     pub groups: FxHashMap<(String, String), FxHashMap<EntityID, UniqueVec<EntityID>>>,
 
+    /// Variables whose field-level values participate in row-sensitive filtering.
+    pub row_sensitive_vars: FxHashSet<String>,
+
+    /// Row-level bindings produced by proposition clauses.
+    ///
+    /// These preserve the tuple relationship between a proposition link and its
+    /// subject/object bindings for result materialization that needs row-level
+    /// ordering or filtering across variables.
+    pub relations: Vec<QueryRelationBinding>,
+
     /// Shared cache for loaded entities
     ///
     /// Provides thread-safe caching of concepts and propositions to avoid
@@ -302,6 +312,25 @@ pub struct QueryCache {
     ///
     /// Maps proposition IDs to their loaded `Proposition` instances.
     pub propositions: RwLock<FxHashMap<u64, Proposition>>,
+}
+
+/// Variables attached to the rows emitted by one proposition clause.
+#[derive(Clone, Debug)]
+pub struct QueryRelationBinding {
+    pub proposition_var: Option<String>,
+    pub subject_var: Option<String>,
+    pub predicate_var: Option<String>,
+    pub object_var: Option<String>,
+    pub rows: Vec<QueryRelationRow>,
+}
+
+/// One concrete proposition-clause match.
+#[derive(Clone, Debug)]
+pub struct QueryRelationRow {
+    pub proposition: EntityID,
+    pub subject: EntityID,
+    pub predicate: String,
+    pub object: EntityID,
 }
 
 /// Specifies the target entities for query operations.
@@ -347,6 +376,8 @@ pub struct PropositionsMatchResult {
     pub subject_to_objects: FxHashMap<EntityID, UniqueVec<EntityID>>,
     /// Per-object grouping: maps each object to its matched subjects
     pub object_to_subjects: FxHashMap<EntityID, UniqueVec<EntityID>>,
+    /// Concrete row matches preserving subject-predicate-object alignment.
+    pub rows: Vec<QueryRelationRow>,
 }
 
 impl PropositionsMatchResult {
@@ -383,14 +414,20 @@ impl PropositionsMatchResult {
             .or_default()
             .push(object.clone());
         self.object_to_subjects
-            .entry(object)
+            .entry(object.clone())
             .or_default()
-            .push(subject);
+            .push(subject.clone());
 
         for pred in predicates {
-            let id = EntityID::Proposition(proposition_id, pred.clone());
-            self.matched_propositions.push(id);
-            self.matched_predicates.push(pred);
+            let proposition = EntityID::Proposition(proposition_id, pred.clone());
+            self.matched_propositions.push(proposition.clone());
+            self.matched_predicates.push(pred.clone());
+            self.rows.push(QueryRelationRow {
+                proposition,
+                subject: subject.clone(),
+                predicate: pred,
+                object: object.clone(),
+            });
         }
     }
 }

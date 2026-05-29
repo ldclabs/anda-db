@@ -646,7 +646,7 @@ impl CognitiveNexus {
                 predicate,
                 object,
             } => {
-                self.match_propositions(ctx, subject, predicate, object)
+                self.match_propositions(ctx, subject, predicate, object, clause.variable.clone())
                     .await?
             }
         };
@@ -671,6 +671,8 @@ impl CognitiveNexus {
         ctx: &mut QueryContext,
         clause: FilterClause,
     ) -> Result<(), KipError> {
+        Self::collect_filter_row_sensitive_vars(&clause.expression, &mut ctx.row_sensitive_vars);
+
         let mut entities: FxHashMap<String, Vec<EntityID>> = ctx
             .entities
             .iter()
@@ -832,6 +834,7 @@ impl CognitiveNexus {
         clauses: Vec<WhereClause>,
     ) -> Result<(), KipError> {
         let mut optional_context = ctx.clone();
+        let base_relation_len = optional_context.relations.len();
         for clause in clauses {
             Box::pin(self.execute_where_clause(&mut optional_context, clause)).await?;
         }
@@ -855,6 +858,15 @@ impl CognitiveNexus {
                 entry.entry(gid).or_default().extend(mids.into_vec());
             }
         }
+
+        ctx.relations.extend(
+            optional_context
+                .relations
+                .into_iter()
+                .skip(base_relation_len),
+        );
+        ctx.row_sensitive_vars
+            .extend(optional_context.row_sensitive_vars);
 
         Ok(())
     }
@@ -890,6 +902,9 @@ impl CognitiveNexus {
                 entry.entry(gid).or_default().extend(mids.into_vec());
             }
         }
+        ctx.relations.extend(union_context.relations);
+        ctx.row_sensitive_vars
+            .extend(union_context.row_sensitive_vars);
 
         Ok(())
     }
@@ -942,6 +957,284 @@ impl CognitiveNexus {
         )))
     }
 
+    fn collect_find_variable_groups(clause: &FindClause) -> Option<Vec<(String, Vec<DotPathVar>)>> {
+        let mut groups: Vec<(String, Vec<DotPathVar>)> = Vec::new();
+
+        for expr in &clause.expressions {
+            let FindExpression::Variable(dot_path) = expr else {
+                return None;
+            };
+
+            if let Some((var, fields)) = groups.last_mut()
+                && var == &dot_path.var
+            {
+                fields.push(dot_path.clone());
+                continue;
+            }
+
+            groups.push((dot_path.var.clone(), vec![dot_path.clone()]));
+        }
+
+        Some(groups)
+    }
+
+    fn collect_filter_row_sensitive_vars(expr: &FilterExpression, vars: &mut FxHashSet<String>) {
+        match expr {
+            FilterExpression::Comparison { left, right, .. } => {
+                Self::collect_filter_operand_row_sensitive_vars(left, vars);
+                Self::collect_filter_operand_row_sensitive_vars(right, vars);
+            }
+            FilterExpression::Logical { left, right, .. } => {
+                Self::collect_filter_row_sensitive_vars(left, vars);
+                Self::collect_filter_row_sensitive_vars(right, vars);
+            }
+            FilterExpression::Not(inner) => Self::collect_filter_row_sensitive_vars(inner, vars),
+            FilterExpression::Function { args, .. } => {
+                for arg in args {
+                    Self::collect_filter_operand_row_sensitive_vars(arg, vars);
+                }
+            }
+        }
+    }
+
+    fn collect_filter_operand_row_sensitive_vars(
+        operand: &FilterOperand,
+        vars: &mut FxHashSet<String>,
+    ) {
+        if let FilterOperand::Variable(dot_path) = operand
+            && !dot_path.path.is_empty()
+        {
+            vars.insert(dot_path.var.clone());
+        }
+    }
+
+    fn relation_covers_var(relation: &QueryRelationBinding, var: &str) -> bool {
+        relation.proposition_var.as_deref() == Some(var)
+            || relation.subject_var.as_deref() == Some(var)
+            || relation.predicate_var.as_deref() == Some(var)
+            || relation.object_var.as_deref() == Some(var)
+    }
+
+    fn relation_row_entity<'a>(
+        relation: &'a QueryRelationBinding,
+        row: &'a QueryRelationRow,
+        var: &str,
+    ) -> Option<&'a EntityID> {
+        if relation.proposition_var.as_deref() == Some(var) {
+            Some(&row.proposition)
+        } else if relation.subject_var.as_deref() == Some(var) {
+            Some(&row.subject)
+        } else if relation.object_var.as_deref() == Some(var) {
+            Some(&row.object)
+        } else {
+            None
+        }
+    }
+
+    fn relation_row_predicate<'a>(
+        relation: &'a QueryRelationBinding,
+        row: &'a QueryRelationRow,
+        var: &str,
+    ) -> Option<&'a str> {
+        if relation.predicate_var.as_deref() == Some(var) {
+            Some(&row.predicate)
+        } else {
+            None
+        }
+    }
+
+    fn relation_row_matches_context(
+        ctx: &QueryContext,
+        relation: &QueryRelationBinding,
+        row: &QueryRelationRow,
+    ) -> bool {
+        for var in [
+            relation.proposition_var.as_deref(),
+            relation.subject_var.as_deref(),
+            relation.object_var.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(allowed) = ctx.entities.get(var)
+                && let Some(entity_id) = Self::relation_row_entity(relation, row, var)
+                && !allowed.iter().any(|id| id == entity_id)
+            {
+                return false;
+            }
+        }
+
+        if let Some(var) = relation.predicate_var.as_deref()
+            && let Some(allowed) = ctx.predicates.get(var)
+            && !allowed.iter().any(|predicate| predicate == &row.predicate)
+        {
+            return false;
+        }
+
+        true
+    }
+
+    async fn load_relation_row_value(
+        &self,
+        cache: &QueryCache,
+        relation: &QueryRelationBinding,
+        row: &QueryRelationRow,
+        dot_path: &DotPathVar,
+    ) -> Result<Json, KipError> {
+        if let Some(entity_id) = Self::relation_row_entity(relation, row, &dot_path.var) {
+            return self
+                .load_entity_field(cache, entity_id, &dot_path.to_pointer())
+                .await;
+        }
+
+        if let Some(predicate) = Self::relation_row_predicate(relation, row, &dot_path.var) {
+            return if dot_path.path.is_empty() {
+                Ok(Json::String(predicate.to_string()))
+            } else {
+                Ok(Json::Null)
+            };
+        }
+
+        Err(KipError::reference_error(format!(
+            "Unbound variable: {:?}",
+            dot_path.var
+        )))
+    }
+
+    async fn try_execute_relation_row_find(
+        &self,
+        ctx: &QueryContext,
+        clause: &FindClause,
+        order_by: &[OrderByCondition],
+        cursor: Option<&EntityID>,
+        limit: usize,
+    ) -> Result<Option<(Vec<Json>, Option<String>)>, KipError> {
+        let Some(groups) = Self::collect_find_variable_groups(clause) else {
+            return Ok(None);
+        };
+
+        let mut referenced: FxHashSet<String> = FxHashSet::default();
+        for (_, dot_paths) in &groups {
+            for dot_path in dot_paths {
+                referenced.insert(dot_path.var.clone());
+            }
+        }
+        for cond in order_by {
+            if !cond.is_aggregation() {
+                referenced.insert(cond.variable.var.clone());
+            }
+        }
+
+        let relation = ctx.relations.iter().rev().find(|relation| {
+            let proposition_var = relation.proposition_var.as_deref();
+            let orders_by_proposition_field = proposition_var
+                .map(|var| {
+                    order_by.iter().any(|cond| {
+                        !cond.is_aggregation()
+                            && cond.variable.var == var
+                            && !cond.variable.path.is_empty()
+                    })
+                })
+                .unwrap_or(false);
+            let filters_by_proposition_field = proposition_var
+                .map(|var| ctx.row_sensitive_vars.contains(var))
+                .unwrap_or(false);
+
+            (orders_by_proposition_field || filters_by_proposition_field)
+                && referenced
+                    .iter()
+                    .all(|var| Self::relation_covers_var(relation, var))
+        });
+
+        let Some(relation) = relation.cloned() else {
+            return Ok(None);
+        };
+
+        let mut rows: Vec<QueryRelationRow> = relation
+            .rows
+            .iter()
+            .filter(|row| Self::relation_row_matches_context(ctx, &relation, row))
+            .cloned()
+            .collect();
+
+        let order_conditions: Vec<&OrderByCondition> = order_by
+            .iter()
+            .filter(|cond| !cond.is_aggregation())
+            .collect();
+        if !order_conditions.is_empty() {
+            let mut keyed_rows: Vec<(QueryRelationRow, Vec<Json>)> = Vec::with_capacity(rows.len());
+            for row in rows {
+                let mut sort_values = Vec::with_capacity(order_conditions.len());
+                for cond in &order_conditions {
+                    sort_values.push(
+                        self.load_relation_row_value(&ctx.cache, &relation, &row, &cond.variable)
+                            .await?,
+                    );
+                }
+                keyed_rows.push((row, sort_values));
+            }
+
+            keyed_rows.sort_by(|(_, left_values), (_, right_values)| {
+                for (idx, cond) in order_conditions.iter().enumerate() {
+                    if let Some(ordering) = compare_json(&left_values[idx], &right_values[idx]) {
+                        let ordering = match cond.direction {
+                            OrderDirection::Asc => ordering,
+                            OrderDirection::Desc => ordering.reverse(),
+                        };
+
+                        if ordering != std::cmp::Ordering::Equal {
+                            return ordering;
+                        }
+                    }
+                }
+
+                std::cmp::Ordering::Equal
+            });
+
+            rows = keyed_rows.into_iter().map(|(row, _)| row).collect();
+        }
+
+        if let Some(cursor) = cursor
+            && let Some(idx) = rows.iter().position(|row| &row.proposition == cursor)
+            && idx < rows.len()
+        {
+            rows = rows.split_off(idx + 1);
+        }
+
+        let mut next_cursor: Option<String> = None;
+        if limit > 0 && limit <= rows.len() {
+            rows.truncate(limit);
+            next_cursor = rows
+                .last()
+                .and_then(|row| BTree::to_cursor(&row.proposition));
+        }
+
+        let mut result: Vec<Json> = Vec::with_capacity(groups.len());
+        for (_, dot_paths) in groups {
+            let mut column = Vec::with_capacity(rows.len());
+            for row in &rows {
+                if dot_paths.len() == 1 {
+                    column.push(
+                        self.load_relation_row_value(&ctx.cache, &relation, row, &dot_paths[0])
+                            .await?,
+                    );
+                } else {
+                    let mut values = Vec::with_capacity(dot_paths.len());
+                    for dot_path in &dot_paths {
+                        values.push(
+                            self.load_relation_row_value(&ctx.cache, &relation, row, dot_path)
+                                .await?,
+                        );
+                    }
+                    column.push(Json::Array(values));
+                }
+            }
+            result.push(Json::Array(column));
+        }
+
+        Ok(Some((result, next_cursor)))
+    }
+
     async fn execute_find_clause(
         &self,
         ctx: &mut QueryContext,
@@ -971,6 +1264,13 @@ impl CognitiveNexus {
 
         // 非分组模式
         let cursor: Option<EntityID> = BTree::from_cursor(&cursor).ok().flatten();
+        if let Some(row_result) = self
+            .try_execute_relation_row_find(ctx, &clause, &order_by, cursor.as_ref(), limit)
+            .await?
+        {
+            return Ok(row_result);
+        }
+
         let mut result: Vec<Json> = Vec::with_capacity(clause.expressions.len());
         let mut next_cursor: Option<String> = None;
         let mut group_var: Option<(String, Vec<String>)> = None;
@@ -3042,6 +3342,7 @@ impl CognitiveNexus {
         subject: TargetTerm,
         predicate: PredTerm,
         object: TargetTerm,
+        proposition_var: Option<String>,
     ) -> Result<TargetEntities, KipError> {
         let subject_var = match &subject {
             TargetTerm::Variable(var) => Some(var.clone()),
@@ -3117,6 +3418,20 @@ impl CognitiveNexus {
                 self.handle_predicate_matching(ctx, predicate).await?
             }
         };
+
+        if proposition_var.is_some()
+            || subject_var.is_some()
+            || predicate_var.is_some()
+            || object_var.is_some()
+        {
+            ctx.relations.push(QueryRelationBinding {
+                proposition_var,
+                subject_var: subject_var.clone(),
+                predicate_var: predicate_var.clone(),
+                object_var: object_var.clone(),
+                rows: result.rows.clone(),
+            });
+        }
 
         if let Some(var) = subject_var {
             ctx.entities.insert(var.clone(), result.matched_subjects);
@@ -3303,7 +3618,14 @@ impl CognitiveNexus {
                         object,
                     } => {
                         // 递归查询命题
-                        Box::pin(self.match_propositions(ctx, subject, predicate, object)).await?
+                        Box::pin(self.match_propositions(
+                            ctx,
+                            subject,
+                            predicate,
+                            object,
+                            variable.clone(),
+                        ))
+                        .await?
                     }
                 };
 
@@ -5825,6 +6147,104 @@ mod tests {
         let arr = result.as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0], "Alice");
+    }
+
+    #[tokio::test]
+    async fn test_kql_prefers_query_preserves_link_row_alignment() {
+        let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+
+        let setup_kml = r#"
+        UPSERT {
+            CONCEPT ?person_type {
+                {type: "$ConceptType", name: "Person"}
+            }
+            CONCEPT ?preference_type {
+                {type: "$ConceptType", name: "Preference"}
+            }
+            CONCEPT ?prefers_type {
+                {type: "$PropositionType", name: "prefers"}
+            }
+            CONCEPT ?person {
+                {type: "Person", name: "alice-prefers-query"}
+            }
+            CONCEPT ?tea {
+                {type: "Preference", name: "Tea"}
+                SET ATTRIBUTES { "evidence_count": 10 }
+            }
+            CONCEPT ?music {
+                {type: "Preference", name: "Music"}
+                SET ATTRIBUTES { "evidence_count": 10 }
+            }
+            CONCEPT ?coffee {
+                {type: "Preference", name: "Coffee"}
+                SET ATTRIBUTES { "evidence_count": 7 }
+            }
+            CONCEPT ?old {
+                {type: "Preference", name: "Old"}
+                SET ATTRIBUTES { "evidence_count": 99 }
+            }
+            PROPOSITION ?tea_link {
+                ({type: "Person", name: "alice-prefers-query"}, "prefers", {type: "Preference", name: "Tea"})
+            } WITH METADATA { "confidence": 0.4 }
+            PROPOSITION ?music_link {
+                ({type: "Person", name: "alice-prefers-query"}, "prefers", {type: "Preference", name: "Music"})
+            } WITH METADATA { "confidence": 0.8 }
+            PROPOSITION ?coffee_link {
+                ({type: "Person", name: "alice-prefers-query"}, "prefers", {type: "Preference", name: "Coffee"})
+            } WITH METADATA { "confidence": 0.9 }
+            PROPOSITION ?old_link {
+                ({type: "Person", name: "alice-prefers-query"}, "prefers", {type: "Preference", name: "Old"})
+            } WITH METADATA { "confidence": 1.0, "superseded": true }
+        }
+        "#;
+        nexus
+            .execute_kml(parse_kml(setup_kml).unwrap(), false)
+            .await
+            .unwrap();
+
+        let command = r#"
+        FIND(?pref, ?link.metadata) WHERE {
+          ?p {type: "Person", name: :person_id}
+          ?link (?p, "prefers", ?pref)
+          FILTER(IS_NULL(?link.metadata.superseded) || ?link.metadata.superseded != true)
+        } ORDER BY ?pref.attributes.evidence_count DESC, ?link.metadata.confidence DESC LIMIT 20
+        "#;
+        let mut parameters = Map::new();
+        parameters.insert(
+            "person_id".to_string(),
+            Json::String("alice-prefers-query".to_string()),
+        );
+        let request = Request {
+            command: command.to_string(),
+            parameters,
+            readonly: true,
+            ..Default::default()
+        };
+
+        let (cmd_type, response) = request.execute(&nexus).await;
+        assert_eq!(cmd_type, CommandType::Kql);
+        let result = response.into_result().unwrap();
+        let columns = result.as_array().unwrap();
+        assert_eq!(columns.len(), 2);
+
+        let prefs = columns[0].as_array().unwrap();
+        let pref_names: Vec<&str> = prefs
+            .iter()
+            .map(|pref| pref["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(pref_names, vec!["Music", "Tea", "Coffee"]);
+
+        let link_metadata = columns[1].as_array().unwrap();
+        let confidences: Vec<Json> = link_metadata
+            .iter()
+            .map(|metadata| metadata["confidence"].clone())
+            .collect();
+        assert_eq!(confidences, vec![json!(0.8), json!(0.4), json!(0.9)]);
+        assert!(
+            link_metadata
+                .iter()
+                .all(|metadata| metadata.get("superseded") != Some(&Json::Bool(true)))
+        );
     }
 
     #[tokio::test]
