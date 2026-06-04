@@ -577,12 +577,37 @@ where
                         name: self.name.clone(),
                         source: err.into(),
                     })?;
-                let bks = bucket.postings.keys().cloned().collect::<Vec<_>>();
-                self.btree.write().extend(bks.iter().cloned());
-                // Update bucket information
-                // Larger buckets have the most recent state and can override smaller buckets
-                self.buckets.insert(i, (data.len(), false, bks.into(), 0));
-                self.postings.extend(bucket.postings);
+                let mut bks = UniqueVec::with_capacity(bucket.postings.len());
+                let mut loaded_keys = Vec::with_capacity(bucket.postings.len());
+
+                // Higher bucket ids are the newer state when a migrated posting
+                // appears in more than one bucket. Reconcile the old in-memory
+                // bucket ownership and mark it dirty so the stale lower bucket
+                // is repaired on the next flush.
+                for (field_value, mut posting) in bucket.postings {
+                    posting.0 = i;
+                    if let Some(previous) = self.postings.insert(field_value.clone(), posting) {
+                        let previous_bucket_id = previous.0;
+                        if previous_bucket_id != i
+                            && let Some(mut previous_bucket) =
+                                self.buckets.get_mut(&previous_bucket_id)
+                            && previous_bucket
+                                .2
+                                .swap_remove_if(|key| key == &field_value)
+                                .is_some()
+                        {
+                            let previous_size = estimate_cbor_size(&previous) + 2;
+                            previous_bucket.0 = previous_bucket.0.saturating_sub(previous_size);
+                            self.mark_bucket_dirty(&mut previous_bucket);
+                        }
+                    }
+
+                    bks.push(field_value.clone());
+                    loaded_keys.push(field_value);
+                }
+
+                self.btree.write().extend(loaded_keys);
+                self.buckets.insert(i, (data.len(), false, bks, 0));
             }
         }
 
@@ -2019,6 +2044,24 @@ mod tests {
         index
     }
 
+    fn encode_bucket(index: &BTreeIndex<u64, String>, bucket_id: u32) -> Vec<u8> {
+        let bucket = index.buckets.get(&bucket_id).unwrap();
+        let postings: rustc_hash::FxHashMap<_, _> = bucket
+            .2
+            .iter()
+            .filter_map(|fv| index.postings.get(fv).map(|posting| (fv, posting)))
+            .collect();
+        let mut buf = Vec::new();
+        ciborium::into_writer(
+            &BucketRef {
+                postings: &postings,
+            },
+            &mut buf,
+        )
+        .unwrap();
+        buf
+    }
+
     #[test]
     fn test_create_index() {
         let index = create_test_index();
@@ -2840,6 +2883,109 @@ mod tests {
                 .query_with(&"apple".to_string(), |ids| Some(ids.clone()))
                 .is_none(),
             "apple should not resurrect from stale source bucket"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_reconciles_stale_source_bucket_after_partial_migration_flush() {
+        let config = BTreeConfig {
+            bucket_overload_size: 80,
+            allow_duplicates: true,
+        };
+        let index = BTreeIndex::new("partial_migration_flush".to_string(), Some(config));
+
+        let mut metadata_buf = Vec::new();
+        let mut bucket_data = Vec::<Vec<u8>>::new();
+
+        index.insert(1, "apple".to_string(), now_ms()).unwrap();
+        index
+            .flush(&mut metadata_buf, now_ms(), async |bucket_id, data| {
+                while bucket_data.len() <= bucket_id as usize {
+                    bucket_data.push(Vec::new());
+                }
+                bucket_data[bucket_id as usize] = data.to_vec();
+                Ok(true)
+            })
+            .await
+            .unwrap();
+
+        let mut doc_id = 2u64;
+        while index.stats().max_bucket_id == 0 && doc_id < 200 {
+            index.insert(doc_id, "apple".to_string(), now_ms()).unwrap();
+            doc_id += 1;
+        }
+
+        let apple = "apple".to_string();
+        let migrated_bucket_id = index.postings.get(&apple).unwrap().0;
+        assert!(
+            migrated_bucket_id > 0,
+            "apple should migrate out of bucket 0"
+        );
+
+        metadata_buf.clear();
+        assert!(index.store_metadata(&mut metadata_buf, now_ms()).unwrap());
+
+        // Simulate a crash after the migrated destination bucket was persisted,
+        // but before the stale source bucket rewrite reached storage.
+        while bucket_data.len() <= migrated_bucket_id as usize {
+            bucket_data.push(Vec::new());
+        }
+        bucket_data[migrated_bucket_id as usize] = encode_bucket(&index, migrated_bucket_id);
+
+        let mut loaded = BTreeIndex::<u64, String>::load_metadata(&metadata_buf[..]).unwrap();
+        loaded
+            .load_buckets(async |bucket_id| {
+                if bucket_id as usize >= bucket_data.len()
+                    || bucket_data[bucket_id as usize].is_empty()
+                {
+                    return Ok(None);
+                }
+                Ok(Some(bucket_data[bucket_id as usize].clone()))
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            loaded.has_dirty_buckets(),
+            "stale source bucket needs repair"
+        );
+        assert!(loaded.query_with(&apple, |ids| Some(ids.clone())).is_some());
+
+        for id in 1..doc_id {
+            loaded.remove(id, apple.clone(), now_ms());
+        }
+        assert!(loaded.query_with(&apple, |ids| Some(ids.clone())).is_none());
+
+        metadata_buf.clear();
+        loaded
+            .flush(&mut metadata_buf, now_ms(), async |bucket_id, data| {
+                while bucket_data.len() <= bucket_id as usize {
+                    bucket_data.push(Vec::new());
+                }
+                bucket_data[bucket_id as usize] = data.to_vec();
+                Ok(true)
+            })
+            .await
+            .unwrap();
+
+        let mut reloaded = BTreeIndex::<u64, String>::load_metadata(&metadata_buf[..]).unwrap();
+        reloaded
+            .load_buckets(async |bucket_id| {
+                if bucket_id as usize >= bucket_data.len()
+                    || bucket_data[bucket_id as usize].is_empty()
+                {
+                    return Ok(None);
+                }
+                Ok(Some(bucket_data[bucket_id as usize].clone()))
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            reloaded
+                .query_with(&apple, |ids| Some(ids.clone()))
+                .is_none(),
+            "apple must not resurrect from a stale source bucket after repair flush"
         );
     }
 

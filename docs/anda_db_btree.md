@@ -192,9 +192,11 @@ The index is designed to be cloned into `Arc` and shared across tasks.
   `Entry::Occupied` + empty re-check, so a concurrent `insert` that re-adds
   a doc id wins over the removal and keeps the posting alive.
 - **Crash-consistent migration.** Moving a posting from bucket A to bucket B
-  marks **both** buckets dirty. After a crash, replaying the two latest
-  on-disk bucket files yields the correct state with no duplicates or
-  resurrections.
+  marks **both** buckets dirty. If a crash leaves a stale lower-numbered
+  bucket file alongside a newer migrated bucket, `load_buckets` treats the
+  higher bucket id as the current owner, removes the stale in-memory ownership
+  from the lower bucket, and marks that lower bucket dirty so the next flush
+  repairs the stale file.
 - **Dirty-version check on flush.** If a bucket is mutated while its CBOR
   blob is being written, its `dirty_version` changes; the post-write clean
   step then refuses to clear the dirty flag, guaranteeing the mutation is
@@ -272,6 +274,10 @@ let idx = BTreeIndex::load_all(meta_reader, async |id| …).await?;
 
 `load_buckets` iterates `0..=max_bucket_id`; missing buckets are tolerated
 (the callback returns `Ok(None)`), so compaction or bucket deletion is safe.
+When the same field value appears in multiple bucket files, later bucket ids
+win. The loader reconciles the older bucket's in-memory `field_values` list and
+marks that bucket dirty, allowing a normal flush to remove the stale on-disk
+entry.
 
 ---
 
@@ -586,7 +592,9 @@ When a posting moves from bucket `A` to bucket `B`:
 3. Bucket `B`'s `field_values` gains the key; `B.is_dirty = true`.
 
 Both dirty flags ensure a crash after step 3 cannot cause the posting to be
-re-read from `A` on the next load.
+re-read from `A` on the next load. If an older source bucket file is still
+present after restart, the loader performs the same source-bucket cleanup in
+memory and schedules it for repair on the next flush.
 
 ### 10.3 Compaction
 
