@@ -365,6 +365,12 @@ where
     where
         F: AsyncFnMut(u32) -> Result<Option<Vec<u8>>, BoxError>,
     {
+        let mut doc_token_lengths: FxHashMap<u64, usize> = self
+            .doc_tokens
+            .iter()
+            .map(|entry| (*entry.key(), *entry.value()))
+            .collect();
+
         for i in 0..=self.max_bucket_id.load(Ordering::Relaxed) {
             let data = f(i).await.map_err(|err| BM25Error::Generic {
                 name: self.name.clone(),
@@ -383,15 +389,68 @@ where
                 };
                 if !bucket.doc_tokens.is_empty() {
                     b.doc_ids = bucket.doc_tokens.keys().cloned().collect();
-                    self.doc_tokens.extend(bucket.doc_tokens);
+                    for (doc_id, token_count) in bucket.doc_tokens {
+                        doc_token_lengths.insert(doc_id, token_count);
+                    }
                 }
 
                 if !bucket.postings.is_empty() {
-                    b.tokens = bucket.postings.keys().cloned().collect();
-                    self.postings.extend(bucket.postings);
+                    for (token, mut posting) in bucket.postings {
+                        // The bucket file path is the source of truth for ownership.
+                        // If a stale lower-numbered bucket is still present after a
+                        // partial flush, later buckets win and the old bucket is
+                        // marked dirty so the stale token is removed on the next flush.
+                        posting.0 = i;
+                        if let Some(previous) = self.postings.insert(token.clone(), posting) {
+                            let previous_bucket_id = previous.0;
+                            if previous_bucket_id != i
+                                && let Some(mut previous_bucket) =
+                                    self.buckets.get_mut(&previous_bucket_id)
+                                && previous_bucket
+                                    .tokens
+                                    .swap_remove_if(|k| &token == k)
+                                    .is_some()
+                            {
+                                let previous_size = estimate_cbor_size(&(&token, &previous)) + 2;
+                                previous_bucket.size =
+                                    previous_bucket.size.saturating_sub(previous_size);
+                                previous_bucket.mark_dirty();
+                            }
+                        }
+
+                        b.tokens.push(token);
+                    }
                 }
 
                 self.buckets.insert(i, b);
+            }
+        }
+
+        let mut doc_ids_by_bucket: FxHashMap<u32, FxHashSet<u64>> = FxHashMap::default();
+        let mut loaded_doc_tokens: FxHashMap<u64, usize> = FxHashMap::default();
+
+        for posting in self.postings.iter() {
+            let bucket_id = posting.0;
+            let doc_ids = doc_ids_by_bucket.entry(bucket_id).or_default();
+            for (doc_id, _) in posting.1.iter() {
+                if let Some(token_count) = doc_token_lengths.get(doc_id) {
+                    loaded_doc_tokens.insert(*doc_id, *token_count);
+                    doc_ids.insert(*doc_id);
+                }
+            }
+        }
+
+        self.doc_tokens.clear();
+        self.doc_tokens.extend(loaded_doc_tokens);
+
+        let bucket_ids: Vec<u32> = self.buckets.iter().map(|b| *b.key()).collect();
+        for bucket_id in bucket_ids {
+            if let Some(mut bucket) = self.buckets.get_mut(&bucket_id) {
+                let doc_ids = doc_ids_by_bucket.remove(&bucket_id).unwrap_or_default();
+                if bucket.doc_ids != doc_ids {
+                    bucket.doc_ids = doc_ids;
+                    bucket.mark_dirty();
+                }
             }
         }
 
@@ -1236,14 +1295,23 @@ where
                     _ => continue,
                 };
 
+                let mut referenced_doc_ids = FxHashSet::default();
                 let postings: FxHashMap<_, _> = bucket
                     .tokens
                     .iter()
-                    .filter_map(|k| self.postings.get(k).map(|v| (k, v)))
+                    .filter_map(|k| {
+                        let posting = self.postings.get(k)?;
+                        if posting.0 != bucket_id {
+                            return None;
+                        }
+                        for (doc_id, _) in posting.1.iter() {
+                            referenced_doc_ids.insert(*doc_id);
+                        }
+                        Some((k, posting))
+                    })
                     .collect();
 
-                let doc_tokens: FxHashMap<_, _> = bucket
-                    .doc_ids
+                let doc_tokens: FxHashMap<_, _> = referenced_doc_ids
                     .iter()
                     .filter_map(|id| self.doc_tokens.get(id).map(|v| (*id, *v)))
                     .collect();
@@ -1327,6 +1395,22 @@ mod tests {
         index
     }
 
+    fn encode_bucket_owned(
+        postings: FxHashMap<String, PostingValue>,
+        doc_tokens: FxHashMap<u64, usize>,
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        ciborium::into_writer(
+            &BucketOwned {
+                postings,
+                doc_tokens,
+            },
+            &mut buf,
+        )
+        .unwrap();
+        buf
+    }
+
     #[test]
     fn test_insert() {
         let index = create_test_index();
@@ -1367,6 +1451,101 @@ mod tests {
         let removed = index.remove(99, "This document doesn't exist", 0);
         assert!(!removed);
         assert_eq!(index.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_load_reconciles_duplicate_token_bucket_ownership() {
+        let index = BM25Index::new(
+            "duplicate_token_load".to_string(),
+            default_tokenizer(),
+            Some(BM25Config {
+                bm25: BM25Params::default(),
+                bucket_overload_size: 64,
+            }),
+        );
+        index.insert(1, "alpha", 0).unwrap();
+
+        let mut initial_metadata = Vec::new();
+        let mut stale_bucket0 = Vec::new();
+        index
+            .flush(&mut initial_metadata, 1, async |bucket_id, data| {
+                if bucket_id == 0 {
+                    stale_bucket0 = data.to_vec();
+                }
+                Ok(true)
+            })
+            .await
+            .unwrap();
+        assert!(!stale_bucket0.is_empty());
+
+        let mut metadata = index.metadata();
+        metadata.stats.version += 1;
+        metadata.stats.max_bucket_id = 1;
+        let mut metadata_buf = Vec::new();
+        ciborium::into_writer(
+            &BM25IndexRef {
+                metadata: &metadata,
+            },
+            &mut metadata_buf,
+        )
+        .unwrap();
+
+        let mut newer_postings = FxHashMap::default();
+        newer_postings.insert("alpha".to_string(), (1, vec![(1, 1)].into()));
+        let newer_bucket1 = encode_bucket_owned(newer_postings, FxHashMap::from_iter([(1, 1)]));
+
+        let mut loaded = BM25Index::load_metadata(default_tokenizer(), &metadata_buf[..]).unwrap();
+        loaded
+            .load_buckets(async |bucket_id| match bucket_id {
+                0 => Ok(Some(stale_bucket0.clone())),
+                1 => Ok(Some(newer_bucket1.clone())),
+                _ => Ok(None),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(loaded.postings.get("alpha").unwrap().0, 1);
+        assert!(
+            !loaded
+                .buckets
+                .get(&0)
+                .unwrap()
+                .tokens
+                .contains(&"alpha".to_string())
+        );
+        assert!(loaded.has_dirty_buckets());
+
+        let mut repaired_buckets: HashMap<u32, Vec<u8>> = HashMap::new();
+        loaded
+            .store_dirty_buckets(async |bucket_id, data| {
+                repaired_buckets.insert(bucket_id, data.to_vec());
+                Ok(true)
+            })
+            .await
+            .unwrap();
+
+        let repaired_bucket0: BucketOwned =
+            ciborium::from_reader(&repaired_buckets.get(&0).unwrap()[..]).unwrap();
+        assert!(repaired_bucket0.postings.is_empty());
+        assert!(repaired_bucket0.doc_tokens.is_empty());
+
+        let reloaded =
+            BM25Index::load_all(
+                default_tokenizer(),
+                &metadata_buf[..],
+                async |id| match id {
+                    0 => Ok(repaired_buckets.get(&0).cloned()),
+                    1 => Ok(Some(newer_bucket1.clone())),
+                    _ => Ok(None),
+                },
+            )
+            .await
+            .unwrap();
+
+        let results = reloaded.search("alpha", 10, None);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, 1);
+        assert!(!reloaded.has_dirty_buckets());
     }
 
     #[test]

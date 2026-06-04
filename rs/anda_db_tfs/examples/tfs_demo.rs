@@ -53,6 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Total documents after removal: {}", index.len());
 
     // 保存和加载
+    std::fs::create_dir_all("debug/tfs_demo")?;
     {
         let metadata = std::fs::File::create("debug/tfs_demo/metadata.cbor")?;
         index
@@ -64,7 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
     }
 
-    let metadata = std::fs::File::open("debug/hnsw_demo/metadata.cbor")?;
+    let metadata = std::fs::File::open("debug/tfs_demo/metadata.cbor")?;
     let loaded_index = BM25Index::load_all(jieba_tokenizer(), metadata, async |id| {
         let mut node = std::fs::File::open(format!("debug/tfs_demo/b_{id}.cbor"))?;
         let mut buf = Vec::new();

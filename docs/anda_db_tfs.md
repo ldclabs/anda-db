@@ -142,6 +142,7 @@ index.flush(metadata_writer, now_ms, async |bucket_id, bytes| {
 
 - `flush` writes metadata first, unless `version` has not advanced.
 - It then scans `buckets`, encodes only buckets where `is_dirty()` is true, and invokes the closure for each of them.
+- During bucket encoding, only postings whose current owner is that bucket are written. The serialized `doc_tokens` table is derived from those postings, so stale bucket-side document IDs are not re-persisted.
 - After each successful write, only that bucket's `saved_version` is advanced to the version snapshot observed at the time. Concurrent modifications still leave it dirty, so the next flush will resend it.
 
 ### 6.4 Startup and Partial Loading
@@ -154,6 +155,7 @@ let idx = BM25Index::load_all(tokenizer, metadata_reader, async |id| {
 
 - `load_metadata` restores metadata only, which is useful for lightweight scenarios that need just statistics.
 - `load_buckets` can skip buckets on demand when the closure returns `Ok(None)`, which fits a layered strategy like lazy loading plus keeping recently active buckets resident in memory. During search, `score_term` automatically ignores documents that were not loaded.
+- If the same token appears in more than one loaded bucket, the later bucket id wins. The loader removes that token from the older bucket, rebuilds bucket document-id sets from the winning postings, and marks repaired buckets dirty so the next flush removes stale on-disk ownership.
 
 ---
 
@@ -254,7 +256,7 @@ Tuning guidance:
 
 Test coverage includes:
 
-- `cargo test -p anda_db_tfs --features full --lib` (27 unit tests)
+- `cargo test -p anda_db_tfs --features full --lib` (31 unit tests)
 - Correctness of insert / remove / search, bucket serialization and partial loading, result invariance after compaction, the regression test `test_no_excessive_small_buckets`, UTF-8 query parsing, and more.
 
 Benchmark command: `cargo bench -p anda_db_tfs --features full --bench tfs_tokenizer`.
