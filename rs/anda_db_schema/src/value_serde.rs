@@ -57,8 +57,18 @@ impl Serialize for FieldValue {
             FieldValue::Bool(x) => serializer.serialize_bool(*x),
             FieldValue::I64(x) => serializer.serialize_i64(*x),
             FieldValue::U64(x) => serializer.serialize_u64(*x),
-            FieldValue::F64(x) => serializer.serialize_f64(*x),
-            FieldValue::F32(x) => serializer.serialize_f32(*x),
+            FieldValue::F64(x) => {
+                if x.is_nan() {
+                    return Err(serde::ser::Error::custom("cannot serialize NaN F64"));
+                }
+                serializer.serialize_f64(*x)
+            }
+            FieldValue::F32(x) => {
+                if x.is_nan() {
+                    return Err(serde::ser::Error::custom("cannot serialize NaN F32"));
+                }
+                serializer.serialize_f32(*x)
+            }
             FieldValue::Bytes(x) => {
                 if serializer.is_human_readable() {
                     BASE64_URL_SAFE.encode(x).serialize(serializer)
@@ -177,11 +187,17 @@ impl<'de> de::Visitor<'de> for Visitor {
 
     #[inline]
     fn visit_f32<E: de::Error>(self, v: f32) -> Result<Self::Value, E> {
+        if v.is_nan() {
+            return Err(E::custom("cannot deserialize NaN F32"));
+        }
         Ok(FieldValue::F32(v))
     }
 
     #[inline]
     fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
+        if v.is_nan() {
+            return Err(E::custom("cannot deserialize NaN F64"));
+        }
         Ok(FieldValue::F64(v))
     }
 

@@ -409,13 +409,14 @@ impl SchemaBuilder {
             )));
         }
 
-        self.idx += 1;
-        if self.idx > u16::MAX as usize {
+        let next_idx = self.idx + 1;
+        if next_idx > u16::MAX as usize {
             return Err(SchemaError::Schema(
                 "Schema has reached the maximum number of fields".to_string(),
             ));
         }
 
+        self.idx = next_idx;
         self.fields
             .insert(entry.name().to_string(), entry.with_idx(self.idx));
         Ok(self)
@@ -572,6 +573,8 @@ mod tests {
         // 添加超过限制的字段
         let overflow_field = Fe::new("overflow".to_string(), Ft::Text).unwrap();
         assert!(builder.add_field(overflow_field).is_err());
+        assert_eq!(builder.idx, u16::MAX as usize);
+        assert!(!builder.fields.contains_key("overflow"));
     }
 
     #[test]

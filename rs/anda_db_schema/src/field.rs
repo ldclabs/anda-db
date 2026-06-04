@@ -184,8 +184,14 @@ impl FieldType {
             (FieldType::Bool, FieldValue::Bool(_)) => Ok(()),
             (FieldType::I64, FieldValue::I64(_)) => Ok(()),
             (FieldType::U64, FieldValue::U64(_)) => Ok(()),
-            (FieldType::F64, FieldValue::F64(_)) => Ok(()),
-            (FieldType::F32, FieldValue::F32(_)) => Ok(()),
+            (FieldType::F64, FieldValue::F64(v)) if !v.is_nan() => Ok(()),
+            (FieldType::F64, FieldValue::F64(v)) => Err(SchemaError::FieldValue(format!(
+                "expected non-NaN F64, got {v:?}"
+            ))),
+            (FieldType::F32, FieldValue::F32(v)) if !v.is_nan() => Ok(()),
+            (FieldType::F32, FieldValue::F32(v)) => Err(SchemaError::FieldValue(format!(
+                "expected non-NaN F32, got {v:?}"
+            ))),
             (FieldType::Bytes, FieldValue::Bytes(_)) => Ok(()),
             (FieldType::Text, FieldValue::Text(_)) => Ok(()),
             (FieldType::Json, _) => Ok(()),
@@ -228,36 +234,7 @@ impl FieldType {
                     Ok(())
                 }
             },
-            (FieldType::Map(types), FieldValue::Map(values)) => match types.len() {
-                0 => Ok(()),
-                _ => {
-                    if let Some(ft) = as_wildcard_map(types) {
-                        // Special case for wildcard map
-                        for fv in values.values() {
-                            ft.validate(fv)?;
-                        }
-                        return Ok(());
-                    }
-
-                    if let Some(k) = values.keys().find(|k| !types.contains_key(*k)) {
-                        return Err(SchemaError::FieldValue(format!("invalid map key {k:?}")));
-                    }
-
-                    for (k, ft) in types.iter() {
-                        let rt = match values.get(k) {
-                            None => ft.validate(&FieldValue::Null),
-                            Some(v) => ft.validate(v),
-                        };
-
-                        rt.map_err(|err| {
-                            SchemaError::FieldValue(format!(
-                                "invalid map value at key {k:?}, error: {err}"
-                            ))
-                        })?;
-                    }
-                    Ok(())
-                }
-            },
+            (FieldType::Map(types), FieldValue::Map(values)) => validate_map_fields(types, values),
             (FieldType::Option(ft), val) => {
                 if val == &FieldValue::Null {
                     return Ok(());
@@ -1190,6 +1167,7 @@ impl FieldValue {
                     }
                 }
 
+                validate_map_fields(types, &vals)?;
                 Ok(FieldValue::Map(vals))
             }
             v => Err(SchemaError::FieldValue(format!("expected Map, got {v:?}"))),
@@ -1503,6 +1481,38 @@ fn as_wildcard_map(m: &BTreeMap<FieldKey, FieldType>) -> Option<&FieldType> {
     }
 }
 
+fn validate_map_fields(
+    types: &BTreeMap<FieldKey, FieldType>,
+    values: &BTreeMap<FieldKey, FieldValue>,
+) -> Result<(), SchemaError> {
+    if types.is_empty() {
+        return Ok(());
+    }
+
+    if let Some(ft) = as_wildcard_map(types) {
+        for fv in values.values() {
+            ft.validate(fv)?;
+        }
+        return Ok(());
+    }
+
+    if let Some(k) = values.keys().find(|k| !types.contains_key(*k)) {
+        return Err(SchemaError::FieldValue(format!("invalid map key {k:?}")));
+    }
+
+    for (k, ft) in types {
+        let rt = match values.get(k) {
+            None => ft.validate(&FieldValue::Null),
+            Some(v) => ft.validate(v),
+        };
+
+        rt.map_err(|err| {
+            SchemaError::FieldValue(format!("invalid map value at key {k:?}, error: {err}"))
+        })?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1722,10 +1732,12 @@ mod tests {
 
         // F64
         assert!(FieldType::F64.validate(&FieldValue::F64(3.15)).is_ok());
+        assert!(FieldType::F64.validate(&FieldValue::F64(f64::NAN)).is_err());
         assert!(FieldType::F64.validate(&FieldValue::F32(3.15)).is_err());
 
         // F32
         assert!(FieldType::F32.validate(&FieldValue::F32(2.71)).is_ok());
+        assert!(FieldType::F32.validate(&FieldValue::F32(f32::NAN)).is_err());
         assert!(FieldType::F32.validate(&FieldValue::F64(2.71)).is_err());
 
         // Bytes
@@ -1826,6 +1838,27 @@ mod tests {
         assert!(option_type.validate(&FieldValue::Bool(true)).is_ok());
         assert!(option_type.validate(&FieldValue::Null).is_ok());
         assert!(option_type.validate(&FieldValue::U64(42)).is_err());
+    }
+
+    #[test]
+    fn test_field_type_extract_rejects_missing_required_map_key() {
+        let map_type = FieldType::Map(BTreeMap::from([
+            ("name".into(), FieldType::Text),
+            ("age".into(), FieldType::Option(Box::new(FieldType::U64))),
+        ]));
+
+        let missing_required = Cbor::Map(vec![(
+            Cbor::Text("age".to_string()),
+            Cbor::Integer(42.into()),
+        )]);
+        assert!(map_type.extract(missing_required).is_err());
+
+        let missing_optional = Cbor::Map(vec![(
+            Cbor::Text("name".to_string()),
+            Cbor::Text("Ada".to_string()),
+        )]);
+        let extracted = map_type.extract(missing_optional).unwrap();
+        assert!(map_type.validate(&extracted).is_ok());
     }
 
     #[test]
@@ -2039,5 +2072,15 @@ mod tests {
         );
         let vv2: Vec<[bf16; 2]> = fv.deserialized().unwrap();
         assert_eq!(vv, vv2);
+    }
+
+    #[test]
+    fn test_nan_field_value_rejected_by_serde() {
+        assert!(serde_json::to_string(&Fv::F64(f64::NAN)).is_err());
+        assert!(serde_json::to_string(&Fv::F32(f32::NAN)).is_err());
+
+        let mut serialized = Vec::new();
+        into_writer(&Cbor::Float(f64::NAN), &mut serialized).unwrap();
+        assert!(from_reader::<Fv, _>(&serialized[..]).is_err());
     }
 }
