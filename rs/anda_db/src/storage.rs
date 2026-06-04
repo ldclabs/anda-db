@@ -1451,6 +1451,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_private_cache_list_and_compression_edges() {
+        let storage = create_test_storage().await;
+
+        let cached_path = storage.full_path("bad_cached");
+        storage
+            .inner
+            .cache
+            .as_ref()
+            .unwrap()
+            .insert(
+                cached_path,
+                Arc::new((
+                    Bytes::from_static(b"bad cached cbor"),
+                    ObjectVersion {
+                        e_tag: None,
+                        version: None,
+                    },
+                )),
+            )
+            .await;
+        assert!(matches!(
+            storage.get::<u64>("bad_cached").await,
+            Err(DBError::Serialization { .. })
+        ));
+
+        storage
+            .put_bytes(
+                "bad_list",
+                Bytes::from_static(b"bad list cbor"),
+                PutMode::Overwrite,
+            )
+            .await
+            .unwrap();
+        let mut listed = storage.list::<u64>(None, None);
+        assert!(matches!(
+            listed.next().await.transpose(),
+            Err(DBError::Serialization { .. })
+        ));
+        let mut metas = storage.list_meta(None, None);
+        assert!(metas.next().await.transpose().unwrap().is_some());
+
+        let incompressible = Bytes::from_static(b"abc");
+        assert_eq!(try_compress(incompressible.clone(), 3), incompressible);
+
+        let original = Bytes::from(vec![b'a'; 8192]);
+        let compressed = try_compress(original.clone(), 3);
+        assert!(zstd_compressed(compressed.as_ref()));
+        assert_eq!(try_decompress(compressed.clone(), u64::MAX), original);
+        assert_eq!(try_decompress(compressed.clone(), 1), compressed);
+        assert_eq!(
+            try_decompress(Bytes::from_static(b"plain"), 100),
+            Bytes::from_static(b"plain")
+        );
+
+        let invalid_frame = Bytes::from_static(b"\x28\xb5\x2f\xfdinvalid");
+        assert_eq!(try_decompress(invalid_frame.clone(), 100), invalid_frame);
+        assert!(streaming_decompress(compressed.as_ref(), u64::MAX).is_ok());
+        assert!(streaming_decompress(compressed.as_ref(), 1).is_err());
+        assert!(!zstd_compressed(b"abc"));
+    }
+
+    #[tokio::test]
     async fn test_stream_writer() {
         let storage = create_test_storage().await;
 

@@ -133,9 +133,11 @@ impl IndexHooks for DefaultIndexHooks {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anda_db_schema::Fv;
+    use crate::storage::{Storage, StorageConfig};
+    use anda_db_schema::{Fe, Ft, Fv, Schema};
+    use object_store::memory::InMemory;
     use serde_json::json;
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, sync::Arc};
 
     #[test]
     fn test_virtual_searchable_text_empty() {
@@ -335,5 +337,81 @@ mod tests {
         let bool_val = json!(true);
         extract_json_text(&mut texts, &bool_val);
         assert!(texts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_default_hnsw_hook_converts_u64_bit_arrays() {
+        assert!(virtual_field_value(&[]).is_none());
+
+        let storage = Storage::connect(
+            "hook_db".to_string(),
+            Arc::new(InMemory::new()),
+            StorageConfig::default(),
+        )
+        .await
+        .unwrap();
+        let hnsw_field = Fe::new("embedding".to_string(), Ft::Vector).unwrap();
+        let hnsw = Hnsw::new(
+            &hnsw_field,
+            HnswConfig {
+                dimension: 2,
+                ..Default::default()
+            },
+            storage,
+            1,
+        )
+        .await
+        .unwrap();
+
+        let mut schema = Schema::builder();
+        schema
+            .add_field(Fe::new("embedding".to_string(), Ft::Array(vec![Ft::U64])).unwrap())
+            .unwrap();
+        let mut doc = Document::new(Arc::new(schema.build().unwrap()));
+        doc.set_field(
+            "embedding",
+            Fv::Array(vec![
+                Fv::U64(u64::from(bf16::from_f32(0.25).to_bits())),
+                Fv::U64(u64::from(bf16::from_f32(0.5).to_bits())),
+            ]),
+        )
+        .unwrap();
+
+        let vector = DefaultIndexHooks
+            .hnsw_index_value(&hnsw, &doc)
+            .expect("u64 bf16 bits should be converted");
+        assert_eq!(vector.len(), 2);
+        assert_eq!(vector[0], bf16::from_f32(0.25));
+
+        let mut text_schema = Schema::builder();
+        text_schema
+            .add_field(Fe::new("embedding".to_string(), Ft::Array(vec![Ft::Text])).unwrap())
+            .unwrap();
+        let mut text_doc = Document::new(Arc::new(text_schema.build().unwrap()));
+        text_doc
+            .set_field(
+                "embedding",
+                Fv::Array(vec![Fv::Text("not-bits".to_string())]),
+            )
+            .unwrap();
+        assert!(
+            DefaultIndexHooks
+                .hnsw_index_value(&hnsw, &text_doc)
+                .is_none()
+        );
+
+        let mut scalar_schema = Schema::builder();
+        scalar_schema
+            .add_field(Fe::new("embedding".to_string(), Ft::Text).unwrap())
+            .unwrap();
+        let mut scalar_doc = Document::new(Arc::new(scalar_schema.build().unwrap()));
+        scalar_doc
+            .set_field("embedding", Fv::Text("not a vector".to_string()))
+            .unwrap();
+        assert!(
+            DefaultIndexHooks
+                .hnsw_index_value(&hnsw, &scalar_doc)
+                .is_none()
+        );
     }
 }

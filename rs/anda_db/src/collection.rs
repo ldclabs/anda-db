@@ -2525,6 +2525,63 @@ mod tests {
         }
     }
 
+    struct BackfillErrorHooks {
+        btree_value: Option<Fv>,
+        hnsw_vector: Option<Vector>,
+    }
+
+    impl BackfillErrorHooks {
+        fn btree(value: Fv) -> Self {
+            Self {
+                btree_value: Some(value),
+                hnsw_vector: None,
+            }
+        }
+
+        fn hnsw(vector: Vector) -> Self {
+            Self {
+                btree_value: None,
+                hnsw_vector: Some(vector),
+            }
+        }
+    }
+
+    impl IndexHooks for BackfillErrorHooks {
+        fn btree_index_value<'a>(&self, index: &BTree, doc: &'a Document) -> Option<Cow<'a, Fv>> {
+            if let Some(value) = &self.btree_value {
+                return Some(Cow::Owned(value.clone()));
+            }
+
+            IndexHooks::btree_index_value(&DefaultIndexHooks, index, doc)
+        }
+
+        fn hnsw_index_value<'a>(&self, index: &Hnsw, doc: &'a Document) -> Option<Cow<'a, Vector>> {
+            if let Some(vector) = &self.hnsw_vector {
+                return Some(Cow::Owned(vector.clone()));
+            }
+
+            IndexHooks::hnsw_index_value(&DefaultIndexHooks, index, doc)
+        }
+    }
+
+    struct UpdateTagsBTreeErrorHooks;
+
+    impl IndexHooks for UpdateTagsBTreeErrorHooks {
+        fn btree_index_value<'a>(&self, index: &BTree, doc: &'a Document) -> Option<Cow<'a, Fv>> {
+            if index.name() == "tags" {
+                return match doc.get_field("age") {
+                    Some(Fv::U64(age)) if *age >= 31 => Some(Cow::Owned(Fv::Array(vec![
+                        Fv::Text("new".to_string()),
+                        Fv::I64(-1),
+                    ]))),
+                    _ => Some(Cow::Owned(Fv::Array(vec![Fv::Text("old".to_string())]))),
+                };
+            }
+
+            IndexHooks::btree_index_value(&DefaultIndexHooks, index, doc)
+        }
+    }
+
     #[derive(Debug)]
     struct FailDeleteStore {
         inner: Arc<InMemory>,
@@ -3704,6 +3761,108 @@ mod tests {
         assert!(matches!(err, DBError::Index { .. }));
         assert!(collection.is_empty());
 
+        db.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_index_backfill_and_update_errors_cleanup_partial_state() -> Result<(), DBError> {
+        let db = setup_test_db().await?;
+        let collection = create_test_collection(&db, async |_| Ok(())).await?;
+
+        let doc = create_test_doc(0, "Alice", 30, vec!["smart"]);
+        let id = collection.add_from(&doc).await?;
+        assert_eq!(id, 1);
+
+        let object_store = db.object_store();
+        db.close().await?;
+        let db = AndaDB::connect(
+            object_store,
+            DBConfig {
+                name: "test_db".to_string(),
+                description: "Test database".to_string(),
+                storage: StorageConfig {
+                    compress_level: 0,
+                    ..Default::default()
+                },
+                lock: None,
+            },
+        )
+        .await?;
+
+        let collection = db
+            .open_collection("test_collection".to_string(), async |collection| {
+                assert!(matches!(
+                    collection.create_btree_index_nx(&["missing"]).await,
+                    Err(DBError::Schema { .. })
+                ));
+                assert!(matches!(
+                    collection.create_bm25_index_nx(&["missing"]).await,
+                    Err(DBError::Schema { .. })
+                ));
+                assert!(matches!(
+                    collection
+                        .create_hnsw_index_nx("age", HnswConfig::default())
+                        .await,
+                    Err(DBError::Schema { .. })
+                ));
+
+                collection.set_index_hooks(Arc::new(BackfillErrorHooks::btree(Fv::I64(-1))));
+                let err = collection.create_btree_index(&["tags"]).await.unwrap_err();
+                assert!(matches!(err, DBError::Index { .. }));
+                assert!(collection.get_btree_index(&["tags"]).is_err());
+
+                let err = collection
+                    .create_btree_index(&["name", "age"])
+                    .await
+                    .unwrap_err();
+                assert!(matches!(err, DBError::Index { .. }));
+                assert!(collection.get_btree_index(&["name", "age"]).is_err());
+
+                collection.set_index_hooks(Arc::new(BackfillErrorHooks::hnsw(vec![
+                    bf16::from_f32(0.1),
+                ])));
+                let err = collection
+                    .create_hnsw_index(
+                        "vector",
+                        HnswConfig {
+                            dimension: 10,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(matches!(err, DBError::Index { .. }));
+                assert!(collection.get_hnsw_index("vector").is_err());
+
+                collection.set_index_hooks(Arc::new(DefaultIndexHooks));
+                collection.create_btree_index(&["tags"]).await?;
+                collection.set_index_hooks(Arc::new(UpdateTagsBTreeErrorHooks));
+
+                let err = collection
+                    .update(
+                        id,
+                        BTreeMap::from([
+                            ("age".to_string(), Fv::U64(31)),
+                            (
+                                "tags".to_string(),
+                                Fv::Array(vec![Fv::Text("updated".to_string())]),
+                            ),
+                        ]),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(matches!(err, DBError::Index { .. }));
+
+                let stored: TestDoc = collection.get_as(id).await?;
+                assert_eq!(stored.age, 30);
+                assert_eq!(stored.tags, vec!["smart".to_string()]);
+
+                Ok(())
+            })
+            .await?;
+
+        assert_eq!(collection.len(), 1);
         db.close().await?;
         Ok(())
     }

@@ -1140,6 +1140,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_collection_create_guards_metadata_and_dropping_state() {
+        let object_store = Arc::new(InMemory::new());
+        let config = DBConfig::default();
+        let db = AndaDB::create(object_store, config).await.unwrap();
+
+        let mut schema = Schema::builder();
+        schema
+            .add_field(Fe::new("name".to_string(), Ft::Text).unwrap())
+            .unwrap();
+        let schema = schema.build().unwrap();
+
+        let ghost_config = CollectionConfig {
+            name: "ghost".to_string(),
+            description: "Ghost Collection".to_string(),
+        };
+        db.inner
+            .metadata
+            .write()
+            .collections
+            .insert(ghost_config.name.clone());
+        let err = Collection::create(db.clone(), schema.clone(), ghost_config)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DBError::AlreadyExists { .. }));
+        db.inner.metadata.write().collections.remove("ghost");
+
+        let dropping_config = CollectionConfig {
+            name: "drop_me".to_string(),
+            description: "Dropping Collection".to_string(),
+        };
+        db.inner
+            .dropping_collections
+            .write()
+            .insert(dropping_config.name.clone());
+
+        let err = db
+            .create_collection(schema.clone(), dropping_config.clone(), async |_| Ok(()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DBError::AlreadyExists { .. }));
+
+        let err = db
+            .open_or_create_collection(schema.clone(), dropping_config.clone(), async |_| Ok(()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DBError::AlreadyExists { .. }));
+
+        let err = db
+            .open_collection(dropping_config.name, async |_| Ok(()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DBError::AlreadyExists { .. }));
+    }
+
+    #[tokio::test]
     async fn test_read_only_mode() {
         let object_store = Arc::new(InMemory::new());
         let config = DBConfig::default();

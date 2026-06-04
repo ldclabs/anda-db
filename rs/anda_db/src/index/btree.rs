@@ -814,3 +814,457 @@ where
         self.index.has_pending_metadata_flush()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::StorageConfig;
+    use object_store::memory::InMemory;
+    use std::collections::BTreeMap;
+
+    async fn test_storage() -> Storage {
+        Storage::connect(
+            "btree_wrapper_tests".to_string(),
+            Arc::new(InMemory::new()),
+            StorageConfig::default(),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn field(name: &str, ft: Ft) -> Fe {
+        Fe::new(name.to_string(), ft).unwrap()
+    }
+
+    #[tokio::test]
+    async fn debug_eq_and_type_branches_are_covered() {
+        let storage = test_storage().await;
+        let now = unix_ms();
+
+        let i64_tree = BTree::new(field("i64_field", Ft::I64), storage.clone(), now)
+            .await
+            .unwrap();
+        let u64_tree = BTree::new(field("u64_field", Ft::U64), storage.clone(), now)
+            .await
+            .unwrap();
+        let text_tree = BTree::new(field("text_field", Ft::Text), storage.clone(), now)
+            .await
+            .unwrap();
+        let bytes_tree = BTree::new(field("bytes_field", Ft::Bytes), storage.clone(), now)
+            .await
+            .unwrap();
+
+        assert_eq!(format!("{i64_tree:?}"), "BTreeIndex<I64>(i64_field)");
+        assert_eq!(format!("{u64_tree:?}"), "BTreeIndex<U64>(u64_field)");
+        assert_eq!(format!("{text_tree:?}"), "BTreeIndex<String>(text_field)");
+        assert_eq!(format!("{bytes_tree:?}"), "BTreeIndex<Bytes>(bytes_field)");
+
+        assert_eq!(&i64_tree, &i64_tree);
+        assert_eq!(&u64_tree, &u64_tree);
+        assert_eq!(&text_tree, &text_tree);
+        assert_eq!(&bytes_tree, &bytes_tree);
+        assert_ne!(&i64_tree, &u64_tree);
+
+        assert!(i64_tree.insert(1, &Fv::I64(-7), now).unwrap());
+        assert!(u64_tree.insert(1, &Fv::U64(7), now).unwrap());
+        assert!(text_tree.insert(1, &Fv::Text("alpha".into()), now).unwrap());
+        assert!(bytes_tree.insert(1, &Fv::Bytes(vec![1, 2]), now).unwrap());
+
+        assert_eq!(
+            i64_tree.query_with(&Fv::I64(-7), |ids| Some(ids.clone())),
+            Some(vec![1])
+        );
+        assert_eq!(
+            u64_tree.query_with(&Fv::U64(7), |ids| Some(ids.clone())),
+            Some(vec![1])
+        );
+        assert_eq!(
+            text_tree.query_with(&Fv::Text("alpha".into()), |ids| Some(ids.clone())),
+            Some(vec![1])
+        );
+        assert_eq!(
+            bytes_tree.query_with(&Fv::Bytes(vec![1, 2]), |ids| Some(ids.clone())),
+            Some(vec![1])
+        );
+
+        assert_eq!(
+            i64_tree.query_with(&Fv::Text("bad".into()), |_| Some(())),
+            None
+        );
+        assert!(i64_tree.insert(2, &Fv::Text("bad".into()), now).is_err());
+        assert!(!i64_tree.remove(2, &Fv::Text("bad".into()), now));
+
+        assert!(i64_tree.flush(now + 1).await.unwrap());
+        assert!(!i64_tree.has_pending_flush());
+        let reloaded = BTree::bootstrap("i64_field".into(), &Ft::I64, storage.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            reloaded.query_with(&Fv::I64(-7), |ids| Some(ids.clone())),
+            Some(vec![1])
+        );
+    }
+
+    #[tokio::test]
+    async fn option_array_map_and_error_branches_are_covered() {
+        let storage = test_storage().await;
+        let now = unix_ms();
+
+        let option_array = BTree::new(
+            field(
+                "option_array",
+                Ft::Option(Box::new(Ft::Array(vec![Ft::U64]))),
+            ),
+            storage.clone(),
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(option_array, BTree::U64(_)));
+
+        let option_map = BTree::new(
+            field(
+                "option_map",
+                Ft::Option(Box::new(Ft::Map(BTreeMap::from([("k".into(), Ft::Text)])))),
+            ),
+            storage.clone(),
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(option_map, BTree::String(_)));
+
+        let map_tree = BTree::new(
+            field(
+                "map_field",
+                Ft::Map(BTreeMap::from([(vec![1_u8].into(), Ft::Bytes)])),
+            ),
+            storage.clone(),
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(map_tree, BTree::Bytes(_)));
+
+        let option_plain = BTree::new(
+            field("option_plain", Ft::Option(Box::new(Ft::I64))),
+            storage.clone(),
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(option_plain, BTree::I64(_)));
+
+        let unsupported = BTree::new(field("unsupported", Ft::Bool), storage.clone(), now).await;
+        assert!(matches!(unsupported, Err(DBError::Index { .. })));
+
+        let bad_virtual = BTree::with_virtual_field(vec!["only_one".into()], storage.clone(), now)
+            .await
+            .unwrap_err();
+        assert!(matches!(bad_virtual, DBError::Index { .. }));
+
+        assert!(BTree::from_cursor::<u64>(&Some("not-base64".into())).is_err());
+        let invalid_cbor = ByteBufB64(vec![0xff]).to_string();
+        assert!(BTree::from_cursor::<u64>(&Some(invalid_cbor)).is_err());
+
+        let cursor = BTree::to_cursor(&123_u64).unwrap();
+        assert_eq!(BTree::from_cursor::<u64>(&Some(cursor)).unwrap(), Some(123));
+        assert_eq!(BTree::from_cursor::<u64>(&None).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn array_and_map_updates_cover_all_value_variants() {
+        let storage = test_storage().await;
+        let now = unix_ms();
+
+        let i64_tree = BTree::new(
+            field("i64_array", Ft::Array(vec![Ft::I64])),
+            storage.clone(),
+            now,
+        )
+        .await
+        .unwrap();
+        let bytes_tree = BTree::new(
+            field("bytes_array", Ft::Array(vec![Ft::Bytes])),
+            storage.clone(),
+            now,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            i64_tree
+                .insert(1, &Fv::Array(vec![Fv::I64(-1), Fv::I64(2)]), now)
+                .unwrap()
+        );
+        assert!(
+            bytes_tree
+                .insert(
+                    1,
+                    &Fv::Array(vec![Fv::Bytes(vec![1]), Fv::Bytes(vec![2])]),
+                    now,
+                )
+                .unwrap()
+        );
+
+        assert!(
+            i64_tree
+                .update(
+                    1,
+                    &Fv::Array(vec![Fv::I64(-1), Fv::I64(2)]),
+                    &Fv::Array(vec![Fv::I64(3)]),
+                    now + 1,
+                )
+                .unwrap()
+        );
+        assert!(
+            bytes_tree
+                .batch_update(
+                    1,
+                    &[Fv::Bytes(vec![1]), Fv::Bytes(vec![2])],
+                    &[Fv::Bytes(vec![3])],
+                    now + 1,
+                )
+                .unwrap()
+                .0
+                > 0
+        );
+
+        assert!(i64_tree.remove(1, &Fv::Array(vec![Fv::I64(3)]), now + 2));
+        assert!(bytes_tree.remove(1, &Fv::Array(vec![Fv::Bytes(vec![3])]), now + 2));
+
+        assert!(
+            i64_tree
+                .insert(2, &Fv::Array(vec![Fv::Text("bad".into())]), now)
+                .is_err()
+        );
+        assert!(
+            bytes_tree
+                .batch_update(2, &[Fv::Bytes(vec![1])], &[Fv::Text("bad".into())], now,)
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn all_variants_expose_metadata_queries_flush_and_drop() {
+        let storage = Storage::connect(
+            "btree_all_variants".to_string(),
+            Arc::new(InMemory::new()),
+            StorageConfig {
+                bucket_overload_size: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let now = unix_ms();
+
+        let i64_tree = BTree::new(field("i64_all", Ft::I64), storage.clone(), now)
+            .await
+            .unwrap();
+        let u64_tree = BTree::new(field("u64_all", Ft::U64), storage.clone(), now)
+            .await
+            .unwrap();
+        let text_tree = BTree::new(field("text_all", Ft::Text), storage.clone(), now)
+            .await
+            .unwrap();
+        let bytes_tree = BTree::new(field("bytes_all", Ft::Bytes), storage.clone(), now)
+            .await
+            .unwrap();
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&&i64_tree, &mut hasher);
+        std::hash::Hash::hash(&&u64_tree, &mut hasher);
+        std::hash::Hash::hash(&&text_tree, &mut hasher);
+        std::hash::Hash::hash(&&bytes_tree, &mut hasher);
+
+        assert!(i64_tree.allow_duplicates());
+        assert!(u64_tree.allow_duplicates());
+        assert!(text_tree.allow_duplicates());
+        assert!(bytes_tree.allow_duplicates());
+        assert_eq!(i64_tree.virtual_field(), &["i64_all".to_string()]);
+        assert_eq!(u64_tree.virtual_field(), &["u64_all".to_string()]);
+        assert_eq!(text_tree.virtual_field(), &["text_all".to_string()]);
+        assert_eq!(bytes_tree.virtual_field(), &["bytes_all".to_string()]);
+
+        for id in 1..=8 {
+            assert!(i64_tree.insert(id, &Fv::I64(-(id as i64)), now).unwrap());
+            assert!(u64_tree.insert(id, &Fv::U64(id), now).unwrap());
+            assert!(
+                text_tree
+                    .insert(id, &Fv::Text(format!("k{id}")), now)
+                    .unwrap()
+            );
+            assert!(
+                bytes_tree
+                    .insert(id, &Fv::Bytes(vec![id as u8]), now)
+                    .unwrap()
+            );
+        }
+
+        assert!(
+            u64_tree
+                .insert(30, &Fv::Array(vec![Fv::U64(30), Fv::U64(31)]), now)
+                .unwrap()
+        );
+        assert!(
+            text_tree
+                .insert(
+                    31,
+                    &Fv::Array(vec![Fv::Text("array-a".into()), Fv::Text("array-b".into())]),
+                    now,
+                )
+                .unwrap()
+        );
+        assert!(u64_tree.remove(30, &Fv::Array(vec![Fv::U64(30)]), now));
+        assert!(text_tree.remove(31, &Fv::Array(vec![Fv::Text("array-a".into())]), now));
+        assert!(!text_tree.remove(31, &Fv::Null, now));
+        assert!(bytes_tree.remove(
+            8,
+            &Fv::Map(BTreeMap::from([(vec![8_u8].into(), Fv::U64(1))])),
+            now,
+        ));
+        assert_eq!(
+            u64_tree
+                .batch_update(40, &[Fv::U64(1)], &[Fv::U64(2), Fv::U64(3)], now)
+                .unwrap(),
+            (0, 2)
+        );
+
+        assert!(!i64_tree.insert(99, &Fv::Null, now).unwrap());
+        assert!(!i64_tree.update(1, &Fv::I64(-1), &Fv::I64(-1), now).unwrap());
+        assert!(i64_tree.update(20, &Fv::Null, &Fv::I64(-20), now).unwrap());
+        assert!(i64_tree.update(20, &Fv::I64(-20), &Fv::Null, now).unwrap());
+        assert!(
+            i64_tree
+                .update(1, &Fv::I64(-1), &Fv::I64(-10), now)
+                .unwrap()
+        );
+
+        assert_eq!(i64_tree.stats().num_elements, 8);
+        assert!(u64_tree.stats().num_elements >= 8);
+        assert!(text_tree.stats().num_elements >= 8);
+        assert!(bytes_tree.stats().num_elements >= 7);
+        assert_eq!(i64_tree.metadata().name, "i64_all");
+        assert_eq!(u64_tree.metadata().name, "u64_all");
+        assert_eq!(text_tree.metadata().name, "text_all");
+        assert_eq!(bytes_tree.metadata().name, "bytes_all");
+
+        let i64_hits = i64_tree.range_query_with(RangeQuery::Le(Fv::I64(-3)), |key, ids| {
+            (true, vec![(key, ids.clone())])
+        });
+        assert!(!i64_hits.is_empty());
+        let u64_hits = u64_tree
+            .range_query_with(RangeQuery::Between(Fv::U64(3), Fv::U64(5)), |key, ids| {
+                (true, vec![(key, ids.clone())])
+            });
+        assert_eq!(u64_hits.len(), 3);
+        let text_hits = text_tree
+            .range_query_with(RangeQuery::Ge(Fv::Text("k6".to_string())), |key, ids| {
+                (true, vec![(key, ids.clone())])
+            });
+        assert!(!text_hits.is_empty());
+        let bytes_hits = bytes_tree
+            .range_query_with(RangeQuery::Gt(Fv::Bytes(vec![4])), |key, ids| {
+                (ids[0] < 7, vec![(key, ids.clone())])
+            });
+        assert!(!bytes_hits.is_empty());
+
+        assert!(
+            i64_tree
+                .range_query_with(RangeQuery::Eq(Fv::Text("bad".into())), |_, _| {
+                    (true, Vec::<()>::new())
+                })
+                .is_empty()
+        );
+        assert!(
+            u64_tree
+                .range_query_with(RangeQuery::Eq(Fv::Text("bad".into())), |_, _| {
+                    (true, Vec::<()>::new())
+                })
+                .is_empty()
+        );
+        assert!(
+            text_tree
+                .range_query_with(RangeQuery::Eq(Fv::U64(1)), |_, _| {
+                    (true, Vec::<()>::new())
+                })
+                .is_empty()
+        );
+        assert!(
+            bytes_tree
+                .range_query_with(RangeQuery::Eq(Fv::U64(1)), |_, _| {
+                    (true, Vec::<()>::new())
+                })
+                .is_empty()
+        );
+
+        assert_eq!(i64_tree.keys(None, Some(2)).len(), 2);
+        assert_eq!(u64_tree.keys(None, Some(2)).len(), 2);
+        assert_eq!(text_tree.keys(None, Some(2)).len(), 2);
+        assert_eq!(bytes_tree.keys(None, Some(2)).len(), 2);
+        assert!(
+            i64_tree
+                .keys(Some("bad-cursor".to_string()), Some(2))
+                .is_empty()
+        );
+        assert!(
+            text_tree
+                .keys(Some("bad-cursor".to_string()), Some(2))
+                .is_empty()
+        );
+        assert!(
+            bytes_tree
+                .keys(Some("bad-cursor".to_string()), Some(2))
+                .is_empty()
+        );
+
+        assert!(i64_tree.has_pending_flush());
+        assert!(u64_tree.has_pending_flush());
+        assert!(text_tree.has_pending_flush());
+        assert!(bytes_tree.has_pending_flush());
+        assert!(i64_tree.flush(now + 1).await.unwrap());
+        assert!(u64_tree.flush(now + 1).await.unwrap());
+        assert!(text_tree.flush(now + 1).await.unwrap());
+        assert!(bytes_tree.flush(now + 1).await.unwrap());
+        assert!(!i64_tree.flush(now + 1).await.unwrap());
+
+        assert!(
+            BTree::bootstrap(
+                "option_boot".to_string(),
+                &Ft::Option(Box::new(Ft::Bool)),
+                storage.clone()
+            )
+            .await
+            .is_err()
+        );
+        let _ = BTree::bootstrap(
+            "u64_all".to_string(),
+            &Ft::Option(Box::new(Ft::Array(vec![Ft::U64]))),
+            storage.clone(),
+        )
+        .await
+        .unwrap();
+        let _ = BTree::bootstrap("i64_all".to_string(), &Ft::I64, storage.clone())
+            .await
+            .unwrap();
+        let _ = BTree::bootstrap("u64_all".to_string(), &Ft::U64, storage.clone())
+            .await
+            .unwrap();
+        let _ = BTree::bootstrap("text_all".to_string(), &Ft::Text, storage.clone())
+            .await
+            .unwrap();
+        let _ = BTree::bootstrap("bytes_all".to_string(), &Ft::Bytes, storage.clone())
+            .await
+            .unwrap();
+
+        i64_tree.compact_index().await.unwrap();
+        u64_tree.compact_index().await.unwrap();
+        text_tree.compact_index().await.unwrap();
+        bytes_tree.compact_index().await.unwrap();
+        i64_tree.drop_data().await;
+        u64_tree.drop_data().await;
+        text_tree.drop_data().await;
+        bytes_tree.drop_data().await;
+    }
+}

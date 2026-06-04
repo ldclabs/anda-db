@@ -177,3 +177,245 @@ impl From<BM25Error> for DBError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anda_db_btree::BTreeError;
+    use anda_db_hnsw::HnswError;
+    use anda_db_schema::SchemaError;
+    use anda_db_tfs::BM25Error;
+    use object_store::path::Path;
+    use serde_json::json;
+
+    fn assert_index(err: DBError, expected_name: &str) {
+        match err {
+            DBError::Index { name, source } => {
+                assert_eq!(name, expected_name);
+                assert!(!source.to_string().is_empty());
+            }
+            other => panic!("expected index error, got {other:?}"),
+        }
+    }
+
+    fn assert_not_found(err: DBError, expected_name: &str, expected_id: u64) {
+        match err {
+            DBError::NotFound {
+                name, path, _id, ..
+            } => {
+                assert_eq!(name, expected_name);
+                assert_eq!(path, "unknown");
+                assert_eq!(_id, expected_id);
+            }
+            other => panic!("expected not found error, got {other:?}"),
+        }
+    }
+
+    fn assert_already_exists(err: DBError, expected_name: &str, expected_id: u64) {
+        match err {
+            DBError::AlreadyExists {
+                name, path, _id, ..
+            } => {
+                assert_eq!(name, expected_name);
+                assert_eq!(path, "unknown");
+                assert_eq!(_id, expected_id);
+            }
+            other => panic!("expected already exists error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn object_store_error_conversions_preserve_specific_variants() {
+        let not_found = object_store::Error::NotFound {
+            path: Path::from("missing").to_string(),
+            source: "missing source".into(),
+        };
+        match DBError::from(not_found) {
+            DBError::NotFound {
+                name, path, _id, ..
+            } => {
+                assert_eq!(name, "unknown");
+                assert_eq!(path, "missing");
+                assert_eq!(_id, 0);
+            }
+            other => panic!("expected not found, got {other:?}"),
+        }
+
+        let already_exists = object_store::Error::AlreadyExists {
+            path: Path::from("exists").to_string(),
+            source: "exists source".into(),
+        };
+        match DBError::from(already_exists) {
+            DBError::AlreadyExists {
+                name, path, _id, ..
+            } => {
+                assert_eq!(name, "unknown");
+                assert_eq!(path, "exists");
+                assert_eq!(_id, 0);
+            }
+            other => panic!("expected already exists, got {other:?}"),
+        }
+
+        let precondition = object_store::Error::Precondition {
+            path: Path::from("stale").to_string(),
+            source: "stale source".into(),
+        };
+        match DBError::from(precondition) {
+            DBError::Precondition { path, .. } => assert_eq!(path, "stale"),
+            other => panic!("expected precondition, got {other:?}"),
+        }
+
+        let generic = object_store::Error::Generic {
+            store: "memory",
+            source: "generic source".into(),
+        };
+        match DBError::from(generic) {
+            DBError::Storage { name, source } => {
+                assert_eq!(name, "unknown");
+                assert!(!source.to_string().is_empty());
+            }
+            other => panic!("expected storage error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn schema_error_conversion_wraps_schema_variant() {
+        let err = SchemaError::FieldName("bad".into());
+        match DBError::from(err) {
+            DBError::Schema { name, source } => {
+                assert_eq!(name, "unknown");
+                assert!(!source.to_string().is_empty());
+            }
+            other => panic!("expected schema error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn btree_error_conversions_preserve_names_and_ids() {
+        assert_index(
+            DBError::from(BTreeError::Generic {
+                name: "idx".into(),
+                source: "generic".into(),
+            }),
+            "idx",
+        );
+        assert_index(
+            DBError::from(BTreeError::Serialization {
+                name: "idx".into(),
+                source: "ser".into(),
+            }),
+            "idx",
+        );
+        assert_not_found(
+            DBError::from(BTreeError::NotFound {
+                name: "idx".into(),
+                id: json!(42),
+                value: json!("a"),
+            }),
+            "idx",
+            42,
+        );
+        assert_already_exists(
+            DBError::from(BTreeError::AlreadyExists {
+                name: "idx".into(),
+                id: json!(43),
+                value: json!("b"),
+            }),
+            "idx",
+            43,
+        );
+        assert_not_found(
+            DBError::from(BTreeError::NotFound {
+                name: "idx".into(),
+                id: json!("not-u64"),
+                value: json!("a"),
+            }),
+            "idx",
+            0,
+        );
+    }
+
+    #[test]
+    fn hnsw_error_conversions_preserve_names_and_ids() {
+        assert_index(
+            DBError::from(HnswError::Generic {
+                name: "vec".into(),
+                source: "generic".into(),
+            }),
+            "vec",
+        );
+        assert_index(
+            DBError::from(HnswError::Serialization {
+                name: "vec".into(),
+                source: "ser".into(),
+            }),
+            "vec",
+        );
+        assert_index(
+            DBError::from(HnswError::DimensionMismatch {
+                name: "vec".into(),
+                expected: 3,
+                got: 2,
+            }),
+            "vec",
+        );
+        assert_not_found(
+            DBError::from(HnswError::NotFound {
+                name: "vec".into(),
+                id: 7,
+            }),
+            "vec",
+            7,
+        );
+        assert_already_exists(
+            DBError::from(HnswError::AlreadyExists {
+                name: "vec".into(),
+                id: 8,
+            }),
+            "vec",
+            8,
+        );
+    }
+
+    #[test]
+    fn bm25_error_conversions_preserve_names_and_ids() {
+        assert_index(
+            DBError::from(BM25Error::Generic {
+                name: "text".into(),
+                source: "generic".into(),
+            }),
+            "text",
+        );
+        assert_index(
+            DBError::from(BM25Error::Serialization {
+                name: "text".into(),
+                source: "ser".into(),
+            }),
+            "text",
+        );
+        assert_index(
+            DBError::from(BM25Error::TokenizeFailed {
+                name: "text".into(),
+                id: 1,
+                text: "".into(),
+            }),
+            "text",
+        );
+        assert_not_found(
+            DBError::from(BM25Error::NotFound {
+                name: "text".into(),
+                id: 9,
+            }),
+            "text",
+            9,
+        );
+        assert_already_exists(
+            DBError::from(BM25Error::AlreadyExists {
+                name: "text".into(),
+                id: 10,
+            }),
+            "text",
+            10,
+        );
+    }
+}
