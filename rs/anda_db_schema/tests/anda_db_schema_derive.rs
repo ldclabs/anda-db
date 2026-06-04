@@ -108,6 +108,20 @@ struct TestConstraints {
     bio: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, AndaDBSchema)]
+struct TestQualifiedPathSchema<T> {
+    _id: std::primitive::u64,
+    title: std::string::String,
+    tags: std::option::Option<std::vec::Vec<std::string::String>>,
+    lookup: std::collections::HashMap<std::string::String, std::primitive::u64>,
+    #[field_type = " Json "]
+    payload: T,
+    #[serde(rename(serialize = "public_name", deserialize = "input_name"))]
+    renamed: String,
+    #[serde(rename(deserialize = "input_only"))]
+    deserialize_only: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,5 +368,33 @@ mod tests {
 
         assert!(schema.get_field("non_existent").is_none());
         assert!(schema.get_field_or_err("non_existent").is_err());
+    }
+
+    #[test]
+    fn test_qualified_paths_generics_and_directional_serde_rename() {
+        let schema = TestQualifiedPathSchema::<Json>::schema().unwrap();
+
+        assert_eq!(
+            schema.get_field("title").unwrap().r#type(),
+            &FieldType::Text
+        );
+        if let FieldType::Option(inner) = schema.get_field("tags").unwrap().r#type() {
+            assert_eq!(inner.as_ref(), &FieldType::Array(vec![FieldType::Text]));
+        } else {
+            panic!("Expected Option<Array<Text>>");
+        }
+        if let FieldType::Map(map_types) = schema.get_field("lookup").unwrap().r#type() {
+            assert_eq!(map_types.get(&TEXT_WILDCARD_KEY), Some(&FieldType::U64));
+        } else {
+            panic!("Expected Map<U64>");
+        }
+        assert_eq!(
+            schema.get_field("payload").unwrap().r#type(),
+            &FieldType::Json
+        );
+        assert!(schema.get_field("public_name").is_some());
+        assert!(schema.get_field("input_name").is_none());
+        assert!(schema.get_field("deserialize_only").is_some());
+        assert!(schema.get_field("input_only").is_none());
     }
 }

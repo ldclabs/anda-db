@@ -18,6 +18,7 @@ pub fn field_typed_derive(input: TokenStream) -> TokenStream {
     // Parse the input tokens into a syntax tree.
     let input = parse_macro_input!(input as DeriveInput);
     let name = &input.ident.unraw();
+    let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
 
     // Only structs with named fields are supported.
     let fields = if let Data::Struct(data_struct) = &input.data {
@@ -45,7 +46,14 @@ pub fn field_typed_derive(input: TokenStream) -> TokenStream {
         let rename_attr = find_rename_attr(&field.attrs).unwrap_or_else(|| field_name_str.clone());
 
         // `#[field_type = "..."]` overrides auto-inference.
-        let custom_field_type = find_field_type_attr(&field.attrs);
+        let custom_field_type = match find_field_type_attr(&field.attrs) {
+            Ok(field_type) => field_type,
+            Err(err_msg) => {
+                return quote! {
+                    compile_error!(#err_msg)
+                };
+            }
+        };
 
         let field_type = if let Some(field_type) = custom_field_type {
             quote! { #field_type }
@@ -68,7 +76,7 @@ pub fn field_typed_derive(input: TokenStream) -> TokenStream {
 
     // Stitch the tuples into the final `field_type()` accessor.
     let expanded = quote! {
-        impl #name {
+        impl #impl_generics #name #ty_generics #where_clause {
             pub fn field_type() -> FieldType {
                 FieldType::Map(
                     vec![

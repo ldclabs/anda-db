@@ -19,6 +19,7 @@ pub fn anda_db_schema_derive(input: TokenStream) -> TokenStream {
     // Parse the input tokens into a syntax tree.
     let input = parse_macro_input!(input as DeriveInput);
     let name = &input.ident.unraw();
+    let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
 
     // Only structs with named fields are supported.
     let fields = if let Data::Struct(data_struct) = &input.data {
@@ -48,7 +49,14 @@ pub fn anda_db_schema_derive(input: TokenStream) -> TokenStream {
         let description = extract_doc_comments(&field.attrs);
 
         // `#[field_type = "..."]` wins over auto-inference.
-        let custom_field_type = find_field_type_attr(&field.attrs);
+        let custom_field_type = match find_field_type_attr(&field.attrs) {
+            Ok(field_type) => field_type,
+            Err(err_msg) => {
+                return Some(quote! {
+                    compile_error!(#err_msg);
+                });
+            }
+        };
 
         let field_type = if let Some(field_type) = custom_field_type {
             quote! { #field_type }
@@ -110,7 +118,7 @@ pub fn anda_db_schema_derive(input: TokenStream) -> TokenStream {
 
     // Generate the schema function implementation
     let expanded = quote! {
-        impl #name {
+        impl #impl_generics #name #ty_generics #where_clause {
             pub fn schema() -> Result<Schema, SchemaError> {
                 let mut builder = Schema::builder();
 

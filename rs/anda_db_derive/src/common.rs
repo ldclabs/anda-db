@@ -7,7 +7,7 @@
 
 use proc_macro2::TokenStream;
 use quote::quote;
-use syn::{Attribute, Expr, GenericArgument, Lit, Meta, PathArguments, Type, ext::IdentExt};
+use syn::{Attribute, Expr, GenericArgument, Lit, Meta, Path, PathArguments, Type, ext::IdentExt};
 
 /// Extract the value of a `#[serde(rename = "...")]` attribute, if any.
 ///
@@ -26,14 +26,37 @@ pub fn find_rename_attr(attrs: &[Attribute]) -> Option<String> {
             Err(_) => continue,
         };
 
-        // Walk all serde meta items and pick out `rename = "..."`.
+        // Walk all serde meta items and pick out `rename = "..."`. When the
+        // directional form is used, the schema follows the serialized field
+        // name because that is what AndaDB stores.
         for meta in args {
-            if let Meta::NameValue(name_value) = meta
-                && name_value.path.is_ident("rename")
-                && let Expr::Lit(expr_lit) = &name_value.value
-                && let Lit::Str(s) = &expr_lit.lit
-            {
-                return Some(s.value());
+            match meta {
+                Meta::NameValue(name_value)
+                    if name_value.path.is_ident("rename")
+                        && matches!(&name_value.value, Expr::Lit(_)) =>
+                {
+                    if let Expr::Lit(expr_lit) = &name_value.value
+                        && let Lit::Str(s) = &expr_lit.lit
+                    {
+                        return Some(s.value());
+                    }
+                }
+                Meta::List(list) if list.path.is_ident("rename") => {
+                    if let Ok(rename_args) = list.parse_args_with(
+                        syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated,
+                    ) {
+                        for rename_meta in rename_args {
+                            if let Meta::NameValue(name_value) = rename_meta
+                                && let Expr::Lit(expr_lit) = &name_value.value
+                                && let Lit::Str(s) = &expr_lit.lit
+                                && name_value.path.is_ident("serialize")
+                            {
+                                return Some(s.value());
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -43,19 +66,28 @@ pub fn find_rename_attr(attrs: &[Attribute]) -> Option<String> {
 /// Locate a `#[field_type = "..."]` attribute and parse its string payload
 /// into a `FieldType` token stream.
 ///
-/// Returns `None` when no such attribute is present, in which case callers
-/// should fall back to [`determine_field_type`].
-pub fn find_field_type_attr(attrs: &[Attribute]) -> Option<TokenStream> {
+/// Returns `Ok(None)` when no such attribute is present, in which case
+/// callers should fall back to [`determine_field_type`].
+pub fn find_field_type_attr(attrs: &[Attribute]) -> Result<Option<TokenStream>, String> {
     for attr in attrs {
-        if attr.path().is_ident("field_type")
-            && let Ok(meta_name_value) = attr.meta.require_name_value()
-                && let Expr::Lit(expr_lit) = &meta_name_value.value
+        if attr.path().is_ident("field_type") {
+            let meta_name_value = attr.meta.require_name_value().map_err(|_| {
+                "`field_type` attribute must use the form #[field_type = \"Type\"]".to_string()
+            })?;
+
+            if let Expr::Lit(expr_lit) = &meta_name_value.value
                 && let Lit::Str(lit_str) = &expr_lit.lit
             {
-                return Some(parse_field_type_str(&lit_str.value()));
+                return Ok(Some(parse_field_type_str(&lit_str.value())));
             }
+
+            return Err(
+                "`field_type` attribute value must be a string literal, e.g. #[field_type = \"Text\"]"
+                    .to_string(),
+            );
+        }
     }
-    None
+    Ok(None)
 }
 
 /// Parse the textual DSL used inside `#[field_type = "..."]` and emit the
@@ -80,8 +112,8 @@ pub fn find_field_type_attr(attrs: &[Attribute]) -> Option<TokenStream> {
 /// Unrecognised input expands to a `compile_error!(...)` invocation so that
 /// the user gets a precise diagnostic at the original macro call site.
 pub fn parse_field_type_str(type_str: &str) -> TokenStream {
-    let trimmed = type_str.trim();
-    match trimmed {
+    let normalized: String = type_str.chars().filter(|ch| !ch.is_whitespace()).collect();
+    match normalized.as_str() {
         // Primitive types.
         "Bytes" => quote! { FieldType::Bytes },
         "Text" => quote! { FieldType::Text },
@@ -194,8 +226,17 @@ pub fn determine_field_type(ty: &Type) -> Result<TokenStream, String> {
     match ty {
         Type::Path(type_path) if !type_path.path.segments.is_empty() => {
             let path = &type_path.path;
-            let segment = &path.segments[0];
+            let Some(segment) = path.segments.last() else {
+                return Err("Unable to determine type from empty path".to_string());
+            };
             let type_name = segment.ident.unraw().to_string();
+            let full_path = path_to_string(path);
+
+            match full_path.as_str() {
+                "serde_json::Value" => return Ok(quote! { FieldType::Json }),
+                "half::bf16" => return unsupported_scalar_bf16(),
+                _ => {}
+            }
 
             match type_name.as_str() {
                 "Option" => {
@@ -236,6 +277,8 @@ pub fn determine_field_type(ty: &Type) -> Result<TokenStream, String> {
                 }
                 "Json" => Ok(quote! { FieldType::Json }),
                 "Vector" => Ok(quote! { FieldType::Vector }),
+                "Value" if full_path == "serde_json::Value" => Ok(quote! { FieldType::Json }),
+                "bf16" => unsupported_scalar_bf16(),
                 "HashMap" | "BTreeMap" | "Map" => {
                     // Handle HashMap / BTreeMap / serde_json::Map.
                     if let PathArguments::AngleBracketed(args) = &segment.arguments
@@ -282,44 +325,27 @@ pub fn determine_field_type(ty: &Type) -> Result<TokenStream, String> {
                     Err(format!("Invalid map type: {}", type_name))
                 }
                 _ => {
-                    if path.segments.len() > 1 {
-                        // Multi-segment paths: match a few well-known fully
-                        // qualified types from external crates.
-                        let full_path = path
-                            .segments
-                            .iter()
-                            .map(|seg| seg.ident.unraw().to_string())
-                            .collect::<Vec<_>>()
-                            .join("::");
-
-                        match full_path.as_str() {
-                            "serde_bytes::ByteArray"
-                            | "serde_bytes::ByteBuf"
-                            | "serde_bytes::Bytes" => {
-                                return Ok(quote! { FieldType::Bytes });
-                            }
-                            "serde_json::Value" => return Ok(quote! { FieldType::Json }),
-                            "half::bf16" => {
-                                return Err(
-                                    "Standalone `half::bf16` is not supported as a field type. \
-                                     Use `Vec<bf16>` (mapped to FieldType::Vector), \
-                                     or annotate with `#[field_type = \"F32\"]`."
-                                        .to_string(),
-                                );
-                            }
-                            _ => {}
-                        }
+                    if matches!(
+                        full_path.as_str(),
+                        "serde_bytes::ByteArray" | "serde_bytes::ByteBuf" | "serde_bytes::Bytes"
+                    ) {
+                        return Ok(quote! { FieldType::Bytes });
                     }
 
                     // Fallback: assume a user-defined struct that derives
                     // `FieldTyped`, and call its `field_type()` accessor.
-                    let type_ident =
-                        proc_macro2::Ident::new(&type_name, proc_macro2::Span::call_site());
                     Ok(quote! {
-                        #type_ident::field_type()
+                        #path::field_type()
                     })
                 }
             }
+        }
+        Type::Reference(reference) => determine_field_type(&reference.elem),
+        Type::Slice(slice) if is_u8_type(&slice.elem) => Ok(quote! { FieldType::Bytes }),
+        Type::Slice(slice) if is_bf16_type(&slice.elem) => Ok(quote! { FieldType::Vector }),
+        Type::Slice(slice) => {
+            let inner_type = determine_field_type(&slice.elem)?;
+            Ok(quote! { FieldType::Array(vec![#inner_type]) })
         }
         Type::Array(array) if is_u8_type(&array.elem) => Ok(quote! { FieldType::Bytes }),
         Type::Array(array) if is_bf16_type(&array.elem) => Ok(quote! { FieldType::Vector }),
@@ -338,10 +364,25 @@ pub fn determine_field_type(ty: &Type) -> Result<TokenStream, String> {
     }
 }
 
+fn path_to_string(path: &Path) -> String {
+    path.segments
+        .iter()
+        .map(|seg| seg.ident.unraw().to_string())
+        .collect::<Vec<_>>()
+        .join("::")
+}
+
+fn unsupported_scalar_bf16() -> Result<TokenStream, String> {
+    Err("Standalone `bf16` is not supported as a field type. \
+         Use `Vec<bf16>` (mapped to FieldType::Vector), \
+         or annotate with `#[field_type = \"F32\"]`."
+        .to_string())
+}
+
 /// Returns `true` if `ty` is the primitive `u8`.
 pub fn is_u8_type(ty: &Type) -> bool {
     if let Type::Path(type_path) = ty
-        && let Some(segment) = type_path.path.segments.first()
+        && let Some(segment) = type_path.path.segments.last()
     {
         return segment.ident == "u8";
     }
@@ -351,7 +392,7 @@ pub fn is_u8_type(ty: &Type) -> bool {
 /// Returns `true` if `ty` is `String` or `str`.
 pub fn is_string_type(ty: &Type) -> bool {
     if let Type::Path(type_path) = ty
-        && let Some(segment) = type_path.path.segments.first()
+        && let Some(segment) = type_path.path.segments.last()
     {
         return segment.ident == "String" || segment.ident == "str";
     }
@@ -367,7 +408,7 @@ pub fn is_string_type(ty: &Type) -> bool {
 /// here for `Map` keys -- prefer `ByteArray` / `ByteArrayB64` instead.
 pub fn is_bytes_type(ty: &Type) -> bool {
     if let Type::Path(type_path) = ty
-        && let Some(segment) = type_path.path.segments.first()
+        && let Some(segment) = type_path.path.segments.last()
     {
         // Vec<u8>
         if segment.ident == "Vec"
@@ -391,7 +432,7 @@ pub fn is_bytes_type(ty: &Type) -> bool {
 /// Returns `true` if `ty` is `bf16` (the `half::bf16` short name).
 pub fn is_bf16_type(ty: &Type) -> bool {
     if let Type::Path(type_path) = ty
-        && let Some(segment) = type_path.path.segments.first()
+        && let Some(segment) = type_path.path.segments.last()
     {
         return segment.ident == "bf16";
     }
@@ -402,7 +443,7 @@ pub fn is_bf16_type(ty: &Type) -> bool {
 /// mandatory `_id: u64` field on structs deriving [`crate::AndaDBSchema`].
 pub fn is_u64_type(ty: &Type) -> bool {
     if let Type::Path(type_path) = ty
-        && let Some(segment) = type_path.path.segments.first()
+        && let Some(segment) = type_path.path.segments.last()
     {
         return segment.ident == "u64";
     }
