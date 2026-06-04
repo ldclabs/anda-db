@@ -693,6 +693,23 @@ impl BTree {
             BTree::Bytes(btree) => btree.has_pending_flush(),
         }
     }
+
+    pub(crate) async fn drop_data(&self) {
+        let rt = match self {
+            BTree::I64(btree) => btree.drop_data().await,
+            BTree::U64(btree) => btree.drop_data().await,
+            BTree::String(btree) => btree.drop_data().await,
+            BTree::Bytes(btree) => btree.drop_data().await,
+        };
+
+        if let Err(err) = rt {
+            log::warn!(
+                action = "BTree::drop_data",
+                index = self.name();
+                "Failed to drop BTree index data: {err:?}",
+            );
+        }
+    }
 }
 
 impl<FV> InnerBTree<FV>
@@ -721,6 +738,10 @@ where
             storage,
             metadata_version: RwLock::new(ver),
         })
+    }
+
+    async fn drop_data(&self) -> Result<(), DBError> {
+        self.storage.delete(&BTree::metadata_path(&self.name)).await
     }
 
     async fn bootstrap(name: String, storage: Storage) -> Result<Self, DBError> {

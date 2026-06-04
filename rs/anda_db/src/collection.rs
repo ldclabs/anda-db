@@ -505,6 +505,75 @@ impl Collection {
         Ok(fixed)
     }
 
+    async fn load_existing_documents(&self) -> Result<Vec<(DocumentId, Document)>, DBError> {
+        let ids = self.ids();
+        let schema = self.schema();
+        let mut docs = Vec::with_capacity(ids.len());
+        let mut stream = futures::stream::iter(ids)
+            .map(|id| {
+                let storage = self.storage.clone();
+                async move { (id, storage.get::<DocumentOwned>(&Self::doc_path(id)).await) }
+            })
+            .buffered(8);
+
+        while let Some((id, result)) = stream.next().await {
+            match result {
+                Ok((doc, _)) => {
+                    docs.push((id, Document::try_from_doc(schema.clone(), doc)?));
+                }
+                Err(DBError::NotFound { .. }) => {}
+                Err(err) => return Err(err),
+            }
+        }
+
+        Ok(docs)
+    }
+
+    async fn backfill_btree_index(&self, index: &BTree, now_ms: u64) -> Result<(), DBError> {
+        if self.is_empty() {
+            return Ok(());
+        }
+
+        for (id, doc) in self.load_existing_documents().await? {
+            if let Some(fv) = self.index_hooks.btree_index_value(index, &doc) {
+                if fv.as_ref() == &FieldValue::Null {
+                    continue;
+                }
+                index.insert(id, &fv, now_ms)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn backfill_bm25_index(&self, index: &BM25, now_ms: u64) -> Result<(), DBError> {
+        if self.is_empty() {
+            return Ok(());
+        }
+
+        for (id, doc) in self.load_existing_documents().await? {
+            if let Some(text) = self.index_hooks.bm25_index_value(index, &doc) {
+                index.insert(id, &text, now_ms)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn backfill_hnsw_index(&self, index: &Hnsw, now_ms: u64) -> Result<(), DBError> {
+        if self.is_empty() {
+            return Ok(());
+        }
+
+        for (id, doc) in self.load_existing_documents().await? {
+            if let Some(vector) = self.index_hooks.hnsw_index_value(index, &doc) {
+                index.insert(id, vector.into_owned(), now_ms)?;
+            }
+        }
+
+        Ok(())
+    }
+
     async fn try_upgrade_schema(&mut self, mut new_schema: Schema) -> Result<(), DBError> {
         if !new_schema.needs_upgrade(&self.schema) {
             return Ok(());
@@ -1020,6 +1089,10 @@ impl Collection {
             let field = self.schema.get_field_or_err(fields[0])?;
 
             let index = BTree::new(field.clone(), self.storage.clone(), now_ms).await?;
+            if let Err(err) = self.backfill_btree_index(&index, now_ms).await {
+                index.drop_data().await;
+                return Err(err);
+            }
             if field.unique() {
                 self.btree_indexes.insert(0, index);
             } else {
@@ -1032,6 +1105,9 @@ impl Collection {
             for field in fields {
                 self.schema.get_field_or_err(field)?;
             }
+            let field = FieldEntry::new("_virtual_field_".to_string(), FieldType::Bytes)?
+                .with_unique()
+                .with_description(name.clone());
             let index = BTree::with_virtual_field(
                 fields.iter().map(|s| s.to_string()).collect(),
                 self.storage.clone(),
@@ -1039,9 +1115,10 @@ impl Collection {
             )
             .await?;
 
-            let field = FieldEntry::new("_virtual_field_".to_string(), FieldType::Bytes)?
-                .with_unique()
-                .with_description(name.clone());
+            if let Err(err) = self.backfill_btree_index(&index, now_ms).await {
+                index.drop_data().await;
+                return Err(err);
+            }
             self.btree_indexes.insert(0, index);
             let mut meta = self.metadata.write();
             meta.btree_indexes.insert(name, field);
@@ -1109,6 +1186,11 @@ impl Collection {
             now_ms,
         )
         .await?;
+
+        if let Err(err) = self.backfill_bm25_index(&index, now_ms).await {
+            index.drop_data().await;
+            return Err(err);
+        }
 
         {
             let mut meta = self.metadata.write();
@@ -1186,6 +1268,10 @@ impl Collection {
         }
 
         let index = Hnsw::new(field, config, self.storage.clone(), now_ms).await?;
+        if let Err(err) = self.backfill_hnsw_index(&index, now_ms).await {
+            index.drop_data().await;
+            return Err(err);
+        }
 
         {
             let mut meta = self.metadata.write();
@@ -1699,29 +1785,54 @@ impl Collection {
             }
         };
 
+        #[allow(clippy::mutable_key_type)]
+        let mut btree_removed: FxHashMap<&BTree, Cow<FieldValue>> = FxHashMap::default();
+        #[allow(clippy::mutable_key_type)]
+        let mut bm25_removed: FxHashMap<&BM25, (u64, Cow<str>)> = FxHashMap::default();
+        #[allow(clippy::mutable_key_type)]
+        let mut hnsw_removed: FxHashMap<&Hnsw, (u64, Cow<Vector>)> = FxHashMap::default();
+
         // Phase 1: remove index entries while we still hold the original
-        // contents. These removes are infallible by design.
+        // contents. Record actual removals so a storage delete failure can
+        // restore the in-memory indexes before returning.
         if let Some(doc) = &doc {
             for index in &self.btree_indexes {
                 if let Some(fv) = self.index_hooks.btree_index_value(index, doc)
                     && fv.as_ref() != &FieldValue::Null
+                    && index.remove(id, &fv, now_ms)
                 {
-                    index.remove(id, &fv, now_ms);
+                    btree_removed.insert(index, fv);
                 }
             }
 
             for index in &self.bm25_indexes {
-                if let Some(text) = self.index_hooks.bm25_index_value(index, doc) {
-                    index.remove(id, &text, now_ms);
+                if let Some(text) = self.index_hooks.bm25_index_value(index, doc)
+                    && index.remove(id, &text, now_ms)
+                {
+                    bm25_removed.insert(index, (id, text));
                 }
             }
 
             for index in &self.hnsw_indexes {
-                if self.index_hooks.hnsw_index_value(index, doc).is_some() {
-                    index.remove(id, now_ms);
+                if let Some(vector) = self.index_hooks.hnsw_index_value(index, doc)
+                    && index.remove(id, now_ms)
+                {
+                    hnsw_removed.insert(index, (id, vector));
                 }
             }
         }
+
+        let rollback_indexes = || {
+            for (index, value) in btree_removed {
+                let _ = index.insert(id, &value, now_ms);
+            }
+            for (index, (id, text)) in bm25_removed {
+                let _ = index.insert(id, &text, now_ms);
+            }
+            for (index, (id, vector)) in hnsw_removed {
+                let _ = index.insert(id, vector.to_vec(), now_ms);
+            }
+        };
 
         // Phase 2: delete the document object before the bitmap so that a
         // failure here keeps the document visible (and recoverable) rather
@@ -1729,6 +1840,7 @@ impl Collection {
         if doc.is_some()
             && let Err(err) = self.storage.delete(&path).await
         {
+            rollback_indexes();
             log::error!(
                 action = "Collection::remove",
                 collection = self.name,
@@ -1845,7 +1957,7 @@ impl Collection {
 
             if let Some(ref vector) = params.vector {
                 for index in self.hnsw_indexes.iter() {
-                    let rt = index.search(vector, top_k);
+                    let rt = index.try_search(vector, top_k)?;
                     results.push(rt.into_iter().map(|r| r.0).collect());
                 }
             }
@@ -2308,11 +2420,25 @@ mod tests {
         schema::{AndaDBSchema, Document, Fv, Json, Schema, Vector},
         storage::{PutMode, StorageConfig},
     };
+    use async_trait::async_trait;
     use bytes::Bytes;
+    use futures::{StreamExt, stream::BoxStream};
     use ic_auth_types::ByteArrayB64;
-    use object_store::memory::InMemory;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+        Result as ObjectStoreResult, memory::InMemory, path::Path,
+    };
     use serde::{Deserialize, Serialize};
-    use std::{borrow::Cow, collections::BTreeMap, sync::Arc};
+    use std::{
+        borrow::Cow,
+        collections::BTreeMap,
+        fmt,
+        sync::{
+            Arc,
+            atomic::{AtomicBool as TestAtomicBool, Ordering as TestOrdering},
+        },
+    };
 
     // 测试用的文档结构
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, AndaDBSchema)]
@@ -2396,6 +2522,120 @@ mod tests {
                 [name] => doc.get_field(name).map(Cow::Borrowed),
                 _ => None,
             }
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailDeleteStore {
+        inner: Arc<InMemory>,
+        fail_delete_suffix: String,
+        fail_next_delete: Arc<TestAtomicBool>,
+    }
+
+    impl FailDeleteStore {
+        fn new(fail_delete_suffix: impl Into<String>) -> Self {
+            Self {
+                inner: Arc::new(InMemory::new()),
+                fail_delete_suffix: fail_delete_suffix.into(),
+                fail_next_delete: Arc::new(TestAtomicBool::new(false)),
+            }
+        }
+
+        fn fail_next_delete(&self) {
+            self.fail_next_delete.store(true, TestOrdering::Release);
+        }
+    }
+
+    impl fmt::Display for FailDeleteStore {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("FailDeleteStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for FailDeleteStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> ObjectStoreResult<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> ObjectStoreResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, ObjectStoreResult<Path>>,
+        ) -> BoxStream<'static, ObjectStoreResult<Path>> {
+            let inner = self.inner.clone();
+            let fail_delete_suffix = self.fail_delete_suffix.clone();
+            let fail_next_delete = self.fail_next_delete.clone();
+
+            locations
+                .then(move |location| {
+                    let inner = inner.clone();
+                    let fail_delete_suffix = fail_delete_suffix.clone();
+                    let fail_next_delete = fail_next_delete.clone();
+                    async move {
+                        let location = location?;
+                        if location.to_string().ends_with(&fail_delete_suffix)
+                            && fail_next_delete.swap(false, TestOrdering::AcqRel)
+                        {
+                            return Err(object_store::Error::Generic {
+                                store: "fail_delete",
+                                source: "injected delete failure".into(),
+                            });
+                        }
+
+                        inner.delete(&location).await?;
+                        Ok(location)
+                    }
+                })
+                .boxed()
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> ObjectStoreResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> ObjectStoreResult<()> {
+            self.inner.copy_opts(from, to, options).await
         }
     }
 
@@ -2511,6 +2751,184 @@ mod tests {
         // 验证集合统计信息
         let stats = collection.stats();
         assert_eq!(stats.num_documents, 1);
+
+        db.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_remove_rolls_back_indexes_when_storage_delete_fails() -> Result<(), DBError> {
+        let object_store = Arc::new(FailDeleteStore::new("data/1.cbor"));
+        let db_config = DBConfig {
+            name: "test_db".to_string(),
+            description: "Test database".to_string(),
+            storage: StorageConfig {
+                compress_level: 0,
+                ..Default::default()
+            },
+            lock: None,
+        };
+        let db = AndaDB::connect(object_store.clone(), db_config).await?;
+        let collection = create_test_collection(&db, async |collection| {
+            collection.create_btree_index_nx(&["name"]).await?;
+            collection
+                .create_bm25_index_nx(&["name", "tags", "metadata"])
+                .await?;
+            collection
+                .create_hnsw_index_nx(
+                    "vector",
+                    HnswConfig {
+                        dimension: 10,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            Ok(())
+        })
+        .await?;
+
+        let doc = create_test_doc(0, "Alice", 30, vec!["smart", "friendly"]);
+        let doc_obj = Document::try_from(collection.schema(), &doc)?;
+        let id = collection.add(doc_obj).await?;
+        assert_eq!(id, 1);
+
+        object_store.fail_next_delete();
+        let err = collection.remove(id).await.unwrap_err();
+        assert!(matches!(err, DBError::Storage { .. }));
+
+        assert!(collection.contains(id));
+        let stored: TestDoc = collection.get_as(id).await?;
+        assert_eq!(stored.name, "Alice");
+
+        let btree_ids = collection
+            .query_ids(
+                Filter::Field(("name".to_string(), RangeQuery::Eq(Fv::Text("Alice".into())))),
+                Some(10),
+            )
+            .await?;
+        assert_eq!(btree_ids, vec![id]);
+
+        let bm25_ids = collection
+            .search_ids(Query {
+                search: Some(Search {
+                    text: Some("Alice".to_string()),
+                    ..Default::default()
+                }),
+                limit: Some(10),
+                ..Default::default()
+            })
+            .await?;
+        assert!(bm25_ids.contains(&id));
+
+        let hnsw_ids = collection
+            .search_ids(Query {
+                search: Some(Search {
+                    vector: Some(
+                        doc.vector
+                            .iter()
+                            .map(|value| value.to_f32())
+                            .collect::<Vec<_>>(),
+                    ),
+                    ..Default::default()
+                }),
+                limit: Some(10),
+                ..Default::default()
+            })
+            .await?;
+        assert!(hnsw_ids.contains(&id));
+
+        db.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_create_indexes_backfills_existing_documents() -> Result<(), DBError> {
+        let object_store = Arc::new(InMemory::new());
+        let db_config = DBConfig {
+            name: "test_db".to_string(),
+            description: "Test database".to_string(),
+            storage: StorageConfig {
+                compress_level: 0,
+                ..Default::default()
+            },
+            lock: None,
+        };
+
+        let db = AndaDB::connect(object_store.clone(), db_config.clone()).await?;
+        let collection = create_test_collection(&db, async |_| Ok(())).await?;
+
+        let alice = create_test_doc(0, "Alice", 30, vec!["smart", "friendly"]);
+        let alice_id = collection
+            .add(Document::try_from(collection.schema(), &alice)?)
+            .await?;
+        let bob = create_test_doc(0, "Bob", 42, vec!["careful", "focused"]);
+        let bob_id = collection
+            .add(Document::try_from(collection.schema(), &bob)?)
+            .await?;
+        assert_eq!((alice_id, bob_id), (1, 2));
+        db.close().await?;
+
+        let db = AndaDB::connect(object_store.clone(), db_config).await?;
+        let collection = db
+            .open_collection("test_collection".to_string(), async |collection| {
+                collection.create_btree_index_nx(&["name"]).await?;
+                collection
+                    .create_bm25_index_nx(&["name", "tags", "metadata"])
+                    .await?;
+                collection
+                    .create_hnsw_index_nx(
+                        "vector",
+                        HnswConfig {
+                            dimension: 10,
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                Ok(())
+            })
+            .await?;
+
+        let btree_ids = collection
+            .query_ids(
+                Filter::Field(("name".to_string(), RangeQuery::Eq(Fv::Text("Alice".into())))),
+                Some(10),
+            )
+            .await?;
+        assert_eq!(btree_ids, vec![alice_id]);
+
+        let bm25_ids = collection
+            .search_ids(Query {
+                search: Some(Search {
+                    text: Some("focused".to_string()),
+                    ..Default::default()
+                }),
+                limit: Some(10),
+                ..Default::default()
+            })
+            .await?;
+        assert!(bm25_ids.contains(&bob_id));
+
+        assert_eq!(collection.get_hnsw_index("vector")?.stats().num_elements, 2);
+        let hnsw_ids = collection
+            .search_ids(Query {
+                search: Some(Search {
+                    vector: Some(
+                        alice
+                            .vector
+                            .iter()
+                            .map(|value| value.to_f32())
+                            .collect::<Vec<_>>(),
+                    ),
+                    ..Default::default()
+                }),
+                limit: Some(10),
+                ..Default::default()
+            })
+            .await?;
+        assert!(
+            hnsw_ids.contains(&alice_id),
+            "HNSW results should contain {alice_id}, got {hnsw_ids:?}",
+        );
 
         db.close().await?;
         Ok(())

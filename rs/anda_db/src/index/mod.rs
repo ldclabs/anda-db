@@ -1,4 +1,4 @@
-use anda_db_schema::{Document, Fv, Json, Vector};
+use anda_db_schema::{Document, Fv, Json, Vector, bf16};
 use ic_auth_types::deterministic_cbor_into_vec;
 use std::borrow::Cow;
 
@@ -38,10 +38,20 @@ pub trait IndexHooks: Send + Sync {
     }
 
     fn hnsw_index_value<'a>(&self, index: &Hnsw, doc: &'a Document) -> Option<Cow<'a, Vector>> {
-        if let Some(Fv::Vector(vector)) = doc.get_field(index.field_name()) {
-            return Some(Cow::Borrowed(vector));
+        match doc.get_field(index.field_name()) {
+            Some(Fv::Vector(vector)) => Some(Cow::Borrowed(vector)),
+            Some(Fv::Array(values)) => {
+                let vector = values
+                    .iter()
+                    .map(|value| match value {
+                        Fv::U64(bits) => u16::try_from(*bits).ok().map(bf16::from_bits),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                Some(Cow::Owned(vector))
+            }
+            _ => None,
         }
-        None
     }
 }
 

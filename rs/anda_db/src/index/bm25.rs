@@ -86,6 +86,16 @@ impl BM25 {
         })
     }
 
+    pub(crate) async fn drop_data(&self) {
+        if let Err(err) = self.storage.delete(&BM25::metadata_path(&self.name)).await {
+            log::warn!(
+                action = "BM25::drop_data",
+                index = self.name;
+                "Failed to drop BM25 index data: {err:?}",
+            );
+        }
+    }
+
     pub async fn bootstrap(
         name: String,
         tokenizer: TokenizerChain,

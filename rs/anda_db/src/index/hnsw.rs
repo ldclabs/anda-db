@@ -83,6 +83,23 @@ impl Hnsw {
         })
     }
 
+    pub(crate) async fn drop_data(&self) {
+        if let Err(err) = self.storage.delete(&Hnsw::metadata_path(&self.name)).await {
+            log::warn!(
+                action = "Hnsw::drop_data",
+                index = self.name;
+                "Failed to drop HNSW metadata: {err:?}",
+            );
+        }
+        if let Err(err) = self.storage.delete(&Hnsw::ids_path(&self.name)).await {
+            log::warn!(
+                action = "Hnsw::drop_data",
+                index = self.name;
+                "Failed to drop HNSW ids: {err:?}",
+            );
+        }
+    }
+
     pub async fn bootstrap(name: String, storage: Storage) -> Result<Self, DBError> {
         let (metadata, metadata_version) = storage.fetch_bytes(&Hnsw::metadata_path(&name)).await?;
         let (ids, ids_version) = storage.fetch_bytes(&Hnsw::ids_path(&name)).await?;
@@ -193,7 +210,11 @@ impl Hnsw {
         self.index.remove(id, now_ms)
     }
 
+    pub fn try_search(&self, query: &[f32], top_k: usize) -> Result<Vec<(u64, f32)>, DBError> {
+        self.index.search_f32(query, top_k).map_err(DBError::from)
+    }
+
     pub fn search(&self, query: &[f32], top_k: usize) -> Vec<(u64, f32)> {
-        self.index.search_f32(query, top_k).unwrap_or_default()
+        self.try_search(query, top_k).unwrap_or_default()
     }
 }

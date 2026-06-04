@@ -160,7 +160,11 @@ This combination supports fast containment checks, ordered scans, and durable re
 
 ## Indexing Model
 
-AndaDB supports three complementary index families.
+AndaDB supports three complementary index families. Creating a new index on an
+existing collection backfills the index from the collection's current document
+ids before the index is registered in collection metadata. If the backfill
+fails, for example because a unique B-Tree index would conflict, the index is
+not made visible and the temporary index metadata is cleaned up best-effort.
 
 ### B-Tree Indexes
 
@@ -205,6 +209,9 @@ Important properties:
 - Index construction is parameterized by `HnswConfig`
 - Query vectors are supplied as `Vec<f32>`
 - Search returns ranked document ids which can be fused with BM25 results
+- Persisted vectors may be read back as the schema-compatible
+  `Array(U64 bits)` representation; the default index hooks normalize this
+  form before inserting into HNSW.
 
 This index family is the semantic-retrieval path for embeddings or representation vectors.
 
