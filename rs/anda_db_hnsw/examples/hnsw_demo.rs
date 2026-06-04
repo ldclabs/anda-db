@@ -89,6 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("- Delete operations: {}", stats.delete_count);
 
     // 最终保存
+    std::fs::create_dir_all("debug/hnsw_demo")?;
     {
         let metadata = std::fs::File::create("debug/hnsw_demo/metadata.cbor")?;
         let ids = std::fs::File::create("debug/hnsw_demo/ids.cbor")?;

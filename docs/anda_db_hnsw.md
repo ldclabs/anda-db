@@ -261,6 +261,11 @@ to issue up to 32 object-store reads in flight concurrently. The resulting
 throughput is typically bound by the underlying store, not by per-node
 deserialisation.
 
+If an id exists in the bitmap but its node blob is missing, the loader removes
+that id from the live bitmap, repairs the entry point if needed, prunes all
+loaded edges pointing to the missing node, and marks the repaired nodes dirty.
+The next flush writes the cleaned graph back to storage.
+
 ## 8. Concurrency & `Send` Safety
 
 Hot paths are designed so that no lock is held across an `.await`:
@@ -272,12 +277,10 @@ Hot paths are designed so that no lock is held across an `.await`:
 - All counters that are hit on every operation are `AtomicU64` with
   `Ordering::Relaxed` — they are *statistics*, not fences.
 
-Writers do not serialise with each other at the granularity of the whole
-index. Two concurrent inserts may both observe the same entry point and
-both promote themselves to the top layer; the second one wins under the
-`entry_point` write-lock. Neighbor-edge updates are similarly
-last-writer-wins on each affected node's clone-then-`insert`, with the
-`version` counter as the authoritative watermark.
+Structural writers (`insert` and `remove`) are serialized by an internal
+mutex because they clone and rewrite adjacency lists. Search remains lock-free
+on the hot path and may overlap with writers; stale references are skipped if
+their node is no longer present.
 
 ## 9. Tuning Guide
 
@@ -324,7 +327,7 @@ attribute failures at the log level without extra wrapping.
 | `search` / `search_f32`                                | k-NN query, sorted ascending by distance                  |
 | `get_node_with`                                        | Visit a node under its pin guard (for custom projections) |
 | `node_ids`                                             | Snapshot the live-id set                                  |
-| `has_dirty_nodes` / `dirty_nodes_len`                  | Inspect the flush backlog                                 |
+| `has_dirty_nodes`                                      | Inspect whether the flush backlog is non-empty            |
 | `store_metadata` / `store_ids` / `store_dirty_nodes`   | Granular persistence                                      |
 | `flush`                                                | End-to-end persist in one call                            |
 | `stats` / `metadata`                                   | Snapshot counters and configuration                       |

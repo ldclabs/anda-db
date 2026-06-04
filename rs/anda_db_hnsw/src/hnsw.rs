@@ -567,6 +567,7 @@ impl HnswIndex {
                     ids.remove(*id);
                 }
             }
+            let repaired_nodes = self.prune_missing_node_edges(&missing_ids);
             let max_layer = self.repair_entry_point();
             self.update_metadata(|metadata| {
                 metadata.stats.version = metadata.stats.version.saturating_add(1);
@@ -576,6 +577,13 @@ impl HnswIndex {
                     .saturating_add(missing_ids.len() as u64);
                 metadata.stats.max_layer = max_layer;
             });
+            if repaired_nodes > 0 {
+                log::debug!(
+                    "Removed stale edges to {} missing HNSW nodes from {} loaded nodes",
+                    missing_ids.len(),
+                    repaired_nodes
+                );
+            }
         } else {
             let (entry_point, _) = *self.entry_point.read();
             if entry_point != 0 && self.nodes.pin().get(&entry_point).is_none() {
@@ -638,6 +646,18 @@ impl HnswIndex {
             return Err(HnswError::Generic {
                 name: name.to_string(),
                 source: format!("Loaded node {expected_id} contains NaN or infinity").into(),
+            });
+        }
+        if node
+            .neighbors
+            .iter()
+            .flatten()
+            .any(|(_, distance)| !distance.is_finite())
+        {
+            return Err(HnswError::Generic {
+                name: name.to_string(),
+                source: format!("Loaded node {expected_id} contains non-finite edge distance")
+                    .into(),
             });
         }
         Ok(())
@@ -1130,6 +1150,13 @@ impl HnswIndex {
             });
         }
 
+        if query.iter().any(|v| !v.is_finite()) {
+            return Err(HnswError::Generic {
+                name: self.name.clone(),
+                source: "Query vector contains invalid values (NaN or infinity)".into(),
+            });
+        }
+
         if top_k == 0 {
             return Ok(Vec::new());
         }
@@ -1193,6 +1220,17 @@ impl HnswIndex {
     ///
     /// * `Result<Vec<(u64, f32)>, HnswError>` - Vector of (id, distance) pairs sorted by ascending distance
     pub fn search_f32(&self, query: &[f32], top_k: usize) -> Result<Vec<(u64, f32)>, HnswError> {
+        if top_k == 0 {
+            return Ok(Vec::new());
+        }
+
+        if query.iter().any(|v| !v.is_finite()) {
+            return Err(HnswError::Generic {
+                name: self.name.clone(),
+                source: "Query vector contains invalid values (NaN or infinity)".into(),
+            });
+        }
+
         self.search(
             &query.iter().map(|v| bf16::from_f32(*v)).collect::<Vec<_>>(),
             top_k,
@@ -1746,6 +1784,42 @@ impl HnswIndex {
         max_layer
     }
 
+    /// Removes all edges that point to node blobs missing during bootstrap.
+    fn prune_missing_node_edges(&self, missing_ids: &[u64]) -> usize {
+        if missing_ids.is_empty() {
+            return 0;
+        }
+
+        let missing: FxHashSet<u64> = FxHashSet::from_iter(missing_ids.iter().copied());
+        let nodes = self.nodes.pin();
+        let mut repaired_nodes = BTreeSet::new();
+
+        for (id, node) in nodes.iter() {
+            let mut repaired = None;
+            for (layer, neighbors) in node.neighbors.iter().enumerate() {
+                if neighbors
+                    .iter()
+                    .any(|(neighbor_id, _)| missing.contains(neighbor_id))
+                {
+                    let node = repaired.get_or_insert_with(|| node.clone());
+                    node.neighbors[layer].retain(|(neighbor_id, _)| !missing.contains(neighbor_id));
+                }
+            }
+
+            if let Some(mut node) = repaired {
+                node.version = node.version.saturating_add(1);
+                repaired_nodes.insert(*id);
+                nodes.insert(*id, node);
+            }
+        }
+
+        let repaired_count = repaired_nodes.len();
+        if repaired_count > 0 {
+            self.dirty_nodes.write().extend(repaired_nodes);
+        }
+        repaired_count
+    }
+
     /// Updates the index metadata
     ///
     /// # Arguments
@@ -1852,6 +1926,19 @@ mod tests {
 
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded.node_ids(), vec![1]);
+        assert!(
+            loaded
+                .get_node_with(1, |node| node
+                    .neighbors
+                    .iter()
+                    .all(|neighbors| neighbors.iter().all(|(id, _)| *id != 2)))
+                .unwrap(),
+            "load should prune stale edges to missing node blobs"
+        );
+        assert!(
+            loaded.has_dirty_nodes(),
+            "pruned stale edges should be persisted on the next flush"
+        );
         assert_eq!(loaded.search_f32(&[1.5, 1.5], 10).unwrap().len(), 1);
         assert!(loaded.stats().version > index.stats().version);
     }
@@ -1867,6 +1954,29 @@ mod tests {
 
         assert!(index.search_f32(&[1.0, 1.0], 0).unwrap().is_empty());
         assert_eq!(index.stats().search_count, 0);
+    }
+
+    #[test]
+    fn test_search_rejects_non_finite_query_values() {
+        let config = HnswConfig {
+            dimension: 2,
+            ..Default::default()
+        };
+        let index = HnswIndex::new("anda_db_hnsw".to_string(), Some(config));
+        index.insert_f32(1, vec![1.0, 1.0], 0).unwrap();
+
+        let result = index.search_f32(&[f32::NAN, 1.0], 1);
+        assert!(matches!(result, Err(HnswError::Generic { .. })));
+
+        let result = index.search(&[bf16::from_f32(f32::INFINITY), bf16::from_f32(1.0)], 1);
+        assert!(matches!(result, Err(HnswError::Generic { .. })));
+
+        assert!(
+            index
+                .search_f32(&[f32::NAN, f32::INFINITY], 0)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
