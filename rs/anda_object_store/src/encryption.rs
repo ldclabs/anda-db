@@ -366,6 +366,15 @@ impl<T: ObjectStore> EncryptedStoreBuilder<T> {
         self.meta_cache.remove(location).await;
     }
 
+    async fn refresh_meta_original_tag(&self, location: &Path) -> Result<()> {
+        let mut meta = self.load_meta(location).await?;
+        let obj = self.store.head(&self.full_path(location)).await?;
+        meta.original_tag = obj.e_tag;
+        meta.original_version = obj.version;
+        self.put_meta(location, meta).await?;
+        Ok(())
+    }
+
     async fn get_chunk(&self, location: &Path, idx: u64, total_size: u64) -> Result<Vec<u8>> {
         let full_path = self.full_path(location);
         let start = idx * self.chunk_size;
@@ -836,6 +845,7 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
             .copy_opts(&meta_from, &meta_to, options)
             .await?;
         self.inner.remove_meta_cache(to).await;
+        self.inner.refresh_meta_original_tag(to).await?;
         Ok(())
     }
 
@@ -855,6 +865,7 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
             .rename_opts(&meta_from, &meta_to, options)
             .await?;
         self.inner.remove_meta_cache(to).await;
+        self.inner.refresh_meta_original_tag(to).await?;
         Ok(())
     }
 }
@@ -1304,6 +1315,53 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::NotModified { .. }));
+    }
+
+    #[tokio::test]
+    async fn conditional_copy_and_rename_refresh_original_tag_for_logical_etag_preconditions() {
+        let storage = EncryptedStoreBuilder::with_secret(InMemory::new(), 100, [0u8; 32])
+            .with_conditional_put()
+            .build();
+        let source = Path::from("encrypted-copy-source");
+        let copied = Path::from("encrypted-copy-target");
+        let renamed = Path::from("encrypted-rename-target");
+        let put = storage
+            .put(&source, Bytes::from_static(b"abc").into())
+            .await
+            .unwrap();
+        let e_tag = put.e_tag.unwrap();
+
+        storage.copy(&source, &copied).await.unwrap();
+        let bytes = storage
+            .get_opts(
+                &copied,
+                GetOptions {
+                    if_match: Some(e_tag.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"abc"));
+
+        storage.rename(&copied, &renamed).await.unwrap();
+        let bytes = storage
+            .get_opts(
+                &renamed,
+                GetOptions {
+                    if_match: Some(e_tag),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"abc"));
     }
 
     #[tokio::test]
