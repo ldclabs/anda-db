@@ -78,6 +78,13 @@ impl CborSizer {
     }
 
     #[inline]
+    fn add_head_len_usize(&mut self, len: usize) -> Result<(), CborSizeError> {
+        let len =
+            u64::try_from(len).map_err(|_| CborSizeError::new("CBOR length exceeds u64::MAX"))?;
+        self.add_head_len(len)
+    }
+
+    #[inline]
     fn add_uint(&mut self, v: u64) -> Result<(), CborSizeError> {
         self.add_head_len(v)
     }
@@ -97,13 +104,13 @@ impl CborSizer {
 
     #[inline]
     fn add_bytes(&mut self, len: usize) -> Result<(), CborSizeError> {
-        self.add_head_len(len as u64)?;
+        self.add_head_len_usize(len)?;
         self.add_count(len)
     }
 
     #[inline]
     fn add_text(&mut self, len: usize) -> Result<(), CborSizeError> {
-        self.add_head_len(len as u64)?;
+        self.add_head_len_usize(len)?;
         self.add_count(len)
     }
 
@@ -111,7 +118,7 @@ impl CborSizer {
     fn add_array_header(&mut self, len: Option<usize>) -> Result<bool, CborSizeError> {
         match len {
             Some(n) => {
-                self.add_head_len(n as u64)?;
+                self.add_head_len_usize(n)?;
                 Ok(false)
             }
             None => {
@@ -135,7 +142,7 @@ impl CborSizer {
     fn add_map_header(&mut self, len: Option<usize>) -> Result<bool, CborSizeError> {
         match len {
             Some(n) => {
-                self.add_head_len(n as u64)?;
+                self.add_head_len_usize(n)?;
                 Ok(false)
             }
             None => {
@@ -828,6 +835,7 @@ mod tests {
     use ciborium::into_writer;
     use ciborium::tag::{Accepted, Captured, Required};
     use serde::Serialize;
+    use serde_bytes::{ByteArray, ByteBuf, Bytes};
     use std::collections::BTreeMap;
 
     fn measured_size<T: ?Sized + Serialize>(v: &T) -> usize {
@@ -929,9 +937,34 @@ mod tests {
             assert_estimate_eq(&format!("i64:{v}"), &v);
         }
 
-        // f32/f64
-        assert_estimate_eq("f32:1.0", &1.0f32);
-        assert_estimate_eq("f64:1.0", &1.0f64);
+        // f32/f64（覆盖 f16/f32/f64 三种编码宽度以及非有限值）
+        for &v in &[
+            0.0f32,
+            -0.0,
+            1.0,
+            1.5,
+            65_504.0,
+            1.0e-10,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+        ] {
+            assert_estimate_eq(&format!("f32:{v:?}"), &v);
+        }
+
+        for &v in &[
+            0.0f64,
+            -0.0,
+            1.0,
+            1.5,
+            1.0e-10,
+            1.0e100,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+        ] {
+            assert_estimate_eq(&format!("f64:{v:?}"), &v);
+        }
 
         // char（ASCII、3字节、4字节）
         assert_estimate_eq("char:a", &'a');
@@ -948,11 +981,23 @@ mod tests {
             assert_estimate_eq(&format!("str:len={len}"), &s);
         }
 
-        // bytes 长度边界：0, 23, 24, 255, 256
+        // 裸 &[u8] 通过 Serde 默认编码为序列。
         for &len in &lens {
             let v = vec![0xABu8; len];
-            assert_estimate_eq(&format!("bytes:len={len}"), &v.as_slice());
+            assert_estimate_eq(&format!("u8-slice:len={len}"), &v.as_slice());
         }
+
+        // serde_bytes 包装类型使用真正的 CBOR byte string 编码。
+        for &len in &lens {
+            let v = vec![0xABu8; len];
+            assert_estimate_eq(&format!("serde_bytes::Bytes:len={len}"), Bytes::new(&v));
+
+            let byte_buf = ByteBuf::from(v);
+            assert_estimate_eq(&format!("serde_bytes::ByteBuf:len={len}"), &byte_buf);
+        }
+
+        let byte_array = ByteArray::new([1u8, 2, 3, 4, 5]);
+        assert_estimate_eq("serde_bytes::ByteArray:len=5", &byte_array);
     }
 
     #[test]

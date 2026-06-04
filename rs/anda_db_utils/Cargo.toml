@@ -1,6 +1,6 @@
 [package]
 name = "anda_db_utils"
-version = "0.2.3"
+version = "0.2.4"
 description = "An utility Rust library for Anda DB."
 keywords = ["anda"]
 categories = ["database", "data-structures"]
@@ -16,4 +16,5 @@ serde = { workspace = true }
 rustc-hash = { workspace = true }
 
 [dev-dependencies]
+serde_bytes = { workspace = true }
 serde_json = { workspace = true }

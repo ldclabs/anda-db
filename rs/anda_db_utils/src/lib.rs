@@ -1,7 +1,7 @@
 use core::ops::Deref;
 use rustc_hash::{FxBuildHasher, FxHashSet};
 use serde::{
-    de::{Deserialize, DeserializeOwned, Deserializer},
+    de::{Deserialize, Deserializer},
     ser::{Serialize, Serializer},
 };
 use std::{borrow::Borrow, hash::Hash};
@@ -69,6 +69,24 @@ impl<T> Pipe<T> for T {
 pub struct UniqueVec<T> {
     set: FxHashSet<T>,
     vec: Vec<T>,
+}
+
+struct UniqueVecSetRebuildGuard<'a, T>
+where
+    T: Eq + Hash + Clone,
+{
+    set: &'a mut FxHashSet<T>,
+    vec: &'a mut Vec<T>,
+}
+
+impl<T> Drop for UniqueVecSetRebuildGuard<'_, T>
+where
+    T: Eq + Hash + Clone,
+{
+    fn drop(&mut self) {
+        self.set.clear();
+        self.set.extend(self.vec.iter().cloned());
+    }
 }
 
 impl<T> Default for UniqueVec<T> {
@@ -187,9 +205,11 @@ where
     where
         F: FnMut(&T) -> bool,
     {
-        self.vec.retain(&mut f);
-        self.set.clear();
-        self.set.extend(self.vec.iter().cloned());
+        let guard = UniqueVecSetRebuildGuard {
+            set: &mut self.set,
+            vec: &mut self.vec,
+        };
+        guard.vec.retain(&mut f);
     }
 
     /// Removes and returns the element at `index`.
@@ -231,9 +251,11 @@ where
 
     /// Intersects the `UniqueVec` with another `UniqueVec`.
     pub fn intersect_with(&mut self, other: &UniqueVec<T>) {
-        self.vec.retain(|item| other.set.contains(item));
-        self.set.clear();
-        self.set.extend(self.vec.iter().cloned());
+        let guard = UniqueVecSetRebuildGuard {
+            set: &mut self.set,
+            vec: &mut self.vec,
+        };
+        guard.vec.retain(|item| other.set.contains(item));
     }
 
     /// Returns the inner `Vec` of the `UniqueVec`.
@@ -283,7 +305,7 @@ where
 
 impl<'de, T> Deserialize<'de> for UniqueVec<T>
 where
-    T: Eq + Hash + Clone + DeserializeOwned,
+    T: Eq + Hash + Clone + Deserialize<'de>,
 {
     /// Deserializes a sequence into a `UniqueVec`.
     #[inline]
@@ -340,7 +362,7 @@ impl std::io::Write for CountingWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::{borrow::Cow, io::Write};
 
     #[test]
     fn test_pipe_trait() {
@@ -436,6 +458,26 @@ mod tests {
         assert!(!uv.contains(&1));
         assert!(!uv.contains(&3));
         assert!(!uv.contains(&5));
+    }
+
+    #[test]
+    fn test_unique_vec_retain_keeps_set_consistent_after_panic() {
+        let mut uv = UniqueVec::from(vec![1, 2, 3, 4, 5]);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            uv.retain(|&x| {
+                if x == 3 {
+                    panic!("intentional retain panic");
+                }
+
+                x % 2 == 0
+            });
+        }));
+
+        assert!(result.is_err());
+        for value in 1..=5 {
+            assert_eq!(uv.contains(&value), uv.as_ref().contains(&value));
+        }
     }
 
     #[test]
@@ -564,6 +606,21 @@ mod tests {
         let deserialized: UniqueVec<i32> = serde_json::from_str("[1,3,2,3,3,2,1]").unwrap();
         assert_eq!(deserialized.len(), 3);
         assert_eq!(deserialized.as_ref(), &[1, 3, 2]);
+    }
+
+    #[test]
+    fn test_unique_vec_deserialize_borrowed_values() {
+        fn deserialize_unique_vec_cow<'a>(json: &'a str) -> UniqueVec<Cow<'a, str>> {
+            serde_json::from_str(json).unwrap()
+        }
+
+        let json = String::from(r#"["alpha","beta","alpha"]"#);
+        let deserialized = deserialize_unique_vec_cow(&json);
+
+        assert_eq!(
+            deserialized.as_ref(),
+            &[Cow::Borrowed("alpha"), Cow::Borrowed("beta")]
+        );
     }
 
     #[test]
