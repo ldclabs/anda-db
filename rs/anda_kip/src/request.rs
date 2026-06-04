@@ -299,13 +299,28 @@ impl Request {
     }
 
     fn validate_request_mode(&self) -> Option<ErrorObject> {
-        if !self.command.trim().is_empty() && !self.commands.is_empty() {
+        let has_command = !self.command.trim().is_empty();
+        let has_commands = !self.commands.is_empty();
+
+        if has_command && has_commands {
             return Some(ErrorObject {
                 code: "KIP_1001".to_string(),
                 message: "Invalid request: `command` and `commands` are mutually exclusive"
                     .to_string(),
                 hint: Some(
                     "Provide either a single `command` string or a batch `commands` array, not both."
+                        .to_string(),
+                ),
+                data: None,
+            });
+        }
+
+        if !has_command && !has_commands {
+            return Some(ErrorObject {
+                code: "KIP_1001".to_string(),
+                message: "Invalid request: missing KIP command".to_string(),
+                hint: Some(
+                    "Provide either a non-empty single `command` string or a non-empty batch `commands` array."
                         .to_string(),
                 ),
                 data: None,
@@ -1506,6 +1521,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_execute_search_command_with_params() {
+        let executor = MockExecutor;
+        let mut parameters = Map::new();
+        parameters.insert("term".to_string(), Json::String("aspirin".to_string()));
+        parameters.insert("type".to_string(), Json::String("Drug".to_string()));
+        parameters.insert("limit".to_string(), Json::Number(5.into()));
+
+        let request = Request {
+            command: r#"SEARCH CONCEPT :term WITH TYPE :type LIMIT :limit"#.to_string(),
+            parameters,
+            ..Default::default()
+        };
+
+        let (cmd_type, response) = request.execute(&executor).await;
+        assert_eq!(cmd_type, CommandType::Meta);
+        assert!(matches!(response, Response::Ok { .. }));
+    }
+
+    #[tokio::test]
     async fn test_execute_single_command_syntax_error() {
         let executor = MockExecutor;
         let request = Request {
@@ -1820,12 +1854,40 @@ mod tests {
             ..Default::default()
         };
 
-        // Empty commands means is_batch() is false, falls to single command mode
+        // Empty commands with no single command is a request-shape error.
         assert!(!request.is_batch());
         let (cmd_type, response) = request.execute(&executor).await;
-        // Empty command string is a syntax error
         assert_eq!(cmd_type, CommandType::Unknown);
-        assert!(matches!(response, Response::Err { .. }));
+        match response {
+            Response::Err { error, .. } => {
+                assert_eq!(error.code, "KIP_1001");
+                assert_eq!(error.message, "Invalid request: missing KIP command");
+            }
+            _ => panic!("Expected request error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_rejects_command_and_commands_together() {
+        let executor = MockExecutor;
+        let request = Request {
+            command: "DESCRIBE PRIMER".to_string(),
+            commands: vec![CommandItem::Simple("DESCRIBE DOMAINS".to_string())],
+            ..Default::default()
+        };
+
+        let (cmd_type, response) = request.execute(&executor).await;
+        assert_eq!(cmd_type, CommandType::Unknown);
+        match response {
+            Response::Err { error, .. } => {
+                assert_eq!(error.code, "KIP_1001");
+                assert_eq!(
+                    error.message,
+                    "Invalid request: `command` and `commands` are mutually exclusive"
+                );
+            }
+            _ => panic!("Expected request error"),
+        }
     }
 
     #[tokio::test]

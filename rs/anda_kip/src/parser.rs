@@ -588,6 +588,8 @@ WITH METADATA {
         assert_eq!(unquote_str("'hello'"), None); // Single quotes instead of double
         assert_eq!(unquote_str("\"hello\" world"), None); // Extra content after closing quote
         assert_eq!(unquote_str("\"invalid\\escape\""), None); // Invalid escape sequence
+        assert_eq!(unquote_str("\"line1\nline2\""), None); // Unescaped control character
+        assert_eq!(unquote_str("\"tab\there\""), None); // Unescaped control character
     }
 
     #[test]

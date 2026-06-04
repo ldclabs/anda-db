@@ -112,6 +112,12 @@ mod tests {
             json.get("name"),
             Some(&Json::String("execute_kip".to_string()))
         );
+        assert_eq!(json["parameters"]["properties"]["command"]["minLength"], 1);
+        assert_eq!(json["parameters"]["properties"]["commands"]["minItems"], 1);
+        assert_eq!(
+            json["parameters"]["properties"]["commands"]["items"]["oneOf"][0]["minLength"],
+            1
+        );
     }
 
     #[test]
@@ -121,6 +127,12 @@ mod tests {
         assert_eq!(
             json.get("name"),
             Some(&Json::String("execute_kip_readonly".to_string()))
+        );
+        assert_eq!(json["parameters"]["properties"]["command"]["minLength"], 1);
+        assert_eq!(json["parameters"]["properties"]["commands"]["minItems"], 1);
+        assert_eq!(
+            json["parameters"]["properties"]["commands"]["items"]["oneOf"][0]["minLength"],
+            1
         );
     }
 }

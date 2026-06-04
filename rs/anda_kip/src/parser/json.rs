@@ -1,7 +1,7 @@
 // https://github.com/rust-bakery/nom/blob/main/examples/json2.rs
 
 use nom::{
-    IResult, Mode, Parser,
+    IResult, Parser,
     branch::alt,
     bytes::{tag, tag_no_case, take},
     character::{
@@ -171,42 +171,29 @@ fn unicode_escape<'a>() -> impl Parser<&'a str, Output = char, Error = VerboseEr
 }
 
 pub fn character<'a>() -> impl Parser<&'a str, Output = char, Error = VerboseError<&'a str>> {
-    Character
-}
-
-struct Character;
-
-impl<'a> Parser<&'a str> for Character {
-    type Output = char;
-
-    type Error = VerboseError<&'a str>;
-
-    fn process<OM: nom::OutputMode>(
-        &mut self,
-        input: &'a str,
-    ) -> nom::PResult<OM, &'a str, Self::Output, Self::Error> {
-        let (input, c): (&str, char) =
-            none_of("\"").process::<nom::OutputM<nom::Emit, OM::Error, OM::Incomplete>>(input)?;
-        if c == '\\' {
-            alt((
-                map_res(anychar, |c| {
-                    Ok(match c {
-                        '"' | '\\' | '/' => c,
-                        'b' => '\x08',
-                        'f' => '\x0C',
-                        'n' => '\n',
-                        'r' => '\r',
-                        't' => '\t',
-                        _ => return Err(()),
-                    })
-                }),
-                preceded(char('u'), unicode_escape()),
-            ))
-            .process::<OM>(input)
-        } else {
-            Ok((input, OM::Output::bind(|| c)))
-        }
-    }
+    context(
+        "JSON string character",
+        alt((
+            preceded(
+                char('\\'),
+                alt((
+                    map_res(anychar, |c| {
+                        Ok(match c {
+                            '"' | '\\' | '/' => c,
+                            'b' => '\x08',
+                            'f' => '\x0C',
+                            'n' => '\n',
+                            'r' => '\r',
+                            't' => '\t',
+                            _ => return Err(()),
+                        })
+                    }),
+                    preceded(char('u'), unicode_escape()),
+                )),
+            ),
+            verify(none_of("\"\\"), |c: &char| *c >= '\u{20}'),
+        )),
+    )
 }
 
 struct JsonParser;
