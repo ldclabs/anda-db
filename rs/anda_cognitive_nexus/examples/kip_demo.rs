@@ -62,7 +62,7 @@ async fn main() -> Result<(), KipError> {
             ]
             .join("\n");
 
-            let result = nexus.execute_kml(parse_kml(&kml)?, false).await?;
+            let result = nexus.execute_kml(parse_kml(kml)?, false).await?;
             log::info!(result:serde = result; "Init $self and $system");
         }
 

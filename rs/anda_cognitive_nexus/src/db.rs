@@ -50,7 +50,7 @@ use crate::{entity::*, helper::*, types::*};
 ///   [`QueryCache`] inside its [`QueryContext`] to avoid loading the same
 ///   row twice during a single execution. The cache is *not* shared
 ///   across calls; KML write paths invalidate cached rows on update.
-/// - **KIP support** — full KIP v1.0-RC6 (KQL/KML/META).
+/// - **KIP support** — full KIP v1.0-RC7 (KQL/KML/META).
 ///
 /// # Concurrency
 ///
@@ -237,7 +237,14 @@ impl CognitiveNexus {
                 })
                 .await
         {
-            this.execute_kml(parse_kml(GENESIS_KIP)?, false).await?;
+            this.execute_kml(parse_kml(GENESIS_KIP)?, false)
+                .await
+                .map_err(|err| {
+                    KipError::new(
+                        err.code,
+                        format!("Genesis bootstrap failed: {}", err.message),
+                    )
+                })?;
         }
 
         if ver <= 1
@@ -248,7 +255,14 @@ impl CognitiveNexus {
                 })
                 .await
         {
-            this.execute_kml(parse_kml(PERSON_KIP)?, false).await?;
+            this.execute_kml(parse_kml(PERSON_KIP)?, false)
+                .await
+                .map_err(|err| {
+                    KipError::new(
+                        err.code,
+                        format!("Person bootstrap failed: {}", err.message),
+                    )
+                })?;
         }
 
         if ver <= 1
@@ -259,7 +273,14 @@ impl CognitiveNexus {
                 })
                 .await
         {
-            this.execute_kml(parse_kml(PREFERENCE_KIP)?, false).await?;
+            this.execute_kml(parse_kml(PREFERENCE_KIP)?, false)
+                .await
+                .map_err(|err| {
+                    KipError::new(
+                        err.code,
+                        format!("Preference bootstrap failed: {}", err.message),
+                    )
+                })?;
         }
 
         if ver <= 1
@@ -270,7 +291,11 @@ impl CognitiveNexus {
                 })
                 .await
         {
-            this.execute_kml(parse_kml(EVENT_KIP)?, false).await?;
+            this.execute_kml(parse_kml(EVENT_KIP)?, false)
+                .await
+                .map_err(|err| {
+                    KipError::new(err.code, format!("Event bootstrap failed: {}", err.message))
+                })?;
         }
 
         if ver <= 1
@@ -281,7 +306,14 @@ impl CognitiveNexus {
                 })
                 .await
         {
-            this.execute_kml(parse_kml(SLEEP_TASK_KIP)?, false).await?;
+            this.execute_kml(parse_kml(SLEEP_TASK_KIP)?, false)
+                .await
+                .map_err(|err| {
+                    KipError::new(
+                        err.code,
+                        format!("SleepTask bootstrap failed: {}", err.message),
+                    )
+                })?;
         }
 
         if ver <= 1
@@ -292,7 +324,14 @@ impl CognitiveNexus {
                 })
                 .await
         {
-            this.execute_kml(parse_kml(INSIGHT_KIP)?, false).await?;
+            this.execute_kml(parse_kml(INSIGHT_KIP)?, false)
+                .await
+                .map_err(|err| {
+                    KipError::new(
+                        err.code,
+                        format!("Insight bootstrap failed: {}", err.message),
+                    )
+                })?;
         }
 
         f(&this).await?;
@@ -511,12 +550,12 @@ impl CognitiveNexus {
     /// - `UPSERT` validates that all referenced concept / proposition
     ///   types exist and that all variable handles can be resolved, but
     ///   does **not** create or update any row.
-    /// - `DELETE CONCEPT` still performs the `KIP_3004` protected-scope
-    ///   pre-flight check so agents can probe for safety without side
-    ///   effects.
+    /// - `DELETE CONCEPT` and protected `DELETE ATTRIBUTES` targets still
+    ///   perform the `KIP_3004` protected-scope pre-flight check so agents
+    ///   can probe for safety without side effects.
     /// - Other delete variants short-circuit and return zeroed counters.
     ///
-    /// On success the returned JSON is shaped per RC6 §4.1 — for upserts
+    /// On success the returned JSON is shaped per RC7 §4.1 — for upserts
     /// an [`UpsertResult`], for deletes a `{"deleted_*": N, "updated_*":
     /// N}` map. KML acquires the write lock so it executes exclusively.
     pub async fn execute_kml(
@@ -2310,11 +2349,21 @@ impl CognitiveNexus {
         dry_run: bool,
     ) -> Result<Json, KipError> {
         let blocks = upsert_blocks.len();
+        self.preflight_upsert(&upsert_blocks).await?;
+
+        if dry_run {
+            return Ok(json!(UpsertResult {
+                blocks,
+                upsert_concept_nodes: Vec::<String>::new(),
+                upsert_proposition_links: Vec::<String>::new(),
+            }));
+        }
+
         let mut concept_nodes: Vec<EntityID> = Vec::new();
         let mut proposition_links: Vec<EntityID> = Vec::new();
+        let mut cached_pks: FxHashMap<EntityPK, EntityID> = FxHashMap::default();
         for block in upsert_blocks {
             let mut handle_map: FxHashMap<String, EntityID> = FxHashMap::default();
-            let mut cached_pks: FxHashMap<EntityPK, EntityID> = FxHashMap::default();
             let default_metadata: Map<String, Json> = block.metadata.unwrap_or_default();
 
             for item in block.items {
@@ -2351,11 +2400,9 @@ impl CognitiveNexus {
             }
         }
 
-        if !dry_run {
-            let now_ms = unix_ms();
-            try_join!(self.concepts.flush(now_ms), self.propositions.flush(now_ms))
-                .map_err(db_to_kip_error)?;
-        }
+        let now_ms = unix_ms();
+        try_join!(self.concepts.flush(now_ms), self.propositions.flush(now_ms))
+            .map_err(db_to_kip_error)?;
 
         Ok(json!(UpsertResult {
             blocks,
@@ -2365,6 +2412,42 @@ impl CognitiveNexus {
                 .map(|id| id.to_string())
                 .collect(),
         }))
+    }
+
+    async fn preflight_upsert(&self, upsert_blocks: &[UpsertBlock]) -> Result<(), KipError> {
+        let mut cached_pks: FxHashMap<EntityPK, EntityID> = FxHashMap::default();
+
+        for block in upsert_blocks.iter().cloned() {
+            let mut handle_map: FxHashMap<String, EntityID> = FxHashMap::default();
+            let default_metadata: Map<String, Json> = block.metadata.unwrap_or_default();
+
+            for item in block.items {
+                match item {
+                    UpsertItem::Concept(concept_block) => {
+                        self.execute_concept_block(
+                            concept_block,
+                            &default_metadata,
+                            &mut handle_map,
+                            &mut cached_pks,
+                            true,
+                        )
+                        .await?;
+                    }
+                    UpsertItem::Proposition(proposition_block) => {
+                        self.execute_proposition_block(
+                            proposition_block,
+                            &default_metadata,
+                            &mut handle_map,
+                            &mut cached_pks,
+                            true,
+                        )
+                        .await?;
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     async fn execute_concept_block(
@@ -2386,21 +2469,13 @@ impl CognitiveNexus {
                 }
             }
             ConceptPK::Object { r#type, .. } => {
-                // 确保概念类型已经定义
-                if r#type != META_CONCEPT_TYPE
-                    && !self
-                        .has_concept(&ConceptPK::Object {
-                            r#type: META_CONCEPT_TYPE.to_string(),
-                            name: r#type.clone(),
-                        })
-                        .await
-                {
-                    return Err(KipError::not_found(format!(
-                        "Concept type {ty} not found",
-                        ty = r#type
-                    )));
-                }
+                self.ensure_concept_type_for_kml(r#type, cached_pks).await?;
             }
+        }
+
+        if let Some(attributes) = &concept_block.set_attributes {
+            self.ensure_concept_attributes_mutable_for_kml(&concept_pk, attributes, cached_pks)
+                .await?;
         }
 
         if let Some(propositions) = &concept_block.set_propositions {
@@ -2411,8 +2486,12 @@ impl CognitiveNexus {
         }
 
         if dry_run {
-            let entity_id = self.next_dry_run_entity_id(cached_pks, None);
-            cached_pks.insert(EntityPK::Concept(concept_pk), entity_id.clone());
+            let entity_pk = EntityPK::Concept(concept_pk);
+            let entity_id = cached_pks
+                .get(&entity_pk)
+                .cloned()
+                .unwrap_or_else(|| self.next_dry_run_entity_id(cached_pks, None));
+            cached_pks.insert(entity_pk, entity_id.clone());
             if let Some(handle) = concept_block.handle {
                 handle_map.insert(handle, entity_id);
             }
@@ -2468,8 +2547,12 @@ impl CognitiveNexus {
                     predicate.clone()
                 }
             };
-            let entity_id = self.next_dry_run_entity_id(cached_pks, Some(predicate));
-            cached_pks.insert(EntityPK::Proposition(proposition_pk), entity_id.clone());
+            let entity_pk = EntityPK::Proposition(proposition_pk);
+            let entity_id = cached_pks
+                .get(&entity_pk)
+                .cloned()
+                .unwrap_or_else(|| self.next_dry_run_entity_id(cached_pks, Some(predicate)));
+            cached_pks.insert(entity_pk, entity_id.clone());
             if let Some(handle) = proposition_block.handle {
                 handle_map.insert(handle, entity_id);
             }
@@ -2507,7 +2590,8 @@ impl CognitiveNexus {
         handle_map: &FxHashMap<String, EntityID>,
         cached_pks: &mut FxHashMap<EntityPK, EntityID>,
     ) -> Result<EntityID, KipError> {
-        self.ensure_proposition_type(&set_prop.predicate).await?;
+        self.ensure_proposition_type_for_kml(&set_prop.predicate, cached_pks)
+            .await?;
 
         let object_id = self
             .resolve_target_term(set_prop.object, handle_map, cached_pks)
@@ -2532,7 +2616,7 @@ impl CognitiveNexus {
     }
 
     /// Returns true if the concept identified by `(type, name)` is system-protected
-    /// per KIP v1.0-RC6 §4.2.4 (DELETE CONCEPT) — meta-type definition nodes
+    /// per KIP v1.0-RC7 §4.2.4 (DELETE CONCEPT) — meta-type definition nodes
     /// (`$ConceptType`, `$PropositionType`), system actor identity tuples
     /// (`$self`, `$system`), and core domains (e.g. `CoreSchema`).
     fn is_protected_concept(r#type: &str, name: &str) -> bool {
@@ -2551,6 +2635,17 @@ impl CognitiveNexus {
             return true;
         }
         false
+    }
+
+    fn is_system_actor(r#type: &str, name: &str) -> bool {
+        r#type == PERSON_TYPE && (name == META_SELF_NAME || name == META_SYSTEM_NAME)
+    }
+
+    fn immutable_core_directives_error(r#type: &str, name: &str) -> KipError {
+        KipError::immutable_target(format!(
+            "Concept {{type: \"{ty}\", name: \"{name}\"}} core_directives are system-protected and cannot be modified",
+            ty = r#type
+        ))
     }
 
     async fn execute_delete(
@@ -2607,13 +2702,6 @@ impl CognitiveNexus {
         where_clauses: Vec<WhereClause>,
         dry_run: bool,
     ) -> Result<Json, KipError> {
-        if dry_run {
-            return Ok(json!({
-                "updated_concepts": 0,
-                "updated_propositions": 0,
-            }));
-        }
-
         let mut ctx = QueryContext::default();
         for clause in where_clauses {
             self.execute_where_clause(&mut ctx, clause).await?;
@@ -2622,6 +2710,29 @@ impl CognitiveNexus {
         let target_entities = ctx.entities.get(&target).cloned().ok_or_else(|| {
             KipError::reference_error(format!("Target term '{}' not found in context", target))
         })?;
+
+        if attributes.iter().any(|name| name == "core_directives") {
+            for entity_id in target_entities.as_ref() {
+                if let EntityID::Concept(id) = entity_id {
+                    let (ty, name) = self
+                        .try_get_concept_with(&ctx.cache, *id, |concept| {
+                            Ok((concept.r#type.clone(), concept.name.clone()))
+                        })
+                        .await?;
+                    if Self::is_system_actor(&ty, &name) {
+                        return Err(Self::immutable_core_directives_error(&ty, &name));
+                    }
+                }
+            }
+        }
+
+        if dry_run {
+            return Ok(json!({
+                "updated_concepts": 0,
+                "updated_propositions": 0,
+            }));
+        }
+
         let mut updated_concepts: u64 = 0;
         let mut updated_propositions: u64 = 0;
         for entity_id in target_entities.as_ref() {
@@ -2918,7 +3029,7 @@ impl CognitiveNexus {
         // Compute the transitive cascade closure: every proposition whose subject
         // or object refers (directly or via higher-order chains) to one of the
         // concepts being deleted must also be removed so no dangling references
-        // remain after a DETACH (KIP v1.0-RC6 §4.2.4).
+        // remain after a DETACH (KIP v1.0-RC7 §4.2.4).
         let mut to_delete_proposition_ids: BTreeSet<u64> = BTreeSet::new();
         let mut frontier: Vec<EntityID> = concept_ids
             .iter()
@@ -3036,7 +3147,8 @@ impl CognitiveNexus {
                 predicate.as_str()
             }
         };
-        self.ensure_proposition_type(predicate_name).await?;
+        self.ensure_proposition_type_for_kml(predicate_name, cached_pks)
+            .await?;
 
         match pk {
             PropositionPK::ID(id, predicate) => {
@@ -3129,6 +3241,15 @@ impl CognitiveNexus {
         }
 
         let concept: Concept = self.concepts.get_as(id).await.map_err(db_to_kip_error)?;
+        if attributes.contains_key("core_directives")
+            && Self::is_system_actor(&concept.r#type, &concept.name)
+        {
+            return Err(Self::immutable_core_directives_error(
+                &concept.r#type,
+                &concept.name,
+            ));
+        }
+
         let mut update_fields: BTreeMap<String, Fv> = BTreeMap::new();
         if !attributes.is_empty() {
             let mut fv = concept.attributes;
@@ -3925,20 +4046,86 @@ impl CognitiveNexus {
         }
     }
 
-    async fn ensure_proposition_type(&self, predicate: &str) -> Result<(), KipError> {
+    async fn ensure_concept_type_for_kml(
+        &self,
+        type_name: &str,
+        cached_pks: &FxHashMap<EntityPK, EntityID>,
+    ) -> Result<(), KipError> {
+        if type_name == META_CONCEPT_TYPE
+            || self
+                .has_concept(&ConceptPK::Object {
+                    r#type: META_CONCEPT_TYPE.to_string(),
+                    name: type_name.to_string(),
+                })
+                .await
+            || cached_pks.contains_key(&EntityPK::Concept(ConceptPK::Object {
+                r#type: META_CONCEPT_TYPE.to_string(),
+                name: type_name.to_string(),
+            }))
+        {
+            Ok(())
+        } else {
+            Err(KipError::type_mismatch(format!(
+                "Concept type {type_name} is not defined"
+            )))
+        }
+    }
+
+    async fn ensure_proposition_type_for_kml(
+        &self,
+        predicate: &str,
+        cached_pks: &FxHashMap<EntityPK, EntityID>,
+    ) -> Result<(), KipError> {
         if self
             .has_concept(&ConceptPK::Object {
                 r#type: META_PROPOSITION_TYPE.to_string(),
                 name: predicate.to_string(),
             })
             .await
+            || cached_pks.contains_key(&EntityPK::Concept(ConceptPK::Object {
+                r#type: META_PROPOSITION_TYPE.to_string(),
+                name: predicate.to_string(),
+            }))
         {
             Ok(())
         } else {
-            Err(KipError::not_found(format!(
-                "Proposition type {predicate} not found"
+            Err(KipError::type_mismatch(format!(
+                "Proposition type {predicate} is not defined"
             )))
         }
+    }
+
+    async fn ensure_concept_attributes_mutable_for_kml(
+        &self,
+        pk: &ConceptPK,
+        attributes: &Map<String, Json>,
+        cached_pks: &FxHashMap<EntityPK, EntityID>,
+    ) -> Result<(), KipError> {
+        if !attributes.contains_key("core_directives") {
+            return Ok(());
+        }
+
+        match pk {
+            ConceptPK::ID(id) => {
+                let concept: Concept = self.concepts.get_as(*id).await.map_err(db_to_kip_error)?;
+                if Self::is_system_actor(&concept.r#type, &concept.name) {
+                    return Err(Self::immutable_core_directives_error(
+                        &concept.r#type,
+                        &concept.name,
+                    ));
+                }
+            }
+            ConceptPK::Object { r#type, name } => {
+                if Self::is_system_actor(r#type, name)
+                    && (self.has_concept(pk).await
+                        || cached_pks.contains_key(&EntityPK::Concept(pk.clone())))
+                {
+                    return Err(Self::immutable_core_directives_error(r#type, name));
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn next_dry_run_entity_id(
@@ -3959,7 +4146,8 @@ impl CognitiveNexus {
         handle_map: &FxHashMap<String, EntityID>,
         cached_pks: &mut FxHashMap<EntityPK, EntityID>,
     ) -> Result<(), KipError> {
-        self.ensure_proposition_type(&set_prop.predicate).await?;
+        self.ensure_proposition_type_for_kml(&set_prop.predicate, cached_pks)
+            .await?;
         self.validate_target_term_for_kml(&set_prop.object, handle_map, cached_pks)
             .await
     }
@@ -3998,7 +4186,8 @@ impl CognitiveNexus {
                 let id = EntityID::from_str(&id).map_err(KipError::invalid_syntax)?;
                 match id {
                     EntityID::Proposition(id, predicate) => {
-                        self.ensure_proposition_type(&predicate).await?;
+                        self.ensure_proposition_type_for_kml(&predicate, cached_pks)
+                            .await?;
                         if !self.propositions.contains(id) {
                             return Err(KipError::not_found(format!(
                                 "Proposition {} not found",
@@ -4025,7 +4214,8 @@ impl CognitiveNexus {
                         )));
                     }
                 };
-                self.ensure_proposition_type(&predicate).await?;
+                self.ensure_proposition_type_for_kml(&predicate, cached_pks)
+                    .await?;
 
                 let subject_id =
                     Box::pin(self.resolve_target_term(subject, handle_map, cached_pks)).await?;
@@ -5408,13 +5598,13 @@ mod tests {
             .execute_kml(parse_kml(unknown_predicate).unwrap(), true)
             .await
             .unwrap_err();
-        assert!(matches!(err.code, KipErrorCode::NotFound));
+        assert!(matches!(err.code, KipErrorCode::TypeMismatch));
 
         let err = nexus
             .execute_kml(parse_kml(unknown_predicate).unwrap(), false)
             .await
             .unwrap_err();
-        assert!(matches!(err.code, KipErrorCode::NotFound));
+        assert!(matches!(err.code, KipErrorCode::TypeMismatch));
         assert!(
             !nexus
                 .has_concept(&ConceptPK::Object {
@@ -5422,6 +5612,166 @@ mod tests {
                     name: "BadDrug".to_string(),
                 })
                 .await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_kml_upsert_preflight_prevents_partial_writes() {
+        let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+        setup_test_data(&nexus).await.unwrap();
+
+        let partial_write_kml = r#"
+        UPSERT {
+            CONCEPT ?partial {
+                {type: "Drug", name: "PartialDrug"}
+            }
+            PROPOSITION ?bad_fact {
+                (?partial, "not_registered", {type: "Symptom", name: "Headache"})
+            }
+        }
+        "#;
+
+        let err = nexus
+            .execute_kml(parse_kml(partial_write_kml).unwrap(), false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err.code, KipErrorCode::TypeMismatch));
+        assert!(
+            !nexus
+                .has_concept(&ConceptPK::Object {
+                    r#type: "Drug".to_string(),
+                    name: "PartialDrug".to_string(),
+                })
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_kml_upsert_preflight_accepts_schema_defined_earlier() {
+        let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+
+        let schema_and_data_kml = r#"
+        UPSERT {
+            CONCEPT ?source_type {
+                {type: "$ConceptType", name: "PreflightSource"}
+            }
+            CONCEPT ?target_type {
+                {type: "$ConceptType", name: "PreflightTarget"}
+            }
+            CONCEPT ?relation_type {
+                {type: "$PropositionType", name: "preflight_link"}
+            }
+            CONCEPT ?target {
+                {type: "PreflightTarget", name: "Target"}
+            }
+            CONCEPT ?source {
+                {type: "PreflightSource", name: "Source"}
+                SET PROPOSITIONS {
+                    ("preflight_link", ?target)
+                }
+            }
+        }
+        "#;
+
+        nexus
+            .execute_kml(parse_kml(schema_and_data_kml).unwrap(), false)
+            .await
+            .unwrap();
+
+        assert!(
+            nexus
+                .has_concept(&ConceptPK::Object {
+                    r#type: "PreflightSource".to_string(),
+                    name: "Source".to_string(),
+                })
+                .await
+        );
+
+        let (result, _) = nexus
+            .execute_kql(
+                parse_kql(
+                    r#"
+        FIND(?target.name)
+        WHERE {
+            (?source {type: "PreflightSource", name: "Source"}, "preflight_link", ?target)
+        }
+        "#,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, json!(["Target"]));
+    }
+
+    #[tokio::test]
+    async fn test_kml_core_directives_are_immutable() {
+        let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+        nexus
+            .execute_kml(parse_kml(PERSON_SELF_KIP).unwrap(), false)
+            .await
+            .unwrap();
+
+        let update_core = r#"
+        UPSERT {
+            CONCEPT ?self_actor {
+                {type: "Person", name: "$self"}
+                SET ATTRIBUTES {
+                    core_directives: []
+                }
+            }
+        }
+        "#;
+        let err = nexus
+            .execute_kml(parse_kml(update_core).unwrap(), false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err.code, KipErrorCode::ImmutableTarget));
+
+        let delete_core = r#"
+        DELETE ATTRIBUTES {"core_directives"} FROM ?self_actor
+        WHERE { ?self_actor {type: "Person", name: "$self"} }
+        "#;
+        let err = nexus
+            .execute_kml(parse_kml(delete_core).unwrap(), false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err.code, KipErrorCode::ImmutableTarget));
+        let err = nexus
+            .execute_kml(parse_kml(delete_core).unwrap(), true)
+            .await
+            .unwrap_err();
+        assert!(matches!(err.code, KipErrorCode::ImmutableTarget));
+
+        let update_persona = r#"
+        UPSERT {
+            CONCEPT ?self_actor {
+                {type: "Person", name: "$self"}
+                SET ATTRIBUTES {
+                    persona: "updated persona"
+                }
+            }
+        }
+        "#;
+        nexus
+            .execute_kml(parse_kml(update_persona).unwrap(), false)
+            .await
+            .unwrap();
+
+        let self_concept = nexus
+            .get_concept(&ConceptPK::Object {
+                r#type: PERSON_TYPE.to_string(),
+                name: META_SELF_NAME.to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(self_concept.attributes["persona"], json!("updated persona"));
+        assert!(
+            self_concept
+                .attributes
+                .get("core_directives")
+                .and_then(Json::as_array)
+                .is_some_and(|items| !items.is_empty())
         );
     }
 

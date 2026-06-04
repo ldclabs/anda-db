@@ -15,7 +15,7 @@
 //!   propositions (higher-order facts). Each row stores all of its
 //!   predicates in a single record to keep the link space compact.
 //!
-//! `CognitiveNexus` accepts the full KIP v1.0-RC6 grammar — KQL queries
+//! `CognitiveNexus` accepts the full KIP v1.0-RC7 grammar — KQL queries
 //! (`FIND … WHERE …`), KML mutations (`UPSERT`, `DELETE …`) and META
 //! introspection (`DESCRIBE …`, `SEARCH …`) — and translates them into
 //! Anda DB collection operations using a small, well-defined index plan
