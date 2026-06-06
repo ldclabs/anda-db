@@ -449,3 +449,251 @@ pub fn is_u64_type(ty: &Type) -> bool {
     }
     false
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use syn::parse_quote;
+
+    fn tokens(value: TokenStream) -> String {
+        value.to_string()
+    }
+
+    #[test]
+    fn find_rename_attr_handles_direct_directional_invalid_and_absent_attrs() {
+        let attrs: Vec<Attribute> = vec![parse_quote!(#[serde(default)])];
+        assert_eq!(find_rename_attr(&attrs), None);
+
+        let attrs: Vec<Attribute> = vec![parse_quote!(#[serde(rename = "wire_name")])];
+        assert_eq!(find_rename_attr(&attrs), Some("wire_name".to_string()));
+
+        let attrs: Vec<Attribute> =
+            vec![parse_quote!(#[serde(rename(serialize = "out", deserialize = "in"))])];
+        assert_eq!(find_rename_attr(&attrs), Some("out".to_string()));
+
+        let attrs: Vec<Attribute> = vec![parse_quote!(#[allow(dead_code)])];
+        assert_eq!(find_rename_attr(&attrs), None);
+    }
+
+    #[test]
+    fn find_field_type_attr_accepts_string_and_rejects_bad_forms() {
+        let attrs: Vec<Attribute> = vec![parse_quote!(#[field_type = "Map<Bytes, U64>"])];
+        let parsed = find_field_type_attr(&attrs).unwrap().unwrap();
+        let parsed = tokens(parsed);
+        assert!(parsed.contains("FieldType :: Map"));
+        assert!(parsed.contains("FieldKey :: from (b\"*\")"));
+
+        let attrs: Vec<Attribute> = vec![parse_quote!(#[serde(default)])];
+        assert!(find_field_type_attr(&attrs).unwrap().is_none());
+
+        let attrs: Vec<Attribute> = vec![parse_quote!(#[field_type("Text")])];
+        assert!(
+            find_field_type_attr(&attrs)
+                .unwrap_err()
+                .contains("must use the form")
+        );
+
+        let attrs: Vec<Attribute> = vec![parse_quote!(#[field_type = 7])];
+        assert!(
+            find_field_type_attr(&attrs)
+                .unwrap_err()
+                .contains("must be a string literal")
+        );
+    }
+
+    #[test]
+    fn parse_field_type_str_covers_primitives_nested_maps_and_errors() {
+        for (input, expected) in [
+            ("Bytes", "FieldType :: Bytes"),
+            ("Text", "FieldType :: Text"),
+            ("U64", "FieldType :: U64"),
+            ("I64", "FieldType :: I64"),
+            ("F64", "FieldType :: F64"),
+            ("F32", "FieldType :: F32"),
+            ("Bool", "FieldType :: Bool"),
+            ("Json", "FieldType :: Json"),
+            ("Vector", "FieldType :: Vector"),
+        ] {
+            assert_eq!(tokens(parse_field_type_str(input)), expected);
+        }
+
+        let array = tokens(parse_field_type_str("Array<Option<Text>>"));
+        assert!(array.contains("FieldType :: Array"));
+        assert!(array.contains("FieldType :: Option"));
+
+        let map = tokens(parse_field_type_str("Map<Text, Array<U64>>"));
+        assert!(map.contains("FieldKey :: from (\"*\")"));
+        assert!(map.contains("FieldType :: Array"));
+
+        let bad_map = tokens(parse_field_type_str("Map<Text>"));
+        assert!(bad_map.contains("compile_error"));
+        assert!(bad_map.contains("Invalid Map field type"));
+
+        let bad_key = tokens(parse_field_type_str("Map<U64, Text>"));
+        assert!(bad_key.contains("Unsupported Map key type"));
+
+        let bad_type = tokens(parse_field_type_str("Unsupported"));
+        assert!(bad_type.contains("Unsupported field type"));
+    }
+
+    #[test]
+    fn determine_field_type_covers_paths_collections_maps_and_errors() {
+        let ty: Type = parse_quote!(serde_json::Value);
+        assert_eq!(
+            tokens(determine_field_type(&ty).unwrap()),
+            "FieldType :: Json"
+        );
+
+        let ty: Type = parse_quote!(Option);
+        assert!(tokens(determine_field_type(&ty).unwrap()).contains("FieldType :: Json"));
+
+        let ty: Type = parse_quote!(Option<Vec<String>>);
+        let inferred = tokens(determine_field_type(&ty).unwrap());
+        assert!(inferred.contains("FieldType :: Option"));
+        assert!(inferred.contains("FieldType :: Array"));
+
+        for input in ["String", "str", "bool", "i32", "u32", "f32", "f64"] {
+            let ty: Type = syn::parse_str(input).unwrap();
+            assert!(tokens(determine_field_type(&ty).unwrap()).contains("FieldType"));
+        }
+
+        let ty: Type = parse_quote!(Vec<u8>);
+        assert_eq!(
+            tokens(determine_field_type(&ty).unwrap()),
+            "FieldType :: Bytes"
+        );
+
+        let ty: Type = parse_quote!(Vec<bf16>);
+        assert_eq!(
+            tokens(determine_field_type(&ty).unwrap()),
+            "FieldType :: Vector"
+        );
+
+        let ty: Type = parse_quote!(Vec<String>);
+        assert!(tokens(determine_field_type(&ty).unwrap()).contains("FieldType :: Array"));
+
+        let ty: Type = parse_quote!(Vec);
+        assert!(
+            determine_field_type(&ty)
+                .unwrap_err()
+                .contains("Unable to determine Vec element type")
+        );
+
+        let ty: Type = parse_quote!(BTreeMap<String, Vec<u8>>);
+        let inferred = tokens(determine_field_type(&ty).unwrap());
+        assert!(inferred.contains("FieldKey :: from (\"*\")"));
+        assert!(inferred.contains("FieldType :: Bytes"));
+
+        let ty: Type = parse_quote!(HashMap<Vec<u8>, String>);
+        assert!(tokens(determine_field_type(&ty).unwrap()).contains("FieldKey :: from (b\"*\")"));
+
+        let ty: Type = parse_quote!(HashMap<[u8; 4], String>);
+        assert!(
+            determine_field_type(&ty)
+                .unwrap_err()
+                .contains("Map key type must be String or bytes")
+        );
+
+        let ty: Type = parse_quote!(HashMap<String>);
+        assert!(
+            determine_field_type(&ty)
+                .unwrap_err()
+                .contains("Invalid map type")
+        );
+
+        let ty: Type = parse_quote!(serde_bytes::ByteBuf);
+        assert_eq!(
+            tokens(determine_field_type(&ty).unwrap()),
+            "FieldType :: Bytes"
+        );
+
+        let ty: Type = parse_quote!(CustomType);
+        assert_eq!(
+            tokens(determine_field_type(&ty).unwrap()),
+            "CustomType :: field_type ()"
+        );
+
+        let ty: Type = parse_quote!(half::bf16);
+        assert!(
+            determine_field_type(&ty)
+                .unwrap_err()
+                .contains("Standalone `bf16`")
+        );
+
+        let ty: Type = parse_quote!(bf16);
+        assert!(
+            determine_field_type(&ty)
+                .unwrap_err()
+                .contains("Standalone `bf16`")
+        );
+    }
+
+    #[test]
+    fn determine_field_type_covers_references_slices_arrays_and_unsupported() {
+        let ty: Type = parse_quote!(&String);
+        assert_eq!(
+            tokens(determine_field_type(&ty).unwrap()),
+            "FieldType :: Text"
+        );
+
+        let ty: Type = syn::parse_str("[u8]").unwrap();
+        assert_eq!(
+            tokens(determine_field_type(&ty).unwrap()),
+            "FieldType :: Bytes"
+        );
+
+        let ty: Type = syn::parse_str("[bf16]").unwrap();
+        assert_eq!(
+            tokens(determine_field_type(&ty).unwrap()),
+            "FieldType :: Vector"
+        );
+
+        let ty: Type = syn::parse_str("[String]").unwrap();
+        assert!(tokens(determine_field_type(&ty).unwrap()).contains("FieldType :: Array"));
+
+        let ty: Type = parse_quote!([u8; 16]);
+        assert_eq!(
+            tokens(determine_field_type(&ty).unwrap()),
+            "FieldType :: Bytes"
+        );
+
+        let ty: Type = parse_quote!([bf16; 3]);
+        assert_eq!(
+            tokens(determine_field_type(&ty).unwrap()),
+            "FieldType :: Vector"
+        );
+
+        let ty: Type = parse_quote!([String; 2]);
+        assert!(tokens(determine_field_type(&ty).unwrap()).contains("FieldType :: Array"));
+
+        let ty: Type = parse_quote!((u64, u64));
+        assert!(
+            determine_field_type(&ty)
+                .unwrap_err()
+                .contains("Unsupported type")
+        );
+    }
+
+    #[test]
+    fn primitive_type_helpers_cover_true_and_false_cases() {
+        let u8_ty: Type = parse_quote!(u8);
+        let u64_ty: Type = parse_quote!(u64);
+        let string_ty: Type = parse_quote!(String);
+        let vec_u8_ty: Type = parse_quote!(Vec<u8>);
+        let bytes_ty: Type = parse_quote!(ByteBufB64);
+        let bf16_ty: Type = parse_quote!(bf16);
+        let tuple_ty: Type = parse_quote!((u8, u8));
+
+        assert!(is_u8_type(&u8_ty));
+        assert!(!is_u8_type(&u64_ty));
+        assert!(is_u64_type(&u64_ty));
+        assert!(!is_u64_type(&u8_ty));
+        assert!(is_string_type(&string_ty));
+        assert!(!is_string_type(&u8_ty));
+        assert!(is_bytes_type(&vec_u8_ty));
+        assert!(is_bytes_type(&bytes_ty));
+        assert!(!is_bytes_type(&tuple_ty));
+        assert!(is_bf16_type(&bf16_ty));
+        assert!(!is_bf16_type(&string_ty));
+    }
+}

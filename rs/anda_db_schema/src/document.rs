@@ -672,4 +672,51 @@ mod tests {
         let result = Document::try_from(schema.clone(), &test_user_wrong_type);
         assert!(result.is_err());
     }
+
+    #[test]
+    fn document_error_paths_and_optional_defaults_are_exercised() {
+        struct FailingSerialize;
+
+        impl Serialize for FailingSerialize {
+            fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                Err(serde::ser::Error::custom("boom"))
+            }
+        }
+
+        let schema = Arc::new(TestUser::schema().unwrap());
+
+        let err = Document::try_from(schema.clone(), &FailingSerialize).unwrap_err();
+        assert!(err.to_string().contains("failed to serialize document"));
+
+        let numeric_key = BTreeMap::from([(1u64, 2u64)]);
+        let err = Document::try_from(schema.clone(), &numeric_key).unwrap_err();
+        assert!(err.to_string().contains("expected CBOR text value"));
+
+        let tuple_doc = ("not", "a map");
+        let err = Document::try_from(schema.clone(), &tuple_doc).unwrap_err();
+        assert!(err.to_string().contains("expected CBOR map value"));
+
+        let mut doc = Document::new(schema.clone());
+        doc.set_id(7);
+        doc.set_field("age", Fv::U64(42)).unwrap();
+        assert!(doc.get_field_or_err("name").is_err());
+        assert!(doc.get_field_or_err("missing").is_err());
+        assert!(doc.get_field_as::<String>("name").is_err());
+        assert!(doc.get_field_as::<String>("missing").is_err());
+        assert_eq!(doc.remove_field("missing"), None);
+        assert!(doc.clone().try_into::<TestUser>().is_err());
+
+        doc.set_field("name", Fv::Text("Ada".to_string())).unwrap();
+        let user = doc.try_into::<TestUser>().unwrap();
+        assert_eq!(user._id, 7);
+        assert_eq!(user.name, "Ada");
+        assert_eq!(user.age, 42);
+        assert_eq!(user.active, None);
+        assert_eq!(user.tags, None);
+        assert_eq!(user.meta, None);
+        assert_eq!(user.picture, None);
+    }
 }

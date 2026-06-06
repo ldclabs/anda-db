@@ -462,3 +462,211 @@ pub struct GraphPath {
     /// Useful for path length comparisons and shortest path algorithms.
     pub hops: u16,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn concept_ref(id: u64) -> EntityID {
+        EntityID::Concept(id)
+    }
+
+    #[test]
+    fn concept_pk_display_and_try_from_matcher_cover_success_and_errors() {
+        let by_id = ConceptPK::ID(7);
+        assert_eq!(by_id.to_string(), "{id: Concept(7)}");
+
+        let by_object = ConceptPK::Object {
+            r#type: "Person".to_string(),
+            name: "Ada".to_string(),
+        };
+        assert_eq!(by_object.to_string(), r#"{type: "Person", name: "Ada"}"#);
+
+        assert_eq!(
+            ConceptPK::try_from(ConceptMatcher::ID("C:7".to_string())).unwrap(),
+            by_id
+        );
+        assert_eq!(
+            ConceptPK::try_from(ConceptMatcher::Object {
+                r#type: "Person".to_string(),
+                name: "Ada".to_string(),
+            })
+            .unwrap(),
+            by_object
+        );
+
+        assert!(ConceptPK::try_from(ConceptMatcher::ID("P:1:likes".to_string())).is_err());
+        assert!(ConceptPK::try_from(ConceptMatcher::Type("Person".to_string())).is_err());
+        assert!(ConceptPK::try_from(ConceptMatcher::ID("bad-id".to_string())).is_err());
+    }
+
+    #[test]
+    fn proposition_and_entity_pk_conversions_cover_nested_targets() {
+        let proposition = PropositionPK::ID(9, "likes".to_string());
+        assert_eq!(proposition.to_string(), r#"(id: Proposition(9, "likes"))"#);
+        assert_eq!(
+            PropositionPK::try_from(PropositionMatcher::ID("P:9:likes".to_string())).unwrap(),
+            proposition
+        );
+
+        let matcher = PropositionMatcher::Object {
+            subject: TargetTerm::Concept {
+                variable: Some("s".to_string()),
+                matcher: ConceptMatcher::Object {
+                    r#type: "Person".to_string(),
+                    name: "Ada".to_string(),
+                },
+            },
+            predicate: PredTerm::Literal("likes".to_string()),
+            object: TargetTerm::Concept {
+                variable: None,
+                matcher: ConceptMatcher::ID("C:2".to_string()),
+            },
+        };
+        let object_pk = PropositionPK::try_from(matcher).unwrap();
+        assert_eq!(
+            object_pk.to_string(),
+            r#"({type: "Person", name: "Ada"}, "likes", {id: Concept(2)})"#
+        );
+
+        assert!(PropositionPK::try_from(PropositionMatcher::ID("C:9".to_string())).is_err());
+        assert!(
+            PropositionPK::try_from(PropositionMatcher::Object {
+                subject: TargetTerm::Variable("s".to_string()),
+                predicate: PredTerm::Variable("p".to_string()),
+                object: TargetTerm::Concept {
+                    variable: None,
+                    matcher: ConceptMatcher::ID("C:1".to_string()),
+                },
+            })
+            .is_err()
+        );
+
+        assert_eq!(
+            EntityPK::try_from(TargetTerm::Concept {
+                variable: None,
+                matcher: ConceptMatcher::ID("C:7".to_string()),
+            })
+            .unwrap(),
+            EntityPK::Concept(ConceptPK::ID(7))
+        );
+        assert_eq!(
+            EntityPK::try_from(TargetTerm::Proposition {
+                variable: None,
+                matcher: Box::new(PropositionMatcher::ID("P:9:likes".to_string())),
+            })
+            .unwrap(),
+            EntityPK::Proposition(PropositionPK::ID(9, "likes".to_string()))
+        );
+        assert!(EntityPK::try_from(TargetTerm::Variable("x".to_string())).is_err());
+
+        assert_eq!(
+            EntityPK::from(EntityID::Proposition(9, "likes".to_string())),
+            EntityPK::Proposition(PropositionPK::ID(9, "likes".to_string()))
+        );
+    }
+
+    #[test]
+    fn proposition_match_result_deduplicates_and_keeps_rows() {
+        let mut result = PropositionsMatchResult::default();
+        result.add_match(
+            concept_ref(1),
+            concept_ref(2),
+            vec!["likes".to_string(), "knows".to_string()],
+            10,
+        );
+        result.add_match(
+            concept_ref(1),
+            concept_ref(2),
+            vec!["likes".to_string()],
+            10,
+        );
+
+        assert_eq!(result.matched_subjects.len(), 1);
+        assert_eq!(result.matched_objects.len(), 1);
+        assert_eq!(result.matched_predicates.len(), 2);
+        assert_eq!(result.matched_propositions.len(), 2);
+        assert_eq!(result.rows.len(), 3);
+        assert_eq!(
+            result
+                .subject_to_objects
+                .get(&concept_ref(1))
+                .unwrap()
+                .to_vec(),
+            vec![concept_ref(2)]
+        );
+        assert_eq!(
+            result
+                .object_to_subjects
+                .get(&concept_ref(2))
+                .unwrap()
+                .to_vec(),
+            vec![concept_ref(1)]
+        );
+    }
+
+    #[test]
+    fn query_context_cache_relation_and_target_structs_are_exercised() {
+        let ctx = QueryContext::default();
+        ctx.cache.concepts.write().insert(
+            1,
+            Concept {
+                _id: 1,
+                r#type: "Person".to_string(),
+                name: "Ada".to_string(),
+                attributes: Map::from_iter([("age".to_string(), json!(42))]),
+                metadata: Map::new(),
+            },
+        );
+        ctx.cache.propositions.write().insert(
+            2,
+            Proposition {
+                _id: 2,
+                subject: concept_ref(1),
+                object: concept_ref(3),
+                predicates: BTreeSet::from(["likes".to_string()]),
+                properties: BTreeMap::new(),
+            },
+        );
+
+        assert_eq!(ctx.cache.concepts.read().get(&1).unwrap().name, "Ada");
+        assert_eq!(
+            ctx.cache.propositions.read().get(&2).unwrap().subject,
+            concept_ref(1)
+        );
+
+        let row = QueryRelationRow {
+            proposition: EntityID::Proposition(2, "likes".to_string()),
+            subject: concept_ref(1),
+            predicate: "likes".to_string(),
+            object: concept_ref(3),
+        };
+        let binding = QueryRelationBinding {
+            proposition_var: Some("p".to_string()),
+            subject_var: Some("s".to_string()),
+            predicate_var: Some("pred".to_string()),
+            object_var: Some("o".to_string()),
+            rows: vec![row.clone()],
+        };
+        assert_eq!(binding.rows[0].predicate, row.predicate);
+
+        let targets = [
+            TargetEntities::Any,
+            TargetEntities::AnyPropositions,
+            TargetEntities::IDs(vec![concept_ref(1)]),
+        ];
+        assert!(matches!(targets[0], TargetEntities::Any));
+        assert!(matches!(targets[1], TargetEntities::AnyPropositions));
+        assert!(matches!(&targets[2], TargetEntities::IDs(ids) if ids == &vec![concept_ref(1)]));
+
+        let path = GraphPath {
+            start: concept_ref(1),
+            end: concept_ref(3),
+            propositions: vec![EntityID::Proposition(2, "likes".to_string())].into(),
+            hops: 1,
+        };
+        assert_eq!(path.hops, path.propositions.len() as u16);
+    }
+}

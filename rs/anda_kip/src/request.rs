@@ -1083,6 +1083,85 @@ mod tests {
     }
 
     #[test]
+    fn request_readonly_builder_sets_flag_and_chains() {
+        let mut request = Request {
+            command: "DESCRIBE PRIMER".to_string(),
+            ..Default::default()
+        };
+
+        let same = request.readonly();
+        same.dry_run = true;
+
+        assert!(request.readonly);
+        assert!(request.dry_run);
+    }
+
+    #[test]
+    fn response_into_result_and_from_result_cover_ok_and_error_paths() {
+        assert_eq!(
+            Response::ok(json!({"ok": true})).into_result().unwrap(),
+            json!({"ok": true})
+        );
+
+        let err = Response::err("failed".to_string())
+            .into_result()
+            .unwrap_err();
+        assert_eq!(err.code, "KIP_4003");
+        assert_eq!(err.message, "failed");
+
+        let ok_with_cursor: Response =
+            Result::<(Json, Option<String>), KipError>::Ok((json!([1, 2]), Some("c1".to_string())))
+                .into();
+        assert_eq!(
+            ok_with_cursor,
+            Response::Ok {
+                result: json!([1, 2]),
+                next_cursor: Some("c1".to_string())
+            }
+        );
+
+        let err_with_cursor: Response =
+            Result::<(Json, Option<String>), KipError>::Err(KipError::not_found("missing")).into();
+        assert!(
+            matches!(err_with_cursor, Response::Err { ref error, .. } if error.code == "KIP_3002")
+        );
+
+        let ok_plain: Response = Result::<Json, KipError>::Ok(json!("plain")).into();
+        assert_eq!(ok_plain, Response::ok(json!("plain")));
+
+        let err_plain: Response =
+            Result::<Json, KipError>::Err(KipError::invalid_syntax("bad")).into();
+        assert!(matches!(err_plain, Response::Err { ref error, .. } if error.code == "KIP_1001"));
+    }
+
+    #[test]
+    fn error_object_conversions_and_display_cover_all_branches() {
+        let from_string = ErrorObject::from("boom".to_string());
+        assert_eq!(from_string.code, "KIP_4003");
+        assert!(from_string.to_string().contains("Hint:"));
+
+        let json_error = serde_json::from_str::<Json>("{not json").unwrap_err();
+        let from_json = ErrorObject::from(json_error);
+        assert_eq!(from_json.code, "KIP_1001");
+        assert!(from_json.hint.unwrap().contains("JSON"));
+
+        let from_kip = ErrorObject::from(KipError::duplicate_exists("exists"));
+        assert_eq!(from_kip.code, "KIP_3003");
+        assert!(!from_kip.hint.unwrap().is_empty());
+
+        let without_hint = ErrorObject {
+            code: "KIP_TEST".to_string(),
+            message: "message".to_string(),
+            hint: None,
+            data: None,
+        };
+        assert_eq!(without_hint.to_string(), "[KIP_TEST] message");
+
+        let response: Response = KipError::not_found("missing").into();
+        assert!(matches!(response, Response::Err { ref error, .. } if error.code == "KIP_3002"));
+    }
+
+    #[test]
     fn test_command_item_deserialization() {
         // Test simple string command
         let simple: CommandItem = serde_json::from_str(r#""DESCRIBE PRIMER""#).unwrap();
@@ -1499,6 +1578,26 @@ mod tests {
                 assert_eq!(result["type"], "meta");
             }
             _ => panic!("Expected Ok response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_readonly_single_rejects_kml_after_builder() {
+        let executor = MockExecutor;
+        let mut request = Request {
+            command: r#"UPSERT { CONCEPT ?d { {type: "Drug", name: "Aspirin"} } }"#.to_string(),
+            ..Default::default()
+        };
+        request.readonly();
+
+        let (cmd_type, response) = request.execute(&executor).await;
+        assert_eq!(cmd_type, CommandType::Kml);
+        match response {
+            Response::Err { error, .. } => {
+                assert_eq!(error.code, "KIP_1001");
+                assert!(error.message.contains("read-only"));
+            }
+            _ => panic!("Expected readonly KML rejection"),
         }
     }
 

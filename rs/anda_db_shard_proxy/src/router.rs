@@ -27,10 +27,10 @@ impl DbShardExtractor for PrefixExtractor {
         // Fall back to extracting from path: prefix{db_name}/...
         if let Some(path) = uri.path().strip_prefix(&self.prefix)
             && let Some(db_name) = path.split('/').next()
-                && !db_name.is_empty()
-            {
-                return (None, Some(db_name.to_string()));
-            }
+            && !db_name.is_empty()
+        {
+            return (None, Some(db_name.to_string()));
+        }
 
         (None, None)
     }

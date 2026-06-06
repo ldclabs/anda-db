@@ -835,6 +835,8 @@ mod tests {
     use ciborium::into_writer;
     use ciborium::tag::{Accepted, Captured, Required};
     use serde::Serialize;
+    use serde::Serializer as _;
+    use serde::ser::{SerializeMap, SerializeSeq};
     use serde_bytes::{ByteArray, ByteBuf, Bytes};
     use std::collections::BTreeMap;
 
@@ -863,6 +865,12 @@ mod tests {
     struct N(u64);
 
     #[derive(Debug, Serialize)]
+    struct PairStruct(u8, u16);
+
+    #[derive(Debug, Serialize)]
+    struct EmptyUnit;
+
+    #[derive(Debug, Serialize)]
     enum E {
         A,
         B(u32),
@@ -872,6 +880,11 @@ mod tests {
     #[derive(Debug, Serialize)]
     enum NE {
         V(u64),
+    }
+
+    #[derive(Debug, Serialize)]
+    enum TupleVariant {
+        Pair(u8, u16),
     }
 
     struct BinaryAware;
@@ -889,6 +902,23 @@ mod tests {
         }
     }
 
+    struct CollectStrValue;
+
+    impl std::fmt::Display for CollectStrValue {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "collect-me")
+        }
+    }
+
+    impl Serialize for CollectStrValue {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            serializer.collect_str(self)
+        }
+    }
+
     struct FailingSerialize;
 
     impl Serialize for FailingSerialize {
@@ -897,6 +927,34 @@ mod tests {
             S: serde::Serializer,
         {
             Err(serde::ser::Error::custom("intentional failure"))
+        }
+    }
+
+    struct IndefiniteSeq;
+
+    impl Serialize for IndefiniteSeq {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            let mut seq = serializer.serialize_seq(None)?;
+            seq.serialize_element(&1u8)?;
+            seq.serialize_element(&2u8)?;
+            seq.end()
+        }
+    }
+
+    struct IndefiniteMap;
+
+    impl Serialize for IndefiniteMap {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            let mut map = serializer.serialize_map(None)?;
+            map.serialize_entry("a", &1u8)?;
+            map.serialize_entry("b", &2u8)?;
+            map.end()
         }
     }
 
@@ -935,6 +993,28 @@ mod tests {
             i64::MAX,
         ] {
             assert_estimate_eq(&format!("i64:{v}"), &v);
+        }
+
+        for &v in &[0i8, 7i8, -7i8] {
+            assert_estimate_eq(&format!("i8:{v}"), &v);
+        }
+        for &v in &[0i16, 700i16, -700i16] {
+            assert_estimate_eq(&format!("i16:{v}"), &v);
+        }
+        for &v in &[0i32, 70_000i32, -70_000i32] {
+            assert_estimate_eq(&format!("i32:{v}"), &v);
+        }
+        for &v in &[0u8, 7u8, u8::MAX] {
+            assert_estimate_eq(&format!("u8:{v}"), &v);
+        }
+        for &v in &[0u16, 700u16, u16::MAX] {
+            assert_estimate_eq(&format!("u16:{v}"), &v);
+        }
+        for &v in &[0u32, 70_000u32, u32::MAX] {
+            assert_estimate_eq(&format!("u32:{v}"), &v);
+        }
+        for &v in &[0i128, i64::MAX as i128, i64::MIN as i128] {
+            assert_estimate_eq(&format!("i128-small:{v}"), &v);
         }
 
         // f32/f64（覆盖 f16/f32/f64 三种编码宽度以及非有限值）
@@ -1016,6 +1096,9 @@ mod tests {
         let t = (1u8, "hi".to_string(), 3u64);
         assert_estimate_eq("tuple(u8,String,u64)", &t);
 
+        let pair = PairStruct(1, 700);
+        assert_estimate_eq("tuple struct PairStruct", &pair);
+
         // Map（使用 BTreeMap 以固定顺序）
         let mut m: BTreeMap<String, u64> = BTreeMap::new();
         m.insert("a".into(), 1);
@@ -1048,6 +1131,12 @@ mod tests {
         // newtype variant
         let ne = NE::V(888);
         assert_estimate_eq("enum NE::V(u64)", &ne);
+
+        let tuple_variant = TupleVariant::Pair(1, 700);
+        assert_estimate_eq("tuple variant Pair", &tuple_variant);
+
+        let unit = EmptyUnit;
+        assert_estimate_eq("unit struct", &unit);
     }
 
     #[test]
@@ -1068,6 +1157,7 @@ mod tests {
     #[test]
     fn test_cbor_size_matches_binary_serializer_mode() {
         assert_estimate_eq("binary-aware serialize", &BinaryAware);
+        assert_estimate_eq("collect_str serialize", &CollectStrValue);
     }
 
     #[test]
@@ -1087,5 +1177,67 @@ mod tests {
     fn test_try_cbor_size_propagates_serialize_errors() {
         let err = try_estimate_cbor_size(&FailingSerialize).unwrap_err();
         assert_eq!(err.to_string(), "intentional failure");
+    }
+
+    #[test]
+    fn test_indefinite_sequence_and_map_match_ciborium() {
+        assert_estimate_eq("indefinite sequence", &IndefiniteSeq);
+        assert_estimate_eq("indefinite map", &IndefiniteMap);
+    }
+
+    #[test]
+    fn test_cbor_sizer_overflow_error() {
+        let mut sizer = CborSizer { count: usize::MAX };
+        let err = sizer.add_count(1).unwrap_err();
+        assert_eq!(err.to_string(), "CBOR size exceeds usize::MAX");
+    }
+
+    #[test]
+    fn test_tag_serializer_accepts_only_unsigned_integer_tags() {
+        assert_eq!(TagSerializer.serialize_u8(7).unwrap(), 7);
+        assert_eq!(TagSerializer.serialize_u16(8).unwrap(), 8);
+        assert_eq!(TagSerializer.serialize_u32(9).unwrap(), 9);
+        assert_eq!(TagSerializer.serialize_u64(10).unwrap(), 10);
+
+        assert!(TagSerializer.serialize_bool(true).is_err());
+        assert!(TagSerializer.serialize_i8(1).is_err());
+        assert!(TagSerializer.serialize_i16(1).is_err());
+        assert!(TagSerializer.serialize_i32(1).is_err());
+        assert!(TagSerializer.serialize_i64(1).is_err());
+        assert!(TagSerializer.serialize_i128(1).is_err());
+        assert!(TagSerializer.serialize_u128(1).is_err());
+        assert!(TagSerializer.serialize_f32(1.0).is_err());
+        assert!(TagSerializer.serialize_f64(1.0).is_err());
+        assert!(TagSerializer.serialize_char('x').is_err());
+        assert!(TagSerializer.serialize_str("x").is_err());
+        assert!(TagSerializer.serialize_bytes(&[1]).is_err());
+        assert!(TagSerializer.serialize_none().is_err());
+        assert!(TagSerializer.serialize_some(&1u8).is_err());
+        assert!(TagSerializer.serialize_unit().is_err());
+        assert!(TagSerializer.serialize_unit_struct("Unit").is_err());
+        assert!(TagSerializer.serialize_unit_variant("E", 0, "A").is_err());
+        assert!(TagSerializer.serialize_newtype_struct("N", &1u8).is_err());
+        assert!(
+            TagSerializer
+                .serialize_newtype_variant("E", 0, "N", &1u8)
+                .is_err()
+        );
+        assert!(TagSerializer.serialize_seq(Some(1)).is_err());
+        assert!(TagSerializer.serialize_tuple(1).is_err());
+        assert!(TagSerializer.serialize_tuple_struct("T", 1).is_err());
+        assert!(
+            TagSerializer
+                .serialize_tuple_variant("E", 0, "T", 1)
+                .is_err()
+        );
+        assert!(TagSerializer.serialize_map(Some(1)).is_err());
+        assert!(TagSerializer.serialize_struct("S", 1).is_err());
+        assert!(
+            TagSerializer
+                .serialize_struct_variant("E", 0, "S", 1)
+                .is_err()
+        );
+        assert!(TagSerializer.collect_str(&"display").is_err());
+        assert!(!TagSerializer.is_human_readable());
     }
 }

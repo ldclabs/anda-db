@@ -1189,6 +1189,55 @@ mod tests {
 
     const NON_EXISTENT_NAME: &str = "nonexistentname";
 
+    #[test]
+    fn builder_custom_cache_and_display_debug_are_exercised() {
+        let cache = Cache::builder().max_capacity(1).build();
+        let storage = EncryptedStoreBuilder::with_secret(InMemory::new(), 100, [0u8; 32])
+            .with_meta_cache(cache)
+            .build();
+
+        assert!(format!("{storage}").contains("EncryptedStore"));
+        assert!(format!("{storage:?}").contains("EncryptedStore"));
+
+        let location = Path::from("nested/object");
+        assert_eq!(
+            storage.inner.full_path(&location).to_string(),
+            "data/nested/object"
+        );
+        assert_eq!(
+            storage.inner.meta_path(&location).to_string(),
+            "meta/nested/object"
+        );
+        assert_eq!(
+            storage
+                .inner
+                .strip_prefix(Path::from("data/nested/object"))
+                .to_string(),
+            "nested/object"
+        );
+        assert_eq!(
+            storage
+                .inner
+                .strip_prefix(Path::from("other/nested/object"))
+                .to_string(),
+            "other/nested/object"
+        );
+        assert_eq!(
+            storage
+                .inner
+                .strip_meta_prefix(Path::from("meta/nested/object"))
+                .to_string(),
+            "nested/object"
+        );
+        assert_eq!(
+            storage
+                .inner
+                .strip_meta_prefix(Path::from("data/nested/object"))
+                .to_string(),
+            "data/nested/object"
+        );
+    }
+
     #[tokio::test]
     async fn test_with_memory() {
         let storage = EncryptedStoreBuilder::with_secret(InMemory::new(), 10000, [0u8; 32]).build();

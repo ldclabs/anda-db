@@ -1,4 +1,5 @@
 use proc_macro::TokenStream;
+use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::{Data, DeriveInput, Fields, ext::IdentExt, parse_macro_input};
 
@@ -17,6 +18,10 @@ use crate::common::{determine_field_type, find_field_type_attr, find_rename_attr
 pub fn field_typed_derive(input: TokenStream) -> TokenStream {
     // Parse the input tokens into a syntax tree.
     let input = parse_macro_input!(input as DeriveInput);
+    TokenStream::from(expand_field_typed_derive(input))
+}
+
+pub(crate) fn expand_field_typed_derive(input: DeriveInput) -> TokenStream2 {
     let name = &input.ident.unraw();
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
 
@@ -25,15 +30,15 @@ pub fn field_typed_derive(input: TokenStream) -> TokenStream {
         match &data_struct.fields {
             Fields::Named(fields_named) => &fields_named.named,
             _ => {
-                return TokenStream::from(quote! {
+                return quote! {
                     compile_error!("FieldTyped only supports structs with named fields");
-                });
+                };
             }
         }
     } else {
-        return TokenStream::from(quote! {
+        return quote! {
             compile_error!("FieldTyped only supports structs");
-        });
+        };
     };
 
     // For each field, emit a `("name".into(), <FieldType>)` tuple that will be
@@ -89,5 +94,74 @@ pub fn field_typed_derive(input: TokenStream) -> TokenStream {
         }
     };
 
-    TokenStream::from(expanded)
+    expanded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use syn::parse_quote;
+
+    fn tokens(input: TokenStream2) -> String {
+        input.to_string()
+    }
+
+    #[test]
+    fn expand_field_typed_generates_map_for_named_structs() {
+        let input: DeriveInput = parse_quote! {
+            struct User<T>
+            where
+                T: Clone
+            {
+                #[serde(rename = "displayName")]
+                name: String,
+                #[field_type = "Option<Array<Text>>"]
+                tags: Vec<String>,
+                nested: T,
+            }
+        };
+
+        let expanded = tokens(expand_field_typed_derive(input));
+        assert!(expanded.contains("impl < T > User < T > where T : Clone"));
+        assert!(expanded.contains("\"displayName\""));
+        assert!(expanded.contains("FieldType :: Option"));
+        assert!(expanded.contains("FieldType :: Array"));
+        assert!(expanded.contains("T :: field_type ()"));
+    }
+
+    #[test]
+    fn expand_field_typed_rejects_unsupported_inputs_and_bad_fields() {
+        let tuple_struct: DeriveInput = parse_quote!(
+            struct Tuple(String);
+        );
+        assert!(
+            tokens(expand_field_typed_derive(tuple_struct))
+                .contains("FieldTyped only supports structs with named fields")
+        );
+
+        let enum_input: DeriveInput = parse_quote!(
+            enum Choice {
+                A,
+            }
+        );
+        assert!(
+            tokens(expand_field_typed_derive(enum_input))
+                .contains("FieldTyped only supports structs")
+        );
+
+        let bad_attr: DeriveInput = parse_quote! {
+            struct BadAttr {
+                #[field_type(Text)]
+                value: String,
+            }
+        };
+        assert!(tokens(expand_field_typed_derive(bad_attr)).contains("field_type"));
+
+        let bad_type: DeriveInput = parse_quote! {
+            struct BadType {
+                value: (u64, u64),
+            }
+        };
+        assert!(tokens(expand_field_typed_derive(bad_type)).contains("Unsupported type"));
+    }
 }

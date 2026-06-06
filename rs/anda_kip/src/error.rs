@@ -839,7 +839,9 @@ fn take_first_chars(s: &str, n: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::parse_kip;
+    use nom::Needed;
 
     fn parse_error_message(input: &str) -> String {
         parse_kip(input).unwrap_err().message
@@ -876,5 +878,269 @@ mod tests {
         );
 
         assert!(message.contains("FILTER equality uses `==`, not `=`"));
+    }
+
+    #[test]
+    fn kip_error_code_table_and_constructors_are_consistent() {
+        let cases = [
+            (KipErrorCode::InvalidSyntax, "KIP_1001", "InvalidSyntax"),
+            (
+                KipErrorCode::InvalidIdentifier,
+                "KIP_1002",
+                "InvalidIdentifier",
+            ),
+            (KipErrorCode::TypeMismatch, "KIP_2001", "TypeMismatch"),
+            (
+                KipErrorCode::ConstraintViolation,
+                "KIP_2002",
+                "ConstraintViolation",
+            ),
+            (
+                KipErrorCode::InvalidValueType,
+                "KIP_2003",
+                "InvalidValueType",
+            ),
+            (KipErrorCode::ReferenceError, "KIP_3001", "ReferenceError"),
+            (KipErrorCode::NotFound, "KIP_3002", "NotFound"),
+            (KipErrorCode::DuplicateExists, "KIP_3003", "DuplicateExists"),
+            (KipErrorCode::ImmutableTarget, "KIP_3004", "ImmutableTarget"),
+            (
+                KipErrorCode::ExecutionTimeout,
+                "KIP_4001",
+                "ExecutionTimeout",
+            ),
+            (
+                KipErrorCode::ResourceExhausted,
+                "KIP_4002",
+                "ResourceExhausted",
+            ),
+            (KipErrorCode::InternalError, "KIP_4003", "InternalError"),
+        ];
+
+        for (code, code_str, name) in cases {
+            assert_eq!(code.code(), code_str);
+            assert_eq!(code.name(), name);
+            assert_eq!(code.to_string(), code_str);
+            assert!(!code.hint().is_empty());
+        }
+
+        let constructors = [
+            KipError::invalid_syntax("bad"),
+            KipError::invalid_identifier("bad"),
+            KipError::type_mismatch("bad"),
+            KipError::constraint_violation("bad"),
+            KipError::invalid_value_type("bad"),
+            KipError::reference_error("bad"),
+            KipError::not_found("bad"),
+            KipError::duplicate_exists("bad"),
+            KipError::immutable_target("bad"),
+            KipError::execution_timeout("bad"),
+            KipError::resource_exhausted("bad"),
+            KipError::internal_error("bad"),
+        ];
+        for (err, (code, _, name)) in constructors.into_iter().zip(cases) {
+            assert_eq!(err.code, code);
+            assert_eq!(err.code_str(), code.code());
+            assert_eq!(err.name(), name);
+            assert_eq!(err.hint(), code.hint());
+            assert!(err.to_string().contains("bad"));
+        }
+    }
+
+    #[test]
+    fn format_nom_error_handles_incomplete_and_verbose_error_kinds() {
+        let incomplete = format_nom_error("FIND(", nom::Err::Incomplete(Needed::Unknown));
+        assert_eq!(incomplete.code, KipErrorCode::InvalidSyntax);
+        assert!(incomplete.message.contains("Parse incomplete"));
+
+        let input = "FIND(?x) WHERE {\n  ?x {type: 1}\n}";
+        let type_slice = &input[24..];
+        let verbose = VerboseError {
+            errors: vec![
+                (input, VerboseErrorKind::Context("WHERE { ... }")),
+                (type_slice, VerboseErrorKind::Char('"')),
+            ],
+        };
+        let formatted = format_nom_error(input, nom::Err::Error(verbose));
+        assert!(formatted.message.contains("Parsing context"));
+        assert!(formatted.message.contains("Expected '\"'"));
+        assert!(formatted.message.contains("Expected here"));
+        assert!(formatted.message.contains("Location: line 2"));
+        assert!(formatted.message.contains("Context:"));
+
+        let alpha = format_verbose_error(
+            "!",
+            VerboseError {
+                errors: vec![("!", VerboseErrorKind::Nom(nom::error::ErrorKind::Alpha))],
+            },
+        );
+        assert!(alpha.contains("Expected a letter"));
+
+        let eof = format_verbose_error(
+            "FIND(?x) trailing",
+            VerboseError {
+                errors: vec![(
+                    " trailing",
+                    VerboseErrorKind::Nom(nom::error::ErrorKind::Eof),
+                )],
+            },
+        );
+        assert!(eof.contains("Unexpected trailing content"));
+
+        let validation = format_verbose_error(
+            "FIND(?x)",
+            VerboseError {
+                errors: vec![("", VerboseErrorKind::Nom(nom::error::ErrorKind::Verify))],
+            },
+        );
+        assert!(validation.contains("Validation check failed"));
+
+        let conversion = format_verbose_error(
+            "FIND(?x)",
+            VerboseError {
+                errors: vec![("", VerboseErrorKind::Nom(nom::error::ErrorKind::MapRes))],
+            },
+        );
+        assert!(conversion.contains("Value conversion/validation failed"));
+    }
+
+    #[test]
+    fn private_error_helpers_cover_context_and_hint_edges() {
+        assert_eq!(compute_line_col("a\nbc", 3), (2, 2));
+        assert!(format_error_context_window("a\nbc\ndef", 3).contains("--> | bc"));
+        assert_eq!(take_first_chars("你好世界", 2), "你好");
+
+        assert_eq!(
+            expected_syntax_for_context(&["KQL predicate term"], None).unwrap(),
+            "a predicate as \"snake_case\", a predicate variable like ?predicate, alternatives \"p1\" | \"p2\", or a path \"p\"{m,n}"
+        );
+        assert!(
+            expected_syntax_for_context(&["KQL proposition matcher"], None)
+                .unwrap()
+                .contains("subject")
+        );
+        assert!(
+            expected_syntax_for_context(&["KQL concept matcher"], None)
+                .unwrap()
+                .contains("{id")
+        );
+        assert!(
+            expected_syntax_for_context(&["FILTER"], None)
+                .unwrap()
+                .contains("FILTER")
+        );
+        assert!(
+            expected_syntax_for_context(&["WHERE clause item"], None)
+                .unwrap()
+                .contains("WHERE item")
+        );
+        assert!(
+            expected_syntax_for_context(&["FIND expression"], None)
+                .unwrap()
+                .contains("FIND")
+        );
+        assert!(
+            expected_syntax_for_context(&["CONCEPT [?local_handle]"], None)
+                .unwrap()
+                .contains("CONCEPT")
+        );
+        assert!(
+            expected_syntax_for_context(&["PROPOSITION [?local_handle]"], None)
+                .unwrap()
+                .contains("PROPOSITION")
+        );
+        assert!(
+            expected_syntax_for_context(&["WITH METADATA"], None)
+                .unwrap()
+                .contains("WITH METADATA")
+        );
+        assert!(
+            expected_syntax_for_context(&["KIP key-value map"], None)
+                .unwrap()
+                .contains("JSON-like")
+        );
+        assert_eq!(
+            expected_syntax_for_context(&[], Some(&("x", VerboseErrorKind::Char(')')))).unwrap(),
+            "the character `)`"
+        );
+        assert!(expected_syntax_for_context(&[], None).is_none());
+
+        assert_eq!(
+            lowercase_keyword_correction("filter("),
+            Some(("filter", "FILTER"))
+        );
+        assert_eq!(lowercase_keyword_correction("FIND("), None);
+        assert!(contains_keyword("FIND(?x) WHERE {}", "WHERE"));
+        assert!(!contains_keyword("NOWHERE", "WHERE"));
+        assert!(contains_standalone_equals("?x = 1"));
+        assert!(!contains_standalone_equals("?x == 1"));
+        assert!(!contains_standalone_equals("?x != 1"));
+
+        let top_hint = generate_recovery_suggestion(
+            "bad",
+            &[],
+            Some(&("bad", VerboseErrorKind::Nom(nom::error::ErrorKind::Tag))),
+            true,
+        )
+        .unwrap();
+        assert!(top_hint.contains("must start"));
+
+        for (ctx, expected) in [
+            ("JSON string", "unterminated strings"),
+            ("JSON array", "array syntax"),
+            ("FIND", "FIND clause syntax"),
+            ("WHERE", "WHERE clause syntax"),
+            ("CONCEPT [?local_handle]", "CONCEPT block syntax"),
+            ("PROPOSITION [?local_handle]", "PROPOSITION block syntax"),
+            ("SET ATTRIBUTES", "SET ATTRIBUTES syntax"),
+            ("SET PROPOSITIONS", "SET PROPOSITIONS syntax"),
+            ("WITH METADATA", "WITH METADATA syntax"),
+            ("UPSERT", "UPSERT block syntax"),
+            ("DELETE", "DELETE syntax variants"),
+            ("FILTER", "FILTER syntax"),
+            ("DESCRIBE", "META commands"),
+            ("concept matcher", "Concept matcher formats"),
+            ("dot notation", "Dot path syntax"),
+        ] {
+            let hint =
+                generate_recovery_suggestion("FIND(?x) WHERE {}", &[ctx], None, false).unwrap();
+            assert!(hint.contains(expected), "{ctx}: {hint}");
+        }
+
+        let object_hint = generate_recovery_suggestion(
+            "{",
+            &["key-value pair"],
+            Some(&("", VerboseErrorKind::Char('}'))),
+            false,
+        )
+        .unwrap();
+        assert!(object_hint.contains("Unclosed JSON object"));
+        let colon_hint = generate_recovery_suggestion(
+            "{ key value }",
+            &["key-value pair"],
+            Some(&(" value", VerboseErrorKind::Char(':'))),
+            false,
+        )
+        .unwrap();
+        assert!(colon_hint.contains("Expected ':'"));
+        let eof_hint = generate_recovery_suggestion(
+            "X(",
+            &["other"],
+            Some(&("", VerboseErrorKind::Nom(nom::error::ErrorKind::Tag))),
+            false,
+        )
+        .unwrap();
+        assert!(eof_hint.contains("Unexpected end of input"));
+        let trailing_hint = generate_recovery_suggestion(
+            "X trailing",
+            &["other"],
+            Some(&(
+                " trailing",
+                VerboseErrorKind::Nom(nom::error::ErrorKind::Eof),
+            )),
+            false,
+        )
+        .unwrap();
+        assert!(trailing_hint.contains("unexpected content"));
     }
 }

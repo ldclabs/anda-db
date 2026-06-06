@@ -2005,6 +2005,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::sync::{Barrier, Mutex};
@@ -2062,6 +2063,33 @@ mod tests {
         buf
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+    struct TestKey(String);
+
+    impl TryFrom<String> for TestKey {
+        type Error = BoxError;
+
+        fn try_from(value: String) -> Result<Self, Self::Error> {
+            if value == "bad" {
+                Err("bad key".into())
+            } else {
+                Ok(TestKey(value))
+            }
+        }
+    }
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("writer failed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn test_create_index() {
         let index = create_test_index();
@@ -2073,6 +2101,274 @@ mod tests {
         let metadata = index.metadata();
         assert_eq!(metadata.name, "test_index");
         assert_eq!(metadata.stats.num_elements, 0);
+    }
+
+    #[test]
+    fn test_default_config_getters_and_query_private_helpers() {
+        let default_config = BTreeConfig::default();
+        assert_eq!(default_config.bucket_overload_size, 1024 * 512);
+        assert!(default_config.allow_duplicates);
+
+        let index = BTreeIndex::<u64, String>::new("defaulted".to_string(), None);
+        assert_eq!(index.name(), "defaulted");
+        assert!(index.allow_duplicates());
+        assert!(index.has_pending_metadata_flush());
+        assert!(!index.has_dirty_buckets());
+        assert_eq!(index.keys(None, None), Vec::<String>::new());
+        assert_eq!(
+            index.range_query_with(RangeQuery::Ge("a".to_string()), |_, _| (true, vec![1_u64])),
+            Vec::<u64>::new()
+        );
+
+        assert_eq!(
+            BTreeIndex::<u64, String>::range_query_seed_rank(&RangeQuery::Eq("a".to_string())),
+            0
+        );
+        assert_eq!(
+            BTreeIndex::<u64, String>::range_query_seed_rank(&RangeQuery::Between(
+                "z".to_string(),
+                "a".to_string(),
+            )),
+            0
+        );
+        assert_eq!(
+            BTreeIndex::<u64, String>::range_query_seed_rank(&RangeQuery::Include(vec![])),
+            0
+        );
+        assert_eq!(
+            BTreeIndex::<u64, String>::range_query_seed_rank(&RangeQuery::Include(vec![
+                "a".to_string()
+            ])),
+            1
+        );
+        assert_eq!(
+            BTreeIndex::<u64, String>::range_query_seed_rank(&RangeQuery::Between(
+                "a".to_string(),
+                "z".to_string(),
+            )),
+            2
+        );
+        assert_eq!(
+            BTreeIndex::<u64, String>::range_query_seed_rank(&RangeQuery::Gt("a".to_string())),
+            3
+        );
+        assert_eq!(
+            BTreeIndex::<u64, String>::range_query_seed_rank(&RangeQuery::Or(vec![])),
+            4
+        );
+        assert_eq!(
+            BTreeIndex::<u64, String>::range_query_seed_rank(&RangeQuery::Not(Box::new(
+                RangeQuery::Eq("a".to_string())
+            ))),
+            5
+        );
+        assert_eq!(
+            BTreeIndex::<u64, String>::range_query_seed_rank(&RangeQuery::And(vec![])),
+            0
+        );
+
+        let key = "m".to_string();
+        assert!(BTreeIndex::<u64, String>::range_key_matches_query(
+            &key,
+            &RangeQuery::Gt("a".to_string())
+        ));
+        assert!(BTreeIndex::<u64, String>::range_key_matches_query(
+            &key,
+            &RangeQuery::Ge("m".to_string())
+        ));
+        assert!(BTreeIndex::<u64, String>::range_key_matches_query(
+            &key,
+            &RangeQuery::Lt("z".to_string())
+        ));
+        assert!(BTreeIndex::<u64, String>::range_key_matches_query(
+            &key,
+            &RangeQuery::Le("m".to_string())
+        ));
+        assert!(BTreeIndex::<u64, String>::range_key_matches_query(
+            &key,
+            &RangeQuery::Include(vec!["m".to_string()])
+        ));
+        assert!(BTreeIndex::<u64, String>::range_key_matches_query(
+            &key,
+            &RangeQuery::Eq("m".to_string())
+        ));
+        assert!(BTreeIndex::<u64, String>::range_key_matches_query(
+            &key,
+            &RangeQuery::Between("a".to_string(), "z".to_string())
+        ));
+        assert!(!BTreeIndex::<u64, String>::range_key_matches_query(
+            &key,
+            &RangeQuery::Between("z".to_string(), "a".to_string())
+        ));
+        assert!(BTreeIndex::<u64, String>::range_key_matches_query(
+            &key,
+            &RangeQuery::Or(vec![
+                Box::new(RangeQuery::Eq("x".to_string())),
+                Box::new(RangeQuery::Eq("m".to_string())),
+            ])
+        ));
+        assert!(BTreeIndex::<u64, String>::range_key_matches_query(
+            &key,
+            &RangeQuery::And(vec![
+                Box::new(RangeQuery::Ge("a".to_string())),
+                Box::new(RangeQuery::Le("z".to_string())),
+            ])
+        ));
+        assert!(BTreeIndex::<u64, String>::range_key_matches_query(
+            &key,
+            &RangeQuery::Not(Box::new(RangeQuery::Eq("x".to_string())))
+        ));
+        assert!(!BTreeIndex::<u64, String>::range_key_matches_query(
+            &key,
+            &RangeQuery::And(vec![])
+        ));
+
+        let populated = create_populated_index();
+        assert_eq!(
+            populated.keys(Some("apple".to_string()), Some(2)),
+            vec!["banana".to_string(), "cherry".to_string()]
+        );
+        assert_eq!(
+            populated.keys(Some("cherry".to_string()), None),
+            vec!["date".to_string(), "eggplant".to_string()]
+        );
+        assert_eq!(
+            populated.keys(None, Some(2)),
+            vec!["apple".to_string(), "banana".to_string()]
+        );
+
+        let mut writer = FailingWriter;
+        writer.flush().unwrap();
+    }
+
+    #[test]
+    fn test_range_query_try_convert_from_all_variants_and_errors() {
+        let converted =
+            RangeQuery::<TestKey>::try_convert_from(RangeQuery::Eq("a".to_string())).unwrap();
+        assert!(matches!(converted, RangeQuery::Eq(TestKey(ref v)) if v == "a"));
+
+        assert!(matches!(
+            RangeQuery::<TestKey>::try_convert_from(RangeQuery::Gt("a".to_string())).unwrap(),
+            RangeQuery::Gt(TestKey(ref v)) if v == "a"
+        ));
+        assert!(matches!(
+            RangeQuery::<TestKey>::try_convert_from(RangeQuery::Ge("a".to_string())).unwrap(),
+            RangeQuery::Ge(TestKey(ref v)) if v == "a"
+        ));
+        assert!(matches!(
+            RangeQuery::<TestKey>::try_convert_from(RangeQuery::Lt("a".to_string())).unwrap(),
+            RangeQuery::Lt(TestKey(ref v)) if v == "a"
+        ));
+        assert!(matches!(
+            RangeQuery::<TestKey>::try_convert_from(RangeQuery::Le("a".to_string())).unwrap(),
+            RangeQuery::Le(TestKey(ref v)) if v == "a"
+        ));
+        assert!(matches!(
+            RangeQuery::<TestKey>::try_convert_from(RangeQuery::Between(
+                "a".to_string(),
+                "z".to_string(),
+            ))
+            .unwrap(),
+            RangeQuery::Between(TestKey(ref a), TestKey(ref z)) if a == "a" && z == "z"
+        ));
+        assert!(matches!(
+            RangeQuery::<TestKey>::try_convert_from(RangeQuery::Include(vec![
+                "a".to_string(),
+                "b".to_string(),
+            ]))
+            .unwrap(),
+            RangeQuery::Include(keys) if keys == vec![TestKey("a".to_string()), TestKey("b".to_string())]
+        ));
+        assert!(matches!(
+            RangeQuery::<TestKey>::try_convert_from(RangeQuery::And(vec![
+                Box::new(RangeQuery::Ge("a".to_string())),
+                Box::new(RangeQuery::Le("z".to_string())),
+            ]))
+            .unwrap(),
+            RangeQuery::And(queries) if queries.len() == 2
+        ));
+        assert!(matches!(
+            RangeQuery::<TestKey>::try_convert_from(RangeQuery::Or(vec![
+                Box::new(RangeQuery::Eq("a".to_string())),
+                Box::new(RangeQuery::Eq("b".to_string())),
+            ]))
+            .unwrap(),
+            RangeQuery::Or(queries) if queries.len() == 2
+        ));
+        assert!(matches!(
+            RangeQuery::<TestKey>::try_convert_from(RangeQuery::Not(Box::new(RangeQuery::Eq(
+                "a".to_string()
+            ))))
+            .unwrap(),
+            RangeQuery::Not(_)
+        ));
+
+        assert!(
+            RangeQuery::<TestKey>::try_convert_from(RangeQuery::Eq("bad".to_string())).is_err()
+        );
+        assert!(
+            RangeQuery::<TestKey>::try_convert_from(RangeQuery::And(vec![
+                Box::new(RangeQuery::Eq("ok".to_string())),
+                Box::new(RangeQuery::Eq("bad".to_string())),
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_range_query_with_early_stop_variants_and_prefix_empty() {
+        let index = create_populated_index();
+
+        for query in [
+            RangeQuery::Eq("apple".to_string()),
+            RangeQuery::Gt("apple".to_string()),
+            RangeQuery::Ge("apple".to_string()),
+            RangeQuery::Between("apple".to_string(), "date".to_string()),
+            RangeQuery::Include(vec!["banana".to_string(), "date".to_string()]),
+            RangeQuery::And(vec![
+                Box::new(RangeQuery::Ge("apple".to_string())),
+                Box::new(RangeQuery::Le("date".to_string())),
+            ]),
+            RangeQuery::Or(vec![
+                Box::new(RangeQuery::Eq("apple".to_string())),
+                Box::new(RangeQuery::Eq("date".to_string())),
+            ]),
+            RangeQuery::Not(Box::new(RangeQuery::Eq("apple".to_string()))),
+        ] {
+            let values =
+                index.range_query_with(query, |key, ids| (false, vec![(key.clone(), ids.len())]));
+            assert_eq!(values.len(), 1);
+        }
+
+        assert_eq!(
+            index.range_query_with(
+                RangeQuery::Between("z".to_string(), "a".to_string()),
+                |key, _| (true, vec![key.clone()])
+            ),
+            Vec::<String>::new()
+        );
+
+        assert_eq!(
+            index.range_keys(RangeQuery::Gt("cherry".to_string())),
+            vec!["date".to_string(), "eggplant".to_string()]
+        );
+        assert_eq!(
+            index.range_keys(RangeQuery::Include(vec![
+                "missing".to_string(),
+                "banana".to_string(),
+            ])),
+            vec!["banana".to_string()]
+        );
+
+        let all_prefix =
+            index.prefix_query_with("", |key, ids| (false, Some((key.to_string(), ids.len()))));
+        assert_eq!(all_prefix, vec![("apple".to_string(), 2)]);
+
+        let empty = create_test_index();
+        assert_eq!(
+            empty.prefix_query_with("", |key, _| (true, Some(key.to_string()))),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -3878,5 +4174,208 @@ mod tests {
             let reloaded = final_loaded.query_with(&q.to_string(), |ids| Some(ids.to_vec()));
             assert_eq!(orig, reloaded, "query '{}' mismatch after reload", q);
         }
+    }
+
+    #[tokio::test]
+    async fn test_load_metadata_and_bucket_error_paths() {
+        match BTreeIndex::<u64, String>::load_metadata(&b"not cbor"[..]) {
+            Err(BTreeError::Serialization { .. }) => {}
+            Err(other) => panic!("expected metadata serialization error, got {other:?}"),
+            Ok(_) => panic!("expected metadata serialization error"),
+        }
+
+        let metadata = BTreeMetadata {
+            name: "load_errors".to_string(),
+            config: BTreeConfig::default(),
+            stats: BTreeStats {
+                version: 7,
+                max_bucket_id: 0,
+                query_count: 3,
+                ..Default::default()
+            },
+        };
+        let mut metadata_buf = Vec::new();
+        ciborium::into_writer(
+            &BTreeIndexRef {
+                metadata: &metadata,
+            },
+            &mut metadata_buf,
+        )
+        .unwrap();
+
+        let mut generic_error_index: BTreeIndex<u64, String> =
+            BTreeIndex::load_metadata(&metadata_buf[..]).unwrap();
+        assert_eq!(generic_error_index.stats().query_count, 3);
+        let err = generic_error_index
+            .load_buckets(async |_| Err::<Option<Vec<u8>>, _>("bucket load failed".into()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BTreeError::Generic { .. }));
+
+        let mut serialization_error_index: BTreeIndex<u64, String> =
+            BTreeIndex::load_metadata(&metadata_buf[..]).unwrap();
+        let err = serialization_error_index
+            .load_buckets(async |_| Ok(Some(b"not a bucket".to_vec())))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BTreeError::Serialization { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_load_buckets_reconciles_duplicate_postings_from_newer_bucket() {
+        let metadata = BTreeMetadata {
+            name: "duplicate_load".to_string(),
+            config: BTreeConfig {
+                bucket_overload_size: 256,
+                allow_duplicates: true,
+            },
+            stats: BTreeStats {
+                version: 4,
+                max_bucket_id: 1,
+                ..Default::default()
+            },
+        };
+        let mut metadata_buf = Vec::new();
+        ciborium::into_writer(
+            &BTreeIndexRef {
+                metadata: &metadata,
+            },
+            &mut metadata_buf,
+        )
+        .unwrap();
+
+        let mut old_postings = FxHashMap::default();
+        old_postings.insert("same".to_string(), (0, 1, vec![1_u64].into()));
+        let mut old_bucket = Vec::new();
+        ciborium::into_writer(
+            &BucketOwned {
+                postings: old_postings,
+            },
+            &mut old_bucket,
+        )
+        .unwrap();
+
+        let mut new_postings = FxHashMap::default();
+        new_postings.insert("same".to_string(), (1, 2, vec![2_u64].into()));
+        let mut new_bucket = Vec::new();
+        ciborium::into_writer(
+            &BucketOwned {
+                postings: new_postings,
+            },
+            &mut new_bucket,
+        )
+        .unwrap();
+
+        let mut loaded: BTreeIndex<u64, String> =
+            BTreeIndex::load_metadata(&metadata_buf[..]).unwrap();
+        loaded
+            .load_buckets(async |bucket_id| {
+                Ok(match bucket_id {
+                    0 => Some(old_bucket.clone()),
+                    1 => Some(new_bucket.clone()),
+                    _ => None,
+                })
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            loaded.query_with(&"same".to_string(), |ids| Some(ids.clone())),
+            Some(vec![2])
+        );
+        assert_eq!(loaded.postings.get("same").unwrap().0, 1);
+        let old_bucket = loaded.buckets.get(&0).unwrap();
+        assert!(old_bucket.1, "stale source bucket should be marked dirty");
+        assert!(!old_bucket.2.contains(&"same".to_string()));
+        assert!(loaded.has_dirty_buckets());
+    }
+
+    #[tokio::test]
+    async fn test_store_metadata_and_dirty_bucket_error_and_stop_paths() {
+        let index = create_test_index();
+
+        let err = index.store_metadata(FailingWriter, now_ms()).unwrap_err();
+        assert!(matches!(err, BTreeError::Serialization { .. }));
+        assert!(index.store_metadata(Vec::new(), now_ms()).unwrap());
+        assert!(!index.store_metadata(Vec::new(), now_ms()).unwrap());
+
+        let fresh = create_test_index();
+        assert!(
+            fresh
+                .flush(Vec::new(), now_ms(), async |_, _| Ok(true))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !fresh
+                .flush(Vec::new(), now_ms(), async |_, _| Ok(true))
+                .await
+                .unwrap()
+        );
+
+        let dirty = create_test_index();
+        dirty.insert(1, "apple".to_string(), now_ms()).unwrap();
+        let err = dirty
+            .store_dirty_buckets(async |_, _| Err::<bool, _>("write failed".into()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BTreeError::Generic { .. }));
+        assert!(dirty.has_dirty_buckets());
+
+        let stop = create_test_index();
+        stop.insert(1, "apple".to_string(), now_ms()).unwrap();
+        stop.insert(2, "banana".to_string(), now_ms()).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let calls_for_closure = calls.clone();
+        stop.store_dirty_buckets(async |bucket_id, _| {
+            calls_for_closure.lock().await.push(bucket_id);
+            Ok(false)
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_dirty_bucket_version_change_keeps_bucket_dirty_until_retry() {
+        let index = create_test_index();
+        index.insert(1, "apple".to_string(), now_ms()).unwrap();
+
+        index
+            .store_dirty_buckets(async |bucket_id, _| {
+                index
+                    .insert(
+                        100 + u64::from(bucket_id),
+                        format!("during-{bucket_id}"),
+                        now_ms(),
+                    )
+                    .unwrap();
+                Ok(true)
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            index.has_dirty_buckets(),
+            "mutation during persistence must keep at least one bucket dirty"
+        );
+
+        index
+            .store_dirty_buckets(async |_, _| Ok(true))
+            .await
+            .unwrap();
+        assert!(!index.has_dirty_buckets());
+    }
+
+    #[test]
+    fn test_compact_buckets_repairs_empty_multi_bucket_index() {
+        let index: BTreeIndex<u64, String> =
+            BTreeIndex::new("empty_compact".to_string(), Some(BTreeConfig::default()));
+        index.buckets.insert(1, (0, false, UniqueVec::default(), 0));
+        index.max_bucket_id.store(1, Ordering::Relaxed);
+        assert_eq!(index.compact_buckets(), (2, 1));
+        assert_eq!(index.stats().max_bucket_id, 0);
+        assert!(index.has_dirty_buckets());
+        assert_eq!(index.buckets.get(&0).unwrap().3, 1);
     }
 }

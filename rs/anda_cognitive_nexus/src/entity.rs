@@ -540,7 +540,119 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_entity() {}
+    fn test_entity() {
+        let concept_id = EntityID::Concept(7);
+        assert_eq!(concept_id.to_string(), "C:7");
+        assert_eq!(EntityID::from_str("C:7").unwrap(), concept_id);
+        assert_eq!(EntityID::try_from("C:7").unwrap(), concept_id);
+
+        let proposition_id = EntityID::Proposition(9, "likes".to_string());
+        assert_eq!(proposition_id.to_string(), "P:9:likes");
+        assert_eq!(EntityID::from_str("P:9:likes").unwrap(), proposition_id);
+
+        assert!(EntityID::from_str("C:not-number").is_err());
+        assert!(EntityID::from_str("P:not-number:likes").is_err());
+        assert!(EntityID::from_str("P:1").is_err());
+        assert!(EntityID::from_str("X:1").is_err());
+
+        let encoded = serde_json::to_string(&proposition_id).unwrap();
+        assert_eq!(encoded, r#""P:9:likes""#);
+        assert_eq!(
+            serde_json::from_str::<EntityID>(&encoded).unwrap(),
+            proposition_id
+        );
+        assert!(serde_json::from_str::<EntityID>(r#""bad""#).is_err());
+    }
+
+    #[test]
+    fn test_concept_and_info_conversions() {
+        let mut attributes = Map::new();
+        attributes.insert("description".to_string(), json!("A person"));
+        attributes.insert("age".to_string(), json!(42));
+        let mut metadata = Map::new();
+        metadata.insert("source".to_string(), json!("test"));
+        let concept = Concept {
+            _id: 3,
+            r#type: "Person".to_string(),
+            name: "Ada".to_string(),
+            attributes: attributes.clone(),
+            metadata: metadata.clone(),
+        };
+
+        assert_eq!(concept.entity_id(), EntityID::Concept(3));
+        assert_eq!(concept.to_concept_node()["id"], "C:3");
+
+        let node = concept.clone().into_concept_node();
+        assert_eq!(node.id, "C:3");
+        assert_eq!(node.r#type, "Person");
+        assert_eq!(node.name, "Ada");
+
+        let domain = DomainInfo::from(&concept);
+        assert_eq!(domain.name, "Ada");
+        assert_eq!(domain.description, "A person");
+        assert!(domain.key_concept_types.is_empty());
+        assert!(domain.key_proposition_types.is_empty());
+
+        let owned_domain = DomainInfo::from(Concept {
+            attributes: Map::new(),
+            ..concept.clone()
+        });
+        assert_eq!(owned_domain.description, "");
+
+        let info = ConceptInfo::from(&concept);
+        assert_eq!(info.id, "C:3");
+        assert_eq!(info.attributes, attributes);
+
+        let owned_info = ConceptInfo::from(concept);
+        assert_eq!(owned_info.name, "Ada");
+    }
+
+    #[test]
+    fn test_proposition_links_properties_and_info() {
+        let mut predicates = BTreeSet::new();
+        predicates.insert("likes".to_string());
+        predicates.insert("knows".to_string());
+
+        let mut attrs = Map::new();
+        attrs.insert("since".to_string(), json!(2024));
+        let props = Properties {
+            attributes: attrs.clone(),
+            metadata: Map::from_iter([("source".to_string(), json!("unit"))]),
+        };
+        let proposition = Proposition {
+            _id: 11,
+            subject: EntityID::Concept(1),
+            object: EntityID::Concept(2),
+            predicates,
+            properties: BTreeMap::from([("likes".to_string(), props.clone())]),
+        };
+
+        assert_eq!(
+            proposition.entity_id("likes".to_string()),
+            EntityID::Proposition(11, "likes".to_string())
+        );
+
+        let likes = proposition.to_proposition_link("likes").unwrap();
+        assert_eq!(likes["id"], "P:11:likes");
+        assert_eq!(likes["subject"], "C:1");
+        assert_eq!(likes["object"], "C:2");
+        assert_eq!(likes["attributes"]["since"], 2024);
+
+        let knows = proposition.to_proposition_link("knows").unwrap();
+        assert_eq!(knows["attributes"], Json::Null);
+        assert!(proposition.to_proposition_link("missing").is_none());
+
+        let info = proposition.to_info("likes").unwrap();
+        assert_eq!(info.id, "P:11:likes");
+        assert_eq!(info.subject, "C:1");
+        assert_eq!(info.object, "C:2");
+        assert_eq!(info.predicate, "likes");
+        assert_eq!(info.attributes, attrs);
+        assert!(proposition.to_info("knows").is_none());
+
+        let field_value = FieldValue::from(props);
+        assert!(matches!(field_value, FieldValue::Map(_)));
+    }
 
     #[test]
     fn test_concept_node_schema() {

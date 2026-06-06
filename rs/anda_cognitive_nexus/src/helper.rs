@@ -346,3 +346,347 @@ fn operand_has_unbound(op: &FilterOperand, bound: &FxHashMap<String, EntityID>) 
         FilterOperand::Literal(_) | FilterOperand::List(_) => false,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anda_kip::{
+        AggregationFunction, ComparisonOperator, DotPathVar, FilterFunction, LogicalOperator,
+        OrderByCondition,
+    };
+    use serde_json::json;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn concept(id: u64, r#type: &str, name: &str) -> Concept {
+        Concept {
+            _id: id,
+            r#type: r#type.to_string(),
+            name: name.to_string(),
+            attributes: Map::from_iter([
+                ("score".to_string(), json!(id)),
+                ("active".to_string(), json!(id % 2 == 1)),
+            ]),
+            metadata: Map::from_iter([("source".to_string(), json!("unit"))]),
+        }
+    }
+
+    fn proposition() -> Proposition {
+        Proposition {
+            _id: 9,
+            subject: EntityID::Concept(1),
+            object: EntityID::Concept(2),
+            predicates: BTreeSet::from(["likes".to_string(), "knows".to_string()]),
+            properties: BTreeMap::from([(
+                "likes".to_string(),
+                Properties {
+                    attributes: Map::from_iter([("since".to_string(), json!(2024))]),
+                    metadata: Map::from_iter([("source".to_string(), json!("unit"))]),
+                },
+            )]),
+        }
+    }
+
+    #[test]
+    fn extract_concept_field_value_covers_paths_and_errors() {
+        let concept = concept(1, "Person", "Ada");
+
+        assert_eq!(
+            extract_concept_field_value(&concept, &[]).unwrap()["id"],
+            "C:1"
+        );
+        assert_eq!(
+            extract_concept_field_value(&concept, &["id".to_string()]).unwrap(),
+            json!("C:1")
+        );
+        assert_eq!(
+            extract_concept_field_value(&concept, &["type".to_string()]).unwrap(),
+            json!("Person")
+        );
+        assert_eq!(
+            extract_concept_field_value(&concept, &["name".to_string()]).unwrap(),
+            json!("Ada")
+        );
+        assert_eq!(
+            extract_concept_field_value(&concept, &["attributes".to_string()]).unwrap()["score"],
+            json!(1)
+        );
+        assert_eq!(
+            extract_concept_field_value(
+                &concept,
+                &["attributes".to_string(), "missing".to_string()],
+            )
+            .unwrap(),
+            Json::Null
+        );
+        assert_eq!(
+            extract_concept_field_value(&concept, &["metadata".to_string()]).unwrap()["source"],
+            json!("unit")
+        );
+        assert_eq!(
+            extract_concept_field_value(
+                &concept,
+                &["metadata".to_string(), "missing".to_string()],
+            )
+            .unwrap(),
+            Json::Null
+        );
+        assert!(extract_concept_field_value(&concept, &["unknown".to_string()]).is_err());
+    }
+
+    #[test]
+    fn extract_proposition_field_value_covers_paths_defaults_and_errors() {
+        let proposition = proposition();
+
+        assert_eq!(
+            extract_proposition_field_value(&proposition, "likes", &[]).unwrap()["id"],
+            "P:9:likes"
+        );
+        assert_eq!(
+            extract_proposition_field_value(&proposition, "likes", &["id".to_string()]).unwrap(),
+            json!("P:9:likes")
+        );
+        assert_eq!(
+            extract_proposition_field_value(&proposition, "likes", &["subject".to_string()])
+                .unwrap(),
+            json!("C:1")
+        );
+        assert_eq!(
+            extract_proposition_field_value(&proposition, "likes", &["object".to_string()])
+                .unwrap(),
+            json!("C:2")
+        );
+        assert_eq!(
+            extract_proposition_field_value(&proposition, "likes", &["predicate".to_string()])
+                .unwrap(),
+            json!("likes")
+        );
+        assert_eq!(
+            extract_proposition_field_value(&proposition, "likes", &["attributes".to_string()])
+                .unwrap()["since"],
+            json!(2024)
+        );
+        assert_eq!(
+            extract_proposition_field_value(
+                &proposition,
+                "likes",
+                &["attributes".to_string(), "missing".to_string()],
+            )
+            .unwrap(),
+            Json::Null
+        );
+        assert_eq!(
+            extract_proposition_field_value(&proposition, "likes", &["metadata".to_string()])
+                .unwrap()["source"],
+            json!("unit")
+        );
+        assert_eq!(
+            extract_proposition_field_value(&proposition, "knows", &["attributes".to_string()])
+                .unwrap(),
+            json!({})
+        );
+        assert!(
+            extract_proposition_field_value(&proposition, "missing", &["id".to_string()]).is_err()
+        );
+        assert!(
+            extract_proposition_field_value(&proposition, "likes", &["unknown".to_string()])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn apply_order_by_handles_numbers_strings_bools_skip_and_descending() {
+        let ids = [
+            EntityID::Concept(1),
+            EntityID::Concept(2),
+            EntityID::Concept(3),
+        ];
+        let values = vec![
+            (&ids[0], json!({"name":"Charlie","score":2,"active":true})),
+            (&ids[1], json!({"name":"Ada","score":2,"active":false})),
+            (&ids[2], json!({"name":"Bob","score":1,"active":true})),
+        ];
+        let conditions = vec![
+            OrderByCondition {
+                variable: DotPathVar {
+                    var: "other".to_string(),
+                    path: vec!["score".to_string()],
+                },
+                direction: OrderDirection::Asc,
+                aggregation: None,
+            },
+            OrderByCondition {
+                variable: DotPathVar {
+                    var: "x".to_string(),
+                    path: vec!["score".to_string()],
+                },
+                direction: OrderDirection::Asc,
+                aggregation: None,
+            },
+            OrderByCondition {
+                variable: DotPathVar {
+                    var: "x".to_string(),
+                    path: vec!["active".to_string()],
+                },
+                direction: OrderDirection::Desc,
+                aggregation: None,
+            },
+            OrderByCondition {
+                variable: DotPathVar {
+                    var: "x".to_string(),
+                    path: vec!["name".to_string()],
+                },
+                direction: OrderDirection::Asc,
+                aggregation: None,
+            },
+            OrderByCondition {
+                variable: DotPathVar {
+                    var: "x".to_string(),
+                    path: vec!["ignored".to_string()],
+                },
+                direction: OrderDirection::Desc,
+                aggregation: Some(AggregationFunction::Count),
+            },
+        ];
+
+        let sorted = apply_order_by(values, "x", &conditions);
+        assert_eq!(
+            sorted
+                .into_iter()
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                EntityID::Concept(3),
+                EntityID::Concept(1),
+                EntityID::Concept(2)
+            ]
+        );
+    }
+
+    #[test]
+    fn match_predicate_against_proposition_covers_all_terms() {
+        let proposition = proposition();
+
+        let literal = match_predicate_against_proposition(
+            &proposition,
+            &PredTerm::Literal("likes".to_string()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(literal.1, vec!["likes".to_string()]);
+
+        assert!(
+            match_predicate_against_proposition(
+                &proposition,
+                &PredTerm::Literal("missing".to_string()),
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        let variable =
+            match_predicate_against_proposition(&proposition, &PredTerm::Variable("p".to_string()))
+                .unwrap()
+                .unwrap();
+        assert_eq!(variable.1.len(), 2);
+
+        let alternative = match_predicate_against_proposition(
+            &proposition,
+            &PredTerm::Alternative(vec!["missing".to_string(), "knows".to_string()]),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(alternative.1, vec!["knows".to_string()]);
+        assert!(
+            match_predicate_against_proposition(
+                &proposition,
+                &PredTerm::Alternative(vec!["missing".to_string()]),
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            match_predicate_against_proposition(
+                &proposition,
+                &PredTerm::MultiHop {
+                    predicate: "likes".to_string(),
+                    min: 1,
+                    max: Some(2),
+                },
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn db_to_kip_error_maps_error_categories() {
+        let source = || std::io::Error::other("boom").into();
+
+        assert_eq!(
+            db_to_kip_error(DBError::Schema {
+                name: "schema".to_string(),
+                source: source(),
+            })
+            .code_str(),
+            "KIP_1001"
+        );
+        assert_eq!(
+            db_to_kip_error(DBError::NotFound {
+                name: "concept".to_string(),
+                path: "x".to_string(),
+                source: source(),
+                _id: 1,
+            })
+            .code_str(),
+            "KIP_3002"
+        );
+        assert_eq!(
+            db_to_kip_error(DBError::AlreadyExists {
+                name: "concept".to_string(),
+                path: "x".to_string(),
+                source: source(),
+                _id: 1,
+            })
+            .code_str(),
+            "KIP_3003"
+        );
+        assert_eq!(
+            db_to_kip_error(DBError::Generic {
+                name: "db".to_string(),
+                source: source(),
+            })
+            .code_str(),
+            "KIP_4003"
+        );
+    }
+
+    #[test]
+    fn filter_expression_ext_detects_unbound_variables_recursively() {
+        let bound = FxHashMap::from_iter([("x".to_string(), EntityID::Concept(1))]);
+        let x = FilterOperand::Variable(DotPathVar {
+            var: "x".to_string(),
+            path: vec![],
+        });
+        let y = FilterOperand::Variable(DotPathVar {
+            var: "y".to_string(),
+            path: vec!["name".to_string()],
+        });
+
+        let comparison = FilterExpression::Comparison {
+            left: x.clone(),
+            operator: ComparisonOperator::Equal,
+            right: FilterOperand::Literal("Ada".into()),
+        };
+        assert!(!comparison.has_unbound_variables(&bound));
+
+        let logical = FilterExpression::Logical {
+            left: Box::new(comparison),
+            operator: LogicalOperator::And,
+            right: Box::new(FilterExpression::Function {
+                func: FilterFunction::Contains,
+                args: vec![y.clone(), FilterOperand::List(vec!["Ada".into()])],
+            }),
+        };
+        assert!(logical.has_unbound_variables(&bound));
+        assert!(FilterExpression::Not(Box::new(logical)).has_unbound_variables(&bound));
+    }
+}

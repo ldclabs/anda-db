@@ -781,6 +781,129 @@ mod tests {
 
     const NON_EXISTENT_NAME: &str = "nonexistentname";
 
+    #[test]
+    fn builder_display_debug_and_prefix_helpers_are_exercised() {
+        let storage = MetaStoreBuilder::new(InMemory::new(), 100)
+            .with_meta_cache_ttl(Duration::from_secs(1))
+            .build();
+
+        assert!(format!("{storage}").contains("MetaStore"));
+        assert!(format!("{storage:?}").contains("MetaStore"));
+
+        let location = Path::from("nested/object");
+        assert_eq!(
+            storage.inner.full_path(&location).to_string(),
+            "data/nested/object"
+        );
+        assert_eq!(
+            storage.inner.meta_path(&location).to_string(),
+            "meta/nested/object"
+        );
+        assert_eq!(
+            storage
+                .inner
+                .strip_prefix(Path::from("data/nested/object"))
+                .to_string(),
+            "nested/object"
+        );
+        assert_eq!(
+            storage
+                .inner
+                .strip_prefix(Path::from("other/nested/object"))
+                .to_string(),
+            "other/nested/object"
+        );
+        assert_eq!(
+            storage
+                .inner
+                .strip_meta_prefix(Path::from("meta/nested/object"))
+                .to_string(),
+            "nested/object"
+        );
+        assert_eq!(
+            storage
+                .inner
+                .strip_meta_prefix(Path::from("data/nested/object"))
+                .to_string(),
+            "data/nested/object"
+        );
+    }
+
+    #[test]
+    fn validate_ranges_rejects_invalid_boundaries() {
+        assert!(validate_ranges("MetaStore", &[0..1], 1).is_ok());
+
+        let err = validate_ranges("MetaStore", &[1..2], 1).unwrap_err();
+        assert!(err.to_string().contains("start 1 is larger than length 1"));
+
+        let err = validate_ranges("MetaStore", &[1..1], 3).unwrap_err();
+        assert!(err.to_string().contains("end 1 is less than start 1"));
+
+        let err = validate_ranges("MetaStore", &[1..4], 3).unwrap_err();
+        assert!(err.to_string().contains("end 4 is larger than length 3"));
+    }
+
+    #[test]
+    fn map_arc_error_reconstructs_path_variants_and_generic_fallback() {
+        let cases = [
+            Error::NotFound {
+                path: "not-found".to_string(),
+                source: "missing".into(),
+            },
+            Error::AlreadyExists {
+                path: "exists".to_string(),
+                source: "exists".into(),
+            },
+            Error::Precondition {
+                path: "precondition".to_string(),
+                source: "stale".into(),
+            },
+            Error::NotModified {
+                path: "not-modified".to_string(),
+                source: "fresh".into(),
+            },
+            Error::PermissionDenied {
+                path: "denied".to_string(),
+                source: "denied".into(),
+            },
+            Error::Unauthenticated {
+                path: "unauthenticated".to_string(),
+                source: "auth".into(),
+            },
+        ];
+
+        for err in cases {
+            let mapped = map_arc_error("MetaStore", Arc::new(err));
+            match mapped {
+                Error::NotFound { path, source }
+                | Error::AlreadyExists { path, source }
+                | Error::Precondition { path, source }
+                | Error::NotModified { path, source }
+                | Error::PermissionDenied { path, source }
+                | Error::Unauthenticated { path, source } => {
+                    assert!(!path.is_empty());
+                    assert!(!source.to_string().is_empty());
+                }
+                other => panic!("unexpected mapped error: {other:?}"),
+            }
+        }
+
+        let mapped = map_arc_error(
+            "MetaStore",
+            Arc::new(Error::Generic {
+                store: "Inner",
+                source: "fallback".into(),
+            }),
+        );
+        assert!(matches!(
+            mapped,
+            Error::Generic {
+                store: "MetaStore",
+                ..
+            }
+        ));
+    }
+
     #[tokio::test]
     async fn test_with_memory() {
         let storage = MetaStoreBuilder::new(InMemory::new(), 10000).build();
@@ -948,7 +1071,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
     async fn test_with_local_file() {
         let root = TempDir::new().unwrap();
         let storage = MetaStoreBuilder::new(

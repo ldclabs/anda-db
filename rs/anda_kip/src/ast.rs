@@ -996,7 +996,9 @@ pub fn compare_json(left: &Json, right: &Json) -> Option<Ordering> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AggregationFunction, DotPathVar, FindExpression};
+    use super::*;
+    use serde_json::json;
+    use std::{cmp::Ordering, str::FromStr};
 
     #[test]
     fn find_expression_display_variable() {
@@ -1034,5 +1036,264 @@ mod tests {
         };
 
         assert_eq!(expr.to_string(), "SUM(DISTINCT ?drug.score)");
+    }
+
+    #[test]
+    fn value_conversions_display_and_accessors_cover_all_variants() {
+        assert_eq!(Value::Null.to_string(), "null");
+        assert_eq!(Value::Bool(true).to_string(), "true");
+        assert_eq!(Value::Number(Number::from(7)).to_string(), "7");
+        assert_eq!(Value::String("a\"b".to_string()).to_string(), r#""a\"b""#);
+
+        assert_eq!(Json::from(Value::Null), Json::Null);
+        assert_eq!(Json::from(Value::Bool(false)), Json::Bool(false));
+        assert_eq!(Json::from(Value::Number(Number::from(3))), json!(3));
+        assert_eq!(Json::from(Value::String("x".to_string())), json!("x"));
+
+        assert_eq!(Value::from("borrowed"), Value::String("borrowed".into()));
+        assert_eq!(
+            Value::from("owned".to_string()),
+            Value::String("owned".into())
+        );
+        assert_eq!(Value::from(true), Value::Bool(true));
+        assert_eq!(
+            Value::from(Number::from(42)),
+            Value::Number(Number::from(42))
+        );
+
+        assert_eq!(Value::try_from(Json::Null).unwrap(), Value::Null);
+        assert_eq!(Value::try_from(json!(true)).unwrap(), Value::Bool(true));
+        assert_eq!(
+            Value::try_from(json!(11)).unwrap(),
+            Value::Number(Number::from(11))
+        );
+        assert_eq!(
+            Value::try_from(json!("text")).unwrap(),
+            Value::String("text".into())
+        );
+        assert!(
+            Value::try_from(json!([1]))
+                .unwrap_err()
+                .contains("Unsupported")
+        );
+
+        assert_eq!(
+            Value::String("s".into()).into_opt_string().unwrap(),
+            Some("s".into())
+        );
+        assert_eq!(Value::Null.into_opt_string().unwrap(), None);
+        assert!(Value::Bool(true).into_opt_string().is_err());
+
+        assert_eq!(
+            Value::Number(Number::from(5)).into_opt_number().unwrap(),
+            Some(Number::from(5))
+        );
+        assert_eq!(Value::Null.into_opt_number().unwrap(), None);
+        assert!(Value::String("bad".into()).into_opt_number().is_err());
+
+        assert_eq!(Value::Bool(false).into_opt_bool().unwrap(), Some(false));
+        assert_eq!(Value::Null.into_opt_bool().unwrap(), None);
+        assert!(Value::Number(Number::from(1)).into_opt_bool().is_err());
+
+        assert_eq!(Value::String("s".into()).as_string(), Some("s".into()));
+        assert_eq!(Value::Null.as_string(), None);
+        assert_eq!(
+            Value::Number(Number::from(9)).as_number(),
+            Some(Number::from(9))
+        );
+        assert_eq!(Value::Null.as_number(), None);
+        assert_eq!(Value::Bool(true).as_bool(), Some(true));
+        assert_eq!(Value::Null.as_bool(), None);
+
+        assert!(Value::String("s".into()).is_string());
+        assert!(Value::Number(Number::from(1)).is_number());
+        assert!(Value::Bool(true).is_bool());
+        assert!(Value::Null.is_null());
+    }
+
+    #[test]
+    fn command_type_display_parse_serde_and_from_command() {
+        assert_eq!(CommandType::Kql.to_string(), "KQL");
+        assert_eq!(CommandType::Kml.to_string(), "KML");
+        assert_eq!(CommandType::Meta.to_string(), "META");
+        assert_eq!(CommandType::Unknown.to_string(), "UNKNOWN");
+
+        assert_eq!(CommandType::from_str("kql").unwrap(), CommandType::Kql);
+        assert_eq!(CommandType::from_str("KML").unwrap(), CommandType::Kml);
+        assert_eq!(CommandType::from_str("meta").unwrap(), CommandType::Meta);
+        assert_eq!(
+            CommandType::from_str("other").unwrap(),
+            CommandType::Unknown
+        );
+
+        let serialized = serde_json::to_string(&CommandType::Kml).unwrap();
+        assert_eq!(serialized, r#""KML""#);
+        assert_eq!(
+            serde_json::from_str::<CommandType>(&serialized).unwrap(),
+            CommandType::Kml
+        );
+
+        let kql = Command::Kql(KqlQuery {
+            find_clause: FindClause {
+                expressions: vec![],
+            },
+            where_clauses: vec![],
+            order_by: None,
+            limit: None,
+            cursor: None,
+        });
+        let kml = Command::Kml(KmlStatement::Upsert(vec![]));
+        let meta = Command::Meta(MetaCommand::Describe(DescribeTarget::Primer));
+        assert_eq!(CommandType::from(&kql), CommandType::Kql);
+        assert_eq!(CommandType::from(&kml), CommandType::Kml);
+        assert_eq!(CommandType::from(&meta), CommandType::Meta);
+    }
+
+    #[test]
+    fn concept_matcher_dot_path_and_comparison_helpers_cover_edges() {
+        assert_eq!(
+            ConceptMatcher::ID("id1".into()).to_string(),
+            r#"{id: "id1"}"#
+        );
+        assert_eq!(
+            ConceptMatcher::Type("Drug".into()).to_string(),
+            r#"{type: "Drug"}"#
+        );
+        assert_eq!(
+            ConceptMatcher::Name("Aspirin".into()).to_string(),
+            r#"{name: "Aspirin"}"#
+        );
+        assert_eq!(
+            ConceptMatcher::Object {
+                r#type: "Drug".into(),
+                name: "Aspirin".into(),
+            }
+            .to_string(),
+            r#"{type: "Drug", name: "Aspirin"}"#
+        );
+
+        assert!(ConceptMatcher::ID("id1".into()).is_unique());
+        assert!(
+            ConceptMatcher::Object {
+                r#type: "Drug".into(),
+                name: "Aspirin".into(),
+            }
+            .is_unique()
+        );
+        assert!(!ConceptMatcher::Type("Drug".into()).is_unique());
+
+        let invalid = ConceptMatcher::try_from(vec![
+            KeyValue {
+                key: "id".into(),
+                value: "id1".into(),
+            },
+            KeyValue {
+                key: "type".into(),
+                value: "Drug".into(),
+            },
+        ])
+        .unwrap_err();
+        assert!(invalid.contains("cannot have both id"));
+        assert!(
+            ConceptMatcher::try_from(vec![KeyValue {
+                key: "name".into(),
+                value: Value::Null,
+            }])
+            .unwrap_err()
+            .contains("must have at least one")
+        );
+
+        let escaped = DotPathVar {
+            var: "node".into(),
+            path: vec!["a/b".into(), "c~d".into()],
+        };
+        assert_eq!(escaped.to_pointer(), "/a~1b/c~0d");
+        assert_eq!(escaped.to_pointer_or("ignored"), "/a~1b/c~0d");
+        let whole_doc = DotPathVar {
+            var: "node".into(),
+            path: vec![],
+        };
+        assert_eq!(whole_doc.to_pointer(), "");
+        assert_eq!(whole_doc.to_pointer_or("a/b"), "/a~1b");
+
+        let value = json!(2);
+        assert!(ComparisonOperator::Equal.compare(&value, &json!(2)));
+        assert!(ComparisonOperator::GreaterEqual.compare(&value, &json!(2)));
+        assert!(!ComparisonOperator::GreaterEqual.compare(&json!(1), &json!(2)));
+        assert!(!ComparisonOperator::LessThan.compare(&json!("x"), &json!(2)));
+    }
+
+    #[test]
+    fn aggregation_display_and_json_comparison_cover_remaining_branches() {
+        let var = DotPathVar {
+            var: "drug".into(),
+            path: vec![],
+        };
+        for (func, expected) in [
+            (AggregationFunction::Avg, "AVG(?drug)"),
+            (AggregationFunction::Min, "MIN(?drug)"),
+            (AggregationFunction::Max, "MAX(?drug)"),
+        ] {
+            let expr = FindExpression::Aggregation {
+                func,
+                var: var.clone(),
+                distinct: false,
+            };
+            assert_eq!(expr.to_string(), expected);
+        }
+
+        let values = vec![json!(1), json!(2), json!(2), json!("skip")];
+        assert_eq!(
+            AggregationFunction::Count.calculate(&values, true),
+            json!(3)
+        );
+        assert_eq!(
+            AggregationFunction::Avg.calculate(&values, false),
+            json!(5.0 / 3.0)
+        );
+        assert_eq!(
+            AggregationFunction::Min.calculate(&values, false),
+            json!(1.0)
+        );
+        assert_eq!(
+            AggregationFunction::Max.calculate(&values, false),
+            json!(2.0)
+        );
+        assert_eq!(
+            AggregationFunction::Avg.calculate(&vec![json!("x")], false),
+            Json::Null
+        );
+
+        assert_eq!(
+            compare_json(&json!(false), &json!(true)),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            compare_json(&Json::Null, &Json::Null),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(
+            compare_json(&json!("9"), &json!("10")),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            compare_json(
+                &json!("2025-01-01T00:00:00Z"),
+                &json!("2025-01-02T00:00:00Z")
+            ),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            compare_json(
+                &json!("Tue, 1 Jul 2003 10:52:37 +0200"),
+                &json!("Tue, 1 Jul 2003 10:53:37 +0200")
+            ),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            compare_json(&json!("abc"), &json!("abd")),
+            Some(Ordering::Less)
+        );
+        assert_eq!(compare_json(&json!("abc"), &json!(1)), None);
     }
 }

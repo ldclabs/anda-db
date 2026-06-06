@@ -706,6 +706,9 @@ mod tests {
             .unwrap();
         let schema_v0 = builder.build().unwrap();
         assert_eq!(schema_v0.version(), 0);
+        let mut schema_v1 = schema_v0.clone();
+        schema_v1.with_version(1);
+        assert_eq!(schema_v1.version(), 1);
 
         // 设置 version
         let mut builder = SchemaBuilder::new();

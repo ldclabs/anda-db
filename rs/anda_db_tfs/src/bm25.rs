@@ -1373,8 +1373,21 @@ where
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::io::{self, Write};
     use std::sync::Arc;
     use tokio::sync::Mutex;
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("writer failed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     // 创建一个简单的测试索引
     fn create_test_index() -> BM25Index<TokenizerChain> {
@@ -1434,6 +1447,32 @@ mod tests {
         assert!(matches!(
             result,
             Err(BM25Error::TokenizeFailed { id: 6, .. })
+        ));
+    }
+
+    #[test]
+    fn test_metadata_accessors_empty_compaction_and_writer_error_paths() {
+        let load_result: Result<BM25Index<_>, _> =
+            BM25Index::load_metadata(default_tokenizer(), &b"not cbor"[..]);
+        assert!(matches!(load_result, Err(BM25Error::Serialization { .. })));
+
+        let index = BM25Index::new("empty_bm25".to_string(), default_tokenizer(), None);
+        assert_eq!(index.name(), "empty_bm25");
+        assert_eq!(index.len(), 0);
+        assert!(index.is_empty());
+        assert!(index.has_pending_metadata_flush());
+        assert_eq!(index.metadata().name, "empty_bm25");
+
+        index.buckets.insert(1, Bucket::default());
+        let (old_count, new_count) = index.compact_buckets();
+        assert_eq!((old_count, new_count), (2, 1));
+        assert_eq!(index.max_bucket_id.load(Ordering::Relaxed), 0);
+        assert!(index.has_dirty_buckets());
+
+        let mut writer = FailingWriter;
+        assert!(matches!(
+            index.store_metadata(&mut writer, 123),
+            Err(BM25Error::Serialization { .. })
         ));
     }
 

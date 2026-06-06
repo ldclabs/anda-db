@@ -340,3 +340,258 @@ impl<'de> de::Visitor<'de> for Visitor {
         Ok(FieldValue::Map(BTreeMap::from_iter(map)))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{FieldKey, FieldValue};
+    use base64::{Engine, prelude::BASE64_URL_SAFE};
+    use half::bf16;
+    use serde::{
+        Deserialize as _,
+        de::{IntoDeserializer, Visitor as _},
+    };
+    use serde_json::json;
+
+    fn cbor_roundtrip<T, U>(value: &T) -> U
+    where
+        T: Serialize,
+        U: for<'de> de::Deserialize<'de>,
+    {
+        let mut bytes = Vec::new();
+        ciborium::into_writer(value, &mut bytes).unwrap();
+        ciborium::from_reader(bytes.as_slice()).unwrap()
+    }
+
+    #[test]
+    fn field_key_serde_covers_text_bytes_and_human_readable_base64() {
+        let text = FieldKey::Text("not base64!".into());
+        let encoded_text = serde_json::to_string(&text).unwrap();
+        assert_eq!(encoded_text, r#""not base64!""#);
+        assert_eq!(
+            serde_json::from_str::<FieldKey>(&encoded_text).unwrap(),
+            text
+        );
+
+        let bytes = FieldKey::Bytes(vec![1, 2, 3]);
+        let encoded_bytes = serde_json::to_string(&bytes).unwrap();
+        assert_eq!(encoded_bytes, r#""AQID""#);
+        assert_eq!(
+            serde_json::from_str::<FieldKey>(&encoded_bytes).unwrap(),
+            bytes
+        );
+
+        assert_eq!(
+            cbor_roundtrip::<_, FieldKey>(&FieldKey::Bytes(vec![4, 5])),
+            FieldKey::Bytes(vec![4, 5])
+        );
+        assert_eq!(
+            serde_json::from_value::<FieldKey>(json!([7, 8])).unwrap(),
+            FieldKey::Bytes(vec![7, 8])
+        );
+    }
+
+    #[test]
+    fn field_value_serializes_all_variants_and_decodes_human_readable_bytes() {
+        assert_eq!(
+            serde_json::to_value(FieldValue::Bool(true)).unwrap(),
+            json!(true)
+        );
+        assert_eq!(
+            serde_json::to_value(FieldValue::I64(-1)).unwrap(),
+            json!(-1)
+        );
+        assert_eq!(serde_json::to_value(FieldValue::U64(1)).unwrap(), json!(1));
+        assert_eq!(
+            serde_json::to_value(FieldValue::F64(1.5)).unwrap(),
+            json!(1.5)
+        );
+        assert_eq!(
+            serde_json::to_value(FieldValue::F32(1.25)).unwrap(),
+            json!(1.25)
+        );
+        assert_eq!(
+            serde_json::to_value(FieldValue::Text("not base64!".into())).unwrap(),
+            json!("not base64!")
+        );
+        assert_eq!(
+            serde_json::to_value(FieldValue::Json(json!({"a": 1}))).unwrap(),
+            json!({"a": 1})
+        );
+        assert_eq!(
+            serde_json::to_value(FieldValue::Null).unwrap(),
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            serde_json::to_value(FieldValue::Vector(vec![bf16::from_f32(1.0)])).unwrap(),
+            json!([bf16::from_f32(1.0).to_bits()])
+        );
+        assert_eq!(
+            serde_json::to_value(FieldValue::Array(vec![FieldValue::U64(1)])).unwrap(),
+            json!([1])
+        );
+
+        let encoded = serde_json::to_string(&FieldValue::Bytes(vec![1, 2, 3])).unwrap();
+        assert_eq!(encoded, r#""AQID""#);
+        assert_eq!(
+            serde_json::from_str::<FieldValue>(&encoded).unwrap(),
+            FieldValue::Bytes(vec![1, 2, 3])
+        );
+        assert_eq!(
+            serde_json::from_value::<FieldValue>(json!("not base64!")).unwrap(),
+            FieldValue::Text("not base64!".into())
+        );
+
+        let mut map = BTreeMap::new();
+        map.insert(FieldKey::Text("not base64!".into()), FieldValue::Bool(true));
+        map.insert(FieldKey::Bytes(vec![9]), FieldValue::U64(9));
+        let json_value = serde_json::to_value(FieldValue::Map(map.clone())).unwrap();
+        assert_eq!(json_value["not base64!"], json!(true));
+        assert_eq!(json_value[BASE64_URL_SAFE.encode([9])], json!(9));
+        let decoded: FieldValue = serde_json::from_value(json_value).unwrap();
+        assert_eq!(decoded, FieldValue::Map(map));
+    }
+
+    #[test]
+    fn field_value_deserialize_visitors_cover_numbers_arrays_maps_and_errors() {
+        assert_eq!(
+            serde_json::from_value::<FieldValue>(json!(true)).unwrap(),
+            FieldValue::Bool(true)
+        );
+        assert_eq!(
+            serde_json::from_value::<FieldValue>(json!(-5)).unwrap(),
+            FieldValue::I64(-5)
+        );
+        assert_eq!(
+            serde_json::from_value::<FieldValue>(json!(5)).unwrap(),
+            FieldValue::U64(5)
+        );
+        assert_eq!(
+            serde_json::from_value::<FieldValue>(json!(1.5)).unwrap(),
+            FieldValue::F64(1.5)
+        );
+        assert_eq!(
+            serde_json::from_value::<FieldValue>(serde_json::Value::Null).unwrap(),
+            FieldValue::Null
+        );
+        assert_eq!(
+            serde_json::from_value::<FieldValue>(json!([1, "not base64!"])).unwrap(),
+            FieldValue::Array(vec![
+                FieldValue::U64(1),
+                FieldValue::Text("not base64!".into())
+            ])
+        );
+
+        let value = cbor_roundtrip::<_, FieldValue>(&vec![1u8, 2u8, 3u8]);
+        assert_eq!(
+            value,
+            FieldValue::Array(vec![
+                FieldValue::U64(1),
+                FieldValue::U64(2),
+                FieldValue::U64(3)
+            ])
+        );
+        assert_eq!(
+            cbor_roundtrip::<_, FieldValue>(&serde_bytes::ByteBuf::from(vec![1, 2])),
+            FieldValue::Bytes(vec![1, 2])
+        );
+        assert_eq!(
+            cbor_roundtrip::<_, FieldValue>(&'x'),
+            FieldValue::Text("x".into())
+        );
+        assert_eq!(
+            cbor_roundtrip::<_, FieldValue>(&1.25f32),
+            FieldValue::F64(1.25)
+        );
+        let f32_deserializer: serde::de::value::F32Deserializer<serde::de::value::Error> =
+            1.25f32.into_deserializer();
+        assert_eq!(
+            FieldValue::deserialize(f32_deserializer).unwrap(),
+            FieldValue::F32(1.25)
+        );
+
+        let i128_deserializer: serde::de::value::I128Deserializer<serde::de::value::Error> =
+            (i128::from(i64::MAX) + 1).into_deserializer();
+        let result = FieldValue::deserialize(i128_deserializer);
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("i128 overflow"));
+
+        let u128_deserializer: serde::de::value::U128Deserializer<serde::de::value::Error> =
+            (u128::from(u64::MAX) + 1).into_deserializer();
+        let result = FieldValue::deserialize(u128_deserializer);
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("u128 overflow"));
+
+        assert!(serde_json::from_str::<FieldValue>("NaN").is_err());
+        assert!(serde_json::to_string(&FieldValue::F64(f64::NAN)).is_err());
+        assert!(serde_json::to_string(&FieldValue::F32(f32::NAN)).is_err());
+    }
+
+    #[test]
+    fn visitors_directly_cover_narrow_numeric_bytes_and_option_paths() {
+        type DeError = serde::de::value::Error;
+
+        assert_eq!(
+            KeyVisitor.visit_borrowed_bytes::<DeError>(b"key").unwrap(),
+            FieldKey::Bytes(b"key".to_vec())
+        );
+        assert_eq!(
+            KeyVisitor
+                .visit_byte_buf::<DeError>(b"owned-key".to_vec())
+                .unwrap(),
+            FieldKey::Bytes(b"owned-key".to_vec())
+        );
+
+        assert_eq!(
+            Visitor.visit_i8::<DeError>(-8).unwrap(),
+            FieldValue::I64(-8)
+        );
+        assert_eq!(
+            Visitor.visit_i16::<DeError>(-16).unwrap(),
+            FieldValue::I64(-16)
+        );
+        assert_eq!(
+            Visitor.visit_i32::<DeError>(-32).unwrap(),
+            FieldValue::I64(-32)
+        );
+        assert_eq!(Visitor.visit_u8::<DeError>(8).unwrap(), FieldValue::U64(8));
+        assert_eq!(
+            Visitor.visit_u16::<DeError>(16).unwrap(),
+            FieldValue::U64(16)
+        );
+        assert_eq!(
+            Visitor.visit_u32::<DeError>(32).unwrap(),
+            FieldValue::U64(32)
+        );
+        assert_eq!(
+            Visitor.visit_char::<DeError>('x').unwrap(),
+            FieldValue::Text("x".to_string())
+        );
+        assert_eq!(
+            Visitor.visit_borrowed_bytes::<DeError>(b"value").unwrap(),
+            FieldValue::Bytes(b"value".to_vec())
+        );
+        assert_eq!(
+            Visitor
+                .visit_byte_buf::<DeError>(b"owned-value".to_vec())
+                .unwrap(),
+            FieldValue::Bytes(b"owned-value".to_vec())
+        );
+        assert_eq!(Visitor.visit_none::<DeError>().unwrap(), FieldValue::Null);
+        assert_eq!(Visitor.visit_unit::<DeError>().unwrap(), FieldValue::Null);
+        let some_deserializer: serde::de::value::U8Deserializer<DeError> = 42u8.into_deserializer();
+        assert_eq!(
+            Visitor.visit_some(some_deserializer).unwrap(),
+            FieldValue::U64(42)
+        );
+        let newtype_deserializer: serde::de::value::StrDeserializer<DeError> =
+            "nested".into_deserializer();
+        assert_eq!(
+            Visitor.visit_newtype_struct(newtype_deserializer).unwrap(),
+            FieldValue::Text("nested".to_string())
+        );
+
+        assert!(Visitor.visit_i128::<DeError>(i128::MAX).is_err());
+        assert!(Visitor.visit_u128::<DeError>(u128::MAX).is_err());
+    }
+}

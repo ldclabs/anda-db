@@ -2083,4 +2083,358 @@ mod tests {
         into_writer(&Cbor::Float(f64::NAN), &mut serialized).unwrap();
         assert!(from_reader::<Fv, _>(&serialized[..]).is_err());
     }
+
+    #[test]
+    fn field_type_and_key_helpers_cover_byte_keys_and_wildcards() {
+        assert!(!FieldType::Text.allows_null());
+        assert!(FieldType::Option(Box::new(FieldType::Text)).allows_null());
+        assert!(
+            FieldType::Array(vec![])
+                .validate(&FieldValue::Array(vec![]))
+                .is_ok()
+        );
+
+        let text_key = FieldKey::from("name".to_string());
+        assert_eq!(text_key.field_type(), FieldType::Text);
+        assert_eq!(text_key.as_bytes(), b"name");
+        assert_eq!(text_key.to_string(), "name");
+
+        let bytes_from_vec = FieldKey::from(vec![1, 2, 3]);
+        let bytes_from_array = FieldKey::from([4, 5, 6]);
+        let bytes_from_slice = FieldKey::from(&[7, 8, 9][..]);
+        assert_eq!(bytes_from_vec.field_type(), FieldType::Bytes);
+        assert_eq!(bytes_from_vec.as_bytes(), &[1, 2, 3]);
+        assert_eq!(bytes_from_array, FieldKey::Bytes(vec![4, 5, 6]));
+        assert_eq!(bytes_from_slice, FieldKey::Bytes(vec![7, 8, 9]));
+        assert_eq!(bytes_from_vec.to_string(), "AQID");
+
+        assert_eq!(
+            FieldKey::try_from(Value::Bytes(vec![10, 11])).unwrap(),
+            FieldKey::Bytes(vec![10, 11])
+        );
+        assert!(FieldKey::try_from(Value::Bool(true)).is_err());
+        assert_eq!(*BYTES_WILDCARD_KEY, FieldKey::Bytes(b"*".to_vec()));
+
+        let wildcard_type = FieldType::Map(BTreeMap::from([(
+            FieldKey::from(b"*".as_slice()),
+            FieldType::U64,
+        )]));
+        let wildcard_value = FieldValue::Map(BTreeMap::from([
+            (FieldKey::from(vec![0]), FieldValue::U64(1)),
+            (FieldKey::from(vec![1]), FieldValue::U64(2)),
+        ]));
+        assert!(wildcard_type.validate(&wildcard_value).is_ok());
+
+        let wildcard_cbor = Cbor::Map(vec![
+            (Cbor::Bytes(vec![0]), Cbor::Integer(1.into())),
+            (Cbor::Bytes(vec![1]), Cbor::Integer(2.into())),
+        ]);
+        assert_eq!(
+            wildcard_type.extract(wildcard_cbor).unwrap(),
+            wildcard_value
+        );
+
+        let fixed_type = FieldType::Map(BTreeMap::from([
+            (FieldKey::from(b"id".as_slice()), FieldType::U64),
+            (
+                FieldKey::from(b"optional".as_slice()),
+                FieldType::Option(Box::new(FieldType::Text)),
+            ),
+        ]));
+        let missing_optional = FieldValue::Map(BTreeMap::from([(
+            FieldKey::from(b"id".as_slice()),
+            FieldValue::U64(9),
+        )]));
+        assert!(fixed_type.validate(&missing_optional).is_ok());
+        let invalid_key = FieldValue::Map(BTreeMap::from([(
+            FieldKey::from(b"unknown".as_slice()),
+            FieldValue::U64(9),
+        )]));
+        assert!(fixed_type.validate(&invalid_key).is_err());
+    }
+
+    #[test]
+    fn field_value_from_impls_cover_collections_and_cbor_byte_map_branch() {
+        assert_eq!(FieldValue::from(true), FieldValue::Bool(true));
+        assert_eq!(FieldValue::from(-7_i64), FieldValue::I64(-7));
+        assert_eq!(FieldValue::from(7_u64), FieldValue::U64(7));
+        assert_eq!(FieldValue::from(1.5_f64), FieldValue::F64(1.5));
+        assert_eq!(FieldValue::from(2.5_f32), FieldValue::F32(2.5));
+        assert_eq!(
+            FieldValue::from(vec![1_u8, 2, 3]),
+            FieldValue::Bytes(vec![1, 2, 3])
+        );
+        assert_eq!(
+            FieldValue::from("hello".to_string()),
+            FieldValue::Text("hello".to_string())
+        );
+        assert_eq!(
+            FieldValue::from(json!({"a": 1})),
+            FieldValue::Json(json!({"a": 1}))
+        );
+
+        let vector = vec![bf16::from_f32(1.0), bf16::from_f32(2.0)];
+        assert_eq!(FieldValue::from(vector.clone()), FieldValue::Vector(vector));
+
+        let from_vec: FieldValue = vec![1_u64, 2_u64].into();
+        assert_eq!(
+            from_vec,
+            FieldValue::Array(vec![FieldValue::U64(1), FieldValue::U64(2)])
+        );
+
+        let mut ordered = BTreeSet::new();
+        ordered.insert(1_u64);
+        ordered.insert(2_u64);
+        assert_eq!(FieldValue::from(ordered), from_vec);
+
+        let mut unordered = HashSet::new();
+        unordered.insert(1_u64);
+        unordered.insert(2_u64);
+        let mut unordered_values = match FieldValue::from(unordered) {
+            FieldValue::Array(values) => values,
+            other => panic!("expected array, got {other:?}"),
+        };
+        unordered_values.sort_by_key(|v| match v {
+            FieldValue::U64(v) => *v,
+            other => panic!("unexpected value {other:?}"),
+        });
+        assert_eq!(
+            unordered_values,
+            vec![FieldValue::U64(1), FieldValue::U64(2)]
+        );
+
+        let tree_map = BTreeMap::from([(FieldKey::from(vec![1, 2]), 9_u64)]);
+        let tree_map_value = FieldValue::from(tree_map);
+        assert_eq!(
+            tree_map_value,
+            FieldValue::Map(BTreeMap::from([(
+                FieldKey::Bytes(vec![1, 2]),
+                FieldValue::U64(9)
+            )]))
+        );
+        let cbor: Cbor = tree_map_value.into();
+        assert_eq!(
+            cbor,
+            Cbor::Map(vec![(Cbor::Bytes(vec![1, 2]), Cbor::Integer(9.into()))])
+        );
+
+        let hash_map = HashMap::from([("answer".to_string(), 42_u64)]);
+        assert_eq!(
+            FieldValue::from(hash_map),
+            FieldValue::Map(BTreeMap::from([(
+                FieldKey::Text("answer".to_string()),
+                FieldValue::U64(42),
+            )]))
+        );
+
+        let json_map = serde_json::Map::from_iter([("flag".to_string(), json!(true))]);
+        assert_eq!(
+            FieldValue::from(json_map),
+            FieldValue::Map(BTreeMap::from([(
+                FieldKey::Text("flag".to_string()),
+                FieldValue::Json(json!(true)),
+            )]))
+        );
+
+        assert_eq!(
+            FieldValue::from(FieldKey::Text("key".to_string())),
+            FieldValue::Text("key".to_string())
+        );
+        assert_eq!(
+            FieldValue::from(FieldKey::Bytes(vec![1, 2])),
+            FieldValue::Bytes(vec![1, 2])
+        );
+    }
+
+    #[test]
+    fn field_value_try_from_impls_cover_success_and_error_paths() {
+        assert!(bool::try_from(FieldValue::Bool(true)).unwrap());
+        assert!(bool::try_from(&FieldValue::Bool(true)).unwrap());
+        assert!(bool::try_from(FieldValue::Text("no".into())).is_err());
+        assert!(bool::try_from(&FieldValue::Text("no".into())).is_err());
+
+        let i64_value = FieldValue::I64(-9);
+        assert_eq!(i64::try_from(i64_value.clone()).unwrap(), -9);
+        assert_eq!(i64::try_from(&i64_value).unwrap(), -9);
+        assert_eq!(<&i64>::try_from(&i64_value).unwrap(), &-9);
+        assert!(i64::try_from(FieldValue::U64(9)).is_err());
+        assert!(i64::try_from(&FieldValue::U64(9)).is_err());
+        assert!(<&i64>::try_from(&FieldValue::U64(9)).is_err());
+
+        let u64_value = FieldValue::U64(9);
+        assert_eq!(u64::try_from(u64_value.clone()).unwrap(), 9);
+        assert_eq!(u64::try_from(&u64_value).unwrap(), 9);
+        assert_eq!(<&u64>::try_from(&u64_value).unwrap(), &9);
+        assert!(u64::try_from(FieldValue::I64(-9)).is_err());
+        assert!(u64::try_from(&FieldValue::I64(-9)).is_err());
+        assert!(<&u64>::try_from(&FieldValue::I64(-9)).is_err());
+
+        assert_eq!(f64::try_from(FieldValue::F64(1.25)).unwrap(), 1.25);
+        assert_eq!(f64::try_from(&FieldValue::F64(1.25)).unwrap(), 1.25);
+        assert!(f64::try_from(FieldValue::F32(1.25)).is_err());
+        assert!(f64::try_from(&FieldValue::F32(1.25)).is_err());
+
+        assert_eq!(f32::try_from(FieldValue::F32(1.25)).unwrap(), 1.25);
+        assert_eq!(f32::try_from(&FieldValue::F32(1.25)).unwrap(), 1.25);
+        assert!(f32::try_from(FieldValue::F64(1.25)).is_err());
+        assert!(f32::try_from(&FieldValue::F64(1.25)).is_err());
+
+        let bytes = FieldValue::Bytes(vec![1, 2, 3]);
+        assert_eq!(Vec::<u8>::try_from(bytes.clone()).unwrap(), vec![1, 2, 3]);
+        assert_eq!(<&Vec<u8>>::try_from(&bytes).unwrap(), &vec![1, 2, 3]);
+        assert_eq!(<[u8; 3]>::try_from(bytes.clone()).unwrap(), [1, 2, 3]);
+        assert!(<[u8; 2]>::try_from(bytes.clone()).is_err());
+        assert!(Vec::<u8>::try_from(FieldValue::Text("bytes".into())).is_err());
+        assert!(<&Vec<u8>>::try_from(&FieldValue::Text("bytes".into())).is_err());
+        assert!(<[u8; 3]>::try_from(FieldValue::Text("bytes".into())).is_err());
+
+        let text = FieldValue::Text("hello".to_string());
+        assert_eq!(String::try_from(text.clone()).unwrap(), "hello");
+        assert_eq!(<&String>::try_from(&text).unwrap(), "hello");
+        assert_eq!(<&str>::try_from(&text).unwrap(), "hello");
+        assert!(String::try_from(FieldValue::Bytes(vec![])).is_err());
+        assert!(<&String>::try_from(&FieldValue::Bytes(vec![])).is_err());
+        assert!(<&str>::try_from(&FieldValue::Bytes(vec![])).is_err());
+
+        let json_value = FieldValue::Json(json!({"name": "Ada"}));
+        assert_eq!(
+            Json::try_from(json_value.clone()).unwrap(),
+            json!({"name": "Ada"})
+        );
+        assert_eq!(
+            <&Json>::try_from(&json_value).unwrap(),
+            &json!({"name": "Ada"})
+        );
+        assert!(Json::try_from(FieldValue::Text("json".into())).is_err());
+        assert!(<&Json>::try_from(&FieldValue::Text("json".into())).is_err());
+
+        let vector = FieldValue::Vector(vec![bf16::from_f32(1.0), bf16::from_f32(2.0)]);
+        assert_eq!(
+            Vec::<bf16>::try_from(vector.clone()).unwrap(),
+            vec![bf16::from_f32(1.0), bf16::from_f32(2.0),]
+        );
+        assert_eq!(
+            <&Vec<bf16>>::try_from(&vector).unwrap(),
+            &vec![bf16::from_f32(1.0), bf16::from_f32(2.0),]
+        );
+        assert_eq!(
+            <[bf16; 2]>::try_from(vector.clone()).unwrap(),
+            [bf16::from_f32(1.0), bf16::from_f32(2.0)]
+        );
+        assert!(<[bf16; 3]>::try_from(vector.clone()).is_err());
+        assert!(Vec::<bf16>::try_from(FieldValue::Array(vec![])).is_err());
+        assert!(<&Vec<bf16>>::try_from(&FieldValue::Array(vec![])).is_err());
+        assert!(<[bf16; 2]>::try_from(FieldValue::Array(vec![])).is_err());
+
+        let array = FieldValue::Array(vec![FieldValue::U64(1), FieldValue::U64(2)]);
+        assert_eq!(Vec::<u64>::try_from(array.clone()).unwrap(), vec![1, 2]);
+        assert_eq!(Vec::<&u64>::try_from(&array).unwrap(), vec![&1, &2]);
+        assert!(Vec::<u64>::try_from(FieldValue::U64(1)).is_err());
+        assert!(Vec::<&u64>::try_from(&FieldValue::U64(1)).is_err());
+        assert!(
+            Vec::<u64>::try_from(FieldValue::Array(vec![FieldValue::Text("bad".into())])).is_err()
+        );
+        assert!(
+            Vec::<&u64>::try_from(&FieldValue::Array(vec![FieldValue::Text("bad".into())]))
+                .is_err()
+        );
+
+        let map = FieldValue::Map(BTreeMap::from([("id".into(), FieldValue::U64(42))]));
+        let converted = BTreeMap::<FieldKey, u64>::try_from(map).unwrap();
+        assert_eq!(converted.get(&FieldKey::Text("id".into())), Some(&42));
+        assert!(BTreeMap::<FieldKey, u64>::try_from(FieldValue::U64(1)).is_err());
+        assert!(
+            BTreeMap::<FieldKey, u64>::try_from(FieldValue::Map(BTreeMap::from([(
+                "bad".into(),
+                FieldValue::Text("not u64".into()),
+            )])))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn field_value_extract_error_branches_and_accessors_are_exercised() {
+        assert!(FieldValue::i64_from(Cbor::Integer(u64::MAX.into())).is_err());
+        assert!(FieldValue::i64_from(Cbor::Text("bad".into())).is_err());
+        assert!(FieldValue::u64_from(Cbor::Integer((-1).into())).is_err());
+        assert!(FieldValue::u64_from(Cbor::Text("bad".into())).is_err());
+        assert!(FieldValue::f64_from(Cbor::Float(f64::NAN)).is_err());
+        assert!(FieldValue::f32_from(Cbor::Float(f64::NAN)).is_err());
+        assert!(
+            FieldValue::json_from(Cbor::Map(vec![(Cbor::Bytes(vec![1]), Cbor::Null,)])).is_err()
+        );
+        assert!(FieldValue::vector_from(Cbor::Text("bad".into())).is_err());
+        assert!(FieldValue::bf16_from(Cbor::Integer((u64::from(u16::MAX) + 1).into())).is_err());
+        assert!(FieldValue::bf16_from(Cbor::Text("bad".into())).is_err());
+        assert!(FieldValue::array_from(Cbor::Text("bad".into()), &[]).is_err());
+        assert!(
+            FieldValue::array_from(
+                Cbor::Array(vec![Cbor::Integer(1.into())]),
+                &[FieldType::U64, FieldType::Text],
+            )
+            .is_err()
+        );
+        assert!(FieldValue::map_from(Cbor::Text("bad".into()), &BTreeMap::new()).is_err());
+        assert!(
+            FieldValue::map_from(
+                Cbor::Map(vec![(Cbor::Integer(1.into()), Cbor::Text("bad".into()))]),
+                &BTreeMap::new(),
+            )
+            .is_err()
+        );
+        assert!(
+            FieldValue::map_from(
+                Cbor::Map(vec![(Cbor::Integer(1.into()), Cbor::Text("bad".into()))]),
+                &BTreeMap::from([("name".into(), FieldType::Text)]),
+            )
+            .is_err()
+        );
+        assert!(
+            FieldValue::map_from(
+                Cbor::Map(vec![(
+                    Cbor::Text("unknown".into()),
+                    Cbor::Text("bad".into())
+                )]),
+                &BTreeMap::from([("name".into(), FieldType::Text)]),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            FieldValue::try_from(Cbor::Tag(1, Box::new(Cbor::Text("tagged".to_string())),))
+                .unwrap(),
+            FieldValue::Text("tagged".to_string())
+        );
+
+        let map = FieldValue::Map(BTreeMap::from([(
+            FieldKey::Text("name".into()),
+            FieldValue::Text("Ada".into()),
+        )]));
+        assert_eq!(
+            map.get_field_as::<str>(&FieldKey::Text("name".into())),
+            Some("Ada")
+        );
+        assert_eq!(
+            map.get_field_as::<str>(&FieldKey::Text("missing".into())),
+            None
+        );
+        assert_eq!(
+            FieldValue::Text("Ada".into()).get_field_as::<str>(&FieldKey::Text("name".into())),
+            None
+        );
+
+        let mut entry = FieldEntry::new("nickname".to_string(), FieldType::Text)
+            .unwrap()
+            .with_description("Display name".to_string());
+        assert_eq!(entry.name(), "nickname");
+        assert_eq!(entry.r#type(), &FieldType::Text);
+        assert!(entry.required());
+        assert!(!entry.unique());
+        assert_eq!(entry.idx(), 0);
+        assert_eq!(entry.set_idx(3).idx(), 3);
+        assert_eq!(
+            entry.extract(Cbor::Text("Ada".to_string()), false).unwrap(),
+            FieldValue::Text("Ada".into())
+        );
+        assert!(entry.extract(Cbor::Integer(1.into()), true).is_err());
+    }
 }

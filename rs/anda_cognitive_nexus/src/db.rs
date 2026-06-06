@@ -4409,6 +4409,57 @@ mod tests {
         Ok(nexus)
     }
 
+    #[tokio::test]
+    async fn test_connect_skips_bootstrap_when_capsules_are_current() {
+        let object_store = Arc::new(InMemory::new());
+        let db_config = DBConfig {
+            name: "test_bootstrap_skip".to_string(),
+            description: "Test Anda Cognitive Nexus bootstrap reuse".to_string(),
+            storage: StorageConfig {
+                compress_level: 0,
+                ..Default::default()
+            },
+            lock: None,
+        };
+        let db = Arc::new(
+            AndaDB::connect(object_store, db_config)
+                .await
+                .map_err(db_to_kip_error)
+                .unwrap(),
+        );
+
+        let first = CognitiveNexus::connect(Arc::clone(&db), async |_| Ok(()))
+            .await
+            .unwrap();
+        assert_eq!(first.capsule_version(), 2);
+        for name in [
+            META_CONCEPT_TYPE,
+            PERSON_TYPE,
+            PREFERENCE_TYPE,
+            EVENT_TYPE,
+            SLEEP_TASK_TYPE,
+            INSIGHT_TYPE,
+        ] {
+            assert!(
+                first
+                    .has_concept(&ConceptPK::Object {
+                        r#type: META_CONCEPT_TYPE.to_string(),
+                        name: name.to_string(),
+                    })
+                    .await
+            );
+        }
+        drop(first);
+
+        let second = CognitiveNexus::connect(Arc::clone(&db), async |nexus| {
+            assert_eq!(nexus.capsule_version(), 2);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(second.capsule_version(), 2);
+    }
+
     async fn setup_test_data(nexus: &CognitiveNexus) -> Result<(), KipError> {
         // 创建基础概念类型
         let drug_type_kml = r#"
@@ -4586,6 +4637,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_public_concept_id_helpers_get_or_init_and_close() {
+        let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+        setup_test_data(&nexus).await.unwrap();
+
+        let aspirin = nexus
+            .get_concept(&ConceptPK::Object {
+                r#type: "Drug".to_string(),
+                name: "Aspirin".to_string(),
+            })
+            .await
+            .unwrap();
+        let aspirin_id = aspirin._id;
+
+        assert!(nexus.has_concept(&ConceptPK::ID(aspirin_id)).await);
+        assert_eq!(
+            nexus
+                .get_concept(&ConceptPK::ID(aspirin_id))
+                .await
+                .unwrap()
+                .name,
+            "Aspirin"
+        );
+        assert!(!nexus.has_concept(&ConceptPK::ID(u64::MAX)).await);
+        assert!(nexus.get_concept(&ConceptPK::ID(u64::MAX)).await.is_err());
+
+        let created = nexus
+            .get_or_init_concept(
+                "Drug".to_string(),
+                "UnitOnlyDrug".to_string(),
+                Map::from_iter([("risk_level".to_string(), json!(1))]),
+                Map::from_iter([("source".to_string(), json!("unit"))]),
+            )
+            .await
+            .unwrap();
+        assert_ne!(created._id, 0);
+        assert_eq!(created.attributes["risk_level"], json!(1));
+
+        let existing = nexus
+            .get_or_init_concept(
+                "Drug".to_string(),
+                "UnitOnlyDrug".to_string(),
+                Map::from_iter([("risk_level".to_string(), json!(9))]),
+                Map::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(existing._id, created._id);
+        assert_eq!(existing.attributes["risk_level"], json!(1));
+
+        nexus.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_kml_concept_id_matcher_updates_existing_and_rejects_missing_id() {
+        let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+        setup_test_data(&nexus).await.unwrap();
+
+        let aspirin = nexus
+            .get_concept(&ConceptPK::Object {
+                r#type: "Drug".to_string(),
+                name: "Aspirin".to_string(),
+            })
+            .await
+            .unwrap();
+        let aspirin_id = aspirin.entity_id().to_string();
+
+        let kml = format!(
+            r#"
+            UPSERT {{
+                CONCEPT ?aspirin {{
+                    {{id: "{aspirin_id}"}}
+                    SET ATTRIBUTES {{
+                        "risk_level": 5,
+                        "dosage": "100mg"
+                    }}
+                }}
+            }}
+            "#
+        );
+        let result = nexus
+            .execute_kml(parse_kml(&kml).unwrap(), false)
+            .await
+            .unwrap();
+        let result: UpsertResult = serde_json::from_value(result).unwrap();
+        assert_eq!(result.upsert_concept_nodes, vec![aspirin_id.clone()]);
+
+        let updated = nexus
+            .get_concept(&ConceptPK::ID(aspirin._id))
+            .await
+            .unwrap();
+        assert_eq!(updated.attributes["risk_level"], json!(5));
+        assert_eq!(updated.attributes["dosage"], json!("100mg"));
+
+        let missing = r#"
+            UPSERT {
+                CONCEPT ?missing {
+                    {id: "C:18446744073709551615"}
+                    SET ATTRIBUTES { "risk_level": 1 }
+                }
+            }
+            "#;
+        let err = nexus
+            .execute_kml(parse_kml(missing).unwrap(), false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err.code, KipErrorCode::NotFound));
+    }
+
+    #[tokio::test]
     async fn test_kql_find_concepts() {
         let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
         setup_test_data(&nexus).await.unwrap();
@@ -4685,6 +4845,244 @@ mod tests {
         let query = parse_kql(kql).unwrap();
         let (result, _) = nexus.execute_kql(query).await.unwrap();
         assert_eq!(result, json!([[], []]));
+
+        let kql = r#"
+        FIND(?symptom.name, COUNT(?link))
+        WHERE {
+            ?symptom {type: "Symptom"}
+            OPTIONAL {
+                ?link (?drug, "treats", ?symptom)
+            }
+        }
+        "#;
+
+        let query = parse_kql(kql).unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        assert_eq!(result, json!([["Headache", "Fever"], 2]));
+    }
+
+    #[tokio::test]
+    async fn test_kql_proposition_id_matcher_success_and_invalid_id() {
+        let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+        setup_test_data(&nexus).await.unwrap();
+
+        let query = parse_kql(
+            r#"
+            FIND(?link)
+            WHERE {
+                ?link (?drug, "treats", ?symptom)
+            }
+            LIMIT 1
+            "#,
+        )
+        .unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        let links: Vec<PropositionLink> = serde_json::from_value(result).unwrap();
+        let link_id = links[0].id.clone();
+
+        let query = parse_kql(&format!(
+            r#"
+            FIND(?link)
+            WHERE {{
+                ?link (id: "{link_id}")
+            }}
+            "#
+        ))
+        .unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        let links: Vec<PropositionLink> = serde_json::from_value(result).unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].id, link_id);
+
+        let query = parse_kql(
+            r#"
+            FIND(?link)
+            WHERE {
+                ?link (id: "C:1")
+            }
+            "#,
+        )
+        .unwrap();
+        let err = nexus.execute_kql(query).await.unwrap_err();
+        assert!(matches!(err.code, KipErrorCode::InvalidSyntax));
+        assert!(err.message.contains("Invalid proposition link ID"));
+    }
+
+    #[tokio::test]
+    async fn test_kml_proposition_id_matcher_and_object_error_paths() {
+        let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+        setup_test_data(&nexus).await.unwrap();
+
+        let query = parse_kql(
+            r#"
+            FIND(?link)
+            WHERE {
+                ?link (?drug, "treats", ?symptom)
+            }
+            LIMIT 1
+            "#,
+        )
+        .unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        let links: Vec<PropositionLink> = serde_json::from_value(result).unwrap();
+        let link_id = links[0].id.clone();
+
+        let update = format!(
+            r#"
+            UPSERT {{
+                PROPOSITION ?link {{
+                    (id: "{link_id}")
+                    SET ATTRIBUTES {{ "source": "kml-id" }}
+                }}
+            }}
+            "#
+        );
+        let result = nexus
+            .execute_kml(parse_kml(&update).unwrap(), false)
+            .await
+            .unwrap();
+        let result: UpsertResult = serde_json::from_value(result).unwrap();
+        assert_eq!(result.upsert_proposition_links, vec![link_id.clone()]);
+
+        let bad_concept_id = r#"
+            UPSERT {
+                PROPOSITION ?link {
+                    (id: "C:1")
+                }
+            }
+            "#;
+        let err = nexus
+            .execute_kml(parse_kml(bad_concept_id).unwrap(), false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err.code, KipErrorCode::InvalidSyntax));
+        assert!(err.message.contains("must be a Proposition ID"));
+
+        let missing_prop_id = r#"
+            UPSERT {
+                PROPOSITION ?link {
+                    (id: "P:18446744073709551615:treats")
+                }
+            }
+            "#;
+        let err = nexus
+            .execute_kml(parse_kml(missing_prop_id).unwrap(), false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err.code, KipErrorCode::NotFound));
+
+        let variable_predicate = r#"
+            UPSERT {
+                PROPOSITION ?link {
+                    ({type: "Drug", name: "Aspirin"}, ?p, {type: "Symptom", name: "Headache"})
+                }
+            }
+            "#;
+        let err = nexus
+            .execute_kml(parse_kml(variable_predicate).unwrap(), false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err.code, KipErrorCode::InvalidSyntax));
+        assert!(err.message.contains("predicate must be a literal string"));
+
+        let same_target = r#"
+            UPSERT {
+                PROPOSITION ?link {
+                    ({type: "Drug", name: "Aspirin"}, "treats", {type: "Drug", name: "Aspirin"})
+                }
+            }
+            "#;
+        let err = nexus
+            .execute_kml(parse_kml(same_target).unwrap(), false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err.code, KipErrorCode::InvalidSyntax));
+        assert!(
+            err.message
+                .contains("Subject and object cannot be the same")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_private_entity_id_resolution_error_paths() {
+        let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+        setup_test_data(&nexus).await.unwrap();
+        let mut cached_pks = FxHashMap::default();
+
+        let missing_concept = EntityPK::Concept(ConceptPK::ID(u64::MAX));
+        let err = nexus
+            .resolve_entity_id(&missing_concept, &mut cached_pks)
+            .await
+            .unwrap_err();
+        assert!(matches!(err.code, KipErrorCode::NotFound));
+        assert!(err.message.contains("Concept"));
+
+        let query = parse_kql(
+            r#"
+            FIND(?link)
+            WHERE {
+                ?link ({type: "Drug", name: "Aspirin"}, "treats", {type: "Symptom", name: "Headache"})
+            }
+            LIMIT 1
+            "#,
+        )
+        .unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        let links: Vec<PropositionLink> = serde_json::from_value(result).unwrap();
+        let EntityID::Proposition(prop_id, predicate) = links[0].id.parse().unwrap() else {
+            panic!("expected proposition link id");
+        };
+
+        let missing_proposition =
+            EntityPK::Proposition(PropositionPK::ID(u64::MAX, predicate.clone()));
+        let err = nexus
+            .resolve_entity_id(&missing_proposition, &mut cached_pks)
+            .await
+            .unwrap_err();
+        assert!(matches!(err.code, KipErrorCode::NotFound));
+        assert!(err.message.contains("Proposition"));
+
+        let wrong_id_predicate =
+            EntityPK::Proposition(PropositionPK::ID(prop_id, "wrong_predicate".to_string()));
+        let err = nexus
+            .resolve_entity_id(&wrong_id_predicate, &mut cached_pks)
+            .await
+            .unwrap_err();
+        assert!(matches!(err.code, KipErrorCode::NotFound));
+        assert!(err.message.contains("proposition link not found"));
+
+        let aspirin = EntityPK::Concept(ConceptPK::Object {
+            r#type: "Drug".to_string(),
+            name: "Aspirin".to_string(),
+        });
+        let headache = EntityPK::Concept(ConceptPK::Object {
+            r#type: "Symptom".to_string(),
+            name: "Headache".to_string(),
+        });
+
+        let wrong_object_predicate = EntityPK::Proposition(PropositionPK::Object {
+            subject: Box::new(aspirin.clone()),
+            predicate: "wrong_predicate".to_string(),
+            object: Box::new(headache.clone()),
+        });
+        let err = nexus
+            .resolve_entity_id(&wrong_object_predicate, &mut cached_pks)
+            .await
+            .unwrap_err();
+        assert!(matches!(err.code, KipErrorCode::NotFound));
+        assert!(err.message.contains("proposition link not found"));
+
+        let missing_link = EntityPK::Proposition(PropositionPK::Object {
+            subject: Box::new(aspirin.clone()),
+            predicate,
+            object: Box::new(aspirin),
+        });
+        let err = nexus
+            .resolve_entity_id(&missing_link, &mut cached_pks)
+            .await
+            .unwrap_err();
+        assert!(matches!(err.code, KipErrorCode::NotFound));
+        assert!(err.message.contains("proposition link not found"));
     }
 
     #[tokio::test]
@@ -5090,6 +5488,23 @@ mod tests {
         let query = parse_kql(kql).unwrap();
         let (result, _) = nexus.execute_kql(query).await.unwrap();
         assert_eq!(result, json!([1, 2]));
+
+        let kql = r#"
+        FIND(
+            ?drug.name,
+            SUM(?drug.attributes.risk_level),
+            AVG(?drug.attributes.risk_level),
+            MIN(?drug.attributes.risk_level),
+            MAX(?drug.attributes.risk_level)
+        )
+        WHERE {
+            ?drug {type: "Drug"}
+        }
+        "#;
+
+        let query = parse_kql(kql).unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        assert_eq!(result, json!([["Aspirin"], 2.0, 2.0, 2.0, 2.0]));
     }
 
     #[tokio::test]
@@ -5330,6 +5745,21 @@ mod tests {
                 "Fever".to_string(),
             ])
         );
+
+        let kql = r#"
+        FIND(?link)
+        WHERE {
+            ?link ({type: "Drug", name: "Aspirin"}, "treats", {type: "Symptom", name: "Headache"})
+            UNION {
+                ?link ({type: "Drug", name: "Aspirin"}, "treats", {type: "Symptom", name: "Fever"})
+            }
+        }
+        "#;
+
+        let query = parse_kql(kql).unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        let links: Vec<PropositionLink> = serde_json::from_value(result).unwrap();
+        assert_eq!(links.len(), 2);
     }
 
     #[tokio::test]
@@ -5613,6 +6043,162 @@ mod tests {
                 })
                 .await
         );
+    }
+
+    #[tokio::test]
+    async fn test_kml_delete_attributes_and_metadata_for_concepts_and_propositions() {
+        let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+
+        let setup = r#"
+        UPSERT {
+            CONCEPT ?person_type {
+                {type: "$ConceptType", name: "DeletePerson"}
+            }
+            CONCEPT ?knows_type {
+                {type: "$PropositionType", name: "delete_knows"}
+            }
+            CONCEPT ?alice {
+                {type: "DeletePerson", name: "Alice"}
+                SET ATTRIBUTES {
+                    "role": "researcher",
+                    "drop_attr": true
+                }
+            } WITH METADATA {
+                "source": "unit",
+                "drop_meta": true
+            }
+            CONCEPT ?bob {
+                {type: "DeletePerson", name: "Bob"}
+            }
+            PROPOSITION ?link {
+                (?alice, "delete_knows", ?bob)
+                SET ATTRIBUTES {
+                    "since": 2024,
+                    "drop_attr": true
+                }
+            } WITH METADATA {
+                "source": "unit",
+                "drop_meta": true
+            }
+        }
+        "#;
+        nexus
+            .execute_kml(parse_kml(setup).unwrap(), false)
+            .await
+            .unwrap();
+
+        let dry_run_metadata = r#"
+        DELETE METADATA {"drop_meta"} FROM ?missing
+        WHERE { ?person {type: "DeletePerson", name: "Alice"} }
+        "#;
+        assert_eq!(
+            nexus
+                .execute_kml(parse_kml(dry_run_metadata).unwrap(), true)
+                .await
+                .unwrap(),
+            json!({"updated_concepts": 0, "updated_propositions": 0})
+        );
+
+        let missing_target = r#"
+        DELETE ATTRIBUTES {"drop_attr"} FROM ?missing
+        WHERE { ?person {type: "DeletePerson", name: "Alice"} }
+        "#;
+        let err = nexus
+            .execute_kml(parse_kml(missing_target).unwrap(), false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err.code, KipErrorCode::ReferenceError));
+
+        let delete_concept_attr = r#"
+        DELETE ATTRIBUTES {"drop_attr", "missing"} FROM ?person
+        WHERE { ?person {type: "DeletePerson", name: "Alice"} }
+        "#;
+        assert_eq!(
+            nexus
+                .execute_kml(parse_kml(delete_concept_attr).unwrap(), false)
+                .await
+                .unwrap(),
+            json!({"updated_concepts": 1, "updated_propositions": 0})
+        );
+        let alice = nexus
+            .get_concept(&ConceptPK::Object {
+                r#type: "DeletePerson".to_string(),
+                name: "Alice".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(alice.attributes["role"], json!("researcher"));
+        assert!(!alice.attributes.contains_key("drop_attr"));
+
+        let delete_concept_metadata = r#"
+        DELETE METADATA {"drop_meta"} FROM ?person
+        WHERE { ?person {type: "DeletePerson", name: "Alice"} }
+        "#;
+        assert_eq!(
+            nexus
+                .execute_kml(parse_kml(delete_concept_metadata).unwrap(), false)
+                .await
+                .unwrap(),
+            json!({"updated_concepts": 1, "updated_propositions": 0})
+        );
+        let alice = nexus
+            .get_concept(&ConceptPK::Object {
+                r#type: "DeletePerson".to_string(),
+                name: "Alice".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(alice.metadata["source"], json!("unit"));
+        assert!(!alice.metadata.contains_key("drop_meta"));
+
+        let delete_link_attr = r#"
+        DELETE ATTRIBUTES {"drop_attr"} FROM ?link
+        WHERE {
+            ?link ({type: "DeletePerson", name: "Alice"}, "delete_knows", {type: "DeletePerson", name: "Bob"})
+        }
+        "#;
+        assert_eq!(
+            nexus
+                .execute_kml(parse_kml(delete_link_attr).unwrap(), false)
+                .await
+                .unwrap(),
+            json!({"updated_concepts": 0, "updated_propositions": 1})
+        );
+
+        let delete_link_metadata = r#"
+        DELETE METADATA {"drop_meta"} FROM ?link
+        WHERE {
+            ?link ({type: "DeletePerson", name: "Alice"}, "delete_knows", {type: "DeletePerson", name: "Bob"})
+        }
+        "#;
+        assert_eq!(
+            nexus
+                .execute_kml(parse_kml(delete_link_metadata).unwrap(), false)
+                .await
+                .unwrap(),
+            json!({"updated_concepts": 0, "updated_propositions": 1})
+        );
+
+        let (result, _) = nexus
+            .execute_kql(
+                parse_kql(
+                    r#"
+                FIND(?link)
+                WHERE {
+                    ?link ({type: "DeletePerson", name: "Alice"}, "delete_knows", {type: "DeletePerson", name: "Bob"})
+                }
+                "#,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let links: Vec<PropositionLink> = serde_json::from_value(result).unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].attributes["since"], json!(2024));
+        assert!(!links[0].attributes.contains_key("drop_attr"));
+        assert_eq!(links[0].metadata["source"], json!("unit"));
+        assert!(!links[0].metadata.contains_key("drop_meta"));
     }
 
     #[tokio::test]
@@ -6281,6 +6867,207 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_kql_filter_not_and_invalid_function_arguments() {
+        let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+        setup_test_data(&nexus).await.unwrap();
+
+        let query = parse_kql(
+            r#"
+            FIND(?drug.name)
+            WHERE {
+                ?drug {type: "Drug"}
+                FILTER(!(?drug.attributes.risk_level > 2))
+            }
+            "#,
+        )
+        .unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        assert_eq!(result, json!(["Aspirin"]));
+
+        let mut ctx = QueryContext::default();
+        let mut bindings_snapshot = FxHashMap::default();
+        let mut bindings_cursor = FxHashMap::default();
+        let err = nexus
+            .evaluate_filter_expression(
+                &mut ctx,
+                FilterExpression::Function {
+                    func: FilterFunction::IsNull,
+                    args: vec![
+                        FilterOperand::Literal("a".into()),
+                        FilterOperand::Literal("b".into()),
+                    ],
+                },
+                &mut bindings_snapshot,
+                &mut bindings_cursor,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err.code, KipErrorCode::InvalidSyntax));
+        assert!(err.message.contains("requires exactly 1 argument"));
+
+        let err = nexus
+            .evaluate_filter_expression(
+                &mut ctx,
+                FilterExpression::Function {
+                    func: FilterFunction::In,
+                    args: vec![
+                        FilterOperand::Literal("Aspirin".into()),
+                        FilterOperand::Literal("Aspirin".into()),
+                    ],
+                },
+                &mut bindings_snapshot,
+                &mut bindings_cursor,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err.code, KipErrorCode::InvalidSyntax));
+        assert!(err.message.contains("IN second argument"));
+
+        let err = nexus
+            .evaluate_filter_expression(
+                &mut ctx,
+                FilterExpression::Function {
+                    func: FilterFunction::Contains,
+                    args: vec![FilterOperand::Literal("Aspirin".into())],
+                },
+                &mut bindings_snapshot,
+                &mut bindings_cursor,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err.code, KipErrorCode::InvalidSyntax));
+        assert!(err.message.contains("Filter functions"));
+    }
+
+    #[tokio::test]
+    async fn test_private_relation_row_helpers_and_predicate_value_loading() {
+        let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+        let relation = QueryRelationBinding {
+            proposition_var: Some("link".to_string()),
+            subject_var: Some("subject".to_string()),
+            predicate_var: Some("pred".to_string()),
+            object_var: Some("object".to_string()),
+            rows: vec![],
+        };
+        let row = QueryRelationRow {
+            proposition: EntityID::Proposition(7, "knows".to_string()),
+            subject: EntityID::Concept(1),
+            predicate: "knows".to_string(),
+            object: EntityID::Concept(2),
+        };
+
+        assert!(CognitiveNexus::relation_covers_var(&relation, "link"));
+        assert!(CognitiveNexus::relation_covers_var(&relation, "subject"));
+        assert!(CognitiveNexus::relation_covers_var(&relation, "pred"));
+        assert!(CognitiveNexus::relation_covers_var(&relation, "object"));
+        assert!(!CognitiveNexus::relation_covers_var(&relation, "missing"));
+        assert_eq!(
+            CognitiveNexus::relation_row_entity(&relation, &row, "link"),
+            Some(&row.proposition)
+        );
+        assert_eq!(
+            CognitiveNexus::relation_row_entity(&relation, &row, "subject"),
+            Some(&row.subject)
+        );
+        assert_eq!(
+            CognitiveNexus::relation_row_entity(&relation, &row, "object"),
+            Some(&row.object)
+        );
+        assert_eq!(
+            CognitiveNexus::relation_row_entity(&relation, &row, "pred"),
+            None
+        );
+        assert_eq!(
+            CognitiveNexus::relation_row_predicate(&relation, &row, "pred"),
+            Some("knows")
+        );
+        assert_eq!(
+            CognitiveNexus::relation_row_predicate(&relation, &row, "subject"),
+            None
+        );
+
+        let mut ctx = QueryContext::default();
+        ctx.entities
+            .insert("subject".to_string(), vec![EntityID::Concept(1)].into());
+        ctx.entities
+            .insert("object".to_string(), vec![EntityID::Concept(2)].into());
+        ctx.predicates
+            .insert("pred".to_string(), vec!["knows".to_string()].into());
+        assert!(CognitiveNexus::relation_row_matches_context(
+            &ctx, &relation, &row
+        ));
+
+        ctx.predicates
+            .insert("pred".to_string(), vec!["likes".to_string()].into());
+        assert!(!CognitiveNexus::relation_row_matches_context(
+            &ctx, &relation, &row
+        ));
+        ctx.predicates
+            .insert("pred".to_string(), vec!["knows".to_string()].into());
+        ctx.entities
+            .insert("object".to_string(), vec![EntityID::Concept(3)].into());
+        assert!(!CognitiveNexus::relation_row_matches_context(
+            &ctx, &relation, &row
+        ));
+
+        let value = nexus
+            .load_relation_row_value(
+                &ctx.cache,
+                &relation,
+                &row,
+                &DotPathVar {
+                    var: "pred".to_string(),
+                    path: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(value, json!("knows"));
+
+        let value = nexus
+            .load_relation_row_value(
+                &ctx.cache,
+                &relation,
+                &row,
+                &DotPathVar {
+                    var: "pred".to_string(),
+                    path: vec!["metadata".to_string()],
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(value, Json::Null);
+
+        let err = nexus
+            .load_relation_row_value(
+                &ctx.cache,
+                &relation,
+                &row,
+                &DotPathVar {
+                    var: "missing".to_string(),
+                    path: vec![],
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err.code, KipErrorCode::ReferenceError));
+
+        let mut vars = FxHashSet::default();
+        CognitiveNexus::collect_filter_row_sensitive_vars(
+            &FilterExpression::Not(Box::new(FilterExpression::Comparison {
+                left: FilterOperand::Variable(DotPathVar {
+                    var: "link".to_string(),
+                    path: vec!["metadata".to_string(), "confidence".to_string()],
+                }),
+                operator: ComparisonOperator::GreaterThan,
+                right: FilterOperand::Literal(serde_json::Number::from_f64(0.5).unwrap().into()),
+            })),
+            &mut vars,
+        );
+        assert!(vars.contains("link"));
+    }
+
+    #[tokio::test]
     async fn test_kql_find_predicate_variable() {
         let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
         setup_test_data(&nexus).await.unwrap();
@@ -6776,6 +7563,42 @@ mod tests {
         let (result, cursor) = nexus.execute_kql(query).await.unwrap();
         assert_eq!(result, json!([["Headache"], [2]]));
         assert!(cursor.is_some());
+
+        let cursor = cursor.unwrap();
+        let kql = r#"
+        FIND(?symptom.name, COUNT(?drug))
+        WHERE {
+            ?symptom {type: "Symptom"}
+            (?drug, "treats", ?symptom)
+        }
+        ORDER BY COUNT(?drug) DESC
+        LIMIT 1
+        CURSOR "$cursor"
+        "#;
+
+        let query = parse_kql(&kql.replace("$cursor", cursor.as_str())).unwrap();
+        let (result, cursor) = nexus.execute_kql(query).await.unwrap();
+        assert_eq!(result, json!([["Fever"], [1]]));
+        assert!(cursor.is_none());
+
+        let kql = r#"
+        FIND(?symptom.name, ?all.name, COUNT(?drug), SUM(?all.attributes.risk_level))
+        WHERE {
+            ?symptom {type: "Symptom"}
+            (?drug, "treats", ?symptom)
+            ?all {type: "Drug"}
+        }
+        ORDER BY COUNT(?drug) DESC
+        LIMIT 1
+        "#;
+
+        let query = parse_kql(kql).unwrap();
+        let (result, _) = nexus.execute_kql(query).await.unwrap();
+        let columns = result.as_array().unwrap();
+        assert_eq!(columns.len(), 4);
+        assert_eq!(columns[0], json!(["Headache"]));
+        assert_eq!(columns[2], json!([2]));
+        assert_eq!(columns[3], json!(5.0));
     }
 
     #[tokio::test]

@@ -1838,6 +1838,53 @@ impl HnswIndex {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::io;
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("writer failed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn test_config() -> HnswConfig {
+        HnswConfig {
+            dimension: 2,
+            max_layers: 3,
+            max_connections: 4,
+            ef_construction: 8,
+            ef_search: 8,
+            ..Default::default()
+        }
+    }
+
+    fn valid_node(id: u64) -> HnswNode {
+        HnswNode {
+            id,
+            layer: 0,
+            vector: vec![bf16::from_f32(id as f32), bf16::from_f32(id as f32 + 0.5)],
+            neighbors: vec![SmallVec::new()],
+            version: 1,
+        }
+    }
+
+    fn metadata_bytes(metadata: &HnswMetadata, entry_point: (u64, u8)) -> Vec<u8> {
+        let mut buf = Vec::new();
+        ciborium::into_writer(
+            &HnswIndexRef {
+                entry_point,
+                metadata,
+            },
+            &mut buf,
+        )
+        .unwrap();
+        buf
+    }
 
     #[test]
     fn test_try_new_rejects_invalid_config() {
@@ -1849,6 +1896,82 @@ mod tests {
             }),
         );
         assert!(matches!(result, Err(HnswError::Generic { .. })));
+    }
+
+    #[test]
+    fn test_config_validation_normalization_and_accessors() {
+        for config in [
+            HnswConfig {
+                max_layers: 0,
+                dimension: 2,
+                ..Default::default()
+            },
+            HnswConfig {
+                max_connections: 1,
+                dimension: 2,
+                ..Default::default()
+            },
+            HnswConfig {
+                ef_construction: 0,
+                dimension: 2,
+                ..Default::default()
+            },
+            HnswConfig {
+                ef_search: 0,
+                dimension: 2,
+                ..Default::default()
+            },
+            HnswConfig {
+                scale_factor: Some(0.0),
+                dimension: 2,
+                ..Default::default()
+            },
+            HnswConfig {
+                scale_factor: Some(f64::INFINITY),
+                dimension: 2,
+                ..Default::default()
+            },
+        ] {
+            assert!(config.validate("invalid").is_err());
+        }
+
+        let normalized = HnswConfig {
+            max_layers: 0,
+            max_connections: 1,
+            ef_construction: 0,
+            ef_search: 0,
+            scale_factor: Some(f64::NEG_INFINITY),
+            dimension: 2,
+            ..Default::default()
+        }
+        .normalized();
+        assert_eq!(normalized.max_layers, HnswConfig::MIN_MAX_LAYERS);
+        assert_eq!(normalized.max_connections, HnswConfig::MIN_MAX_CONNECTIONS);
+        assert_eq!(normalized.ef_construction, 1);
+        assert_eq!(normalized.ef_search, 1);
+        assert_eq!(normalized.scale_factor, None);
+
+        let config = HnswConfig {
+            dimension: 2,
+            scale_factor: Some(1.5),
+            ..Default::default()
+        };
+        config.validate("valid").unwrap();
+        let _ = config.layer_gen();
+
+        let index = HnswIndex::new("getters".to_string(), Some(test_config()));
+        assert!(index.is_empty());
+        assert_eq!(index.name(), "getters");
+        assert_eq!(index.dimension(), 2);
+        assert_eq!(index.node_ids(), Vec::<u64>::new());
+        assert!(matches!(
+            index.get_node_with(42, |node| node.id),
+            Err(HnswError::NotFound { id: 42, .. })
+        ));
+        assert_eq!(
+            index.search_f32(&[0.0, 0.0], 3).unwrap(),
+            Vec::<(u64, f32)>::new()
+        );
     }
 
     #[test]
@@ -2286,6 +2409,81 @@ mod tests {
         assert_eq!(heuristic_results.len(), 5);
     }
 
+    #[test]
+    fn test_legacy_heuristic_helper_invalid_bf16_and_pending_metadata_flush() {
+        let config = HnswConfig {
+            dimension: 2,
+            ..Default::default()
+        };
+        let index = HnswIndex::new("anda_db_hnsw".to_string(), Some(config));
+        assert!(index.has_pending_metadata_flush());
+
+        assert!(matches!(
+            index.insert(99, vec![bf16::from_f32(f32::NAN), bf16::from_f32(1.0)], 0,),
+            Err(HnswError::Generic { .. })
+        ));
+
+        index.insert_f32(1, vec![0.0, 0.0], 1).unwrap();
+        index.insert_f32(2, vec![1.0, 0.0], 2).unwrap();
+        index.insert_f32(3, vec![0.0, 1.0], 3).unwrap();
+        assert!(index.has_pending_metadata_flush());
+
+        let candidates = vec![(1, 0.1, 0), (2, 0.2, 0), (3, 0.3, 0)];
+        let mut cache = FxHashMap::default();
+        let selected = index
+            .select_neighbors_heuristic(candidates.clone(), 2, &mut cache)
+            .unwrap();
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].0, 1);
+        assert!(!cache.is_empty());
+
+        let selected_from_cache = index
+            .select_neighbors_heuristic(candidates.clone(), 2, &mut cache)
+            .unwrap();
+        assert_eq!(selected_from_cache.len(), 2);
+
+        let passthrough = index
+            .select_neighbors_heuristic(candidates.clone(), 4, &mut cache)
+            .unwrap();
+        assert_eq!(passthrough, candidates);
+
+        let mut layer_cache = FxHashMap::default();
+        assert!(matches!(
+            index.search_layer(
+                &[bf16::from_f32(0.0), bf16::from_f32(0.0)],
+                u64::MAX,
+                0,
+                0,
+                0,
+                &mut layer_cache,
+            ),
+            Err(HnswError::NotFound { id: u64::MAX, .. })
+        ));
+
+        let mut pair_cache = FxHashMap::default();
+        let simple = index
+            .select_neighbors(
+                vec![(3, 0.3, 0), (1, 0.1, 0), (2, 0.2, 0)],
+                2,
+                SelectNeighborsStrategy::Simple,
+                &mut pair_cache,
+            )
+            .unwrap();
+        assert_eq!(simple, vec![(1, 0.1, 0), (2, 0.2, 0)]);
+
+        let empty_index = HnswIndex::new(
+            "empty_hnsw".to_string(),
+            Some(HnswConfig {
+                dimension: 2,
+                ..Default::default()
+            }),
+        );
+        assert_eq!(empty_index.repair_entry_point(), 0);
+
+        let mut writer = FailingWriter;
+        assert!(writer.flush().is_ok());
+    }
+
     #[tokio::test]
     async fn test_file_persistence() {
         let mut metadata = Vec::new();
@@ -2537,5 +2735,202 @@ mod tests {
         }
 
         futures::future::try_join_all(handles).await.unwrap();
+    }
+
+    #[test]
+    fn test_load_metadata_and_ids_error_paths_and_entry_clamp() {
+        match HnswIndex::load_metadata(&b"not cbor"[..]) {
+            Err(HnswError::Serialization { .. }) => {}
+            Err(other) => panic!("expected metadata serialization error, got {other:?}"),
+            Ok(_) => panic!("expected metadata serialization error"),
+        }
+
+        let metadata = HnswMetadata {
+            name: "load_metadata".to_string(),
+            config: HnswConfig {
+                dimension: 2,
+                max_layers: 1,
+                max_connections: 1,
+                ef_construction: 0,
+                ef_search: 0,
+                scale_factor: Some(f64::NAN),
+                ..Default::default()
+            },
+            stats: HnswStats {
+                version: 9,
+                search_count: 4,
+                ..Default::default()
+            },
+        };
+        let bytes = metadata_bytes(&metadata, (99, 9));
+        let mut loaded = HnswIndex::load_metadata(&bytes[..]).unwrap();
+        assert_eq!(*loaded.entry_point.read(), (99, 0));
+        assert_eq!(loaded.metadata().config.max_layers, 1);
+        assert_eq!(loaded.metadata().config.max_connections, 2);
+        assert_eq!(loaded.metadata().config.ef_construction, 1);
+        assert_eq!(loaded.metadata().config.ef_search, 1);
+        assert_eq!(loaded.metadata().config.scale_factor, None);
+        assert_eq!(loaded.stats().search_count, 4);
+
+        assert!(matches!(
+            loaded.load_ids(&b"not cbor"[..]),
+            Err(HnswError::Serialization { .. })
+        ));
+
+        let mut invalid_bitmap = Vec::new();
+        ciborium::into_writer(&ciborium::Value::Bytes(vec![1, 2, 3]), &mut invalid_bitmap).unwrap();
+        assert!(matches!(
+            loaded.load_ids(&invalid_bitmap[..]),
+            Err(HnswError::Generic { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_load_nodes_validation_and_loader_errors() {
+        let mut empty = HnswIndex::new("empty_load".to_string(), Some(test_config()));
+        empty.load_nodes(async |_| Ok(Some(vec![]))).await.unwrap();
+
+        let mut generic = HnswIndex::new("generic_load".to_string(), Some(test_config()));
+        generic.ids.write().add(1);
+        let err = generic
+            .load_nodes(async |_| Err::<Option<Vec<u8>>, _>("load failed".into()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HnswError::Generic { .. }));
+
+        let mut bad_cbor = HnswIndex::new("bad_cbor_load".to_string(), Some(test_config()));
+        bad_cbor.ids.write().add(1);
+        let err = bad_cbor
+            .load_nodes(async |_| Ok(Some(b"not a node".to_vec())))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HnswError::Serialization { .. }));
+
+        let cases = vec![
+            {
+                let mut node = valid_node(2);
+                node.id = 99;
+                node
+            },
+            {
+                let mut node = valid_node(2);
+                node.vector.pop();
+                node
+            },
+            {
+                let mut node = valid_node(2);
+                node.layer = 3;
+                node.neighbors = vec![
+                    SmallVec::new(),
+                    SmallVec::new(),
+                    SmallVec::new(),
+                    SmallVec::new(),
+                ];
+                node
+            },
+            {
+                let mut node = valid_node(2);
+                node.neighbors.clear();
+                node
+            },
+            {
+                let mut node = valid_node(2);
+                node.vector[0] = bf16::from_f32(f32::NAN);
+                node
+            },
+            {
+                let mut node = valid_node(2);
+                node.neighbors[0].push((1, bf16::from_f32(f32::INFINITY)));
+                node
+            },
+        ];
+
+        for node in cases {
+            let mut index = HnswIndex::new("validation_load".to_string(), Some(test_config()));
+            index.ids.write().add(2);
+            let data = serialize_node(&node);
+            let err = index
+                .load_nodes(async |_| Ok(Some(data.clone())))
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                HnswError::Generic { .. } | HnswError::DimensionMismatch { .. }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_load_nodes_repairs_missing_entry_point_without_missing_ids() {
+        let mut index = HnswIndex::new("entry_repair_load".to_string(), Some(test_config()));
+        index.ids.write().add(1);
+        *index.entry_point.write() = (99, 0);
+        let node = valid_node(1);
+        let data = serialize_node(&node);
+
+        index
+            .load_nodes(async |_| Ok(Some(data.clone())))
+            .await
+            .unwrap();
+
+        assert_eq!(*index.entry_point.read(), (1, 0));
+        assert_eq!(index.len(), 1);
+        assert!(index.stats().version > 1);
+    }
+
+    #[tokio::test]
+    async fn test_store_metadata_ids_dirty_nodes_and_flush_error_paths() {
+        let index = HnswIndex::new("store_errors".to_string(), Some(test_config()));
+        let err = index.store_metadata(FailingWriter, 1).unwrap_err();
+        assert!(matches!(err, HnswError::Serialization { .. }));
+
+        assert!(index.store_metadata(Vec::new(), 1).unwrap());
+        assert!(!index.store_metadata(Vec::new(), 2).unwrap());
+        assert!(matches!(
+            index.store_ids(FailingWriter),
+            Err(HnswError::Serialization { .. })
+        ));
+
+        let clean = HnswIndex::new("clean_flush".to_string(), Some(test_config()));
+        assert!(
+            clean
+                .flush(Vec::new(), Vec::new(), 1, async |_, _| Ok(true))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !clean
+                .flush(Vec::new(), Vec::new(), 2, async |_, _| Ok(true))
+                .await
+                .unwrap()
+        );
+
+        let dirty = HnswIndex::new("dirty_store".to_string(), Some(test_config()));
+        dirty.insert_f32(1, vec![1.0, 1.0], 1).unwrap();
+        let err = dirty
+            .store_dirty_nodes(async |_, _| Err::<bool, _>("node write failed".into()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HnswError::Generic { .. }));
+        assert!(dirty.has_dirty_nodes());
+
+        let stop = HnswIndex::new("stop_store".to_string(), Some(test_config()));
+        stop.insert_f32(1, vec![1.0, 1.0], 1).unwrap();
+        stop.insert_f32(2, vec![2.0, 2.0], 1).unwrap();
+        stop.store_dirty_nodes(async |_, _| Ok(false))
+            .await
+            .unwrap();
+        assert!(stop.has_dirty_nodes());
+
+        stop.store_dirty_nodes(async |_, _| Ok(true)).await.unwrap();
+        assert!(!stop.has_dirty_nodes());
+
+        let stale_dirty = HnswIndex::new("stale_dirty".to_string(), Some(test_config()));
+        stale_dirty.dirty_nodes.write().insert(999);
+        stale_dirty
+            .store_dirty_nodes(async |_, _| panic!("missing dirty node must be skipped"))
+            .await
+            .unwrap();
+        assert!(!stale_dirty.has_dirty_nodes());
     }
 }

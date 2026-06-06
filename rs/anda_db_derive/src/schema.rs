@@ -1,4 +1,5 @@
 use proc_macro::TokenStream;
+use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::{Attribute, Data, DeriveInput, Expr, Fields, Lit, ext::IdentExt, parse_macro_input};
 
@@ -18,6 +19,10 @@ use crate::common::{determine_field_type, find_field_type_attr, find_rename_attr
 pub fn anda_db_schema_derive(input: TokenStream) -> TokenStream {
     // Parse the input tokens into a syntax tree.
     let input = parse_macro_input!(input as DeriveInput);
+    TokenStream::from(expand_anda_db_schema_derive(input))
+}
+
+pub(crate) fn expand_anda_db_schema_derive(input: DeriveInput) -> TokenStream2 {
     let name = &input.ident.unraw();
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
 
@@ -26,15 +31,15 @@ pub fn anda_db_schema_derive(input: TokenStream) -> TokenStream {
         match &data_struct.fields {
             Fields::Named(fields_named) => &fields_named.named,
             _ => {
-                return TokenStream::from(quote! {
+                return quote! {
                     compile_error!("AndaDBSchema only supports structs with named fields");
-                });
+                };
             }
         }
     } else {
-        return TokenStream::from(quote! {
+        return quote! {
             compile_error!("AndaDBSchema only supports structs");
-        });
+        };
     };
 
     // Build one `builder.add_field(...)` invocation per field (except `_id`).
@@ -129,7 +134,7 @@ pub fn anda_db_schema_derive(input: TokenStream) -> TokenStream {
         }
     };
 
-    TokenStream::from(expanded)
+    expanded
 }
 
 /// Returns `true` if any of the supplied attributes is `#[unique]`.
@@ -156,4 +161,104 @@ fn extract_doc_comments(attrs: &[Attribute]) -> String {
     }
 
     doc_comments.join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use syn::parse_quote;
+
+    fn tokens(input: TokenStream2) -> String {
+        input.to_string()
+    }
+
+    #[test]
+    fn expand_schema_generates_builder_for_supported_fields() {
+        let input: DeriveInput = parse_quote! {
+            struct User<T>
+            where
+                T: Clone
+            {
+                /// managed id ignored by generated fields
+                _id: u64,
+                /// Display
+                /// name
+                #[serde(rename = "displayName")]
+                #[unique]
+                name: String,
+                #[field_type = "Option<Array<Text>>"]
+                tags: Vec<String>,
+                nested: T,
+            }
+        };
+
+        let expanded = tokens(expand_anda_db_schema_derive(input));
+        assert!(expanded.contains("impl < T > User < T > where T : Clone"));
+        assert!(expanded.contains("Schema :: builder"));
+        assert!(expanded.contains("\"displayName\""));
+        assert!(expanded.contains("with_description (\"Display name\""));
+        assert!(expanded.contains("with_unique"));
+        assert!(expanded.contains("FieldType :: Option"));
+        assert!(expanded.contains("T :: field_type ()"));
+        assert!(!expanded.contains("\"_id\" . to_string"));
+    }
+
+    #[test]
+    fn expand_schema_rejects_unsupported_shapes_and_bad_fields() {
+        let tuple_struct: DeriveInput = parse_quote!(
+            struct Tuple(u64);
+        );
+        assert!(
+            tokens(expand_anda_db_schema_derive(tuple_struct))
+                .contains("AndaDBSchema only supports structs with named fields")
+        );
+
+        let enum_input: DeriveInput = parse_quote!(
+            enum Choice {
+                A,
+            }
+        );
+        assert!(
+            tokens(expand_anda_db_schema_derive(enum_input))
+                .contains("AndaDBSchema only supports structs")
+        );
+
+        let bad_id: DeriveInput = parse_quote! {
+            struct BadId {
+                _id: String,
+            }
+        };
+        assert!(tokens(expand_anda_db_schema_derive(bad_id)).contains("_id"));
+
+        let bad_attr: DeriveInput = parse_quote! {
+            struct BadAttr {
+                _id: u64,
+                #[field_type(Text)]
+                value: String,
+            }
+        };
+        assert!(tokens(expand_anda_db_schema_derive(bad_attr)).contains("field_type"));
+
+        let bad_type: DeriveInput = parse_quote! {
+            struct BadType {
+                _id: u64,
+                value: (u64, u64),
+            }
+        };
+        assert!(tokens(expand_anda_db_schema_derive(bad_type)).contains("Unsupported type"));
+    }
+
+    #[test]
+    fn extract_doc_comments_skips_empty_and_non_doc_attributes() {
+        let field: syn::Field = parse_quote! {
+            /// First
+            #[serde(rename = "ignored")]
+            ///
+            /// Second
+            value: String
+        };
+
+        assert_eq!(extract_doc_comments(&field.attrs), "First Second");
+        assert!(!has_unique_attr(&field.attrs));
+    }
 }

@@ -246,4 +246,66 @@ mod tests {
         let rt: Entity = serde_json::from_str(&rt).unwrap();
         assert_eq!(rt, prop);
     }
+
+    #[test]
+    fn test_entity_refs_and_dot_path_validation() {
+        let mut attributes = Map::new();
+        attributes.insert("score".to_string(), serde_json::json!(7));
+        let metadata = Map::new();
+
+        let concept_ref = EntityRef::ConceptNode(ConceptNodeRef {
+            id: "C:1",
+            r#type: "Drug",
+            name: "Aspirin",
+            attributes: &attributes,
+            metadata: &metadata,
+        });
+        let concept_json = serde_json::to_value(concept_ref).unwrap();
+        assert_eq!(concept_json["_type"], "ConceptNode");
+        assert_eq!(concept_json["attributes"]["score"], 7);
+
+        let prop_ref = EntityRef::PropositionLink(PropositionLinkRef {
+            id: "P:1:treats",
+            subject: "C:1",
+            object: "C:2",
+            predicate: "treats",
+            attributes: &metadata,
+            metadata: &metadata,
+        });
+        let prop_json = serde_json::to_value(prop_ref).unwrap();
+        assert_eq!(prop_json["_type"], "PropositionLink");
+        assert_eq!(prop_json["predicate"], "treats");
+
+        assert!(validate_dot_path_var(&[], EntityType::ConceptNode).is_ok());
+        assert!(validate_dot_path_var(&["name".to_string()], EntityType::ConceptNode).is_ok());
+        assert!(
+            validate_dot_path_var(&["subject".to_string()], EntityType::PropositionLink).is_ok()
+        );
+        assert!(
+            validate_dot_path_var(
+                &["attributes".to_string(), "score".to_string()],
+                EntityType::ConceptNode,
+            )
+            .is_ok()
+        );
+        assert!(validate_dot_path_var(&["subject".to_string()], EntityType::ConceptNode).is_err());
+        assert!(
+            validate_dot_path_var(
+                &["name".to_string(), "first".to_string()],
+                EntityType::ConceptNode,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_dot_path_var(
+                &[
+                    "attributes".to_string(),
+                    "score".to_string(),
+                    "extra".to_string()
+                ],
+                EntityType::ConceptNode,
+            )
+            .is_err()
+        );
+    }
 }

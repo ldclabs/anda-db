@@ -352,4 +352,64 @@ mod tests {
             "manhattan: impl={impl_manhattan}, scalar={scalar_manhattan}"
         );
     }
+
+    #[test]
+    fn test_distance_metric_public_compute_and_zero_vector_edges() {
+        let a = [1.0_f32, 2.0, 3.0];
+        let b = [2.0_f32, 4.0, 6.0];
+
+        assert!(DistanceMetric::Euclidean.compute_f32(&a, &b).unwrap() > 0.0);
+        assert!(DistanceMetric::Cosine.compute_f32(&a, &b).unwrap() >= 0.0);
+        assert_eq!(
+            DistanceMetric::InnerProduct.compute_f32(&a, &b).unwrap(),
+            -28.0
+        );
+        assert_eq!(DistanceMetric::Manhattan.compute_f32(&a, &b).unwrap(), 6.0);
+        assert!(matches!(
+            DistanceMetric::Euclidean.compute_f32(&a, &b[..2]),
+            Err(HnswError::DimensionMismatch {
+                expected: 3,
+                got: 2,
+                ..
+            })
+        ));
+        assert_eq!(
+            DistanceMetric::Cosine
+                .compute_f32(&[0.0, 0.0], &[1.0, 0.0])
+                .unwrap(),
+            1.0
+        );
+
+        let a_bf16: Vec<bf16> = a.iter().copied().map(bf16::from_f32).collect();
+        let b_bf16: Vec<bf16> = b.iter().copied().map(bf16::from_f32).collect();
+        assert!(DistanceMetric::Euclidean.compute(&a_bf16, &b_bf16).unwrap() > 0.0);
+        assert!(DistanceMetric::Cosine.compute(&a_bf16, &b_bf16).unwrap() >= 0.0);
+        assert_eq!(
+            DistanceMetric::InnerProduct
+                .compute(&a_bf16, &b_bf16)
+                .unwrap(),
+            -28.0
+        );
+        assert_eq!(
+            DistanceMetric::Manhattan.compute(&a_bf16, &b_bf16).unwrap(),
+            6.0
+        );
+        assert!(matches!(
+            DistanceMetric::Euclidean.compute(&a_bf16, &b_bf16[..2]),
+            Err(HnswError::DimensionMismatch {
+                expected: 3,
+                got: 2,
+                ..
+            })
+        ));
+        assert_eq!(
+            DistanceMetric::Cosine
+                .compute(
+                    &[bf16::from_f32(0.0), bf16::from_f32(0.0)],
+                    &[bf16::from_f32(1.0), bf16::from_f32(0.0)],
+                )
+                .unwrap(),
+            1.0
+        );
+    }
 }
