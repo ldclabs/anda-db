@@ -79,6 +79,10 @@ impl Schema {
     /// # Errors
     /// - If `self.version` is not greater than `old.version`.
     /// - If a field that exists in both schemas has a different type.
+    /// - If a field that exists only in the new schema is required.
+    /// - If assigning indexes to new fields would exceed `u16::MAX`.
+    ///
+    /// On error `self` is left unchanged.
     pub fn upgrade_with(&mut self, old: &Schema) -> Result<(), SchemaError> {
         if !self.needs_upgrade(old) {
             return Err(SchemaError::Schema(format!(
@@ -88,11 +92,12 @@ impl Schema {
         }
 
         // Find the maximum index used in the old schema to allocate new indexes after it.
-        let mut next_idx = old.idx.iter().copied().max().unwrap_or(0) + 1;
-
-        for (name, field) in self.fields.iter_mut() {
+        // The first pass only validates, so that `self` stays untouched when any
+        // field is rejected.
+        let mut next_idx = old.idx.last().copied().unwrap_or(0) + 1;
+        for (name, field) in self.fields.iter() {
             if let Some(old_field) = old.fields.get(name) {
-                // Field exists in both: verify type compatibility and inherit idx.
+                // Field exists in both: the type must not change.
                 if field.r#type() != old_field.r#type() {
                     return Err(SchemaError::Schema(format!(
                         "field {name:?} type changed from {:?} to {:?}, type changes are not allowed",
@@ -100,7 +105,6 @@ impl Schema {
                         field.r#type()
                     )));
                 }
-                field.set_idx(old_field.idx());
             } else {
                 if field.required() {
                     return Err(SchemaError::Schema(format!(
@@ -114,7 +118,19 @@ impl Schema {
                     ));
                 }
 
-                // New field: assign the next available index.
+                next_idx += 1;
+            }
+        }
+
+        // Second pass: apply the index assignments (infallible).
+        let mut next_idx = old.idx.last().copied().unwrap_or(0) + 1;
+        for (name, field) in self.fields.iter_mut() {
+            if let Some(old_field) = old.fields.get(name) {
+                // Field exists in both: inherit the persisted idx.
+                field.set_idx(old_field.idx());
+            } else {
+                // New field: assign the next available index. Removed fields keep
+                // their old indexes unallocated so they are never reused.
                 field.set_idx(next_idx);
                 next_idx += 1;
             }
@@ -918,6 +934,41 @@ mod tests {
             format!("{err:?}").contains("type changed"),
             "expected type change error, got: {err:?}"
         );
+    }
+
+    #[test]
+    fn test_upgrade_with_is_atomic_on_error() {
+        // old schema v1: _id(0), age(1), name(2)
+        let mut old_builder = SchemaBuilder::new();
+        old_builder.with_version(1);
+        old_builder
+            .add_field(Fe::new("age".to_string(), Ft::U64).unwrap())
+            .unwrap();
+        old_builder
+            .add_field(Fe::new("name".to_string(), Ft::Text).unwrap())
+            .unwrap();
+        let old = old_builder.build().unwrap();
+
+        // new schema v2: insertion order flipped so the builder assigns
+        // name=1, age=2 — i.e. "age" must inherit a different idx (1) during the
+        // upgrade. "name" changes type (Text → U64), which fails the upgrade
+        // *after* "age" would already have been visited.
+        let mut new_builder = SchemaBuilder::new();
+        new_builder.with_version(2);
+        new_builder
+            .add_field(Fe::new("name".to_string(), Ft::U64).unwrap())
+            .unwrap();
+        new_builder
+            .add_field(Fe::new("age".to_string(), Ft::U64).unwrap())
+            .unwrap();
+        let mut new_schema = new_builder.build().unwrap();
+        let snapshot = new_schema.clone();
+
+        assert!(new_schema.upgrade_with(&old).is_err());
+        // The failed upgrade must not leave the schema partially migrated:
+        // "age" must keep the builder-assigned idx 2, not the inherited 1.
+        assert_eq!(new_schema, snapshot);
+        assert_eq!(new_schema.get_field("age").unwrap().idx(), 2);
     }
 
     #[test]

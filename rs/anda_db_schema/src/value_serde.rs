@@ -161,7 +161,8 @@ impl<'de> de::Visitor<'de> for KeyVisitor {
 
     #[inline]
     fn visit_seq<A: de::SeqAccess<'de>>(self, mut acc: A) -> Result<Self::Value, A::Error> {
-        let mut seq: Vec<u8> = Vec::new();
+        let mut seq: Vec<u8> =
+            Vec::with_capacity(acc.size_hint().filter(|&l| l < 1024).unwrap_or(0));
 
         while let Some(elem) = acc.next_element()? {
             seq.push(elem);
@@ -318,7 +319,8 @@ impl<'de> de::Visitor<'de> for Visitor {
 
     #[inline]
     fn visit_seq<A: de::SeqAccess<'de>>(self, mut acc: A) -> Result<Self::Value, A::Error> {
-        let mut seq = Vec::new();
+        let mut seq: Vec<FieldValue> =
+            Vec::with_capacity(acc.size_hint().filter(|&l| l < 1024).unwrap_or(0));
 
         while let Some(elem) = acc.next_element()? {
             seq.push(elem);

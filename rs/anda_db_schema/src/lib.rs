@@ -30,7 +30,7 @@
 //!   nested `FieldType::Map` describing the struct's layout.
 //!
 //! See the crate-level guide in `docs/anda_db_schema.md` for a full tour and
-//! [`SCHEMA.md`] for the on-disk format.
+//! `SCHEMA.md` for the on-disk format.
 //!
 //! ## Storage format
 //!

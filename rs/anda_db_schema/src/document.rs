@@ -123,7 +123,7 @@ impl Document {
             ))
         })?;
 
-        let mut doc_owned = DocumentOwned::default();
+        let mut fields = IndexedFieldValues::new();
         for (k, v) in doc {
             let k = k.into_text().map_err(|err| {
                 SchemaError::Validation(format!(
@@ -133,10 +133,25 @@ impl Document {
 
             let field = schema.get_field_or_err(&k)?;
             let value = field.extract(v, false)?;
-            doc_owned.fields.insert(field.idx(), value);
+            if fields.insert(field.idx(), value).is_some() {
+                return Err(SchemaError::Validation(format!(
+                    "duplicate field {k:?} in document"
+                )));
+            }
         }
 
-        Self::try_from_doc(schema, doc_owned)
+        // `FieldEntry::extract` is strict, so every present value already conforms
+        // to its declared type; only required-field presence remains to check.
+        for field in schema.iter() {
+            if field.required() && !fields.contains_key(&field.idx()) {
+                return Err(SchemaError::Validation(format!(
+                    "field {:?} is required",
+                    field.name()
+                )));
+            }
+        }
+
+        Ok(Self { fields, schema })
     }
 
     /// Deserializes the document into the specified type.
@@ -671,6 +686,30 @@ mod tests {
 
         let result = Document::try_from(schema.clone(), &test_user_wrong_type);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_document_try_from_rejects_duplicate_field_keys() {
+        struct DuplicateKeys;
+
+        impl Serialize for DuplicateKeys {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                use serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(Some(4))?;
+                map.serialize_entry("_id", &1u64)?;
+                map.serialize_entry("name", "a")?;
+                map.serialize_entry("age", &1u64)?;
+                map.serialize_entry("name", "b")?;
+                map.end()
+            }
+        }
+
+        let schema = Arc::new(TestUser::schema().unwrap());
+        let err = Document::try_from(schema, &DuplicateKeys).unwrap_err();
+        assert!(err.to_string().contains("duplicate field"));
     }
 
     #[test]

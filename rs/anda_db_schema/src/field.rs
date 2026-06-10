@@ -21,7 +21,7 @@ use base64::{Engine, prelude::BASE64_URL_SAFE};
 use ciborium::Value;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, btree_map::Entry},
     fmt,
 };
 
@@ -35,7 +35,7 @@ pub use half::bf16;
 
 pub use ic_auth_types::{ByteArrayB64, ByteBufB64};
 
-/// Type alias for Vec<bf16>
+/// Type alias for `Vec<bf16>`
 pub type Vector = Vec<bf16>;
 
 /// Type alias for FieldType
@@ -94,8 +94,8 @@ pub enum FieldType {
     Text,
     /// JSON value
     Json,
-    /// Vec<bf16>, bf16: 16-bit floating point type implementing the bfloat16 format.
-    /// Detail: https://docs.rs/half/latest/half/struct.bf16.html
+    /// `Vec<bf16>`, bf16: 16-bit floating point type implementing the bfloat16 format.
+    /// Detail: <https://docs.rs/half/latest/half/struct.bf16.html>
     Vector,
     /// Array of field types
     Array(Vec<FieldType>),
@@ -197,7 +197,12 @@ impl FieldType {
             (FieldType::Json, _) => Ok(()),
             (FieldType::Vector, FieldValue::Vector(_)) => Ok(()),
             (FieldType::Vector, FieldValue::Array(values)) => {
-                if values.iter().all(|v| matches!(v, FieldValue::U64(_))) {
+                // Each element must be a bf16 bit pattern, i.e. fit in u16,
+                // so that the value can also be extracted as a Vector.
+                if values
+                    .iter()
+                    .all(|v| matches!(v, FieldValue::U64(u) if *u <= u16::MAX as u64))
+                {
                     return Ok(());
                 }
                 Err(SchemaError::FieldValue(format!(
@@ -381,8 +386,8 @@ pub enum FieldValue {
     Text(String),
     /// JSON value
     Json(Json),
-    /// Vec<bf16>, bf16: 16-bit floating point type implementing the bfloat16 format.
-    /// Detail: https://docs.rs/half/latest/half/struct.bf16.html
+    /// `Vec<bf16>`, bf16: 16-bit floating point type implementing the bfloat16 format.
+    /// Detail: <https://docs.rs/half/latest/half/struct.bf16.html>
     Vector(Vec<bf16>),
     /// Array of field values
     Array(Vec<FieldValue>),
@@ -698,6 +703,17 @@ impl TryFrom<FieldValue> for Vec<u8> {
 }
 
 impl<'a> TryFrom<&'a FieldValue> for &'a Vec<u8> {
+    type Error = BoxError;
+
+    fn try_from(value: &'a FieldValue) -> Result<Self, Self::Error> {
+        match value {
+            FieldValue::Bytes(v) => Ok(v),
+            _ => Err(SchemaError::FieldValue(format!("expected Bytes, got {value:?}")).into()),
+        }
+    }
+}
+
+impl<'a> TryFrom<&'a FieldValue> for &'a [u8] {
     type Error = BoxError;
 
     fn try_from(value: &'a FieldValue) -> Result<Self, Self::Error> {
@@ -1115,59 +1131,50 @@ impl FieldValue {
     ) -> Result<Self, SchemaError> {
         match value {
             Cbor::Map(values) => {
-                if types.is_empty() {
-                    return Ok(FieldValue::Map(
-                        values
-                            .into_iter()
-                            .map(|(k, v)| {
-                                let key = match k {
-                                    Cbor::Text(s) => FieldKey::Text(s),
-                                    Cbor::Bytes(b) => FieldKey::Bytes(b),
-                                    _ => {
-                                        return Err(SchemaError::FieldValue(format!(
-                                            "invalid map key: {k:?}"
-                                        )));
-                                    }
-                                };
-                                Ok::<_, SchemaError>((key, FieldValue::try_from(v)?))
-                            })
-                            .collect::<Result<BTreeMap<_, _>, _>>()?,
-                    ));
-                }
-
                 let wildcard_map = as_wildcard_map(types);
 
                 let mut vals: BTreeMap<FieldKey, FieldValue> = BTreeMap::new();
                 for (k, v) in values {
-                    let k = k.try_into().map_err(|err| {
-                        SchemaError::FieldType(format!("invalid map key: {err:?}"))
+                    let k: FieldKey = k.try_into().map_err(|err| {
+                        SchemaError::FieldValue(format!("invalid map key: {err:?}"))
                     })?;
-                    if vals.contains_key(&k) {
-                        return Err(SchemaError::FieldValue(format!("duplicate map key {k:?}")));
-                    }
 
-                    match wildcard_map {
-                        Some(ft) => {
-                            // Special case for wildcard map
-                            let v = ft.extract(v)?;
-                            vals.insert(k, v);
-                            continue;
+                    let v = if types.is_empty() {
+                        FieldValue::try_from(v)?
+                    } else if let Some(ft) = wildcard_map {
+                        ft.extract(v)?
+                    } else if let Some(ft) = types.get(&k) {
+                        ft.extract(v)?
+                    } else {
+                        return Err(SchemaError::FieldValue(format!("invalid map key {k:?}")));
+                    };
+
+                    match vals.entry(k) {
+                        Entry::Vacant(e) => {
+                            e.insert(v);
                         }
-                        None => match types.get(&k) {
-                            None => {
-                                return Err(SchemaError::FieldValue(format!(
-                                    "invalid map key {k:?}"
-                                )));
-                            }
-                            Some(ft) => {
-                                let v = ft.extract(v)?;
-                                vals.insert(k, v);
-                            }
-                        },
+                        Entry::Occupied(e) => {
+                            return Err(SchemaError::FieldValue(format!(
+                                "duplicate map key {:?}",
+                                e.key()
+                            )));
+                        }
                     }
                 }
 
-                validate_map_fields(types, &vals)?;
+                // `extract` already guarantees that every present value conforms to
+                // its declared type, so only missing required keys remain to check.
+                if !types.is_empty() && wildcard_map.is_none() {
+                    for (k, ft) in types {
+                        if !vals.contains_key(k) {
+                            ft.validate(&FieldValue::Null).map_err(|err| {
+                                SchemaError::FieldValue(format!(
+                                    "invalid map value at key {k:?}, error: {err}"
+                                ))
+                            })?;
+                        }
+                    }
+                }
                 Ok(FieldValue::Map(vals))
             }
             v => Err(SchemaError::FieldValue(format!("expected Map, got {v:?}"))),
@@ -1789,7 +1796,20 @@ mod tests {
         );
         assert!(
             FieldType::Vector
+                .validate(&FieldValue::Array(vec![FieldValue::U64(u16::MAX as u64)]))
+                .is_ok()
+        );
+        assert!(
+            FieldType::Vector
                 .validate(&FieldValue::Array(vec![FieldValue::I64(-1)]))
+                .is_err()
+        );
+        // Elements that cannot be extracted as bf16 bits must not validate either.
+        assert!(
+            FieldType::Vector
+                .validate(&FieldValue::Array(vec![FieldValue::U64(
+                    u16::MAX as u64 + 1
+                )]))
                 .is_err()
         );
 
@@ -1838,6 +1858,23 @@ mod tests {
         assert!(option_type.validate(&FieldValue::Bool(true)).is_ok());
         assert!(option_type.validate(&FieldValue::Null).is_ok());
         assert!(option_type.validate(&FieldValue::U64(42)).is_err());
+    }
+
+    #[test]
+    fn test_map_from_rejects_duplicate_keys() {
+        let dup = Cbor::Map(vec![
+            (Cbor::Text("k".to_string()), Cbor::Integer(1.into())),
+            (Cbor::Text("k".to_string()), Cbor::Integer(2.into())),
+        ]);
+
+        // Untyped extraction must not silently drop duplicate entries.
+        let err = FieldValue::map_from(dup.clone(), &BTreeMap::new()).unwrap_err();
+        assert!(err.to_string().contains("duplicate map key"));
+
+        // Typed (wildcard) extraction rejects duplicates as well.
+        let types = BTreeMap::from([(TEXT_WILDCARD_KEY.clone(), FieldType::U64)]);
+        let err = FieldValue::map_from(dup, &types).unwrap_err();
+        assert!(err.to_string().contains("duplicate map key"));
     }
 
     #[test]

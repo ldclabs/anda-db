@@ -40,7 +40,7 @@ pub struct Resource {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uri: Option<String>,
 
-    /// MIME type, https://developer.mozilla.org/zh-CN/docs/Web/HTTP/MIME_types/Common_types
+    /// MIME type, <https://developer.mozilla.org/zh-CN/docs/Web/HTTP/MIME_types/Common_types>
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
 
@@ -64,4 +64,61 @@ pub struct Resource {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+    use crate::{Document, FieldValue};
+    use std::sync::Arc;
+
+    #[test]
+    fn resource_schema_marks_hash_unique() {
+        let schema = Resource::schema().unwrap();
+
+        let id = schema.get_field("_id").unwrap();
+        assert_eq!(id.r#type(), &FieldType::U64);
+        assert!(id.unique());
+
+        let hash = schema.get_field("hash").unwrap();
+        assert!(hash.unique());
+        assert_eq!(
+            hash.r#type(),
+            &FieldType::Option(Box::new(FieldType::Bytes))
+        );
+        assert!(!hash.required());
+
+        let name = schema.get_field("name").unwrap();
+        assert_eq!(name.r#type(), &FieldType::Text);
+        assert!(name.required());
+        assert!(!name.unique());
+    }
+
+    #[test]
+    fn resource_with_blob_and_hash_roundtrips_through_document() {
+        let schema = Arc::new(Resource::schema().unwrap());
+        let resource = Resource {
+            _id: 7,
+            tags: vec!["image".to_string(), "png".to_string()],
+            name: "avatar.png".to_string(),
+            description: Some("profile picture".to_string()),
+            uri: None,
+            mime_type: Some("image/png".to_string()),
+            blob: Some(vec![0x89, 0x50, 0x4E, 0x47].into()),
+            size: Some(4),
+            hash: Some([7u8; 32].into()),
+            metadata: None,
+        };
+
+        let doc = Document::try_from(schema.clone(), &resource).unwrap();
+        // Binary fields must be stored as CBOR bytes, not Base64 text.
+        assert_eq!(
+            doc.get_field("blob").unwrap(),
+            &FieldValue::Bytes(vec![0x89, 0x50, 0x4E, 0x47])
+        );
+        assert_eq!(
+            doc.get_field("hash").unwrap(),
+            &FieldValue::Bytes(vec![7u8; 32])
+        );
+
+        let decoded: Resource = doc.try_into().unwrap();
+        assert_eq!(decoded, resource);
+    }
+}
