@@ -533,10 +533,20 @@ where
         let query_count = AtomicU64::new(index.metadata.stats.query_count);
         let last_saved_version = AtomicU64::new(index.metadata.stats.version);
 
+        // `num_elements` comes from untrusted storage; cap the pre-allocation
+        // so a corrupted value cannot trigger a huge allocation (or a capacity
+        // overflow panic). The map grows on demand past this hint anyway.
+        const MAX_PREALLOCATED_CAPACITY: u64 = 1 << 16;
+        let capacity = index
+            .metadata
+            .stats
+            .num_elements
+            .min(MAX_PREALLOCATED_CAPACITY) as usize;
+
         Ok(BTreeIndex {
             name: index.metadata.name.clone(),
             config: index.metadata.config.clone(),
-            postings: DashMap::with_capacity(index.metadata.stats.num_elements as usize),
+            postings: DashMap::with_capacity(capacity),
             buckets: DashMap::from_iter(vec![(0, (0, false, UniqueVec::default(), 0))]),
             btree: RwLock::new(BTreeSet::new()),
             metadata: RwLock::new(index.metadata),
@@ -671,9 +681,14 @@ where
         // Ensure the current bucket exists.
         // This avoids races where max_bucket_id advances before the bucket entry is created,
         // and also supports calling insert() after load_metadata() but before load_buckets().
-        self.buckets
-            .entry(bucket)
-            .or_insert_with(|| (0, false, UniqueVec::default(), 0));
+        // contains_key (shard read lock) first: every insert hits the same current
+        // bucket id, so taking the shard write lock via entry() each time would
+        // serialize concurrent inserts on this hot path.
+        if !self.buckets.contains_key(&bucket) {
+            self.buckets
+                .entry(bucket)
+                .or_insert_with(|| (0, false, UniqueVec::default(), 0));
+        }
 
         // Calculate the size increase for this insertion
         let mut is_new = false;
@@ -713,8 +728,18 @@ where
         };
 
         if is_new {
-            // Add the field value to the B-tree for range queries
-            self.btree.write().insert(field_value.clone());
+            // Add the field value to the B-tree for range queries.
+            //
+            // Re-check the posting inside the btree lock: a concurrent `remove`
+            // may have already deleted the just-created posting, and its btree
+            // cleanup (which also takes the btree lock, see
+            // `remove_btree_key_if_posting_absent`) found nothing to remove.
+            // Inserting unconditionally would leave a phantom key in the btree
+            // with no backing posting.
+            let mut btree = self.btree.write();
+            if self.postings.contains_key(&field_value) {
+                btree.insert(field_value.clone());
+            }
         }
 
         // If the index was modified, update bucket state
@@ -792,7 +817,7 @@ where
         Ok(size_increase > 0)
     }
 
-    /// Removes a document_id-field_value pair from the index with hook function
+    /// Removes a document_id-field_value pair from the index
     ///
     /// # Arguments
     ///
@@ -830,12 +855,10 @@ where
                 // Atomically check-and-remove: only remove if the posting is still empty.
                 // Between dropping the `get_mut` above and here, a concurrent `insert`
                 // could have added a new doc_id, making the posting non-empty again.
-                if let dashmap::Entry::Occupied(entry) = self.postings.entry(field_value.clone())
-                    && entry.get().2.is_empty()
-                {
-                    entry.remove();
-                    entry_removed = true;
-                }
+                entry_removed = self
+                    .postings
+                    .remove_if(&field_value, |_, posting| posting.2.is_empty())
+                    .is_some();
 
                 if entry_removed {
                     self.remove_btree_key_if_posting_absent(&field_value);
@@ -909,6 +932,11 @@ where
     ///
     /// Returns [`BTreeError::AlreadyExists`] when `allow_duplicates` is `false`
     /// and one of the field values already maps to a different `doc_id`.
+    /// In the sequential case this is rejected by a pre-check before any
+    /// mutation. If the conflict only appears mid-loop (a concurrent writer
+    /// added a conflicting `doc_id` after the pre-check), associations created
+    /// for field values processed before the conflicting one remain applied,
+    /// with consistent internal bookkeeping; values after it are not processed.
     pub fn insert_array(
         &self,
         doc_id: PK,
@@ -944,9 +972,19 @@ where
 
         // Ensure the current bucket exists (see insert()).
         let bucket_id = self.max_bucket_id.load(Ordering::Relaxed);
-        self.buckets
-            .entry(bucket_id)
-            .or_insert_with(|| (0, false, UniqueVec::default(), 0));
+        if !self.buckets.contains_key(&bucket_id) {
+            self.buckets
+                .entry(bucket_id)
+                .or_insert_with(|| (0, false, UniqueVec::default(), 0));
+        }
+
+        // A uniqueness violation detected mid-loop must NOT return early:
+        // postings already modified in this call still need their btree keys
+        // and bucket accounting (phases below), otherwise they would be
+        // invisible to range queries and silently dropped by the next flush.
+        // Record the error, stop processing further values, finish the
+        // bookkeeping for what was applied, then surface the error.
+        let mut uniqueness_conflict: Option<BTreeError> = None;
 
         for field_value in field_values {
             let mut size_increase = 0;
@@ -961,11 +999,12 @@ where
                     // The pre-check above may have passed, but a concurrent insert could have
                     // added a different doc_id between the pre-check and here.
                     if !self.config.allow_duplicates && !posting.2.contains(&doc_id) {
-                        return Err(BTreeError::AlreadyExists {
+                        uniqueness_conflict = Some(BTreeError::AlreadyExists {
                             name: self.name.clone(),
                             id: json!(doc_id),
                             value: json!(field_value),
                         });
+                        break;
                     }
 
                     // Only add the doc_id if it's not already present
@@ -997,9 +1036,16 @@ where
             }
         }
 
-        // Add all new values to the B-tree in a single operation
+        // Add all new values to the B-tree in a single operation.
+        // Same phantom-key guard as in `insert`: skip keys whose posting was
+        // concurrently removed between posting creation and this point.
         if !new_btree_values.is_empty() {
-            self.btree.write().extend(new_btree_values);
+            let mut btree = self.btree.write();
+            for field_value in new_btree_values {
+                if self.postings.contains_key(&field_value) {
+                    btree.insert(field_value);
+                }
+            }
         }
 
         // Phase 2: handle bucket overflow and updates
@@ -1070,7 +1116,15 @@ where
                 }
 
                 let mut new_bucket = false;
-                if let Some(mut nb) = self.buckets.get_mut(&next_bucket_id) {
+                {
+                    // entry().or_insert_with() instead of get_mut(): the bucket
+                    // normally exists, but if it ever went missing the posting
+                    // would silently stop being tracked by any bucket and be
+                    // lost on the next reload.
+                    let mut nb = self
+                        .buckets
+                        .entry(next_bucket_id)
+                        .or_insert_with(|| (0, false, UniqueVec::default(), 0));
                     if nb.2.is_empty() || nb.0 + size < self.config.bucket_overload_size {
                         // Bucket has enough space, update directly
                         nb.0 += size;
@@ -1113,6 +1167,10 @@ where
                 m.stats.last_inserted = now_ms;
                 m.stats.insert_count += inserted_count as u64;
             });
+        }
+
+        if let Some(err) = uniqueness_conflict {
+            return Err(err);
         }
 
         Ok(inserted_count)
@@ -1191,10 +1249,11 @@ where
         {
             let mut entry_removed = false;
             if posting_empty
-                && let dashmap::Entry::Occupied(entry) = self.postings.entry(field_value.clone())
-                && entry.get().2.is_empty()
+                && self
+                    .postings
+                    .remove_if(&field_value, |_, posting| posting.2.is_empty())
+                    .is_some()
             {
-                entry.remove();
                 entry_removed = true;
                 entries_removed.insert(field_value.clone());
             }
@@ -1302,6 +1361,11 @@ where
     /// # Returns
     ///
     /// * `Option<R>` - Result of the function applied to the posting value
+    ///
+    /// # Re-entrancy
+    ///
+    /// `f` runs while internal locks are held. It must not call back into the
+    /// same index (e.g. `insert` / `remove`), or it may deadlock.
     pub fn query_with<F, R>(&self, field_value: &FV, f: F) -> Option<R>
     where
         F: FnOnce(&Vec<PK>) -> Option<R>,
@@ -1324,6 +1388,12 @@ where
     /// # Returns
     ///
     /// * `Vec<R>` - Vector of results from the function applied to the posting values
+    ///
+    /// # Re-entrancy
+    ///
+    /// `f` runs while internal locks are held (including the btree read lock
+    /// during range scans). It must not call back into the same index, or it
+    /// may deadlock.
     pub fn range_query_with<F, R>(&self, query: RangeQuery<FV>, mut f: F) -> Vec<R>
     where
         F: FnMut(&FV, &Vec<PK>) -> (bool, Vec<R>),
@@ -1688,6 +1758,12 @@ where
     /// many tiny buckets. After compaction all buckets are marked dirty and will be
     /// persisted on the next [`flush`](Self::flush) call.
     ///
+    /// # Concurrency
+    ///
+    /// This method rebuilds the bucket map non-atomically and must NOT run
+    /// concurrently with writers (`insert*` / `remove*`) or flushes. Call it
+    /// during startup/offline maintenance, before the index is shared.
+    ///
     /// # Returns
     ///
     /// `(old_bucket_count, new_bucket_count)`
@@ -1954,6 +2030,11 @@ where
     ///
     /// # Returns
     /// * `Vec<R>` - Vector of results from the function applied to the posting values
+    ///
+    /// # Re-entrancy
+    ///
+    /// `f` runs while internal locks are held (including the btree read lock).
+    /// It must not call back into the same index, or it may deadlock.
     pub fn prefix_query_with<F, R>(&self, prefix: &str, mut f: F) -> Vec<R>
     where
         F: FnMut(&str, &Vec<PK>) -> (bool, Option<R>),
@@ -1964,29 +2045,15 @@ where
         }
 
         self.query_count.fetch_add(1, Ordering::Relaxed);
-        // 空前缀：遍历全部键
-        if prefix.is_empty() {
-            for k in self.btree.read().iter() {
-                if let Some(posting) = self.postings.get(k) {
-                    let (con, rt) = f(k, &posting.2);
-                    if let Some(r) = rt {
-                        results.push(r);
-                    }
-                    if !con {
-                        break;
-                    }
-                }
+
+        // 从 prefix 起正序遍历，遇到第一个不以 prefix 开头的键即终止。
+        // 以 prefix 开头的键在 BTreeSet 中是连续区段，因此这种写法是完备的；
+        // 而旧实现构造 "prefix + char::MAX" 作为闭区间上界，会漏掉
+        // "prefix + char::MAX + 任意后缀" 这类键。空前缀自然退化为全量遍历。
+        for k in self.btree.read().range(prefix.to_string()..) {
+            if !k.starts_with(prefix) {
+                break;
             }
-            return results;
-        }
-
-        // [lower, upper] 区间：upper = prefix + char::MAX，覆盖所有以 prefix 开头的字符串
-        let lower = prefix.to_string();
-        let mut upper = String::with_capacity(prefix.len() + 4);
-        upper.push_str(prefix);
-        upper.push(char::MAX);
-
-        for k in self.btree.read().range(lower..=upper) {
             if let Some(posting) = self.postings.get(k) {
                 let (con, rt) = f(k, &posting.2);
                 if let Some(r) = rt {
@@ -4377,5 +4444,192 @@ mod tests {
         assert_eq!(index.stats().max_bucket_id, 0);
         assert!(index.has_dirty_buckets());
         assert_eq!(index.buckets.get(&0).unwrap().3, 1);
+    }
+
+    #[test]
+    fn test_prefix_query_includes_keys_containing_char_max() {
+        // Regression test: the old implementation used "prefix + char::MAX" as
+        // an inclusive upper bound, which missed keys like "app\u{10FFFF}x".
+        let index = create_test_index();
+
+        let plain = "app".to_string();
+        let with_max = format!("app{}", char::MAX);
+        let with_max_suffix = format!("app{}x", char::MAX);
+
+        index.insert(1, plain.clone(), now_ms()).unwrap();
+        index.insert(2, with_max.clone(), now_ms()).unwrap();
+        index.insert(3, with_max_suffix.clone(), now_ms()).unwrap();
+        index.insert(4, "apz".to_string(), now_ms()).unwrap();
+
+        let results = index.prefix_query_with("app", |k, _| (true, Some(k.to_string())));
+        assert_eq!(
+            results,
+            vec![plain, with_max, with_max_suffix],
+            "prefix query must cover every key starting with the prefix"
+        );
+    }
+
+    #[test]
+    fn test_load_metadata_caps_corrupted_num_elements_preallocation() {
+        // A corrupted/hostile num_elements must not drive a giant
+        // pre-allocation (or a capacity-overflow panic) on load.
+        let metadata = BTreeMetadata {
+            name: "huge".to_string(),
+            config: BTreeConfig::default(),
+            stats: BTreeStats {
+                version: 1,
+                num_elements: u64::MAX,
+                ..Default::default()
+            },
+        };
+        let mut buf = Vec::new();
+        ciborium::into_writer(
+            &BTreeIndexRef {
+                metadata: &metadata,
+            },
+            &mut buf,
+        )
+        .unwrap();
+
+        let index = BTreeIndex::<u64, String>::load_metadata(&buf[..]).unwrap();
+        assert_eq!(index.len(), 0);
+        index.insert(1, "a".to_string(), now_ms()).unwrap();
+        assert_eq!(index.len(), 1);
+    }
+
+    #[test]
+    fn test_chaos_concurrent_insert_remove_no_phantom_btree_keys() {
+        // Regression test for the phantom-btree-key race: an insert that
+        // creates a posting races with a remove that deletes the posting
+        // before the insert has added the key to the btree; the stale key
+        // must not survive in the btree.
+        //
+        // Plain OS threads (not tokio tasks): the remover busy-spins to stay
+        // temporally adjacent to the inserter, and a busy-spinning tokio task
+        // would starve the inserter task via the worker's non-stealable LIFO
+        // slot, while OS threads are preempted fairly.
+        for _ in 0..5 {
+            let index = BTreeIndex::<u64, String>::new(
+                "phantom_chaos".to_string(),
+                Some(BTreeConfig {
+                    bucket_overload_size: 4096,
+                    allow_duplicates: true,
+                }),
+            );
+
+            let n_keys = 3000u64;
+            let barrier = std::sync::Barrier::new(2);
+
+            std::thread::scope(|s| {
+                // Inserter: each (doc_id, key) pair is inserted exactly once.
+                s.spawn(|| {
+                    barrier.wait();
+                    for i in 0..n_keys {
+                        index.insert(i, format!("k{i}"), now_ms()).unwrap();
+                    }
+                });
+
+                // Remover: spins until each pair is actually removed, staying
+                // right on the inserter's heels so the remove lands inside
+                // insert's create-posting → add-btree-key window as often as
+                // possible. Every key therefore ends fully removed.
+                s.spawn(|| {
+                    barrier.wait();
+                    for i in 0..n_keys {
+                        let key = format!("k{i}");
+                        let mut spins = 0u64;
+                        while !index.remove(i, key.clone(), now_ms()) {
+                            spins += 1;
+                            assert!(spins < 100_000_000, "remover starved at ({i}, {key})");
+                            if spins.is_multiple_of(64) {
+                                // Guarantee inserter progress even on a
+                                // single-core machine.
+                                std::thread::yield_now();
+                            } else {
+                                std::hint::spin_loop();
+                            }
+                        }
+                    }
+                });
+            });
+
+            // Every pair was inserted once and removed once, so both postings
+            // and btree must be empty; any leftover btree key is a phantom.
+            assert_eq!(index.len(), 0);
+            assert_eq!(
+                index.keys(None, None),
+                Vec::<String>::new(),
+                "phantom btree keys without postings survived"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_chaos_unique_insert_array_keeps_bookkeeping_consistent() {
+        // Regression test: when a unique-index insert_array hits a concurrent
+        // uniqueness conflict mid-loop, the values inserted before the conflict
+        // must keep consistent bookkeeping (btree keys + bucket tracking) so
+        // they survive flush + reload.
+        for _ in 0..10 {
+            let index = Arc::new(BTreeIndex::<u64, String>::new(
+                "unique_chaos".to_string(),
+                Some(BTreeConfig {
+                    bucket_overload_size: 256,
+                    allow_duplicates: false,
+                }),
+            ));
+            let keys: Vec<String> = (0..50).map(|i| format!("k_{i:02}")).collect();
+            let barrier = Arc::new(Barrier::new(2));
+            let mut handles = Vec::new();
+            for doc_id in 1..=2u64 {
+                let index = index.clone();
+                let keys = keys.clone();
+                let b = barrier.clone();
+                handles.push(tokio::spawn(async move {
+                    b.wait().await;
+                    // One of the two calls may fail with AlreadyExists; the
+                    // applied prefix must still be consistent.
+                    let _ = index.insert_array(doc_id, keys, now_ms());
+                }));
+            }
+            futures::future::try_join_all(handles).await.unwrap();
+
+            let btree_keys = index.keys(None, None);
+            for key in &btree_keys {
+                assert!(index.postings.contains_key(key));
+            }
+            assert_eq!(
+                btree_keys.len(),
+                index.postings.len(),
+                "every applied posting must have a btree key"
+            );
+
+            let mut metadata_buf = Vec::new();
+            let mut bucket_data: std::collections::HashMap<u32, Vec<u8>> = Default::default();
+            index
+                .flush(&mut metadata_buf, now_ms(), async |id, data| {
+                    bucket_data.insert(id, data.to_vec());
+                    Ok(true)
+                })
+                .await
+                .unwrap();
+
+            let loaded: BTreeIndex<u64, String> =
+                BTreeIndex::load_all(&metadata_buf[..], async |id| {
+                    Ok(bucket_data.get(&id).cloned())
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                loaded.len(),
+                index.len(),
+                "postings lost across flush + reload"
+            );
+            for key in &btree_keys {
+                let original = index.query_with(key, |ids| Some(ids.clone()));
+                let reloaded = loaded.query_with(key, |ids| Some(ids.clone()));
+                assert_eq!(original, reloaded, "posting for {key} differs after reload");
+            }
+        }
     }
 }

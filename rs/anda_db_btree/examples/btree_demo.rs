@@ -49,6 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // persist the index to files
     {
+        std::fs::create_dir_all("debug/btree_demo")?;
         let metadata = std::fs::File::create("debug/btree_demo/metadata.cbor")?;
         index
             .flush(metadata, now_ms, async |id, data| {
@@ -61,7 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Load the index from metadata
-    let mut index2 = BTreeIndex::<String, u64>::load_metadata(std::fs::File::open(
+    let mut index2 = BTreeIndex::<u64, String>::load_metadata(std::fs::File::open(
         "debug/btree_demo/metadata.cbor",
     )?)?;
 
