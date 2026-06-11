@@ -275,7 +275,7 @@ where
             config: config.clone(),
             doc_tokens: DashMap::new(),
             postings: DashMap::new(),
-            buckets: DashMap::from_iter(vec![(0, Bucket::default())]),
+            buckets: DashMap::from_iter([(0, Bucket::default())]),
             metadata: RwLock::new(BM25Metadata {
                 name,
                 config,
@@ -341,7 +341,7 @@ where
             config: index.metadata.config.clone(),
             doc_tokens: DashMap::new(),
             postings: DashMap::new(),
-            buckets: DashMap::from_iter(vec![(0, Bucket::default())]),
+            buckets: DashMap::from_iter([(0, Bucket::default())]),
             metadata: RwLock::new(index.metadata),
             max_bucket_id,
             max_document_id,
@@ -361,6 +361,14 @@ where
     ///
     /// After this call, `total_tokens` and `avg_doc_tokens` are recomputed
     /// from the documents that were actually loaded.
+    ///
+    /// Posting entries that reference a document with no token count in any
+    /// loaded bucket are pruned and the affected buckets are marked dirty, so
+    /// the next [`flush`](Self::flush) persists the cleanup. Buckets are
+    /// written self-contained (a bucket's `doc_tokens` cover every document
+    /// referenced by its postings), so such entries can only be leftovers of
+    /// documents removed with non-original text; documents from buckets that
+    /// were skipped via `Ok(None)` are unaffected.
     pub async fn load_buckets<F>(&mut self, mut f: F) -> Result<(), BM25Error>
     where
         F: AsyncFnMut(u32) -> Result<Option<Vec<u8>>, BoxError>,
@@ -428,15 +436,56 @@ where
 
         let mut doc_ids_by_bucket: FxHashMap<u32, FxHashSet<u64>> = FxHashMap::default();
         let mut loaded_doc_tokens: FxHashMap<u64, usize> = FxHashMap::default();
+        let mut empty_tokens: Vec<(u32, String)> = Vec::new();
+        let mut bucket_size_decrease: FxHashMap<u32, usize> = FxHashMap::default();
 
-        for posting in self.postings.iter() {
+        for mut posting in self.postings.iter_mut() {
             let bucket_id = posting.0;
             let doc_ids = doc_ids_by_bucket.entry(bucket_id).or_default();
-            for (doc_id, _) in posting.1.iter() {
-                if let Some(token_count) = doc_token_lengths.get(doc_id) {
-                    loaded_doc_tokens.insert(*doc_id, *token_count);
-                    doc_ids.insert(*doc_id);
+            // Prune entries whose document has no token length anywhere.
+            // Buckets are self-contained (a bucket's doc_tokens cover every
+            // document referenced by its postings), so after loading, an entry
+            // without a token length can only be a stale leftover from a
+            // remove() that was given non-original text. Dropping it here makes
+            // the index self-healing on reload. Documents from buckets that
+            // were intentionally skipped (partial load) are not affected.
+            let mut removed_entries: Vec<(u64, usize)> = Vec::new();
+            posting.1.retain(|entry| {
+                if let Some(token_count) = doc_token_lengths.get(&entry.0) {
+                    loaded_doc_tokens.insert(entry.0, *token_count);
+                    doc_ids.insert(entry.0);
+                    true
+                } else {
+                    removed_entries.push(*entry);
+                    false
                 }
+            });
+
+            if !removed_entries.is_empty() {
+                let size_decrease = if posting.1.is_empty() {
+                    empty_tokens.push((bucket_id, posting.key().clone()));
+                    estimate_cbor_size(&(posting.key(), (bucket_id, &removed_entries))) + 2
+                } else {
+                    removed_entries
+                        .iter()
+                        .map(|entry| estimate_cbor_size(entry) + 2)
+                        .sum()
+                };
+                *bucket_size_decrease.entry(bucket_id).or_default() += size_decrease;
+            }
+        }
+
+        for (bucket_id, token) in empty_tokens {
+            self.postings.remove(&token);
+            if let Some(mut bucket) = self.buckets.get_mut(&bucket_id) {
+                bucket.tokens.swap_remove_if(|k| k == &token);
+            }
+        }
+
+        for (bucket_id, size_decrease) in bucket_size_decrease {
+            if let Some(mut bucket) = self.buckets.get_mut(&bucket_id) {
+                bucket.size = bucket.size.saturating_sub(size_decrease);
+                bucket.mark_dirty();
             }
         }
 
@@ -552,7 +601,7 @@ where
         // Phase 1: Update the postings collection
         let bucket_id = self.max_bucket_id.load(Ordering::Acquire);
         let tokens: usize = token_freqs.values().sum();
-        // buckets_to_update: BTreeMap<bucketid, FxHashMap<token, size_increase>>
+        // buckets_to_update: FxHashMap<bucketid, FxHashMap<token, size_increase>>
         let mut buckets_to_update: FxHashMap<u32, FxHashMap<String, usize>> = FxHashMap::default();
         match self.doc_tokens.entry(id) {
             dashmap::Entry::Occupied(_) => {
@@ -583,9 +632,17 @@ where
                     match self.postings.entry(token.clone()) {
                         dashmap::Entry::Occupied(mut entry) => {
                             let val = (id, freq);
-                            let size_increase = estimate_cbor_size(&val) + 2;
                             let e = entry.get_mut();
-                            e.1.push(val);
+                            // `push` is a no-op when the exact (doc, freq) pair is
+                            // already present (a stale entry left by a remove() with
+                            // non-original text). Don't count its size again, but
+                            // still mark the bucket dirty below so the refreshed
+                            // doc_tokens snapshot gets persisted.
+                            let size_increase = if e.1.push(val) {
+                                estimate_cbor_size(&val) + 2
+                            } else {
+                                0
+                            };
                             let b = buckets_to_update.entry(e.0).or_default();
                             b.insert(token, size_increase);
                         }
@@ -693,8 +750,9 @@ where
     /// [`insert`](Self::insert); it is re-tokenized to identify which posting
     /// lists should drop this document. If the text does not match, postings
     /// may retain stale entries — searches still skip them because scoring
-    /// filters by `doc_tokens` membership, but the index will grow until a
-    /// [`compact_buckets`](Self::compact_buckets) is performed.
+    /// filters by `doc_tokens` membership, and the stale entries are pruned
+    /// the next time the index is loaded via
+    /// [`load_buckets`](Self::load_buckets).
     ///
     /// # Arguments
     ///
@@ -736,25 +794,47 @@ where
         // buckets_to_update: FxHashMap<bucketid, FxHashMap<token, size_decrease>>
         let mut buckets_to_update: FxHashMap<u32, FxHashMap<String, usize>> = FxHashMap::default();
         // Remove from inverted index
-        let mut tokens_to_remove: FxHashSet<String> = FxHashSet::default();
+        let mut maybe_empty_tokens: Vec<String> = Vec::new();
         for (token, _) in token_freqs {
             if let Some(mut posting) = self.postings.get_mut(&token) {
-                // Remove document from postings list
-                if let Some(val) = posting.1.swap_remove_if(|&(idx, _)| idx == id) {
-                    let mut size_decrease = estimate_cbor_size(&val) + 2;
-                    if posting.1.is_empty() {
-                        size_decrease =
-                            estimate_cbor_size(&(&token, (posting.0, &[(val.0, val.1)]))) + 2;
-                        tokens_to_remove.insert(token.clone());
-                    }
-                    let b = buckets_to_update.entry(posting.0).or_default();
-                    b.insert(token, size_decrease);
+                // Remove every entry for this document. Duplicates can exist
+                // when a previous remove() was given non-original text and the
+                // document was re-inserted afterwards.
+                let mut removed_vals: Vec<(u64, usize)> = Vec::new();
+                while let Some(val) = posting.1.swap_remove_if(|&(idx, _)| idx == id) {
+                    removed_vals.push(val);
                 }
+                if removed_vals.is_empty() {
+                    continue;
+                }
+
+                let size_decrease = if posting.1.is_empty() {
+                    maybe_empty_tokens.push(token.clone());
+                    estimate_cbor_size(&(&token, (posting.0, &removed_vals))) + 2
+                } else {
+                    removed_vals
+                        .iter()
+                        .map(|val| estimate_cbor_size(val) + 2)
+                        .sum()
+                };
+                let b = buckets_to_update.entry(posting.0).or_default();
+                b.insert(token, size_decrease);
             }
         }
 
-        for token in tokens_to_remove.iter() {
-            self.postings.remove(token);
+        // Drop empty postings atomically: a concurrent insert may have appended
+        // a new entry after the guard above was released, in which case the
+        // posting must survive. `remove_if` re-checks under the shard lock.
+        let mut removed_postings: FxHashSet<String> =
+            FxHashSet::with_capacity_and_hasher(maybe_empty_tokens.len(), FxBuildHasher);
+        for token in maybe_empty_tokens {
+            if self
+                .postings
+                .remove_if(&token, |_, posting| posting.1.is_empty())
+                .is_some()
+            {
+                removed_postings.insert(token);
+            }
         }
 
         for (bucket_id, val) in buckets_to_update {
@@ -763,7 +843,7 @@ where
                 b.mark_dirty();
                 for (token, size_decrease) in val {
                     b.size = b.size.saturating_sub(size_decrease);
-                    if tokens_to_remove.contains(&token) {
+                    if removed_postings.contains(&token) {
                         b.tokens.swap_remove_if(|k| &token == k);
                     }
                 }
@@ -771,8 +851,20 @@ where
             }
         }
 
-        for mut bucket in self.buckets.iter_mut() {
-            if bucket.doc_ids.remove(&id) {
+        // Other buckets may still reference this document in their serialized
+        // doc_tokens (e.g. stale postings left by a remove() with non-original
+        // text); mark them dirty so the next flush drops the reference.
+        // Read-scan first to avoid write-locking every shard on each remove.
+        let stale_buckets: Vec<u32> = self
+            .buckets
+            .iter()
+            .filter(|bucket| bucket.doc_ids.contains(&id))
+            .map(|bucket| *bucket.key())
+            .collect();
+        for bucket_id in stale_buckets {
+            if let Some(mut bucket) = self.buckets.get_mut(&bucket_id)
+                && bucket.doc_ids.remove(&id)
+            {
                 bucket.mark_dirty();
             }
         }
@@ -910,31 +1002,37 @@ where
             return FxHashMap::default();
         }
 
+        let doc_count = self.doc_tokens.len() as f32;
+        if doc_count == 0.0 {
+            return FxHashMap::default();
+        }
+
         let mut scores: FxHashMap<u64, f32> =
             FxHashMap::with_capacity_and_hasher(self.doc_tokens.len().min(1000), FxBuildHasher);
-        let doc_count = self.doc_tokens.len() as f32;
         let avg_doc_tokens = *self.avg_doc_tokens.read();
         let avg_doc_tokens = avg_doc_tokens.max(1.0);
 
         for query_token in query_terms.keys() {
             if let Some(postings) = self.postings.get(query_token) {
-                // Single-pass: collect (doc_id, tf, doc_len) for valid documents in one
-                // sweep over the postings. Avoids two DashMap lookups per posting entry.
+                // Single-pass: collect doc_id -> (tf, doc_len) for valid documents
+                // in one sweep over the postings.
                 // Filter out deleted / not-loaded documents:
                 // `remove()` depends on the caller providing original text; if they don't,
                 // postings can become stale. Also, when only part of buckets are loaded,
                 // postings might contain docs missing in `doc_tokens`.
-                let valid: Vec<(u64, f32, f32)> = postings
-                    .1
-                    .iter()
-                    .filter_map(|(doc_id, token_freq)| {
-                        self.doc_tokens
-                            .get(doc_id)
-                            .map(|v| (*doc_id, *token_freq as f32, *v as f32))
-                    })
-                    .collect();
+                // Keyed by doc_id so a stale duplicate entry (left by a remove()
+                // with non-original text followed by a re-insert) cannot be
+                // scored twice or inflate the document frequency; the newest
+                // (last) entry wins.
+                let mut valid: FxHashMap<u64, (f32, f32)> =
+                    FxHashMap::with_capacity_and_hasher(postings.1.len(), FxBuildHasher);
+                for (doc_id, token_freq) in postings.1.iter() {
+                    if let Some(v) = self.doc_tokens.get(doc_id) {
+                        valid.insert(*doc_id, (*token_freq as f32, *v as f32));
+                    }
+                }
 
-                if valid.is_empty() || doc_count == 0.0 {
+                if valid.is_empty() {
                     continue;
                 }
 
@@ -943,7 +1041,7 @@ where
                 let idf = ((doc_count - df + 0.5) / (df + 0.5) + 1.0).ln();
 
                 // Compute BM25 score for each valid document
-                for (doc_id, tf, doc_len) in valid {
+                for (doc_id, (tf, doc_len)) in valid {
                     let tf_component =
                         (tf * (k1 + 1.0)) / (tf + k1 * (1.0 - b + b * doc_len / avg_doc_tokens));
                     *scores.entry(doc_id).or_default() += idf * tf_component;
@@ -985,28 +1083,32 @@ where
             return self.execute_query(&subqueries[0], params, false);
         }
 
-        // Execute the first subquery
-        let mut result = self.execute_query(&subqueries[0], params, false);
-        if result.is_empty() {
-            return FxHashMap::default();
-        }
+        // Evaluate non-NOT subqueries first so that a leading NOT does not
+        // force building the full complement document set: `NOT a AND b`
+        // takes the same cheap path as `b AND NOT a`. The result is
+        // order-independent (intersection then subtraction).
+        let (positives, negatives): (Vec<&QueryType>, Vec<&QueryType>) = subqueries
+            .iter()
+            .map(|q| q.as_ref())
+            .partition(|q| !matches!(q, QueryType::Not(_)));
 
-        // Execute the remaining subqueries and intersect the results
-        for subquery in &subqueries[1..] {
-            let sub_result = self.execute_query(subquery, params, true);
-            if matches!(subquery.as_ref(), QueryType::Not(_)) {
-                // handle NOT query, remove it from the result
-                for doc_id in sub_result.keys() {
-                    result.remove(doc_id);
-                }
-                continue;
+        let mut result = if let Some((&first, _)) = positives.split_first() {
+            self.execute_query(first, params, false)
+        } else {
+            // All subqueries are NOT: start from the complement of the first
+            // and subtract the rest below.
+            self.execute_query(negatives[0], params, false)
+        };
+
+        // Intersect the remaining positive subqueries, merging scores.
+        for &subquery in positives.iter().skip(1) {
+            if result.is_empty() {
+                return result;
             }
+            let sub_result = self.execute_query(subquery, params, false);
 
             // Retain only documents that are in both results
             result.retain(|k, _| sub_result.contains_key(k));
-            if result.is_empty() {
-                return FxHashMap::default();
-            }
 
             // Merge scores
             for (doc_id, score) in sub_result {
@@ -1014,17 +1116,35 @@ where
             }
         }
 
+        // Subtract documents matching the negated subqueries.
+        let skip_negatives = if positives.is_empty() { 1 } else { 0 };
+        for &subquery in negatives.iter().skip(skip_negatives) {
+            if result.is_empty() {
+                return result;
+            }
+            let excluded = self.execute_query(subquery, params, true);
+            for doc_id in excluded.keys() {
+                result.remove(doc_id);
+            }
+        }
+
         result
     }
 
-    /// Scores a NOT query
+    /// Scores a NOT query.
+    ///
+    /// The subquery is always evaluated in normal (non-negated) mode;
+    /// `negated_not` only selects what to return: the matching documents
+    /// (the AND caller subtracts them) or their complement. Evaluating the
+    /// subquery with the parent's negation flag would mis-handle double
+    /// negation such as `a AND NOT (NOT b)`.
     fn score_not(
         &self,
         subquery: &QueryType,
         params: &BM25Params,
         negated_not: bool,
     ) -> FxHashMap<u64, f32> {
-        let exclude = self.execute_query(subquery, params, negated_not);
+        let exclude = self.execute_query(subquery, params, false);
         if negated_not {
             return exclude;
         }
@@ -1654,6 +1774,28 @@ mod tests {
                 "removed document was found after reload for term '{term}'"
             );
         }
+
+        // Loading prunes stale posting entries of deleted documents entirely,
+        // and the resulting cleanup is flushed on the next store.
+        assert!(
+            loaded_index.postings.is_empty(),
+            "stale postings must be pruned on load"
+        );
+        assert!(loaded_index.has_dirty_buckets());
+
+        let mut metadata2: Vec<u8> = Vec::new();
+        loaded_index
+            .flush(&mut metadata2, 4, async |id: u32, data: &[u8]| {
+                buckets.insert(id, data.to_vec());
+                Ok(true)
+            })
+            .await
+            .unwrap();
+        for data in buckets.values() {
+            let bucket: BucketOwned = ciborium::from_reader(&data[..]).unwrap();
+            assert!(bucket.postings.is_empty());
+            assert!(bucket.doc_tokens.is_empty());
+        }
     }
 
     #[test]
@@ -1946,6 +2088,125 @@ mod tests {
         let results = index.search_advanced("NOT fox", 10, None);
         let ids: Vec<u64> = results.iter().map(|(id, _)| *id).collect();
         assert_eq!(ids, vec![3]);
+    }
+
+    #[test]
+    fn test_double_negation_inside_and() {
+        let index = create_test_index();
+
+        // dog AND NOT (NOT lazy) === dog AND lazy => 文档1、2、3
+        let results = index.search_advanced("dog AND NOT (NOT lazy)", 10, None);
+        let mut ids: Vec<u64> = results.iter().map(|(id, _)| *id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2, 3]);
+
+        // NOT (NOT fox) === fox => 文档1、2、4
+        let results = index.search_advanced("NOT (NOT fox)", 10, None);
+        let mut ids: Vec<u64> = results.iter().map(|(id, _)| *id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2, 4]);
+    }
+
+    #[test]
+    fn test_not_first_in_and_matches_not_last() {
+        let index = create_test_index();
+
+        // NOT lazy AND fox === fox AND NOT lazy => 只有文档4
+        let a = index.search_advanced("NOT lazy AND fox", 10, None);
+        let b = index.search_advanced("fox AND NOT lazy", 10, None);
+        let mut ids_a: Vec<u64> = a.iter().map(|(id, _)| *id).collect();
+        let mut ids_b: Vec<u64> = b.iter().map(|(id, _)| *id).collect();
+        ids_a.sort_unstable();
+        ids_b.sort_unstable();
+        assert_eq!(ids_a, vec![4]);
+        assert_eq!(ids_a, ids_b);
+    }
+
+    #[test]
+    fn test_and_with_only_not_subqueries() {
+        let index = create_test_index();
+
+        // NOT fox AND NOT rare => 不含 fox 也不含 rare 的文档 (文档3)
+        let results = index.search_advanced("NOT fox AND NOT rare", 10, None);
+        let ids: Vec<u64> = results.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![3]);
+    }
+
+    #[test]
+    fn test_reinsert_after_remove_with_wrong_text() {
+        let index = BM25Index::new("reinsert".to_string(), default_tokenizer(), None);
+        index.insert(1, "dog dog cat", 0).unwrap();
+
+        // Remove with non-original text: the "dog"/"cat" postings keep stale entries.
+        assert!(index.remove(1, "bird", 0));
+
+        // Re-insert the same id with a different "dog" frequency; the stale
+        // posting entry must not be double-counted nor inflate df.
+        index.insert(1, "dog dog dog mouse", 0).unwrap();
+
+        let results = index.search("dog", 10, None);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, 1);
+        assert!(
+            results[0].1.is_finite() && results[0].1 > 0.0,
+            "score must be positive, got {}",
+            results[0].1
+        );
+
+        // Removing with the correct text must clear all entries for the doc,
+        // including stale duplicates, and drop the now-empty posting.
+        assert!(index.remove(1, "dog dog dog mouse", 0));
+        assert!(index.search("dog", 10, None).is_empty());
+        assert!(index.postings.get("dog").is_none());
+    }
+
+    #[test]
+    fn test_concurrent_insert_remove_shared_token() {
+        use std::thread;
+
+        // Regression test: remove() must not drop a posting that a concurrent
+        // insert just appended to (the empty-check and the removal must be
+        // atomic). Two writers share the token "shared"; the reader-side
+        // assertion in thread B would fail if the posting got lost.
+        let index = Arc::new(BM25Index::new(
+            "concurrent_shared".to_string(),
+            default_tokenizer(),
+            None,
+        ));
+
+        const ITERS: usize = 500;
+        let a = {
+            let index = index.clone();
+            thread::spawn(move || {
+                for _ in 0..ITERS {
+                    index.insert(2, "shared alpha", 0).unwrap();
+                    assert!(index.remove(2, "shared alpha", 0));
+                }
+            })
+        };
+        let b = {
+            let index = index.clone();
+            thread::spawn(move || {
+                for _ in 0..ITERS {
+                    index.insert(3, "shared beta", 0).unwrap();
+                    let results = index.search("shared", 10, None);
+                    assert!(
+                        results.iter().any(|(id, _)| *id == 3),
+                        "doc 3 must stay searchable while it exists"
+                    );
+                    assert!(index.remove(3, "shared beta", 0));
+                }
+            })
+        };
+
+        a.join().unwrap();
+        b.join().unwrap();
+
+        // After all churn the index must still accept and find new documents.
+        index.insert(10, "shared final", 0).unwrap();
+        let results = index.search("shared", 10, None);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, 10);
     }
 
     #[tokio::test]
