@@ -112,11 +112,31 @@ mod tests {
             json.get("name"),
             Some(&Json::String("execute_kip".to_string()))
         );
-        assert_eq!(json["parameters"]["properties"]["command"]["minLength"], 1);
-        assert_eq!(json["parameters"]["properties"]["commands"]["minItems"], 1);
         assert_eq!(
-            json["parameters"]["properties"]["commands"]["items"]["oneOf"][0]["minLength"],
-            1
+            json["parameters"]["properties"]["command"]["type"],
+            Json::String("string".to_string())
+        );
+        assert_eq!(
+            json["parameters"]["properties"]["commands"]["type"],
+            Json::String("array".to_string())
+        );
+        // minLength/minItems were removed so retried calls with empty inputs
+        // surface as KIP errors instead of schema validation failures.
+        assert!(
+            json["parameters"]["properties"]["command"]
+                .get("minLength")
+                .is_none()
+        );
+        assert!(
+            json["parameters"]["properties"]["commands"]
+                .get("minItems")
+                .is_none()
+        );
+        assert!(
+            json["parameters"]["properties"]["commands"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("UPSERT/UPDATE/MERGE/DELETE")
         );
     }
 
@@ -128,11 +148,29 @@ mod tests {
             json.get("name"),
             Some(&Json::String("execute_kip_readonly".to_string()))
         );
-        assert_eq!(json["parameters"]["properties"]["command"]["minLength"], 1);
-        assert_eq!(json["parameters"]["properties"]["commands"]["minItems"], 1);
         assert_eq!(
-            json["parameters"]["properties"]["commands"]["items"]["oneOf"][0]["minLength"],
-            1
+            json["parameters"]["properties"]["command"]["type"],
+            Json::String("string".to_string())
+        );
+        assert_eq!(
+            json["parameters"]["properties"]["commands"]["type"],
+            Json::String("array".to_string())
+        );
+        assert!(
+            json["parameters"]["properties"]["command"]
+                .get("minLength")
+                .is_none()
+        );
+        assert!(
+            json["parameters"]["properties"]["commands"]
+                .get("minItems")
+                .is_none()
+        );
+        assert!(
+            json["parameters"]["properties"]["command"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("EXPORT")
         );
     }
 }

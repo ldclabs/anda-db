@@ -211,10 +211,8 @@ impl TryFrom<TargetTerm> for EntityPK {
     /// * `Err(KipError)` - If the target term is invalid or unsupported
     fn try_from(value: TargetTerm) -> Result<Self, Self::Error> {
         match value {
-            TargetTerm::Concept { matcher, .. } => {
-                Ok(EntityPK::Concept(ConceptPK::try_from(matcher)?))
-            }
-            TargetTerm::Proposition { matcher, .. } => {
+            TargetTerm::Concept(matcher) => Ok(EntityPK::Concept(ConceptPK::try_from(matcher)?)),
+            TargetTerm::Proposition(matcher) => {
                 Ok(EntityPK::Proposition(PropositionPK::try_from(*matcher)?))
             }
             _ => Err(KipError::invalid_syntax(format!(
@@ -512,18 +510,12 @@ mod tests {
         );
 
         let matcher = PropositionMatcher::Object {
-            subject: TargetTerm::Concept {
-                variable: Some("s".to_string()),
-                matcher: ConceptMatcher::Object {
-                    r#type: "Person".to_string(),
-                    name: "Ada".to_string(),
-                },
-            },
+            subject: TargetTerm::Concept(ConceptMatcher::Object {
+                r#type: "Person".to_string(),
+                name: "Ada".to_string(),
+            }),
             predicate: PredTerm::Literal("likes".to_string()),
-            object: TargetTerm::Concept {
-                variable: None,
-                matcher: ConceptMatcher::ID("C:2".to_string()),
-            },
+            object: TargetTerm::Concept(ConceptMatcher::ID("C:2".to_string())),
         };
         let object_pk = PropositionPK::try_from(matcher).unwrap();
         assert_eq!(
@@ -536,27 +528,19 @@ mod tests {
             PropositionPK::try_from(PropositionMatcher::Object {
                 subject: TargetTerm::Variable("s".to_string()),
                 predicate: PredTerm::Variable("p".to_string()),
-                object: TargetTerm::Concept {
-                    variable: None,
-                    matcher: ConceptMatcher::ID("C:1".to_string()),
-                },
+                object: TargetTerm::Concept(ConceptMatcher::ID("C:1".to_string())),
             })
             .is_err()
         );
 
         assert_eq!(
-            EntityPK::try_from(TargetTerm::Concept {
-                variable: None,
-                matcher: ConceptMatcher::ID("C:7".to_string()),
-            })
-            .unwrap(),
+            EntityPK::try_from(TargetTerm::Concept(ConceptMatcher::ID("C:7".to_string()))).unwrap(),
             EntityPK::Concept(ConceptPK::ID(7))
         );
         assert_eq!(
-            EntityPK::try_from(TargetTerm::Proposition {
-                variable: None,
-                matcher: Box::new(PropositionMatcher::ID("P:9:likes".to_string())),
-            })
+            EntityPK::try_from(TargetTerm::Proposition(Box::new(PropositionMatcher::ID(
+                "P:9:likes".to_string()
+            ))))
             .unwrap(),
             EntityPK::Proposition(PropositionPK::ID(9, "likes".to_string()))
         );

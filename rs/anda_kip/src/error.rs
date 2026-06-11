@@ -41,6 +41,8 @@ pub enum KipErrorCode {
     DuplicateExists,
     /// KIP_3004: ImmutableTarget - Attempted to modify/delete protected system nodes.
     ImmutableTarget,
+    /// KIP_3005: VersionConflict - `EXPECT VERSION` mismatch on a conditional write.
+    VersionConflict,
 
     // 4xxx: System & Execution errors
     /// KIP_4001: ExecutionTimeout - Query too complex, execution time exceeded system limit.
@@ -67,6 +69,7 @@ impl KipErrorCode {
             Self::NotFound => "KIP_3002",
             Self::DuplicateExists => "KIP_3003",
             Self::ImmutableTarget => "KIP_3004",
+            Self::VersionConflict => "KIP_3005",
             // 4xxx: System & Execution
             Self::ExecutionTimeout => "KIP_4001",
             Self::ResourceExhausted => "KIP_4002",
@@ -89,6 +92,7 @@ impl KipErrorCode {
             Self::NotFound => "NotFound",
             Self::DuplicateExists => "DuplicateExists",
             Self::ImmutableTarget => "ImmutableTarget",
+            Self::VersionConflict => "VersionConflict",
             // 4xxx: System & Execution
             Self::ExecutionTimeout => "ExecutionTimeout",
             Self::ResourceExhausted => "ResourceExhausted",
@@ -122,6 +126,9 @@ impl KipErrorCode {
             }
             Self::ImmutableTarget => {
                 "**Operation Prohibited.** Do not attempt to modify system meta-definitions or core identity nodes."
+            }
+            Self::VersionConflict => {
+                "The element changed since you read it. Re-read it (obtaining the fresh `_version`), re-apply your merge in memory, and retry with the new `EXPECT VERSION`."
             }
             // 4xxx: System & Execution
             Self::ExecutionTimeout => {
@@ -224,6 +231,11 @@ impl KipError {
         Self::new(KipErrorCode::ImmutableTarget, format!("{err}"))
     }
 
+    /// Creates a VersionConflict error (KIP_3005)
+    pub fn version_conflict(err: impl Display) -> Self {
+        Self::new(KipErrorCode::VersionConflict, format!("{err}"))
+    }
+
     // ==================== 4xxx: System & Execution Errors ====================
 
     /// Creates an ExecutionTimeout error (KIP_4001)
@@ -310,7 +322,7 @@ fn format_verbose_error(input: &str, ve: VerboseError<&str>) -> String {
                         let got = take_first_chars(slice, 20);
                         format!(
                             "Unrecognized KIP command starting with: \"{}\". \
-                             A KIP statement must begin with FIND, UPSERT, DELETE, DESCRIBE, or SEARCH (case-sensitive).",
+                             A KIP statement must begin with FIND, UPSERT, UPDATE, MERGE, DELETE, DESCRIBE, SEARCH, or EXPORT (case-sensitive).",
                             got
                         )
                     } else {
@@ -342,12 +354,12 @@ fn format_verbose_error(input: &str, ve: VerboseError<&str>) -> String {
                 nom::error::ErrorKind::Alt => {
                     if is_at_start {
                         if slice.is_empty() {
-                            "Empty input. A KIP statement must begin with FIND, UPSERT, DELETE, DESCRIBE, or SEARCH.".to_string()
+                            "Empty input. A KIP statement must begin with FIND, UPSERT, UPDATE, MERGE, DELETE, DESCRIBE, SEARCH, or EXPORT.".to_string()
                         } else {
                             let got = take_first_chars(slice, 20);
                             format!(
                                 "Unrecognized KIP command starting with: \"{}\". \
-                                 A KIP statement must begin with FIND, UPSERT, DELETE, DESCRIBE, or SEARCH (case-sensitive).",
+                                 A KIP statement must begin with FIND, UPSERT, UPDATE, MERGE, DELETE, DESCRIBE, SEARCH, or EXPORT (case-sensitive).",
                                 got
                             )
                         }
@@ -417,6 +429,34 @@ fn expected_syntax_for_context(
         return Some(
             "{id: \"...\"}, {type: \"Type\"}, {name: \"Name\"}, or {type: \"Type\", name: \"Name\"}".to_string(),
         );
+    }
+
+    if context_contains(contexts, "KQL target term") {
+        return Some(
+            "a bound variable ?var, an unnamed {type/name/id} concept clause, or an unnamed (subject, predicate, object) clause — do not attach a variable to an embedded endpoint clause; bind it in a separate clause first".to_string(),
+        );
+    }
+
+    if context_contains(contexts, "EXPECT VERSION") {
+        return Some(
+            "EXPECT VERSION <non-negative integer> (0 asserts the element does not exist yet)"
+                .to_string(),
+        );
+    }
+
+    if context_contains(contexts, "UPDATE expression") || context_contains(contexts, "UPDATE value")
+    {
+        return Some(
+            "a JSON value or an update expression: ADD(a, b) | MUL(a, b) | CLAMP(x, lo, hi) | COALESCE(x, default); operands are numbers, nested expressions, or dot-paths on the UPDATE target itself".to_string(),
+        );
+    }
+
+    if context_contains(contexts, "SEARCH MODE") {
+        return Some("\"keyword\", \"semantic\", or \"hybrid\" (quoted)".to_string());
+    }
+
+    if context_contains(contexts, "SEARCH THRESHOLD") {
+        return Some("a number between 0.0 and 1.0".to_string());
     }
 
     if context_contains(contexts, "FILTER") {
@@ -533,8 +573,8 @@ fn generate_recovery_suggestion(
     if is_at_start {
         return Some(
             "A KIP statement must start with one of: \
-             FIND (for queries), UPSERT/DELETE (for modifications), \
-             or DESCRIBE/SEARCH (for schema exploration). \
+             FIND (for queries), UPSERT/UPDATE/MERGE/DELETE (for modifications), \
+             or DESCRIBE/SEARCH/EXPORT (for exploration & grounding). \
              All keywords are case-sensitive and must be UPPERCASE."
                 .to_string(),
         );
@@ -594,6 +634,42 @@ fn generate_recovery_suggestion(
             "FIND clause syntax: FIND(?variable) or FIND(?var1, ?var2, COUNT(?var3)). \
              Variables start with '?' followed by an identifier. \
              Aggregation functions: COUNT, SUM, AVG, MIN, MAX."
+                .to_string(),
+        );
+    }
+
+    if innermost.contains("UPDATE") {
+        return Some(
+            "UPDATE syntax: UPDATE ?target SET ATTRIBUTES { key: value_or_expr, ... } SET METADATA { ... } WHERE {...} [LIMIT N]. \
+             At least one SET block is required. \
+             Update expressions: ADD(a, b), MUL(a, b), CLAMP(x, lo, hi), COALESCE(x, default); \
+             operands are numbers, nested expressions, or dot-paths on the target itself \
+             (e.g., ?target.metadata.confidence). Reserved `_` metadata keys cannot be written."
+                .to_string(),
+        );
+    }
+
+    if innermost.contains("MERGE") {
+        return Some(
+            "MERGE syntax: MERGE CONCEPT ?source INTO ?target WHERE { ... }. \
+             Each variable must bind exactly one concept node, and both nodes must have the same type."
+                .to_string(),
+        );
+    }
+
+    if innermost.contains("EXPORT") {
+        return Some(
+            "EXPORT syntax: EXPORT ?target WHERE { ... } [LIMIT N]. \
+             Serializes the matched concepts/propositions into an idempotent UPSERT capsule (read-only)."
+                .to_string(),
+        );
+    }
+
+    if innermost.contains("EXPECT VERSION") {
+        return Some(
+            "EXPECT VERSION syntax: EXPECT VERSION <n>, placed immediately after the identity clause \
+             in a CONCEPT/PROPOSITION block. <n> is a non-negative integer; 0 means create-only \
+             (the element must not exist yet)."
                 .to_string(),
         );
     }
@@ -683,8 +759,9 @@ fn generate_recovery_suggestion(
             "META commands: DESCRIBE PRIMER | DESCRIBE DOMAINS | \
              DESCRIBE CONCEPT TYPES [LIMIT N] | DESCRIBE CONCEPT TYPE \"TypeName\" | \
              DESCRIBE PROPOSITION TYPES [LIMIT N] | DESCRIBE PROPOSITION TYPE \"pred\" | \
-             SEARCH CONCEPT \"term\" [WITH TYPE \"T\"] [LIMIT N] | \
-             SEARCH PROPOSITION \"term\" [WITH TYPE \"T\"] [LIMIT N]."
+             SEARCH CONCEPT|PROPOSITION \"term\" [WITH TYPE \"T\"] \
+             [MODE \"keyword\"|\"semantic\"|\"hybrid\"] [THRESHOLD 0.0-1.0] [LIMIT N] | \
+             EXPORT ?target WHERE { ... } [LIMIT N]."
                 .to_string(),
         );
     }
@@ -731,8 +808,8 @@ fn generate_recovery_suggestion(
     if contexts.is_empty() {
         return Some(
             "A KIP statement must start with one of: \
-             FIND (for queries), UPSERT/DELETE (for modifications), \
-             or DESCRIBE/SEARCH (for schema exploration). \
+             FIND (for queries), UPSERT/UPDATE/MERGE/DELETE (for modifications), \
+             or DESCRIBE/SEARCH/EXPORT (for exploration & grounding). \
              Keywords are case-sensitive and must be UPPERCASE."
                 .to_string(),
         );
@@ -792,9 +869,12 @@ fn lowercase_keyword_correction(input: &str) -> Option<(&str, &'static str)> {
         "find" => "FIND",
         "where" => "WHERE",
         "upsert" => "UPSERT",
+        "update" => "UPDATE",
+        "merge" => "MERGE",
         "delete" => "DELETE",
         "describe" => "DESCRIBE",
         "search" => "SEARCH",
+        "export" => "EXPORT",
         "filter" => "FILTER",
         "optional" => "OPTIONAL",
         "not" => "NOT",
@@ -904,6 +984,7 @@ mod tests {
             (KipErrorCode::NotFound, "KIP_3002", "NotFound"),
             (KipErrorCode::DuplicateExists, "KIP_3003", "DuplicateExists"),
             (KipErrorCode::ImmutableTarget, "KIP_3004", "ImmutableTarget"),
+            (KipErrorCode::VersionConflict, "KIP_3005", "VersionConflict"),
             (
                 KipErrorCode::ExecutionTimeout,
                 "KIP_4001",
@@ -934,6 +1015,7 @@ mod tests {
             KipError::not_found("bad"),
             KipError::duplicate_exists("bad"),
             KipError::immutable_target("bad"),
+            KipError::version_conflict("bad"),
             KipError::execution_timeout("bad"),
             KipError::resource_exhausted("bad"),
             KipError::internal_error("bad"),

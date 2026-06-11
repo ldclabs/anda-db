@@ -40,6 +40,8 @@ During each sleep cycle:
 
 Gather state before changing anything.
 
+> Queries containing `:type` are **per-type templates** — iterate over concept types from the Primer; KIP has no untyped match-all concept clause.
+
 ```prolog
 // 1.1 Pending SleepTasks for $system
 FIND(?task) WHERE {
@@ -200,30 +202,40 @@ FIND(?a.name, ?b.name) WHERE {
 } LIMIT 50
 ```
 
-Merge survivor + casualty: copy missing attributes onto survivor, redirect propositions to survivor, archive the casualty (do not hard-delete — preserve provenance via `superseded` / `merged_into`).
+Semantic search also catches paraphrase twins: `SEARCH CONCEPT :name MODE "semantic" THRESHOLD 0.85 LIMIT 5`. Verify both candidates with `FIND` (similarity is not identity), enrich the survivor first if the duplicate holds better attribute values (`MERGE` never overwrites existing target values), then merge atomically:
+
+```prolog
+MERGE CONCEPT ?dup INTO ?survivor
+WHERE {
+  ?dup {type: :type, name: :duplicate_name}
+  ?survivor {type: :type, name: :survivor_name}
+}
+```
+
+`MERGE` repoints all incident links (IDs and higher-order references preserved), unions `aliases` (the duplicate's `name` included), fills missing attributes, records `_merged_from` provenance, and removes the duplicate — one transaction.
 
 ### Phase 7 — Confidence Decay
 
-```prolog
-FIND(?link) WHERE {
-  ?link (?s, "prefers", ?o)
-  FILTER(?link.metadata.created_at < :decay_threshold)
-  FILTER(?link.metadata.confidence > 0.3)
-} LIMIT 100
-```
-
-Apply formula `new_confidence = old_confidence * decay_factor` (e.g., 0.95 per week):
+Apply formula `new_confidence = old_confidence * decay_factor` (e.g., 0.95 per week) as **one bulk `UPDATE`** — a predicate variable sweeps all predicates, and the arithmetic runs per element:
 
 ```prolog
-UPSERT {
-  PROPOSITION ?link {
-    ({type: :s_type, name: :s_name}, "prefers", {type: :o_type, name: :o_name})
-  }
+UPDATE ?link
+SET METADATA {
+  confidence: CLAMP(MUL(?link.metadata.confidence, :decay_factor), 0.0, 1.0),
+  decay_applied_at: :timestamp
 }
-WITH METADATA { confidence: :new_confidence, decay_applied_at: :timestamp }
+WHERE {
+  ?link (?s, ?p, ?o)
+  FILTER(?p != "belongs_to_domain")
+  FILTER(IS_NULL(?link.metadata.superseded) || ?link.metadata.superseded != true)
+  FILTER(IS_NOT_NULL(?link.metadata.created_at))
+  FILTER(?link.metadata.created_at < :decay_threshold)
+  FILTER(?link.metadata.confidence > 0.3 && ?link.metadata.confidence < 1.0)
+}
+LIMIT 500
 ```
 
-Repeat this pattern with the concrete predicate literal selected for each decay pass.
+Run a slow pass (factor `0.98`) for strong memories (high `evidence_count`, fresh `last_observed`) and a fast pass (factor `0.90`) for never-reinforced facts — decay is asymmetric: use it or lose it.
 
 ### Phase 8 — Domain Health
 
@@ -345,16 +357,25 @@ WHERE {
 
 ---
 
-## Appendix — Predicates for Consolidation
+## Appendix — Consolidation Vocabulary
 
-| Predicate         | Description                 | Example                       |
-| ----------------- | --------------------------- | ----------------------------- |
-| `consolidated_to` | Event → Semantic concept    | Event → Preference            |
-| `derived_from`    | Semantic → Event source     | Preference → Event            |
-| `mentions`        | Event → Concept             | Event → Person                |
-| `supersedes`      | New fact → Old fact         | NewPreference → OldPreference |
-| `merged_into`     | Casualty → Survivor (dedup) | "JS" → "JavaScript"           |
-| `assigned_to`     | SleepTask → Actor           | SleepTask → `$system`         |
+**Registered predicates** (proposition links; pre-bootstrapped in the capsules):
+
+| Predicate         | Description              | Example               |
+| ----------------- | ------------------------ | --------------------- |
+| `consolidated_to` | Event → Semantic concept | Event → Preference    |
+| `derived_from`    | Semantic → Event source  | Preference → Event    |
+| `mentions`        | Event → Concept          | Event → Person        |
+| `involves`        | Event → Participant      | Event → Person        |
+| `assigned_to`     | SleepTask → Actor        | SleepTask → `$system` |
+
+**Metadata fields** (not predicates — set via `WITH METADATA`, never as proposition links):
+
+| Field                          | Description                               | Example                           |
+| ------------------------------ | ----------------------------------------- | --------------------------------- |
+| `supersedes` / `superseded_by` | State-evolution chain pointers (link IDs) | new link `supersedes: "<old_id>"` |
+| `superseded` / `superseded_at` | Marks the old fact as historical          | `superseded: true`                |
+| `merged_into`                  | Casualty → Survivor pointer (dedup)       | "JS" merged_into "JavaScript"     |
 
 ---
 

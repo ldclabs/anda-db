@@ -7,11 +7,11 @@
 |                       |                                                                                                                                                       |
 | :-------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Crate                 | [`anda_cognitive_nexus`](../rs/anda_cognitive_nexus/)                                                                                                 |
-| Version               | `0.7.x`                                                                                                                                               |
-| Implements            | KIP **v1.0-RC6** [`Executor`](../rs/anda_kip/src/executor.rs) ([SPECIFICATION.md](../rs/anda_kip/SPECIFICATION.md))                                   |
+| Version               | `0.8.x`                                                                                                                                               |
+| Implements            | KIP **v1.0 Release Candidate** [`Executor`](../rs/anda_kip/src/executor.rs) ([SPECIFICATION.md](../rs/anda_kip/SPECIFICATION.md))                     |
 | Storage backend       | [Anda DB](../rs/anda_db/) — embedded document store with B-Tree + BM25 + HNSW indexes                                                                 |
 | Other implementations | [`anda_cognitive_nexus_server`](../rs/anda_cognitive_nexus_server/) (HTTP/JSON-RPC), [`anda_cognitive_nexus_py`](../py/anda_cognitive_nexus_py/) (Py) |
-| Status                | KIP v1.0-RC6 conformant: KQL/KML/META full support, protected-concept enforcement (`KIP_3004`), transitive `DELETE CONCEPT` cascade, 43 unit tests.   |
+| Status                | KIP v1.0-RC conformant: full KQL/KML/META incl. `UPDATE`/`MERGE`/`EXPORT`, `EXPECT VERSION`, reserved `_` metadata, protected-scope enforcement.      |
 
 ---
 
@@ -96,22 +96,32 @@ mutate through KQL/KML/META instructions.
 
 ### 1.2 What this crate provides
 
-- [`CognitiveNexus`](../rs/anda_cognitive_nexus/src/db.rs) — a clonable
+- [`CognitiveNexus`](../rs/anda_cognitive_nexus/src/db/mod.rs) — a clonable
   handle that owns the `concepts` and `propositions` collections plus
   the KML lock.
-- An `impl Executor for CognitiveNexus` covering **all** of KIP
-  v1.0-RC6:
+- An `impl Executor for CognitiveNexus` covering **all** of the KIP
+  v1.0 Release Candidate:
   - **KQL** with multi-hop graph traversal, optional zero-hop
     (`{0,n}`), filters with `IN`/`IS_NULL`/`IS_NOT_NULL`, `OPTIONAL` /
     `NOT` / `UNION` scopes, implicit `GROUP BY`, regex caching, and
     cursor-based pagination.
   - **KML** `UPSERT` (concept blocks, proposition blocks, handle
-    references, default `metadata.source`) and `DELETE` of
+    references, default `metadata.source`, optional `EXPECT VERSION`
+    optimistic-concurrency guards), `UPDATE` (pattern-matched bulk
+    mutation with `ADD`/`MUL`/`CLAMP`/`COALESCE` update expressions),
+    `MERGE` (atomic entity consolidation with link repointing,
+    deduplication and `_merged_from` provenance), and `DELETE` of
     `ATTRIBUTES` / `METADATA` / `PROPOSITIONS` / `CONCEPT` with
     protected-concept enforcement and a transitive cascade for
     higher-order propositions.
   - **META** `DESCRIBE PRIMER/DOMAINS/CONCEPT TYPE[S]/PROPOSITION
-    TYPE[S]` and BM25-backed `SEARCH CONCEPT/PROPOSITION`.
+    TYPE[S]`, BM25-backed `SEARCH CONCEPT/PROPOSITION` with retrieval
+    modes, `THRESHOLD` filtering and transient `metadata._score`, and
+    `EXPORT` of matched subgraphs as idempotent `UPSERT` capsules.
+  - **Reserved `_` metadata** per KIP §2.11: the engine maintains
+    `_version` / `_updated_at` on every element; KML writes to the `_`
+    namespace are rejected with `KIP_2002` while KQL reads them like
+    ordinary metadata.
 - A small set of public helpers (`has_concept`, `get_concept`,
   `get_or_init_concept`, `capsule_version`) that are useful for
   bootstrapping, migrations and direct integrations.
@@ -123,9 +133,9 @@ mutate through KQL/KML/META instructions.
 
 ```toml
 [dependencies]
-anda_cognitive_nexus = "0.7"
+anda_cognitive_nexus = "0.8"
 anda_db = "0.7"
-anda_kip = "0.7"
+anda_kip = "0.8"
 object_store = "0.11"
 tokio = { version = "1", features = ["full"] }
 ```
@@ -188,7 +198,14 @@ rs/anda_cognitive_nexus/
 │   └── kip_demo.rs            # End-to-end demo (LocalFileSystem store)
 └── src/
     ├── lib.rs                 # Crate root, re-exports
-    ├── db.rs                  # CognitiveNexus + Executor impl (the core)
+    ├── db/
+    │   ├── mod.rs             # CognitiveNexus struct, Executor impl, connect
+    │   │                      # + capsule sync, public helpers, dispatch
+    │   ├── kql.rs             # WHERE / FILTER / FIND execution
+    │   ├── matching.rs        # proposition pattern matching, multi-hop BFS
+    │   ├── kml.rs             # UPSERT / UPDATE / MERGE / DELETE pipelines
+    │   ├── meta.rs            # DESCRIBE / SEARCH / EXPORT
+    │   └── tests.rs           # integration-style test suite
     ├── entity.rs              # Concept, Proposition, Properties, EntityID
     ├── helper.rs              # field extraction, ORDER BY, predicate match
     └── types.rs               # ConceptPK / PropositionPK / EntityPK,
@@ -196,9 +213,13 @@ rs/anda_cognitive_nexus/
                                # PropositionsMatchResult, GraphPath
 ```
 
-| Module      | Responsibility                                                                                                                                                                                                                                                                                                                                            |
-| :---------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `db.rs`     | The `CognitiveNexus` struct, `Executor` impl, all `execute_*` routines, WHERE-clause sub-executors, UPSERT/DELETE pipelines, META command pipeline, helper queries (`query_concept_id`, `find_propositions`, …).                                                                                                                                          |
+| Module           | Responsibility                                                                                                                                                                                                                                                                                                                                            |
+| :--------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `db/mod.rs`      | The `CognitiveNexus` struct and `Executor` impl, `connect` with bundled-capsule hash sync, public helpers (`has_concept`, `get_concept`, `capsule_version`, …), command dispatch (`execute_kql` / `execute_kml` / `execute_meta`), shared row-cache accessors and identity lookups (`query_concept_id`, …).                                              |
+| `db/kql.rs`      | WHERE-clause sub-executors (concept / proposition / `FILTER` / `NOT` / `OPTIONAL` / `UNION`), filter expression evaluation, and `FIND` projection with grouping, aggregation, `ORDER BY` and cursor pagination.                                                                                                                                           |
+| `db/matching.rs` | Proposition pattern matching against the `propositions` collection, multi-hop BFS traversal, and target-term resolution.                                                                                                                                                                                                                                  |
+| `db/kml.rs`      | `UPSERT` (with `EXPECT VERSION` guards), `UPDATE`, `MERGE`, `DELETE` pipelines, protected-scope checks, and the engine-maintained `_version` / `_updated_at` bookkeeping.                                                                                                                                                                                 |
+| `db/meta.rs`     | `DESCRIBE` introspection, BM25-backed `SEARCH` with transient `_score`, and `EXPORT` capsule generation.                                                                                                                                                                                                                                                  |
 | `entity.rs` | Persisted graph data model. `Concept` carries `{type, name, attributes, metadata}`; `Proposition` carries `{subject, object, predicates, properties}`; `Properties` is a compact `{a, m}` shape (renamed via serde) shared by per-predicate attribute/metadata storage; `EntityID` is the canonical reference encoding (`C:{id}` / `P:{id}:{predicate}`). |
 | `helper.rs` | Pure helpers: extract a field value from a `Concept` / `Proposition`, sort result rows by `ORDER BY`, match a predicate descriptor against a stored proposition row, map `DBError` → `KipError`, and a `FilterExpressionExt` trait that distinguishes selective vs. open filter shapes for query planning.                                                |
 | `types.rs`  | Execution scaffolding. `ConceptPK` / `PropositionPK` / `EntityPK` are typed primary-key shapes; `QueryContext` carries variable bindings and the per-query cache; `QueryCache` deduplicates row loads inside one execution; `TargetEntities` is the result of resolving the `target` clause of a `DELETE`; `GraphPath` records multi-hop traversals.      |
@@ -326,7 +347,7 @@ fact that the encoding is reversible (`EntityID::from_str`).
 KIP allows `subject` or `object` to *be* another proposition — this is
 how an agent records *meta-claims* like "Alice **believes** that aspirin
 treats headaches". In the storage layer this is a row whose `subject` is
-`P:{id}:{predicate}`. Every cascade-delete path in `db.rs` enumerates
+`P:{id}:{predicate}`. Every cascade-delete path in `db/kml.rs` enumerates
 these higher-order references using a BFS over `subject` / `object`
 indexes seeded with the canonical `EntityID::to_string()` of the row
 being removed, so deleting a base proposition transitively removes any
@@ -354,26 +375,39 @@ against an existing database is safe:
    schemas described in §3.1.
 2. Register the BTree and BM25 indexes from §3.2 and install the jieba
    tokenizer.
-3. Ensure the meta-type `$ConceptType` exists (it is its own definition).
-4. Apply the bundled Genesis capsules, in order:
-   `GENESIS_KIP` → `PERSON_KIP` → `PREFERENCE_KIP` → `EVENT_KIP` →
-   `SLEEP_TASK_KIP` → `INSIGHT_KIP`. Each capsule is a KML `UPSERT`
-   payload that defines a built-in `$ConceptType` /
-   `$PropositionType` family and any required `Domain` anchors.
-5. Call the user-supplied initialiser closure (typically used to seed
+3. Synchronize the bundled system capsules (`BUNDLED_CAPSULES`, in
+   dependency order: `GENESIS_KIP` → `PERSON_KIP` → `PREFERENCE_KIP` →
+   `EVENT_KIP` → `SLEEP_TASK_KIP` → `INSIGHT_KIP` → `COMMITMENT_KIP`).
+   For each capsule the engine stores a hex-encoded SHA3-256 of its
+   source as the `capsule_hash:<name>` collection extension. A capsule
+   is (re-)applied when the stored hash differs from the bundled source
+   — i.e. when a crate upgrade ships a revised `.kip` file — or when
+   its anchor `$ConceptType` definition is missing (self-healing).
+   Capsules are idempotent `UPSERT` scripts: re-applying shallow-merges
+   the revised definitions into existing instances without touching
+   user data (schema nodes get a regular `_version` bump). A failed
+   apply leaves the stored hash untouched, so the next `connect`
+   retries.
+4. Call the user-supplied initialiser closure (typically used to seed
    application-specific concept types or to register `$self` /
    `$system`).
-6. Persist the new `capsule_version` so subsequent runs can skip the
-   capsule replay if there is nothing newer to apply.
+5. Persist `capsule_version` (see §5.2).
 
 ### 5.2 `capsule_version` schema migration
 
 `capsule_version()` reads the value stored as a collection extension on
-`concepts`. A return of `0` means "no version recorded yet". The
-bundled Genesis capsules currently target version `1`; when the crate
-ships a new RC of the spec the version is bumped and `connect`
-re-applies only the new capsules. Application code can also call
-`save_capsule_version(n)` to gate its own migrations.
+`concepts`. A return of `0` means "no version recorded yet". Routine
+capsule refreshes are driven entirely by the content hashes described
+in §5.1, so this cursor is reserved for **breaking migrations** —
+schema changes that idempotent `UPSERT` capsules cannot express, such
+as renaming a concept type (a `MERGE` job), retiring a predicate (a
+`DELETE PROPOSITIONS` sweep), or restructuring attributes (an `UPDATE`
+pass). Application code can also call `save_capsule_version(n)` to
+gate its own migrations.
+
+Connect-time migration relies on the workspace's single-writer
+assumption; production deployments where multiple processes may open
+the same store concurrently should configure `DBConfig.lock`.
 
 ### 5.3 `$self` / `$system` are not auto-created
 
@@ -615,8 +649,9 @@ When the caller passes `dry_run = true`:
 | `DESCRIBE CONCEPT TYPE "..."`        | `execute_describe_concept_type` — returns the `ConceptInfo` projection for one `$ConceptType` definition.                                      |
 | `DESCRIBE PROPOSITION TYPES`         | `execute_describe_proposition_types` — returns sorted registered `$PropositionType` names; the cursor is the last emitted name.                |
 | `DESCRIBE PROPOSITION TYPE "..."`    | `execute_describe_proposition_type` — returns the `ConceptInfo` projection for one `$PropositionType` definition.                              |
-| `SEARCH CONCEPT "..." [LIMIT N]`     | BM25 over `concepts.["name", "attributes", "metadata"]`. Results are deserialised through `Concept`, then projected.                           |
-| `SEARCH PROPOSITION "..." [LIMIT N]` | BM25 over `propositions.["properties"]`. Filters can post-prune by predicate / subject type / etc.                                             |
+| `SEARCH CONCEPT "..." […]`           | BM25 over `concepts.["name", "attributes", "metadata"]`. Hits carry the transient `metadata._score` (normalized, descending); `THRESHOLD` drops weak hits; `MODE "semantic"`/`"hybrid"` degrade to keyword (no embedding store). |
+| `SEARCH PROPOSITION "..." […]`       | BM25 over `propositions.["predicates", "properties"]`, post-pruned per predicate (and by `WITH TYPE`); same `_score` / `THRESHOLD` semantics.  |
+| `EXPORT ?t WHERE { … } [LIMIT N]`    | `execute_export` — serializes matched concepts/links into an idempotent `UPSERT` capsule: in-set endpoints become local handles, out-of-set endpoints become `{type, name}` / nested clauses, and reserved `_` metadata is stripped. |
 
 ---
 
@@ -687,17 +722,28 @@ which is gated behind a feature flag in this workspace.
 
 ## 14. Compatibility
 
-| Component         | Version pinned                                                       |
-| :---------------- | :------------------------------------------------------------------- |
-| KIP specification | `v1.0-RC6` (see [SPECIFICATION.md](../rs/anda_kip/SPECIFICATION.md)) |
-| `anda_kip` crate  | `0.7.x`                                                              |
-| `anda_db` crate   | `0.7.x`                                                              |
-| Rust edition      | 2024 (workspace-default; `async fn` in traits, `let-else`, …)        |
-| Tokio             | `1.x` with `sync` and `rt-multi-thread`                              |
+| Component         | Version pinned                                                                     |
+| :---------------- | :--------------------------------------------------------------------------------- |
+| KIP specification | `v1.0` Release Candidate (see [SPECIFICATION.md](../rs/anda_kip/SPECIFICATION.md)) |
+| `anda_kip` crate  | `0.8.x`                                                                             |
+| `anda_db` crate   | `0.7.x`                                                                             |
+| Rust edition      | 2024 (workspace-default; `async fn` in traits, `let-else`, …)                       |
+| Tokio             | `1.x` with `sync` and `rt-multi-thread`                                             |
 
-RC6 features explicitly verified by the test suite: zero-hop
-`{0,n}` repetitions, `FILTER` with `IN` / `IS_NULL` / `IS_NOT_NULL`,
-`OPTIONAL` / `NOT` / `UNION` scopes, implicit `GROUP BY`, BM25-backed
-`SEARCH` for both entity kinds, `KIP_3004` protected-scope enforcement
-across both real and `dry_run` calls, and the transitive `DELETE
-CONCEPT` cascade through higher-order propositions.
+Release Candidate features explicitly verified by the test suite:
+zero-hop `{0,n}` repetitions, `FILTER` with `IN` / `IS_NULL` /
+`IS_NOT_NULL`, `OPTIONAL` / `NOT` / `UNION` scopes, implicit `GROUP
+BY`, BM25-backed `SEARCH` for both entity kinds with `MODE` /
+`THRESHOLD` / transient `_score`, `KIP_3004` protected-scope
+enforcement across both real and `dry_run` calls, the transitive
+`DELETE CONCEPT` cascade through higher-order propositions,
+engine-maintained `_version` / `_updated_at` with `KIP_2002` rejection
+of reserved-key writes, `EXPECT VERSION` guards (`KIP_3005`, atomic
+abort), bulk `UPDATE` with per-element update expressions, `MERGE`
+consolidation (repointing, deduplication, alias union,
+`_merged_from`), and `EXPORT` capsules round-tripped into a fresh
+nexus.
+
+The protocol deliberately defines no access statistics (per KIP
+§2.11.1), so KQL/META execution never writes — reads stay cheap,
+cacheable, and safely concurrent under the shared read lock.

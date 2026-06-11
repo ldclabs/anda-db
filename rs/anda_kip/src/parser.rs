@@ -36,8 +36,8 @@ use crate::error::{KipError, format_nom_error};
 ///
 /// # Parsing Order
 /// 1. **KQL (Knowledge Query Language)**: FIND queries for data retrieval
-/// 2. **KML (Knowledge Manipulation Language)**: UPSERT/DELETE operations for data modification
-/// 3. **META**: DESCRIBE commands for schema introspection
+/// 2. **KML (Knowledge Manipulation Language)**: UPSERT/UPDATE/MERGE/DELETE operations for data modification
+/// 3. **META**: DESCRIBE/SEARCH/EXPORT commands for schema introspection and grounding
 ///
 /// # Arguments
 ///
@@ -65,7 +65,7 @@ use crate::error::{KipError, format_nom_error};
 /// ```
 pub fn parse_kip(input: &str) -> Result<Command, KipError> {
     let rt = all_consuming(json::ws(context(
-        "KIP command: FIND (KQL) | UPSERT/DELETE (KML) | DESCRIBE/SEARCH (META)",
+        "KIP command: FIND (KQL) | UPSERT/UPDATE/MERGE/DELETE (KML) | DESCRIBE/SEARCH/EXPORT (META)",
         alt((
             map(kql::parse_kql_query, Command::Kql),
             map(kml::parse_kml_statement, Command::Kml),
@@ -403,10 +403,12 @@ WITH METADATA {
                     ast::UpsertItem::Concept(ast::ConceptBlock {
                         handle,
                         concept,
+                        expect_version,
                         set_attributes,
                         set_propositions,
                         metadata,
                     }) => {
+                        assert!(expect_version.is_none());
                         assert_eq!(handle, &Some("cognizine".to_string()));
                         assert_eq!(
                             concept,
@@ -428,10 +430,12 @@ WITH METADATA {
                     ast::UpsertItem::Concept(ast::ConceptBlock {
                         handle,
                         concept,
+                        expect_version,
                         set_attributes,
                         set_propositions,
                         metadata,
                     }) => {
+                        assert!(expect_version.is_none());
                         assert_eq!(handle, &Some("neural_bloom".to_string()));
                         assert_eq!(
                             concept,
@@ -472,6 +476,54 @@ WITH METADATA {
             }
             _ => panic!("Expected Upsert statement"),
         }
+    }
+
+    #[test]
+    fn test_parse_kip_routes_new_statements() {
+        // UPDATE and MERGE are KML; EXPORT is META (read-only).
+        let update = parse_kip(
+            r#"
+            UPDATE ?pref
+            SET ATTRIBUTES { evidence_count: ADD(COALESCE(?pref.attributes.evidence_count, 0), 1) }
+            WHERE { ?pref {type: "Preference", name: "concise_style"} }
+            "#,
+        )
+        .unwrap();
+        assert!(matches!(
+            update,
+            Command::Kml(KmlStatement::Update(_))
+        ));
+
+        let merge = parse_kip(
+            r#"
+            MERGE CONCEPT ?dup INTO ?canonical
+            WHERE {
+                ?dup {type: "SkillTopic", name: "JS"}
+                ?canonical {type: "SkillTopic", name: "JavaScript"}
+            }
+            "#,
+        )
+        .unwrap();
+        assert!(matches!(merge, Command::Kml(KmlStatement::Merge(_))));
+
+        let export = parse_kip(
+            r#"
+            EXPORT ?n
+            WHERE { (?n, "belongs_to_domain", {type: "Domain", name: "Medical"}) }
+            LIMIT 500
+            "#,
+        )
+        .unwrap();
+        assert!(matches!(
+            export,
+            Command::Meta(MetaCommand::Export(_))
+        ));
+
+        let search = parse_kip(
+            r#"SEARCH CONCEPT "深色模式" MODE "hybrid" THRESHOLD 0.6 LIMIT 10"#,
+        )
+        .unwrap();
+        assert!(matches!(search, Command::Meta(MetaCommand::Search(_))));
     }
 
     #[test]

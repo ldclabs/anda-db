@@ -2,23 +2,26 @@ use nom::{
     Parser,
     branch::alt,
     bytes::complete::tag,
-    combinator::{map, opt, value},
+    combinator::{cut, map, map_res, opt, value},
     error::context,
     sequence::preceded,
 };
+use std::str::FromStr;
 
 use super::common::*;
-use super::kql::{parse_cursor_clause, parse_limit_clause};
+use super::json::parse_number;
+use super::kql::{parse_cursor_clause, parse_limit_clause, parse_where_block};
 use crate::ast::*;
 
 // --- Top Level META Parser ---
 
 pub fn parse_meta_command(input: &str) -> VResult<'_, MetaCommand> {
     context(
-        "META command: DESCRIBE ... or SEARCH ...",
+        "META command: DESCRIBE ... | SEARCH ... | EXPORT ...",
         alt((
             map(parse_describe_command, MetaCommand::Describe),
             map(parse_search_command, MetaCommand::Search),
+            map(parse_export_command, MetaCommand::Export),
         )),
     )
     .parse(input)
@@ -80,7 +83,7 @@ fn parse_describe_command(input: &str) -> VResult<'_, DescribeTarget> {
 // --- SEARCH ---
 fn parse_search_command(input: &str) -> VResult<'_, SearchCommand> {
     context(
-        "SEARCH CONCEPT|PROPOSITION \"<term>\" [WITH TYPE \"<Type>\"] [LIMIT N]",
+        "SEARCH CONCEPT|PROPOSITION \"<term>\" [WITH TYPE \"<Type>\"] [MODE \"keyword\"|\"semantic\"|\"hybrid\"] [THRESHOLD <0.0-1.0>] [LIMIT N]",
         map(
             preceded(
                 ws(keyword("SEARCH")),
@@ -91,16 +94,69 @@ fn parse_search_command(input: &str) -> VResult<'_, SearchCommand> {
                     ))),
                     ws(quoted_string),
                     opt(preceded(keywords(&["WITH", "TYPE"]), ws(quoted_string))),
+                    opt(preceded(keyword("MODE"), cut(ws(parse_search_mode)))),
+                    opt(preceded(
+                        keyword("THRESHOLD"),
+                        cut(ws(parse_search_threshold)),
+                    )),
                     opt(preceded(
                         keyword("LIMIT"),
                         ws(nom::character::complete::usize),
                     )),
                 ),
             ),
-            |(target, term, in_type, limit)| SearchCommand {
+            |(target, term, in_type, mode, threshold, limit)| SearchCommand {
                 target,
                 term,
                 in_type,
+                mode,
+                threshold,
+                limit,
+            },
+        ),
+    )
+    .parse(input)
+}
+
+fn parse_search_mode(input: &str) -> VResult<'_, SearchMode> {
+    context(
+        "SEARCH MODE: \"keyword\" | \"semantic\" | \"hybrid\"",
+        map_res(quoted_string, |s| SearchMode::from_str(&s)),
+    )
+    .parse(input)
+}
+
+fn parse_search_threshold(input: &str) -> VResult<'_, Number> {
+    context(
+        "SEARCH THRESHOLD: a number between 0.0 and 1.0",
+        map_res(parse_number, |n| {
+            let v = n.as_f64().unwrap_or(-1.0);
+            if (0.0..=1.0).contains(&v) {
+                Ok(n)
+            } else {
+                Err(format!("THRESHOLD must be between 0.0 and 1.0, got {n}"))
+            }
+        }),
+    )
+    .parse(input)
+}
+
+// --- EXPORT ---
+fn parse_export_command(input: &str) -> VResult<'_, ExportCommand> {
+    context(
+        "EXPORT ?target WHERE { ... } [LIMIT N]",
+        map(
+            preceded(
+                ws(keyword("EXPORT")),
+                cut((
+                    ws(variable),
+                    parse_where_block,
+                    opt(ws(parse_limit_clause)),
+                )),
+            ),
+            |(target, where_clauses, limit)| ExportCommand {
+                target,
+                where_clauses,
                 limit,
             },
         ),
@@ -133,6 +189,8 @@ mod tests {
                     target: SearchTarget::Concept,
                     term: "aspirin".to_string(),
                     in_type: None,
+                    mode: None,
+                    threshold: None,
                     limit: None,
                 })
             ))
@@ -249,6 +307,8 @@ mod tests {
                     target: SearchTarget::Concept,
                     term: "aspirin".to_string(),
                     in_type: None,
+                    mode: None,
+                    threshold: None,
                     limit: None,
                 }
             ))
@@ -263,6 +323,8 @@ mod tests {
                     target: SearchTarget::Concept,
                     term: "aspirin".to_string(),
                     in_type: Some("Drug".to_string()),
+                    mode: None,
+                    threshold: None,
                     limit: Some(5),
                 }
             ))
@@ -277,6 +339,8 @@ mod tests {
                     target: SearchTarget::Proposition,
                     term: "aspirin".to_string(),
                     in_type: None,
+                    mode: None,
+                    threshold: None,
                     limit: Some(5),
                 }
             ))
@@ -291,6 +355,8 @@ mod tests {
                     target: SearchTarget::Concept,
                     term: "aspirin".to_string(),
                     in_type: Some("Drug".to_string()),
+                    mode: None,
+                    threshold: None,
                     limit: Some(5),
                 }
             ))
@@ -305,6 +371,8 @@ mod tests {
                     target: SearchTarget::Concept,
                     term: "aspirin".to_string(),
                     in_type: None,
+                    mode: None,
+                    threshold: None,
                     limit: None,
                 }
             ))
@@ -319,6 +387,8 @@ mod tests {
                     target: SearchTarget::Concept,
                     term: "阿司匹林".to_string(),
                     in_type: None,
+                    mode: None,
+                    threshold: None,
                     limit: None,
                 }
             ))
@@ -326,6 +396,108 @@ mod tests {
 
         // Test invalid search command
         assert!(parse_search_command("SEARCH INVALID").is_err());
+    }
+
+    #[test]
+    fn test_parse_search_with_mode_and_threshold() {
+        // Associative recall probe from the spec
+        assert_eq!(
+            parse_search_command(
+                r#"SEARCH CONCEPT "headache relief" MODE "semantic" THRESHOLD 0.75 LIMIT 10"#
+            ),
+            Ok((
+                "",
+                SearchCommand {
+                    target: SearchTarget::Concept,
+                    term: "headache relief".to_string(),
+                    in_type: None,
+                    mode: Some(SearchMode::Semantic),
+                    threshold: Some(Number::from_f64(0.75).unwrap()),
+                    limit: Some(10),
+                }
+            ))
+        );
+
+        // Full option set with WITH TYPE
+        assert_eq!(
+            parse_search_command(
+                r#"SEARCH PROPOSITION "treats" WITH TYPE "treats" MODE "hybrid" THRESHOLD 0.5 LIMIT 5"#
+            ),
+            Ok((
+                "",
+                SearchCommand {
+                    target: SearchTarget::Proposition,
+                    term: "treats".to_string(),
+                    in_type: Some("treats".to_string()),
+                    mode: Some(SearchMode::Hybrid),
+                    threshold: Some(Number::from_f64(0.5).unwrap()),
+                    limit: Some(5),
+                }
+            ))
+        );
+
+        // Keyword mode without threshold
+        assert_eq!(
+            parse_search_command(r#"SEARCH CONCEPT "aspirin" MODE "keyword""#),
+            Ok((
+                "",
+                SearchCommand {
+                    target: SearchTarget::Concept,
+                    term: "aspirin".to_string(),
+                    in_type: None,
+                    mode: Some(SearchMode::Keyword),
+                    threshold: None,
+                    limit: None,
+                }
+            ))
+        );
+
+        // Invalid mode value
+        assert!(parse_meta_command(r#"SEARCH CONCEPT "x" MODE "fuzzy""#).is_err());
+        // Threshold out of range
+        assert!(parse_meta_command(r#"SEARCH CONCEPT "x" THRESHOLD 1.5"#).is_err());
+        assert!(parse_meta_command(r#"SEARCH CONCEPT "x" THRESHOLD -0.1"#).is_err());
+    }
+
+    #[test]
+    fn test_parse_export_command() {
+        let input = r#"
+        EXPORT ?n
+        WHERE {
+            (?n, "belongs_to_domain", {type: "Domain", name: "Medical"})
+        }
+        LIMIT 500
+        "#;
+
+        let result = parse_meta_command(input);
+        assert!(result.is_ok(), "Failed to parse: {result:?}");
+        let (_, command) = result.unwrap();
+        match command {
+            MetaCommand::Export(export) => {
+                assert_eq!(export.target, "n");
+                assert_eq!(export.where_clauses.len(), 1);
+                assert_eq!(export.limit, Some(500));
+            }
+            _ => panic!("Expected ExportCommand"),
+        }
+
+        // EXPORT without LIMIT
+        let (_, command) = parse_meta_command(
+            r#"EXPORT ?x WHERE { ?x {type: "Drug"} }"#,
+        )
+        .unwrap();
+        match command {
+            MetaCommand::Export(export) => {
+                assert_eq!(export.target, "x");
+                assert_eq!(export.limit, None);
+            }
+            _ => panic!("Expected ExportCommand"),
+        }
+
+        // EXPORT requires a WHERE block
+        assert!(parse_meta_command("EXPORT ?x LIMIT 10").is_err());
+        // EXPORT requires a target variable
+        assert!(parse_meta_command(r#"EXPORT WHERE { ?x {type: "Drug"} }"#).is_err());
     }
 
     #[test]
@@ -356,6 +528,8 @@ mod tests {
                     target: SearchTarget::Concept,
                     term: "aspirin".to_string(),
                     in_type: Some("Drug".to_string()),
+                    mode: None,
+                    threshold: None,
                     limit: Some(5),
                 }
             ))

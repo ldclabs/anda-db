@@ -10,7 +10,7 @@ license.workspace = true
 
 [dependencies]
 anda_db_schema = { version = "0.4", path = "../anda_db_schema" }
-anda_db = { version = "0.7", path = "../anda_db", features = ["full"] }
+anda_db = { version = "0.8", path = "../anda_db", features = ["full"] }
 anda_object_store = { version = "0.3", path = "../anda_object_store" }
 axum = { workspace = true }
 bytes = { workspace = true }

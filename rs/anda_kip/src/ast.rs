@@ -394,26 +394,19 @@ pub enum PropositionMatcher {
 
 /// Represents a term that can be a variable, node reference, or nested proposition.
 /// Used for both subject and object positions in proposition patterns.
+///
+/// Per the KIP specification, an embedded endpoint clause must be **unnamed**:
+/// to bind an endpoint to a variable, declare it in a separate clause first and
+/// reference the variable here.
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub enum TargetTerm {
     /// A variable (e.g., `?drug`)
     Variable(String),
-    /// A reference to an existing concept node (via ConceptClause), optionally
-    /// bound to a variable in the same position (e.g., `?y {type: "Person", name: "Yan"}`).
-    Concept {
-        /// Optional variable to bind the matched concept to (e.g., `?y`).
-        variable: Option<String>,
-        /// The concept matcher used to identify the concept node.
-        matcher: ConceptMatcher,
-    },
-    /// A nested proposition clause, optionally bound to a variable in the same
-    /// position (e.g., `?link (?s, "p", ?o)`).
-    Proposition {
-        /// Optional variable to bind the matched proposition to (e.g., `?link`).
-        variable: Option<String>,
-        /// The proposition matcher used to identify the proposition link.
-        matcher: Box<PropositionMatcher>,
-    },
+    /// An unnamed concept clause referencing an existing concept node
+    /// (e.g., `{type: "Person", name: "Yan"}`).
+    Concept(ConceptMatcher),
+    /// An unnamed nested proposition clause (e.g., `(?s, "p", ?o)`).
+    Proposition(Box<PropositionMatcher>),
 }
 
 /// Represents a predicate term in a proposition.
@@ -779,10 +772,17 @@ pub enum OrderDirection {
 
 /// Represents a KML (Knowledge Manipulation Language) statement.
 /// KML is responsible for knowledge evolution and is the core tool for Agent learning.
+/// It comprises four statements: `UPSERT` (identity-addressed create-or-update),
+/// `UPDATE` (pattern-matched bulk mutation), `MERGE` (atomic entity consolidation),
+/// and `DELETE` (targeted removal).
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub enum KmlStatement {
     /// UPSERT statement for atomic knowledge creation/updates
     Upsert(Vec<UpsertBlock>),
+    /// UPDATE statement for pattern-matched bulk mutation (never creates)
+    Update(UpdateStatement),
+    /// MERGE statement for atomic entity consolidation
+    Merge(MergeStatement),
     /// DELETE statement for knowledge removal
     Delete(DeleteStatement),
 }
@@ -817,6 +817,12 @@ pub struct ConceptBlock {
     pub handle: Option<String>,
     /// Concept clause for matching the existing concept or creating new one
     pub concept: ConceptMatcher,
+    /// Optional optimistic-concurrency guard (`EXPECT VERSION <n>`).
+    /// The block executes only if the matched element's `_version` equals this value;
+    /// `0` asserts the element does not exist yet (create-only). On mismatch the
+    /// entire UPSERT aborts atomically with `KIP_3005` (VersionConflict).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect_version: Option<u64>,
     /// Optional attributes to set on the concept
     pub set_attributes: Option<Map<String, Json>>,
     /// Optional propositions emanating from this concept
@@ -846,6 +852,10 @@ pub struct PropositionBlock {
     pub handle: Option<String>,
     /// Proposition clause for matching the existing proposition or creating new one
     pub proposition: PropositionMatcher,
+    /// Optional optimistic-concurrency guard (`EXPECT VERSION <n>`).
+    /// See [`ConceptBlock::expect_version`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect_version: Option<u64>,
     /// Optional attributes to set on the concept
     pub set_attributes: Option<Map<String, Json>>,
     /// Optional metadata for this proposition
@@ -893,17 +903,233 @@ pub enum DeleteStatement {
     },
 }
 
+/// Represents an UPDATE statement for pattern-matched bulk mutation.
+/// Where UPSERT addresses elements one at a time by identity, UPDATE mutates
+/// every element matched by a WHERE pattern in a single atomic statement.
+/// It never creates elements.
+///
+/// Syntax:
+/// ```prolog
+/// UPDATE ?target
+/// SET ATTRIBUTES { <key>: <value_or_expr>, ... }
+/// SET METADATA { <key>: <value_or_expr>, ... }
+/// WHERE { ... }
+/// LIMIT N
+/// ```
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub struct UpdateStatement {
+    /// The target variable bound in the WHERE clause (concept nodes or proposition links)
+    pub target: String,
+    /// Attributes to set (shallow merge); values may be JSON or update expressions
+    pub set_attributes: Option<Vec<(String, UpdateValue)>>,
+    /// Author-asserted metadata to set (shallow merge); reserved `_` keys are
+    /// rejected by executors with `KIP_2002`
+    pub set_metadata: Option<Vec<(String, UpdateValue)>>,
+    /// WHERE clauses containing graph patterns and filters binding the target
+    pub where_clauses: Vec<WhereClause>,
+    /// Optional safety cap on the number of elements updated in one statement
+    pub limit: Option<usize>,
+}
+
+/// A value position inside an UPDATE `SET ATTRIBUTES` / `SET METADATA` block.
+/// Either a plain JSON value (same semantics as UPSERT) or a numeric update
+/// expression computed per element from the target's own current state.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub enum UpdateValue {
+    /// A plain JSON value
+    Json(Json),
+    /// A numeric update expression (e.g., `ADD(?t.attributes.count, 1)`)
+    Expr(UpdateExpr),
+}
+
+/// Numeric update expression functions available in UPDATE statements.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub enum UpdateFunction {
+    /// ADD(a, b) - `a + b` (use a negative `b` to subtract)
+    Add,
+    /// MUL(a, b) - `a × b`
+    Mul,
+    /// CLAMP(x, lo, hi) - constrains `x` into `[lo, hi]`
+    Clamp,
+    /// COALESCE(x, default) - `x` if non-null, else `default`
+    Coalesce,
+}
+
+impl UpdateFunction {
+    /// Applies the function to pre-evaluated operand values.
+    ///
+    /// `ADD` / `MUL` / `CLAMP` operate on numbers and preserve integer arithmetic
+    /// when all operands are integers; any `null` or non-number operand yields
+    /// `Json::Null` (the executor then skips that key for that element).
+    /// `COALESCE` returns the first operand when it is non-null, else the second.
+    pub fn calculate(&self, args: &[Json]) -> Json {
+        fn binary_number_op(
+            a: &Json,
+            b: &Json,
+            int_op: impl Fn(i128, i128) -> Option<i128>,
+            float_op: impl Fn(f64, f64) -> f64,
+        ) -> Json {
+            match (as_i128(a), as_i128(b)) {
+                (Some(x), Some(y)) => int_op(x, y)
+                    .and_then(i128_to_number)
+                    .map(Json::Number)
+                    .unwrap_or_else(|| {
+                        float_number(float_op(x as f64, y as f64))
+                    }),
+                _ => match (a.as_f64(), b.as_f64()) {
+                    (Some(x), Some(y)) => float_number(float_op(x, y)),
+                    _ => Json::Null,
+                },
+            }
+        }
+
+        match self {
+            UpdateFunction::Add => match args {
+                [a, b] => binary_number_op(a, b, |x, y| x.checked_add(y), |x, y| x + y),
+                _ => Json::Null,
+            },
+            UpdateFunction::Mul => match args {
+                [a, b] => binary_number_op(a, b, |x, y| x.checked_mul(y), |x, y| x * y),
+                _ => Json::Null,
+            },
+            UpdateFunction::Clamp => match args {
+                [x, lo, hi] => match (as_i128(x), as_i128(lo), as_i128(hi)) {
+                    (Some(x), Some(lo), Some(hi)) if lo <= hi => i128_to_number(x.clamp(lo, hi))
+                        .map(Json::Number)
+                        .unwrap_or(Json::Null),
+                    _ => match (x.as_f64(), lo.as_f64(), hi.as_f64()) {
+                        (Some(x), Some(lo), Some(hi)) if lo <= hi => {
+                            float_number(x.clamp(lo, hi))
+                        }
+                        _ => Json::Null,
+                    },
+                },
+                _ => Json::Null,
+            },
+            UpdateFunction::Coalesce => match args {
+                [x, default] => {
+                    if x.is_null() {
+                        default.clone()
+                    } else {
+                        x.clone()
+                    }
+                }
+                _ => Json::Null,
+            },
+        }
+    }
+}
+
+fn as_i128(value: &Json) -> Option<i128> {
+    match value {
+        Json::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Some(i as i128)
+            } else {
+                n.as_u64().map(|u| u as i128)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn i128_to_number(value: i128) -> Option<Number> {
+    if let Ok(i) = i64::try_from(value) {
+        Some(Number::from(i))
+    } else {
+        u64::try_from(value).ok().map(Number::from)
+    }
+}
+
+fn float_number(value: f64) -> Json {
+    Number::from_f64(value).map(Json::Number).unwrap_or_default()
+}
+
+/// An operand/expression tree for UPDATE value computation.
+/// Operands may be number literals, dot-notation paths on the UPDATE target
+/// itself, or nested update expressions.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub enum UpdateExpr {
+    /// A number literal
+    Number(Number),
+    /// A dot-notation path on the UPDATE target itself
+    /// (e.g., `?target.metadata.confidence`); paths on other variables are invalid
+    Variable(DotPathVar),
+    /// A function application (e.g., `CLAMP(MUL(?t.metadata.confidence, 0.9), 0.0, 1.0)`)
+    Function {
+        /// The update function to apply
+        func: UpdateFunction,
+        /// The function arguments
+        args: Vec<UpdateExpr>,
+    },
+}
+
+impl UpdateExpr {
+    /// Evaluates the expression for one element.
+    ///
+    /// `resolve` maps a dot-notation path on the target to the element's current
+    /// JSON value (returning `Json::Null` for missing paths). A `null` or
+    /// non-number result means the executor skips that key for that element.
+    pub fn evaluate<F>(&self, resolve: &F) -> Json
+    where
+        F: Fn(&DotPathVar) -> Json,
+    {
+        match self {
+            UpdateExpr::Number(n) => Json::Number(n.clone()),
+            UpdateExpr::Variable(path) => resolve(path),
+            UpdateExpr::Function { func, args } => {
+                let args: Vec<Json> = args.iter().map(|arg| arg.evaluate(resolve)).collect();
+                func.calculate(&args)
+            }
+        }
+    }
+
+    /// Returns all dot-notation paths referenced by this expression.
+    pub fn referenced_paths(&self) -> Vec<&DotPathVar> {
+        match self {
+            UpdateExpr::Number(_) => vec![],
+            UpdateExpr::Variable(path) => vec![path],
+            UpdateExpr::Function { args, .. } => {
+                args.iter().flat_map(|arg| arg.referenced_paths()).collect()
+            }
+        }
+    }
+}
+
+/// Represents a MERGE statement for atomic entity consolidation.
+/// Declares that two concept nodes denote the same entity and merges the
+/// source into the target: repoints all links, fills missing attributes
+/// (target wins; `aliases` unioned), deletes the source, and records
+/// `_merged_from` provenance.
+///
+/// Syntax:
+/// ```prolog
+/// MERGE CONCEPT ?source INTO ?target
+/// WHERE { ... }
+/// ```
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub struct MergeStatement {
+    /// The source variable (must bind exactly one concept node)
+    pub source: String,
+    /// The target variable (must bind exactly one concept node of the same type)
+    pub target: String,
+    /// WHERE clauses binding both variables
+    pub where_clauses: Vec<WhereClause>,
+}
+
 // --- META AST ---
 
 /// Represents META commands for knowledge exploration and grounding.
-/// META is a lightweight subset focused on introspection and disambiguation.
-/// These are fast, metadata-driven commands that don't involve complex graph traversal.
+/// META is a lightweight subset focused on introspection, disambiguation,
+/// and capsule round-trips.
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub enum MetaCommand {
     /// DESCRIBE commands for schema information and cognitive primers
     Describe(DescribeTarget),
-    /// SEARCH commands for concept disambiguation
+    /// SEARCH commands for index-driven grounding and associative retrieval
     Search(SearchCommand),
+    /// EXPORT command for serializing knowledge into an idempotent UPSERT capsule
+    Export(ExportCommand),
 }
 
 /// Represents different targets for DESCRIBE commands.
@@ -934,9 +1160,10 @@ pub enum DescribeTarget {
     PropositionType(String),
 }
 
-/// Represents a SEARCH command for concept disambiguation.
+/// Represents a SEARCH command for index-driven grounding and associative retrieval.
 /// Helps LLMs find and identify concepts or propositions when exact matches are unclear.
-/// Syntax: `SEARCH [CONCEPT|PROPOSITION] "<search_term>" WITH TYPE "<type_name>" LIMIT N`
+/// Syntax:
+/// `SEARCH CONCEPT|PROPOSITION "<term>" [WITH TYPE "<Type>"] [MODE "keyword"|"semantic"|"hybrid"] [THRESHOLD <0.0-1.0>] [LIMIT N]`
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct SearchCommand {
     pub target: SearchTarget,
@@ -944,8 +1171,53 @@ pub struct SearchCommand {
     pub term: String,
     /// Optional type constraint for the search
     pub in_type: Option<String>,
+    /// Optional retrieval mode. When omitted, the engine uses `hybrid` if it
+    /// supports semantic retrieval, otherwise `keyword`. Engines without
+    /// semantic capability MUST treat `semantic` / `hybrid` as `keyword`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<SearchMode>,
+    /// Optional relevance threshold in `[0, 1]`: hits whose transient
+    /// `metadata._score` falls below it are dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<Number>,
     /// Optional limit on the number of results
     pub limit: Option<usize>,
+}
+
+/// Retrieval mode for SEARCH commands.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub enum SearchMode {
+    /// Lexical match over the grounding fields (text index)
+    Keyword,
+    /// Meaning-based similarity over the grounding fields (engine owns embeddings)
+    Semantic,
+    /// Fused lexical + semantic ranking (recommended default where supported)
+    Hybrid,
+}
+
+impl fmt::Display for SearchMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SearchMode::Keyword => write!(f, "keyword"),
+            SearchMode::Semantic => write!(f, "semantic"),
+            SearchMode::Hybrid => write!(f, "hybrid"),
+        }
+    }
+}
+
+impl FromStr for SearchMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "keyword" => Ok(SearchMode::Keyword),
+            "semantic" => Ok(SearchMode::Semantic),
+            "hybrid" => Ok(SearchMode::Hybrid),
+            _ => Err(format!(
+                "Invalid SEARCH mode: {s:?}, expected \"keyword\", \"semantic\", or \"hybrid\""
+            )),
+        }
+    }
 }
 
 /// Represents the target of a search command.
@@ -956,6 +1228,21 @@ pub enum SearchTarget {
     Concept,
     /// Searching for propositions
     Proposition,
+}
+
+/// Represents an EXPORT command that serializes matched concepts/propositions
+/// into an idempotent UPSERT capsule for backup, migration, and agent-to-agent
+/// knowledge exchange. Read-only.
+///
+/// Syntax: `EXPORT ?target WHERE { ... } [LIMIT N]`
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub struct ExportCommand {
+    /// The target variable bound in the WHERE clause (concept nodes and/or proposition links)
+    pub target: String,
+    /// WHERE clauses containing graph patterns and filters binding the target
+    pub where_clauses: Vec<WhereClause>,
+    /// Optional limit on the number of exported elements
+    pub limit: Option<usize>,
 }
 
 pub fn compare_json(left: &Json, right: &Json) -> Option<Ordering> {
@@ -1221,6 +1508,134 @@ mod tests {
         assert!(ComparisonOperator::GreaterEqual.compare(&value, &json!(2)));
         assert!(!ComparisonOperator::GreaterEqual.compare(&json!(1), &json!(2)));
         assert!(!ComparisonOperator::LessThan.compare(&json!("x"), &json!(2)));
+    }
+
+    #[test]
+    fn update_function_calculate_covers_numeric_and_null_semantics() {
+        // Integer arithmetic is preserved when all operands are integers.
+        assert_eq!(
+            UpdateFunction::Add.calculate(&[json!(5), json!(1)]),
+            json!(6)
+        );
+        assert_eq!(
+            UpdateFunction::Add.calculate(&[json!(5), json!(-2)]),
+            json!(3)
+        );
+        assert_eq!(
+            UpdateFunction::Mul.calculate(&[json!(4), json!(3)]),
+            json!(12)
+        );
+        // Mixed integer/float falls back to float arithmetic.
+        assert_eq!(
+            UpdateFunction::Mul.calculate(&[json!(0.5), json!(4)]),
+            json!(2.0)
+        );
+        // CLAMP constrains into [lo, hi], integer-preserving when possible.
+        assert_eq!(
+            UpdateFunction::Clamp.calculate(&[json!(15), json!(0), json!(10)]),
+            json!(10)
+        );
+        assert_eq!(
+            UpdateFunction::Clamp.calculate(&[json!(1.2), json!(0.0), json!(1.0)]),
+            json!(1.0)
+        );
+        // COALESCE returns the first non-null operand.
+        assert_eq!(
+            UpdateFunction::Coalesce.calculate(&[Json::Null, json!(0)]),
+            json!(0)
+        );
+        assert_eq!(
+            UpdateFunction::Coalesce.calculate(&[json!(7), json!(0)]),
+            json!(7)
+        );
+        // A null or non-number operand yields null (the key is then skipped).
+        assert_eq!(
+            UpdateFunction::Add.calculate(&[Json::Null, json!(1)]),
+            Json::Null
+        );
+        assert_eq!(
+            UpdateFunction::Mul.calculate(&[json!("text"), json!(2)]),
+            Json::Null
+        );
+        assert_eq!(
+            UpdateFunction::Clamp.calculate(&[json!(1), json!(10), json!(0)]),
+            Json::Null // lo > hi
+        );
+    }
+
+    #[test]
+    fn update_expr_evaluate_resolves_target_paths() {
+        // ADD(COALESCE(?t.attributes.count, 0), 1) — the reinforcement idiom.
+        let expr = UpdateExpr::Function {
+            func: UpdateFunction::Add,
+            args: vec![
+                UpdateExpr::Function {
+                    func: UpdateFunction::Coalesce,
+                    args: vec![
+                        UpdateExpr::Variable(DotPathVar {
+                            var: "t".to_string(),
+                            path: vec!["attributes".to_string(), "count".to_string()],
+                        }),
+                        UpdateExpr::Number(Number::from(0)),
+                    ],
+                },
+                UpdateExpr::Number(Number::from(1)),
+            ],
+        };
+
+        // Missing counter initializes via COALESCE.
+        assert_eq!(expr.evaluate(&|_| Json::Null), json!(1));
+        // Existing integer counter increments without losing integerness.
+        assert_eq!(expr.evaluate(&|_| json!(41)), json!(42));
+        // Non-numeric state yields null (key skipped).
+        assert_eq!(expr.evaluate(&|_| json!("not a number")), Json::Null);
+
+        assert_eq!(
+            expr.referenced_paths()
+                .into_iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>(),
+            vec!["?t.attributes.count".to_string()]
+        );
+
+        // CLAMP(MUL(?t.metadata.confidence, 0.9), 0.0, 1.0) — the decay idiom.
+        let decay = UpdateExpr::Function {
+            func: UpdateFunction::Clamp,
+            args: vec![
+                UpdateExpr::Function {
+                    func: UpdateFunction::Mul,
+                    args: vec![
+                        UpdateExpr::Variable(DotPathVar {
+                            var: "t".to_string(),
+                            path: vec!["metadata".to_string(), "confidence".to_string()],
+                        }),
+                        UpdateExpr::Number(Number::from_f64(0.9).unwrap()),
+                    ],
+                },
+                UpdateExpr::Number(Number::from_f64(0.0).unwrap()),
+                UpdateExpr::Number(Number::from_f64(1.0).unwrap()),
+            ],
+        };
+        assert_eq!(decay.evaluate(&|_| json!(0.5)), json!(0.45));
+        assert_eq!(decay.evaluate(&|_| json!(2.0)), json!(1.0));
+        assert_eq!(decay.evaluate(&|_| Json::Null), Json::Null);
+    }
+
+    #[test]
+    fn search_mode_display_and_from_str_roundtrip() {
+        for (mode, s) in [
+            (SearchMode::Keyword, "keyword"),
+            (SearchMode::Semantic, "semantic"),
+            (SearchMode::Hybrid, "hybrid"),
+        ] {
+            assert_eq!(mode.to_string(), s);
+            assert_eq!(SearchMode::from_str(s).unwrap(), mode);
+            assert_eq!(
+                SearchMode::from_str(&s.to_ascii_uppercase()).unwrap(),
+                mode
+            );
+        }
+        assert!(SearchMode::from_str("fuzzy").is_err());
     }
 
     #[test]

@@ -2,24 +2,30 @@ use nom::{
     Parser,
     branch::alt,
     bytes::complete::tag,
-    character::complete::char,
-    combinator::{cut, map, opt},
+    character::complete::{char, multispace1},
+    combinator::{cut, map, map_res, opt},
     error::context,
     multi::{many1, separated_list1},
     sequence::{preceded, separated_pair, terminated},
 };
 
 use super::common::*;
-use super::kql::{parse_concept_matcher, parse_prop_mather, parse_target_term, parse_where_block};
+use super::json::{json_value, parse_number};
+use super::kql::{
+    parse_concept_matcher, parse_limit_clause, parse_prop_mather, parse_target_term,
+    parse_where_block,
+};
 use crate::ast::*;
 
 // --- Top Level KML Parser ---
 
 pub fn parse_kml_statement(input: &str) -> VResult<'_, KmlStatement> {
     context(
-        "KML statement: UPSERT { ... } or DELETE ...",
+        "KML statement: UPSERT { ... } | UPDATE ... | MERGE ... | DELETE ...",
         alt((
             map(parse_upsert_blocks, KmlStatement::Upsert),
+            map(parse_update_statement, KmlStatement::Update),
+            map(parse_merge_statement, KmlStatement::Merge),
             map(parse_delete_statement, KmlStatement::Delete),
         )),
     )
@@ -64,6 +70,18 @@ fn parse_upsert_item(input: &str) -> VResult<'_, UpsertItem> {
     .parse(input)
 }
 
+/// Parses the optional optimistic-concurrency guard: `EXPECT VERSION <n>`.
+fn parse_expect_version(input: &str) -> VResult<'_, u64> {
+    context(
+        "EXPECT VERSION <n>",
+        preceded(
+            (keywords(&["EXPECT", "VERSION"]), multispace1),
+            cut(nom::character::complete::u64),
+        ),
+    )
+    .parse(input)
+}
+
 fn parse_concept_block(input: &str) -> VResult<'_, ConceptBlock> {
     context(
         "CONCEPT [?local_handle] { ... }",
@@ -72,6 +90,7 @@ fn parse_concept_block(input: &str) -> VResult<'_, ConceptBlock> {
                 preceded(ws(keyword("CONCEPT")), opt(ws(variable))),
                 cut(braced_block((
                     ws(parse_concept_matcher),
+                    opt(ws(parse_expect_version)),
                     opt(context(
                         "SET ATTRIBUTES { ... }",
                         ws(preceded(keywords(&["SET", "ATTRIBUTES"]), json_value_map)),
@@ -86,12 +105,15 @@ fn parse_concept_block(input: &str) -> VResult<'_, ConceptBlock> {
                 ))),
                 opt(ws(parse_with_metadata)),
             ),
-            |(handle, (concept, set_attributes, set_propositions), metadata)| ConceptBlock {
-                handle,
-                concept,
-                set_attributes,
-                set_propositions,
-                metadata,
+            |(handle, (concept, expect_version, set_attributes, set_propositions), metadata)| {
+                ConceptBlock {
+                    handle,
+                    concept,
+                    expect_version,
+                    set_attributes,
+                    set_propositions,
+                    metadata,
+                }
             },
         ),
     )
@@ -128,6 +150,7 @@ fn parse_proposition_block(input: &str) -> VResult<'_, PropositionBlock> {
                 preceded(ws(keyword("PROPOSITION")), opt(ws(variable))),
                 cut(braced_block((
                     ws(parse_prop_mather),
+                    opt(ws(parse_expect_version)),
                     opt(context(
                         "SET ATTRIBUTES { ... }",
                         ws(preceded(keywords(&["SET", "ATTRIBUTES"]), json_value_map)),
@@ -135,11 +158,180 @@ fn parse_proposition_block(input: &str) -> VResult<'_, PropositionBlock> {
                 ))),
                 opt(ws(parse_with_metadata)),
             ),
-            |(handle, (proposition, set_attributes), metadata)| PropositionBlock {
+            |(handle, (proposition, expect_version, set_attributes), metadata)| PropositionBlock {
                 handle,
                 proposition,
+                expect_version,
                 set_attributes,
                 metadata,
+            },
+        ),
+    )
+    .parse(input)
+}
+
+// --- UPDATE ---
+
+fn parse_update_statement(input: &str) -> VResult<'_, UpdateStatement> {
+    context(
+        "UPDATE ?target SET ATTRIBUTES { ... } / SET METADATA { ... } WHERE { ... } [LIMIT N]",
+        map_res(
+            preceded(
+                ws(keyword("UPDATE")),
+                cut((
+                    ws(variable),
+                    opt(context(
+                        "SET ATTRIBUTES { ... }",
+                        ws(preceded(
+                            keywords(&["SET", "ATTRIBUTES"]),
+                            parse_update_value_map,
+                        )),
+                    )),
+                    opt(context(
+                        "SET METADATA { ... }",
+                        ws(preceded(keywords(&["SET", "METADATA"]), parse_update_value_map)),
+                    )),
+                    parse_where_block,
+                    opt(ws(parse_limit_clause)),
+                )),
+            ),
+            |(target, set_attributes, set_metadata, where_clauses, limit)| {
+                if set_attributes.is_none() && set_metadata.is_none() {
+                    return Err(
+                        "UPDATE requires at least one SET ATTRIBUTES or SET METADATA block"
+                            .to_string(),
+                    );
+                }
+                Ok(UpdateStatement {
+                    target,
+                    set_attributes,
+                    set_metadata,
+                    where_clauses,
+                    limit,
+                })
+            },
+        ),
+    )
+    .parse(input)
+}
+
+/// Parses an UPDATE SET map whose values may be JSON values or update expressions.
+fn parse_update_value_map(input: &str) -> VResult<'_, Vec<(String, UpdateValue)>> {
+    map(
+        context(
+            "UPDATE SET map",
+            preceded(
+                ws(char('{')),
+                cut(terminated(
+                    opt(terminated(
+                        separated_list1(ws(char(',')), parse_update_key_value),
+                        opt(ws(char(','))), // Allow trailing comma
+                    )),
+                    ws(char('}')),
+                )),
+            ),
+        ),
+        |kvs| kvs.unwrap_or_default(),
+    )
+    .parse(input)
+}
+
+fn parse_update_key_value(input: &str) -> VResult<'_, (String, UpdateValue)> {
+    context(
+        "key-value pair",
+        separated_pair(
+            alt((quoted_string, map(identifier, |s| s.to_string()))),
+            cut(ws(char(':'))),
+            cut(parse_update_value),
+        ),
+    )
+    .parse(input)
+}
+
+fn parse_update_value(input: &str) -> VResult<'_, UpdateValue> {
+    context(
+        "UPDATE value: JSON value or ADD/MUL/CLAMP/COALESCE(...) expression",
+        alt((
+            map(parse_update_expr_function, UpdateValue::Expr),
+            map(json_value(), UpdateValue::Json),
+        )),
+    )
+    .parse(input)
+}
+
+fn parse_update_expr(input: &str) -> VResult<'_, UpdateExpr> {
+    context(
+        "UPDATE expression operand: number, ?target dot-path, or nested expression",
+        alt((
+            parse_update_expr_function,
+            map(dot_path_var, UpdateExpr::Variable),
+            map(parse_number, UpdateExpr::Number),
+        )),
+    )
+    .parse(input)
+}
+
+fn parse_update_expr_function(input: &str) -> VResult<'_, UpdateExpr> {
+    context(
+        "UPDATE expression: ADD(a, b) | MUL(a, b) | CLAMP(x, lo, hi) | COALESCE(x, default)",
+        map_res(
+            (
+                parse_update_function,
+                parenthesized_block(separated_list1(ws(char(',')), ws(parse_update_expr))),
+            ),
+            |(func, args)| validate_update_function_args(func, args),
+        ),
+    )
+    .parse(input)
+}
+
+fn parse_update_function(input: &str) -> VResult<'_, UpdateFunction> {
+    alt((
+        map(tag("ADD"), |_| UpdateFunction::Add),
+        map(tag("MUL"), |_| UpdateFunction::Mul),
+        map(tag("CLAMP"), |_| UpdateFunction::Clamp),
+        map(tag("COALESCE"), |_| UpdateFunction::Coalesce),
+    ))
+    .parse(input)
+}
+
+fn validate_update_function_args(
+    func: UpdateFunction,
+    args: Vec<UpdateExpr>,
+) -> Result<UpdateExpr, String> {
+    let (name, expected) = match func {
+        UpdateFunction::Add => ("ADD", 2),
+        UpdateFunction::Mul => ("MUL", 2),
+        UpdateFunction::Coalesce => ("COALESCE", 2),
+        UpdateFunction::Clamp => ("CLAMP", 3),
+    };
+    if args.len() != expected {
+        return Err(format!(
+            "{name} requires exactly {expected} arguments, got {}",
+            args.len()
+        ));
+    }
+    Ok(UpdateExpr::Function { func, args })
+}
+
+// --- MERGE ---
+
+fn parse_merge_statement(input: &str) -> VResult<'_, MergeStatement> {
+    context(
+        "MERGE CONCEPT ?source INTO ?target WHERE { ... }",
+        map(
+            preceded(
+                ws(keywords(&["MERGE", "CONCEPT"])),
+                cut((
+                    ws(variable),
+                    preceded(ws(tag("INTO")), ws(variable)),
+                    parse_where_block,
+                )),
+            ),
+            |(source, target, where_clauses)| MergeStatement {
+                source,
+                target,
+                where_clauses,
             },
         ),
     )
@@ -434,25 +626,19 @@ mod tests {
                         assert_eq!(props[0].predicate, "is_class_of");
                         assert_eq!(
                             props[0].object,
-                            TargetTerm::Concept {
-                                variable: None,
-                                matcher: ConceptMatcher::Object {
+                            TargetTerm::Concept(ConceptMatcher::Object {
                                     r#type: "DrugClass".to_string(),
                                     name: "Nootropic".to_string(),
-                                },
-                            }
+                                })
                         );
 
                         assert_eq!(props[1].predicate, "treats");
                         assert_eq!(
                             props[1].object,
-                            TargetTerm::Concept {
-                                variable: None,
-                                matcher: ConceptMatcher::Object {
+                            TargetTerm::Concept(ConceptMatcher::Object {
                                     r#type: "Symptom".to_string(),
                                     name: "Brain Fog".to_string(),
-                                },
-                            }
+                                })
                         );
 
                         assert_eq!(props[2].predicate, "has_side_effect");
@@ -535,18 +721,12 @@ mod tests {
                         assert_eq!(
                             prop.proposition,
                             PropositionMatcher::Object {
-                                subject: TargetTerm::Concept {
-                                    variable: None,
-                                    matcher: ConceptMatcher::Name("Zhang San".to_string()),
-                                },
+                                subject: TargetTerm::Concept(ConceptMatcher::Name("Zhang San".to_string())),
                                 predicate: PredTerm::Literal("stated".to_string()),
-                                object: TargetTerm::Concept {
-                                    variable: None,
-                                    matcher: ConceptMatcher::Object {
+                                object: TargetTerm::Concept(ConceptMatcher::Object {
                                         r#type: "Paper".to_string(),
                                         name: "paper_doi".to_string(),
-                                    },
-                                },
+                                    }),
                             }
                         );
 
@@ -768,15 +948,9 @@ mod tests {
                         assert_eq!(
                             prop.proposition,
                             PropositionMatcher::Object {
-                                subject: TargetTerm::Concept {
-                                    variable: None,
-                                    matcher: ConceptMatcher::ID("drug_001".to_string()),
-                                },
+                                subject: TargetTerm::Concept(ConceptMatcher::ID("drug_001".to_string())),
                                 predicate: PredTerm::Literal("interacts_with".to_string()),
-                                object: TargetTerm::Concept {
-                                    variable: None,
-                                    matcher: ConceptMatcher::ID("drug_002".to_string()),
-                                },
+                                object: TargetTerm::Concept(ConceptMatcher::ID("drug_002".to_string())),
                             }
                         );
                         let metadata = prop.metadata.as_ref().unwrap();
@@ -951,5 +1125,245 @@ mod tests {
             }
             _ => panic!("expected UPSERT"),
         }
+    }
+
+    #[test]
+    fn test_parse_upsert_with_expect_version() {
+        let input = r#"
+        UPSERT {
+            CONCEPT ?self {
+                {type: "Person", name: "$self"}
+                EXPECT VERSION 42
+                SET ATTRIBUTES { behavior_preferences: ["concise"] }
+            }
+            PROPOSITION ?fact {
+                (?self, "prefers", {type: "Preference", name: "concise_style"})
+                EXPECT VERSION 0
+                SET ATTRIBUTES { note: "create-only" }
+            }
+        }
+        WITH METADATA { source: "test", author: "$self", confidence: 1.0 }
+        "#;
+
+        let (_, statement) = parse_kml_statement(input).unwrap();
+        match statement {
+            KmlStatement::Upsert(blocks) => {
+                assert_eq!(blocks.len(), 1);
+                match &blocks[0].items[0] {
+                    UpsertItem::Concept(concept) => {
+                        assert_eq!(concept.expect_version, Some(42));
+                        assert!(concept.set_attributes.is_some());
+                    }
+                    _ => panic!("Expected ConceptBlock"),
+                }
+                match &blocks[0].items[1] {
+                    UpsertItem::Proposition(prop) => {
+                        assert_eq!(prop.expect_version, Some(0));
+                        assert!(prop.set_attributes.is_some());
+                    }
+                    _ => panic!("Expected PropositionBlock"),
+                }
+            }
+            _ => panic!("Expected UpsertBlock"),
+        }
+
+        // EXPECT VERSION must be a non-negative integer
+        let invalid = r#"
+        UPSERT {
+            CONCEPT ?self {
+                {type: "Person", name: "$self"}
+                EXPECT VERSION -1
+            }
+        }
+        "#;
+        assert!(parse_kml_statement(invalid).is_err());
+    }
+
+    #[test]
+    fn test_parse_update_statement() {
+        // The memory-metabolism workhorse from the spec: confidence decay.
+        let input = r#"
+        UPDATE ?link
+        SET METADATA {
+            confidence: CLAMP(MUL(?link.metadata.confidence, 0.9), 0.0, 1.0),
+            decay_applied_at: "2026-06-11T00:00:00Z"
+        }
+        WHERE {
+            ?link (?s, ?p, ?o)
+            FILTER(IS_NULL(?link.metadata.superseded) || ?link.metadata.superseded != true)
+            FILTER(?link.metadata.created_at < "2026-05-11T00:00:00Z" && ?link.metadata.confidence > 0.3)
+        }
+        LIMIT 500
+        "#;
+
+        let (_, statement) = parse_kml_statement(input).unwrap();
+        match statement {
+            KmlStatement::Update(update) => {
+                assert_eq!(update.target, "link");
+                assert!(update.set_attributes.is_none());
+                assert_eq!(update.limit, Some(500));
+                assert_eq!(update.where_clauses.len(), 3);
+
+                let metadata = update.set_metadata.as_ref().unwrap();
+                assert_eq!(metadata.len(), 2);
+                assert_eq!(metadata[0].0, "confidence");
+                assert_eq!(
+                    metadata[0].1,
+                    UpdateValue::Expr(UpdateExpr::Function {
+                        func: UpdateFunction::Clamp,
+                        args: vec![
+                            UpdateExpr::Function {
+                                func: UpdateFunction::Mul,
+                                args: vec![
+                                    UpdateExpr::Variable(DotPathVar {
+                                        var: "link".to_string(),
+                                        path: vec![
+                                            "metadata".to_string(),
+                                            "confidence".to_string()
+                                        ],
+                                    }),
+                                    UpdateExpr::Number(Number::from_f64(0.9).unwrap()),
+                                ],
+                            },
+                            UpdateExpr::Number(Number::from_f64(0.0).unwrap()),
+                            UpdateExpr::Number(Number::from_f64(1.0).unwrap()),
+                        ],
+                    })
+                );
+                assert_eq!(metadata[1].0, "decay_applied_at");
+                assert_eq!(
+                    metadata[1].1,
+                    UpdateValue::Json(Json::String("2026-06-11T00:00:00Z".to_string()))
+                );
+            }
+            _ => panic!("Expected UpdateStatement"),
+        }
+    }
+
+    #[test]
+    fn test_parse_update_statement_reinforcement() {
+        // Reinforce without read-modify-write: ADD + COALESCE, both SET blocks.
+        let input = r#"
+        UPDATE ?pref
+        SET ATTRIBUTES {
+            evidence_count: ADD(COALESCE(?pref.attributes.evidence_count, 0), 1),
+            last_observed: "2026-06-11T00:00:00Z"
+        }
+        SET METADATA { observed_at: "2026-06-11T00:00:00Z" }
+        WHERE {
+            ?pref {type: "Preference", name: "concise_style"}
+        }
+        "#;
+
+        let (_, statement) = parse_kml_statement(input).unwrap();
+        match statement {
+            KmlStatement::Update(update) => {
+                assert_eq!(update.target, "pref");
+                assert_eq!(update.limit, None);
+
+                let attrs = update.set_attributes.as_ref().unwrap();
+                assert_eq!(attrs.len(), 2);
+                assert_eq!(attrs[0].0, "evidence_count");
+                assert_eq!(
+                    attrs[0].1,
+                    UpdateValue::Expr(UpdateExpr::Function {
+                        func: UpdateFunction::Add,
+                        args: vec![
+                            UpdateExpr::Function {
+                                func: UpdateFunction::Coalesce,
+                                args: vec![
+                                    UpdateExpr::Variable(DotPathVar {
+                                        var: "pref".to_string(),
+                                        path: vec![
+                                            "attributes".to_string(),
+                                            "evidence_count".to_string()
+                                        ],
+                                    }),
+                                    UpdateExpr::Number(Number::from(0)),
+                                ],
+                            },
+                            UpdateExpr::Number(Number::from(1)),
+                        ],
+                    })
+                );
+
+                let metadata = update.set_metadata.as_ref().unwrap();
+                assert_eq!(metadata.len(), 1);
+                assert_eq!(metadata[0].0, "observed_at");
+            }
+            _ => panic!("Expected UpdateStatement"),
+        }
+    }
+
+    #[test]
+    fn test_parse_update_error_cases() {
+        // No SET block at all
+        let no_set = r#"
+        UPDATE ?link
+        WHERE { ?link (?s, ?p, ?o) }
+        "#;
+        assert!(parse_kml_statement(no_set).is_err());
+
+        // Missing WHERE block
+        let no_where = r#"
+        UPDATE ?link
+        SET METADATA { confidence: 0.5 }
+        "#;
+        assert!(parse_kml_statement(no_where).is_err());
+
+        // Wrong arity: CLAMP requires 3 arguments
+        let bad_arity = r#"
+        UPDATE ?link
+        SET METADATA { confidence: CLAMP(0.5, 1.0) }
+        WHERE { ?link (?s, ?p, ?o) }
+        "#;
+        assert!(parse_kml_statement(bad_arity).is_err());
+
+        // Wrong arity: ADD requires 2 arguments
+        let bad_add = r#"
+        UPDATE ?link
+        SET METADATA { confidence: ADD(1) }
+        WHERE { ?link (?s, ?p, ?o) }
+        "#;
+        assert!(parse_kml_statement(bad_add).is_err());
+    }
+
+    #[test]
+    fn test_parse_merge_statement() {
+        let input = r#"
+        MERGE CONCEPT ?dup INTO ?canonical
+        WHERE {
+            ?dup {type: "SkillTopic", name: "JS"}
+            ?canonical {type: "SkillTopic", name: "JavaScript"}
+        }
+        "#;
+
+        let (_, statement) = parse_kml_statement(input).unwrap();
+        match statement {
+            KmlStatement::Merge(merge) => {
+                assert_eq!(merge.source, "dup");
+                assert_eq!(merge.target, "canonical");
+                assert_eq!(merge.where_clauses.len(), 2);
+                assert_eq!(
+                    merge.where_clauses[0],
+                    WhereClause::Concept(ConceptClause {
+                        matcher: ConceptMatcher::Object {
+                            r#type: "SkillTopic".to_string(),
+                            name: "JS".to_string(),
+                        },
+                        variable: "dup".to_string(),
+                    })
+                );
+            }
+            _ => panic!("Expected MergeStatement"),
+        }
+
+        // MERGE without INTO is invalid
+        assert!(
+            parse_kml_statement(r#"MERGE CONCEPT ?dup WHERE { ?dup {type: "T", name: "x"} }"#)
+                .is_err()
+        );
+        // MERGE without WHERE is invalid
+        assert!(parse_kml_statement("MERGE CONCEPT ?dup INTO ?canonical").is_err());
     }
 }

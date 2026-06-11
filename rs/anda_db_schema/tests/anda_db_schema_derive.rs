@@ -128,6 +128,7 @@ struct TestRenameAll {
 // 测试 serde 透明智能指针的类型推断
 // (注:Arc 的 serde 序列化需启用 serde 的 `rc` feature,此处仅验证 schema 推断)
 #[allow(dead_code)]
+#[allow(clippy::box_collection)]
 #[derive(Debug, AndaDBSchema)]
 struct TestSmartPointers {
     _id: u64,

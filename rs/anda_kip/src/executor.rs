@@ -177,8 +177,9 @@ pub async fn execute_kip(
 /// High-level convenience function for executing KIP commands in read-only mode.
 ///
 /// This function is similar to `execute_kip` but enforces that only read-only commands
-/// (KQL queries and META commands) are executed. If a KML command is detected, an error is returned
-/// indicating that only KQL and META commands are allowed in read-only mode.
+/// (KQL queries and META commands, including `DESCRIBE` / `SEARCH` / `EXPORT`) are executed.
+/// If a KML command (`UPSERT` / `UPDATE` / `MERGE` / `DELETE`) is detected, an error is
+/// returned indicating that only KQL and META commands are allowed in read-only mode.
 ///
 pub async fn execute_readonly(
     executor: &impl Executor,

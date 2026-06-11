@@ -198,6 +198,7 @@ struct Wrapper<T> {
 }
 
 #[allow(dead_code)]
+#[allow(clippy::box_collection)]
 #[derive(Debug, FieldTyped)]
 struct UsesGenericNested {
     wrapped: Wrapper<u64>,

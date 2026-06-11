@@ -15,11 +15,15 @@
 //!   propositions (higher-order facts). Each row stores all of its
 //!   predicates in a single record to keep the link space compact.
 //!
-//! `CognitiveNexus` accepts the full KIP v1.0-RC7 grammar — KQL queries
-//! (`FIND … WHERE …`), KML mutations (`UPSERT`, `DELETE …`) and META
-//! introspection (`DESCRIBE …`, `SEARCH …`) — and translates them into
+//! `CognitiveNexus` accepts the full KIP v1.0 Release Candidate grammar —
+//! KQL queries (`FIND … WHERE …`), KML mutations (`UPSERT` with
+//! `EXPECT VERSION` guards, `UPDATE`, `MERGE`, `DELETE …`) and META
+//! commands (`DESCRIBE …`, `SEARCH …` with retrieval modes and relevance
+//! thresholds, `EXPORT …` knowledge capsules) — and translates them into
 //! Anda DB collection operations using a small, well-defined index plan
 //! (BTree + BM25 over the `concepts` and `propositions` collections).
+//! Reserved `_` metadata (`_version`, `_updated_at`, `_merged_from`, the
+//! transient `_score`) is engine-maintained per KIP §2.11.
 //!
 //! ## Quick start
 //!

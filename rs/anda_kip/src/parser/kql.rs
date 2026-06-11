@@ -148,36 +148,14 @@ fn parse_concept_clause(input: &str) -> VResult<'_, ConceptClause> {
 
 pub fn parse_target_term(input: &str) -> VResult<'_, TargetTerm> {
     context(
-        "KQL target term",
+        "KQL target term: ?var, unnamed {concept clause}, or unnamed (proposition clause)",
         alt((
-            // `?var (matcher)` nested proposition with binding
-            map(pair(variable, ws(parse_prop_mather)), |(var, matcher)| {
-                TargetTerm::Proposition {
-                    variable: Some(var),
-                    matcher: Box::new(matcher),
-                }
-            }),
-            // `?var {matcher}` or `?var`
-            map(
-                pair(variable, opt(ws(parse_concept_matcher))),
-                |(var, matcher)| match matcher {
-                    Some(matcher) => TargetTerm::Concept {
-                        variable: Some(var),
-                        matcher,
-                    },
-                    None => TargetTerm::Variable(var),
-                },
-            ),
-            // anonymous `{matcher}`
-            map(parse_concept_matcher, |matcher| TargetTerm::Concept {
-                variable: None,
-                matcher,
-            }),
-            // anonymous nested proposition `(...)`
-            map(parse_prop_mather, |p| TargetTerm::Proposition {
-                variable: None,
-                matcher: Box::new(p),
-            }),
+            // `?var` — a previously bound variable
+            map(variable, TargetTerm::Variable),
+            // unnamed `{matcher}` concept clause
+            map(parse_concept_matcher, TargetTerm::Concept),
+            // unnamed nested proposition clause `(...)`
+            map(parse_prop_mather, |p| TargetTerm::Proposition(Box::new(p))),
         )),
     )
     .parse(input)
@@ -783,13 +761,10 @@ mod tests {
                     PropositionMatcher::Object {
                         subject: TargetTerm::Variable("drug".to_string()),
                         predicate: PredTerm::Literal("treats".to_string()),
-                        object: TargetTerm::Concept {
-                            variable: None,
-                            matcher: ConceptMatcher::Object {
+                        object: TargetTerm::Concept(ConceptMatcher::Object {
                                 r#type: "Symptom".to_string(),
                                 name: "Headache".to_string(),
-                            },
-                        },
+                            }),
                     }
                 );
             }
@@ -798,11 +773,14 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_nested_proposition_with_variable_binding() {
+    fn test_parse_nested_proposition_endpoint() {
+        // The endpoint proposition clause must be unnamed; bind it in a separate
+        // clause first, then reference the variable.
         let input = r#"
             FIND(?evidence)
             WHERE {
-                (?paper, "cites", ?evidence (?drug, "treats", ?symptom))
+                ?evidence (?drug, "treats", ?symptom)
+                (?paper, "cites", ?evidence)
             }
         "#;
 
@@ -810,60 +788,21 @@ mod tests {
         assert!(result.is_ok(), "Failed to parse: {:?}", result);
 
         let (_, query) = result.unwrap();
-        assert_eq!(query.where_clauses.len(), 1);
+        assert_eq!(query.where_clauses.len(), 2);
 
         match &query.where_clauses[0] {
             WhereClause::Proposition(clause) => {
-                assert_eq!(clause.variable, None);
+                assert_eq!(clause.variable, Some("evidence".to_string()));
                 assert_eq!(
                     clause.matcher,
                     PropositionMatcher::Object {
-                        subject: TargetTerm::Variable("paper".to_string()),
-                        predicate: PredTerm::Literal("cites".to_string()),
-                        object: TargetTerm::Proposition {
-                            variable: Some("evidence".to_string()),
-                            matcher: Box::new(PropositionMatcher::Object {
-                                subject: TargetTerm::Variable("drug".to_string()),
-                                predicate: PredTerm::Literal("treats".to_string()),
-                                object: TargetTerm::Variable("symptom".to_string()),
-                            }),
-                        },
+                        subject: TargetTerm::Variable("drug".to_string()),
+                        predicate: PredTerm::Literal("treats".to_string()),
+                        object: TargetTerm::Variable("symptom".to_string()),
                     }
                 );
             }
             _ => panic!("Expected proposition clause"),
-        }
-    }
-
-    #[test]
-    fn test_parse_nested_concept_with_variable_binding() {
-        let input = r#"
-            FIND(?e, ?p, ?y)
-            WHERE {
-                ?e {type: "Event", name: "Conversation:2026-04-27:introduction_yan"}
-                (?e, "involves", ?y {type: "Person", name: "Yan"})
-                (?e, "consolidated_to", ?p {type: "Preference", name: "call_ai_anda"})
-            }
-        "#;
-
-        let result = parse_kql_query(input);
-        assert!(result.is_ok());
-
-        let (_, query) = result.unwrap();
-        assert_eq!(query.where_clauses.len(), 3);
-
-        match &query.where_clauses[0] {
-            WhereClause::Concept(clause) => {
-                assert_eq!(clause.variable, "e".to_string());
-                assert_eq!(
-                    clause.matcher,
-                    ConceptMatcher::Object {
-                        r#type: "Event".to_string(),
-                        name: "Conversation:2026-04-27:introduction_yan".to_string(),
-                    }
-                );
-            }
-            _ => panic!("Expected concept clause"),
         }
 
         match &query.where_clauses[1] {
@@ -872,36 +811,58 @@ mod tests {
                 assert_eq!(
                     clause.matcher,
                     PropositionMatcher::Object {
-                        subject: TargetTerm::Variable("e".to_string()),
-                        predicate: PredTerm::Literal("involves".to_string()),
-                        object: TargetTerm::Concept {
-                            variable: Some("y".to_string()),
-                            matcher: ConceptMatcher::Object {
-                                r#type: "Person".to_string(),
-                                name: "Yan".to_string(),
-                            },
-                        },
+                        subject: TargetTerm::Variable("paper".to_string()),
+                        predicate: PredTerm::Literal("cites".to_string()),
+                        object: TargetTerm::Variable("evidence".to_string()),
                     }
                 );
             }
             _ => panic!("Expected proposition clause"),
         }
+    }
 
-        match &query.where_clauses[2] {
+    #[test]
+    fn test_named_embedded_endpoint_is_rejected() {
+        // Attaching a variable name to an embedded endpoint clause was removed
+        // from the protocol: bind the variable in a separate clause instead.
+        let named_concept_endpoint = r#"
+            FIND(?e, ?y)
+            WHERE {
+                ?e {type: "Event", name: "Conversation:2026-04-27:introduction_yan"}
+                (?e, "involves", ?y {type: "Person", name: "Yan"})
+            }
+        "#;
+        assert!(parse_kql_query(named_concept_endpoint).is_err());
+
+        let named_proposition_endpoint = r#"
+            FIND(?evidence)
+            WHERE {
+                (?paper, "cites", ?evidence (?drug, "treats", ?symptom))
+            }
+        "#;
+        assert!(parse_kql_query(named_proposition_endpoint).is_err());
+
+        // The unnamed equivalents are valid.
+        let unnamed = r#"
+            FIND(?e)
+            WHERE {
+                ?e {type: "Event", name: "Conversation:2026-04-27:introduction_yan"}
+                (?e, "involves", {type: "Person", name: "Yan"})
+            }
+        "#;
+        let (_, query) = parse_kql_query(unnamed).unwrap();
+        assert_eq!(query.where_clauses.len(), 2);
+        match &query.where_clauses[1] {
             WhereClause::Proposition(clause) => {
-                assert_eq!(clause.variable, None);
                 assert_eq!(
                     clause.matcher,
                     PropositionMatcher::Object {
                         subject: TargetTerm::Variable("e".to_string()),
-                        predicate: PredTerm::Literal("consolidated_to".to_string()),
-                        object: TargetTerm::Concept {
-                            variable: Some("p".to_string()),
-                            matcher: ConceptMatcher::Object {
-                                r#type: "Preference".to_string(),
-                                name: "call_ai_anda".to_string(),
-                            },
-                        },
+                        predicate: PredTerm::Literal("involves".to_string()),
+                        object: TargetTerm::Concept(ConceptMatcher::Object {
+                            r#type: "Person".to_string(),
+                            name: "Yan".to_string(),
+                        }),
                     }
                 );
             }
@@ -956,29 +917,20 @@ mod tests {
                 assert_eq!(
                     clause.matcher,
                     PropositionMatcher::Object {
-                        subject: TargetTerm::Concept {
-                            variable: None,
-                            matcher: ConceptMatcher::Object {
+                        subject: TargetTerm::Concept(ConceptMatcher::Object {
                                 r#type: "Person".to_string(),
                                 name: "张三".to_string(),
-                            },
-                        },
-                        predicate: PredTerm::Literal("stated".to_string()),
-                        object: TargetTerm::Proposition {
-                            variable: None,
-                            matcher: Box::new(PropositionMatcher::Object {
-                                subject: TargetTerm::Variable("paper".to_string()),
-                                predicate: PredTerm::Literal("cites_as_evidence".to_string()),
-                                object: TargetTerm::Proposition {
-                                    variable: None,
-                                    matcher: Box::new(PropositionMatcher::Object {
-                                        subject: TargetTerm::Variable("drug".to_string()),
-                                        predicate: PredTerm::Literal("treats".to_string()),
-                                        object: TargetTerm::Variable("symptom".to_string()),
-                                    }),
-                                },
                             }),
-                        },
+                        predicate: PredTerm::Literal("stated".to_string()),
+                        object: TargetTerm::Proposition(Box::new(PropositionMatcher::Object {
+                            subject: TargetTerm::Variable("paper".to_string()),
+                            predicate: PredTerm::Literal("cites_as_evidence".to_string()),
+                            object: TargetTerm::Proposition(Box::new(PropositionMatcher::Object {
+                                subject: TargetTerm::Variable("drug".to_string()),
+                                predicate: PredTerm::Literal("treats".to_string()),
+                                object: TargetTerm::Variable("symptom".to_string()),
+                            })),
+                        })),
                     }
                 );
             }
@@ -1708,10 +1660,7 @@ mod tests {
                             PropositionMatcher::Object {
                                 subject: TargetTerm::Variable("drug".to_string()),
                                 predicate: PredTerm::Literal("is_class_of".to_string()),
-                                object: TargetTerm::Concept {
-                                    variable: None,
-                                    matcher: ConceptMatcher::Name("NSAID".to_string()),
-                                },
+                                object: TargetTerm::Concept(ConceptMatcher::Name("NSAID".to_string())),
                             }
                         );
                     }
@@ -1751,10 +1700,7 @@ mod tests {
                             PropositionMatcher::Object {
                                 subject: TargetTerm::Variable("drug".to_string()),
                                 predicate: PredTerm::Literal("treats".to_string()),
-                                object: TargetTerm::Concept {
-                                    variable: None,
-                                    matcher: ConceptMatcher::Name("Fever".to_string()),
-                                },
+                                object: TargetTerm::Concept(ConceptMatcher::Name("Fever".to_string())),
                             }
                         );
                     }

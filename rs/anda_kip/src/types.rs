@@ -7,6 +7,31 @@ use crate::{
     ast::{Json, Map},
 };
 
+/// Reserved system metadata namespace prefix.
+///
+/// Metadata keys beginning with `_` are maintained exclusively by the engine:
+/// KML statements cannot set or delete them (`KIP_2002`), while KQL reads them
+/// like ordinary metadata (e.g., `?x.metadata._version`).
+pub static RESERVED_METADATA_PREFIX: &str = "_";
+
+/// Monotonic mutation counter (starts at 1); target of `EXPECT VERSION`. REQUIRED.
+pub static METADATA_VERSION: &str = "_version";
+
+/// ISO 8601 timestamp of the element's last mutation (engine truth). RECOMMENDED.
+pub static METADATA_UPDATED_AT: &str = "_updated_at";
+
+/// Transient normalized `SEARCH` relevance score `[0, 1]`; never persisted. OPTIONAL.
+pub static METADATA_SCORE: &str = "_score";
+
+/// Provenance trail (`"<Type>:<name>"` entries) left on the target by `MERGE`.
+pub static METADATA_MERGED_FROM: &str = "_merged_from";
+
+/// Returns true if the metadata key belongs to the reserved `_` namespace
+/// (engine-maintained, read-only to KML).
+pub fn is_reserved_metadata_key(key: &str) -> bool {
+    key.starts_with(RESERVED_METADATA_PREFIX)
+}
+
 /// Enumeration of entity types for type checking and validation.
 ///
 /// This enum is used to distinguish between different entity types

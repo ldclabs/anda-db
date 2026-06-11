@@ -8,7 +8,7 @@
 //! - [`GENESIS_KIP`] defines the meta-types `$ConceptType` / `$PropositionType`,
 //!   the `Domain` type, and the `CoreSchema` core domain.
 //! - The remaining `*_KIP` constants define standard concept types
-//!   (`Person`, `Event`, `Insight`, `Preference`, `SleepTask`).
+//!   (`Person`, `Event`, `Insight`, `Preference`, `Commitment`, `SleepTask`).
 //! - [`PERSON_SELF_KIP`] / [`PERSON_SYSTEM_KIP`] materialize the system actors
 //!   `$self` (waking persona) and `$system` (sleeping persona).
 //!
@@ -45,6 +45,9 @@ pub static SLEEP_TASK_TYPE: &str = "SleepTask";
 /// The type identifier for preference entities.
 pub static PREFERENCE_TYPE: &str = "Preference";
 
+/// The type identifier for commitment entities (prospective memory).
+pub static COMMITMENT_TYPE: &str = "Commitment";
+
 /// The predicate type for domain membership relationships.
 pub static BELONGS_TO_DOMAIN_TYPE: &str = "belongs_to_domain";
 
@@ -62,6 +65,10 @@ pub static PERSON_KIP: &str = include_str!("../capsules/Person.kip");
 
 /// The Preference type definition capsule.
 pub static PREFERENCE_KIP: &str = include_str!("../capsules/Preference.kip");
+
+/// The Commitment type definition capsule (prospective memory:
+/// promises, reminders, follow-ups, deadlines).
+pub static COMMITMENT_KIP: &str = include_str!("../capsules/Commitment.kip");
 
 /// The SleepTask type definition capsule.
 pub static SLEEP_TASK_KIP: &str = include_str!("../capsules/SleepTask.kip");
@@ -94,6 +101,10 @@ mod tests {
         let preference_type =
             parse_kip(PREFERENCE_KIP).expect("Failed to parse Preference type capsule");
         println!("Preference Type Capsule: {:#?}", preference_type);
+
+        let commitment_type =
+            parse_kip(COMMITMENT_KIP).expect("Failed to parse Commitment type capsule");
+        println!("Commitment Type Capsule: {:#?}", commitment_type);
 
         let sleep_task_type =
             parse_kip(SLEEP_TASK_KIP).expect("Failed to parse SleepTask type capsule");

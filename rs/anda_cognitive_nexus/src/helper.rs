@@ -6,13 +6,141 @@
 use anda_db::error::DBError;
 use anda_db_utils::Pipe;
 use anda_kip::{
-    EntityType, FilterExpression, FilterOperand, Json, KipError, Map, OrderByCondition,
-    OrderDirection, PredTerm, validate_dot_path_var,
+    EntityType, FilterExpression, FilterOperand, Json, KipError, METADATA_SCORE,
+    METADATA_UPDATED_AT, METADATA_VERSION, Map, OrderByCondition, OrderDirection, PredTerm,
+    is_reserved_metadata_key, validate_dot_path_var,
 };
 use rustc_hash::FxHashMap;
 use std::borrow::Cow;
 
 use crate::entity::{Concept, EntityID, Properties, Proposition};
+
+/// Returns the engine-maintained `_version` of an **existing** element.
+///
+/// Elements created before version tracking have no `_version` key; they are
+/// treated as version `1` (creation counts as the first mutation). Callers
+/// must map "element does not exist" to `0` themselves — that is the value
+/// `EXPECT VERSION 0` (create-only) guards against.
+pub fn system_metadata_version(metadata: &Map<String, Json>) -> u64 {
+    metadata
+        .get(METADATA_VERSION)
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1)
+}
+
+/// Marks an element as freshly created: `_version = 1`, `_updated_at = now`.
+pub fn init_system_metadata(metadata: &mut Map<String, Json>, now_ms: u64) {
+    metadata.insert(METADATA_VERSION.to_string(), Json::from(1u64));
+    metadata.insert(
+        METADATA_UPDATED_AT.to_string(),
+        Json::String(unix_ms_to_iso8601(now_ms)),
+    );
+}
+
+/// Marks an element as mutated: increments `_version` and refreshes
+/// `_updated_at`. Must be called on every successful mutation of an existing
+/// element (KIP §2.11.1).
+pub fn bump_system_metadata(metadata: &mut Map<String, Json>, now_ms: u64) {
+    let version = system_metadata_version(metadata).saturating_add(1);
+    metadata.insert(METADATA_VERSION.to_string(), Json::from(version));
+    metadata.insert(
+        METADATA_UPDATED_AT.to_string(),
+        Json::String(unix_ms_to_iso8601(now_ms)),
+    );
+}
+
+/// Rejects author-supplied metadata keys in the reserved `_` namespace with
+/// `KIP_2002` (ConstraintViolation). The reserved namespace is engine-maintained
+/// and read-only to KML (KIP §2.11.1).
+pub fn reject_reserved_metadata_keys<'a, I>(keys: I) -> Result<(), KipError>
+where
+    I: IntoIterator<Item = &'a String>,
+{
+    for key in keys {
+        if is_reserved_metadata_key(key) {
+            return Err(KipError::constraint_violation(format!(
+                "Metadata key {key:?} is reserved (`_` namespace is engine-maintained and read-only to KML)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Normalizes a raw BM25 score into `[0, 1]` relative to the best hit of the
+/// result set, rounded to 6 decimal places for stable JSON output.
+pub fn normalize_search_score(score: f32, max_score: f32) -> f64 {
+    let normalized = if max_score > 0.0 {
+        (score / max_score) as f64
+    } else {
+        0.0
+    };
+    (normalized.clamp(0.0, 1.0) * 1e6).round() / 1e6
+}
+
+/// Attaches the transient `metadata._score` field (KIP §5.2.2) to a search
+/// hit. The score lives only in the response — it is never persisted.
+pub fn attach_search_score(hit: &mut Json, score: f64) {
+    if let Some(metadata) = hit.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+        metadata.insert(METADATA_SCORE.to_string(), Json::from(score));
+    } else if let Some(obj) = hit.as_object_mut() {
+        obj.insert(
+            "metadata".to_string(),
+            Json::Object(Map::from_iter([(
+                METADATA_SCORE.to_string(),
+                Json::from(score),
+            )])),
+        );
+    }
+}
+
+/// Serializes a value as compact JSON for embedding in generated KIP source.
+/// The KIP grammar accepts standard JSON (quoted keys included) wherever a
+/// JSON value or map is expected, so `serde_json` output is always parseable.
+pub fn to_kip_json<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_string(value).expect("JSON serialization of in-memory values cannot fail")
+}
+
+/// Returns a copy of `metadata` without the reserved `_` namespace.
+/// Used by `EXPORT`: engine bookkeeping is not knowledge and never leaves
+/// the source engine (KIP §5.3).
+pub fn strip_reserved_metadata(metadata: &Map<String, Json>) -> Map<String, Json> {
+    metadata
+        .iter()
+        .filter(|(key, _)| !is_reserved_metadata_key(key))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+/// Formats a Unix timestamp in milliseconds as an ISO 8601 / RFC 3339 UTC
+/// string (e.g., `2026-06-11T08:30:00.123Z`).
+pub fn unix_ms_to_iso8601(ms: u64) -> String {
+    let secs = ms / 1000;
+    let millis = ms % 1000;
+    let days = (secs / 86_400) as i64;
+    let tod = secs % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{millis:03}Z",
+        tod / 3600,
+        (tod % 3600) / 60,
+        tod % 60,
+    )
+}
+
+/// Converts days since the Unix epoch to a (year, month, day) civil date
+/// (Howard Hinnant's `civil_from_days` algorithm).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
 
 /// Extracts field values from a concept using a dot-notation path.
 ///
@@ -656,6 +784,48 @@ mod tests {
             })
             .code_str(),
             "KIP_4003"
+        );
+    }
+
+    #[test]
+    fn system_metadata_helpers_track_versions_and_reject_reserved_keys() {
+        let mut metadata = Map::new();
+        // Existing element without `_version` is treated as version 1.
+        assert_eq!(system_metadata_version(&metadata), 1);
+
+        init_system_metadata(&mut metadata, 1_750_000_000_123);
+        assert_eq!(system_metadata_version(&metadata), 1);
+        assert!(metadata["_updated_at"].as_str().unwrap().ends_with(".123Z"));
+
+        bump_system_metadata(&mut metadata, 1_750_000_001_000);
+        assert_eq!(system_metadata_version(&metadata), 2);
+
+        assert!(reject_reserved_metadata_keys(std::iter::empty::<&String>()).is_ok());
+        assert!(
+            reject_reserved_metadata_keys(
+                Map::from_iter([("confidence".to_string(), json!(0.9))]).keys()
+            )
+            .is_ok()
+        );
+        let err = reject_reserved_metadata_keys(
+            Map::from_iter([("_version".to_string(), json!(2))]).keys(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code_str(), "KIP_2002");
+    }
+
+    #[test]
+    fn unix_ms_to_iso8601_formats_utc_dates() {
+        assert_eq!(unix_ms_to_iso8601(0), "1970-01-01T00:00:00.000Z");
+        // 2026-06-11T00:00:00Z
+        assert_eq!(
+            unix_ms_to_iso8601(1_781_136_000_000),
+            "2026-06-11T00:00:00.000Z"
+        );
+        // Leap-year day: 2024-02-29T12:34:56.789Z
+        assert_eq!(
+            unix_ms_to_iso8601(1_709_210_096_789),
+            "2024-02-29T12:34:56.789Z"
         );
     }
 

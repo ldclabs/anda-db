@@ -432,8 +432,8 @@ impl Request {
     /// Marks this request as read-only.
     ///
     /// When set, [`Self::execute`] dispatches through `execute_readonly`, which
-    /// rejects KML commands (UPSERT/DELETE) with `KIP_1001` so callers can route
-    /// untrusted or query-only traffic through a guaranteed non-mutating path.
+    /// rejects KML commands (UPSERT/UPDATE/MERGE/DELETE) with `KIP_1001` so callers
+    /// can route untrusted or query-only traffic through a guaranteed non-mutating path.
     pub fn readonly(&mut self) -> &mut Self {
         self.readonly = true;
         self
@@ -775,6 +775,72 @@ mod tests {
         assert_eq!(result, "FIND(?drug) WHERE { ?drug {type: \"Drug\"} }");
         assert!(matches!(result, Cow::Borrowed(_)));
         assert!(parse_kql(&result).is_ok());
+    }
+
+    #[test]
+    fn test_to_command_substitutes_update_and_search_placeholders() {
+        // The spec's decay UPDATE with :factor / :now / :threshold placeholders.
+        let request = Request {
+            command: r#"
+            UPDATE ?link
+            SET METADATA {
+                confidence: CLAMP(MUL(?link.metadata.confidence, :factor), 0.0, 1.0),
+                decay_applied_at: :now
+            }
+            WHERE {
+                ?link (?s, ?p, ?o)
+                FILTER(?link.metadata.created_at < :threshold && ?link.metadata.confidence > 0.3)
+            }
+            LIMIT :limit
+            "#
+            .to_string(),
+            parameters: [
+                ("factor".to_string(), json!(0.9)),
+                ("now".to_string(), json!("2026-06-11T00:00:00Z")),
+                ("threshold".to_string(), json!("2026-05-11T00:00:00Z")),
+                ("limit".to_string(), json!(500)),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+
+        let substituted = request.to_command();
+        let command = crate::parse_kip(&substituted).unwrap();
+        match command {
+            Command::Kml(crate::KmlStatement::Update(update)) => {
+                assert_eq!(update.target, "link");
+                assert_eq!(update.limit, Some(500));
+            }
+            other => panic!("Expected UPDATE statement, got {other:?}"),
+        }
+
+        // SEARCH with :mode / :threshold / :limit placeholders.
+        let request = Request {
+            command: r#"SEARCH CONCEPT :term MODE :mode THRESHOLD :threshold LIMIT :limit"#
+                .to_string(),
+            parameters: [
+                ("term".to_string(), json!("headache relief")),
+                ("mode".to_string(), json!("semantic")),
+                ("threshold".to_string(), json!(0.75)),
+                ("limit".to_string(), json!(10)),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+
+        let substituted = request.to_command();
+        let command = crate::parse_kip(&substituted).unwrap();
+        match command {
+            Command::Meta(crate::MetaCommand::Search(search)) => {
+                assert_eq!(search.term, "headache relief");
+                assert_eq!(search.mode, Some(crate::SearchMode::Semantic));
+                assert_eq!(search.threshold, Some(crate::Number::from_f64(0.75).unwrap()));
+                assert_eq!(search.limit, Some(10));
+            }
+            other => panic!("Expected SEARCH command, got {other:?}"),
+        }
     }
 
     #[test]
