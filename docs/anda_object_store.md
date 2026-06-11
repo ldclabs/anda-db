@@ -56,6 +56,13 @@ Callers always interact with the *logical* path (`<logical-path>`); the
 wrapper rewrites paths transparently for every read, write, list, copy and
 delete operation, and strips the prefix back when results are returned.
 
+Internally, both wrappers delegate everything that depends only on this
+layout — path rewriting, the cached metadata pipeline, and the structurally
+identical `ObjectStore` operations (delete, list, copy, rename) — to a
+shared, crate-private generic core (`SidecarStore<T, M>` in `src/sidecar.rs`).
+Only hashing, encryption/decryption and the conditional-put behaviour live in
+the wrappers themselves.
+
 ### 2.1 MetaStore metadata (CBOR)
 
 ```text
@@ -73,11 +80,17 @@ delete operation, and strips the prefix back when results are returned.
   "o": <Option<String> inner ETag>,
   "v": <Option<String> inner version>,
   "n": <12-byte base nonce>,
-  "t": [<16-byte chunk_0 tag>, <16-byte chunk_1 tag>, …] }
+  "t": [<16-byte chunk_0 tag>, <16-byte chunk_1 tag>, …],
+  "c": <Option<u64> plaintext chunk size used at write time> }
 ```
 
 The `aes_tags` vector grows linearly with the object size; for a 1 GiB
 object at the default 256 KiB chunk size, the metadata costs ~64 KiB.
+
+The chunk size is recorded per object (`"c"`), so objects stay readable
+after the store is reconfigured with a different `with_chunk_size` value.
+Metadata written by older versions lacks the field; readers then fall back
+to the store's configured chunk size.
 
 ---
 
@@ -130,8 +143,8 @@ front of the on-disk truth.
 | `put_opts`                  | Writes data, then metadata, then updates cache. Atomic from the cache's point of view.             |
 | `put_multipart`             | Streams parts to the inner uploader; finalises metadata in `complete()`.                           |
 | `get_opts`                  | Forwards range/preconditions, swaps the response ETag for the content-addressable one.             |
-| `delete_stream`             | Deletes data first, then metadata. Tolerates missing metadata so partial failures are recoverable. |
-| `copy_opts` / `rename_opts` | Performs the operation on both `data/` and `meta/` paths, invalidates caches.                      |
+| `delete_stream`             | Per location: deletes data, then metadata. Tolerates missing metadata; a missing data object surfaces as `NotFound` under the logical path while orphaned metadata is still cleaned up. |
+| `copy_opts` / `rename_opts` | Performs the operation on both `data/` and `meta/` paths (metadata always with Overwrite — the data phase enforces the requested mode), invalidates caches. |
 | `list*`                     | Lists data, fetches metadata concurrently (8-way), restores ETag.                                  |
 
 > ⚠️ **Crash atomicity.** A crash between writing data and writing metadata
@@ -144,12 +157,11 @@ front of the on-disk truth.
 
 `MetaStore` exposes only the logical path; internally the wrapper uses:
 
-| Helper                 | Maps                                      |
-| ---------------------- | ----------------------------------------- |
-| `full_path(loc)`       | `loc` → `data/<loc>`                      |
-| `meta_path(loc)`       | `loc` → `meta/<loc>`                      |
-| `strip_prefix(p)`      | `data/<loc>` → `<loc>` (else passthrough) |
-| `strip_meta_prefix(p)` | `meta/<loc>` → `<loc>` (else passthrough) |
+| Helper            | Maps                                      |
+| ----------------- | ----------------------------------------- |
+| `full_path(loc)`  | `loc` → `data/<loc>`                      |
+| `meta_path(loc)`  | `loc` → `meta/<loc>`                      |
+| `strip_prefix(p)` | `data/<loc>` → `<loc>` (else passthrough) |
 
 ---
 
@@ -241,18 +253,20 @@ all chunks. AES-GCM's nonce-uniqueness requirement is satisfied.
    on the first chunk, truncate the last chunk to `b - a` total bytes,
    yield as the result stream.
 
-`get_ranges` does the same in non-streaming form and additionally caches
-the most recently decrypted chunk so adjacent ranges within one chunk only
-pay one decryption.
+`get_ranges` fetches each requested range's chunk span with a single inner
+range request, decrypts it in place, and caches the most recently decrypted
+span so subsequent ranges that fall inside it pay no further I/O or
+decryption.
 
 ### 4.5 Multipart uploads
 
 `EncryptedStoreUploader` buffers caller-supplied parts until at least one
-full plaintext chunk is available, then encrypts the chunk in place and
-forwards the ciphertext to the inner uploader's `put_part`. `complete()`
-flushes any remaining (possibly short) tail chunk, persists the encryption
-metadata, and returns a `PutResult` whose `e_tag` is the
-content-addressable hash over the ciphertext.
+full plaintext chunk is available, then encrypts all complete chunks in
+place and forwards them to the inner uploader as a single part. This keeps
+the caller's part granularity, which matters for backends with minimum
+part sizes (e.g. S3). `complete()` flushes the remaining (possibly short)
+tail chunk, persists the encryption metadata, and returns a `PutResult`
+whose `e_tag` is the content-addressable hash over the ciphertext.
 
 Because GCM is non-streaming per chunk, abort/retry semantics are handled
 by the underlying `MultipartUpload`; the encryption layer is stateless

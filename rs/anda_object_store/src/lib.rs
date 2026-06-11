@@ -8,7 +8,7 @@
 //!   metadata (object size, content hash, original backend ETag/version).
 //!   This enables a uniform, content-addressable ETag and conditional
 //!   `PutMode::Update` semantics on top of backends that lack them natively
-//!   (notably [`object_store::local::LocalFileSystem`]).
+//!   (notably `object_store::local::LocalFileSystem`).
 //! - [`EncryptedStore`] — provides transparent, chunked AES-256-GCM
 //!   encryption-at-rest. Objects are split into fixed-size chunks, each
 //!   encrypted with a per-chunk nonce derived from a random per-object base
@@ -20,23 +20,26 @@
 //! underlying backend, so they can be layered on top of any compliant store
 //! (in-memory, local filesystem, S3, GCS, Azure Blob, …).
 //!
-//! See [`docs/anda_object_store.md`] for the full design document.
+//! See `docs/anda_object_store.md` in the repository for the full design
+//! document.
 
 use async_trait::async_trait;
 use base64::{Engine, prelude::BASE64_URL_SAFE};
 use bytes::Bytes;
-use ciborium::{from_reader, into_writer};
-use futures::{StreamExt, TryStreamExt, stream::BoxStream};
-use moka::{future::Cache, ops::compute::Op};
+use futures::stream::BoxStream;
+use moka::future::Cache;
 use object_store::{path::Path, *};
 use serde::{Deserialize, Serialize};
 use sha3::Digest;
-use std::{fmt::Debug, ops::Range, sync::Arc, time::Duration};
+use std::{ops::Range, sync::Arc, time::Duration};
 
 /// Transparent AES-256-GCM encryption-at-rest layer for any [`ObjectStore`].
 pub mod encryption;
+mod sidecar;
 
 pub use encryption::{EncryptedStore, EncryptedStoreBuilder, EncryptedStoreUploader};
+
+use sidecar::{SidecarMeta, SidecarStore};
 
 /// `MetaStore` is a wrapper around an `ObjectStore` implementation that adds metadata capabilities.
 ///
@@ -61,22 +64,17 @@ pub use encryption::{EncryptedStore, EncryptedStoreBuilder, EncryptedStoreUpload
 /// ```
 #[derive(Clone)]
 pub struct MetaStore<T: ObjectStore> {
-    inner: Arc<MetaStoreBuilder<T>>,
+    inner: Arc<SidecarStore<T, Metadata>>,
 }
 
 /// Builder for creating a `MetaStore` instance.
 ///
 /// This builder configures:
 /// - The underlying storage implementation
-/// - Data and metadata path prefixes
 /// - Metadata cache settings
 pub struct MetaStoreBuilder<T: ObjectStore> {
     /// The underlying storage implementation
     store: T,
-    /// Prefix for actual data objects
-    data_prefix: Path,
-    /// Prefix for metadata objects
-    meta_prefix: Path,
     /// Cache for metadata to reduce storage operations
     meta_cache: Cache<Path, Arc<Metadata>>,
     /// Maximum number of metadata entries to cache
@@ -114,6 +112,19 @@ struct Metadata {
     original_version: Option<String>,
 }
 
+impl SidecarMeta for Metadata {
+    const STORE_NAME: &'static str = "MetaStore";
+
+    fn e_tag(&self) -> Option<&str> {
+        self.e_tag.as_deref()
+    }
+
+    fn set_original(&mut self, e_tag: Option<String>, version: Option<String>) {
+        self.original_tag = e_tag;
+        self.original_version = version;
+    }
+}
+
 impl<T: ObjectStore> std::fmt::Display for MetaStore<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "MetaStore({:?})", self.inner.store)
@@ -138,8 +149,6 @@ impl<T: ObjectStore> MetaStoreBuilder<T> {
     pub fn new(store: T, meta_cache_capacity: u64) -> Self {
         MetaStoreBuilder {
             store,
-            data_prefix: Path::from("data"),
-            meta_prefix: Path::from("meta"),
             meta_cache: Cache::builder()
                 .max_capacity(meta_cache_capacity)
                 .time_to_live(Duration::from_secs(60 * 60))
@@ -163,120 +172,8 @@ impl<T: ObjectStore> MetaStoreBuilder<T> {
     /// A new `MetaStore` instance
     pub fn build(self) -> MetaStore<T> {
         MetaStore {
-            inner: Arc::new(self),
+            inner: Arc::new(SidecarStore::new(self.store, self.meta_cache)),
         }
-    }
-
-    fn meta_path(&self, location: &Path) -> Path {
-        self.meta_prefix.parts().chain(location.parts()).collect()
-    }
-
-    fn full_path(&self, location: &Path) -> Path {
-        self.data_prefix.parts().chain(location.parts()).collect()
-    }
-
-    fn strip_prefix(&self, path: Path) -> Path {
-        if let Some(suffix) = path.prefix_match(&self.data_prefix) {
-            return suffix.collect();
-        }
-        path
-    }
-
-    fn strip_meta_prefix(&self, path: Path) -> Path {
-        if let Some(suffix) = path.prefix_match(&self.meta_prefix) {
-            return suffix.collect();
-        }
-        path
-    }
-
-    async fn load_meta(&self, location: &Path) -> Result<Metadata> {
-        let meta_path = self.meta_path(location);
-        let data = self.store.get(&meta_path).await?;
-        let data = data.bytes().await?;
-        let meta: Metadata = from_reader(&data[..]).map_err(|err| Error::Generic {
-            store: "MetaStore",
-            source: format!("Failed to deserialize Metadata for path {location}: {err:?}").into(),
-        })?;
-        Ok(meta)
-    }
-
-    async fn get_meta(&self, location: &Path) -> Result<Metadata> {
-        let meta = self
-            .meta_cache
-            .try_get_with(location.clone(), async {
-                let meta = self.load_meta(location).await?;
-                Ok(Arc::new(meta))
-            })
-            .await
-            .map_err(|err| map_arc_error("MetaStore", err))?;
-
-        Ok(meta.as_ref().clone())
-    }
-
-    async fn put_meta(&self, location: &Path, meta: Metadata) -> Result<PutResult> {
-        let meta_path = self.meta_path(location);
-        let mut data = Vec::new();
-        into_writer(&meta, &mut data).map_err(|err| Error::Generic {
-            store: "MetaStore",
-            source: format!("Failed to serialize Metadata for path {location}: {err:?}").into(),
-        })?;
-        // Persist to the underlying store first, then update cache.
-        // If we cached before the put and the put failed, readers would
-        // observe a non-persisted metadata until the cache entry expired.
-        let rt = self
-            .store
-            .put_opts(&meta_path, data.into(), PutOptions::default())
-            .await?;
-        self.meta_cache
-            .insert(location.clone(), Arc::new(meta))
-            .await;
-        Ok(rt)
-    }
-
-    async fn update_meta_with<F>(&self, location: &Path, f: F) -> Result<Arc<Metadata>>
-    where
-        F: AsyncFnOnce(Option<&Metadata>) -> Result<Metadata>,
-    {
-        let rt = self
-            .meta_cache
-            .entry(location.clone())
-            .and_try_compute_with(|entry| async {
-                let val = match entry {
-                    Some(meta) => f(Some(meta.value())).await?,
-                    None => match self.load_meta(location).await {
-                        Ok(meta) => f(Some(&meta)).await?,
-                        Err(Error::NotFound { .. }) => f(None).await?,
-                        Err(err) => return Err(err),
-                    },
-                };
-
-                let meta_path = self.meta_path(location);
-                let mut data = Vec::new();
-                into_writer(&val, &mut data).map_err(|err| Error::Generic {
-                    store: "MetaStore",
-                    source: format!("Failed to serialize Metadata for path {location}: {err:?}")
-                        .into(),
-                })?;
-                self.store
-                    .put_opts(&meta_path, data.into(), PutOptions::default())
-                    .await?;
-                Ok::<_, Error>(Op::Put(Arc::new(val)))
-            })
-            .await?;
-        Ok(rt.unwrap().value().clone())
-    }
-
-    async fn remove_meta_cache(&self, location: &Path) {
-        self.meta_cache.remove(location).await;
-    }
-
-    async fn refresh_meta_original_tag(&self, location: &Path) -> Result<()> {
-        let mut meta = self.load_meta(location).await?;
-        let obj = self.store.head(&self.full_path(location)).await?;
-        meta.original_tag = obj.e_tag;
-        meta.original_version = obj.version;
-        self.put_meta(location, meta).await?;
-        Ok(())
     }
 }
 
@@ -308,21 +205,22 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
                 }
 
                 let full_path = self.inner.full_path(location);
-                let payload = Bytes::from(payload);
-                let hash = sha3_256(&payload);
+                // Hash segment-by-segment so multi-segment payloads are not
+                // concatenated into a temporary contiguous buffer.
+                let mut hasher = sha3::Sha3_256::new();
+                for segment in payload.iter() {
+                    hasher.update(segment);
+                }
+                let hash: [u8; 32] = hasher.finalize().into();
 
                 let mut meta = Metadata {
-                    size: payload.len() as u64,
+                    size: payload.content_length() as u64,
                     e_tag: Some(BASE64_URL_SAFE.encode(hash)),
                     original_tag: None,
                     original_version: None,
                 };
 
-                let rt = self
-                    .inner
-                    .store
-                    .put_opts(&full_path, payload.into(), opts)
-                    .await?;
+                let rt = self.inner.store.put_opts(&full_path, payload, opts).await?;
                 meta.original_tag = rt.e_tag;
                 meta.original_version = rt.version;
                 Ok(meta)
@@ -368,7 +266,7 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
 
         let mut res = self.inner.store.get_opts(&full_path, options).await?;
         res.meta.location = self.inner.strip_prefix(res.meta.location);
-        res.meta.e_tag = meta.e_tag;
+        res.meta.e_tag = meta.e_tag.clone();
 
         Ok(res)
     }
@@ -389,81 +287,11 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
         &self,
         locations: BoxStream<'static, Result<Path>>,
     ) -> BoxStream<'static, Result<Path>> {
-        let inner = self.inner.clone();
-
-        // 1) Delete the data objects via the underlying store's delete_stream,
-        //    rewriting each logical path into its `data/` full path.
-        let data_locations = locations
-            .map_ok({
-                let inner = inner.clone();
-                move |location| inner.full_path(&location)
-            })
-            .boxed();
-
-        let data_deleted = inner.store.delete_stream(data_locations);
-
-        // 2) Map each successfully deleted data path back to its logical path,
-        //    then delete the corresponding metadata object.
-        let meta_locations = data_deleted
-            .map_ok({
-                let inner = inner.clone();
-                move |full_path| {
-                    let location = inner.strip_prefix(full_path);
-                    inner.meta_path(&location)
-                }
-            })
-            .boxed();
-
-        let meta_deleted = inner.store.delete_stream(meta_locations);
-
-        // 3) Suppress NotFound on metadata (data deletion is the source of
-        //    truth), invalidate the cache, and surface the logical path.
-        meta_deleted
-            .map({
-                let inner = inner.clone();
-                move |res| {
-                    let inner = inner.clone();
-                    async move {
-                        match res {
-                            Ok(meta_full_path) => {
-                                let location = inner.strip_meta_prefix(meta_full_path);
-                                inner.remove_meta_cache(&location).await;
-                                Ok(location)
-                            }
-                            Err(Error::NotFound { path, .. }) => {
-                                // Tolerate missing metadata; still return the
-                                // corresponding logical path for the caller.
-                                let location = inner.strip_meta_prefix(Path::from(path.as_str()));
-                                inner.remove_meta_cache(&location).await;
-                                Ok(location)
-                            }
-                            Err(err) => Err(err),
-                        }
-                    }
-                }
-            })
-            .buffered(8)
-            .boxed()
+        self.inner.clone().delete_stream(locations)
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
-        let prefix = self.inner.full_path(prefix.unwrap_or(&Path::default()));
-        let stream = self.inner.store.list(Some(&prefix));
-
-        let inner = self.inner.clone();
-        stream
-            .map_ok(move |mut obj| {
-                let store = inner.clone();
-                async move {
-                    let location = store.strip_prefix(obj.location);
-                    let meta = store.get_meta(&location).await?;
-                    obj.location = location;
-                    obj.e_tag = meta.e_tag;
-                    Ok::<ObjectMeta, Error>(obj)
-                }
-            })
-            .try_buffered(8) // fetch metadata concurrently
-            .boxed()
+        self.inner.clone().list(prefix, true)
     }
 
     fn list_with_offset(
@@ -471,107 +299,19 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
         prefix: Option<&Path>,
         offset: &Path,
     ) -> BoxStream<'static, Result<ObjectMeta>> {
-        let offset = self.inner.full_path(offset);
-        let prefix = self.inner.full_path(prefix.unwrap_or(&Path::default()));
-        let stream = self.inner.store.list_with_offset(Some(&prefix), &offset);
-
-        let inner = self.inner.clone();
-        stream
-            .map_ok(move |mut obj| {
-                let store = inner.clone();
-                async move {
-                    let location = store.strip_prefix(obj.location);
-                    let meta = store.get_meta(&location).await?;
-                    obj.location = location;
-                    obj.e_tag = meta.e_tag;
-                    Ok::<ObjectMeta, Error>(obj)
-                }
-            })
-            .try_buffered(8) // fetch metadata concurrently
-            .boxed()
+        self.inner.clone().list_with_offset(prefix, offset, true)
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
-        let prefix = self.inner.full_path(prefix.unwrap_or(&Path::default()));
-        let rt = self.inner.store.list_with_delimiter(Some(&prefix)).await?;
-        let common_prefixes = rt
-            .common_prefixes
-            .into_iter()
-            .map(|p| self.inner.strip_prefix(p))
-            .collect::<Vec<_>>();
-
-        let objects = rt
-            .objects
-            .into_iter()
-            .map(|mut meta| {
-                meta.location = self.inner.strip_prefix(meta.location);
-                meta
-            })
-            .collect::<Vec<_>>();
-
-        // Fetch the metadata for each object concurrently while preserving
-        // the original listing order.
-        let inner = self.inner.clone();
-        let mut indexed =
-            futures::stream::iter(objects.into_iter().enumerate().map(move |(idx, mut obj)| {
-                let store = inner.clone();
-                async move {
-                    let meta = store.get_meta(&obj.location).await?;
-                    obj.e_tag = meta.e_tag;
-                    Ok::<(usize, ObjectMeta), Error>((idx, obj))
-                }
-            }))
-            .buffer_unordered(8)
-            .try_collect::<Vec<_>>()
-            .await?;
-
-        // Restore the original order based on the captured index.
-        indexed.sort_by_key(|(idx, _)| *idx);
-        let objects = indexed.into_iter().map(|(_, obj)| obj).collect();
-
-        Ok(ListResult {
-            common_prefixes,
-            objects,
-        })
+        self.inner.list_with_delimiter(prefix, true).await
     }
 
     async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
-        let full_from = self.inner.full_path(from);
-        let full_to = self.inner.full_path(to);
-        self.inner
-            .store
-            .copy_opts(&full_from, &full_to, options.clone())
-            .await?;
-
-        let meta_from = self.inner.meta_path(from);
-        let meta_to = self.inner.meta_path(to);
-        self.inner
-            .store
-            .copy_opts(&meta_from, &meta_to, options)
-            .await?;
-        self.inner.remove_meta_cache(to).await;
-        self.inner.refresh_meta_original_tag(to).await?;
-        Ok(())
+        self.inner.copy_opts(from, to, options).await
     }
 
     async fn rename_opts(&self, from: &Path, to: &Path, options: RenameOptions) -> Result<()> {
-        let full_from = self.inner.full_path(from);
-        let full_to = self.inner.full_path(to);
-        self.inner
-            .store
-            .rename_opts(&full_from, &full_to, options.clone())
-            .await?;
-        self.inner.remove_meta_cache(from).await;
-
-        let meta_from = self.inner.meta_path(from);
-        let meta_to = self.inner.meta_path(to);
-        self.inner
-            .store
-            .rename_opts(&meta_from, &meta_to, options)
-            .await?;
-        self.inner.remove_meta_cache(to).await;
-        self.inner.refresh_meta_original_tag(to).await?;
-        Ok(())
+        self.inner.rename_opts(from, to, options).await
     }
 }
 
@@ -588,8 +328,8 @@ pub struct MetaStoreUploader<T: ObjectStore> {
     size: usize,
     /// Logical path of the object
     location: Path,
-    /// Reference to the MetaStoreBuilder
-    store: Arc<MetaStoreBuilder<T>>,
+    /// Shared sidecar core of the originating `MetaStore`
+    store: Arc<SidecarStore<T, Metadata>>,
     /// Underlying multipart upload handler
     inner: Box<dyn MultipartUpload>,
 }
@@ -603,10 +343,11 @@ impl<T: ObjectStore> std::fmt::Debug for MetaStoreUploader<T> {
 #[async_trait]
 impl<T: ObjectStore> MultipartUpload for MetaStoreUploader<T> {
     fn put_part(&mut self, payload: PutPayload) -> UploadPart {
-        let payload = Bytes::from(payload);
-        self.size += payload.len();
-        self.hasher.update(&payload);
-        self.inner.put_part(payload.into())
+        self.size += payload.content_length();
+        for segment in payload.iter() {
+            self.hasher.update(segment);
+        }
+        self.inner.put_part(payload)
     }
 
     async fn complete(&mut self) -> Result<PutResult> {
@@ -650,7 +391,16 @@ fn check_update_version(
     current_version: &Option<String>,
     update: &UpdateVersion,
 ) -> Result<()> {
-    if current_e_tag != &update.e_tag {
+    // Mirror `object_store`'s in-memory reference behavior: an e_tag is
+    // required for conditional updates.
+    let Some(expected) = &update.e_tag else {
+        return Err(Error::Precondition {
+            path: location.to_string(),
+            source: "missing e_tag for conditional update".into(),
+        });
+    };
+
+    if current_e_tag.as_ref() != Some(expected) {
         return Err(Error::Precondition {
             path: location.to_string(),
             source: format!("{:?} does not match {:?}", current_e_tag, update.e_tag).into(),
@@ -813,33 +563,23 @@ mod tests {
                 .to_string(),
             "other/nested/object"
         );
-        assert_eq!(
-            storage
-                .inner
-                .strip_meta_prefix(Path::from("meta/nested/object"))
-                .to_string(),
-            "nested/object"
-        );
-        assert_eq!(
-            storage
-                .inner
-                .strip_meta_prefix(Path::from("data/nested/object"))
-                .to_string(),
-            "data/nested/object"
-        );
     }
 
     #[test]
     fn validate_ranges_rejects_invalid_boundaries() {
-        assert!(validate_ranges("MetaStore", &[0..1], 1).is_ok());
+        fn check(range: Range<u64>, len: u64) -> Result<()> {
+            validate_ranges("MetaStore", std::slice::from_ref(&range), len)
+        }
 
-        let err = validate_ranges("MetaStore", &[1..2], 1).unwrap_err();
+        assert!(check(0..1, 1).is_ok());
+
+        let err = check(1..2, 1).unwrap_err();
         assert!(err.to_string().contains("start 1 is larger than length 1"));
 
-        let err = validate_ranges("MetaStore", &[1..1], 3).unwrap_err();
+        let err = check(1..1, 3).unwrap_err();
         assert!(err.to_string().contains("end 1 is less than start 1"));
 
-        let err = validate_ranges("MetaStore", &[1..4], 3).unwrap_err();
+        let err = check(1..4, 3).unwrap_err();
         assert!(err.to_string().contains("end 4 is larger than length 3"));
     }
 
@@ -1068,6 +808,103 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, Error::Precondition { .. }));
+    }
+
+    #[tokio::test]
+    async fn put_update_requires_e_tag() {
+        let storage = MetaStoreBuilder::new(InMemory::new(), 100).build();
+        let location = Path::from("missing-etag");
+        storage
+            .put(&location, Bytes::from_static(b"abc").into())
+            .await
+            .unwrap();
+
+        let err = storage
+            .put_opts(
+                &location,
+                Bytes::from_static(b"def").into(),
+                PutOptions {
+                    mode: PutMode::Update(UpdateVersion {
+                        e_tag: None,
+                        version: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Precondition { .. }));
+    }
+
+    #[tokio::test]
+    async fn delete_nonexistent_reports_logical_path() {
+        let root = TempDir::new().unwrap();
+        let storage =
+            MetaStoreBuilder::new(LocalFileSystem::new_with_prefix(root.path()).unwrap(), 100)
+                .build();
+
+        let err = storage
+            .delete(&Path::from("missing/object"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::NotFound { path, .. } if path == "missing/object"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_tolerates_missing_metadata_and_heals_orphans() {
+        let root = TempDir::new().unwrap();
+        let storage =
+            MetaStoreBuilder::new(LocalFileSystem::new_with_prefix(root.path()).unwrap(), 100)
+                .build();
+        let location = Path::from("orphan");
+
+        // Orphaned data (metadata lost): delete succeeds and removes the data.
+        storage
+            .put(&location, Bytes::from_static(b"abc").into())
+            .await
+            .unwrap();
+        storage
+            .inner
+            .store
+            .delete(&Path::from("meta/orphan"))
+            .await
+            .unwrap();
+        storage.delete(&location).await.unwrap();
+        let err = storage
+            .inner
+            .store
+            .get(&Path::from("data/orphan"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotFound { .. }));
+
+        // Orphaned metadata (data lost): delete reports NotFound for the data
+        // object but still cleans up the metadata.
+        storage
+            .put(&location, Bytes::from_static(b"abc").into())
+            .await
+            .unwrap();
+        storage
+            .inner
+            .store
+            .delete(&Path::from("data/orphan"))
+            .await
+            .unwrap();
+        let err = storage.delete(&location).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::NotFound { path, .. } if path == "orphan"),
+            "unexpected error: {err:?}"
+        );
+        let err = storage
+            .inner
+            .store
+            .get(&Path::from("meta/orphan"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotFound { .. }));
     }
 
     #[tokio::test]
