@@ -27,6 +27,8 @@ structured-logger = { workspace = true }
 tantivy = { workspace = true, features = ["stemmer"] }
 tantivy-jieba = { workspace = true }
 criterion = { workspace = true }
+futures = { workspace = true, features = ["executor"] }
+proptest = { workspace = true }
 
 [features]
 default = ["tantivy"]

@@ -20,8 +20,9 @@ parking_lot = { workspace = true }
 rustc-hash = { workspace = true }
 
 [dev-dependencies]
-futures = { workspace = true, features = ["alloc"] }
+futures = { workspace = true, features = ["alloc", "executor"] }
 hex = { workspace = true }
+proptest = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 
 [[example]]

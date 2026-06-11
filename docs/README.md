@@ -71,6 +71,7 @@ across storage backends:
 | [anda_object_store.md](./anda_object_store.md)       | Storage substrate       | `MetaStore`, `EncryptedStore`, portable conditional writes, AES-256-GCM chunked encryption              | Build portable or encrypted object-store-backed persistence               |
 | [anda_kip.md](./anda_kip.md)                         | Protocol layer          | KIP parser, AST, request/response model, executor interface, error codes                                | Integrate LLM-facing protocol handling or implement a backend             |
 | [anda_cognitive_nexus.md](./anda_cognitive_nexus.md) | Knowledge graph runtime | Reference KIP executor, concept/proposition model, graph execution, bootstrap flow                      | Build or debug the AI memory brain on top of AndaDB                       |
+| [testing.md](./testing.md)                           | Quality assurance       | Crash-consistency harness, fault injection, property tests, fuzzing, recall floors, format fixtures     | Add tests for a new feature or understand the durability test contract    |
 
 ## Layered View of the Stack
 

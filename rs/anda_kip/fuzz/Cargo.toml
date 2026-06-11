@@ -1,0 +1,45 @@
+[package]
+name = "anda_kip-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+anda_kip = { path = ".." }
+
+# This crate is intentionally not part of the root workspace: it is only
+# built by `cargo fuzz` (nightly) and must not affect normal builds.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_kip"
+path = "fuzz_targets/fuzz_kip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_kql"
+path = "fuzz_targets/fuzz_kql.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_kml"
+path = "fuzz_targets/fuzz_kml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_meta"
+path = "fuzz_targets/fuzz_meta.rs"
+test = false
+doc = false
+bench = false

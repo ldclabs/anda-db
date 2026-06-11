@@ -14,3 +14,11 @@ test:
 
 test-py:
 	@cargo test -p anda_cognitive_nexus_py --lib
+
+# Coverage is a dashboard, not a gate: use it to find untested branches in
+# core code paths. Requires `cargo install cargo-llvm-cov`.
+coverage:
+	@cargo llvm-cov --workspace --all-features --exclude anda_cognitive_nexus_py
+
+coverage-html:
+	@cargo llvm-cov --workspace --all-features --exclude anda_cognitive_nexus_py --html --open

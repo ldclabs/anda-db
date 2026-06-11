@@ -24,3 +24,4 @@ path = "src/bin/kip_cli.rs"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
+proptest = { workspace = true }

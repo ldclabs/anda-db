@@ -109,6 +109,7 @@ pyo3-asyncio = { version = "0.20", default-features = false }
 pyo3-build-config = { version = "0.20" }
 serde-pyobject = { version = "0.2", default-features = false }
 mimalloc = { version = "0.1", features = ["v3"] }
+proptest = { version = "1", default-features = false, features = ["std"] }
 
 [workspace.metadata.cargo-shear]
 ignored = []

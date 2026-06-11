@@ -11,6 +11,8 @@ target/
 *.pdb
 
 *.cbor
+# On-disk format fixtures are intentionally committed (format compatibility tests).
+!rs/anda_db/tests/fixtures/**/*.cbor
 
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can

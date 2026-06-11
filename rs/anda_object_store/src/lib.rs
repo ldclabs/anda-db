@@ -35,9 +35,12 @@ use std::{ops::Range, sync::Arc, time::Duration};
 
 /// Transparent AES-256-GCM encryption-at-rest layer for any [`ObjectStore`].
 pub mod encryption;
+/// Fault-injection wrapper for crash-consistency and chaos testing.
+pub mod fault;
 mod sidecar;
 
 pub use encryption::{EncryptedStore, EncryptedStoreBuilder, EncryptedStoreUploader};
+pub use fault::{FaultHandle, FaultKind, FaultOp, FaultRule, FaultStore};
 
 use sidecar::{SidecarMeta, SidecarStore};
 
