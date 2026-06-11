@@ -10,7 +10,17 @@ pub use bm25::*;
 pub use btree::*;
 pub use hnsw::*;
 
+/// Customization point for deriving indexable values from stored documents.
+///
+/// The default implementation indexes physical fields directly. Applications
+/// that need virtual composite keys, normalized full-text content, or alternate
+/// vector encodings can provide their own hook implementation and install it
+/// with `Collection::set_index_hooks`.
 pub trait IndexHooks: Send + Sync {
+    /// Returns the value to insert into a B-tree index for `doc`.
+    ///
+    /// The default implementation returns a borrowed single-field value or a
+    /// deterministic CBOR byte key for multi-field virtual indexes.
     fn btree_index_value<'a>(&self, index: &BTree, doc: &'a Document) -> Option<Cow<'a, Fv>> {
         let fields = index.virtual_field();
         match fields {
@@ -27,6 +37,10 @@ pub trait IndexHooks: Send + Sync {
         }
     }
 
+    /// Returns searchable text to insert into a BM25 index for `doc`.
+    ///
+    /// The default implementation extracts text from all configured fields and
+    /// joins multiple text fragments with newline separators.
     fn bm25_index_value<'a>(&self, index: &BM25, doc: &'a Document) -> Option<Cow<'a, str>> {
         let fields = index.virtual_field();
         let mut vals: Vec<Option<&Fv>> = Vec::with_capacity(fields.len());
@@ -37,6 +51,10 @@ pub trait IndexHooks: Send + Sync {
         virtual_searchable_text(&vals)
     }
 
+    /// Returns the vector to insert into an HNSW index for `doc`.
+    ///
+    /// The default implementation accepts native vector fields and the compact
+    /// array-of-bf16-bits representation used by serialized documents.
     fn hnsw_index_value<'a>(&self, index: &Hnsw, doc: &'a Document) -> Option<Cow<'a, Vector>> {
         match doc.get_field(index.field_name()) {
             Some(Fv::Vector(vector)) => Some(Cow::Borrowed(vector)),
@@ -55,14 +73,20 @@ pub trait IndexHooks: Send + Sync {
     }
 }
 
+/// Builds the stable index name for a single-field or multi-field index.
 pub fn virtual_field_name(fields: &[&str]) -> String {
     fields.join("-")
 }
 
+/// Splits an index name back into the field list it represents.
 pub fn from_virtual_field_name(name: &str) -> Vec<String> {
     name.split('-').map(String::from).collect()
 }
 
+/// Builds a deterministic byte key for a multi-field B-tree index.
+///
+/// Each field value, including `None`, is encoded as deterministic CBOR and
+/// concatenated so the resulting key has stable ordering and equality.
 pub fn virtual_field_value(vals: &[Option<&Fv>]) -> Option<Fv> {
     if vals.is_empty() {
         return None;
@@ -74,6 +98,11 @@ pub fn virtual_field_value(vals: &[Option<&Fv>]) -> Option<Fv> {
     Some(Fv::Bytes(data))
 }
 
+/// Extracts searchable text from one or more field values.
+///
+/// Text inside arrays, maps, and JSON values is recursively collected. A single
+/// text fragment is borrowed; multiple fragments are joined into an owned
+/// newline-separated string.
 pub fn virtual_searchable_text<'a>(vals: &[Option<&'a Fv>]) -> Option<Cow<'a, str>> {
     let mut texts: Vec<&str> = Vec::new();
     for val in vals.iter().flatten() {
@@ -105,6 +134,10 @@ fn extract_text<'a>(texts: &mut Vec<&'a str>, val: &'a Fv) {
     }
 }
 
+/// Recursively appends text values found inside JSON data.
+///
+/// Arrays whose first element is not a string or object are treated as scalar
+/// arrays and skipped to avoid indexing arbitrary numeric/vector payloads.
 pub fn extract_json_text<'a>(texts: &mut Vec<&'a str>, val: &'a Json) {
     match val {
         Json::String(s) => texts.push(s),
@@ -126,6 +159,7 @@ pub fn extract_json_text<'a>(texts: &mut Vec<&'a str>, val: &'a Json) {
     }
 }
 
+/// Default physical-field indexing behavior.
 pub struct DefaultIndexHooks;
 
 impl IndexHooks for DefaultIndexHooks {}

@@ -6,7 +6,16 @@
 
 use crate::proxy::DbShardExtractor;
 
+/// Extracts shard routing keys from a path prefix or shard headers.
+///
+/// Header values named `Shard-ID` or `X-Shard` take precedence. When neither
+/// header is present, the extractor removes [`Self::prefix`] from the request
+/// path and treats the next path segment as the database name.
 pub struct PrefixExtractor {
+    /// Path prefix that precedes the database name.
+    ///
+    /// For example, a prefix of `/db/` extracts `tenant-a` from
+    /// `/db/tenant-a/query`.
     pub prefix: String,
 }
 

@@ -29,7 +29,12 @@ pub enum ConceptPK {
     /// Concept identified by its numeric ID
     ID(u64),
     /// Concept identified by its type and name
-    Object { r#type: String, name: String },
+    Object {
+        /// Concept type name.
+        r#type: String,
+        /// Concept display name within the type.
+        name: String,
+    },
 }
 
 impl fmt::Display for ConceptPK {
@@ -94,8 +99,11 @@ pub enum PropositionPK {
     ID(u64, String),
     /// Proposition identified by its subject, predicate, and object
     Object {
+        /// Subject entity primary key.
         subject: Box<EntityPK>,
+        /// Predicate name connecting subject and object.
         predicate: String,
+        /// Object entity primary key.
         object: Box<EntityPK>,
     },
 }
@@ -315,19 +323,28 @@ pub struct QueryCache {
 /// Variables attached to the rows emitted by one proposition clause.
 #[derive(Clone, Debug)]
 pub struct QueryRelationBinding {
+    /// Optional variable bound to the proposition entity.
     pub proposition_var: Option<String>,
+    /// Optional variable bound to the subject entity.
     pub subject_var: Option<String>,
+    /// Optional variable bound to the predicate string.
     pub predicate_var: Option<String>,
+    /// Optional variable bound to the object entity.
     pub object_var: Option<String>,
+    /// Concrete relation rows produced by the clause.
     pub rows: Vec<QueryRelationRow>,
 }
 
 /// One concrete proposition-clause match.
 #[derive(Clone, Debug)]
 pub struct QueryRelationRow {
+    /// Matched proposition id.
     pub proposition: EntityID,
+    /// Matched subject entity id.
     pub subject: EntityID,
+    /// Matched predicate name.
     pub predicate: String,
+    /// Matched object entity id.
     pub object: EntityID,
 }
 

@@ -14,16 +14,29 @@ pub fn jieba_tokenizer() -> TokenizerChain {
         .build()
 }
 
-/// 检测文本的主要字符集/语言
+/// Coarse script family detected from token text.
+///
+/// The merge filter uses this signal to decide when a token should be
+/// re-tokenized by Jieba for CJK word segmentation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Script {
+    /// Latin alphabet, including Latin extended ranges.
     Latin,
+    /// Cyrillic alphabet.
     Cyrillic,
+    /// Arabic alphabet.
     Arabic,
+    /// CJK unified ideographs.
     Cjk,
+    /// No dominant supported script was detected.
     Other,
 }
 
+/// Detects the dominant script family for a text slice.
+///
+/// CJK wins as soon as any CJK character is present because Chinese/Japanese
+/// segmentation benefits from a specialized tokenizer even in mixed-script
+/// tokens. Otherwise the most frequent supported script family is returned.
 pub fn detect_script(text: &str) -> Script {
     let mut latin = 0;
     let mut cyrillic = 0;
@@ -71,6 +84,7 @@ impl Default for JiebaMergeFilter {
 }
 
 impl JiebaMergeFilter {
+    /// Creates a merge filter that re-tokenizes CJK spans with Jieba.
     pub fn new() -> Self {
         Self {
             tokenizer: JiebaTokenizer::new(),
@@ -90,6 +104,10 @@ impl TokenFilter for JiebaMergeFilter {
 }
 
 #[derive(Clone)]
+/// Tokenizer wrapper produced by [`JiebaMergeFilter`].
+///
+/// It delegates initial tokenization to the inner tokenizer, then replaces CJK
+/// tokens with Jieba token spans while preserving the original token offsets.
 pub struct JiebaMergeTokenizer<T> {
     inner: T,
     tokenizer: JiebaTokenizer,
@@ -138,6 +156,10 @@ impl<T: Tokenizer> Tokenizer for JiebaMergeTokenizer<T> {
     }
 }
 
+/// Token stream over the merged tokenizer output.
+///
+/// Tantivy token filters pull tokens sequentially from this stream after the
+/// CJK replacement and deterministic offset ordering have already been applied.
 pub struct MergedTokenStream {
     tokens: Vec<Token>,
     index: usize,

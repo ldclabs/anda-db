@@ -560,8 +560,9 @@ pub enum Response {
         /// The internal structure is defined by the specific KIP request command.
         result: Json,
 
-        // An opaque token representing the pagination position after the last returned result.
-        // If present, there may be more results available.
+        /// Opaque pagination token after the last returned result.
+        ///
+        /// If present, the caller can pass it back to request the next page.
         #[serde(skip_serializing_if = "Option::is_none")]
         next_cursor: Option<String>,
     },
@@ -571,6 +572,7 @@ pub enum Response {
     /// Must be present when the request fails.
     /// Contains detailed information about what went wrong.
     Err {
+        /// Structured error object describing the failure.
         error: ErrorObject,
 
         /// Partial result data, if any, when an error occurs.
@@ -836,7 +838,10 @@ mod tests {
             Command::Meta(crate::MetaCommand::Search(search)) => {
                 assert_eq!(search.term, "headache relief");
                 assert_eq!(search.mode, Some(crate::SearchMode::Semantic));
-                assert_eq!(search.threshold, Some(crate::Number::from_f64(0.75).unwrap()));
+                assert_eq!(
+                    search.threshold,
+                    Some(crate::Number::from_f64(0.75).unwrap())
+                );
                 assert_eq!(search.limit, Some(10));
             }
             other => panic!("Expected SEARCH command, got {other:?}"),

@@ -1,3 +1,15 @@
+//! Derive macros for generating AndaDB schema metadata from Rust structs.
+//!
+//! This crate exposes two procedural macros:
+//!
+//! - [`FieldTyped`] generates a `field_type()` associated function that
+//!   describes a struct as an `anda_db_schema::FieldType::Map`.
+//! - [`AndaDBSchema`] generates a `schema()` associated function returning an
+//!   `anda_db_schema::Schema` for collection creation.
+//!
+//! Both macros follow serde field naming rules where possible, so generated
+//! metadata matches the serialized document shape used by AndaDB.
+
 use proc_macro::TokenStream;
 
 mod common;
@@ -9,7 +21,7 @@ mod schema;
 ///
 /// The generated method returns a `FieldType::Map` whose keys are the
 /// serialized field names and whose values are the inferred or explicitly
-/// overridden [`anda_db_schema::FieldType`] for each field. It is the
+/// overridden `anda_db_schema::FieldType` for each field. It is the
 /// building block used by `AndaDBSchema` for nested user-defined types.
 ///
 /// # Attributes
@@ -77,7 +89,7 @@ pub fn field_typed_derive(input: TokenStream) -> TokenStream {
 /// A derive macro that generates a `schema()` associated function for a
 /// struct.
 ///
-/// The generated method builds a fully-formed [`anda_db_schema::Schema`]
+/// The generated method builds a fully-formed `anda_db_schema::Schema`
 /// using `Schema::builder()`, with one `FieldEntry` per serialized field
 /// (excluding `_id`, which is provided by the builder itself).
 ///

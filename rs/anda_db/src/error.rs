@@ -9,47 +9,103 @@ use crate::schema::{BoxError, SchemaError};
 /// Anda DB related errors
 #[derive(Error, Debug)]
 pub enum DBError {
+    /// General database-level failure.
     #[error("Anda DB {name:?} error: {source:?}")]
-    Generic { name: String, source: BoxError },
+    Generic {
+        /// Database or subsystem name associated with the failure.
+        name: String,
+        /// Original error returned by the lower-level operation.
+        source: BoxError,
+    },
 
+    /// Collection-level failure.
     #[error("Collection {name:?} error: {source:?}")]
-    Collection { name: String, source: BoxError },
+    Collection {
+        /// Collection name associated with the failure.
+        name: String,
+        /// Original collection operation error.
+        source: BoxError,
+    },
 
+    /// Schema validation or conversion failure.
     #[error("Schema error: {source:?}")]
-    Schema { name: String, source: BoxError },
+    Schema {
+        /// Schema, collection, or field name associated with the failure.
+        name: String,
+        /// Original schema error.
+        source: BoxError,
+    },
 
+    /// Object-store or storage-wrapper failure.
     #[error("Storage error: {source:?}")]
-    Storage { name: String, source: BoxError },
+    Storage {
+        /// Storage namespace or object name associated with the failure.
+        name: String,
+        /// Original storage error.
+        source: BoxError,
+    },
 
+    /// Index creation, update, lookup, or persistence failure.
     #[error("Index error: {source:?}")]
-    Index { name: String, source: BoxError },
+    Index {
+        /// Index name associated with the failure.
+        name: String,
+        /// Original index error.
+        source: BoxError,
+    },
 
+    /// Object or document was expected but not found.
     #[error("Object {name} at location {path} not found: {source:?}")]
     NotFound {
+        /// Logical object name or index name.
         name: String,
+        /// Object-store path or logical location.
         path: String,
+        /// Original not-found error.
         source: BoxError,
+        /// Document id when the error refers to a document; `0` otherwise.
         _id: u64,
     },
 
+    /// Object, document, collection, or index already exists.
     #[error("Object {name} at location {path} already exists: {source:?}")]
     AlreadyExists {
+        /// Logical object name or index name.
         name: String,
+        /// Object-store path or logical location.
         path: String,
+        /// Original duplicate-object error.
         source: BoxError,
+        /// Document id when the error refers to a document; `0` otherwise.
         _id: u64,
     },
 
+    /// Conditional storage update failed because the object version changed.
     #[error("Precondition failed at location {path}: {source:?}")]
-    Precondition { path: String, source: BoxError },
+    Precondition {
+        /// Object-store path whose conditional update failed.
+        path: String,
+        /// Original precondition error.
+        source: BoxError,
+    },
 
+    /// Serialization or deserialization failure.
     #[error("Serialization error: {source:?}")]
-    Serialization { name: String, source: BoxError },
+    Serialization {
+        /// Logical object, schema, or index name being encoded or decoded.
+        name: String,
+        /// Original serialization error.
+        source: BoxError,
+    },
 
+    /// Encoded payload exceeded the configured storage limit.
     #[error("Payload too large at location {path}: size {size} exceeds limit {limit}")]
     PayloadTooLarge {
+        /// Object-store path that would receive the payload.
         path: String,
+        /// Payload size in bytes.
         size: usize,
+        /// Configured maximum payload size in bytes.
         limit: usize,
     },
 }

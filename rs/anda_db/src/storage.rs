@@ -121,6 +121,7 @@ struct StorageStatsAtomic {
 /// Storage statistics.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct StorageStats {
+    /// Last persisted checkpoint timestamp or sequence value.
     pub check_point: u64,
     /// Internal version counter.
     pub version: u64,
@@ -196,6 +197,11 @@ impl From<&StorageStats> for StorageStatsAtomic {
     }
 }
 
+/// Object-store version token captured after a successful write or fetch.
+///
+/// The version is later converted into `object_store::UpdateVersion` for
+/// conditional updates, preventing lost writes when the backend supports ETags
+/// or version IDs.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ObjectVersion {
     /// The ETag (entity tag) of the object, used for caching and conditional requests.

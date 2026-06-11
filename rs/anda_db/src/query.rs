@@ -59,6 +59,8 @@ pub struct Search {
     /// Whether to use logical search operators.
     ///
     /// When true, the search text can include logical operators (AND, OR, NOT).
+    /// Defaults to false when omitted.
+    #[serde(default)]
     pub logical_search: bool,
 }
 

@@ -16,10 +16,19 @@ use crate::{
     unix_ms,
 };
 
+/// Collection-level typed B-tree index wrapper.
+///
+/// AndaDB supports B-tree indexes over scalar `u64`, `i64`, text, and byte
+/// values. Array and map fields are indexed by their elements or map keys when
+/// the underlying scalar type is supported.
 pub enum BTree {
+    /// B-tree over unsigned integer keys.
     U64(InnerBTree<u64>),
+    /// B-tree over signed integer keys.
     I64(InnerBTree<i64>),
+    /// B-tree over UTF-8 text keys.
     String(InnerBTree<String>),
+    /// B-tree over byte-array keys.
     Bytes(InnerBTree<Vec<u8>>),
 }
 
@@ -58,6 +67,9 @@ impl Hash for &BTree {
     }
 }
 
+/// Concrete B-tree wrapper for one supported field value type.
+///
+/// The type parameter is the native key type stored in the lower-level index.
 pub struct InnerBTree<FV>
 where
     FV: Eq + Ord + Hash + Debug + Clone + Serialize + DeserializeOwned,
@@ -82,6 +94,7 @@ impl BTree {
         format!("btree_indexes/{name}/b_{bucket}.cbor")
     }
 
+    /// Decodes an optional pagination cursor from base64url deterministic CBOR.
     pub fn from_cursor<T>(cursor: &Option<String>) -> Result<Option<T>, DBError>
     where
         T: DeserializeOwned,
@@ -102,6 +115,7 @@ impl BTree {
             })
     }
 
+    /// Encodes a pagination cursor as base64url deterministic CBOR.
     pub fn to_cursor<T>(cursor: &T) -> Option<String>
     where
         T: Serialize,
@@ -111,6 +125,7 @@ impl BTree {
             .ok()
     }
 
+    /// Creates a new persisted single-field B-tree index.
     pub async fn new(field: Fe, storage: Storage, now_ms: u64) -> Result<Self, DBError> {
         let config = BTreeConfig {
             bucket_overload_size: storage.bucket_overload_size(),
@@ -151,6 +166,10 @@ impl BTree {
         }
     }
 
+    /// Creates a persisted multi-field B-tree index.
+    ///
+    /// Multi-field indexes store a deterministic byte key composed from each
+    /// configured field value.
     pub async fn with_virtual_field(
         fields: Vec<String>,
         storage: Storage,
@@ -169,6 +188,7 @@ impl BTree {
         BTree::inner_new(fields, &Ft::Bytes, config, storage, now_ms).await
     }
 
+    /// Loads an existing B-tree index from persisted metadata and bucket objects.
     pub async fn bootstrap(name: String, ft: &Ft, storage: Storage) -> Result<Self, DBError> {
         match ft {
             Ft::Option(ft) => match ft.as_ref() {
@@ -228,6 +248,7 @@ impl BTree {
         }
     }
 
+    /// Returns the stable index name.
     pub fn name(&self) -> &str {
         match self {
             BTree::I64(btree) => &btree.name,
@@ -237,6 +258,7 @@ impl BTree {
         }
     }
 
+    /// Returns the physical fields represented by this index.
     pub fn virtual_field(&self) -> &[String] {
         match self {
             BTree::I64(btree) => &btree.fields,
@@ -246,6 +268,7 @@ impl BTree {
         }
     }
 
+    /// Returns whether multiple documents may share the same indexed key.
     pub fn allow_duplicates(&self) -> bool {
         match self {
             BTree::I64(btree) => btree.index.allow_duplicates(),
@@ -255,6 +278,7 @@ impl BTree {
         }
     }
 
+    /// Returns a snapshot of B-tree runtime statistics.
     pub fn stats(&self) -> BTreeStats {
         match self {
             BTree::I64(btree) => btree.index.stats(),
@@ -264,6 +288,7 @@ impl BTree {
         }
     }
 
+    /// Returns a snapshot of B-tree metadata.
     pub fn metadata(&self) -> BTreeMetadata {
         match self {
             BTree::I64(btree) => btree.index.metadata(),
@@ -290,6 +315,10 @@ impl BTree {
             .collect()
     }
 
+    /// Inserts an indexed value for `doc_id`.
+    ///
+    /// `Null` values are ignored. Array values are expanded into multiple keys,
+    /// and map values index their keys.
     pub fn insert(
         &self,
         doc_id: DocumentId,
@@ -376,6 +405,7 @@ impl BTree {
         }
     }
 
+    /// Removes an indexed value for `doc_id`.
     pub fn remove(&self, doc_id: DocumentId, field_value: &Fv, now_ms: u64) -> bool {
         if field_value == &Fv::Null {
             return false;
@@ -410,6 +440,9 @@ impl BTree {
         }
     }
 
+    /// Updates the indexed value for `doc_id`.
+    ///
+    /// Returns `true` if the index changed.
     pub fn update(
         &self,
         doc_id: DocumentId,
@@ -485,6 +518,7 @@ impl BTree {
         }
     }
 
+    /// Applies an array-style batch update and returns `(removed, inserted)`.
     pub fn batch_update(
         &self,
         doc_id: DocumentId,
@@ -532,6 +566,7 @@ impl BTree {
         }
     }
 
+    /// Executes `f` with the document ids matching an exact key.
     pub fn query_with<F, R>(&self, field_value: &Fv, f: F) -> Option<R>
     where
         F: FnOnce(&Vec<DocumentId>) -> Option<R>,
@@ -545,6 +580,7 @@ impl BTree {
         }
     }
 
+    /// Runs a range query and maps each matching key/id-list pair through `f`.
     pub fn range_query_with<F, R>(&self, query: RangeQuery<Fv>, mut f: F) -> Vec<R>
     where
         F: FnMut(Fv, &Vec<DocumentId>) -> (bool, Vec<R>),
@@ -585,6 +621,7 @@ impl BTree {
         }
     }
 
+    /// Returns index keys after `cursor`, limited by `limit` when provided.
     pub fn keys(&self, cursor: Option<String>, limit: Option<usize>) -> Vec<Fv> {
         match self {
             BTree::I64(btree) => match Self::from_cursor(&cursor) {
@@ -626,6 +663,7 @@ impl BTree {
         }
     }
 
+    /// Compacts bucket layout and flushes if bucket count shrinks.
     pub async fn compact_index(&self) -> Result<(), DBError> {
         match self {
             BTree::I64(btree) => {
@@ -680,6 +718,9 @@ impl BTree {
         Ok(())
     }
 
+    /// Persists dirty metadata and buckets.
+    ///
+    /// Returns `true` when any object was written.
     pub async fn flush(&self, now_ms: u64) -> Result<bool, DBError> {
         match self {
             BTree::I64(btree) => btree.flush(now_ms).await,
@@ -689,6 +730,7 @@ impl BTree {
         }
     }
 
+    /// Returns whether metadata or buckets have in-memory changes to flush.
     pub fn has_pending_flush(&self) -> bool {
         match self {
             BTree::I64(btree) => btree.has_pending_flush(),
@@ -736,7 +778,11 @@ where
         // exist, so overwrite any leftover files from a crashed creation or a
         // previously removed index instead of failing with AlreadyExists.
         let ver = storage
-            .put_bytes(&BTree::metadata_path(&name), data.into(), PutMode::Overwrite)
+            .put_bytes(
+                &BTree::metadata_path(&name),
+                data.into(),
+                PutMode::Overwrite,
+            )
             .await?;
         Ok(InnerBTree {
             name,

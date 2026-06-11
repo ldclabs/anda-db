@@ -120,7 +120,15 @@ impl Bucket {
 /// (`k1` to `>= 0`, `b` to `[0, 1]`) to avoid producing `NaN`/`inf` scores.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BM25Params {
+    /// Term-frequency saturation factor.
+    ///
+    /// Higher values make repeated occurrences of a term contribute more to
+    /// the score. Typical values are in the `1.2..=2.0` range.
     pub k1: f32,
+    /// Document-length normalization factor.
+    ///
+    /// `0.0` disables length normalization; `1.0` applies full normalization.
+    /// The usual BM25 default is `0.75`.
     pub b: f32,
 }
 
@@ -142,6 +150,7 @@ impl Default for BM25Params {
 ///   but more I/O per full reload); larger values do the opposite.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BM25Config {
+    /// BM25 scoring parameters used for all query scoring.
     pub bm25: BM25Params,
     /// Maximum size of a bucket before creating a new one
     /// When a bucket's stored data exceeds this size,

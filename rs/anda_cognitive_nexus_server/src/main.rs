@@ -1,3 +1,8 @@
+//! HTTP server for the Anda Cognitive Nexus.
+//!
+//! The binary opens an AndaDB-backed cognitive nexus, exposes a health/info
+//! endpoint, and accepts KIP commands over HTTP at `/kip`.
+
 use anda_db::{
     database::{AndaDB, DBConfig},
     storage::StorageConfig,
@@ -38,8 +43,11 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+/// Storage backend selection for the server.
 pub enum Commands {
+    /// Use a local filesystem-backed database.
     Local {
+        /// Local database directory.
         #[clap(long, env = "LOCAL_DB_PATH", default_value = "./db")]
         db: String,
     },
@@ -103,6 +111,7 @@ async fn main() -> Result<(), BoxError> {
     Ok(())
 }
 
+/// Waits for a process termination signal and triggers graceful shutdown.
 pub async fn shutdown_signal(cancel_token: CancellationToken) {
     let ctrl_c = async {
         signal::ctrl_c()
@@ -130,6 +139,7 @@ pub async fn shutdown_signal(cancel_token: CancellationToken) {
     cancel_token.cancel();
 }
 
+/// Creates a TCP listener with `SO_REUSEPORT` enabled.
 pub async fn create_reuse_port_listener(
     addr: SocketAddr,
 ) -> Result<tokio::net::TcpListener, BoxError> {

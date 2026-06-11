@@ -856,6 +856,11 @@ impl Collection {
         self.tokenizer = tokenizer;
     }
 
+    /// Replaces the strategy used to derive indexable values from documents.
+    ///
+    /// Custom hooks are useful for virtual fields, precomputed search text, or
+    /// alternative vector encodings that should be indexed without changing the
+    /// stored document shape.
     pub fn set_index_hooks(&mut self, hooks: Arc<dyn IndexHooks>) {
         self.index_hooks = hooks;
     }
@@ -1317,6 +1322,10 @@ impl Collection {
         }
     }
 
+    /// Removes a B-tree index and its persisted files.
+    ///
+    /// Returns `true` when either metadata or an in-memory index entry was
+    /// removed. Returns `false` if the requested index did not exist.
     pub async fn remove_btree_index(&mut self, fields: &[&str]) -> Result<bool, DBError> {
         if fields.is_empty() {
             return Err(DBError::Schema {
@@ -1370,6 +1379,10 @@ impl Collection {
         Ok(())
     }
 
+    /// Removes a BM25 full-text index and its persisted files.
+    ///
+    /// Returns `true` when either metadata or an in-memory index entry was
+    /// removed. Returns `false` if the requested index did not exist.
     pub async fn remove_bm25_index(&mut self, fields: &[&str]) -> Result<bool, DBError> {
         if fields.is_empty() {
             return Err(DBError::Schema {
@@ -1403,6 +1416,10 @@ impl Collection {
         Ok(removed)
     }
 
+    /// Removes an HNSW vector index and its persisted files.
+    ///
+    /// Returns `true` when either metadata or an in-memory index entry was
+    /// removed. Returns `false` if the requested field has no HNSW index.
     pub async fn remove_hnsw_index(&mut self, field: &str) -> Result<bool, DBError> {
         if field.is_empty() {
             return Err(DBError::Schema {
@@ -1437,6 +1454,10 @@ impl Collection {
         Ok(removed)
     }
 
+    /// Returns the B-tree index over `fields`.
+    ///
+    /// Multi-field indexes are addressed by the same virtual field name used
+    /// during index creation.
     pub fn get_btree_index(&self, fields: &[&str]) -> Result<&BTree, DBError> {
         let name = virtual_field_name(fields);
         if let Some(index) = self.btree_indexes.iter().find(|i| i.name() == name) {
@@ -1449,6 +1470,10 @@ impl Collection {
         })
     }
 
+    /// Returns the BM25 full-text index over `fields`.
+    ///
+    /// Multi-field indexes are addressed by the same virtual field name used
+    /// during index creation.
     pub fn get_bm25_index(&self, fields: &[&str]) -> Result<&BM25, DBError> {
         let name = virtual_field_name(fields);
         if let Some(index) = self.bm25_indexes.iter().find(|i| i.name() == name) {
@@ -1461,6 +1486,7 @@ impl Collection {
         })
     }
 
+    /// Returns the HNSW vector index for `field`.
     pub fn get_hnsw_index(&self, field: &str) -> Result<&Hnsw, DBError> {
         if let Some(index) = self.hnsw_indexes.iter().find(|i| i.field_name() == field) {
             return Ok(index);

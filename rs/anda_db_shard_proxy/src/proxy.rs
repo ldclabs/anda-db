@@ -25,8 +25,13 @@ const SHARD_ID_HEADER: HeaderName = HeaderName::from_static("shard-id");
 /// A pluggable extractor that resolves either database name or shard id
 /// from an incoming request.
 ///
-/// A default implementation is provided by [`router::PrefixExtractor`].
+/// A default implementation is provided by [`crate::router::PrefixExtractor`].
 pub trait DbShardExtractor: Send + Sync {
+    /// Extracts either a shard id or database name from a request.
+    ///
+    /// The first tuple member is a concrete shard id. The second member is a
+    /// database name that still needs to be resolved through the shard store.
+    /// Implementations should return at most one populated value.
     fn extract(&self, uri: &Uri, headers: &HeaderMap) -> (Option<u32>, Option<String>);
 }
 
@@ -40,7 +45,7 @@ pub struct AppState {
     /// Optional bearer token required for management endpoints.
     pub api_key: Arc<Option<String>>,
     /// Custom extractor to read the database name or shard ID from requests.
-    /// Defaults to [`router::PrefixExtractor`].
+    /// Defaults to [`crate::router::PrefixExtractor`].
     pub db_name_extractor: Arc<dyn DbShardExtractor>,
     /// Upper bound for a proxied backend request.
     pub proxy_request_timeout: Duration,

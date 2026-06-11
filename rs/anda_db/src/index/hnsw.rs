@@ -11,6 +11,11 @@ use crate::{
     storage::{ObjectVersion, PutMode, Storage},
 };
 
+/// Collection-level wrapper around an HNSW vector index.
+///
+/// The wrapper owns persistence paths and object versions for index metadata,
+/// id lists, and graph nodes while delegating search behavior to
+/// `anda_db_hnsw::HnswIndex`.
 pub struct Hnsw {
     name: String,
     index: HnswIndex,
@@ -55,6 +60,7 @@ impl Hnsw {
         format!("hnsw_indexes/{name}/n_{node}.cbor")
     }
 
+    /// Creates a new persisted HNSW index for `field`.
     pub async fn new(
         field: &Fe,
         config: HnswConfig,
@@ -101,6 +107,7 @@ impl Hnsw {
         }
     }
 
+    /// Loads an existing HNSW index from metadata, id list, and node objects.
     pub async fn bootstrap(name: String, storage: Storage) -> Result<Self, DBError> {
         let (metadata, metadata_version) = storage.fetch_bytes(&Hnsw::metadata_path(&name)).await?;
         let (ids, ids_version) = storage.fetch_bytes(&Hnsw::ids_path(&name)).await?;
@@ -125,6 +132,9 @@ impl Hnsw {
         })
     }
 
+    /// Persists dirty metadata, id lists, and graph nodes.
+    ///
+    /// Returns `true` when any object was written.
     pub async fn flush(&self, now_ms: u64) -> Result<bool, DBError> {
         let mut buf = Vec::with_capacity(256);
         let meta_saved = self.index.store_metadata(&mut buf, now_ms)?;
@@ -178,6 +188,7 @@ impl Hnsw {
         Ok(meta_saved || had_dirty)
     }
 
+    /// Returns whether metadata or nodes have in-memory changes to flush.
     pub fn has_pending_flush(&self) -> bool {
         if self.index.has_dirty_nodes() {
             return true;
@@ -186,35 +197,43 @@ impl Hnsw {
         self.index.has_pending_metadata_flush()
     }
 
+    /// Returns the stable index name.
     pub fn name(&self) -> &str {
         &self.name
     }
 
+    /// Returns the field indexed by this HNSW index.
     pub fn field_name(&self) -> &str {
         &self.name
     }
 
+    /// Returns a snapshot of HNSW runtime statistics.
     pub fn stats(&self) -> HnswStats {
         self.index.stats()
     }
 
+    /// Returns a snapshot of HNSW metadata.
     pub fn metadata(&self) -> HnswMetadata {
         self.index.metadata()
     }
 
+    /// Inserts or updates the vector for `id`.
     pub fn insert(&self, id: u64, vector: Vector, now_ms: u64) -> Result<(), DBError> {
         self.index.insert(id, vector, now_ms)?;
         Ok(())
     }
 
+    /// Removes the vector for `id` if present.
     pub fn remove(&self, id: u64, now_ms: u64) -> bool {
         self.index.remove(id, now_ms)
     }
 
+    /// Searches for the nearest vectors and returns `(document_id, distance)` pairs.
     pub fn try_search(&self, query: &[f32], top_k: usize) -> Result<Vec<(u64, f32)>, DBError> {
         self.index.search_f32(query, top_k).map_err(DBError::from)
     }
 
+    /// Searches for nearest vectors, returning an empty result on search errors.
     pub fn search(&self, query: &[f32], top_k: usize) -> Vec<(u64, f32)> {
         self.try_search(query, top_k).unwrap_or_default()
     }

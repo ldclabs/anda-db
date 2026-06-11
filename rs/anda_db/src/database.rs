@@ -655,6 +655,11 @@ impl AndaDB {
         Ok(collection)
     }
 
+    /// Deletes a collection's metadata, cached instance, and storage prefix.
+    ///
+    /// The deletion first persists database metadata so reopening the database
+    /// does not try to load the removed collection. Object deletion is then
+    /// performed under the collection prefix.
     pub async fn delete_collection(&self, name: &str) -> Result<(), DBError> {
         if self.inner.read_only.load(Ordering::Relaxed) {
             return Err(DBError::Generic {

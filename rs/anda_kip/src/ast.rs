@@ -171,6 +171,7 @@ impl Value {
     }
 }
 
+/// High-level language family of a parsed KIP command.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CommandType {
     /// KQL (Knowledge Query Language) - for knowledge retrieval and reasoning
@@ -184,6 +185,7 @@ pub enum CommandType {
 }
 
 impl CommandType {
+    /// Returns the command family for a parsed [`Command`].
     pub fn from(val: &Command) -> CommandType {
         match val {
             Command::Kql(_) => CommandType::Kql,
@@ -302,7 +304,12 @@ pub enum ConceptMatcher {
     /// Syntax: `{name: "<name>"}`
     Name(String),
     /// Syntax: `{type: "<type>", name: "<name>"}`
-    Object { r#type: String, name: String },
+    Object {
+        /// Concept type name.
+        r#type: String,
+        /// Concept display name within the type.
+        name: String,
+    },
 }
 
 impl fmt::Display for ConceptMatcher {
@@ -386,8 +393,11 @@ pub enum PropositionMatcher {
     ID(String),
     /// `(?subject, "<predicate>", ?object)`
     Object {
+        /// Subject endpoint of the proposition pattern.
         subject: TargetTerm,
+        /// Predicate matcher between subject and object.
         predicate: PredTerm,
+        /// Object endpoint of the proposition pattern.
         object: TargetTerm,
     },
 }
@@ -421,8 +431,11 @@ pub enum PredTerm {
     Alternative(Vec<String>),
     /// A multi-hop predicate (e.g., `"is_subclass_of"{0,5}`)
     MultiHop {
+        /// Predicate name to traverse repeatedly.
         predicate: String,
+        /// Minimum number of hops in the traversal.
         min: u16,
+        /// Optional maximum number of hops; `None` means unbounded.
         max: Option<u16>,
     },
 }
@@ -569,6 +582,10 @@ pub enum AggregationFunction {
 }
 
 impl AggregationFunction {
+    /// Applies this aggregation to a list of JSON values.
+    ///
+    /// Non-numeric values are ignored by numeric aggregations. `distinct`
+    /// de-duplicates values before `COUNT`, matching KQL `DISTINCT` behavior.
     pub fn calculate(&self, values: &Vec<Json>, distinct: bool) -> Json {
         match self {
             AggregationFunction::Count => {
@@ -643,21 +660,29 @@ pub struct FilterClause {
 pub enum FilterExpression {
     /// Comparison operations (==, !=, <, >, <=, >=)
     Comparison {
+        /// Left operand of the comparison.
         left: FilterOperand,
+        /// Comparison operator to apply.
         operator: ComparisonOperator,
+        /// Right operand of the comparison.
         right: FilterOperand,
     },
     /// Logical operations (&&, ||)
     Logical {
+        /// Left boolean expression.
         left: Box<FilterExpression>,
+        /// Logical operator joining the expressions.
         operator: LogicalOperator,
+        /// Right boolean expression.
         right: Box<FilterExpression>,
     },
     /// Unary negation (!)
     Not(Box<FilterExpression>),
     /// Function calls (CONTAINS, STARTS_WITH, etc.)
     Function {
+        /// Built-in filter function to invoke.
         func: FilterFunction,
+        /// Function arguments in source order.
         args: Vec<FilterOperand>,
     },
 }
@@ -692,6 +717,10 @@ pub enum ComparisonOperator {
 }
 
 impl ComparisonOperator {
+    /// Compares two JSON values according to this operator.
+    ///
+    /// Ordering comparisons use [`compare_json`] and return `false` for value
+    /// pairs that do not have a defined ordering.
     pub fn compare(&self, left: &Json, right: &Json) -> bool {
         match self {
             ComparisonOperator::Equal => left == right,
@@ -973,9 +1002,7 @@ impl UpdateFunction {
                 (Some(x), Some(y)) => int_op(x, y)
                     .and_then(i128_to_number)
                     .map(Json::Number)
-                    .unwrap_or_else(|| {
-                        float_number(float_op(x as f64, y as f64))
-                    }),
+                    .unwrap_or_else(|| float_number(float_op(x as f64, y as f64))),
                 _ => match (a.as_f64(), b.as_f64()) {
                     (Some(x), Some(y)) => float_number(float_op(x, y)),
                     _ => Json::Null,
@@ -998,9 +1025,7 @@ impl UpdateFunction {
                         .map(Json::Number)
                         .unwrap_or(Json::Null),
                     _ => match (x.as_f64(), lo.as_f64(), hi.as_f64()) {
-                        (Some(x), Some(lo), Some(hi)) if lo <= hi => {
-                            float_number(x.clamp(lo, hi))
-                        }
+                        (Some(x), Some(lo), Some(hi)) if lo <= hi => float_number(x.clamp(lo, hi)),
                         _ => Json::Null,
                     },
                 },
@@ -1042,7 +1067,9 @@ fn i128_to_number(value: i128) -> Option<Number> {
 }
 
 fn float_number(value: f64) -> Json {
-    Number::from_f64(value).map(Json::Number).unwrap_or_default()
+    Number::from_f64(value)
+        .map(Json::Number)
+        .unwrap_or_default()
 }
 
 /// An operand/expression tree for UPDATE value computation.
@@ -1166,6 +1193,7 @@ pub enum DescribeTarget {
 /// `SEARCH CONCEPT|PROPOSITION "<term>" [WITH TYPE "<Type>"] [MODE "keyword"|"semantic"|"hybrid"] [THRESHOLD <0.0-1.0>] [LIMIT N]`
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct SearchCommand {
+    /// Entity class to search.
     pub target: SearchTarget,
     /// The search term
     pub term: String,
@@ -1245,6 +1273,11 @@ pub struct ExportCommand {
     pub limit: Option<usize>,
 }
 
+/// Compares JSON scalar values using KIP filter ordering rules.
+///
+/// Numbers compare numerically, booleans compare by boolean order, `null`
+/// compares only to `null`, and strings first try numeric then RFC 3339
+/// datetime comparison before falling back to lexical ordering.
 pub fn compare_json(left: &Json, right: &Json) -> Option<Ordering> {
     match (left, right) {
         (Json::Number(a), Json::Number(b)) => a
@@ -1630,10 +1663,7 @@ mod tests {
         ] {
             assert_eq!(mode.to_string(), s);
             assert_eq!(SearchMode::from_str(s).unwrap(), mode);
-            assert_eq!(
-                SearchMode::from_str(&s.to_ascii_uppercase()).unwrap(),
-                mode
-            );
+            assert_eq!(SearchMode::from_str(&s.to_ascii_uppercase()).unwrap(), mode);
         }
         assert!(SearchMode::from_str("fuzzy").is_err());
     }

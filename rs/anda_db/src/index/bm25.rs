@@ -16,6 +16,10 @@ use crate::{
     unix_ms,
 };
 
+/// Collection-level wrapper around the full-text BM25 index.
+///
+/// The wrapper keeps the index name, virtual field list, storage namespace, and
+/// object versions needed for optimistic metadata updates.
 pub struct BM25 {
     name: String,
     fields: Vec<String>,
@@ -56,12 +60,18 @@ impl BM25 {
         format!("bm25_indexes/{name}/b_{bucket}.cbor")
     }
 
+    /// Tokenizes `text` with `tokenizer` and returns the unique indexed terms.
     pub fn collect_tokens(tokenizer: &TokenizerChain, text: &str) -> Vec<String> {
         let mut tokenizer = tokenizer.clone();
         let token_freqs = collect_tokens(&mut tokenizer, text, None);
         token_freqs.into_keys().collect()
     }
 
+    /// Creates a new persisted BM25 index for the provided fields.
+    ///
+    /// The initial metadata object is written immediately; the caller is
+    /// responsible for backfilling existing documents before publishing the
+    /// index in collection metadata.
     pub async fn new(
         fields: Vec<String>,
         tokenizer: TokenizerChain,
@@ -104,6 +114,7 @@ impl BM25 {
         }
     }
 
+    /// Loads an existing BM25 index from persisted metadata and bucket objects.
     pub async fn bootstrap(
         name: String,
         tokenizer: TokenizerChain,
@@ -132,6 +143,9 @@ impl BM25 {
         })
     }
 
+    /// Persists dirty metadata and buckets.
+    ///
+    /// Returns `true` when any object was written.
     pub async fn flush(&self, now_ms: u64) -> Result<bool, DBError> {
         let mut buf = Vec::with_capacity(256);
         let meta_saved = self.index.store_metadata(&mut buf, now_ms)?;
@@ -169,6 +183,7 @@ impl BM25 {
         Ok(meta_saved || had_dirty)
     }
 
+    /// Compacts bucket layout and flushes if bucket count shrinks.
     pub async fn compact_index(&self) -> Result<(), DBError> {
         let (old_bucket_count, new_bucket_count) = self.index.compact_buckets();
         if new_bucket_count < old_bucket_count {
@@ -183,6 +198,7 @@ impl BM25 {
         Ok(())
     }
 
+    /// Returns whether metadata or buckets have in-memory changes to flush.
     pub fn has_pending_flush(&self) -> bool {
         if self.index.has_dirty_buckets() {
             return true;
@@ -191,22 +207,29 @@ impl BM25 {
         self.index.has_pending_metadata_flush()
     }
 
+    /// Returns the stable index name.
     pub fn name(&self) -> &str {
         &self.name
     }
 
+    /// Returns the physical fields represented by this BM25 index.
     pub fn virtual_field(&self) -> &[String] {
         &self.fields
     }
 
+    /// Returns a snapshot of BM25 runtime statistics.
     pub fn stats(&self) -> BM25Stats {
         self.index.stats()
     }
 
+    /// Returns a snapshot of BM25 metadata.
     pub fn metadata(&self) -> BM25Metadata {
         self.index.metadata()
     }
 
+    /// Inserts or updates the text indexed for `id`.
+    ///
+    /// Empty-token documents are ignored because they are not searchable.
     pub fn insert(&self, id: DocumentId, text: &str, now_ms: u64) -> Result<(), DBError> {
         match self.index.insert(id, text, now_ms) {
             Ok(()) => Ok(()),
@@ -215,14 +238,17 @@ impl BM25 {
         }
     }
 
+    /// Removes the indexed text for `id`.
     pub fn remove(&self, id: DocumentId, text: &str, now_ms: u64) -> bool {
         self.index.remove(id, text, now_ms)
     }
 
+    /// Searches the index and returns `(document_id, score)` pairs.
     pub fn search(&self, query: &str, top_k: usize, params: Option<BM25Params>) -> Vec<(u64, f32)> {
         self.index.search(query, top_k, params)
     }
 
+    /// Searches with advanced query parsing and returns `(document_id, score)` pairs.
     pub fn search_advanced(
         &self,
         query: &str,

@@ -269,6 +269,7 @@ impl Proposition {
         }
     }
 
+    /// Converts one predicate edge into a lightweight proposition summary.
     pub fn to_info(&self, predicate: &str) -> Option<PropositionInfo> {
         self.properties.get(predicate).map(|v| PropositionInfo {
             id: self.entity_id(predicate.to_string()).to_string(),
@@ -453,7 +454,9 @@ impl<'de> Deserialize<'de> for EntityID {
 /// domain-specific reasoning, query optimization, and knowledge organization.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct DomainInfo {
+    /// Domain name.
     pub name: String,
+    /// Human-readable domain description.
     pub description: String,
 
     /// Key concept types in this domain.
@@ -498,9 +501,13 @@ impl From<Concept> for DomainInfo {
 /// Simplified information about a concept.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ConceptInfo {
+    /// Stable concept entity id.
     pub id: String,
+    /// Concept type name.
     pub r#type: String,
+    /// Concept display name.
     pub name: String,
+    /// Public concept attributes.
     pub attributes: Map<String, Json>,
 }
 
@@ -526,12 +533,18 @@ impl From<Concept> for ConceptInfo {
     }
 }
 
+/// Lightweight information about a proposition edge.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PropositionInfo {
+    /// Stable proposition entity id.
     pub id: String,
+    /// Subject entity id.
     pub subject: String,
+    /// Object entity id.
     pub object: String,
+    /// Predicate name connecting subject and object.
     pub predicate: String,
+    /// Public proposition attributes.
     pub attributes: Map<String, Json>,
 }
 

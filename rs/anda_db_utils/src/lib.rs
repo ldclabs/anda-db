@@ -1,3 +1,14 @@
+//! Shared utility types used by the AndaDB workspace.
+//!
+//! The crate intentionally stays small and dependency-light. It currently
+//! provides:
+//!
+//! - [`UniqueVec`], an insertion-ordered vector that rejects duplicates.
+//! - [`CountingWriter`], a writer that counts serialized bytes without storing
+//!   the payload.
+//! - CBOR size estimation helpers for sizing encoded index buckets.
+//! - [`Pipe`], a small functional-style chaining trait.
+
 use core::ops::Deref;
 use rustc_hash::{FxBuildHasher, FxHashSet};
 use serde::{

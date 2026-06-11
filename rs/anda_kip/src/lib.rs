@@ -87,7 +87,12 @@ pub use parser::*;
 pub use request::*;
 pub use types::*;
 
+/// Prompt instructions that describe how an agent should use KIP as its
+/// self-facing memory protocol.
 pub static SELF_INSTRUCTIONS: &str = include_str!("../SelfInstructions.md");
+
+/// Prompt instructions that describe KIP behavior from the system-level
+/// execution and governance perspective.
 pub static SYSTEM_INSTRUCTIONS: &str = include_str!("../SystemInstructions.md");
 
 /// JSON schema definition for the `execute_kip` function

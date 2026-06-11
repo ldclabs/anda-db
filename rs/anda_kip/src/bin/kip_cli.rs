@@ -1,3 +1,9 @@
+//! Command-line syntax checker for `.kip` source files.
+//!
+//! The binary walks files or directories supplied on the command line, parses
+//! every `.kip` file it finds with [`anda_kip::parse_kip`], and exits with a
+//! non-zero status if any file is missing, unreadable, or syntactically invalid.
+
 use std::{env, fs, path::Path, process};
 
 use anda_kip::parse_kip;

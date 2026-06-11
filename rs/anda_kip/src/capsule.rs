@@ -34,6 +34,7 @@ pub static DOMAIN_TYPE: &str = "Domain";
 /// The type identifier for event entities.
 pub static EVENT_TYPE: &str = "Event";
 
+/// The type identifier for person entities.
 pub static PERSON_TYPE: &str = "Person";
 
 /// The type identifier for Insight entities.
