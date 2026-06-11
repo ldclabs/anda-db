@@ -1,9 +1,12 @@
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
-use syn::{Attribute, Data, DeriveInput, Expr, Fields, Lit, ext::IdentExt, parse_macro_input};
+use syn::{Attribute, DeriveInput, Expr, Lit, ext::IdentExt, parse_macro_input};
 
-use crate::common::{determine_field_type, find_field_type_attr, find_rename_attr, is_u64_type};
+use crate::common::{
+    effective_field_name, is_u64_type, named_fields, parse_container_serde_attrs,
+    parse_field_serde_attrs, resolve_field_type, validate_schema_field_name,
+};
 
 /// Implementation of `#[derive(AndaDBSchema)]`.
 ///
@@ -11,11 +14,12 @@ use crate::common::{determine_field_type, find_field_type_attr, find_rename_attr
 /// `impl <Struct> { pub fn schema() -> Result<Schema, SchemaError> { ... } }`
 /// block that builds an `anda_db_schema::Schema` via `Schema::builder()`.
 ///
-/// The `_id: u64` field is recognised specially: it must exist with the
-/// correct type (the schema builder injects the entry automatically) and is
-/// otherwise skipped during code generation. Unique constraints, doc-comment
-/// descriptions, custom `field_type` overrides and serde renames are all
-/// honoured here -- see the crate-level docs for the full attribute list.
+/// The `_id: u64` field is recognised specially: when declared it must have
+/// the correct type and serialize as `"_id"` (the schema builder injects the
+/// entry automatically) and is otherwise skipped during code generation.
+/// Unique constraints, doc-comment descriptions, custom `field_type`
+/// overrides and serde renames/skips are all honoured here -- see the
+/// crate-level docs for the full attribute list.
 pub fn anda_db_schema_derive(input: TokenStream) -> TokenStream {
     // Parse the input tokens into a syntax tree.
     let input = parse_macro_input!(input as DeriveInput);
@@ -23,118 +27,170 @@ pub fn anda_db_schema_derive(input: TokenStream) -> TokenStream {
 }
 
 pub(crate) fn expand_anda_db_schema_derive(input: DeriveInput) -> TokenStream2 {
-    let name = &input.ident.unraw();
+    let name = &input.ident;
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
 
     // Only structs with named fields are supported.
-    let fields = if let Data::Struct(data_struct) = &input.data {
-        match &data_struct.fields {
-            Fields::Named(fields_named) => &fields_named.named,
-            _ => {
-                return quote! {
-                    compile_error!("AndaDBSchema only supports structs with named fields");
-                };
-            }
-        }
-    } else {
-        return quote! {
-            compile_error!("AndaDBSchema only supports structs");
-        };
+    let fields = match named_fields(&input, "AndaDBSchema") {
+        Ok(fields) => fields,
+        Err(err) => return err.to_compile_error(),
     };
 
-    // Build one `builder.add_field(...)` invocation per field (except `_id`).
-    let field_entries = fields.iter().filter_map(|field| {
-        let field_name = field.ident.as_ref().unwrap().unraw();
-        let field_name_str = field_name.to_string();
+    let container = match parse_container_serde_attrs(&input.attrs) {
+        Ok(container) => container,
+        Err(err) => return err.to_compile_error(),
+    };
+    if container.transparent {
+        return syn::Error::new_spanned(
+            &input.ident,
+            "AndaDBSchema does not support #[serde(transparent)]: the struct serializes as its inner field, not as a map",
+        )
+        .to_compile_error();
+    }
 
-        // Honour `#[serde(rename = "...")]` for the schema field name.
-        let rename_attr = find_rename_attr(&field.attrs).unwrap_or_else(|| field_name_str.clone());
+    // Build one `builder.add_field(...)` invocation per serialized field
+    // (except `_id`). Errors are emitted in place so that every offending
+    // field is reported at once.
+    let mut seen_names = std::collections::BTreeSet::new();
+    let mut field_entries = Vec::with_capacity(fields.len());
+    for field in fields {
+        let field_ident = field.ident.as_ref().unwrap();
+        let rust_name = field_ident.unraw().to_string();
+        let serde_attrs = parse_field_serde_attrs(&field.attrs);
 
-        // Doc comments become the schema field description.
-        let description = extract_doc_comments(&field.attrs);
-
-        // `#[field_type = "..."]` wins over auto-inference.
-        let custom_field_type = match find_field_type_attr(&field.attrs) {
-            Ok(field_type) => field_type,
-            Err(err_msg) => {
-                return Some(quote! {
-                    compile_error!(#err_msg);
-                });
-            }
-        };
-
-        let field_type = if let Some(field_type) = custom_field_type {
-            quote! { #field_type }
-        } else {
-            match determine_field_type(&field.ty) {
-                Ok(field_type) => field_type,
-                Err(err_msg) => {
-                    // Surface the inference failure as a compile error.
-                    return Some(quote! {
-                        compile_error!(#err_msg);
-                    });
+        // The `_id` column is provided automatically by `SchemaBuilder`; the
+        // user-declared field is validated and then skipped.
+        if rust_name == "_id" {
+            if !is_u64_type(&field.ty) {
+                field_entries.push(
+                    syn::Error::new_spanned(&field.ty, "The '_id' field must be of type u64")
+                        .to_compile_error(),
+                );
+            } else if !serde_attrs.skip_serializing {
+                // serde must keep serializing the primary key as "_id",
+                // otherwise stored documents would not match the schema.
+                let schema_name =
+                    effective_field_name(&rust_name, &serde_attrs, container.rename_all);
+                if schema_name != "_id" {
+                    field_entries.push(
+                        syn::Error::new_spanned(
+                            field_ident,
+                            format!(
+                                "serde renames `_id` to {schema_name:?}, but the primary key must serialize as \"_id\"; add #[serde(rename = \"_id\")]"
+                            ),
+                        )
+                        .to_compile_error(),
+                    );
                 }
             }
-        };
-
-        // The `_id` column is provided automatically by `SchemaBuilder`.
-        if field_name_str == "_id" {
-            // ...but the user-declared type must still match `u64`.
-            if !is_u64_type(&field.ty) {
-                return Some(quote! {
-                    compile_error!("The '_id' field must be of type u64");
-                });
-            }
-
-            return None;
+            continue;
         }
 
-        // `#[unique]` adds a unique constraint to the generated entry.
-        let is_unique = has_unique_attr(&field.attrs);
+        // Fields serde never serializes must not appear in the schema.
+        if serde_attrs.skip_serializing {
+            continue;
+        }
+        if serde_attrs.flatten {
+            field_entries.push(
+                syn::Error::new_spanned(
+                    field_ident,
+                    "#[serde(flatten)] is not supported: flattened keys are inlined into the parent map and cannot be described by a single schema field",
+                )
+                .to_compile_error(),
+            );
+            continue;
+        }
 
-        // Generate field entry creation
-        let field_entry_creation = if description.is_empty() {
-            if is_unique {
-                quote! {
-                    FieldEntry::new(#rename_attr.to_string(), #field_type)?.with_unique()
-                }
-            } else {
-                quote! {
-                    FieldEntry::new(#rename_attr.to_string(), #field_type)?
-                }
-            }
-        } else if is_unique {
-            quote! {
-                FieldEntry::new(#rename_attr.to_string(), #field_type)?
-                    .with_description(#description.to_string())
-                    .with_unique()
-            }
-        } else {
-            quote! {
-                FieldEntry::new(#rename_attr.to_string(), #field_type)?
-                    .with_description(#description.to_string())
+        // Schema field names follow the serialized names: serde renames and
+        // container-level rename_all rules are honoured.
+        let schema_name = effective_field_name(&rust_name, &serde_attrs, container.rename_all);
+
+        // Reject names AndaDB would refuse at runtime (`FieldEntry::new`
+        // accepts only `[a-z0-9_]{1,64}`): a document serialized with such a
+        // key could never be stored, so fail at compile time instead.
+        if let Err(reason) = validate_schema_field_name(&schema_name) {
+            field_entries.push(
+                syn::Error::new_spanned(
+                    field_ident,
+                    format!(
+                        "schema field name {schema_name:?} is not a valid AndaDB field name ({reason}); \
+                         field names must match [a-z0-9_]{{1,64}}. Adjust the field name or its #[serde(rename...)] attributes"
+                    ),
+                )
+                .to_compile_error(),
+            );
+            continue;
+        }
+
+        if schema_name == "_id" {
+            field_entries.push(
+                syn::Error::new_spanned(
+                    field_ident,
+                    format!(
+                        "field {rust_name:?} serializes as \"_id\", which collides with the auto-generated primary key"
+                    ),
+                )
+                .to_compile_error(),
+            );
+            continue;
+        }
+        if !seen_names.insert(schema_name.clone()) {
+            field_entries.push(
+                syn::Error::new_spanned(
+                    field_ident,
+                    format!("duplicate schema field name {schema_name:?} (after serde renaming)"),
+                )
+                .to_compile_error(),
+            );
+            continue;
+        }
+
+        // `#[field_type = "..."]` wins over auto-inference.
+        let field_type = match resolve_field_type(field) {
+            Ok(field_type) => field_type,
+            Err(err) => {
+                field_entries.push(err.to_compile_error());
+                continue;
             }
         };
 
-        Some(quote! {
-            builder.add_field(#field_entry_creation)?;
-        })
-    });
+        // Doc comments become the schema field description, and `#[unique]`
+        // adds a unique constraint to the generated entry.
+        let mut entry = quote! { FieldEntry::new(#schema_name.to_string(), #field_type)? };
+        let description = extract_doc_comments(&field.attrs);
+        if !description.is_empty() {
+            entry = quote! { #entry.with_description(#description.to_string()) };
+        }
+        if has_unique_attr(&field.attrs) {
+            entry = quote! { #entry.with_unique() };
+        }
 
-    // Generate the schema function implementation
-    let expanded = quote! {
+        field_entries.push(quote! {
+            builder.add_field(#entry)?;
+        });
+    }
+
+    // Avoid an `unused_mut` warning when the struct declares no field other
+    // than `_id`.
+    let builder_binding = if field_entries.is_empty() {
+        quote! { let builder = Schema::builder(); }
+    } else {
+        quote! { let mut builder = Schema::builder(); }
+    };
+
+    // Generate the schema function implementation.
+    quote! {
         impl #impl_generics #name #ty_generics #where_clause {
+            #[doc = "Returns the AndaDB `Schema` derived from this struct's serialized fields.\n\nThe `_id` primary-key column is injected automatically by the schema builder.\nGenerated by `#[derive(AndaDBSchema)]`."]
             pub fn schema() -> Result<Schema, SchemaError> {
-                let mut builder = Schema::builder();
+                #builder_binding
 
                 #(#field_entries)*
 
                 builder.build()
             }
         }
-    };
-
-    expanded
+    }
 }
 
 /// Returns `true` if any of the supplied attributes is `#[unique]`.
@@ -183,7 +239,7 @@ mod tests {
                 _id: u64,
                 /// Display
                 /// name
-                #[serde(rename = "displayName")]
+                #[serde(rename = "display_name")]
                 #[unique]
                 name: String,
                 #[field_type = "Option<Array<Text>>"]
@@ -195,12 +251,83 @@ mod tests {
         let expanded = tokens(expand_anda_db_schema_derive(input));
         assert!(expanded.contains("impl < T > User < T > where T : Clone"));
         assert!(expanded.contains("Schema :: builder"));
-        assert!(expanded.contains("\"displayName\""));
+        assert!(expanded.contains("\"display_name\""));
         assert!(expanded.contains("with_description (\"Display name\""));
         assert!(expanded.contains("with_unique"));
         assert!(expanded.contains("FieldType :: Option"));
-        assert!(expanded.contains("T :: field_type ()"));
+        assert!(expanded.contains("< T > :: field_type ()"));
         assert!(!expanded.contains("\"_id\" . to_string"));
+        assert!(!expanded.contains("compile_error"));
+    }
+
+    #[test]
+    fn expand_schema_honours_rename_all_and_skip() {
+        // `snake_case` / `lowercase` rules keep names valid for AndaDB.
+        let input: DeriveInput = parse_quote! {
+            #[serde(rename_all = "snake_case")]
+            struct Payload {
+                _id: u64,
+                created_at: u64,
+                #[serde(rename = "explicit_name")]
+                some_field: String,
+                #[serde(skip)]
+                local_cache: String,
+                #[serde(skip_serializing)]
+                more_cache: String,
+            }
+        };
+
+        let expanded = tokens(expand_anda_db_schema_derive(input));
+        assert!(expanded.contains("\"created_at\""));
+        assert!(expanded.contains("\"explicit_name\""));
+        assert!(!expanded.contains("some_field"));
+        // Skipped fields never appear in the serialized form, so they are
+        // excluded from the generated schema.
+        assert!(!expanded.contains("local_cache"));
+        assert!(!expanded.contains("more_cache"));
+        assert!(!expanded.contains("compile_error"));
+    }
+
+    #[test]
+    fn expand_schema_rejects_names_anda_db_cannot_store() {
+        // camelCase produces "createdAt", which `FieldEntry::new` would
+        // reject at runtime -- the macro must reject it at compile time.
+        let input: DeriveInput = parse_quote! {
+            #[serde(rename_all = "camelCase")]
+            struct Payload {
+                #[serde(rename = "_id")]
+                _id: u64,
+                created_at: u64,
+            }
+        };
+        let expanded = tokens(expand_anda_db_schema_derive(input));
+        assert!(expanded.contains("not a valid AndaDB field name"));
+        assert!(expanded.contains("createdAt"));
+
+        // Same for an explicit rename to an invalid name.
+        let input: DeriveInput = parse_quote! {
+            struct Payload {
+                #[serde(rename = "Bad-Name")]
+                value: u64,
+            }
+        };
+        assert!(
+            tokens(expand_anda_db_schema_derive(input)).contains("not a valid AndaDB field name")
+        );
+    }
+
+    #[test]
+    fn expand_schema_elides_mut_for_id_only_structs() {
+        let input: DeriveInput = parse_quote! {
+            struct OnlyId {
+                _id: u64,
+            }
+        };
+
+        let expanded = tokens(expand_anda_db_schema_derive(input));
+        assert!(expanded.contains("let builder"));
+        assert!(!expanded.contains("let mut builder"));
+        assert!(!expanded.contains("compile_error"));
     }
 
     #[test]
@@ -228,7 +355,10 @@ mod tests {
                 _id: String,
             }
         };
-        assert!(tokens(expand_anda_db_schema_derive(bad_id)).contains("_id"));
+        assert!(
+            tokens(expand_anda_db_schema_derive(bad_id))
+                .contains("The '_id' field must be of type u64")
+        );
 
         let bad_attr: DeriveInput = parse_quote! {
             struct BadAttr {
@@ -246,6 +376,56 @@ mod tests {
             }
         };
         assert!(tokens(expand_anda_db_schema_derive(bad_type)).contains("Unsupported type"));
+    }
+
+    #[test]
+    fn expand_schema_guards_the_reserved_id_column() {
+        // rename_all would serialize `_id` as "id": stored documents could
+        // never match the schema, so this must be rejected.
+        let input: DeriveInput = parse_quote! {
+            #[serde(rename_all = "camelCase")]
+            struct BadId {
+                _id: u64,
+                created_at: u64,
+            }
+        };
+        assert!(
+            tokens(expand_anda_db_schema_derive(input)).contains("must serialize as \\\"_id\\\"")
+        );
+
+        // Renaming another field to `_id` collides with the primary key.
+        let input: DeriveInput = parse_quote! {
+            struct Collide {
+                #[serde(rename = "_id")]
+                key: u64,
+            }
+        };
+        assert!(tokens(expand_anda_db_schema_derive(input)).contains("collides"));
+
+        // Two fields serializing under one name are rejected.
+        let input: DeriveInput = parse_quote! {
+            struct Duplicate {
+                #[serde(rename = "name")]
+                a: String,
+                name: String,
+            }
+        };
+        assert!(
+            tokens(expand_anda_db_schema_derive(input)).contains("duplicate schema field name")
+        );
+
+        // Flattened fields cannot be described by the schema.
+        let input: DeriveInput = parse_quote! {
+            struct WithFlatten {
+                _id: u64,
+                #[serde(flatten)]
+                extra: std::collections::HashMap<String, String>,
+            }
+        };
+        assert!(
+            tokens(expand_anda_db_schema_derive(input))
+                .contains("#[serde(flatten)] is not supported")
+        );
     }
 
     #[test]

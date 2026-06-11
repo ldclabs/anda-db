@@ -552,8 +552,10 @@ use anda_db_schema::{AndaDBSchema, FieldTyped};
 
 ### 8.1 `AndaDBSchema`
 
-Generates `MyStruct::schema() -> Result<Schema, SchemaError>`. The
-struct **must** declare `_id: u64` so the generated schema is valid.
+Generates `MyStruct::schema() -> Result<Schema, SchemaError>`. Declaring
+`_id: u64` on the struct is optional (the builder injects the primary-key
+column automatically); when declared, it must be `u64` and keep serializing
+as `"_id"`.
 
 ### 8.2 `FieldTyped`
 
@@ -564,23 +566,32 @@ derived `field_type()` of any sub-struct it encounters.
 
 ### 8.3 Attributes
 
-| Attribute                         | Effect                                            |
-| :-------------------------------- | :------------------------------------------------ |
-| `#[field_type = "FieldTypeExpr"]` | Override the inferred type (see below).           |
-| `#[unique]`                       | Mark a field as unique (requires `AndaDBSchema`). |
-| `#[serde(rename = "newName")]`    | Use `newName` as the schema field name.           |
-| `///` doc comment                 | Captured as the field's `description`.            |
+| Attribute                              | Effect                                                            |
+| :------------------------------------- | :---------------------------------------------------------------- |
+| `#[field_type = "TypeDSL"]`            | Override the inferred type (see below).                           |
+| `#[unique]`                            | Mark a field as unique (requires `AndaDBSchema`).                 |
+| `#[serde(rename = "new_name")]`        | Use the serialized name as the schema field name.                 |
+| `#[serde(rename_all = "...")]`         | Container-level case rule, honoured like serde does.              |
+| `#[serde(skip)]` / `skip_serializing`  | Exclude the never-serialized field from the schema.               |
+| `///` doc comment                      | Captured as the field's `description`.                            |
 
-`#[field_type = "..."]` accepts a Rust expression that resolves to a
-`FieldType`, e.g.:
+`#[field_type = "..."]` accepts a small type DSL (whitespace-insensitive):
+primitives (`Bytes`, `Text`, `U64`, `I64`, `F64`, `F32`, `Bool`, `Json`,
+`Vector`), plus `Array<T>`, `Option<T>` and `Map<String|Text|Bytes, T>`:
 
 ```rust
 #[field_type = "Bytes"]
 some_id: [u8; 16],
 
-#[field_type = "Array(vec![FieldType::F32])"]
-embedding_f32: Vec<f32>,
+#[field_type = "Array<F32>"]
+samples: Vec<f32>,
+
+#[field_type = "Option<Map<Text, Json>>"]
+extra: Option<HashMap<String, Value>>,
 ```
+
+See [anda_db_derive.md](./anda_db_derive.md) for the full grammar and
+diagnostics.
 
 ### 8.4 Type inference table
 
@@ -598,7 +609,8 @@ embedding_f32: Vec<f32>,
 | `HashMap<K, V>`, `BTreeMap<K, V>`, `Map<K, V>` (`K = String`) | `Map({"*": V})`                       |
 | `HashMap<K, V>` etc. with byte-string keys                    | `Map({b"*": V})`                      |
 | `Option<T>`                                                   | `Option(T)`                           |
-| any other path `Foo`                                          | `Foo::field_type()` (must be derived) |
+| `Box<T>`, `Arc<T>`, `Rc<T>`, `Cow<'_, T>`                     | inferred from `T` (serde-transparent) |
+| any other path `Foo`                                          | `<Foo>::field_type()` (must be derived) |
 
 ---
 

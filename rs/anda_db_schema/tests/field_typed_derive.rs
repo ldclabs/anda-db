@@ -163,6 +163,62 @@ fn map_text_alias_works() {
     assert_eq!(ft, expected);
 }
 
+// serde 容器级 rename_all 与字段级 skip:field_type() 必须描述序列化后的形态。
+// 嵌套 Map 的键不受 AndaDB 顶层字段命名规则限制,camelCase 是合法的。
+#[allow(dead_code)]
+#[derive(Debug, Serialize, Deserialize, FieldTyped)]
+#[serde(rename_all = "camelCase")]
+struct RenamedNested {
+    display_name: String,
+    #[serde(skip)]
+    local_state: u64,
+    #[serde(skip_serializing)]
+    more_state: u64,
+}
+
+#[test]
+fn rename_all_and_skip_work() {
+    assert_eq!(
+        RenamedNested::field_type(),
+        FieldType::Map(
+            vec![("displayName".into(), FieldType::Text)]
+                .into_iter()
+                .collect()
+        )
+    );
+}
+
+// 泛型自定义类型作为嵌套字段:生成代码必须在表达式位置合法(<Wrapper<T>>::field_type())
+#[allow(dead_code)]
+#[derive(Debug, FieldTyped)]
+struct Wrapper<T> {
+    #[field_type = "Json"]
+    value: T,
+    label: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, FieldTyped)]
+struct UsesGenericNested {
+    wrapped: Wrapper<u64>,
+    boxed: Box<String>,
+}
+
+#[test]
+fn generic_nested_and_smart_pointers_work() {
+    assert_eq!(
+        UsesGenericNested::field_type(),
+        FieldType::Map(
+            vec![
+                ("wrapped".into(), Wrapper::<u64>::field_type()),
+                ("boxed".into(), FieldType::Text),
+            ]
+            .into_iter()
+            .collect()
+        )
+    );
+}
+
 #[allow(dead_code)]
 mod qualified_path_models {
     use super::*;

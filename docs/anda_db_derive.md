@@ -1,7 +1,7 @@
 # `anda_db_derive` Technical Documentation
 
-**Crate version**: 0.4
-**Last updated**: 2026-04-25
+**Crate version**: 0.5
+**Last updated**: 2026-06-11
 
 ---
 
@@ -100,10 +100,11 @@ impl User {
 #[proc_macro_derive(AndaDBSchema, attributes(field_type, unique))]
 ```
 
-Builds a complete `Schema` via `Schema::builder()`. The `_id: u64` field is
-**mandatory** — the macro validates its type at compile time and skips it
-during code generation, since the builder injects the primary-key column
-itself.
+Builds a complete `Schema` via `Schema::builder()`. Declaring the `_id: u64`
+field is **optional** — the builder injects the primary-key column either
+way. When declared, the macro validates at compile time that it is `u64` and
+that serde keeps serializing it as `"_id"` (beware `rename_all` rules), and
+skips it during code generation.
 
 ```rust
 use anda_db_derive::AndaDBSchema;
@@ -146,12 +147,16 @@ impl Article {
 
 ## 3. Attributes
 
-| Attribute                   | Applies to                   | Effect                                                                                              |
-| --------------------------- | ---------------------------- | --------------------------------------------------------------------------------------------------- |
-| `#[field_type = "..."]`     | `FieldTyped`, `AndaDBSchema` | Override the inferred field type using the [DSL](#5-the-field_type-dsl).                            |
-| `#[unique]`                 | `AndaDBSchema` only          | Adds `FieldEntry::with_unique()` to the generated entry.                                            |
-| `#[serde(rename = "name")]` | both                         | Use the renamed identifier as the schema field name. Other serde keys are ignored.                  |
-| `/// doc comment`           | `AndaDBSchema` only          | All `///` lines on a field are joined with a space and emitted as `FieldEntry::with_description()`. |
+| Attribute                          | Applies to                   | Effect                                                                                              |
+| ---------------------------------- | ---------------------------- | --------------------------------------------------------------------------------------------------- |
+| `#[field_type = "..."]`            | `FieldTyped`, `AndaDBSchema` | Override the inferred field type using the [DSL](#5-the-field_type-dsl).                            |
+| `#[unique]`                        | `AndaDBSchema` only          | Adds `FieldEntry::with_unique()` to the generated entry.                                            |
+| `#[serde(rename = "name")]`        | both                         | Use the serialized name as the schema field name (directional form: the `serialize` half is used).  |
+| `#[serde(rename_all = "...")]`     | both (container level)       | Apply serde's case rule to all fields without an explicit rename, mirroring serde's precedence.     |
+| `#[serde(skip)]` / `#[serde(skip_serializing)]` | both            | The field never appears in serialized output and is excluded from the schema / type map.            |
+| `#[serde(flatten)]`                | both                         | **Rejected** with a compile error: flattened keys cannot be described by a per-field schema entry.  |
+| `#[serde(transparent)]`            | both (container level)       | **Rejected** with a compile error: the struct serializes as its inner field, not as a map.          |
+| `/// doc comment`                  | `AndaDBSchema` only          | All `///` lines on a field are joined with a space and emitted as `FieldEntry::with_description()`. |
 
 Notes:
 
@@ -160,7 +165,15 @@ Notes:
 - Multiple `///` lines are concatenated; empty doc lines are dropped before
   joining.
 - Only the first `serde(rename = "...")` is honoured; other serde syntax that
-  fails to parse is skipped without raising an error.
+  fails to parse is skipped without raising an error. `#[serde(with = "...")]`
+  / `serialize_with` may change the serialized shape — combine them with an
+  explicit `#[field_type = "..."]` override when they do.
+- `AndaDBSchema` validates every resulting field name against AndaDB's naming
+  rules (`[a-z0-9_]`, at most 64 bytes) at compile time, and also rejects
+  duplicate names and collisions with the reserved `_id` column. Keys of
+  nested `FieldTyped` maps are free-form, so case rules like `camelCase` are
+  fine there, while on `AndaDBSchema` they are only usable when the resulting
+  names stay valid (`snake_case` / `lowercase`, or explicit renames).
 
 ---
 
@@ -216,12 +229,13 @@ For maps the key `K` must be one of:
 
 Any other key type is a compile error.
 
-### 4.5 Optionality and user-defined types
+### 4.5 Optionality, smart pointers and user-defined types
 
-| Rust type                             | `FieldType`                                        |
-| ------------------------------------- | -------------------------------------------------- |
-| `Option<T>`                           | `Option(T)`                                        |
-| Any other path (single segment) `Foo` | `Foo::field_type()` — **must** derive `FieldTyped` |
+| Rust type                                  | `FieldType`                                          |
+| ------------------------------------------ | ---------------------------------------------------- |
+| `Option<T>`                                | `Option(T)`                                          |
+| `Box<T>` / `Arc<T>` / `Rc<T>` / `Cow<'_, T>` | the inner `T` (serde serializes these transparently) |
+| Any other path `Foo` (incl. `Foo<G>`)      | `<Foo>::field_type()` — **must** derive `FieldTyped` |
 
 Selected fully qualified paths are recognised explicitly even if the leading
 segment is not the type name:
@@ -229,6 +243,10 @@ segment is not the type name:
 - `serde_bytes::Bytes` / `ByteArray` / `ByteBuf` → `Bytes`
 - `serde_json::Value` → `Json`
 - `half::bf16` → compile error (with guidance)
+
+Parenthesized types (`(String)`) and the invisible groups produced by
+`macro_rules!` substitution are unwrapped transparently, so macro-generated
+structs infer the same way as hand-written ones.
 
 ---
 
@@ -384,17 +402,27 @@ struct Transaction {
 
 ### 7.1 `common.rs`
 
-| Symbol                 | Responsibility                                                |
-| ---------------------- | ------------------------------------------------------------- |
-| `find_rename_attr`     | Extract `serde(rename = "...")`.                              |
-| `find_field_type_attr` | Extract and parse `#[field_type = "..."]`.                    |
-| `parse_field_type_str` | Compile the `field_type` DSL into a `FieldType` token stream. |
-| `determine_field_type` | Infer `FieldType` directly from a `syn::Type`.                |
-| `is_u8_type`           | Predicate for `u8`.                                           |
-| `is_string_type`       | Predicate for `String` / `str`.                               |
-| `is_bytes_type`        | Predicate for the supported byte container types.             |
-| `is_bf16_type`         | Predicate for `bf16`.                                         |
-| `is_u64_type`          | Predicate used to validate the `_id: u64` requirement.        |
+| Symbol                       | Responsibility                                                      |
+| ---------------------------- | ------------------------------------------------------------------- |
+| `named_fields`               | Shared "struct with named fields" validation for both derives.      |
+| `parse_container_serde_attrs`| Extract `rename_all` (incl. directional form) and `transparent`.    |
+| `parse_field_serde_attrs`    | Extract `rename` (incl. directional form), `skip*` and `flatten`.   |
+| `RenameRule`                 | serde-compatible `rename_all` case conversion.                      |
+| `effective_field_name`       | Resolve the serialized name (explicit rename wins over rename_all). |
+| `validate_schema_field_name` | Compile-time mirror of `anda_db_schema::validate_field_name`.       |
+| `resolve_field_type`         | `#[field_type]` override or fall back to inference.                 |
+| `find_field_type_attr`       | Extract and parse `#[field_type = "..."]`.                          |
+| `parse_field_type_str`       | Compile the `field_type` DSL into a `FieldType` token stream.       |
+| `determine_field_type`       | Infer `FieldType` directly from a `syn::Type`.                      |
+| `is_u8_type`                 | Predicate for `u8`.                                                 |
+| `is_string_type`             | Predicate for `String` / `str`.                                     |
+| `is_bytes_type`              | Predicate for the supported byte container types.                   |
+| `is_bf16_type`               | Predicate for `bf16`.                                               |
+| `is_u64_type`                | Predicate used to validate the `_id: u64` requirement.              |
+
+All fallible helpers return `syn::Result` with errors spanned at the
+offending field, type or attribute, so diagnostics point at the user's code
+instead of the `#[derive(...)]` line.
 
 #### Map parsing details
 
@@ -409,22 +437,29 @@ Whitespace is trimmed on both sides of every separator, so writes like
 Pipeline executed by `anda_db_schema_derive`:
 
 1. Parse the input as `DeriveInput`.
-2. Reject anything that is not a struct with named fields.
+2. Reject anything that is not a struct with named fields, and reject
+   `#[serde(transparent)]`.
 3. For every field:
-   - read the (optional) serde rename;
-   - extract `///` doc comments (joined with spaces);
-   - resolve the field type via `find_field_type_attr` *or*
-     `determine_field_type`;
-   - if the field is `_id`, verify it is `u64` and skip code generation;
-   - look for `#[unique]` and choose between four `FieldEntry` builder
-     templates (with/without description × with/without unique).
+   - if the field is `_id`, verify it is `u64` and still serializes as
+     `"_id"`, then skip code generation;
+   - skip fields marked `#[serde(skip)]` / `#[serde(skip_serializing)]`,
+     reject `#[serde(flatten)]`;
+   - resolve the serialized name (explicit rename > `rename_all` > Rust
+     identifier) and validate it against AndaDB's naming rules, the reserved
+     `_id` column and previously seen names;
+   - resolve the field type via `#[field_type]` *or* `determine_field_type`;
+   - extract `///` doc comments (joined with spaces) and `#[unique]`, then
+     compose `FieldEntry::new(...)?[.with_description(...)][.with_unique()]`.
 4. Emit `impl <Struct> { pub fn schema() -> Result<Schema, SchemaError> { … } }`.
+   Per-field errors are emitted in place (as spanned `compile_error!`s) so
+   every offending field is reported in a single compilation pass.
 
 ### 7.3 `field_typed.rs`
 
-Same parse / validation prelude as `schema.rs`. For each field the macro
-produces a `(rename_or_name.into(), <field_type>)` tuple and collects them
-into a single `FieldType::Map`.
+Same parse / validation prelude as `schema.rs` (minus the AndaDB naming
+restrictions — nested map keys are free-form). For each serialized field the
+macro produces a `(serialized_name.into(), <field_type>)` tuple and collects
+them into a single `FieldType::Map`.
 
 ### 7.4 Worked example
 
@@ -462,20 +497,32 @@ impl User {
 
 ### 8.1 Compile-time errors
 
-| Message                                                                           | Cause                                                                          |
-| --------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| `FieldTyped only supports structs`                                                | Applied to an enum or union.                                                   |
-| `FieldTyped only supports structs with named fields`                              | Applied to a tuple or unit struct.                                             |
-| `AndaDBSchema only supports structs`                                              | Applied to an enum or union.                                                   |
-| `AndaDBSchema only supports structs with named fields`                            | Applied to a tuple or unit struct.                                             |
-| `The '_id' field must be of type u64`                                             | The struct declares `_id` with a type other than `u64`.                        |
-| `Unsupported field type: '...'. Supported types: …`                               | DSL string in `#[field_type]` was not recognised.                              |
-| `Unsupported Map key type: '...'. Expected 'String', 'Text' or 'Bytes'.`          | Unsupported key in `Map<K, V>` DSL.                                            |
-| `Invalid Map field type: '...'. Expected 'Map<KeyType, ValueType>'.`              | DSL `Map<…>` string lacks a comma-separated key/value pair.                    |
-| `Unsupported type: '...'. Consider: …`                                            | Inference failed (references, tuples, trait objects, etc.).                    |
-| `Unable to determine Vec element type for: ...`                                   | Generic argument missing on a `Vec` / `HashSet` / `BTreeSet`.                  |
-| `Map key type must be String or bytes (e.g., Vec<u8>, [u8; N]), found: ...`       | `HashMap`/`BTreeMap` key inferred as something neither string- nor bytes-like. |
-| `Standalone \`half::bf16\` is not supported as a field type. Use \`Vec<bf16>\` …` | Bare `bf16` field without `Vec`/override.                                      |
+All messages are spanned at the offending field, type or attribute. Types in
+messages are rendered as Rust source (e.g. `(u64, u64)`), not as AST dumps.
+
+| Message                                                                            | Cause                                                                          |
+| ----------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| `FieldTyped only supports structs`                                                  | Applied to an enum or union.                                                   |
+| `FieldTyped only supports structs with named fields`                                | Applied to a tuple or unit struct.                                             |
+| `AndaDBSchema only supports structs`                                                | Applied to an enum or union.                                                   |
+| `AndaDBSchema only supports structs with named fields`                              | Applied to a tuple or unit struct.                                             |
+| `The '_id' field must be of type u64`                                               | The struct declares `_id` with a type other than `u64`.                        |
+| `serde renames `_id` to "...", but the primary key must serialize as "_id"; …`      | `rename_all`/`rename` changes how `_id` serializes.                            |
+| `field "..." serializes as "_id", which collides with the auto-generated primary key` | Another field is renamed to `_id`.                                           |
+| `schema field name "..." is not a valid AndaDB field name (...)`                    | The serialized name violates `[a-z0-9_]{1,64}` (`AndaDBSchema` only).          |
+| `duplicate schema field name "..." (after serde renaming)`                          | Two fields end up with the same serialized name.                               |
+| `#[serde(flatten)] is not supported: …`                                             | Flattened keys cannot be described by a per-field schema entry.                |
+| `… does not support #[serde(transparent)]: …`                                       | Transparent structs do not serialize as maps.                                  |
+| `unknown #[serde(rename_all = "...")] rule; …`                                      | Unrecognised case rule (would silently desync schema and data otherwise).      |
+| `Unsupported field type: '...'. Supported types: …`                                 | DSL string in `#[field_type]` was not recognised.                              |
+| `Unsupported Map key type: '...'. Expected 'String', 'Text' or 'Bytes'.`            | Unsupported key in `Map<K, V>` DSL.                                            |
+| `Invalid Map field type: '...'. Expected 'Map<KeyType, ValueType>'.`                | DSL `Map<…>` string lacks a comma-separated key/value pair.                    |
+| `Unsupported type: \`...\`. Consider: …`                                            | Inference failed (tuples, trait objects, etc.).                                |
+| `Unable to determine Vec element type for: ...`                                     | Generic argument missing on a `Vec` / `HashSet` / `BTreeSet`.                  |
+| `Unable to determine Option element type`                                           | Generic argument missing on an `Option`.                                       |
+| `Unable to determine the inner type of: ...`                                        | Generic argument missing on a `Box` / `Arc` / `Rc` / `Cow`.                    |
+| `Map key type must be String or bytes (e.g., Vec<u8>, ByteArray, ByteBuf), found: …`| `HashMap`/`BTreeMap` key inferred as something neither string- nor bytes-like. |
+| `Standalone \`bf16\` is not supported as a field type. Use \`Vec<bf16>\` …`         | Bare `bf16` field without `Vec`/override.                                      |
 
 ### 8.2 Runtime errors
 
@@ -490,4 +537,4 @@ with:
 
 ---
 
-*Document generated: 2026-04-25*
+*Document updated: 2026-06-11*

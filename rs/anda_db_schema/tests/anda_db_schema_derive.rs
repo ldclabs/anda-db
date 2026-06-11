@@ -108,6 +108,35 @@ struct TestConstraints {
     bio: Option<String>,
 }
 
+// 测试 serde 容器级 rename_all 与字段级 rename/skip:schema 字段名必须与序列化结果一致。
+// 注:AndaDB 顶层字段名仅允许 [a-z0-9_],因此 camelCase 等规则会被编译期拒绝;
+// snake_case/lowercase 是合法的。
+#[derive(Debug, Serialize, Deserialize, AndaDBSchema)]
+#[serde(rename_all = "snake_case")]
+struct TestRenameAll {
+    _id: u64,
+    /// Creation timestamp
+    created_at: u64,
+    /// Runtime-only state, never serialized
+    #[allow(dead_code)]
+    #[serde(skip)]
+    runtime_cache: Option<String>,
+    #[serde(rename = "explicit_name")]
+    some_field: String,
+}
+
+// 测试 serde 透明智能指针的类型推断
+// (注:Arc 的 serde 序列化需启用 serde 的 `rc` feature,此处仅验证 schema 推断)
+#[allow(dead_code)]
+#[derive(Debug, AndaDBSchema)]
+struct TestSmartPointers {
+    _id: u64,
+    boxed_text: Box<String>,
+    shared_text: std::sync::Arc<String>,
+    cow_text: std::borrow::Cow<'static, str>,
+    boxed_bytes: Box<Vec<u8>>,
+}
+
 #[derive(Debug, Serialize, Deserialize, AndaDBSchema)]
 struct TestQualifiedPathSchema<T> {
     _id: std::primitive::u64,
@@ -359,6 +388,60 @@ mod tests {
         } else {
             panic!("Expected Option<Text>");
         }
+    }
+
+    #[test]
+    fn test_rename_all_and_skip_match_serialization() {
+        let schema = TestRenameAll::schema().unwrap();
+
+        // schema 字段名跟随序列化名(rename_all / 显式 rename)
+        assert!(schema.get_field("created_at").is_some());
+        assert!(schema.get_field("explicit_name").is_some());
+        assert!(schema.get_field("some_field").is_none());
+
+        // skip 字段不进入 schema
+        assert!(schema.get_field("runtime_cache").is_none());
+
+        // 端到端:serde 序列化出的文档能通过 schema 校验,skip 字段不出现
+        let value = TestRenameAll {
+            _id: 1,
+            created_at: 42,
+            runtime_cache: Some("not stored".into()),
+            some_field: "hello".into(),
+        };
+        let schema = std::sync::Arc::new(schema);
+        let doc = anda_db_schema::Document::try_from(schema, &value).unwrap();
+        assert_eq!(
+            doc.get_field("created_at"),
+            Some(&anda_db_schema::Fv::U64(42))
+        );
+        assert_eq!(
+            doc.get_field("explicit_name"),
+            Some(&anda_db_schema::Fv::Text("hello".into()))
+        );
+        assert!(doc.get_field("runtime_cache").is_none());
+    }
+
+    #[test]
+    fn test_smart_pointer_inference() {
+        let schema = TestSmartPointers::schema().unwrap();
+
+        assert_eq!(
+            schema.get_field("boxed_text").unwrap().r#type(),
+            &FieldType::Text
+        );
+        assert_eq!(
+            schema.get_field("shared_text").unwrap().r#type(),
+            &FieldType::Text
+        );
+        assert_eq!(
+            schema.get_field("cow_text").unwrap().r#type(),
+            &FieldType::Text
+        );
+        assert_eq!(
+            schema.get_field("boxed_bytes").unwrap().r#type(),
+            &FieldType::Bytes
+        );
     }
 
     #[test]

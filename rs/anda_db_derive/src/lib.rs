@@ -8,9 +8,9 @@ mod schema;
 /// struct.
 ///
 /// The generated method returns a `FieldType::Map` whose keys are the
-/// (possibly serde-renamed) field names and whose values are the inferred or
-/// explicitly overridden [`anda_db_schema::FieldType`] for each field. It is
-/// the building block used by `AndaDBSchema` for nested user-defined types.
+/// serialized field names and whose values are the inferred or explicitly
+/// overridden [`anda_db_schema::FieldType`] for each field. It is the
+/// building block used by `AndaDBSchema` for nested user-defined types.
 ///
 /// # Attributes
 ///
@@ -19,8 +19,19 @@ mod schema;
 ///   as `Array<T>`, `Option<T>`, `Map<String, T>`, `Map<Text, T>` and
 ///   `Map<Bytes, T>` (where `T` is itself any supported type, including
 ///   nested wrappers).
-/// - `#[serde(rename = "name")]` -- use the renamed identifier as the
-///   schema field name. Other serde options are ignored.
+/// - `#[serde(rename = "name")]` / `#[serde(rename_all = "...")]` -- the
+///   generated map follows the *serialized* field names, so field-level
+///   renames and container-level case rules (e.g. `camelCase`) are both
+///   honoured, with the same precedence as serde itself.
+/// - `#[serde(skip)]` / `#[serde(skip_serializing)]` -- the field never
+///   appears in serialized output and is therefore excluded from the
+///   generated map.
+/// - `#[serde(flatten)]` and `#[serde(transparent)]` are rejected with a
+///   compile error: they change the serialized shape in ways a per-field
+///   schema cannot describe.
+/// - Other serde options are ignored. Note that `#[serde(with = "...")]` /
+///   `serialize_with` may change the serialized shape -- combine them with
+///   an explicit `#[field_type = "..."]` override when they do.
 ///
 /// # Type inference
 ///
@@ -33,12 +44,16 @@ mod schema;
 /// - `Vec<T>` / `HashSet<T>` / `BTreeSet<T>` -> `Array(T)`
 /// - `HashMap<K, V>` / `BTreeMap<K, V>` (string- or bytes-like key) -> `Map`
 /// - `Option<T>` -> `Option(T)`
+/// - `Box<T>` / `Arc<T>` / `Rc<T>` / `Cow<'_, T>` -> the inner `T` (serde
+///   serializes these wrappers transparently)
 /// - `serde_json::Value`, `Json` -> `Json`
 /// - any other path -> the type's `field_type()` function (so the type must
 ///   itself derive `FieldTyped`)
 ///
 /// Standalone `bf16` values are intentionally rejected -- vectors, not
 /// scalars, are the supported abstraction.
+///
+/// All diagnostics are spanned at the offending field, type or attribute.
 ///
 /// # Example
 ///
@@ -63,8 +78,8 @@ pub fn field_typed_derive(input: TokenStream) -> TokenStream {
 /// struct.
 ///
 /// The generated method builds a fully-formed [`anda_db_schema::Schema`]
-/// using `Schema::builder()`, with one `FieldEntry` per field (excluding the
-/// mandatory `_id: u64`, which is provided by the builder itself).
+/// using `Schema::builder()`, with one `FieldEntry` per serialized field
+/// (excluding `_id`, which is provided by the builder itself).
 ///
 /// # Attributes
 ///
@@ -72,16 +87,28 @@ pub fn field_typed_derive(input: TokenStream) -> TokenStream {
 ///   for `FieldTyped`; see that macro's docs for the full grammar.
 /// - `#[unique]` -- mark the field as having a unique constraint
 ///   (`FieldEntry::with_unique`).
-/// - `#[serde(rename = "name")]` -- use the renamed identifier as the schema
-///   field name.
+/// - `#[serde(rename = "name")]` / `#[serde(rename_all = "...")]` -- the
+///   schema follows the *serialized* field names, so field-level renames and
+///   container-level case rules (e.g. `camelCase`) are both honoured, with
+///   the same precedence as serde itself.
+/// - `#[serde(skip)]` / `#[serde(skip_serializing)]` -- the field never
+///   appears in serialized output and is therefore excluded from the schema.
+/// - `#[serde(flatten)]` and `#[serde(transparent)]` are rejected with a
+///   compile error: they change the serialized shape in ways a per-field
+///   schema cannot describe.
 /// - Doc comments (`/// ...`) are concatenated and used as the field
 ///   description (`FieldEntry::with_description`).
 ///
+/// Two fields that would serialize under the same schema name (e.g. via
+/// renames) are rejected at compile time.
+///
 /// # Special fields
 ///
-/// The struct **must** declare `_id: u64`. The field is validated at compile
-/// time but skipped during code generation -- AndaDB manages the primary
-/// key automatically.
+/// The `_id: u64` primary-key column is injected by the schema builder
+/// automatically, so declaring it on the struct is optional. When declared,
+/// it must be of type `u64` and keep serializing as `"_id"` (beware
+/// `rename_all` rules: add `#[serde(rename = "_id")]` if needed); it is
+/// validated at compile time and skipped during code generation.
 ///
 /// # Example
 ///

@@ -9,7 +9,14 @@ and keeping application data models aligned with the database type system.
 - `AndaDBSchema` for generating a complete `Schema`
 - `FieldTyped` for generating nested `FieldType` descriptions
 - support for `#[field_type = "..."]` overrides
-- support for `#[unique]` and `#[serde(rename = "...")]`
+- support for `#[unique]`
+- serde-aware naming: `#[serde(rename = "...")]` and
+  `#[serde(rename_all = "...")]` are honoured, and
+  `#[serde(skip)]` / `#[serde(skip_serializing)]` fields are excluded, so the
+  generated schema always matches the serialized representation
+- compile-time validation: field names AndaDB cannot store, duplicate names,
+  `_id` misuse, and unsupported `#[serde(flatten)]` / `#[serde(transparent)]`
+  are reported with precise spans
 - extraction of doc comments into schema field descriptions
 
 ## When to Use It
@@ -28,7 +35,7 @@ Add the derive crate alongside `anda_db_schema`:
 ```toml
 [dependencies]
 anda_db_schema = "0.4"
-anda_db_derive = "0.4"
+anda_db_derive = "0.5"
 serde = { version = "1", features = ["derive"] }
 ```
 

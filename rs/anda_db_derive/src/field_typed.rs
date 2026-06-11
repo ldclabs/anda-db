@@ -1,16 +1,19 @@
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
-use syn::{Data, DeriveInput, Fields, ext::IdentExt, parse_macro_input};
+use syn::{DeriveInput, ext::IdentExt, parse_macro_input};
 
-use crate::common::{determine_field_type, find_field_type_attr, find_rename_attr};
+use crate::common::{
+    effective_field_name, named_fields, parse_container_serde_attrs, parse_field_serde_attrs,
+    resolve_field_type,
+};
 
 /// Implementation of `#[derive(FieldTyped)]`.
 ///
 /// Generates an inherent `pub fn field_type() -> FieldType` method that
-/// returns a `FieldType::Map` whose keys are the (possibly serde-renamed)
-/// field names and whose values are the inferred (or explicitly overridden)
-/// `FieldType` for each field.
+/// returns a `FieldType::Map` whose keys are the serialized field names
+/// (honouring serde renames) and whose values are the inferred (or
+/// explicitly overridden) `FieldType` for each serialized field.
 ///
 /// This is the workhorse for nested types: when [`super::schema::anda_db_schema_derive`]
 /// or `determine_field_type` encounters a user-defined struct, it calls
@@ -22,66 +25,82 @@ pub fn field_typed_derive(input: TokenStream) -> TokenStream {
 }
 
 pub(crate) fn expand_field_typed_derive(input: DeriveInput) -> TokenStream2 {
-    let name = &input.ident.unraw();
+    let name = &input.ident;
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
 
     // Only structs with named fields are supported.
-    let fields = if let Data::Struct(data_struct) = &input.data {
-        match &data_struct.fields {
-            Fields::Named(fields_named) => &fields_named.named,
-            _ => {
-                return quote! {
-                    compile_error!("FieldTyped only supports structs with named fields");
-                };
-            }
-        }
-    } else {
-        return quote! {
-            compile_error!("FieldTyped only supports structs");
-        };
+    let fields = match named_fields(&input, "FieldTyped") {
+        Ok(fields) => fields,
+        Err(err) => return err.to_compile_error(),
     };
 
-    // For each field, emit a `("name".into(), <FieldType>)` tuple that will be
-    // collected into the resulting `FieldType::Map`.
-    let field_type_mappings = fields.iter().map(|field| {
-        let field_name = field.ident.as_ref().unwrap().unraw();
-        let field_name_str = field_name.to_string();
+    let container = match parse_container_serde_attrs(&input.attrs) {
+        Ok(container) => container,
+        Err(err) => return err.to_compile_error(),
+    };
+    if container.transparent {
+        return syn::Error::new_spanned(
+            &input.ident,
+            "FieldTyped does not support #[serde(transparent)]: the struct serializes as its inner field, not as a map",
+        )
+        .to_compile_error();
+    }
 
-        // Honour `#[serde(rename = "...")]` for the map key.
-        let rename_attr = find_rename_attr(&field.attrs).unwrap_or_else(|| field_name_str.clone());
+    // For each serialized field, emit a `("name".into(), <FieldType>)` tuple
+    // that will be collected into the resulting `FieldType::Map`. Errors are
+    // emitted in place so that every offending field is reported at once.
+    let mut seen_names = std::collections::BTreeSet::new();
+    let mut field_type_mappings = Vec::with_capacity(fields.len());
+    for field in fields {
+        let field_ident = field.ident.as_ref().unwrap();
+        let serde_attrs = parse_field_serde_attrs(&field.attrs);
+
+        // Fields serde never serializes must not appear in the type map.
+        if serde_attrs.skip_serializing {
+            continue;
+        }
+        if serde_attrs.flatten {
+            field_type_mappings.push(
+                syn::Error::new_spanned(
+                    field_ident,
+                    "#[serde(flatten)] is not supported: flattened keys are inlined into the parent map and cannot be described by a single schema field",
+                )
+                .to_compile_error(),
+            );
+            continue;
+        }
+
+        // Schema field names follow the serialized names: serde renames and
+        // container-level rename_all rules are honoured.
+        let schema_name = effective_field_name(
+            &field_ident.unraw().to_string(),
+            &serde_attrs,
+            container.rename_all,
+        );
+        if !seen_names.insert(schema_name.clone()) {
+            field_type_mappings.push(
+                syn::Error::new_spanned(
+                    field_ident,
+                    format!("duplicate schema field name {schema_name:?} (after serde renaming)"),
+                )
+                .to_compile_error(),
+            );
+            continue;
+        }
 
         // `#[field_type = "..."]` overrides auto-inference.
-        let custom_field_type = match find_field_type_attr(&field.attrs) {
-            Ok(field_type) => field_type,
-            Err(err_msg) => {
-                return quote! {
-                    compile_error!(#err_msg)
-                };
-            }
-        };
-
-        let field_type = if let Some(field_type) = custom_field_type {
-            quote! { #field_type }
-        } else {
-            match determine_field_type(&field.ty) {
-                Ok(field_type) => field_type,
-                Err(err_msg) => {
-                    // Emit a compile error in place of the tuple.
-                    return quote! {
-                        compile_error!(#err_msg)
-                    };
-                }
-            }
-        };
-
-        quote! {
-            (#rename_attr.into(), #field_type)
+        match resolve_field_type(field) {
+            Ok(field_type) => field_type_mappings.push(quote! {
+                (#schema_name.into(), #field_type)
+            }),
+            Err(err) => field_type_mappings.push(err.to_compile_error()),
         }
-    });
+    }
 
     // Stitch the tuples into the final `field_type()` accessor.
-    let expanded = quote! {
+    quote! {
         impl #impl_generics #name #ty_generics #where_clause {
+            #[doc = "Returns the `FieldType` map describing this struct's serialized fields.\n\nGenerated by `#[derive(FieldTyped)]`."]
             pub fn field_type() -> FieldType {
                 FieldType::Map(
                     vec![
@@ -92,9 +111,7 @@ pub(crate) fn expand_field_typed_derive(input: DeriveInput) -> TokenStream2 {
                 )
             }
         }
-    };
-
-    expanded
+    }
 }
 
 #[cfg(test)]
@@ -126,7 +143,35 @@ mod tests {
         assert!(expanded.contains("\"displayName\""));
         assert!(expanded.contains("FieldType :: Option"));
         assert!(expanded.contains("FieldType :: Array"));
-        assert!(expanded.contains("T :: field_type ()"));
+        assert!(expanded.contains("< T > :: field_type ()"));
+        assert!(!expanded.contains("compile_error"));
+    }
+
+    #[test]
+    fn expand_field_typed_honours_rename_all_and_skip() {
+        let input: DeriveInput = parse_quote! {
+            #[serde(rename_all = "camelCase")]
+            struct Payload {
+                created_at: u64,
+                #[serde(skip)]
+                local_cache: String,
+                #[serde(skip_serializing)]
+                more_cache: String,
+                #[serde(rename = "explicit")]
+                renamed_field: bool,
+            }
+        };
+
+        let expanded = tokens(expand_field_typed_derive(input));
+        assert!(expanded.contains("\"createdAt\""));
+        // Skipped fields never appear in the serialized form, so they are
+        // excluded from the generated map.
+        assert!(!expanded.contains("localCache"));
+        assert!(!expanded.contains("moreCache"));
+        // An explicit rename wins over the container rule.
+        assert!(expanded.contains("\"explicit\""));
+        assert!(!expanded.contains("renamedField"));
+        assert!(!expanded.contains("compile_error"));
     }
 
     #[test]
@@ -163,5 +208,41 @@ mod tests {
             }
         };
         assert!(tokens(expand_field_typed_derive(bad_type)).contains("Unsupported type"));
+    }
+
+    #[test]
+    fn expand_field_typed_rejects_flatten_transparent_and_duplicates() {
+        let flatten: DeriveInput = parse_quote! {
+            struct WithFlatten {
+                #[serde(flatten)]
+                extra: std::collections::HashMap<String, String>,
+            }
+        };
+        assert!(
+            tokens(expand_field_typed_derive(flatten))
+                .contains("#[serde(flatten)] is not supported")
+        );
+
+        let transparent: DeriveInput = parse_quote! {
+            #[serde(transparent)]
+            struct Wrapper {
+                inner: String,
+            }
+        };
+        assert!(
+            tokens(expand_field_typed_derive(transparent))
+                .contains("does not support #[serde(transparent)]")
+        );
+
+        let duplicate: DeriveInput = parse_quote! {
+            struct Duplicate {
+                #[serde(rename = "name")]
+                a: String,
+                name: String,
+            }
+        };
+        assert!(
+            tokens(expand_field_typed_derive(duplicate)).contains("duplicate schema field name")
+        );
     }
 }
