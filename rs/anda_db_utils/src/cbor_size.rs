@@ -10,6 +10,9 @@ use std::fmt;
 
 /// 估算任意 `Serialize` 值经 CBOR 序列化后的字节大小（不实际写入字节）。
 ///
+/// 估算结果与 `ciborium::into_writer` 的实际输出字节数严格一致（包括最短浮点
+/// 编码、bignum、CBOR tag、不定长集合等规则）；测试套件会逐项校验这一契约。
+///
 /// 如果自定义 `Serialize` 实现返回错误，本函数会 panic；需要显式处理错误时请使用
 /// [`try_estimate_cbor_size`]。
 pub fn estimate_cbor_size<T: ?Sized + Serialize>(value: &T) -> usize {
@@ -17,6 +20,8 @@ pub fn estimate_cbor_size<T: ?Sized + Serialize>(value: &T) -> usize {
 }
 
 /// 尝试估算任意 `Serialize` 值经 CBOR 序列化后的字节大小（不实际写入字节）。
+///
+/// 估算结果与 `ciborium::into_writer` 的实际输出字节数严格一致。
 pub fn try_estimate_cbor_size<T: ?Sized + Serialize>(value: &T) -> Result<usize, CborSizeError> {
     let mut s = CborSizer { count: 0 };
     value.serialize(&mut s)?;
@@ -510,7 +515,8 @@ impl<'a> ser::Serializer for &'a mut CborSizer {
 
     #[inline]
     fn serialize_char(self, v: char) -> Result<Self::Ok, Self::Error> {
-        self.serialize_str(&v.to_string())
+        // char 编码为 UTF-8 文本串，长度可直接计算，无需构造字符串
+        self.add_text(v.len_utf8())
     }
 
     #[inline]
@@ -1046,10 +1052,31 @@ mod tests {
             assert_estimate_eq(&format!("f64:{v:?}"), &v);
         }
 
-        // char（ASCII、3字节、4字节）
+        // char（ASCII、2字节、3字节、4字节）
         assert_estimate_eq("char:a", &'a');
+        assert_estimate_eq("char:ß", &'ß');
         assert_estimate_eq("char:中", &'中');
         assert_estimate_eq("char:🦀", &'🦀');
+    }
+
+    #[test]
+    fn test_cbor_size_nan_payloads() {
+        // 非规范 NaN payload、sNaN、负 NaN：宽度选择必须与 ciborium 一致
+        for &bits in &[
+            0x7ff8_0000_0000_0000u64, // canonical quiet NaN
+            0xfff8_0000_0000_0000,    // negative quiet NaN
+            0x7ff8_0000_0000_0001,    // quiet NaN with low payload bits
+            0x7ff0_0000_0000_0001,    // signaling NaN
+            0x7ffc_dead_beef_0000,    // payload in high mantissa bits
+        ] {
+            let v = f64::from_bits(bits);
+            assert_estimate_eq(&format!("f64:nan:{bits:#018x}"), &v);
+        }
+
+        for &bits in &[0x7fc0_0001u32, 0xffc0_0000, 0x7fa0_0000] {
+            let v = f32::from_bits(bits);
+            assert_estimate_eq(&format!("f32:nan:{bits:#010x}"), &v);
+        }
     }
 
     #[test]

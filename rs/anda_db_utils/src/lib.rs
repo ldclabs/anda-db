@@ -84,8 +84,14 @@ where
     T: Eq + Hash + Clone,
 {
     fn drop(&mut self) {
-        self.set.clear();
-        self.set.extend(self.vec.iter().cloned());
+        // Retain-style edits can only delete elements, never duplicate them, so
+        // equal lengths imply the set still mirrors the vec exactly. Rebuild only
+        // on divergence (e.g. a panicking predicate or an inconsistent Hash/Eq
+        // implementation interrupted the incremental set maintenance).
+        if self.set.len() != self.vec.len() {
+            self.set.clear();
+            self.set.extend(self.vec.iter().cloned());
+        }
     }
 }
 
@@ -209,7 +215,15 @@ where
             set: &mut self.set,
             vec: &mut self.vec,
         };
-        guard.vec.retain(&mut f);
+        let set = &mut *guard.set;
+        guard.vec.retain(|item| {
+            if f(item) {
+                true
+            } else {
+                set.remove(item);
+                false
+            }
+        });
     }
 
     /// Removes and returns the element at `index`.
@@ -255,7 +269,15 @@ where
             set: &mut self.set,
             vec: &mut self.vec,
         };
-        guard.vec.retain(|item| other.set.contains(item));
+        let set = &mut *guard.set;
+        guard.vec.retain(|item| {
+            if other.set.contains(item) {
+                true
+            } else {
+                set.remove(item);
+                false
+            }
+        });
     }
 
     /// Returns the inner `Vec` of the `UniqueVec`.
@@ -294,7 +316,7 @@ where
 
 impl<T> Serialize for UniqueVec<T>
 where
-    T: Eq + Hash + Clone + Serialize,
+    T: Serialize,
 {
     /// Serializes the `UniqueVec` as a sequence.
     #[inline]
@@ -478,6 +500,38 @@ mod tests {
         for value in 1..=5 {
             assert_eq!(uv.contains(&value), uv.as_ref().contains(&value));
         }
+    }
+
+    #[test]
+    fn test_unique_vec_retain_without_removal_keeps_set_consistent() {
+        let mut uv = UniqueVec::from(vec![1, 2, 3]);
+
+        uv.retain(|_| true);
+
+        assert_eq!(uv.as_ref(), &[1, 2, 3]);
+        // The set must still reject duplicates and accept new items.
+        assert!(!uv.push(2));
+        assert!(uv.push(4));
+        assert_eq!(uv.as_ref(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_unique_vec_intersect_with_superset_and_disjoint() {
+        let mut uv = UniqueVec::from(vec![1, 2, 3]);
+        let superset = UniqueVec::from(vec![1, 2, 3, 4, 5]);
+
+        // Intersecting with a superset removes nothing.
+        uv.intersect_with(&superset);
+        assert_eq!(uv.as_ref(), &[1, 2, 3]);
+        assert!(!uv.push(3));
+
+        // Intersecting with a disjoint set removes everything; removed items
+        // must be insertable again afterwards.
+        let disjoint = UniqueVec::from(vec![7, 8]);
+        uv.intersect_with(&disjoint);
+        assert!(uv.is_empty());
+        assert!(!uv.contains(&1));
+        assert!(uv.push(1));
     }
 
     #[test]
