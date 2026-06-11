@@ -163,6 +163,17 @@ impl Collection {
     /// Path to the document IDs bitmap file
     const IDS_PATH: &'static str = "ids.cbor";
 
+    /// Upper bound for limit-driven speculative pre-allocations, so a huge
+    /// caller-supplied limit (e.g. via `query_ids`) cannot allocate excessive
+    /// memory up front. Result vectors still grow on demand beyond this hint.
+    const MAX_RESERVE_HINT: usize = 1024;
+
+    /// Returns a safe pre-allocation size for a caller-supplied limit.
+    #[inline]
+    fn reserve_hint(limit: usize) -> usize {
+        limit.min(Self::MAX_RESERVE_HINT)
+    }
+
     /// Generates the storage path for a document with the given ID
     fn doc_path(id: DocumentId) -> String {
         format!("data/{id}.cbor")
@@ -222,7 +233,15 @@ impl Collection {
             ids.run_optimize();
             ids.serialize::<Portable>()
         };
-        let ids_version = storage.create(Self::IDS_PATH, &ids_data).await?;
+        let ids_version = match storage.create(Self::IDS_PATH, &ids_data).await {
+            Ok(ver) => ver,
+            Err(err) => {
+                // Remove the metadata object written above, otherwise the
+                // half-created collection blocks re-creation under this name.
+                let _ = storage.delete(Self::METADATA_PATH).await;
+                return Err(err);
+            }
+        };
 
         // created successfully, and store storage metadata
         storage.store_metadata(0, unix_ms()).await?;
@@ -679,22 +698,10 @@ impl Collection {
         // 禁止进一步写入
         self.set_read_only(true);
 
-        // 列举并发删除集合存储下的全部对象
         let start = Instant::now();
-        let ids = self.ids();
-        let total = ids.len();
-        let _ = futures::stream::iter(ids)
-            .map(|id| {
-                let storage = self.storage.clone();
-                async move {
-                    let _ = storage.delete(&Self::doc_path(id)).await;
-                }
-            })
-            .buffer_unordered(32)
-            .collect::<Vec<_>>()
-            .await;
+        let total = self.len();
 
-        // delete metadata, ids, indexes and others
+        // 并发删除集合存储下的全部对象（文档、元数据、ids 和索引）
         self.storage.drop_data().await?;
         let elapsed = start.elapsed();
         log::warn!(
@@ -783,6 +790,10 @@ impl Collection {
             }
         };
         *self.metadata_version.write() = ver;
+        // Note: deliberately do NOT advance `last_saved_version` here. The next
+        // periodic flush must still observe version > last_saved_version so it
+        // runs the full path (`store_metadata` + `store_ids`), since this
+        // method persists only the metadata object and not the ids bitmap.
         Ok(())
     }
 
@@ -1331,7 +1342,32 @@ impl Collection {
             removed
         };
 
-        Ok(removed_index || removed_metadata)
+        let removed = removed_index || removed_metadata;
+        if removed {
+            self.cleanup_removed_index(&BTree::dir_path(&name)).await?;
+        }
+
+        Ok(removed)
+    }
+
+    /// Persists the metadata change of a removed index, then best-effort deletes
+    /// its storage files.
+    ///
+    /// The order matters for crash safety: metadata must stop referencing the
+    /// index before its files disappear, otherwise reopening the collection
+    /// would fail to bootstrap the index. Leftover files from a failed deletion
+    /// are harmless and will be overwritten if the index is re-created.
+    async fn cleanup_removed_index(&self, dir_path: &str) -> Result<(), DBError> {
+        self.flush_metadata().await?;
+        if let Err(err) = self.storage.drop_prefix(dir_path).await {
+            log::warn!(
+                action = "Collection::cleanup_removed_index",
+                collection = self.name,
+                index_dir = dir_path;
+                "Failed to drop index data: {err:?}",
+            );
+        }
+        Ok(())
     }
 
     pub async fn remove_bm25_index(&mut self, fields: &[&str]) -> Result<bool, DBError> {
@@ -1359,7 +1395,12 @@ impl Collection {
             removed
         };
 
-        Ok(removed_index || removed_metadata)
+        let removed = removed_index || removed_metadata;
+        if removed {
+            self.cleanup_removed_index(&BM25::dir_path(&name)).await?;
+        }
+
+        Ok(removed)
     }
 
     pub async fn remove_hnsw_index(&mut self, field: &str) -> Result<bool, DBError> {
@@ -1388,7 +1429,12 @@ impl Collection {
             removed
         };
 
-        Ok(removed_index || removed_metadata)
+        let removed = removed_index || removed_metadata;
+        if removed {
+            self.cleanup_removed_index(&Hnsw::dir_path(field)).await?;
+        }
+
+        Ok(removed)
     }
 
     pub fn get_btree_index(&self, fields: &[&str]) -> Result<&BTree, DBError> {
@@ -2143,7 +2189,7 @@ impl Collection {
                 } else if let Some(index) =
                     self.btree_indexes.iter().find(|i| i.name() == index_name)
                 {
-                    result.reserve_exact(limit);
+                    result.reserve_exact(Self::reserve_hint(limit));
                     let _: Vec<()> = index.range_query_with(filter, |_, ids| {
                         for id in ids {
                             if candidates.is_none_or(|s| s.contains(id)) {
@@ -2164,7 +2210,7 @@ impl Collection {
                 }
             }
             Filter::Or(queries) => {
-                let mut rt: UniqueVec<u64> = UniqueVec::with_capacity(limit);
+                let mut rt: UniqueVec<u64> = UniqueVec::with_capacity(Self::reserve_hint(limit));
                 for query in queries {
                     let ids = self.filter_by_field_with(*query, candidates, limit)?;
                     rt.extend(ids);
@@ -2207,7 +2253,7 @@ impl Collection {
                 Ok(result)
             }
             Filter::Not(query) => {
-                result.reserve_exact(limit);
+                result.reserve_exact(Self::reserve_hint(limit));
                 let exclude: FxHashSet<u64> = self
                     .filter_by_field_with(*query, None, 0)?
                     .into_iter()
@@ -2250,7 +2296,7 @@ impl Collection {
                 }
             }
             RangeQuery::Gt(start_key) => {
-                result.reserve_exact(limit);
+                result.reserve_exact(Self::reserve_hint(limit));
                 for id in self.doc_ids_index.read().range((
                     std::ops::Bound::Excluded(start_key),
                     std::ops::Bound::Unbounded,
@@ -2264,7 +2310,7 @@ impl Collection {
                 }
             }
             RangeQuery::Ge(start_key) => {
-                result.reserve_exact(limit);
+                result.reserve_exact(Self::reserve_hint(limit));
                 for id in self
                     .doc_ids_index
                     .read()
@@ -2280,7 +2326,7 @@ impl Collection {
             }
             RangeQuery::Lt(end_key) => {
                 // 倒序遍历以便在有上限时尽快终止，最终结果按正序返回
-                let mut tmp = Vec::with_capacity(if limit > 0 { limit } else { 0 });
+                let mut tmp = Vec::with_capacity(Self::reserve_hint(limit));
                 for id in self
                     .doc_ids_index
                     .read()
@@ -2299,7 +2345,7 @@ impl Collection {
             }
             RangeQuery::Le(end_key) => {
                 // 倒序遍历以便在有上限时尽快终止，最终结果按正序返回
-                let mut tmp = Vec::with_capacity(if limit > 0 { limit } else { 0 });
+                let mut tmp = Vec::with_capacity(Self::reserve_hint(limit));
                 for id in self
                     .doc_ids_index
                     .read()
@@ -2317,9 +2363,9 @@ impl Collection {
                 result.extend(tmp);
             }
             RangeQuery::Between(start_key, end_key) => {
-                result.reserve_exact(
+                result.reserve_exact(Self::reserve_hint(
                     limit.min(end_key.saturating_sub(start_key).saturating_add(1) as usize),
-                );
+                ));
                 for id in self.doc_ids_index.read().range(start_key..=end_key) {
                     if candidates.is_none_or(|s| s.contains(id)) {
                         result.push(*id);
@@ -2378,7 +2424,7 @@ impl Collection {
                 // }
             }
             RangeQuery::Not(query) => {
-                result.reserve_exact(limit);
+                result.reserve_exact(Self::reserve_hint(limit));
                 // 先收集要排除的 key，再遍历全集差集
                 let exclude: FxHashSet<u64> =
                     self.filter_by_id(*query, None, 0).into_iter().collect();
@@ -4304,6 +4350,161 @@ mod tests {
         let old = collection.set_extension_with(key.clone(), |_| None);
         assert!(old.is_none());
         assert_eq!(collection.get_extension(&key), Some(FieldValue::U64(200)));
+
+        db.close().await?;
+        Ok(())
+    }
+
+    async fn count_objects(object_store: &Arc<dyn ObjectStore>, prefix: &str) -> usize {
+        let mut stream = object_store.list(Some(&Path::from(prefix)));
+        let mut count = 0;
+        while let Some(item) = stream.next().await {
+            item.expect("list should succeed");
+            count += 1;
+        }
+        count
+    }
+
+    #[tokio::test]
+    async fn test_removed_index_can_be_recreated() -> Result<(), DBError> {
+        let db = setup_test_db().await?;
+        let object_store = db.object_store();
+        let db_config = || DBConfig {
+            name: "test_db".to_string(),
+            description: "Test database".to_string(),
+            storage: StorageConfig {
+                compress_level: 0,
+                ..Default::default()
+            },
+            lock: None,
+        };
+
+        {
+            let collection = create_test_collection(&db, async |collection| {
+                collection.create_btree_index_nx(&["name"]).await?;
+                collection.create_bm25_index_nx(&["name", "tags"]).await?;
+                collection
+                    .create_hnsw_index_nx(
+                        "vector",
+                        HnswConfig {
+                            dimension: 10,
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                Ok(())
+            })
+            .await?;
+
+            for i in 1..=3u64 {
+                let doc = create_test_doc(0, &format!("user_{i}"), 20 + i as u32, vec!["x"]);
+                collection.add_from(&doc).await?;
+            }
+            db.close().await?;
+        }
+
+        // Remove the indexes; their storage objects must be deleted.
+        let db = AndaDB::connect(object_store.clone(), db_config()).await?;
+        let _ = db
+            .open_collection("test_collection".to_string(), async |collection| {
+                assert!(collection.remove_btree_index(&["name"]).await?);
+                assert!(collection.remove_bm25_index(&["name", "tags"]).await?);
+                assert!(collection.remove_hnsw_index("vector").await?);
+                Ok(())
+            })
+            .await?;
+        assert_eq!(
+            count_objects(&object_store, "test_db/test_collection/btree_indexes").await,
+            0
+        );
+        assert_eq!(
+            count_objects(&object_store, "test_db/test_collection/bm25_indexes").await,
+            0
+        );
+        assert_eq!(
+            count_objects(&object_store, "test_db/test_collection/hnsw_indexes").await,
+            0
+        );
+        db.close().await?;
+
+        // Simulate leftover files from a crashed index creation: a stale meta
+        // object must not block re-creation.
+        object_store
+            .put_opts(
+                &Path::from("test_db/test_collection/btree_indexes/name/meta.cbor"),
+                PutPayload::from(Bytes::from_static(b"stale")),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        // Re-creating the same indexes used to fail with AlreadyExists because
+        // the old index files were left behind.
+        let db = AndaDB::connect(object_store.clone(), db_config()).await?;
+        let collection = db
+            .open_collection("test_collection".to_string(), async |collection| {
+                collection.create_btree_index(&["name"]).await?;
+                collection.create_bm25_index(&["name", "tags"]).await?;
+                collection
+                    .create_hnsw_index(
+                        "vector",
+                        HnswConfig {
+                            dimension: 10,
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                Ok(())
+            })
+            .await?;
+
+        // Backfill repopulated the fresh indexes from the existing documents.
+        let ids = collection
+            .query_ids(
+                Filter::Field((
+                    "name".to_string(),
+                    RangeQuery::Eq(Fv::Text("user_2".to_string())),
+                )),
+                None,
+            )
+            .await?;
+        assert_eq!(ids.len(), 1);
+
+        db.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_query_ids_with_huge_limit_does_not_overallocate() -> Result<(), DBError> {
+        let db = setup_test_db().await?;
+        let collection = create_test_collection(&db, async |collection| {
+            collection.create_btree_index_nx(&["age"]).await?;
+            Ok(())
+        })
+        .await?;
+
+        for i in 1..=5u64 {
+            let doc = create_test_doc(0, &format!("user_{i}"), 20 + i as u32, vec!["x"]);
+            collection.add_from(&doc).await?;
+        }
+
+        // A huge limit must not pre-allocate a huge buffer up front (this
+        // previously aborted with a capacity overflow via reserve_exact).
+        let ids = collection
+            .query_ids(
+                Filter::Field(("age".to_string(), RangeQuery::Ge(Fv::U64(21)))),
+                Some(usize::MAX),
+            )
+            .await?;
+        assert_eq!(ids.len(), 5);
+
+        let ids = collection
+            .query_ids(
+                Filter::Field((Schema::ID_KEY.to_string(), RangeQuery::Ge(Fv::U64(1)))),
+                Some(usize::MAX),
+            )
+            .await?;
+        assert_eq!(ids.len(), 5);
 
         db.close().await?;
         Ok(())

@@ -44,6 +44,10 @@ impl Hash for &BM25 {
 }
 
 impl BM25 {
+    pub(crate) fn dir_path(name: &str) -> String {
+        format!("bm25_indexes/{name}/")
+    }
+
     fn metadata_path(name: &str) -> String {
         format!("bm25_indexes/{name}/meta.cbor")
     }
@@ -74,8 +78,11 @@ impl BM25 {
         index
             .flush(&mut data, now_ms, async |_, _| Ok(true))
             .await?;
+        // The collection metadata is the source of truth for which indexes
+        // exist, so overwrite any leftover files from a crashed creation or a
+        // previously removed index instead of failing with AlreadyExists.
         let ver = storage
-            .put_bytes(&BM25::metadata_path(&name), data.into(), PutMode::Create)
+            .put_bytes(&BM25::metadata_path(&name), data.into(), PutMode::Overwrite)
             .await?;
         Ok(Self {
             name,
@@ -87,7 +94,8 @@ impl BM25 {
     }
 
     pub(crate) async fn drop_data(&self) {
-        if let Err(err) = self.storage.delete(&BM25::metadata_path(&self.name)).await {
+        // Delete the metadata and all bucket objects under the index directory.
+        if let Err(err) = self.storage.drop_prefix(&BM25::dir_path(&self.name)).await {
             log::warn!(
                 action = "BM25::drop_data",
                 index = self.name;

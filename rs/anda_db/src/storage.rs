@@ -790,16 +790,32 @@ impl Storage {
 
     /// Drops all objects under the storage's base path, effectively deleting the entire storage.
     pub async fn drop_data(&self) -> Result<(), DBError> {
-        // 并发删除 base_path 下的所有对象，失败立即返回
+        self.inner_drop_prefix(self.inner.base_path.clone()).await
+    }
+
+    /// Drops all objects under the given path prefix (relative to the base path).
+    ///
+    /// Used to remove derived data such as a whole index directory. Cached
+    /// entries for the deleted objects are invalidated as well.
+    pub async fn drop_prefix(&self, prefix: &str) -> Result<(), DBError> {
+        self.inner_drop_prefix(self.full_path(prefix)).await
+    }
+
+    async fn inner_drop_prefix(&self, prefix: Path) -> Result<(), DBError> {
+        // 并发删除 prefix 下的所有对象，失败立即返回
         self.inner
             .object_store
-            .list(Some(&self.inner.base_path))
+            .list(Some(&prefix))
             .map_err(DBError::from)
             .try_for_each_concurrent(16, move |meta| {
                 let object_store = self.inner.object_store.clone();
+                let cache = self.inner.cache.clone();
                 async move {
                     // 删除对象
                     object_store.delete(&meta.location).await?;
+                    if let Some(cache) = &cache {
+                        cache.remove(&meta.location).await;
+                    }
                     Ok(())
                 }
             })
@@ -1662,6 +1678,39 @@ mod tests {
             .await
             .unwrap();
         assert!(after.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_storage_drop_prefix() {
+        let storage = create_test_storage().await;
+
+        #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+        struct T {
+            k: u32,
+        }
+
+        storage.create("keep/a", &T { k: 1 }).await.unwrap();
+        storage.create("del/b", &T { k: 2 }).await.unwrap();
+        storage.create("del/c", &T { k: 3 }).await.unwrap();
+
+        // Populate the cache so we can verify invalidation below.
+        let _ = storage.get::<T>("del/b").await.unwrap();
+
+        storage.drop_prefix("del/").await.unwrap();
+
+        // Deleted objects are gone and must not be served from the cache.
+        assert!(matches!(
+            storage.get::<T>("del/b").await,
+            Err(DBError::NotFound { .. })
+        ));
+        let metas = storage
+            .list_meta(None, None)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(metas.len(), 1);
+        let (kept, _) = storage.get::<T>("keep/a").await.unwrap();
+        assert_eq!(kept, T { k: 1 });
     }
 
     #[tokio::test]

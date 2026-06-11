@@ -70,6 +70,10 @@ where
 }
 
 impl BTree {
+    pub(crate) fn dir_path(name: &str) -> String {
+        format!("btree_indexes/{name}/")
+    }
+
     fn metadata_path(name: &str) -> String {
         format!("btree_indexes/{name}/meta.cbor")
     }
@@ -728,8 +732,11 @@ where
         index
             .flush(&mut data, now_ms, async |_, _| Ok(true))
             .await?;
+        // The collection metadata is the source of truth for which indexes
+        // exist, so overwrite any leftover files from a crashed creation or a
+        // previously removed index instead of failing with AlreadyExists.
         let ver = storage
-            .put_bytes(&BTree::metadata_path(&name), data.into(), PutMode::Create)
+            .put_bytes(&BTree::metadata_path(&name), data.into(), PutMode::Overwrite)
             .await?;
         Ok(InnerBTree {
             name,
@@ -741,7 +748,8 @@ where
     }
 
     async fn drop_data(&self) -> Result<(), DBError> {
-        self.storage.delete(&BTree::metadata_path(&self.name)).await
+        // Delete the metadata and all bucket objects under the index directory.
+        self.storage.drop_prefix(&BTree::dir_path(&self.name)).await
     }
 
     async fn bootstrap(name: String, storage: Storage) -> Result<Self, DBError> {

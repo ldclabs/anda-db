@@ -182,76 +182,9 @@ impl AndaDB {
         object_store: Arc<dyn ObjectStore>,
         config: DBConfig,
     ) -> Result<Self, DBError> {
-        validate_field_name(config.name.as_str())?;
-
-        let storage = Storage::connect(
-            config.name.clone(),
-            object_store.clone(),
-            config.storage.clone(),
-        )
-        .await?;
-
-        match storage.fetch::<DBMetadata>(Self::METADATA_PATH).await {
-            Ok((metadata, _)) => {
-                let set_lock = match (&metadata.config.lock, config.lock) {
-                    (None, Some(lock)) => Some(lock),
-                    (Some(existing_lock), lock) => {
-                        if lock.as_ref() != Some(existing_lock) {
-                            return Err(DBError::Storage {
-                                name: config.name.clone(),
-                                source: "Database lock mismatch".into(),
-                            });
-                        }
-                        None
-                    }
-                    _ => None,
-                };
-
-                let this = Self {
-                    inner: Arc::new(InnerDB {
-                        name: metadata.config.name.clone(),
-                        object_store,
-                        storage,
-                        metadata: RwLock::new(metadata),
-                        collections: RwLock::new(BTreeMap::new()),
-                        read_only: AtomicBool::new(false),
-                        dropping_collections: RwLock::new(BTreeSet::new()),
-                    }),
-                };
-
-                if let Some(lock) = set_lock {
-                    this.set_lock(lock).await?;
-                }
-
-                Ok(this)
-            }
-            Err(DBError::NotFound { .. }) => {
-                let metadata = DBMetadata {
-                    config,
-                    collections: BTreeSet::new(),
-                    extensions: BTreeMap::new(),
-                };
-
-                match storage.create(Self::METADATA_PATH, &metadata).await {
-                    Ok(_) => {
-                        // DB created successfully, and store storage metadata
-                        storage.store_metadata(0, unix_ms()).await?;
-                    }
-                    Err(err) => return Err(err),
-                }
-
-                Ok(Self {
-                    inner: Arc::new(InnerDB {
-                        name: metadata.config.name.clone(),
-                        object_store,
-                        storage,
-                        metadata: RwLock::new(metadata),
-                        collections: RwLock::new(BTreeMap::new()),
-                        read_only: AtomicBool::new(false),
-                        dropping_collections: RwLock::new(BTreeSet::new()),
-                    }),
-                })
-            }
+        match Self::open(object_store.clone(), config.clone()).await {
+            Ok(db) => Ok(db),
+            Err(DBError::NotFound { .. }) => Self::create(object_store, config).await,
             Err(err) => Err(err),
         }
     }
@@ -544,7 +477,12 @@ impl AndaDB {
         let start = Instant::now();
         // self.metadata.collections will check it exists again in Collection::create
         let mut collection = Collection::create(self.clone(), schema, config).await?;
-        f(&mut collection).await?;
+        if let Err(err) = f(&mut collection).await {
+            // The collection is not registered in the database metadata yet;
+            // delete the files written so far so the name can be created again.
+            let _ = collection.drop_data().await;
+            return Err(err);
+        }
         let collection = Arc::new(collection);
         {
             let mut collections = self.inner.collections.write();
@@ -702,7 +640,14 @@ impl AndaDB {
         let collection = Collection::open(self.clone(), name, schema, f).await?;
         let collection = Arc::new(collection);
         {
+            // A concurrent open of the same collection may have won the race
+            // while we were loading. Keep the registered instance as the single
+            // source of truth: two live instances would maintain divergent
+            // in-memory state (doc id bitmap, indexes) over the same storage.
             let mut collections = self.inner.collections.write();
+            if let Some(existing) = collections.get(collection.name()) {
+                return Ok(existing.clone());
+            }
             collections.insert(collection.name().to_string(), collection.clone());
         }
         let now = unix_ms();
@@ -718,37 +663,47 @@ impl AndaDB {
             });
         }
 
-        // 更新元数据并持久化
-        {
-            if !self.inner.metadata.write().collections.remove(name) {
-                return Ok(());
-            }
+        // The name is used to build the storage prefix below.
+        validate_field_name(name)?;
 
+        // 更新元数据并持久化。即使集合未注册（例如此前创建中途失败的残留），
+        // 也继续执行下面的清理流程，使该名字可以重新创建。
+        let registered = {
+            let registered = self.inner.metadata.write().collections.remove(name);
             self.inner
                 .dropping_collections
                 .write()
                 .insert(name.to_string());
+            registered
+        };
+
+        if registered && let Err(err) = self.flush_metadata(unix_ms()).await {
+            // Roll back the in-memory state so it matches the persisted
+            // metadata; otherwise the name stays in `dropping_collections`
+            // forever and can no longer be opened or created.
+            self.inner
+                .metadata
+                .write()
+                .collections
+                .insert(name.to_string());
+            self.inner.dropping_collections.write().remove(name);
+            return Err(err);
         }
 
-        self.flush_metadata(unix_ms()).await?;
-
-        // Take any in-memory handle; if not loaded, lazily open it so we can
-        // safely drop on-disk data instead of orphaning storage objects.
+        // Take any in-memory handle to stop further writes, then delete every
+        // object under the collection's storage prefix. Deleting by prefix does
+        // not require opening the collection (which would load all indexes and
+        // run repair scans) and also cleans up partially created leftovers.
         let col = { self.inner.collections.write().remove(name) };
         let drop_result = match col {
             Some(col) => col.drop_data().await,
             None => {
-                match crate::collection::Collection::open(
-                    self.clone(),
-                    name.to_string(),
-                    None,
-                    async |_| Ok(()),
-                )
-                .await
+                let base_path = object_store::path::Path::from(self.name()).join(name);
+                let storage_config = { self.inner.metadata.read().config.storage.clone() };
+                match Storage::connect(base_path.to_string(), self.object_store(), storage_config)
+                    .await
                 {
-                    Ok(col) => col.drop_data().await,
-                    // If metadata files are already gone, treat as success.
-                    Err(DBError::NotFound { .. }) => Ok(()),
+                    Ok(storage) => storage.drop_data().await,
                     Err(err) => Err(err),
                 }
             }
@@ -1305,6 +1260,81 @@ mod tests {
             .await
             .unwrap();
         assert!(db.metadata().collections.contains("test_collection"));
+    }
+
+    #[tokio::test]
+    async fn test_create_collection_cleans_up_after_callback_failure() {
+        let object_store = Arc::new(InMemory::new());
+        let db = AndaDB::create(object_store.clone(), DBConfig::default())
+            .await
+            .unwrap();
+
+        let mut schema = Schema::builder();
+        schema
+            .add_field(Fe::new("name".to_string(), Ft::Text).unwrap())
+            .unwrap();
+        let schema = schema.build().unwrap();
+
+        let config = CollectionConfig {
+            name: "broken".to_string(),
+            description: "Broken Collection".to_string(),
+        };
+
+        let err = db
+            .create_collection(schema.clone(), config.clone(), async |_| {
+                Err(DBError::Generic {
+                    name: "broken".to_string(),
+                    source: "callback failed".into(),
+                })
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DBError::Generic { .. }));
+        assert!(!db.metadata().collections.contains("broken"));
+
+        // The half-created files were cleaned up, so the same name can be
+        // created again (previously wedged with AlreadyExists).
+        let collection = db
+            .create_collection(schema, config, async |_| Ok(()))
+            .await
+            .unwrap();
+        assert_eq!(collection.name(), "broken");
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_delete_collection_cleans_unregistered_leftovers() {
+        use bytes::Bytes;
+        use object_store::{PutOptions, PutPayload, path::Path};
+
+        let object_store = Arc::new(InMemory::new());
+        let db = AndaDB::create(object_store.clone(), DBConfig::default())
+            .await
+            .unwrap();
+
+        // Simulate files left behind by a crashed collection creation that was
+        // never registered in the database metadata.
+        object_store
+            .put_opts(
+                &Path::from("anda_db/ghostcol/meta.cbor"),
+                PutPayload::from(Bytes::from_static(b"junk")),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        assert!(!db.metadata().collections.contains("ghostcol"));
+        db.delete_collection("ghostcol").await.unwrap();
+
+        let mut listed = object_store.list(Some(&Path::from("anda_db/ghostcol")));
+        assert!(listed.next().await.is_none());
+
+        // Deleting a collection that never existed is a no-op.
+        db.delete_collection("ghostcol").await.unwrap();
+
+        // Invalid names are rejected instead of being used as storage paths.
+        assert!(db.delete_collection("../escape").await.is_err());
+        db.close().await.unwrap();
     }
 
     #[tokio::test]

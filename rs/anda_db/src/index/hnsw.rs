@@ -39,6 +39,10 @@ impl Hash for &Hnsw {
 }
 
 impl Hnsw {
+    pub(crate) fn dir_path(name: &str) -> String {
+        format!("hnsw_indexes/{name}/")
+    }
+
     fn metadata_path(name: &str) -> String {
         format!("hnsw_indexes/{name}/meta.cbor")
     }
@@ -64,15 +68,18 @@ impl Hnsw {
         index
             .flush(&mut metadata, &mut ids, now_ms, async |_, _| Ok(true))
             .await?;
+        // The collection metadata is the source of truth for which indexes
+        // exist, so overwrite any leftover files from a crashed creation or a
+        // previously removed index instead of failing with AlreadyExists.
         let metadata_version = storage
             .put_bytes(
                 &Hnsw::metadata_path(&name),
                 metadata.into(),
-                PutMode::Create,
+                PutMode::Overwrite,
             )
             .await?;
         let ids_version = storage
-            .put_bytes(&Hnsw::ids_path(&name), ids.into(), PutMode::Create)
+            .put_bytes(&Hnsw::ids_path(&name), ids.into(), PutMode::Overwrite)
             .await?;
         Ok(Self {
             name,
@@ -84,18 +91,12 @@ impl Hnsw {
     }
 
     pub(crate) async fn drop_data(&self) {
-        if let Err(err) = self.storage.delete(&Hnsw::metadata_path(&self.name)).await {
+        // Delete the metadata, ids and all node objects under the index directory.
+        if let Err(err) = self.storage.drop_prefix(&Hnsw::dir_path(&self.name)).await {
             log::warn!(
                 action = "Hnsw::drop_data",
                 index = self.name;
-                "Failed to drop HNSW metadata: {err:?}",
-            );
-        }
-        if let Err(err) = self.storage.delete(&Hnsw::ids_path(&self.name)).await {
-            log::warn!(
-                action = "Hnsw::drop_data",
-                index = self.name;
-                "Failed to drop HNSW ids: {err:?}",
+                "Failed to drop HNSW index data: {err:?}",
             );
         }
     }
