@@ -121,6 +121,57 @@ def test_andadbconfig_type_validation():
         AndaDbConfig(StoreLocationType.InMem, '', 'test_db', ["not", "a", "string"])
 
 @pytest.mark.asyncio
+async def test_execute_kip_non_json_parameters_raise_value_error():
+    """
+    Parameters that have no JSON equivalent must raise ValueError —
+    never panic/abort the interpreter.
+    """
+    db_config = AndaDbConfig(StoreLocationType.InMem, "", "test_db_bad_params")
+    db = await PyAndaDB.create(db_config)
+    command = "FIND(?x) WHERE { ?x {type: :t} }"
+    # unsupported value type
+    with pytest.raises(ValueError):
+        await db.execute_kip(command, parameters={"t": object()})
+    # non-finite float
+    with pytest.raises(ValueError):
+        await db.execute_kip(command, parameters={"t": float("nan")})
+    # non-string key
+    with pytest.raises(ValueError):
+        await db.execute_kip(command, parameters={1: "x"})
+
+@pytest.mark.asyncio
+async def test_execute_kip_nested_parameters():
+    """Nested JSON-compatible parameters (lists, tuples, dicts) are accepted."""
+    db_config = AndaDbConfig(StoreLocationType.InMem, "", "test_db_nested_params")
+    db = await PyAndaDB.create(db_config)
+    upsert = await db.execute_kip(
+        'UPSERT { CONCEPT ?c { {type: "$ConceptType", name: :tname} '
+        "SET ATTRIBUTES { tags: :tags, meta: :meta, pair: :pair } } }",
+        parameters={
+            "tname": "Symptom",
+            "tags": ["a", "b"],
+            "meta": {"k": [1, 2.5, True, None]},
+            "pair": (1, 2),  # tuple becomes a JSON array
+        },
+    )
+    assert "result" in upsert["response"], upsert["response"]
+    found = await db.execute_kip(
+        "FIND(?x.name) WHERE { ?x {type: :t, name: :n} }",
+        parameters={"t": "$ConceptType", "n": "Symptom"},
+    )
+    assert found["response"]["result"] == ["Symptom"]
+
+@pytest.mark.asyncio
+async def test_close_is_idempotent():
+    db_config = AndaDbConfig(StoreLocationType.InMem, "", "test_db_close")
+    db = await PyAndaDB.create(db_config)
+    result = await db.execute_kip("DESCRIBE PRIMER")
+    assert "response" in result
+    assert await db.close() is None
+    # second close is a no-op
+    assert await db.close() is None
+
+@pytest.mark.asyncio
 async def test_pyandadb_thread_safety_and_async():
     """
     Test that PyAndaDB can be used safely from multiple async tasks (and threads, if supported).

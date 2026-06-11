@@ -1,6 +1,6 @@
 [project]
 name = "anda-db"
-version = "0.1.0"
+dynamic = ["version"]
 description = "AndaDB: A Rust-powered knowledge and memory database for AI agents, with Python FFI."
 authors = [
     { name = "LDCLabs", email = "info@ldclabs.com" }
@@ -17,7 +17,7 @@ classifiers = [
 ]
 
 [tool.maturin]
-manifest-path = "Cargo.toml"
+manifest-path = "anda_cognitive_nexus_py/Cargo.toml"
 features = ["pyo3/extension-module"]
 
 [build-system]

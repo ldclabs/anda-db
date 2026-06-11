@@ -3,17 +3,16 @@
 use anda_cognitive_nexus::CognitiveNexus;
 use anda_db::database::{AndaDB, DBConfig};
 use anda_kip::executor::Executor;
-use anda_kip::Json;
-use anda_kip::{CommandType, KipError, Request, Response};
+use anda_kip::{CommandType, Json, KipError, Map, Number, Request, Response};
 use anda_object_store::MetaStoreBuilder;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyBool, PyDict, PyFloat, PyList, PyLong, PyString, PyTuple};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
 use serde_pyobject::to_pyobject;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -32,6 +31,7 @@ fn sum_as_string(a: usize, b: usize) -> PyResult<String> {
 #[pyclass]
 pub struct PyAndaDB {
     nexus: Arc<CognitiveNexus>,
+    closed: AtomicBool,
 }
 
 /// Python-facing wrapper for the Rust CommandType enum.
@@ -59,10 +59,10 @@ impl From<CommandType> for PyCommandType {
 
 impl From<&str> for PyCommandType {
     fn from(s: &str) -> Self {
-        match s.trim() {
-            "Kml" => PyCommandType::Kml,
-            "Kql" => PyCommandType::Kql,
-            "Meta" => PyCommandType::Meta,
+        match s.trim().to_ascii_lowercase().as_str() {
+            "kml" => PyCommandType::Kml,
+            "kql" => PyCommandType::Kql,
+            "meta" => PyCommandType::Meta,
             _ => PyCommandType::Unknown,
         }
     }
@@ -70,6 +70,9 @@ impl From<&str> for PyCommandType {
 
 #[pymethods]
 impl PyCommandType {
+    /// Parse a command type name (case-insensitive). Unrecognized names map to Unknown.
+    // `from_str` is the Python-facing method name; it is not the std trait.
+    #[allow(clippy::should_implement_trait)]
     #[staticmethod]
     pub fn from_str(s: &str) -> Self {
         PyCommandType::from(s)
@@ -91,10 +94,13 @@ impl PyAndaDB {
     /// Raises:
     ///     RuntimeError: If config deserialization or DB creation fails.
     pub fn create<'py>(py: Python<'py>, db_config: AndaDbConfig) -> PyResult<&'py PyAny> {
-        log::info!("AndaDB.create called with db_config.");
+        log::debug!("AndaDB.create called: db_config={:?}", db_config);
         let fut = async move {
             match create_kip_db(db_config).await {
-                Ok(nexus) => Ok(PyAndaDB { nexus }),
+                Ok(nexus) => Ok(PyAndaDB {
+                    nexus,
+                    closed: AtomicBool::new(false),
+                }),
                 Err(e) => Err(PyRuntimeError::new_err(format!("DB creation error: {}", e))),
             }
         };
@@ -119,6 +125,7 @@ impl PyAndaDB {
     ///           (converted from the underlying `serde_json::Value` using serde-pyobject).
     ///
     /// Raises:
+    ///     ValueError: If `parameters` is not a JSON-compatible dict.
     ///     RuntimeError: If KIP execution fails.
     pub fn execute_kip<'py>(
         &self,
@@ -127,47 +134,25 @@ impl PyAndaDB {
         dry_run: bool,
         parameters: Option<&PyDict>,
     ) -> PyResult<&'py PyAny> {
-        log::info!(
-            "AndaDB.execute_kip called: command={}, dry_run={}",
-            command,
-            dry_run
-        );
-
-        // Convert Python dict -> serde_json::Map<String, Value>
-        let params_map = parameters
-            .map(|dict| {
-                let json_mod = py.import("json").unwrap();
-                let json_str: String = json_mod
-                    .call_method1("dumps", (dict,))
-                    .unwrap()
-                    .extract()
-                    .unwrap();
-                serde_json::from_str::<Map<String, Value>>(&json_str).unwrap()
-            })
-            .unwrap_or_default();
-
         log::debug!(
-            "params_map: {}",
-            serde_json::to_string(&params_map).unwrap()
+            "AndaDB.execute_kip called: dry_run={}, command={}",
+            dry_run,
+            command
         );
+
+        // Convert Python dict -> Map<String, Json> directly, without a JSON string
+        // round-trip. Conversion failures surface as Python exceptions; they must
+        // never panic, as release builds abort on panic.
+        let params_map: Map<String, Json> = match parameters {
+            Some(dict) => pydict_to_json_map(dict, 0)?,
+            None => Map::new(),
+        };
 
         let nexus = self.nexus.clone();
 
         // Async future that returns a PyObject (a Python dict)
         let fut = async move {
-            match execute_kip(
-                nexus.as_ref(),
-                command,
-                Some(
-                    params_map
-                        .into_iter()
-                        .map(|(k, v)| (k, Json::from(v)))
-                        .collect(),
-                ),
-                dry_run,
-            )
-            .await
-            {
+            match execute_kip(nexus.as_ref(), command, Some(params_map), dry_run).await {
                 Ok((cmd_type, response)) => {
                     // Convert both the cmd_type and the response into Python objects while holding the GIL
                     let py_obj: PyObject = Python::with_gil(|py| -> PyResult<PyObject> {
@@ -197,6 +182,33 @@ impl PyAndaDB {
         };
 
         // Convert the Rust Future -> Python awaitable
+        pyo3_asyncio::tokio::future_into_py(py, fut)
+    }
+
+    #[pyo3(text_signature = "() -> Awaitable[None]")]
+    /// Close the database, flushing all pending data to storage.
+    ///
+    /// Call this before the process exits when using a file-backed store,
+    /// otherwise buffered data may be lost. Calling it more than once is a no-op.
+    /// After closing, `execute_kip` KML commands will fail with a read-only error.
+    ///
+    /// Returns:
+    ///     Awaitable[None]
+    ///
+    /// Raises:
+    ///     RuntimeError: If closing the database fails.
+    pub fn close<'py>(&self, py: Python<'py>) -> PyResult<&'py PyAny> {
+        let already_closed = self.closed.swap(true, Ordering::SeqCst);
+        let nexus = self.nexus.clone();
+        let fut = async move {
+            if already_closed {
+                return Ok(());
+            }
+            nexus
+                .close()
+                .await
+                .map_err(|e| PyRuntimeError::new_err(format!("DB close error: {}", e)))
+        };
         pyo3_asyncio::tokio::future_into_py(py, fut)
     }
 }
@@ -278,7 +290,9 @@ impl AndaDbConfig {
 /// A Python module implemented in Rust.
 #[pymodule]
 fn anda_cognitive_nexus_py(_py: Python, m: &PyModule) -> PyResult<()> {
-    structured_logger::init();
+    // The host process (or another Rust-backed extension) may have already
+    // installed a global logger; that must not make `import` fail or panic.
+    let _ = structured_logger::Builder::new().try_init();
     m.add_class::<PyAndaDB>()?;
     m.add_class::<PyCommandType>()?;
     m.add_class::<StoreLocationType>()?;
@@ -326,6 +340,89 @@ impl TryFrom<&str> for StoreLocationType {
             )))
         }
     }
+}
+
+/// Maximum nesting depth accepted for KIP parameter values, guarding against
+/// stack exhaustion from deeply nested Python structures.
+const MAX_PARAMS_DEPTH: usize = 128;
+
+/// Converts a Python dict into KIP command parameters.
+///
+/// Keys must be strings; values must be JSON-compatible (str, bool, int,
+/// float, None, list, tuple, dict). Anything else raises `ValueError`.
+fn pydict_to_json_map(dict: &PyDict, depth: usize) -> PyResult<Map<String, Json>> {
+    let mut map = Map::new();
+    for (key, value) in dict.iter() {
+        let key = key.downcast::<PyString>().map_err(|_| {
+            PyValueError::new_err(format!(
+                "parameter keys must be strings, got: {}",
+                key.get_type().name().unwrap_or("<unknown>")
+            ))
+        })?;
+        map.insert(key.to_str()?.to_owned(), py_to_json(value, depth + 1)?);
+    }
+    Ok(map)
+}
+
+/// Converts a single Python value into JSON, raising `ValueError` for values
+/// that have no JSON equivalent. Must never panic: release builds abort on
+/// panic, which would take down the host Python interpreter.
+fn py_to_json(value: &PyAny, depth: usize) -> PyResult<Json> {
+    if depth > MAX_PARAMS_DEPTH {
+        return Err(PyValueError::new_err(format!(
+            "parameters nested deeper than {} levels",
+            MAX_PARAMS_DEPTH
+        )));
+    }
+    if value.is_none() {
+        return Ok(Json::Null);
+    }
+    // PyBool must be checked before PyLong: bool is a subclass of int in Python.
+    if let Ok(v) = value.downcast::<PyBool>() {
+        return Ok(Json::Bool(v.is_true()));
+    }
+    if value.downcast::<PyLong>().is_ok() {
+        if let Ok(v) = value.extract::<i64>() {
+            return Ok(Json::from(v));
+        }
+        if let Ok(v) = value.extract::<u64>() {
+            return Ok(Json::from(v));
+        }
+        return Err(PyValueError::new_err(
+            "integer parameter out of JSON number range",
+        ));
+    }
+    if let Ok(v) = value.downcast::<PyFloat>() {
+        return Number::from_f64(v.value())
+            .map(Json::Number)
+            .ok_or_else(|| {
+                PyValueError::new_err("non-finite float parameter is not JSON-compatible")
+            });
+    }
+    if let Ok(v) = value.downcast::<PyString>() {
+        return Ok(Json::String(v.to_str()?.to_owned()));
+    }
+    if let Ok(list) = value.downcast::<PyList>() {
+        let mut arr = Vec::with_capacity(list.len());
+        for item in list.iter() {
+            arr.push(py_to_json(item, depth + 1)?);
+        }
+        return Ok(Json::Array(arr));
+    }
+    if let Ok(tuple) = value.downcast::<PyTuple>() {
+        let mut arr = Vec::with_capacity(tuple.len());
+        for item in tuple.iter() {
+            arr.push(py_to_json(item, depth + 1)?);
+        }
+        return Ok(Json::Array(arr));
+    }
+    if let Ok(nested) = value.downcast::<PyDict>() {
+        return Ok(Json::Object(pydict_to_json_map(nested, depth)?));
+    }
+    Err(PyValueError::new_err(format!(
+        "unsupported parameter type: {}",
+        value.get_type().name().unwrap_or("<unknown>")
+    )))
 }
 
 /// Create a CognitiveNexus instance from AndaDbConfig.

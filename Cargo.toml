@@ -16,8 +16,9 @@ members = [
   "rs/anda_db_shard_proxy",
   # "py/anda_cognitive_nexus_py",
 ]
-# Python binding package (anda_cognitive_nexus_py) is excluded from workspace testing
-# because it requires Python library linking. Test it separately with:
+# The Python binding (anda_cognitive_nexus_py) is excluded from default workspace
+# builds because it links against a Python interpreter. To build or test it,
+# temporarily uncomment the member above, then:
 #   cargo test -p anda_cognitive_nexus_py --lib
 
 [workspace.package]
@@ -105,6 +106,7 @@ regex = { version = "1.11", default-features = false }
 rustc-hash = { version = "2", default-features = false, features = ["std"] }
 pyo3 = { version = "0.20", default-features = false }
 pyo3-asyncio = { version = "0.20", default-features = false }
+pyo3-build-config = { version = "0.20" }
 serde-pyobject = { version = "0.2", default-features = false }
 mimalloc = { version = "0.1", features = ["v3"] }
 
@@ -118,3 +120,10 @@ strip = true
 opt-level = 'z'
 codegen-units = 1
 panic = "abort"
+
+# Python extension wheels must unwind on panic so PyO3 can turn panics into
+# Python exceptions instead of aborting the host interpreter.
+# Build with: maturin build --profile release-py
+[profile.release-py]
+inherits = "release"
+panic = "unwind"

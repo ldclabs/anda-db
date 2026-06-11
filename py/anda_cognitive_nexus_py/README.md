@@ -56,7 +56,14 @@ uv pip install -r tests_py/requirements.txt
 maturin develop
 ```
 
-After this step, the `anda` module is available to be imported in any Python script run from this activated environment.
+After this step, the `anda_cognitive_nexus_py` module is available to be imported in any Python script run from this activated environment.
+
+To build a release wheel, use the `release-py` profile so panics unwind into
+Python exceptions instead of aborting the interpreter:
+
+```bash
+maturin build --profile release-py
+```
 
 ## Running Tests
 
@@ -85,7 +92,7 @@ To quickly verify your setup, you can run the following Python script:
 
 ```python
 # main.py
-import anda
+import anda_cognitive_nexus_py as anda
 
 # This is the "hello world" function currently implemented
 result = anda.sum_as_string(10, 20)
@@ -111,7 +118,7 @@ python main.py
 The API now exposes configuration and enums as Python classes, not dicts or strings. Construct configs using `AndaDbConfig` and `StoreLocationType` directly:
 
 ```python
-import anda
+import anda_cognitive_nexus_py as anda
 
 # Construct the config using Python classes (not dicts)
 config = anda.AndaDbConfig(
@@ -126,9 +133,16 @@ config = anda.AndaDbConfig(
 import asyncio
 async def main():
 	db = await anda.PyAndaDB.create(config)
-	# Execute a KIP command (async)
-	result = await db.execute_kip("KIP_COMMAND_STRING")
-	print(result)  # result is a Python dict, not a JSON string
+	try:
+		# Execute a KIP command (async), optionally with :name parameters
+		result = await db.execute_kip(
+			"FIND(?t.name) WHERE { ?t {type: :t} } LIMIT 10",
+			parameters={"t": "$ConceptType"},
+		)
+		print(result)  # result is a Python dict, not a JSON string
+	finally:
+		# Flush pending data to storage; required for file-backed stores.
+		await db.close()
 
 asyncio.run(main())
 ```
