@@ -26,7 +26,7 @@ use smallvec::SmallVec;
 use std::{
     borrow::Cow,
     cmp::{self, Reverse},
-    collections::{BTreeSet, BinaryHeap},
+    collections::{BTreeSet, BinaryHeap, hash_map::Entry},
     io::{Read, Write},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -242,8 +242,11 @@ pub enum SelectNeighborsStrategy {
     /// Greedy top-k by distance. Fastest to build; lower recall on hard data.
     Simple,
 
-    /// Algorithm 4 from the HNSW paper (approximate diverse selection).
-    /// Slower construction, better recall, especially on clustered data.
+    /// Algorithm 4 from the HNSW paper with `keepPrunedConnections`: keeps a
+    /// candidate only if it is closer to the query than to every neighbor
+    /// already selected, then backfills with the closest pruned candidates.
+    /// Better recall than [`SelectNeighborsStrategy::Simple`], especially on
+    /// clustered data.
     Heuristic,
 }
 
@@ -350,6 +353,11 @@ struct HnswIndexRef<'a> {
 impl HnswIndex {
     /// Maximum number of in-flight node loads used by [`Self::load_nodes`].
     pub const LOAD_NODES_CONCURRENCY: usize = 32;
+
+    /// Maximum number of attempts a search makes when nodes on its path are
+    /// being removed concurrently (each retry re-reads the repaired entry
+    /// point).
+    pub const SEARCH_MAX_ATTEMPTS: usize = 3;
 
     /// Creates a new HNSW index.
     ///
@@ -476,7 +484,7 @@ impl HnswIndex {
     /// * `Result<(), HnswError>` - Ok(()) if successful, or an error.
     pub fn load_ids<R: Read>(&mut self, r: R) -> Result<(), HnswError> {
         let ids: Vec<u8> = ciborium::from_reader(r).map_err(|err| HnswError::Serialization {
-            name: "unknown".to_string(),
+            name: self.name.clone(),
             source: err.into(),
         })?;
         let treemap =
@@ -725,7 +733,7 @@ impl HnswIndex {
     /// Gets a node by ID and applies a function to it.
     pub fn get_node_with<R, F>(&self, id: u64, f: F) -> Result<R, HnswError>
     where
-        F: FnMut(&HnswNode) -> R,
+        F: FnOnce(&HnswNode) -> R,
     {
         self.nodes
             .pin()
@@ -784,6 +792,17 @@ impl HnswIndex {
         }
 
         let (initial_entry_point_node, current_max_layer) = { *self.entry_point.read() };
+        // Self-heal a stale entry point (e.g. left behind by interrupted
+        // bootstrap or external state corruption). Without this, every insert
+        // and search would keep failing with `NotFound`. Safe here because the
+        // structural lock is held.
+        let (initial_entry_point_node, current_max_layer) =
+            if !nodes.is_empty() && !nodes.contains_key(&initial_entry_point_node) {
+                self.repair_entry_point();
+                *self.entry_point.read()
+            } else {
+                (initial_entry_point_node, current_max_layer)
+            };
         // Randomly determine the node's layer
         let layer = self.layer_gen.generate(current_max_layer);
         let mut node_neighbors: Vec<SmallVec<[(u64, bf16); 64]>> =
@@ -819,6 +838,10 @@ impl HnswIndex {
         }
 
         // --- Phase 1: descend the layers to gather search state ---
+        // The new vector is exactly representable in f32, so searching with the
+        // f32 copy yields bit-identical distances while skipping the per-element
+        // bf16 promotion of the query inside every distance computation.
+        let vector_f32: Vec<f32> = vector.iter().map(|v| v.to_f32()).collect();
         let mut distance_cache = FxHashMap::default();
         let mut entry_point_node = initial_entry_point_node;
         let mut entry_point_layer = current_max_layer;
@@ -827,7 +850,7 @@ impl HnswIndex {
         // Search from top layer down to find the best entry point
         for current_layer_search in (current_max_layer.min(layer + 1)..=current_max_layer).rev() {
             let nearest = self.search_layer(
-                &vector,
+                &vector_f32,
                 entry_point_node,
                 entry_point_layer,
                 current_layer_search,
@@ -868,7 +891,7 @@ impl HnswIndex {
             };
 
             let nearest = self.search_layer(
-                &vector,
+                &vector_f32,
                 entry_point_node, // Use the best entry point found so far
                 entry_point_layer,
                 current_layer_build,
@@ -892,6 +915,10 @@ impl HnswIndex {
             {
                 entry_point_node = closest_in_layer.0;
                 entry_point_dist = closest_in_layer.1;
+                // Keep the layer metadata in sync with the new entry node;
+                // `search_layer` propagates it into its results, and the
+                // reverse-edge guard below relies on it being accurate.
+                entry_point_layer = closest_in_layer.2;
             }
 
             // Record forward edges on the new node and queue reverse edges.
@@ -1137,10 +1164,14 @@ impl HnswIndex {
     /// 2. Layer-0 beam search with width `max(ef_search, top_k)`, then truncate
     ///    to `top_k`.
     ///
+    /// If a node on the search path is removed concurrently, the search is
+    /// transparently retried (up to [`Self::SEARCH_MAX_ATTEMPTS`] times) from
+    /// the repaired entry point.
+    ///
     /// # Errors
     /// * [`HnswError::DimensionMismatch`] on dimension mismatch.
-    /// * [`HnswError::NotFound`] if the current entry point has been removed
-    ///   concurrently and has not yet been repaired by a subsequent mutation.
+    /// * [`HnswError::NotFound`] if the entry point could not be resolved even
+    ///   after retrying (e.g. persistent index corruption).
     pub fn search(&self, query: &[bf16], top_k: usize) -> Result<Vec<(u64, f32)>, HnswError> {
         if query.len() != self.config.dimension {
             return Err(HnswError::DimensionMismatch {
@@ -1161,10 +1192,72 @@ impl HnswIndex {
             return Ok(Vec::new());
         }
 
-        if self.nodes.is_empty() {
-            return Ok(vec![]);
+        let query_f32: Vec<f32> = query.iter().map(|v| v.to_f32()).collect();
+        self.search_inner(&query_f32, top_k)
+    }
+
+    /// Searches for nearest neighbors using an `f32` query vector.
+    ///
+    /// The query stays in `f32` for all distance computations (only the stored
+    /// vectors are `bf16`), so no query precision is lost to quantization.
+    ///
+    /// # Arguments
+    ///
+    /// * `query` - Query vector as f32 values
+    /// * `top_k` - Number of nearest neighbors to return
+    ///
+    /// # Returns
+    ///
+    /// * `Result<Vec<(u64, f32)>, HnswError>` - Vector of (id, distance) pairs sorted by ascending distance
+    pub fn search_f32(&self, query: &[f32], top_k: usize) -> Result<Vec<(u64, f32)>, HnswError> {
+        if top_k == 0 {
+            return Ok(Vec::new());
         }
 
+        if query.iter().any(|v| !v.is_finite()) {
+            return Err(HnswError::Generic {
+                name: self.name.clone(),
+                source: "Query vector contains invalid values (NaN or infinity)".into(),
+            });
+        }
+
+        if query.len() != self.config.dimension {
+            return Err(HnswError::DimensionMismatch {
+                name: self.name.clone(),
+                expected: self.config.dimension,
+                got: query.len(),
+            });
+        }
+
+        self.search_inner(query, top_k)
+    }
+
+    /// Runs the two-phase search, retrying when a concurrently removed node
+    /// surfaces as a transient [`HnswError::NotFound`].
+    ///
+    /// `remove` repairs the entry point under the structural lock before it
+    /// returns, so re-reading the entry point on the next attempt resolves the
+    /// race; the retry bound only guards against persistent corruption.
+    fn search_inner(&self, query: &[f32], top_k: usize) -> Result<Vec<(u64, f32)>, HnswError> {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            if self.nodes.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            match self.search_attempt(query, top_k) {
+                Ok(results) => {
+                    self.search_count.fetch_add(1, Ordering::Relaxed);
+                    return Ok(results);
+                }
+                Err(HnswError::NotFound { .. }) if attempt < Self::SEARCH_MAX_ATTEMPTS => continue,
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    fn search_attempt(&self, query: &[f32], top_k: usize) -> Result<Vec<(u64, f32)>, HnswError> {
         let mut distance_cache = FxHashMap::default();
         let mut current_dist = f32::MAX;
         let (mut current_node, mut current_node_layer) = { *self.entry_point.read() };
@@ -1199,42 +1292,10 @@ impl HnswIndex {
         )?;
         results.truncate(top_k);
 
-        self.search_count.fetch_add(1, Ordering::Relaxed);
-
         Ok(results
             .into_iter()
             .map(|(id, dist, _)| (id, dist))
             .collect())
-    }
-
-    /// Searches for nearest neighbors using f32 query vector
-    ///
-    /// Automatically converts f32 values to bf16 for distance calculations
-    ///
-    /// # Arguments
-    ///
-    /// * `query` - Query vector as f32 values
-    /// * `top_k` - Number of nearest neighbors to return
-    ///
-    /// # Returns
-    ///
-    /// * `Result<Vec<(u64, f32)>, HnswError>` - Vector of (id, distance) pairs sorted by ascending distance
-    pub fn search_f32(&self, query: &[f32], top_k: usize) -> Result<Vec<(u64, f32)>, HnswError> {
-        if top_k == 0 {
-            return Ok(Vec::new());
-        }
-
-        if query.iter().any(|v| !v.is_finite()) {
-            return Err(HnswError::Generic {
-                name: self.name.clone(),
-                source: "Query vector contains invalid values (NaN or infinity)".into(),
-            });
-        }
-
-        self.search(
-            &query.iter().map(|v| bf16::from_f32(*v)).collect::<Vec<_>>(),
-            top_k,
-        )
     }
 
     /// Searches for nearest neighbors within a specific layer
@@ -1244,7 +1305,7 @@ impl HnswIndex {
     ///
     /// # Arguments
     ///
-    /// * `query` - Query vector
+    /// * `query` - Query vector (`f32`; stored vectors stay `bf16`)
     /// * `entry_point` - Starting node ID for the search
     /// * `entry_point_layer` - Layer of the entry point node
     /// * `layer` - Layer to search in
@@ -1256,7 +1317,7 @@ impl HnswIndex {
     /// * `Result<Vec<(u64, f32, u8)>, HnswError>` - Vector of (id, distance, node layer) pairs sorted by ascending distance
     fn search_layer(
         &self,
-        query: &[bf16],
+        query: &[f32],
         entry_point: u64,
         entry_point_layer: u8,
         layer: u8,
@@ -1388,68 +1449,75 @@ impl HnswIndex {
                 Ok(selected)
             }
             SelectNeighborsStrategy::Heuristic => {
-                // Heuristic strategy: balance distance and connection diversity
-                // Create candidate and result sets
-                let mut selected: Vec<(u64, f32, u8)> = Vec::with_capacity(m);
+                // Algorithm 4 from the HNSW paper: scan candidates from nearest
+                // to farthest and keep one only if it is closer to the query
+                // point than to every neighbor selected so far. This favors
+                // edges that span different directions ("diversity") over
+                // tightly clustered ones, and needs at most `c * m` pairwise
+                // distances with an early exit on the first conflict.
                 let mut remaining = candidates;
                 remaining
                     .sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(cmp::Ordering::Equal));
 
-                // Add the first nearest neighbor
-                if !remaining.is_empty() {
-                    selected.push(remaining.remove(0));
-                }
+                let mut selected: Vec<(u64, f32, u8)> = Vec::with_capacity(m);
+                // Candidates pruned by the diversity rule, kept in ascending
+                // distance order as backfill (`keepPrunedConnections`) so the
+                // node still ends up with exactly `m` edges.
+                let mut discarded: Vec<(u64, f32, u8)> = Vec::new();
 
-                // Greedily add remaining nodes while considering diversity
-                while selected.len() < m && !remaining.is_empty() {
-                    let mut best_candidate_idx = 0;
-                    let mut best_distance_improvement = f32::MIN;
+                for candidate in remaining {
+                    if selected.len() >= m {
+                        break;
+                    }
 
-                    for (i, &(cand_id, cand_dist, _)) in remaining.iter().enumerate() {
-                        let mut min_dist_to_selected = f32::MAX;
-                        for &(sel_id, _, _) in &selected {
-                            let cache_key = if cand_id < sel_id {
-                                (cand_id, sel_id)
-                            } else {
-                                (sel_id, cand_id)
-                            };
+                    let (cand_id, cand_dist, _) = candidate;
+                    let mut keep = true;
+                    for &(sel_id, _, _) in &selected {
+                        let cache_key = if cand_id < sel_id {
+                            (cand_id, sel_id)
+                        } else {
+                            (sel_id, cand_id)
+                        };
 
-                            let dist = if let Some(&cached_dist) = distance_cache.get(&cache_key) {
-                                cached_dist
-                            } else if let (Some(cand_node), Some(sel_node)) =
-                                (nodes.get(&cand_id), nodes.get(&sel_id))
-                            {
-                                let new_dist = self
-                                    .config
-                                    .distance_metric
-                                    .compute(&cand_node.vector, &sel_node.vector)?;
-                                distance_cache.insert(cache_key, new_dist);
-                                new_dist
-                            } else {
-                                continue;
-                            };
+                        let dist = match distance_cache.entry(cache_key) {
+                            Entry::Occupied(entry) => *entry.get(),
+                            Entry::Vacant(entry) => {
+                                if let (Some(cand_node), Some(sel_node)) =
+                                    (nodes.get(&cand_id), nodes.get(&sel_id))
+                                {
+                                    let dist = self
+                                        .config
+                                        .distance_metric
+                                        .compute(&cand_node.vector, &sel_node.vector)?;
+                                    entry.insert(dist);
+                                    dist
+                                } else {
+                                    // Missing node (defensive): treat the pair
+                                    // as non-conflicting.
+                                    continue;
+                                }
+                            }
+                        };
 
-                            min_dist_to_selected = min_dist_to_selected.min(dist);
-                        }
-
-                        // Balance: proximity to the query vs. diversity w.r.t.
-                        // the already-selected set.
-                        let improvement = min_dist_to_selected - cand_dist;
-                        if improvement > best_distance_improvement {
-                            best_distance_improvement = improvement;
-                            best_candidate_idx = i;
+                        if dist < cand_dist {
+                            keep = false;
+                            break;
                         }
                     }
 
-                    // Commit the best candidate (bounds-checked to avoid a
-                    // pathological infinite loop on degenerate inputs).
-                    if best_candidate_idx < remaining.len() {
-                        selected.push(remaining.swap_remove(best_candidate_idx));
-                    } else if !remaining.is_empty() {
-                        // Fall back to the simple strategy.
-                        selected.push(remaining.remove(0));
+                    if keep {
+                        selected.push(candidate);
                     } else {
-                        break;
+                        discarded.push(candidate);
+                    }
+                }
+
+                // Backfill with the closest pruned candidates.
+                let mut discarded = discarded.into_iter();
+                while selected.len() < m {
+                    match discarded.next() {
+                        Some(candidate) => selected.push(candidate),
+                        None => break,
                     }
                 }
 
@@ -1458,89 +1526,12 @@ impl HnswIndex {
         }
     }
 
-    // TODO: use improved version
-    #[allow(dead_code)]
-    fn select_neighbors_heuristic(
-        &self,
-        candidates: Vec<(u64, f32, u8)>,
-        m: usize,
-        distance_cache: &mut FxHashMap<(u64, u64), f32>,
-    ) -> Result<Vec<(u64, f32, u8)>, HnswError> {
-        if candidates.len() <= m {
-            return Ok(candidates);
-        }
-
-        let nodes = self.nodes.pin();
-        let mut selected: Vec<(u64, f32, u8)> = Vec::with_capacity(m);
-        let mut remaining = candidates;
-        remaining.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(cmp::Ordering::Equal));
-
-        // Always seed with the single closest candidate.
-        if !remaining.is_empty() {
-            selected.push(remaining.remove(0));
-        }
-
-        // Refined diversity metric: average distance to the selected set.
-        while selected.len() < m && !remaining.is_empty() {
-            let mut best_idx = 0;
-            let mut best_score = f32::MIN;
-
-            for (i, &(cand_id, cand_dist, _)) in remaining.iter().enumerate() {
-                let mut diversity_score = 0.0;
-                let mut valid_comparisons = 0;
-
-                for &(sel_id, _, _) in &selected {
-                    let cache_key = if cand_id < sel_id {
-                        (cand_id, sel_id)
-                    } else {
-                        (sel_id, cand_id)
-                    };
-
-                    if let Some(&cached_dist) = distance_cache.get(&cache_key) {
-                        diversity_score += cached_dist;
-                        valid_comparisons += 1;
-                    } else if let (Some(cand_node), Some(sel_node)) =
-                        (nodes.get(&cand_id), nodes.get(&sel_id))
-                    {
-                        let dist = self
-                            .config
-                            .distance_metric
-                            .compute(&cand_node.vector, &sel_node.vector)?;
-                        distance_cache.insert(cache_key, dist);
-                        diversity_score += dist;
-                        valid_comparisons += 1;
-                    }
-                }
-
-                if valid_comparisons > 0 {
-                    diversity_score /= valid_comparisons as f32;
-                    // Combine diversity (higher is better) with proximity to the
-                    // query (lower `cand_dist` is better); λ = 0.5.
-                    let combined_score = diversity_score - cand_dist * 0.5;
-
-                    if combined_score > best_score {
-                        best_score = combined_score;
-                        best_idx = i;
-                    }
-                }
-            }
-
-            if best_idx < remaining.len() {
-                selected.push(remaining.swap_remove(best_idx));
-            } else {
-                break;
-            }
-        }
-
-        Ok(selected)
-    }
-
     /// Gets the distance between a query vector and a node, using cache when available
     ///
     /// # Arguments
     ///
     /// * `cache` - Cache of previously computed distances
-    /// * `query` - Query vector
+    /// * `query` - Query vector (`f32`; stored vectors stay `bf16`)
     /// * `neighbor` - Node to compute distance to
     ///
     /// # Returns
@@ -1549,17 +1540,17 @@ impl HnswIndex {
     fn get_distance_with_cache(
         &self,
         cache: &mut FxHashMap<u64, f32>,
-        query: &[bf16],
+        query: &[f32],
         neighbor: &HnswNode,
     ) -> Result<f32, HnswError> {
-        match cache.get(&neighbor.id) {
-            Some(&dist) => Ok(dist),
-            None => {
+        match cache.entry(neighbor.id) {
+            Entry::Occupied(entry) => Ok(*entry.get()),
+            Entry::Vacant(entry) => {
                 let dist = self
                     .config
                     .distance_metric
-                    .compute(query, &neighbor.vector)?;
-                cache.insert(neighbor.id, dist);
+                    .compute_mixed(query, &neighbor.vector)?;
+                entry.insert(dist);
                 Ok(dist)
             }
         }
@@ -2410,7 +2401,7 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_heuristic_helper_invalid_bf16_and_pending_metadata_flush() {
+    fn test_select_neighbors_invalid_bf16_and_pending_metadata_flush() {
         let config = HnswConfig {
             dimension: 2,
             ..Default::default()
@@ -2428,35 +2419,9 @@ mod tests {
         index.insert_f32(3, vec![0.0, 1.0], 3).unwrap();
         assert!(index.has_pending_metadata_flush());
 
-        let candidates = vec![(1, 0.1, 0), (2, 0.2, 0), (3, 0.3, 0)];
-        let mut cache = FxHashMap::default();
-        let selected = index
-            .select_neighbors_heuristic(candidates.clone(), 2, &mut cache)
-            .unwrap();
-        assert_eq!(selected.len(), 2);
-        assert_eq!(selected[0].0, 1);
-        assert!(!cache.is_empty());
-
-        let selected_from_cache = index
-            .select_neighbors_heuristic(candidates.clone(), 2, &mut cache)
-            .unwrap();
-        assert_eq!(selected_from_cache.len(), 2);
-
-        let passthrough = index
-            .select_neighbors_heuristic(candidates.clone(), 4, &mut cache)
-            .unwrap();
-        assert_eq!(passthrough, candidates);
-
         let mut layer_cache = FxHashMap::default();
         assert!(matches!(
-            index.search_layer(
-                &[bf16::from_f32(0.0), bf16::from_f32(0.0)],
-                u64::MAX,
-                0,
-                0,
-                0,
-                &mut layer_cache,
-            ),
+            index.search_layer(&[0.0, 0.0], u64::MAX, 0, 0, 0, &mut layer_cache),
             Err(HnswError::NotFound { id: u64::MAX, .. })
         ));
 
@@ -2482,6 +2447,170 @@ mod tests {
 
         let mut writer = FailingWriter;
         assert!(writer.flush().is_ok());
+    }
+
+    #[test]
+    fn test_select_neighbors_heuristic_diversity_and_backfill() {
+        let config = HnswConfig {
+            dimension: 2,
+            ..Default::default()
+        };
+        let index = HnswIndex::new("anda_db_hnsw".to_string(), Some(config));
+        // Query point is the origin. Node 2 is "shadowed" by node 1 (it is
+        // closer to node 1 than to the query), nodes 3 and 4 span other
+        // directions.
+        index.insert_f32(1, vec![1.0, 0.0], 0).unwrap();
+        index.insert_f32(2, vec![1.2, 0.0], 0).unwrap();
+        index.insert_f32(3, vec![0.0, 1.4], 0).unwrap();
+        index.insert_f32(4, vec![-1.6, 0.0], 0).unwrap();
+
+        let candidates = vec![(1, 1.0, 0), (2, 1.2, 0), (3, 1.4, 0), (4, 1.6, 0)];
+
+        // With m = 2, the diversity rule must skip node 2 (dist(2, 1) = 0.2 <
+        // dist(2, query) = 1.2) and pick node 3 instead.
+        let mut cache = FxHashMap::default();
+        let selected = index
+            .select_neighbors(
+                candidates.clone(),
+                2,
+                SelectNeighborsStrategy::Heuristic,
+                &mut cache,
+            )
+            .unwrap();
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].0, 1);
+        assert_eq!(selected[1].0, 3);
+        assert!(!cache.is_empty());
+
+        // With m = 3, the third diverse pick is node 4; node 2 stays pruned.
+        let selected = index
+            .select_neighbors(
+                candidates.clone(),
+                3,
+                SelectNeighborsStrategy::Heuristic,
+                &mut cache,
+            )
+            .unwrap();
+        assert_eq!(
+            selected.iter().map(|(id, ..)| *id).collect::<Vec<_>>(),
+            vec![1, 3, 4]
+        );
+
+        // Candidate count ≤ m passes through unchanged.
+        let passthrough = index
+            .select_neighbors(
+                candidates.clone(),
+                4,
+                SelectNeighborsStrategy::Heuristic,
+                &mut cache,
+            )
+            .unwrap();
+        assert_eq!(passthrough, candidates);
+
+        // All shadowed by node 1: backfill must still deliver exactly m edges,
+        // closest pruned candidates first.
+        index.insert_f32(5, vec![1.1, 0.1], 0).unwrap();
+        let clustered = vec![(1, 1.0, 0), (2, 1.2, 0), (5, 1.3, 0)];
+        let selected = index
+            .select_neighbors(clustered, 2, SelectNeighborsStrategy::Heuristic, &mut cache)
+            .unwrap();
+        assert_eq!(
+            selected.iter().map(|(id, ..)| *id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        // m == 0 yields no neighbors.
+        let empty = index
+            .select_neighbors(
+                vec![(1, 1.0, 0), (2, 1.2, 0)],
+                0,
+                SelectNeighborsStrategy::Heuristic,
+                &mut cache,
+            )
+            .unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_search_is_robust_while_entry_point_is_removed() {
+        use std::sync::Arc;
+
+        let config = HnswConfig {
+            dimension: 2,
+            ..Default::default()
+        };
+        let index = Arc::new(HnswIndex::new("anda_db_hnsw".to_string(), Some(config)));
+        for i in 0..64u64 {
+            index
+                .insert_f32(i, vec![(i % 8) as f32, (i / 8) as f32], 0)
+                .unwrap();
+        }
+
+        // Writer: keep removing and re-inserting the current entry point so
+        // searches race against entry-point invalidation.
+        let writer = {
+            let index = Arc::clone(&index);
+            tokio::task::spawn_blocking(move || {
+                for _ in 0..300 {
+                    let (entry_id, _) = *index.entry_point.read();
+                    if index.remove(entry_id, 0) {
+                        index
+                            .insert_f32(
+                                entry_id,
+                                vec![(entry_id % 8) as f32, (entry_id / 8) as f32],
+                                0,
+                            )
+                            .unwrap();
+                    }
+                }
+            })
+        };
+
+        let mut readers = Vec::new();
+        for t in 0..4u64 {
+            let index = Arc::clone(&index);
+            readers.push(tokio::task::spawn_blocking(move || {
+                for i in 0..500u64 {
+                    let q = [((t + i) % 8) as f32, (i % 8) as f32];
+                    // Transient entry-point removal must never surface as an
+                    // error: search retries from the repaired entry point.
+                    let results = index.search_f32(&q, 5).unwrap();
+                    assert!(!results.is_empty());
+                }
+            }));
+        }
+
+        writer.await.unwrap();
+        for reader in readers {
+            reader.await.unwrap();
+        }
+        assert_eq!(index.len(), 64);
+    }
+
+    #[test]
+    fn test_corrupt_entry_point_fails_search_but_insert_self_heals() {
+        let config = HnswConfig {
+            dimension: 2,
+            ..Default::default()
+        };
+        let index = HnswIndex::new("anda_db_hnsw".to_string(), Some(config));
+        index.insert_f32(1, vec![1.0, 1.0], 0).unwrap();
+
+        // Simulate a corrupted entry point referencing a missing node.
+        *index.entry_point.write() = (404, 0);
+
+        // Search retries and then surfaces the corruption.
+        let result = index.search_f32(&[1.0, 1.0], 1);
+        assert!(matches!(result, Err(HnswError::NotFound { id: 404, .. })));
+        assert_eq!(index.stats().search_count, 0);
+
+        // The next insert self-heals the entry point and search recovers.
+        index.insert_f32(2, vec![2.0, 2.0], 0).unwrap();
+        let entry_id = index.entry_point.read().0;
+        assert!(index.nodes.pin().contains_key(&entry_id));
+        let results = index.search_f32(&[1.0, 1.0], 2).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, 1);
     }
 
     #[tokio::test]

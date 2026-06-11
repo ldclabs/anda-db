@@ -31,20 +31,8 @@ impl DistanceMetric {
     /// # Errors
     /// Returns [`HnswError::DimensionMismatch`] if `a.len() != b.len()`.
     pub fn compute(&self, a: &[bf16], b: &[bf16]) -> Result<f32, HnswError> {
-        if a.len() != b.len() {
-            return Err(HnswError::DimensionMismatch {
-                name: "unknown".to_string(),
-                expected: a.len(),
-                got: b.len(),
-            });
-        }
-
-        match self {
-            DistanceMetric::Euclidean => Ok(euclidean_distance_bf16(a, b)),
-            DistanceMetric::Cosine => Ok(cosine_distance_bf16(a, b)),
-            DistanceMetric::InnerProduct => Ok(inner_product_bf16(a, b)),
-            DistanceMetric::Manhattan => Ok(manhattan_distance_bf16(a, b)),
-        }
+        check_dimensions(a, b)?;
+        Ok(self.dispatch(a, b))
     }
 
     /// Computes the distance between two `f32` vectors.
@@ -55,29 +43,52 @@ impl DistanceMetric {
     /// # Errors
     /// Returns [`HnswError::DimensionMismatch`] if `a.len() != b.len()`.
     pub fn compute_f32(&self, a: &[f32], b: &[f32]) -> Result<f32, HnswError> {
-        if a.len() != b.len() {
-            return Err(HnswError::DimensionMismatch {
-                name: "unknown".to_string(),
-                expected: a.len(),
-                got: b.len(),
-            });
-        }
+        check_dimensions(a, b)?;
+        Ok(self.dispatch(a, b))
+    }
 
+    /// Computes the distance between an `f32` query and a stored `bf16` vector.
+    ///
+    /// This avoids quantizing the query to `bf16` first: only the stored
+    /// vector carries quantization error, which improves ranking fidelity on
+    /// the search hot path.
+    ///
+    /// # Errors
+    /// Returns [`HnswError::DimensionMismatch`] if `a.len() != b.len()`.
+    pub fn compute_mixed(&self, a: &[f32], b: &[bf16]) -> Result<f32, HnswError> {
+        check_dimensions(a, b)?;
+        Ok(self.dispatch(a, b))
+    }
+
+    #[inline]
+    fn dispatch<A: AsF32, B: AsF32>(&self, a: &[A], b: &[B]) -> f32 {
         match self {
-            DistanceMetric::Euclidean => Ok(euclidean_distance_f32(a, b)),
-            DistanceMetric::Cosine => Ok(cosine_distance_f32(a, b)),
-            DistanceMetric::InnerProduct => Ok(inner_product_f32(a, b)),
-            DistanceMetric::Manhattan => Ok(manhattan_distance_f32(a, b)),
+            DistanceMetric::Euclidean => euclidean_distance(a, b),
+            DistanceMetric::Cosine => cosine_distance(a, b),
+            DistanceMetric::InnerProduct => inner_product(a, b),
+            DistanceMetric::Manhattan => manhattan_distance(a, b),
         }
     }
+}
+
+#[inline]
+fn check_dimensions<A, B>(a: &[A], b: &[B]) -> Result<(), HnswError> {
+    if a.len() != b.len() {
+        return Err(HnswError::DimensionMismatch {
+            name: "unknown".to_string(),
+            expected: a.len(),
+            got: b.len(),
+        });
+    }
+    Ok(())
 }
 
 /// Random layer generator for HNSW.
 ///
 /// Draws a layer index from a truncated exponential distribution so that the
 /// expected number of nodes at layer `ℓ` decays as `M^{-ℓ}`, where `M` is
-/// [`HnswConfig::max_connections`]. This reproduces the behavior of the
-/// reference HNSW paper.
+/// [`crate::HnswConfig::max_connections`]. This reproduces the behavior of
+/// the reference HNSW paper.
 #[derive(Debug)]
 pub struct LayerGen {
     /// Uniform distribution sampler
@@ -156,96 +167,114 @@ impl LayerGen {
     }
 }
 
+/// Element types that promote losslessly to `f32` for distance computation.
+trait AsF32: Copy {
+    fn as_f32(self) -> f32;
+}
+
+impl AsF32 for f32 {
+    #[inline(always)]
+    fn as_f32(self) -> f32 {
+        self
+    }
+}
+
+impl AsF32 for bf16 {
+    #[inline(always)]
+    fn as_f32(self) -> f32 {
+        self.to_f32()
+    }
+}
+
+/// Unroll width for the distance kernels below. Eight independent `f32`
+/// accumulators break the floating-point add dependency chain so the loop can
+/// be pipelined / auto-vectorized; the slight change in summation order is
+/// well within `bf16` quantization noise.
+const LANES: usize = 8;
+
 #[inline]
-fn euclidean_distance_f32(a: &[f32], b: &[f32]) -> f32 {
-    let mut sum = 0.0f32;
-    for (&x, &y) in a.iter().zip(b) {
-        let d = x - y;
+fn euclidean_distance<A: AsF32, B: AsF32>(a: &[A], b: &[B]) -> f32 {
+    let mut acc = [0.0f32; LANES];
+    let mut chunks_a = a.chunks_exact(LANES);
+    let mut chunks_b = b.chunks_exact(LANES);
+    for (ca, cb) in (&mut chunks_a).zip(&mut chunks_b) {
+        for i in 0..LANES {
+            let d = ca[i].as_f32() - cb[i].as_f32();
+            acc[i] += d * d;
+        }
+    }
+    let mut sum: f32 = acc.iter().sum();
+    for (&x, &y) in chunks_a.remainder().iter().zip(chunks_b.remainder()) {
+        let d = x.as_f32() - y.as_f32();
         sum += d * d;
     }
     sum.sqrt()
 }
 
 #[inline]
-fn cosine_distance_f32(a: &[f32], b: &[f32]) -> f32 {
-    let mut dot = 0.0f32;
-    let mut norm_a2 = 0.0f32;
-    let mut norm_b2 = 0.0f32;
-    for (&x, &y) in a.iter().zip(b) {
-        dot += x * y;
-        norm_a2 += x * x;
-        norm_b2 += y * y;
+fn cosine_distance<A: AsF32, B: AsF32>(a: &[A], b: &[B]) -> f32 {
+    let mut dot = [0.0f32; LANES];
+    let mut norm_a2 = [0.0f32; LANES];
+    let mut norm_b2 = [0.0f32; LANES];
+    let mut chunks_a = a.chunks_exact(LANES);
+    let mut chunks_b = b.chunks_exact(LANES);
+    for (ca, cb) in (&mut chunks_a).zip(&mut chunks_b) {
+        for i in 0..LANES {
+            let x = ca[i].as_f32();
+            let y = cb[i].as_f32();
+            dot[i] += x * y;
+            norm_a2[i] += x * x;
+            norm_b2[i] += y * y;
+        }
     }
-    let norm_a = norm_a2.sqrt();
-    let norm_b = norm_b2.sqrt();
+    let mut dot_sum: f32 = dot.iter().sum();
+    let mut norm_a2_sum: f32 = norm_a2.iter().sum();
+    let mut norm_b2_sum: f32 = norm_b2.iter().sum();
+    for (&x, &y) in chunks_a.remainder().iter().zip(chunks_b.remainder()) {
+        let x = x.as_f32();
+        let y = y.as_f32();
+        dot_sum += x * y;
+        norm_a2_sum += x * x;
+        norm_b2_sum += y * y;
+    }
+    let norm_a = norm_a2_sum.sqrt();
+    let norm_b = norm_b2_sum.sqrt();
     if norm_a < f32::EPSILON || norm_b < f32::EPSILON {
         return 1.0;
     }
-    1.0 - (dot / (norm_a * norm_b)).clamp(-1.0, 1.0)
+    1.0 - (dot_sum / (norm_a * norm_b)).clamp(-1.0, 1.0)
 }
 
 #[inline]
-fn inner_product_f32(a: &[f32], b: &[f32]) -> f32 {
-    let mut dot = 0.0f32;
-    for (&x, &y) in a.iter().zip(b) {
-        dot += x * y;
+fn inner_product<A: AsF32, B: AsF32>(a: &[A], b: &[B]) -> f32 {
+    let mut acc = [0.0f32; LANES];
+    let mut chunks_a = a.chunks_exact(LANES);
+    let mut chunks_b = b.chunks_exact(LANES);
+    for (ca, cb) in (&mut chunks_a).zip(&mut chunks_b) {
+        for i in 0..LANES {
+            acc[i] += ca[i].as_f32() * cb[i].as_f32();
+        }
+    }
+    let mut dot: f32 = acc.iter().sum();
+    for (&x, &y) in chunks_a.remainder().iter().zip(chunks_b.remainder()) {
+        dot += x.as_f32() * y.as_f32();
     }
     -dot
 }
 
 #[inline]
-fn manhattan_distance_f32(a: &[f32], b: &[f32]) -> f32 {
-    let mut sum = 0.0f32;
-    for (&x, &y) in a.iter().zip(b) {
-        sum += (x - y).abs();
+fn manhattan_distance<A: AsF32, B: AsF32>(a: &[A], b: &[B]) -> f32 {
+    let mut acc = [0.0f32; LANES];
+    let mut chunks_a = a.chunks_exact(LANES);
+    let mut chunks_b = b.chunks_exact(LANES);
+    for (ca, cb) in (&mut chunks_a).zip(&mut chunks_b) {
+        for i in 0..LANES {
+            acc[i] += (ca[i].as_f32() - cb[i].as_f32()).abs();
+        }
     }
-    sum
-}
-
-#[inline]
-fn euclidean_distance_bf16(a: &[bf16], b: &[bf16]) -> f32 {
-    let mut sum = 0.0f32;
-    for (&x, &y) in a.iter().zip(b) {
-        let d = x.to_f32() - y.to_f32();
-        sum += d * d;
-    }
-    sum.sqrt()
-}
-
-#[inline]
-fn cosine_distance_bf16(a: &[bf16], b: &[bf16]) -> f32 {
-    let mut dot = 0.0f32;
-    let mut norm_a2 = 0.0f32;
-    let mut norm_b2 = 0.0f32;
-    for (&x, &y) in a.iter().zip(b) {
-        let xf = x.to_f32();
-        let yf = y.to_f32();
-        dot += xf * yf;
-        norm_a2 += xf * xf;
-        norm_b2 += yf * yf;
-    }
-    let norm_a = norm_a2.sqrt();
-    let norm_b = norm_b2.sqrt();
-    if norm_a < f32::EPSILON || norm_b < f32::EPSILON {
-        return 1.0;
-    }
-    1.0 - (dot / (norm_a * norm_b)).clamp(-1.0, 1.0)
-}
-
-#[inline]
-fn inner_product_bf16(a: &[bf16], b: &[bf16]) -> f32 {
-    let mut dot = 0.0f32;
-    for (&x, &y) in a.iter().zip(b) {
-        dot += x.to_f32() * y.to_f32();
-    }
-    -dot
-}
-
-#[inline]
-fn manhattan_distance_bf16(a: &[bf16], b: &[bf16]) -> f32 {
-    let mut sum = 0.0f32;
-    for (&x, &y) in a.iter().zip(b) {
-        sum += (x.to_f32() - y.to_f32()).abs();
+    let mut sum: f32 = acc.iter().sum();
+    for (&x, &y) in chunks_a.remainder().iter().zip(chunks_b.remainder()) {
+        sum += (x.as_f32() - y.as_f32()).abs();
     }
     sum
 }
@@ -321,7 +350,7 @@ mod tests {
         }
 
         // Euclidean.
-        let impl_euclidean = euclidean_distance_f32(&v1, &v2);
+        let impl_euclidean = euclidean_distance(&v1, &v2);
         let scalar_euclidean = euclidean_distance_scalar(&v1, &v2);
         assert!(
             (impl_euclidean - scalar_euclidean).abs() < 1e-4,
@@ -329,7 +358,7 @@ mod tests {
         );
 
         // Cosine.
-        let impl_cosine = cosine_distance_f32(&v1, &v2);
+        let impl_cosine = cosine_distance(&v1, &v2);
         let scalar_cosine = cosine_distance_scalar(&v1, &v2);
         assert!(
             (impl_cosine - scalar_cosine).abs() < 1e-4,
@@ -337,7 +366,7 @@ mod tests {
         );
 
         // Inner product.
-        let impl_inner = inner_product_f32(&v1, &v2);
+        let impl_inner = inner_product(&v1, &v2);
         let scalar_inner = inner_product_scalar(&v1, &v2);
         assert!(
             (impl_inner - scalar_inner).abs() < 1e-4,
@@ -345,12 +374,52 @@ mod tests {
         );
 
         // Manhattan.
-        let impl_manhattan = manhattan_distance_f32(&v1, &v2);
+        let impl_manhattan = manhattan_distance(&v1, &v2);
         let scalar_manhattan = manhattan_distance_scalar(&v1, &v2);
         assert!(
             (impl_manhattan - scalar_manhattan).abs() < 1e-4,
             "manhattan: impl={impl_manhattan}, scalar={scalar_manhattan}"
         );
+    }
+
+    #[test]
+    fn test_compute_mixed_matches_bf16_for_exact_queries() {
+        let mut rng = rand::rng();
+        // Vector lengths that exercise both the unrolled body and the remainder.
+        for dims in [3, 8, 17, 128] {
+            // Build a query already representable in bf16, so `compute_mixed`
+            // (f32 query) and `compute` (bf16 query) must agree exactly.
+            let query_bf16: Vec<bf16> = (0..dims)
+                .map(|_| bf16::from_f32(rng.random::<f32>()))
+                .collect();
+            let query_f32: Vec<f32> = query_bf16.iter().map(|v| v.to_f32()).collect();
+            let stored: Vec<bf16> = (0..dims)
+                .map(|_| bf16::from_f32(rng.random::<f32>()))
+                .collect();
+
+            for metric in [
+                DistanceMetric::Euclidean,
+                DistanceMetric::Cosine,
+                DistanceMetric::InnerProduct,
+                DistanceMetric::Manhattan,
+            ] {
+                let mixed = metric.compute_mixed(&query_f32, &stored).unwrap();
+                let bf16_only = metric.compute(&query_bf16, &stored).unwrap();
+                assert_eq!(
+                    mixed, bf16_only,
+                    "metric {metric:?} dims {dims}: mixed={mixed}, bf16={bf16_only}"
+                );
+            }
+        }
+
+        assert!(matches!(
+            DistanceMetric::Euclidean.compute_mixed(&[1.0, 2.0], &[bf16::from_f32(1.0)]),
+            Err(HnswError::DimensionMismatch {
+                expected: 2,
+                got: 1,
+                ..
+            })
+        ));
     }
 
     #[test]

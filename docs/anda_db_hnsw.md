@@ -79,14 +79,18 @@ reduced to $M$ connections. Two strategies are available (configured via
 
 - **`Simple`** — just take the $M$ closest. Fastest; recall degrades on
   strongly clustered data because many picked neighbors are mutually close.
-- **`Heuristic`** — seeds with the single closest candidate, then at each
-  step picks the remaining candidate that maximises
+- **`Heuristic`** — Algorithm 4 of the original HNSW paper with
+  `keepPrunedConnections`: candidates are scanned from nearest to farthest,
+  and candidate $c$ is kept only if
 
-  $$\text{score}(c) \;=\; \underbrace{\overline{d(c,\mathrm{selected})}}_{\text{diversity}} \;-\; \lambda \cdot d(c,q),\qquad \lambda = 0.5,$$
+  $$d(c, q) \;<\; \min_{s \,\in\, \mathrm{selected}} d(c, s),$$
 
-  so that the selected set spreads across the local manifold. This mirrors
-  Algorithm 4 of the original HNSW paper, tuned with a diversity term
-  normalized over the current selected-set size.
+  i.e. it is closer to the query point than to every neighbor already
+  selected, so the edge set spreads across the local manifold instead of
+  collapsing into one cluster. Pruned candidates are then backfilled
+  (closest first) until $M$ edges are reached. Pairwise distances are
+  memoized per insert, and the scan exits early on the first conflict, so
+  selection costs at most $c \cdot M$ distance computations.
 
 The heuristic strategy is the default.
 
@@ -192,6 +196,12 @@ map. This trades a tiny amount of read-time work for a much cheaper delete.
 2. Greedy descent from the entry point down to layer 1.
 3. Layer-0 beam search with width $\max(\mathrm{ef\_search},\,\mathrm{top\_k})$.
 4. Truncate to `top_k` and sort by ascending distance.
+
+The query is kept in `f32` for every distance computation (only the stored
+vectors are `bf16`), so `search_f32` loses no query precision to
+quantization. If a node on the search path is removed concurrently, the
+search transparently retries from the repaired entry point (up to
+`SEARCH_MAX_ATTEMPTS` times) instead of surfacing a transient `NotFound`.
 
 `ef_search` is the primary recall/latency knob at query time; values in the
 range `2 × top_k … 10 × top_k` are typical.
