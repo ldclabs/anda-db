@@ -29,7 +29,7 @@ Add the crate to your project:
 
 ```toml
 [dependencies]
-anda_db = { version = "0.7", features = ["full"] }
+anda_db = { version = "0.8", features = ["full"] }
 object_store = { version = "0.13", features = ["fs"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

@@ -1,6 +1,6 @@
 //! [`Document`] and [`DocumentOwned`] — the runtime and on-disk
 //! representations of an Anda DB document.
-use ciborium::Value;
+use cbor2::Value;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::sync::Arc;
 

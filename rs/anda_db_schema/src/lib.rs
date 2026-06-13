@@ -8,7 +8,7 @@
 //! - [`FieldType`] (alias [`Ft`]): a closed enum of every type a field may declare,
 //!   including primitive, composite (`Array`, `Map`) and `Option` variants.
 //! - [`FieldValue`] (alias [`Fv`]): the runtime representation of an actual value.
-//!   It can losslessly round-trip with [`Cbor`](ciborium::Value) and is
+//!   It can losslessly round-trip with [`Cbor`](cbor2::Value) and is
 //!   serde-compatible for both human-readable (JSON) and binary (CBOR) formats.
 //! - [`FieldEntry`] (alias [`Fe`]): metadata for a single field — name, type,
 //!   description, uniqueness flag and a stable numeric `idx` used as the on-disk

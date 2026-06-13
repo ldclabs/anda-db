@@ -6,7 +6,6 @@
 //! - [`UniqueVec`], an insertion-ordered vector that rejects duplicates.
 //! - [`CountingWriter`], a writer that counts serialized bytes without storing
 //!   the payload.
-//! - CBOR size estimation helpers for sizing encoded index buckets.
 //! - [`Pipe`], a small functional-style chaining trait.
 
 use core::ops::Deref;
@@ -16,10 +15,6 @@ use serde::{
     ser::{Serialize, Serializer},
 };
 use std::{borrow::Borrow, hash::Hash};
-
-mod cbor_size;
-
-pub use cbor_size::{CborSizeError, estimate_cbor_size, try_estimate_cbor_size};
 
 /// A trait for functional-style method chaining.
 ///

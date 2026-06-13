@@ -28,9 +28,9 @@ Add the crate to your project:
 
 ```toml
 [dependencies]
-anda_cognitive_nexus = "0.7"
-anda_kip = "0.7"
-anda_db = "0.7"
+anda_cognitive_nexus = "0.8"
+anda_kip = "0.8"
+anda_db = "0.8"
 ```
 
 For the higher-level technical model and execution details, start with the

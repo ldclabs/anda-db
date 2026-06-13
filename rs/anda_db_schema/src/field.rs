@@ -14,11 +14,11 @@
 //!   `FieldType` together with description, uniqueness and a stable numeric
 //!   index used for compact storage.
 //!
-//! Values round-trip through CBOR (via [`Cbor`](ciborium::Value)) for
+//! Values round-trip through CBOR (via [`Cbor`](cbor2::Value)) for
 //! persistence and through JSON for human-readable APIs. In JSON mode,
 //! [`FieldValue::Bytes`] is encoded as a Base64 (URL-safe) string.
 use base64::{Engine, prelude::BASE64_URL_SAFE};
-use ciborium::Value;
+use cbor2::Value;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, btree_map::Entry},
@@ -47,8 +47,8 @@ pub type Fv = FieldValue;
 /// Type alias for FieldEntry
 pub type Fe = FieldEntry;
 
-/// Type alias for ciborium::Value
-pub type Cbor = ciborium::Value;
+/// Type alias for cbor2::Value
+pub type Cbor = cbor2::Value;
 
 /// Type alias for serde_json::Value
 pub type Json = serde_json::Value;
@@ -1192,7 +1192,7 @@ impl FieldValue {
         match value {
             Cbor::Bool(_) => Self::bool_from(value),
             Cbor::Integer(i) => {
-                let z = ciborium::value::Integer::from(0);
+                let z = cbor2::value::Integer::from(0);
                 if i >= z {
                     Self::u64_from(value)
                 } else {
@@ -1523,7 +1523,7 @@ fn validate_map_fields(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ciborium::{cbor, from_reader, into_writer};
+    use cbor2::{cbor, from_reader, to_writer};
     use ic_auth_types::{Xid, cbor_into_vec};
     use serde_json::json;
 
@@ -2039,7 +2039,7 @@ mod tests {
         let deserialized: Ft = serde_json::from_str(&serialized).unwrap();
         assert_eq!(field_type, deserialized);
         let mut serialized = Vec::new();
-        into_writer(&field_type, &mut serialized).unwrap();
+        to_writer(&field_type, &mut serialized).unwrap();
         println!("Serialized FieldType: {:?}", hex::encode(&serialized));
         let deserialized: Ft = from_reader(&serialized[..]).unwrap();
         assert_eq!(field_type, deserialized);
@@ -2047,7 +2047,7 @@ mod tests {
         // 测试 FieldValue 序列化和反序列化
         let field_value = Fv::Array(vec![Fv::U64(1), Fv::Text("hello".to_string())]);
         let mut serialized = Vec::new();
-        into_writer(&field_value, &mut serialized).unwrap();
+        to_writer(&field_value, &mut serialized).unwrap();
         println!("Serialized FieldValue: {:?}", hex::encode(&serialized));
         assert_eq!(hex::encode(&serialized), "82016568656c6c6f");
         let deserialized: Fv = from_reader(&serialized[..]).unwrap();
@@ -2055,7 +2055,7 @@ mod tests {
 
         let field_value = Fv::Bytes(vec![1, 2, 3, 4]);
         let mut serialized = Vec::new();
-        into_writer(&field_value, &mut serialized).unwrap();
+        to_writer(&field_value, &mut serialized).unwrap();
         println!("Serialized bytes: {:?}", hex::encode(&serialized));
         assert_eq!(hex::encode(&serialized), "4401020304");
         let deserialized: Fv = from_reader(&serialized[..]).unwrap();
@@ -2067,13 +2067,13 @@ mod tests {
             .with_unique()
             .with_idx(0);
         let mut serialized = Vec::new();
-        into_writer(&field_entry, &mut serialized).unwrap();
+        to_writer(&field_entry, &mut serialized).unwrap();
         let deserialized: Fe = from_reader(&serialized[..]).unwrap();
         assert_eq!(field_entry, deserialized);
 
         let xid = Xid([1u8; 12]);
         let mut data = Vec::new();
-        into_writer(&xid, &mut data).unwrap();
+        to_writer(&xid, &mut data).unwrap();
         println!("Serialized Xid: {:?}", hex::encode(&data));
         assert_eq!(hex::encode(&data), "4c010101010101010101010101");
         let cb: Cbor = from_reader(&data[..]).unwrap();
@@ -2117,7 +2117,7 @@ mod tests {
         assert!(serde_json::to_string(&Fv::F32(f32::NAN)).is_err());
 
         let mut serialized = Vec::new();
-        into_writer(&Cbor::Float(f64::NAN), &mut serialized).unwrap();
+        to_writer(&Cbor::Float(f64::NAN), &mut serialized).unwrap();
         assert!(from_reader::<Fv, _>(&serialized[..]).is_err());
     }
 

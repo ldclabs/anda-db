@@ -80,7 +80,7 @@
 //! - [`BTreeIndex::compact_buckets`] re-packs fragmented buckets using
 //!   first-fit-decreasing bin packing.
 
-use anda_db_utils::{UniqueVec, estimate_cbor_size};
+use anda_db_utils::UniqueVec;
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -95,6 +95,13 @@ use std::{
 };
 
 use crate::{BTreeError, BoxError};
+
+fn cbor_serialized_size<T: ?Sized + Serialize>(value: &T) -> usize {
+    cbor2::serialized_size(value)
+        .expect("CBOR serialized size calculation failed")
+        .try_into()
+        .expect("CBOR serialized size exceeds usize")
+}
 
 /// Thread-safe, bucket-based B-tree index with range query support.
 ///
@@ -523,7 +530,7 @@ where
     pub fn load_metadata<R: Read>(r: R) -> Result<Self, BTreeError> {
         // Deserialize the index metadata
         let index: BTreeIndexOwned =
-            ciborium::from_reader(r).map_err(|err| BTreeError::Serialization {
+            cbor2::from_reader(r).map_err(|err| BTreeError::Serialization {
                 name: "unknown".to_string(),
                 source: err.into(),
             })?;
@@ -583,7 +590,7 @@ where
             })?;
             if let Some(data) = data {
                 let bucket: BucketOwned<PK, FV> =
-                    ciborium::from_reader(&data[..]).map_err(|err| BTreeError::Serialization {
+                    cbor2::from_reader(&data[..]).map_err(|err| BTreeError::Serialization {
                         name: self.name.clone(),
                         source: err.into(),
                     })?;
@@ -606,7 +613,7 @@ where
                                 .swap_remove_if(|key| key == &field_value)
                                 .is_some()
                         {
-                            let previous_size = estimate_cbor_size(&previous) + 2;
+                            let previous_size = cbor_serialized_size(&previous) + 2;
                             previous_bucket.0 = previous_bucket.0.saturating_sub(previous_size);
                             self.mark_bucket_dirty(&mut previous_bucket);
                         }
@@ -699,7 +706,7 @@ where
             dashmap::Entry::Occupied(mut entry) => {
                 let posting = entry.get_mut();
                 target_bucket = posting.0;
-                let posting_size_before_update = estimate_cbor_size(&*posting) + 2;
+                let posting_size_before_update = cbor_serialized_size(&*posting) + 2;
 
                 // Unique index semantics: allow idempotent insert of the same (doc_id, field_value)
                 // while rejecting a different doc_id for an existing field_value.
@@ -713,7 +720,7 @@ where
 
                 // Add doc_id if it doesn't exist
                 if posting.2.push(doc_id.clone()) {
-                    size_increase = estimate_cbor_size(&doc_id) + 2;
+                    size_increase = cbor_serialized_size(&doc_id) + 2;
                     previous_posting_size = posting_size_before_update;
                     posting.1 += 1; // increment version
                 }
@@ -721,7 +728,7 @@ where
             dashmap::Entry::Vacant(entry) => {
                 // Create a new posting for this field value
                 let posting = (bucket, 1, vec![doc_id].into());
-                size_increase = estimate_cbor_size(&posting) + 2;
+                size_increase = cbor_serialized_size(&posting) + 2;
                 entry.insert(posting);
                 is_new = true;
             }
@@ -766,7 +773,7 @@ where
                     if let Some(mut posting) = self.postings.get_mut(&field_value) {
                         // Update the posting's bucket ID
                         posting.0 = new_bucket;
-                        let migrated_posting_size = estimate_cbor_size(&posting) + 2;
+                        let migrated_posting_size = cbor_serialized_size(&posting) + 2;
                         source_size_decrease = if previous_posting_size > 0 {
                             previous_posting_size
                         } else {
@@ -838,12 +845,12 @@ where
         {
             if let Some(mut posting) = self.postings.get_mut(&field_value) {
                 bucket_id = posting.0;
-                let prev_posting_size = estimate_cbor_size(&*posting) + 2;
+                let prev_posting_size = cbor_serialized_size(&*posting) + 2;
                 if posting.2.swap_remove_if(|id| id == &doc_id).is_some() {
                     removed = true;
                     posting.1 += 1; // increment version
                     posting_empty = posting.2.is_empty();
-                    doc_size_decrease = estimate_cbor_size(&doc_id) + 2;
+                    doc_size_decrease = cbor_serialized_size(&doc_id) + 2;
                     full_size_decrease = prev_posting_size;
                 }
             }
@@ -1010,14 +1017,14 @@ where
                     // Only add the doc_id if it's not already present
                     if posting.2.push(doc_id.clone()) {
                         // Calculate size increase for this insertion
-                        size_increase = estimate_cbor_size(&doc_id) + 2;
+                        size_increase = cbor_serialized_size(&doc_id) + 2;
                         posting.1 += 1; // Increment version
                     }
                 }
                 dashmap::Entry::Vacant(entry) => {
                     // Create a new posting for this field value
                     let posting = (bucket_id, 1, vec![doc_id.clone()].into());
-                    size_increase = estimate_cbor_size(&posting) + 2;
+                    size_increase = cbor_serialized_size(&posting) + 2;
                     // Insert the new posting
                     entry.insert(posting);
                     // Remember to add this to the B-tree for range queries
@@ -1073,7 +1080,7 @@ where
 
                 // Newly-created posting; decide whether it stays in this bucket or migrates.
                 let fv_size = if let Some(posting) = self.postings.get(&fv) {
-                    estimate_cbor_size(&posting) + 2
+                    cbor_serialized_size(&posting) + 2
                 } else {
                     // Posting was concurrently removed; nothing more to do.
                     continue;
@@ -1213,7 +1220,7 @@ where
             if let Some(mut posting) = self.postings.get_mut(&field_value) {
                 bucket_id = posting.0;
 
-                let prev_posting_size = estimate_cbor_size(&*posting) + 2;
+                let prev_posting_size = cbor_serialized_size(&*posting) + 2;
 
                 // Check if the document ID exists in the posting
                 if posting.2.swap_remove_if(|id| id == &doc_id).is_some() {
@@ -1222,7 +1229,7 @@ where
                     posting_empty = posting.2.is_empty();
 
                     // Calculate size decrease based on whether this key is fully removed.
-                    doc_size_decrease = estimate_cbor_size(&doc_id) + 2;
+                    doc_size_decrease = cbor_serialized_size(&doc_id) + 2;
                     full_size_decrease = prev_posting_size;
                 }
             }
@@ -1778,7 +1785,7 @@ where
             .postings
             .iter()
             .map(|entry| {
-                let size = estimate_cbor_size(&(entry.key(), entry.value())) + 2;
+                let size = cbor_serialized_size(&(entry.key(), entry.value())) + 2;
                 (entry.key().clone(), size)
             })
             .collect();
@@ -1869,7 +1876,7 @@ where
         }
 
         meta.stats.last_saved = now_ms.max(meta.stats.last_saved);
-        if let Err(err) = ciborium::into_writer(&BTreeIndexRef { metadata: &meta }, w) {
+        if let Err(err) = cbor2::to_writer(&BTreeIndexRef { metadata: &meta }, w) {
             // Serialization failed: try to revert only if no other writer has already
             // advanced this atomic to a newer version.
             let _ = self.last_saved_version.compare_exchange(
@@ -1960,7 +1967,7 @@ where
                     .collect();
 
                 buf.clear();
-                ciborium::into_writer(
+                cbor2::to_writer(
                     &BucketRef {
                         postings: &postings,
                     },
@@ -2120,7 +2127,7 @@ mod tests {
             .filter_map(|fv| index.postings.get(fv).map(|posting| (fv, posting)))
             .collect();
         let mut buf = Vec::new();
-        ciborium::into_writer(
+        cbor2::to_writer(
             &BucketRef {
                 postings: &postings,
             },
@@ -3369,7 +3376,7 @@ mod tests {
 
         let owned = BTreeIndexOwned { metadata: meta };
         let mut buf = Vec::new();
-        ciborium::into_writer(&owned, &mut buf).unwrap();
+        cbor2::to_writer(&owned, &mut buf).unwrap();
 
         let index = BTreeIndex::<u64, String>::load_metadata(&buf[..]).unwrap();
         let result = index.insert(1, "apple".to_string(), now_ms());
@@ -4117,7 +4124,7 @@ mod tests {
         let moving_key = "moving".to_string();
         let previous_posting_size = {
             let posting = index.postings.get(&moving_key).unwrap();
-            estimate_cbor_size(&*posting) + 2
+            cbor_serialized_size(&*posting) + 2
         };
 
         let forced_source_size = {
@@ -4262,7 +4269,7 @@ mod tests {
             },
         };
         let mut metadata_buf = Vec::new();
-        ciborium::into_writer(
+        cbor2::to_writer(
             &BTreeIndexRef {
                 metadata: &metadata,
             },
@@ -4303,7 +4310,7 @@ mod tests {
             },
         };
         let mut metadata_buf = Vec::new();
-        ciborium::into_writer(
+        cbor2::to_writer(
             &BTreeIndexRef {
                 metadata: &metadata,
             },
@@ -4314,7 +4321,7 @@ mod tests {
         let mut old_postings = FxHashMap::default();
         old_postings.insert("same".to_string(), (0, 1, vec![1_u64].into()));
         let mut old_bucket = Vec::new();
-        ciborium::into_writer(
+        cbor2::to_writer(
             &BucketOwned {
                 postings: old_postings,
             },
@@ -4325,7 +4332,7 @@ mod tests {
         let mut new_postings = FxHashMap::default();
         new_postings.insert("same".to_string(), (1, 2, vec![2_u64].into()));
         let mut new_bucket = Vec::new();
-        ciborium::into_writer(
+        cbor2::to_writer(
             &BucketOwned {
                 postings: new_postings,
             },
@@ -4483,7 +4490,7 @@ mod tests {
             },
         };
         let mut buf = Vec::new();
-        ciborium::into_writer(
+        cbor2::to_writer(
             &BTreeIndexRef {
                 metadata: &metadata,
             },

@@ -46,7 +46,7 @@ async fn test_app() -> Router {
 async fn rpc_cbor(app: &Router, path: &str, method: &str, params: Value) -> (StatusCode, Value) {
     let req = json!({"method": method, "params": params});
     let mut body = Vec::new();
-    ciborium::ser::into_writer(&req, &mut body).unwrap();
+    cbor2::ser::to_writer(&req, &mut body).unwrap();
 
     let resp = app
         .clone()
@@ -65,7 +65,7 @@ async fn rpc_cbor(app: &Router, path: &str, method: &str, params: Value) -> (Sta
         "application/cbor"
     );
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    let value: Value = ciborium::de::from_reader(&bytes[..]).unwrap();
+    let value: Value = cbor2::de::from_reader(&bytes[..]).unwrap();
     (status, value)
 }
 
@@ -605,7 +605,7 @@ async fn test_auth() {
 
     let req = json!({"method": "info"});
     let mut body = Vec::new();
-    ciborium::ser::into_writer(&req, &mut body).unwrap();
+    cbor2::ser::to_writer(&req, &mut body).unwrap();
 
     for token in [None, Some("Bearer wrong")] {
         let mut builder = Request::post(format!("/{PRIMARY_DB}"))
@@ -677,12 +677,12 @@ async fn test_encoding_negotiation() {
         "application/cbor"
     );
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    let value: Value = ciborium::de::from_reader(&bytes[..]).unwrap();
+    let value: Value = cbor2::de::from_reader(&bytes[..]).unwrap();
     assert_eq!(value["result"]["name"], "test");
 
     // No Content-Type at all: the body is parsed as CBOR.
     let mut body = Vec::new();
-    ciborium::ser::into_writer(&json!({"method": "info"}), &mut body).unwrap();
+    cbor2::ser::to_writer(&json!({"method": "info"}), &mut body).unwrap();
     let resp = app
         .clone()
         .oneshot(Request::post("/").body(Body::from(body)).unwrap())

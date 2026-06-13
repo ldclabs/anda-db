@@ -85,7 +85,7 @@ impl Encoding {
         match self {
             Encoding::Cbor => {
                 let mut buf = Vec::new();
-                ciborium::ser::into_writer(value, &mut buf)
+                cbor2::ser::to_writer(value, &mut buf)
                     .map_err(|e| ApiError::internal(format!("failed to encode CBOR: {e}")))?;
                 Ok(buf)
             }
@@ -158,7 +158,7 @@ impl RpcRequest {
                     params: Option<Cbor>,
                 }
 
-                let req: Req = ciborium::de::from_reader(body).map_err(|e| {
+                let req: Req = cbor2::de::from_reader(body).map_err(|e| {
                     ApiError::bad_request(format!("failed to parse CBOR request: {e}"))
                 })?;
                 Ok(Self {
@@ -232,7 +232,7 @@ mod tests {
     #[test]
     fn parse_request_defaults_to_cbor() {
         let mut body = Vec::new();
-        ciborium::ser::into_writer(
+        cbor2::ser::to_writer(
             &serde_json::json!({"method": "info", "params": {"a": 1}}),
             &mut body,
         )

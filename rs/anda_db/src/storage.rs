@@ -1,6 +1,6 @@
 use async_compression::tokio::{bufread::ZstdDecoder, write::ZstdEncoder};
 use bytes::Bytes;
-use ciborium::{from_reader, into_writer};
+use cbor2::{from_reader, to_writer};
 use futures::{
     StreamExt, TryStreamExt,
     future::{BoxFuture, FutureExt},
@@ -549,7 +549,7 @@ impl Storage {
 
     /// Creates a new document in the object store. Fails if the document already exists.
     ///
-    /// Serializes the document using `ciborium` and compresses it if enabled.
+    /// Serializes the document using `cbor2` and compresses it if enabled.
     /// This method is suitable only for objects smaller than `max_small_object_size`.
     ///
     /// # Arguments
@@ -567,7 +567,7 @@ impl Storage {
         let path = self.full_path(doc_path);
         let mut buf: Vec<u8> = Vec::new();
 
-        into_writer(doc, &mut buf).map_err(|err| DBError::Serialization {
+        to_writer(doc, &mut buf).map_err(|err| DBError::Serialization {
             name: self.inner.base_path.to_string(),
             source: err.into(),
         })?;
@@ -577,7 +577,7 @@ impl Storage {
 
     /// Puts (creates or overwrites/updates) a document in the object store.
     ///
-    /// Serializes the document using `ciborium` and compresses it if enabled.
+    /// Serializes the document using `cbor2` and compresses it if enabled.
     /// This method is suitable only for objects smaller than `max_small_object_size`.
     /// Use `stream_writer` for larger objects.
     ///
@@ -602,7 +602,7 @@ impl Storage {
         let path = self.full_path(doc_path);
         let mut buf: Vec<u8> = Vec::new();
 
-        into_writer(doc, &mut buf).map_err(|err| DBError::Serialization {
+        to_writer(doc, &mut buf).map_err(|err| DBError::Serialization {
             name: self.inner.base_path.to_string(),
             source: err.into(),
         })?;

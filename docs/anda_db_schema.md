@@ -43,7 +43,7 @@
 These primitives are designed for two concurrent goals:
 
 - **Compact, deterministic on-disk format** — values are normalized into
-  CBOR (via [`ciborium`](https://docs.rs/ciborium)), and `FieldEntry`/`Schema`
+  CBOR (via [`cbor2`](https://docs.rs/cbor2)), and `FieldEntry`/`Schema`
   serialize their keys to single letters to keep records small.
 - **Self-describing dynamic typing** — the closed `FieldType` enum lets
   the database accept arbitrary user structs while still validating every
@@ -183,7 +183,7 @@ pub static BYTES_WILDCARD_KEY: LazyLock<FieldKey>; // b"*"
 ```
 
 Convertible from `String`, `&str`, `Vec<u8>`, `[u8; N]`, `&[u8]`, and
-`ciborium::Value` (text or bytes).
+`cbor2::Value` (text or bytes).
 
 ### 2.5 Field name rules
 
@@ -695,7 +695,7 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 | `Ft`                 | `FieldType`                                |
 | `Fv`                 | `FieldValue`                               |
 | `Fe`                 | `FieldEntry`                               |
-| `Cbor`               | `ciborium::Value`                          |
+| `Cbor`               | `cbor2::Value`                            |
 | `Json`               | `serde_json::Value`                        |
 | `Map<K, V>`          | `serde_json::Map<K, V>`                    |
 | `Vector`             | `Vec<bf16>`                                |

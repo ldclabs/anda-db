@@ -1,6 +1,6 @@
 use anda_db_btree::BTreeIndex;
 use bytes::Bytes;
-use ciborium::from_reader;
+use cbor2::from_reader;
 use ic_auth_types::{ByteBufB64, deterministic_cbor_into_vec};
 use parking_lot::RwLock;
 use serde::{Serialize, de::DeserializeOwned};

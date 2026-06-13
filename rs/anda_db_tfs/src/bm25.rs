@@ -4,7 +4,7 @@
 //! index that backs the crate. See the crate-level documentation for a
 //! high-level overview.
 
-use anda_db_utils::{UniqueVec, estimate_cbor_size};
+use anda_db_utils::UniqueVec;
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
@@ -17,6 +17,13 @@ use std::{
 use crate::error::*;
 use crate::query::*;
 use crate::tokenizer::*;
+
+fn cbor_serialized_size<T: ?Sized + Serialize>(value: &T) -> usize {
+    cbor2::serialized_size(value)
+        .expect("CBOR serialized size calculation failed")
+        .try_into()
+        .expect("CBOR serialized size exceeds usize")
+}
 
 /// Concurrent, bucket-sharded full-text index using BM25 scoring.
 ///
@@ -334,7 +341,7 @@ where
     /// index (possibly on demand, or only for a subset of buckets).
     pub fn load_metadata<R: Read>(tokenizer: T, r: R) -> Result<Self, BM25Error> {
         let index: BM25IndexOwned =
-            ciborium::from_reader(r).map_err(|err| BM25Error::Serialization {
+            cbor2::from_reader(r).map_err(|err| BM25Error::Serialization {
                 name: "unknown".to_string(),
                 source: err.into(),
             })?;
@@ -395,7 +402,7 @@ where
             })?;
             if let Some(data) = data {
                 let bucket: BucketOwned =
-                    ciborium::from_reader(&data[..]).map_err(|err| BM25Error::Serialization {
+                    cbor2::from_reader(&data[..]).map_err(|err| BM25Error::Serialization {
                         name: self.name.clone(),
                         source: err.into(),
                     })?;
@@ -428,7 +435,7 @@ where
                                     .swap_remove_if(|k| &token == k)
                                     .is_some()
                             {
-                                let previous_size = estimate_cbor_size(&(&token, &previous)) + 2;
+                                let previous_size = cbor_serialized_size(&(&token, &previous)) + 2;
                                 previous_bucket.size =
                                     previous_bucket.size.saturating_sub(previous_size);
                                 previous_bucket.mark_dirty();
@@ -473,11 +480,11 @@ where
             if !removed_entries.is_empty() {
                 let size_decrease = if posting.1.is_empty() {
                     empty_tokens.push((bucket_id, posting.key().clone()));
-                    estimate_cbor_size(&(posting.key(), (bucket_id, &removed_entries))) + 2
+                    cbor_serialized_size(&(posting.key(), (bucket_id, &removed_entries))) + 2
                 } else {
                     removed_entries
                         .iter()
-                        .map(|entry| estimate_cbor_size(entry) + 2)
+                        .map(|entry| cbor_serialized_size(entry) + 2)
                         .sum()
                 };
                 *bucket_size_decrease.entry(bucket_id).or_default() += size_decrease;
@@ -648,7 +655,7 @@ where
                             // still mark the bucket dirty below so the refreshed
                             // doc_tokens snapshot gets persisted.
                             let size_increase = if e.1.push(val) {
-                                estimate_cbor_size(&val) + 2
+                                cbor_serialized_size(&val) + 2
                             } else {
                                 0
                             };
@@ -659,7 +666,7 @@ where
                             // Create new posting
                             let val = (bucket_id, vec![(id, freq)].into());
                             let size_increase =
-                                estimate_cbor_size(&(&token, (bucket_id, &[(id, freq)]))) + 2;
+                                cbor_serialized_size(&(&token, (bucket_id, &[(id, freq)]))) + 2;
                             entry.insert(val);
                             let b = buckets_to_update.entry(bucket_id).or_default();
                             b.insert(token, size_increase);
@@ -819,11 +826,11 @@ where
 
                 let size_decrease = if posting.1.is_empty() {
                     maybe_empty_tokens.push(token.clone());
-                    estimate_cbor_size(&(&token, (posting.0, &removed_vals))) + 2
+                    cbor_serialized_size(&(&token, (posting.0, &removed_vals))) + 2
                 } else {
                     removed_vals
                         .iter()
-                        .map(|val| estimate_cbor_size(val) + 2)
+                        .map(|val| cbor_serialized_size(val) + 2)
                         .sum()
                 };
                 let b = buckets_to_update.entry(posting.0).or_default();
@@ -1250,7 +1257,7 @@ where
             .postings
             .iter()
             .map(|entry| {
-                let size = estimate_cbor_size(&(entry.key(), entry.value())) + 2;
+                let size = cbor_serialized_size(&(entry.key(), entry.value())) + 2;
                 (entry.key().clone(), size)
             })
             .collect();
@@ -1379,7 +1386,7 @@ where
 
         meta.stats.last_saved = now_ms.max(meta.stats.last_saved);
 
-        if let Err(err) = ciborium::into_writer(&BM25IndexRef { metadata: &meta }, w) {
+        if let Err(err) = cbor2::to_writer(&BM25IndexRef { metadata: &meta }, w) {
             // Serialization failed: revert only if this call still owns the claimed version.
             let _ = self.last_saved_version.compare_exchange(
                 meta.stats.version,
@@ -1446,7 +1453,7 @@ where
                     .collect();
 
                 buf.clear();
-                ciborium::into_writer(
+                cbor2::to_writer(
                     &BucketRef {
                         postings: &postings,
                         doc_tokens: &doc_tokens,
@@ -1542,7 +1549,7 @@ mod tests {
         doc_tokens: FxHashMap<u64, usize>,
     ) -> Vec<u8> {
         let mut buf = Vec::new();
-        ciborium::into_writer(
+        cbor2::to_writer(
             &BucketOwned {
                 postings,
                 doc_tokens,
@@ -1650,7 +1657,7 @@ mod tests {
         metadata.stats.version += 1;
         metadata.stats.max_bucket_id = 1;
         let mut metadata_buf = Vec::new();
-        ciborium::into_writer(
+        cbor2::to_writer(
             &BM25IndexRef {
                 metadata: &metadata,
             },
@@ -1693,7 +1700,7 @@ mod tests {
             .unwrap();
 
         let repaired_bucket0: BucketOwned =
-            ciborium::from_reader(&repaired_buckets.get(&0).unwrap()[..]).unwrap();
+            cbor2::from_reader(&repaired_buckets.get(&0).unwrap()[..]).unwrap();
         assert!(repaired_bucket0.postings.is_empty());
         assert!(repaired_bucket0.doc_tokens.is_empty());
 
@@ -1801,7 +1808,7 @@ mod tests {
             .await
             .unwrap();
         for data in buckets.values() {
-            let bucket: BucketOwned = ciborium::from_reader(&data[..]).unwrap();
+            let bucket: BucketOwned = cbor2::from_reader(&data[..]).unwrap();
             assert!(bucket.postings.is_empty());
             assert!(bucket.doc_tokens.is_empty());
         }
@@ -2284,7 +2291,7 @@ mod tests {
 
         // 验证每个桶的内容
         for (bucket_id, data) in &buckets {
-            let bucket: BucketOwned = ciborium::from_reader(&data[..]).unwrap();
+            let bucket: BucketOwned = cbor2::from_reader(&data[..]).unwrap();
             println!("Document bucket {bucket_id} {:?}", bucket.doc_tokens);
             assert!(!bucket.postings.is_empty());
 

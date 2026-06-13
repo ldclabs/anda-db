@@ -287,7 +287,7 @@ pub struct HnswNode {
 /// external tools that snapshot individual nodes.
 pub fn serialize_node(node: &HnswNode) -> Vec<u8> {
     let mut buf = Vec::new();
-    ciborium::into_writer(node, &mut buf).expect("Failed to serialize node");
+    cbor2::to_writer(node, &mut buf).expect("Failed to serialize node");
     buf
 }
 
@@ -440,7 +440,7 @@ impl HnswIndex {
     /// * `Result<Self, HnswError>` - Loaded index or error.
     pub fn load_metadata<R: Read>(r: R) -> Result<Self, HnswError> {
         let mut index: HnswIndexOwned =
-            ciborium::from_reader(r).map_err(|err| HnswError::Serialization {
+            cbor2::from_reader(r).map_err(|err| HnswError::Serialization {
                 name: "unknown".to_string(),
                 source: err.into(),
             })?;
@@ -483,7 +483,7 @@ impl HnswIndex {
     ///
     /// * `Result<(), HnswError>` - Ok(()) if successful, or an error.
     pub fn load_ids<R: Read>(&mut self, r: R) -> Result<(), HnswError> {
-        let ids: Vec<u8> = ciborium::from_reader(r).map_err(|err| HnswError::Serialization {
+        let ids: Vec<u8> = cbor2::from_reader(r).map_err(|err| HnswError::Serialization {
             name: self.name.clone(),
             source: err.into(),
         })?;
@@ -537,7 +537,7 @@ impl HnswIndex {
             .map(|id| async move {
                 match f_ref(id).await {
                     Ok(Some(data)) => {
-                        let node: HnswNode = ciborium::from_reader(&data[..]).map_err(|err| {
+                        let node: HnswNode = cbor2::from_reader(&data[..]).map_err(|err| {
                             HnswError::Serialization {
                                 name: name.clone(),
                                 source: err.into(),
@@ -1631,7 +1631,7 @@ impl HnswIndex {
         }
 
         meta.stats.last_saved = now_ms.max(meta.stats.last_saved);
-        if let Err(err) = ciborium::into_writer(
+        if let Err(err) = cbor2::to_writer(
             &HnswIndexRef {
                 entry_point: *self.entry_point.read(),
                 metadata: &meta,
@@ -1675,11 +1675,9 @@ impl HnswIndex {
             ids.serialize::<Portable>()
         };
 
-        ciborium::into_writer(&ciborium::Value::Bytes(data), w).map_err(|err| {
-            HnswError::Serialization {
-                name: self.name.clone(),
-                source: err.into(),
-            }
+        cbor2::to_writer(&cbor2::Value::Bytes(data), w).map_err(|err| HnswError::Serialization {
+            name: self.name.clone(),
+            source: err.into(),
         })
     }
 
@@ -1714,11 +1712,9 @@ impl HnswIndex {
                 let nodes = self.nodes.pin();
                 if let Some(node) = nodes.get(&id) {
                     buf.clear();
-                    ciborium::into_writer(&node, &mut buf).map_err(|err| {
-                        HnswError::Serialization {
-                            name: self.name.clone(),
-                            source: err.into(),
-                        }
+                    cbor2::to_writer(&node, &mut buf).map_err(|err| HnswError::Serialization {
+                        name: self.name.clone(),
+                        source: err.into(),
                     })?;
                     true
                 } else {
@@ -1866,7 +1862,7 @@ mod tests {
 
     fn metadata_bytes(metadata: &HnswMetadata, entry_point: (u64, u8)) -> Vec<u8> {
         let mut buf = Vec::new();
-        ciborium::into_writer(
+        cbor2::to_writer(
             &HnswIndexRef {
                 entry_point,
                 metadata,
@@ -2191,7 +2187,7 @@ mod tests {
         assert_eq!(ids.into_iter().collect::<Vec<_>>(), vec![1, 2, 3, 4, 5]);
 
         let data = index.get_node_with(1, serialize_node).unwrap();
-        let node: HnswNode = ciborium::from_reader(&data[..]).unwrap();
+        let node: HnswNode = cbor2::from_reader(&data[..]).unwrap();
         println!("Node data: {node:?}");
         assert_eq!(node.vector, vec![bf16::from_f32(1.0), bf16::from_f32(1.0)]);
         assert!(!node.neighbors[0].is_empty());
@@ -2907,7 +2903,7 @@ mod tests {
         ));
 
         let mut invalid_bitmap = Vec::new();
-        ciborium::into_writer(&ciborium::Value::Bytes(vec![1, 2, 3]), &mut invalid_bitmap).unwrap();
+        cbor2::to_writer(&cbor2::Value::Bytes(vec![1, 2, 3]), &mut invalid_bitmap).unwrap();
         assert!(matches!(
             loaded.load_ids(&invalid_bitmap[..]),
             Err(HnswError::Generic { .. })

@@ -361,8 +361,8 @@ mod tests {
         U: for<'de> de::Deserialize<'de>,
     {
         let mut bytes = Vec::new();
-        ciborium::into_writer(value, &mut bytes).unwrap();
-        ciborium::from_reader(bytes.as_slice()).unwrap()
+        cbor2::to_writer(value, &mut bytes).unwrap();
+        cbor2::from_reader(bytes.as_slice()).unwrap()
     }
 
     #[test]

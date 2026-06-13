@@ -10,10 +10,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dfinity/setup-dfx@main
-      - name: Run tests
+      - name: Run clippy
         run: |
           cargo clippy --verbose --all-targets --all-features
-          cargo test --verbose --workspace --all-features --exclude anda_cognitive_nexus_py -- --nocapture
+      - name: Install fuzzing tools
+        run: |
+          rustup toolchain install nightly --profile minimal
+          cargo install cargo-fuzz --locked
+      - name: Run full test suite
+        run: |
+          make test-all
   coverage:
     # Coverage is informational (no threshold gate): it surfaces untested
     # branches in core paths; quality is enforced by the test suites themselves.

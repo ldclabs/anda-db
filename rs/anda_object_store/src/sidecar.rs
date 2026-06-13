@@ -16,7 +16,7 @@
 //! `conditional_put` switch is enabled — the listing helpers surface that
 //! switch as their `with_logical_e_tag` parameter.
 
-use ciborium::{from_reader, into_writer};
+use cbor2::{from_reader, to_writer};
 use futures::{StreamExt, TryStreamExt, stream::BoxStream};
 use moka::{future::Cache, ops::compute::Op};
 use object_store::{path::Path, *};
@@ -123,7 +123,7 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
     pub(crate) async fn put_meta(&self, location: &Path, meta: M) -> Result<PutResult> {
         let meta_path = self.meta_path(location);
         let mut data = Vec::new();
-        into_writer(&meta, &mut data).map_err(|err| Error::Generic {
+        to_writer(&meta, &mut data).map_err(|err| Error::Generic {
             store: M::STORE_NAME,
             source: format!("Failed to serialize Metadata for path {location}: {err:?}").into(),
         })?;
@@ -166,7 +166,7 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
 
                 let meta_path = self.meta_path(location);
                 let mut data = Vec::new();
-                into_writer(&val, &mut data).map_err(|err| Error::Generic {
+                to_writer(&val, &mut data).map_err(|err| Error::Generic {
                     store: M::STORE_NAME,
                     source: format!("Failed to serialize Metadata for path {location}: {err:?}")
                         .into(),

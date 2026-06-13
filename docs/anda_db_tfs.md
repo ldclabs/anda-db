@@ -227,7 +227,7 @@ pub enum BM25Error {
 }
 ```
 
-`Generic` is used for errors returned by I/O closures; `Serialization` wraps `ciborium` failures; `AlreadyExists` and `TokenizeFailed` occur during `insert`; `NotFound` is left to upper-layer APIs for idempotent validation.
+`Generic` is used for errors returned by I/O closures; `Serialization` wraps `cbor2` failures; `AlreadyExists` and `TokenizeFailed` occur during `insert`; `NotFound` is left to upper-layer APIs for idempotent validation.
 
 ---
 

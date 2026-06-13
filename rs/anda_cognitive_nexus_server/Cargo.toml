@@ -1,6 +1,6 @@
 [package]
 name = "anda_cognitive_nexus_server"
-version = "0.1.5"
+version = "0.8.0"
 description = "A HTTP server for the Anda Cognitive Nexus, facilitating knowledge interaction via KIP."
 categories = ["database", "data-structures", "text-processing"]
 repository = "https://github.com/ldclabs/anda_db/tree/main/rs/anda_cognitive_nexus_server"
@@ -9,11 +9,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-anda_db_schema = { version = "0.4", path = "../anda_db_schema" }
+anda_db_schema = { version = "0.8", path = "../anda_db_schema" }
 anda_kip = { version = "0.8", path = "../anda_kip" }
 anda_db = { version = "0.8", path = "../anda_db", features = ["full"] }
 anda_cognitive_nexus = { version = "0.8", path = "../anda_cognitive_nexus" }
-anda_object_store = { version = "0.3", path = "../anda_object_store" }
+anda_object_store = { version = "0.8", path = "../anda_object_store" }
 axum = { workspace = true }
 clap = { workspace = true }
 dotenv = { workspace = true }

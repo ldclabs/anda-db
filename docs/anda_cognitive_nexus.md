@@ -134,9 +134,9 @@ mutate through KQL/KML/META instructions.
 ```toml
 [dependencies]
 anda_cognitive_nexus = "0.8"
-anda_db = "0.7"
+anda_db = "0.8"
 anda_kip = "0.8"
-object_store = "0.11"
+object_store = "0.13"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -215,15 +215,15 @@ rs/anda_cognitive_nexus/
 
 | Module           | Responsibility                                                                                                                                                                                                                                                                                                                                            |
 | :--------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `db/mod.rs`      | The `CognitiveNexus` struct and `Executor` impl, `connect` with bundled-capsule hash sync, public helpers (`has_concept`, `get_concept`, `capsule_version`, …), command dispatch (`execute_kql` / `execute_kml` / `execute_meta`), shared row-cache accessors and identity lookups (`query_concept_id`, …).                                              |
+| `db/mod.rs`      | The `CognitiveNexus` struct and `Executor` impl, `connect` with bundled-capsule hash sync, public helpers (`has_concept`, `get_concept`, `capsule_version`, …), command dispatch (`execute_kql` / `execute_kml` / `execute_meta`), shared row-cache accessors and identity lookups (`query_concept_id`, …).                                               |
 | `db/kql.rs`      | WHERE-clause sub-executors (concept / proposition / `FILTER` / `NOT` / `OPTIONAL` / `UNION`), filter expression evaluation, and `FIND` projection with grouping, aggregation, `ORDER BY` and cursor pagination.                                                                                                                                           |
 | `db/matching.rs` | Proposition pattern matching against the `propositions` collection, multi-hop BFS traversal, and target-term resolution.                                                                                                                                                                                                                                  |
 | `db/kml.rs`      | `UPSERT` (with `EXPECT VERSION` guards), `UPDATE`, `MERGE`, `DELETE` pipelines, protected-scope checks, and the engine-maintained `_version` / `_updated_at` bookkeeping.                                                                                                                                                                                 |
 | `db/meta.rs`     | `DESCRIBE` introspection, BM25-backed `SEARCH` with transient `_score`, and `EXPORT` capsule generation.                                                                                                                                                                                                                                                  |
-| `entity.rs` | Persisted graph data model. `Concept` carries `{type, name, attributes, metadata}`; `Proposition` carries `{subject, object, predicates, properties}`; `Properties` is a compact `{a, m}` shape (renamed via serde) shared by per-predicate attribute/metadata storage; `EntityID` is the canonical reference encoding (`C:{id}` / `P:{id}:{predicate}`). |
-| `helper.rs` | Pure helpers: extract a field value from a `Concept` / `Proposition`, sort result rows by `ORDER BY`, match a predicate descriptor against a stored proposition row, map `DBError` → `KipError`, and a `FilterExpressionExt` trait that distinguishes selective vs. open filter shapes for query planning.                                                |
-| `types.rs`  | Execution scaffolding. `ConceptPK` / `PropositionPK` / `EntityPK` are typed primary-key shapes; `QueryContext` carries variable bindings and the per-query cache; `QueryCache` deduplicates row loads inside one execution; `TargetEntities` is the result of resolving the `target` clause of a `DELETE`; `GraphPath` records multi-hop traversals.      |
-| `lib.rs`    | Re-exports the public API of the modules above and contains the crate-level docs.                                                                                                                                                                                                                                                                         |
+| `entity.rs`      | Persisted graph data model. `Concept` carries `{type, name, attributes, metadata}`; `Proposition` carries `{subject, object, predicates, properties}`; `Properties` is a compact `{a, m}` shape (renamed via serde) shared by per-predicate attribute/metadata storage; `EntityID` is the canonical reference encoding (`C:{id}` / `P:{id}:{predicate}`). |
+| `helper.rs`      | Pure helpers: extract a field value from a `Concept` / `Proposition`, sort result rows by `ORDER BY`, match a predicate descriptor against a stored proposition row, map `DBError` → `KipError`, and a `FilterExpressionExt` trait that distinguishes selective vs. open filter shapes for query planning.                                                |
+| `types.rs`       | Execution scaffolding. `ConceptPK` / `PropositionPK` / `EntityPK` are typed primary-key shapes; `QueryContext` carries variable bindings and the per-query cache; `QueryCache` deduplicates row loads inside one execution; `TargetEntities` is the result of resolving the `target` clause of a `DELETE`; `GraphPath` records multi-hop traversals.      |
+| `lib.rs`         | Re-exports the public API of the modules above and contains the crate-level docs.                                                                                                                                                                                                                                                                         |
 
 ---
 
@@ -641,17 +641,17 @@ When the caller passes `dry_run = true`:
 
 ## 10. Executing META
 
-| Sub-command                          | Implementation                                                                                                                                 |
-| :----------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------- |
-| `DESCRIBE PRIMER`                    | `execute_describe_primer` — projects `(Person, $self)` plus core domain anchors. Returns a single JSON object; `next_cursor` is always `None`. |
-| `DESCRIBE DOMAINS`                   | `execute_describe_domains` — enumerates `Domain` concepts. `next_cursor` is always `None`.                                                     |
-| `DESCRIBE CONCEPT TYPES`             | `execute_describe_concept_types` — returns sorted registered `$ConceptType` names; the cursor is the last emitted name.                        |
-| `DESCRIBE CONCEPT TYPE "..."`        | `execute_describe_concept_type` — returns the `ConceptInfo` projection for one `$ConceptType` definition.                                      |
-| `DESCRIBE PROPOSITION TYPES`         | `execute_describe_proposition_types` — returns sorted registered `$PropositionType` names; the cursor is the last emitted name.                |
-| `DESCRIBE PROPOSITION TYPE "..."`    | `execute_describe_proposition_type` — returns the `ConceptInfo` projection for one `$PropositionType` definition.                              |
-| `SEARCH CONCEPT "..." […]`           | BM25 over `concepts.["name", "attributes", "metadata"]`. Hits carry the transient `metadata._score` (normalized, descending); `THRESHOLD` drops weak hits; `MODE "semantic"`/`"hybrid"` degrade to keyword (no embedding store). |
-| `SEARCH PROPOSITION "..." […]`       | BM25 over `propositions.["predicates", "properties"]`, post-pruned per predicate (and by `WITH TYPE`); same `_score` / `THRESHOLD` semantics.  |
-| `EXPORT ?t WHERE { … } [LIMIT N]`    | `execute_export` — serializes matched concepts/links into an idempotent `UPSERT` capsule: in-set endpoints become local handles, out-of-set endpoints become `{type, name}` / nested clauses, and reserved `_` metadata is stripped. |
+| Sub-command                       | Implementation                                                                                                                                                                                                                       |
+| :-------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DESCRIBE PRIMER`                 | `execute_describe_primer` — projects `(Person, $self)` plus core domain anchors. Returns a single JSON object; `next_cursor` is always `None`.                                                                                       |
+| `DESCRIBE DOMAINS`                | `execute_describe_domains` — enumerates `Domain` concepts. `next_cursor` is always `None`.                                                                                                                                           |
+| `DESCRIBE CONCEPT TYPES`          | `execute_describe_concept_types` — returns sorted registered `$ConceptType` names; the cursor is the last emitted name.                                                                                                              |
+| `DESCRIBE CONCEPT TYPE "..."`     | `execute_describe_concept_type` — returns the `ConceptInfo` projection for one `$ConceptType` definition.                                                                                                                            |
+| `DESCRIBE PROPOSITION TYPES`      | `execute_describe_proposition_types` — returns sorted registered `$PropositionType` names; the cursor is the last emitted name.                                                                                                      |
+| `DESCRIBE PROPOSITION TYPE "..."` | `execute_describe_proposition_type` — returns the `ConceptInfo` projection for one `$PropositionType` definition.                                                                                                                    |
+| `SEARCH CONCEPT "..." […]`        | BM25 over `concepts.["name", "attributes", "metadata"]`. Hits carry the transient `metadata._score` (normalized, descending); `THRESHOLD` drops weak hits; `MODE "semantic"`/`"hybrid"` degrade to keyword (no embedding store).     |
+| `SEARCH PROPOSITION "..." […]`    | BM25 over `propositions.["predicates", "properties"]`, post-pruned per predicate (and by `WITH TYPE`); same `_score` / `THRESHOLD` semantics.                                                                                        |
+| `EXPORT ?t WHERE { … } [LIMIT N]` | `execute_export` — serializes matched concepts/links into an idempotent `UPSERT` capsule: in-set endpoints become local handles, out-of-set endpoints become `{type, name}` / nested clauses, and reserved `_` metadata is stripped. |
 
 ---
 
@@ -725,10 +725,10 @@ which is gated behind a feature flag in this workspace.
 | Component         | Version pinned                                                                     |
 | :---------------- | :--------------------------------------------------------------------------------- |
 | KIP specification | `v1.0` Release Candidate (see [SPECIFICATION.md](../rs/anda_kip/SPECIFICATION.md)) |
-| `anda_kip` crate  | `0.8.x`                                                                             |
-| `anda_db` crate   | `0.7.x`                                                                             |
-| Rust edition      | 2024 (workspace-default; `async fn` in traits, `let-else`, …)                       |
-| Tokio             | `1.x` with `sync` and `rt-multi-thread`                                             |
+| `anda_kip` crate  | `0.8.x`                                                                            |
+| `anda_db` crate   | `0.7.x`                                                                            |
+| Rust edition      | 2024 (workspace-default; `async fn` in traits, `let-else`, …)                      |
+| Tokio             | `1.x` with `sync` and `rt-multi-thread`                                            |
 
 Release Candidate features explicitly verified by the test suite:
 zero-hop `{0,n}` repetitions, `FILTER` with `IN` / `IS_NULL` /

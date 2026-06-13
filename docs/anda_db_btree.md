@@ -752,5 +752,5 @@ The implementation upholds the following invariants; tests in
 - Source: [rs/anda_db_btree](../rs/anda_db_btree)
 - Module overview: [rs/anda_db_btree/src/btree.rs](../rs/anda_db_btree/src/btree.rs)
 - Example: [rs/anda_db_btree/examples/btree_demo.rs](../rs/anda_db_btree/examples/btree_demo.rs)
-- Utilities: `UniqueVec`, `estimate_cbor_size` in
-  [rs/anda_db_utils](../rs/anda_db_utils)
+- Utilities: `UniqueVec` in [rs/anda_db_utils](../rs/anda_db_utils);
+  CBOR size accounting uses `cbor2::serialized_size`.

@@ -9,8 +9,6 @@ reusable building blocks used by indexing, persistence, and supporting code.
 - `UniqueVec<T>` for ordered unique collections
 - `Pipe` for lightweight functional-style chaining
 - `CountingWriter` for byte-counting during serialization workflows
-- `estimate_cbor_size` / `try_estimate_cbor_size` for CBOR size estimation
-	without buffers
 - small helper primitives reused by multiple workspace crates
 
 ## When to Use It
@@ -18,7 +16,6 @@ reusable building blocks used by indexing, persistence, and supporting code.
 Use `anda_db_utils` when you need:
 
 - deterministic uniqueness with vector-like iteration order
-- serialization size estimation without materializing full output buffers
 - a small utility dependency shared with the rest of the AndaDB stack
 
 ## Getting Started
@@ -27,7 +24,7 @@ Add the crate to your project:
 
 ```toml
 [dependencies]
-anda_db_utils = "0.2"
+anda_db_utils = "0.8"
 ```
 
 This crate is most often consumed indirectly through higher-level workspace
