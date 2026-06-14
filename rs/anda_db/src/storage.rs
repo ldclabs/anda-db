@@ -39,14 +39,6 @@ struct InnerStorage {
     object_store: Arc<dyn ObjectStore>,
     /// Base path for all documents within the object store.
     base_path: Path,
-    // /// Zstd compression level (0 for no compression, 1-22).
-    // compress_level: i32,
-    // /// Chunk size for buffered reading/writing, streaming operations and encryption.
-    // /// Cannot changed after initialization.
-    // object_chunk_size: usize,
-    // /// Maximum object size (in bytes) that can be stored using a single `put` operation.
-    // /// Objects larger than this size must be written using `stream_writer`.
-    // max_small_object_size: usize,
     /// Atomic storage statistics.
     stats: StorageStatsAtomic,
     /// Storage metadata (configuration and non-atomic stats).
@@ -669,7 +661,7 @@ impl Storage {
     /// # Arguments
     ///
     /// * `doc_path` - The relative path of the object.
-    pub fn stream_writer(&self, doc_path: &str) -> Pin<Box<dyn tokio::io::AsyncWrite>> {
+    pub fn stream_writer(&self, doc_path: &str) -> Pin<Box<dyn tokio::io::AsyncWrite + Send>> {
         let path = self.full_path(doc_path);
         let writer = BufWriter::with_capacity(
             self.inner.object_store.clone(),
@@ -678,10 +670,16 @@ impl Storage {
         );
 
         let level = async_compression::Level::Precise(self.inner.metadata.config.compress_level);
+        // Coerce both branches to the same `Send` trait-object type so the writer
+        // can be held across await points and moved into spawned tasks, mirroring
+        // `stream_reader`.
         if self.inner.metadata.config.compress_level > 0 {
-            Box::pin(ZstdEncoder::with_quality(writer, level))
+            let w: Pin<Box<dyn tokio::io::AsyncWrite + Send>> =
+                Box::pin(ZstdEncoder::with_quality(writer, level));
+            w
         } else {
-            Box::pin(writer)
+            let w: Pin<Box<dyn tokio::io::AsyncWrite + Send>> = Box::pin(writer);
+            w
         }
     }
 
@@ -1048,8 +1046,11 @@ fn streaming_decompress(data: &[u8], max_size: u64) -> Result<Vec<u8>, String> {
     let mut dctx = zstd_safe::DCtx::create();
     dctx.init().map_err(|e| format!("DCtx::init: {e:?}"))?;
 
-    // Start with a reasonable guess; we'll grow as needed.
-    let initial = (data.len().saturating_mul(4)).clamp(64 * 1024, 4 * 1024 * 1024);
+    // Start with a reasonable guess; we'll grow as needed. Never pre-allocate
+    // beyond `max_size`, so a tiny limit doesn't trigger a large allocation.
+    let initial = (data.len().saturating_mul(4))
+        .clamp(64 * 1024, 4 * 1024 * 1024)
+        .min(max_size.saturating_add(1).min(usize::MAX as u64) as usize);
     let mut out: Vec<u8> = Vec::with_capacity(initial);
     let mut in_buf = zstd_safe::InBuffer::around(data);
 
@@ -1060,10 +1061,13 @@ fn streaming_decompress(data: &[u8], max_size: u64) -> Result<Vec<u8>, String> {
             let new_cap = out.capacity().saturating_mul(2).max(64 * 1024);
             let cap = (new_cap as u64).min(max_size.saturating_add(1)) as usize;
             if cap <= out.len() {
-                return Err(format!("decompressed output exceeds max_size {max_size}",));
+                return Err(format!("decompressed output exceeds max_size {max_size}"));
             }
             out.reserve(cap - out.len());
         }
+
+        let in_pos_before = in_buf.pos();
+        let out_len_before = out.len();
 
         let cur_len = out.len();
         let mut out_buf = zstd_safe::OutBuffer::around_pos(&mut out, cur_len);
@@ -1080,17 +1084,22 @@ fn streaming_decompress(data: &[u8], max_size: u64) -> Result<Vec<u8>, String> {
         }
 
         if (out.len() as u64) > max_size {
-            return Err(format!("decompressed output exceeds max_size {max_size}",));
+            return Err(format!("decompressed output exceeds max_size {max_size}"));
         }
 
-        // Done when zstd reports a complete frame (hint == 0) and input drained.
-        if hint == 0 && in_buf.pos() == data.len() {
+        // A complete frame is reached when zstd no longer asks for more input.
+        // Any trailing bytes after the frame are ignored.
+        if hint == 0 {
             return Ok(out);
         }
-        // No forward progress and input fully consumed: avoid infinite loop.
-        if hint == 0 && in_buf.pos() < data.len() {
-            // Trailing data after a frame — treat as success and return what we got.
-            return Ok(out);
+
+        // The frame is incomplete but this iteration made no forward progress
+        // (no input consumed and no output produced). This happens when the
+        // input is exhausted mid-frame (truncated/corrupt data); bail out
+        // instead of spinning forever. Spare output capacity is guaranteed by
+        // the grow step above, so a stall can only be caused by missing input.
+        if in_buf.pos() == in_pos_before && out.len() == out_len_before {
+            return Err("incomplete zstd frame: input exhausted before end of stream".to_string());
         }
     }
 }
@@ -1532,6 +1541,11 @@ mod tests {
         assert!(streaming_decompress(compressed.as_ref(), u64::MAX).is_ok());
         assert!(streaming_decompress(compressed.as_ref(), 1).is_err());
         assert!(!zstd_compressed(b"abc"));
+
+        // A truncated frame must terminate with an error instead of spinning
+        // forever: the input drains mid-frame while zstd still expects more.
+        let truncated = &compressed[..compressed.len() / 2];
+        assert!(streaming_decompress(truncated, u64::MAX).is_err());
     }
 
     #[tokio::test]

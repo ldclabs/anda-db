@@ -1,10 +1,10 @@
 [package]
 name = "anda_object_store"
-version = "0.8.0"
+version = "0.8.2"
 description = "A Rust library that extends the functionality of the object_store crate with metadata management and encryption."
 keywords = ["database", "object_store", "encryption", "anda", "AndaDB"]
 categories = ["database", "data-structures", "text-processing"]
-repository = "https://github.com/ldclabs/anda_db/tree/main/rs/anda_object_store"
+repository = "https://github.com/ldclabs/anda-db/tree/main/rs/anda_object_store"
 publish = true
 edition.workspace = true
 license.workspace = true

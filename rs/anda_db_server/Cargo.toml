@@ -1,9 +1,9 @@
 [package]
 name = "anda_db_server"
-version = "0.8.0"
+version = "0.8.2"
 description = "An HTTP server for Anda DB with a CBOR-first RPC API (JSON supported)."
 categories = ["database", "data-structures", "web-programming"]
-repository = "https://github.com/ldclabs/anda_db/tree/main/rs/anda_db_server"
+repository = "https://github.com/ldclabs/anda-db/tree/main/rs/anda_db_server"
 publish = false
 edition.workspace = true
 license.workspace = true

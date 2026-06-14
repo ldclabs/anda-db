@@ -2,6 +2,23 @@
 
 All notable changes to this workspace are documented in this file.
 
+## [0.8.2] — 2026-06-14
+
+### Changed
+
+- **Workspace crates aligned for the 0.8.2 release** — Bumped the published Rust crates to `0.8.2` and kept internal workspace dependency requirements on the matching `0.8` line.
+- **Repository metadata normalized** — Updated Cargo package repository and homepage URLs from the old `anda_db` path to the canonical `anda-db` GitHub repository path.
+- **Canonical CBOR encoding consolidated on `cbor2`** — Switched index key and virtual-field encoding paths to call `cbor2::to_canonical_vec` directly.
+- **Index runtime stats refreshed consistently** — Reused live counter overlays for BM25 and HNSW metadata/stat snapshots so callers observe current element, search, bucket, document, and token statistics.
+- **BM25 query execution streamlined** — Reused per-token dedup buffers and merged conjunctive scores during intersection to reduce avoidable allocations and passes.
+
+### Fixed
+
+- **B-Tree posting size accounting** — Reworked existing-posting append and bucket-migration accounting to avoid repeated full-posting measurement while preserving exact source-bucket size updates at CBOR size boundaries.
+- **Storage streaming writer sendability** — Made `Storage::stream_writer` return a `Send` async writer so callers can hold it across await points and spawned tasks.
+- **Zstd streaming decompression edge cases** — Prevented oversized preallocation for small `max_size` limits and returned an error for truncated frames instead of spinning without progress.
+- **HNSW entry-point repair** — Repaired dangling persisted entry points even when the entry id is `0`, treating node id 0 as valid rather than as an unset sentinel.
+
 ## [0.8.1] — 2026-06-13
 
 ### Added

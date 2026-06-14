@@ -593,8 +593,15 @@ impl HnswIndex {
                 );
             }
         } else {
+            // No node blobs were missing, but the persisted entry point may
+            // still dangle (corruption / partial write). Repair whenever the
+            // entry node is absent from the loaded graph. We must not use
+            // `entry_point != 0` as an "unset" sentinel: id 0 is a valid node,
+            // so that guard would skip repairing a dangling `(0, _)` entry and
+            // leave every search failing with `NotFound { id: 0 }`. Reaching
+            // this branch implies `self.nodes` is non-empty (some id loaded).
             let (entry_point, _) = *self.entry_point.read();
-            if entry_point != 0 && self.nodes.pin().get(&entry_point).is_none() {
+            if self.nodes.pin().get(&entry_point).is_none() {
                 let max_layer = self.repair_entry_point();
                 self.update_metadata(|metadata| {
                     metadata.stats.version = metadata.stats.version.saturating_add(1);
@@ -706,9 +713,7 @@ impl HnswIndex {
     /// Returns the index metadata
     pub fn metadata(&self) -> HnswMetadata {
         let mut metadata = { self.metadata.read().clone() };
-        metadata.stats.num_elements = self.nodes.len() as u64;
-        metadata.stats.search_count = self.search_count.load(Ordering::Relaxed);
-
+        self.refresh_live_stats(&mut metadata.stats);
         metadata
     }
 
@@ -719,10 +724,15 @@ impl HnswIndex {
     /// * `IndexStats` - Current statistics
     pub fn stats(&self) -> HnswStats {
         let mut stats = { self.metadata.read().stats.clone() };
+        self.refresh_live_stats(&mut stats);
+        stats
+    }
+
+    /// Overlays the live atomic/runtime counters onto a snapshot of the
+    /// persisted statistics so callers always observe up-to-date values.
+    fn refresh_live_stats(&self, stats: &mut HnswStats) {
         stats.num_elements = self.nodes.len() as u64;
         stats.search_count = self.search_count.load(Ordering::Relaxed);
-
-        stats
     }
 
     /// Gets all node IDs in the index.
@@ -3001,6 +3011,29 @@ mod tests {
         assert_eq!(*index.entry_point.read(), (1, 0));
         assert_eq!(index.len(), 1);
         assert!(index.stats().version > 1);
+    }
+
+    #[tokio::test]
+    async fn test_load_nodes_repairs_zero_entry_point_when_node_zero_absent() {
+        // The entry point defaults to `(0, 0)`. If the persisted graph does not
+        // contain node 0 (e.g. partial write / corruption), the dangling entry
+        // must still be repaired — id 0 is a valid node, not an "unset" sentinel.
+        let mut index = HnswIndex::new("zero_entry_repair".to_string(), Some(test_config()));
+        index.ids.write().add(5);
+        let node = valid_node(5);
+        let data = serialize_node(&node);
+
+        index
+            .load_nodes(async |_| Ok(Some(data.clone())))
+            .await
+            .unwrap();
+
+        assert_eq!(*index.entry_point.read(), (5, 0));
+        assert_eq!(index.len(), 1);
+        assert!(index.stats().version > 1);
+        // Search must resolve via the repaired entry point instead of failing
+        // with `NotFound { id: 0 }`.
+        assert_eq!(index.search_f32(&[5.0, 5.5], 1).unwrap().len(), 1);
     }
 
     #[tokio::test]

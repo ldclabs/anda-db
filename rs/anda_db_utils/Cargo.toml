@@ -1,10 +1,10 @@
 [package]
 name = "anda_db_utils"
-version = "0.8.0"
+version = "0.8.2"
 description = "A utility Rust library for Anda DB."
 keywords = ["anda"]
 categories = ["database", "data-structures"]
-repository = "https://github.com/ldclabs/anda_db/tree/main/rs/anda_db_utils"
+repository = "https://github.com/ldclabs/anda-db/tree/main/rs/anda_db_utils"
 publish = true
 edition.workspace = true
 license.workspace = true

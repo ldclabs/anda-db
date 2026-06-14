@@ -552,11 +552,7 @@ where
     /// Returns the index metadata
     pub fn metadata(&self) -> BM25Metadata {
         let mut metadata = self.metadata.read().clone();
-        metadata.stats.search_count = self.search_count.load(Ordering::Relaxed);
-        metadata.stats.num_elements = self.doc_tokens.len() as u64;
-        metadata.stats.max_bucket_id = self.max_bucket_id.load(Ordering::Relaxed);
-        metadata.stats.max_document_id = self.max_document_id.load(Ordering::Relaxed);
-        metadata.stats.avg_doc_tokens = *self.avg_doc_tokens.read();
+        self.refresh_live_stats(&mut metadata.stats);
         metadata
     }
 
@@ -566,13 +562,19 @@ where
     ///
     /// * `IndexStats` - Current statistics
     pub fn stats(&self) -> BM25Stats {
-        let mut stats = { self.metadata.read().stats.clone() };
+        let mut stats = self.metadata.read().stats.clone();
+        self.refresh_live_stats(&mut stats);
+        stats
+    }
+
+    /// Overlays the live atomic/lock-protected counters onto a snapshot of the
+    /// persisted statistics so callers always observe up-to-date values.
+    fn refresh_live_stats(&self, stats: &mut BM25Stats) {
         stats.search_count = self.search_count.load(Ordering::Relaxed);
         stats.num_elements = self.doc_tokens.len() as u64;
         stats.max_bucket_id = self.max_bucket_id.load(Ordering::Relaxed);
         stats.max_document_id = self.max_document_id.load(Ordering::Relaxed);
         stats.avg_doc_tokens = *self.avg_doc_tokens.read();
-        stats
     }
 
     /// Inserts a document into the index.
@@ -1028,6 +1030,9 @@ where
         let avg_doc_tokens = *self.avg_doc_tokens.read();
         let avg_doc_tokens = avg_doc_tokens.max(1.0);
 
+        // Per-token dedup buffer, reused across query terms so a multi-term
+        // query does not reallocate a fresh map for every term.
+        let mut valid: FxHashMap<u64, (f32, f32)> = FxHashMap::default();
         for query_token in query_terms.keys() {
             if let Some(postings) = self.postings.get(query_token) {
                 // Single-pass: collect doc_id -> (tf, doc_len) for valid documents
@@ -1040,8 +1045,8 @@ where
                 // with non-original text followed by a re-insert) cannot be
                 // scored twice or inflate the document frequency; the newest
                 // (last) entry wins.
-                let mut valid: FxHashMap<u64, (f32, f32)> =
-                    FxHashMap::with_capacity_and_hasher(postings.1.len(), FxBuildHasher);
+                valid.clear();
+                valid.reserve(postings.1.len());
                 for (doc_id, token_freq) in postings.1.iter() {
                     if let Some(v) = self.doc_tokens.get(doc_id) {
                         valid.insert(*doc_id, (*token_freq as f32, *v as f32));
@@ -1056,8 +1061,9 @@ where
                 let df = valid.len() as f32;
                 let idf = ((doc_count - df + 0.5) / (df + 0.5) + 1.0).ln();
 
-                // Compute BM25 score for each valid document
-                for (doc_id, (tf, doc_len)) in valid {
+                // Compute BM25 score for each valid document. `drain` empties the
+                // map while keeping its allocation for the next query term.
+                for (doc_id, (tf, doc_len)) in valid.drain() {
                     let tf_component =
                         (tf * (k1 + 1.0)) / (tf + k1 * (1.0 - b + b * doc_len / avg_doc_tokens));
                     *scores.entry(doc_id).or_default() += idf * tf_component;
@@ -1123,13 +1129,16 @@ where
             }
             let sub_result = self.execute_query(subquery, params, false);
 
-            // Retain only documents that are in both results
-            result.retain(|k, _| sub_result.contains_key(k));
-
-            // Merge scores
-            for (doc_id, score) in sub_result {
-                result.entry(doc_id).and_modify(|s| *s += score);
-            }
+            // Keep only documents present in both results, summing their scores
+            // in a single pass over the (already intersected, smaller) result.
+            result.retain(|doc_id, score| {
+                if let Some(sub_score) = sub_result.get(doc_id) {
+                    *score += *sub_score;
+                    true
+                } else {
+                    false
+                }
+            });
         }
 
         // Subtract documents matching the negated subqueries.

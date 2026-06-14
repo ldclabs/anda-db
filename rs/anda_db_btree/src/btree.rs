@@ -103,6 +103,30 @@ fn cbor_serialized_size<T: ?Sized + Serialize>(value: &T) -> usize {
         .expect("CBOR serialized size exceeds usize")
 }
 
+fn previous_posting_size_after_append<PK>(
+    bucket_id: u32,
+    version_after_append: u64,
+    doc_ids_after_append: &UniqueVec<PK>,
+    appended_doc_id: &PK,
+) -> usize
+where
+    PK: Eq + Hash + Clone + Serialize,
+{
+    let mut previous_doc_ids = doc_ids_after_append.to_vec();
+    let removed_doc_id = previous_doc_ids.pop();
+    debug_assert!(matches!(
+        removed_doc_id.as_ref(),
+        Some(id) if id == appended_doc_id
+    ));
+
+    let previous = (
+        bucket_id,
+        version_after_append.saturating_sub(1),
+        UniqueVec::from(previous_doc_ids),
+    );
+    cbor_serialized_size(&previous) + 2
+}
+
 /// Thread-safe, bucket-based B-tree index with range query support.
 ///
 /// `PK` is the primary key type (typically the document id) and `FV` is the
@@ -700,13 +724,12 @@ where
         // Calculate the size increase for this insertion
         let mut is_new = false;
         let mut size_increase = 0;
-        let mut previous_posting_size = 0;
+        let mut appended_existing_posting = false;
         let mut target_bucket = bucket;
         match self.postings.entry(field_value.clone()) {
             dashmap::Entry::Occupied(mut entry) => {
                 let posting = entry.get_mut();
                 target_bucket = posting.0;
-                let posting_size_before_update = cbor_serialized_size(&*posting) + 2;
 
                 // Unique index semantics: allow idempotent insert of the same (doc_id, field_value)
                 // while rejecting a different doc_id for an existing field_value.
@@ -718,16 +741,18 @@ where
                     });
                 }
 
-                // Add doc_id if it doesn't exist
+                // Add doc_id if it doesn't exist. Measure only the appended
+                // doc_id, never the whole posting: doing the latter on every
+                // insert would make growing a single posting O(n^2).
                 if posting.2.push(doc_id.clone()) {
                     size_increase = cbor_serialized_size(&doc_id) + 2;
-                    previous_posting_size = posting_size_before_update;
+                    appended_existing_posting = true;
                     posting.1 += 1; // increment version
                 }
             }
             dashmap::Entry::Vacant(entry) => {
                 // Create a new posting for this field value
-                let posting = (bucket, 1, vec![doc_id].into());
+                let posting = (bucket, 1, vec![doc_id.clone()].into());
                 size_increase = cbor_serialized_size(&posting) + 2;
                 entry.insert(posting);
                 is_new = true;
@@ -772,13 +797,26 @@ where
                 {
                     if let Some(mut posting) = self.postings.get_mut(&field_value) {
                         // Update the posting's bucket ID
+                        // The source bucket tracked this posting WITHOUT the
+                        // just-appended doc_id (the migration path never added
+                        // `size_increase` to it), so reclaim the exact
+                        // pre-insert size. Compute this only on migration: CBOR
+                        // sequence length and integer width can grow at
+                        // boundaries such as 23 -> 24, so subtracting only the
+                        // appended doc_id from the post-insert size is not exact.
+                        source_size_decrease = if appended_existing_posting {
+                            previous_posting_size_after_append(
+                                target_bucket,
+                                posting.1,
+                                &posting.2,
+                                &doc_id,
+                            )
+                        } else {
+                            0
+                        };
+
                         posting.0 = new_bucket;
                         let migrated_posting_size = cbor_serialized_size(&posting) + 2;
-                        source_size_decrease = if previous_posting_size > 0 {
-                            previous_posting_size
-                        } else {
-                            migrated_posting_size
-                        };
                         size_increase = migrated_posting_size;
                     } else {
                         size_increase = 0;
@@ -845,7 +883,16 @@ where
         {
             if let Some(mut posting) = self.postings.get_mut(&field_value) {
                 bucket_id = posting.0;
-                let prev_posting_size = cbor_serialized_size(&*posting) + 2;
+                // The whole-posting size is only consumed when this removal
+                // empties the posting (it then becomes the bucket's full size
+                // decrease). Measure it only in that case — when the posting
+                // holds a single doc_id — to avoid an O(n) CBOR pass on every
+                // removal from a large posting.
+                let prev_posting_size = if posting.2.len() == 1 {
+                    cbor_serialized_size(&*posting) + 2
+                } else {
+                    0
+                };
                 if posting.2.swap_remove_if(|id| id == &doc_id).is_some() {
                     removed = true;
                     posting.1 += 1; // increment version
@@ -1220,7 +1267,14 @@ where
             if let Some(mut posting) = self.postings.get_mut(&field_value) {
                 bucket_id = posting.0;
 
-                let prev_posting_size = cbor_serialized_size(&*posting) + 2;
+                // Only needed when this removal empties the posting; measuring it
+                // only for a single-element posting avoids an O(n) CBOR pass on
+                // every removal. See remove() for the rationale.
+                let prev_posting_size = if posting.2.len() == 1 {
+                    cbor_serialized_size(&*posting) + 2
+                } else {
+                    0
+                };
 
                 // Check if the document ID exists in the posting
                 if posting.2.swap_remove_if(|id| id == &doc_id).is_some() {
@@ -4119,7 +4173,11 @@ mod tests {
             BTreeIndex::new("single_insert_migration_size".to_string(), Some(config));
 
         index.insert(1, "anchor".to_string(), now_ms()).unwrap();
-        index.insert(1, "moving".to_string(), now_ms()).unwrap();
+        for doc_id in 1u64..=23 {
+            index
+                .insert(doc_id, "moving".to_string(), now_ms())
+                .unwrap();
+        }
 
         let moving_key = "moving".to_string();
         let previous_posting_size = {
@@ -4133,7 +4191,7 @@ mod tests {
             bucket.0
         };
 
-        index.insert(2, moving_key.clone(), now_ms()).unwrap();
+        index.insert(24, moving_key.clone(), now_ms()).unwrap();
 
         let moved_posting = index.postings.get(&moving_key).unwrap();
         assert_ne!(moved_posting.0, 0, "posting should migrate to a new bucket");
@@ -4142,7 +4200,7 @@ mod tests {
         assert_eq!(
             source_bucket.0,
             forced_source_size.saturating_sub(previous_posting_size),
-            "source bucket must subtract the posting size before the appended doc_id"
+            "source bucket must reclaim the migrated posting's pre-insert size"
         );
         assert!(!source_bucket.2.contains(&moving_key));
     }

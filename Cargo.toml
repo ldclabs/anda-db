@@ -23,8 +23,8 @@ members = [
 
 [workspace.package]
 description = "Anda DB is a Rust library designed as a specialized database for AI Agents, focusing on knowledge & memory."
-repository = "https://github.com/ldclabs/anda_db"
-homepage = "https://github.com/ldclabs/anda_db"
+repository = "https://github.com/ldclabs/anda-db"
+homepage = "https://github.com/ldclabs/anda-db"
 keywords = ["ai-agent", "object_store", "hnsw", "database"]
 categories = [
   "accessibility",

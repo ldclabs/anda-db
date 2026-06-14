@@ -1,6 +1,6 @@
 [package]
 name = "anda_cognitive_nexus"
-version = "0.8.1"
+version = "0.8.2"
 description = "A Rust implementation of KIP (Knowledge Interaction Protocol) base on Anda DB."
 keywords = [
   "KIP",
@@ -10,7 +10,7 @@ keywords = [
   "ai-agent",
 ]
 categories = ["database", "data-structures", "text-processing"]
-repository = "https://github.com/ldclabs/anda_db/tree/main/rs/anda_cognitive_nexus"
+repository = "https://github.com/ldclabs/anda-db/tree/main/rs/anda_cognitive_nexus"
 publish = true
 edition.workspace = true
 license.workspace = true

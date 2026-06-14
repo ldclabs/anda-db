@@ -1,10 +1,10 @@
 [package]
 name = "anda_db_schema"
-version = "0.8.0"
+version = "0.8.2"
 description = "Anda DB schema library for Rust."
 keywords = ["database", "vector", "search", "embedding", "ai"]
 categories = ["database", "data-structures", "text-processing"]
-repository = "https://github.com/ldclabs/anda_db/tree/main/rs/anda_db_schema"
+repository = "https://github.com/ldclabs/anda-db/tree/main/rs/anda_db_schema"
 publish = true
 edition.workspace = true
 license.workspace = true

@@ -1,10 +1,10 @@
 [package]
 name = "anda_db"
-version = "0.8.1"
+version = "0.8.2"
 description = "Anda DB is a Rust library designed as a specialized database for AI Agents, focusing on knowledge & memory."
 keywords = ["database", "vector", "search", "embedding", "ai"]
 categories = ["database", "data-structures", "text-processing"]
-repository = "https://github.com/ldclabs/anda_db/tree/main/rs/anda_db"
+repository = "https://github.com/ldclabs/anda-db/tree/main/rs/anda_db"
 publish = true
 edition.workspace = true
 license.workspace = true
