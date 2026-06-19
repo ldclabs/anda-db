@@ -1,4 +1,4 @@
-use anda_db_derive::AndaDBSchema;
+use anda_db_derive::{AndaDBSchema, FieldTyped};
 use anda_db_schema::{FieldEntry, FieldKey, FieldType, Json, Schema, SchemaError};
 use serde::{Deserialize, Serialize};
 use serde_json::Map;
@@ -152,10 +152,34 @@ struct TestQualifiedPathSchema<T> {
     deserialize_only: String,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, cbor2::Cbor, FieldTyped)]
+struct SimplifiedClaims {
+    #[cbor(key = 1)]
+    #[serde(rename = "iss", skip_serializing_if = "Option::is_none", default)]
+    issuer: Option<String>,
+    #[cbor(key = 4)]
+    #[serde(rename = "exp", skip_serializing_if = "Option::is_none", default)]
+    expiration: Option<u64>,
+    #[cbor(key = 7)]
+    #[serde(
+        rename = "cti",
+        with = "serde_bytes",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    cwt_id: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, AndaDBSchema)]
+struct TestClaimsAsValue {
+    _id: u64,
+    claims: SimplifiedClaims,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anda_db_schema::TEXT_WILDCARD_KEY;
+    use anda_db_schema::{Document, Fv, TEXT_WILDCARD_KEY};
 
     #[test]
     fn test_generated_schema() {
@@ -480,5 +504,52 @@ mod tests {
         assert!(schema.get_field("input_name").is_none());
         assert!(schema.get_field("deserialize_only").is_some());
         assert!(schema.get_field("input_only").is_none());
+    }
+
+    #[test]
+    fn cbor_claims_can_be_used_as_nested_schema_value_type() {
+        let claims_type = FieldType::Map(BTreeMap::from([
+            (
+                FieldKey::from(1_i64),
+                FieldType::Option(Box::new(FieldType::Text)),
+            ),
+            (
+                FieldKey::from(4_i64),
+                FieldType::Option(Box::new(FieldType::U64)),
+            ),
+            (
+                FieldKey::from(7_i64),
+                FieldType::Option(Box::new(FieldType::Bytes)),
+            ),
+        ]));
+        assert_eq!(SimplifiedClaims::field_type(), claims_type);
+
+        let schema = TestClaimsAsValue::schema().unwrap();
+        assert_eq!(schema.get_field("claims").unwrap().r#type(), &claims_type);
+
+        let value = TestClaimsAsValue {
+            _id: 9,
+            claims: SimplifiedClaims {
+                issuer: Some("coap://as.example.com".into()),
+                expiration: Some(1_444_064_944),
+                cwt_id: Some(vec![0x0b, 0x71]),
+            },
+        };
+
+        let doc = Document::try_from(std::sync::Arc::new(schema), &value).unwrap();
+        assert_eq!(
+            doc.get_field("claims"),
+            Some(&Fv::Map(BTreeMap::from([
+                (
+                    FieldKey::from(1_i64),
+                    Fv::Text("coap://as.example.com".into()),
+                ),
+                (FieldKey::from(4_i64), Fv::U64(1_444_064_944)),
+                (FieldKey::from(7_i64), Fv::Bytes(vec![0x0b, 0x71])),
+            ])))
+        );
+
+        let decoded: TestClaimsAsValue = doc.try_into().unwrap();
+        assert_eq!(decoded, value);
     }
 }

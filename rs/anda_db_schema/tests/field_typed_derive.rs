@@ -12,6 +12,7 @@ struct User {
     name: String,
     age: u32,
     tags: HashMap<String, String>,         // 会被正确映射为 Map
+    scores: BTreeMap<i64, String>,         // 会被正确映射为 Map<I64, Text>
     properties: BTreeMap<String, Vec<u8>>, // 会被正确映射为 Map 包含 Bytes
 
     attributes: Map<String, serde_json::Value>, // 会被正确映射为 Map 包含 Json
@@ -53,6 +54,13 @@ fn field_typed_derive_works() {
                     "tags".into(),
                     FieldType::Map(std::collections::BTreeMap::from([(
                         "*".into(),
+                        FieldType::Text
+                    )]))
+                ),
+                (
+                    "scores".into(),
+                    FieldType::Map(std::collections::BTreeMap::from([(
+                        FieldKey::from(i64::MIN),
                         FieldType::Text
                     )]))
                 ),
@@ -122,6 +130,9 @@ struct MapKeyAliases {
     // 通过 field_type 字符串使用 Text 关键字声明字符串键 Map(等价于 String)
     #[field_type = "Map<Text, Text>"]
     by_text: HashMap<String, String>,
+    // 通过 field_type 字符串使用 I64 关键字声明整数键 Map。
+    #[field_type = "Map<I64, Text>"]
+    by_i64: BTreeMap<i64, String>,
     // 也允许带额外空格 / 嵌套类型
     #[field_type = "Map< Text , Array<U64> >"]
     nested: HashMap<String, Vec<u64>>,
@@ -139,6 +150,13 @@ fn map_text_alias_works() {
                 "by_text".into(),
                 FieldType::Map(std::collections::BTreeMap::from([(
                     "*".into(),
+                    FieldType::Text,
+                )])),
+            ),
+            (
+                "by_i64".into(),
+                FieldType::Map(std::collections::BTreeMap::from([(
+                    FieldKey::from(i64::MIN),
                     FieldType::Text,
                 )])),
             ),

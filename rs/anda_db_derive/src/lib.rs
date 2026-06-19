@@ -28,9 +28,12 @@ mod schema;
 ///
 /// - `#[field_type = "TypeName"]` -- override the inferred type. The string
 ///   accepts a small DSL: primitives (`Bytes`, `Text`, `U64`, ...), as well
-///   as `Array<T>`, `Option<T>`, `Map<String, T>`, `Map<Text, T>` and
-///   `Map<Bytes, T>` (where `T` is itself any supported type, including
-///   nested wrappers).
+///   as `Array<T>`, `Option<T>`, `Map<String, T>`, `Map<Text, T>`,
+///   `Map<I64, T>` and `Map<Bytes, T>` (where `T` is itself any supported
+///   type, including nested wrappers).
+/// - `#[cbor(key = N)]` -- for nested structs that also derive
+///   `cbor2::Cbor`, use the integer CBOR map key as the generated
+///   `FieldKey` instead of the serde text name.
 /// - `#[serde(rename = "name")]` / `#[serde(rename_all = "...")]` -- the
 ///   generated map follows the *serialized* field names, so field-level
 ///   renames and container-level case rules (e.g. `camelCase`) are both
@@ -54,7 +57,8 @@ mod schema;
 /// - `Vec<u8>`, `[u8; N]`, `Bytes`, `ByteBuf`, `ByteArray`, `*B64` -> `Bytes`
 /// - `Vec<bf16>`, `[bf16; N]` -> `Vector`
 /// - `Vec<T>` / `HashSet<T>` / `BTreeSet<T>` -> `Array(T)`
-/// - `HashMap<K, V>` / `BTreeMap<K, V>` (string- or bytes-like key) -> `Map`
+/// - `HashMap<K, V>` / `BTreeMap<K, V>` (string-, signed integer-, or
+///   bytes-like key) -> `Map`
 /// - `Option<T>` -> `Option(T)`
 /// - `Box<T>` / `Arc<T>` / `Rc<T>` / `Cow<'_, T>` -> the inner `T` (serde
 ///   serializes these wrappers transparently)
@@ -81,7 +85,7 @@ mod schema;
 ///     age: u32,
 /// }
 /// ```
-#[proc_macro_derive(FieldTyped, attributes(field_type))]
+#[proc_macro_derive(FieldTyped, attributes(field_type, cbor))]
 pub fn field_typed_derive(input: TokenStream) -> TokenStream {
     field_typed::field_typed_derive(input)
 }

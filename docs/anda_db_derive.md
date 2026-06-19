@@ -60,7 +60,7 @@ Generated code references `FieldType`, `FieldKey`, `FieldEntry`, `Schema` and
 ### 2.1 `FieldTyped`
 
 ```rust
-#[proc_macro_derive(FieldTyped, attributes(field_type))]
+#[proc_macro_derive(FieldTyped, attributes(field_type, cbor))]
 ```
 
 For each named field, the macro emits one `(key, FieldType)` tuple and packs
@@ -150,6 +150,7 @@ impl Article {
 | Attribute                          | Applies to                   | Effect                                                                                              |
 | ---------------------------------- | ---------------------------- | --------------------------------------------------------------------------------------------------- |
 | `#[field_type = "..."]`            | `FieldTyped`, `AndaDBSchema` | Override the inferred field type using the [DSL](#5-the-field_type-dsl).                            |
+| `#[cbor(key = N)]`                 | `FieldTyped` only            | Use an integer CBOR map key for a nested field, matching `cbor2::Cbor` integer-keyed structs.       |
 | `#[unique]`                        | `AndaDBSchema` only          | Adds `FieldEntry::with_unique()` to the generated entry.                                            |
 | `#[serde(rename = "name")]`        | both                         | Use the serialized name as the schema field name (directional form: the `serialize` half is used).  |
 | `#[serde(rename_all = "...")]`     | both (container level)       | Apply serde's case rule to all fields without an explicit rename, mirroring serde's precedence.     |
@@ -168,6 +169,9 @@ Notes:
   fails to parse is skipped without raising an error. `#[serde(with = "...")]`
   / `serialize_with` may change the serialized shape — combine them with an
   explicit `#[field_type = "..."]` override when they do.
+- `FieldTyped` prefers `#[cbor(key = N)]` over serde names for nested struct
+  fields. This lets CBOR-native value types such as CWT-style claims model
+  integer labels without losing schema validation.
 - `AndaDBSchema` validates every resulting field name against AndaDB's naming
   rules (`[a-z0-9_]`, at most 64 bytes) at compile time, and also rejects
   duplicate names and collisions with the reserved `_id` column. Keys of
@@ -224,6 +228,8 @@ type and produce a `FieldType` token stream.
 For maps the key `K` must be one of:
 
 - a string-like type (`String`, `&str`) → wildcard text key `"*"`
+- a signed integer type (`i8`, `i16`, `i32`, `i64`, `isize`) → wildcard
+  integer key `i64::MIN`
 - a bytes-like type (`Vec<u8>`, `Bytes`, `ByteArray`, `ByteBuf`, `*B64`) →
   wildcard bytes key `b"*"`
 
@@ -263,7 +269,7 @@ primitive   := "Bytes" | "Text" | "U64" | "I64"
 array       := "Array<" type ">"
 option      := "Option<" type ">"
 map         := "Map<" map_key "," type ">"
-map_key     := "String" | "Text" | "Bytes"
+map_key     := "String" | "Text" | "I64" | "Bytes"
 ```
 
 ### 5.1 String / Text equivalence
@@ -279,6 +285,13 @@ from `HashMap<String, _>`. Both:
 
 expand to the same wildcard `Map({"*" => Json})`.
 
+Signed integer map keys use `I64` and expand to the integer wildcard key
+`i64::MIN`:
+
+```rust
+#[field_type = "Map<I64, Text>"]
+```
+
 ### 5.2 Examples
 
 | DSL string                  | `FieldType`                  |
@@ -288,6 +301,7 @@ expand to the same wildcard `Map({"*" => Json})`.
 | `"Option<Text>"`            | `Option(Text)`               |
 | `"Map<String, Json>"`       | `Map({"*" => Json})`         |
 | `"Map<Text, Array<U64>>"`   | `Map({"*" => Array(U64)})`   |
+| `"Map<I64, Text>"`          | `Map({i64::MIN => Text})`    |
 | `"Map<Bytes, F64>"`         | `Map({b"*" => F64})`         |
 | `"Option<Map<Bytes, F64>>"` | `Option(Map({b"*" => F64}))` |
 
@@ -298,11 +312,11 @@ Unrecognised input produces a `compile_error!` at the original macro span:
 ```text
 Unsupported field type: '...'. Supported types: Bytes, Text, U64, I64,
 F64, F32, Bool, Json, Vector, Array<T>, Option<T>, Map<String, T>,
-Map<Text, T>, Map<Bytes, T>
+Map<Text, T>, Map<I64, T>, Map<Bytes, T>
 ```
 
 ```text
-Unsupported Map key type: '...'. Expected 'String', 'Text' or 'Bytes'.
+Unsupported Map key type: '...'. Expected 'String', 'Text', 'I64' or 'Bytes'.
 ```
 
 ```text
@@ -428,9 +442,9 @@ instead of the `#[derive(...)]` line.
 
 `parse_field_type_str` finds the **top-level** comma inside `Map<...>` by
 counting angle-bracket depth. This is what allows nested types such as
-`Map<Text, Array<U64>>` or `Option<Map<Bytes, F64>>` to parse correctly.
-Whitespace is trimmed on both sides of every separator, so writes like
-`Map< Text , Array<U64> >` are also accepted.
+`Map<Text, Array<U64>>`, `Map<I64, Text>`, or `Option<Map<Bytes, F64>>` to
+parse correctly. Whitespace is trimmed on both sides of every separator, so
+writes like `Map< Text , Array<U64> >` are also accepted.
 
 ### 7.2 `schema.rs`
 
@@ -458,8 +472,10 @@ Pipeline executed by `anda_db_schema_derive`:
 
 Same parse / validation prelude as `schema.rs` (minus the AndaDB naming
 restrictions — nested map keys are free-form). For each serialized field the
-macro produces a `(serialized_name.into(), <field_type>)` tuple and collects
-them into a single `FieldType::Map`.
+macro produces a `(key, <field_type>)` tuple and collects them into a single
+`FieldType::Map`. The key is normally the serde serialized field name; when a
+field has `#[cbor(key = N)]`, the generated key is `FieldKey::from(N)` so the
+schema mirrors CBOR integer-keyed maps.
 
 ### 7.4 Worked example
 
@@ -515,13 +531,13 @@ messages are rendered as Rust source (e.g. `(u64, u64)`), not as AST dumps.
 | `… does not support #[serde(transparent)]: …`                                       | Transparent structs do not serialize as maps.                                  |
 | `unknown #[serde(rename_all = "...")] rule; …`                                      | Unrecognised case rule (would silently desync schema and data otherwise).      |
 | `Unsupported field type: '...'. Supported types: …`                                 | DSL string in `#[field_type]` was not recognised.                              |
-| `Unsupported Map key type: '...'. Expected 'String', 'Text' or 'Bytes'.`            | Unsupported key in `Map<K, V>` DSL.                                            |
+| `Unsupported Map key type: '...'. Expected 'String', 'Text', 'I64' or 'Bytes'.`     | Unsupported key in `Map<K, V>` DSL.                                            |
 | `Invalid Map field type: '...'. Expected 'Map<KeyType, ValueType>'.`                | DSL `Map<…>` string lacks a comma-separated key/value pair.                    |
 | `Unsupported type: \`...\`. Consider: …`                                            | Inference failed (tuples, trait objects, etc.).                                |
 | `Unable to determine Vec element type for: ...`                                     | Generic argument missing on a `Vec` / `HashSet` / `BTreeSet`.                  |
 | `Unable to determine Option element type`                                           | Generic argument missing on an `Option`.                                       |
 | `Unable to determine the inner type of: ...`                                        | Generic argument missing on a `Box` / `Arc` / `Rc` / `Cow`.                    |
-| `Map key type must be String or bytes (e.g., Vec<u8>, ByteArray, ByteBuf), found: …`| `HashMap`/`BTreeMap` key inferred as something neither string- nor bytes-like. |
+| `Map key type must be String, signed integer, or bytes (e.g., Vec<u8>, ByteArray, ByteBuf), found: …` | `HashMap`/`BTreeMap` key inferred as something neither string-, signed integer-, nor bytes-like. |
 | `Standalone \`bf16\` is not supported as a field type. Use \`Vec<bf16>\` …`         | Bare `bf16` field without `Vec`/override.                                      |
 
 ### 8.2 Runtime errors

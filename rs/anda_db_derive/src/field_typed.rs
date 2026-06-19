@@ -4,8 +4,8 @@ use quote::quote;
 use syn::{DeriveInput, ext::IdentExt, parse_macro_input};
 
 use crate::common::{
-    effective_field_name, named_fields, parse_container_serde_attrs, parse_field_serde_attrs,
-    resolve_field_type,
+    effective_field_name, named_fields, parse_container_serde_attrs, parse_field_cbor_attrs,
+    parse_field_serde_attrs, resolve_field_type,
 };
 
 /// Implementation of `#[derive(FieldTyped)]`.
@@ -49,7 +49,7 @@ pub(crate) fn expand_field_typed_derive(input: DeriveInput) -> TokenStream2 {
     // For each serialized field, emit a `("name".into(), <FieldType>)` tuple
     // that will be collected into the resulting `FieldType::Map`. Errors are
     // emitted in place so that every offending field is reported at once.
-    let mut seen_names = std::collections::BTreeSet::new();
+    let mut seen_keys = std::collections::BTreeSet::new();
     let mut field_type_mappings = Vec::with_capacity(fields.len());
     for field in fields {
         let field_ident = field.ident.as_ref().unwrap();
@@ -69,19 +69,37 @@ pub(crate) fn expand_field_typed_derive(input: DeriveInput) -> TokenStream2 {
             );
             continue;
         }
+        let cbor_attrs = match parse_field_cbor_attrs(&field.attrs) {
+            Ok(attrs) => attrs,
+            Err(err) => {
+                field_type_mappings.push(err.to_compile_error());
+                continue;
+            }
+        };
 
         // Schema field names follow the serialized names: serde renames and
-        // container-level rename_all rules are honoured.
+        // container-level rename_all rules are honoured unless cbor2 provides
+        // an integer map key for the CBOR serialized shape.
         let schema_name = effective_field_name(
             &field_ident.unraw().to_string(),
             &serde_attrs,
             container.rename_all,
         );
-        if !seen_names.insert(schema_name.clone()) {
+        let (field_key, duplicate_key) = if let Some(key) = cbor_attrs.key {
+            (quote! { FieldKey::from(#key) }, format!("i64:{key}"))
+        } else {
+            (
+                quote! { #schema_name.into() },
+                format!("text:{schema_name}"),
+            )
+        };
+        if !seen_keys.insert(duplicate_key.clone()) {
             field_type_mappings.push(
                 syn::Error::new_spanned(
                     field_ident,
-                    format!("duplicate schema field name {schema_name:?} (after serde renaming)"),
+                    format!(
+                        "duplicate schema field key {duplicate_key:?} (after serde/cbor renaming)"
+                    ),
                 )
                 .to_compile_error(),
             );
@@ -91,7 +109,7 @@ pub(crate) fn expand_field_typed_derive(input: DeriveInput) -> TokenStream2 {
         // `#[field_type = "..."]` overrides auto-inference.
         match resolve_field_type(field) {
             Ok(field_type) => field_type_mappings.push(quote! {
-                (#schema_name.into(), #field_type)
+                (#field_key, #field_type)
             }),
             Err(err) => field_type_mappings.push(err.to_compile_error()),
         }
@@ -144,6 +162,27 @@ mod tests {
         assert!(expanded.contains("FieldType :: Option"));
         assert!(expanded.contains("FieldType :: Array"));
         assert!(expanded.contains("< T > :: field_type ()"));
+        assert!(!expanded.contains("compile_error"));
+    }
+
+    #[test]
+    fn expand_field_typed_uses_cbor_integer_keys_when_present() {
+        let input: DeriveInput = parse_quote! {
+            struct Claims {
+                #[cbor(key = 1)]
+                #[serde(rename = "iss")]
+                issuer: Option<String>,
+                #[cbor(key = 4)]
+                #[serde(rename = "exp")]
+                expiration: Option<u64>,
+            }
+        };
+
+        let expanded = tokens(expand_field_typed_derive(input));
+        assert!(expanded.contains("FieldKey :: from (1i64)"));
+        assert!(expanded.contains("FieldKey :: from (4i64)"));
+        assert!(!expanded.contains("\"iss\" . into"));
+        assert!(!expanded.contains("\"exp\" . into"));
         assert!(!expanded.contains("compile_error"));
     }
 
@@ -242,7 +281,7 @@ mod tests {
             }
         };
         assert!(
-            tokens(expand_field_typed_derive(duplicate)).contains("duplicate schema field name")
+            tokens(expand_field_typed_derive(duplicate)).contains("duplicate schema field key")
         );
     }
 }

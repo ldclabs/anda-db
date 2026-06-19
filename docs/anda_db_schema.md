@@ -139,12 +139,12 @@ shape:
 
 #### `Map`
 
-`FieldType::Map` is keyed by `FieldKey` (text or bytes). It supports two
-shapes:
+`FieldType::Map` is keyed by `FieldKey` (text, signed `i64`, or bytes). It
+supports two shapes:
 
 - **Wildcard map** — exactly one entry whose key is the wildcard
-  (`"*"` for text, `b"*"` for bytes). Any key is allowed at runtime, and
-  every value must match the wildcard's value type.
+  (`"*"` for text, `i64::MIN` for integer keys, `b"*"` for bytes). Any key is
+  allowed at runtime, and every value must match the wildcard's value type.
 - **Schema-bound map** — the keys present in the type are the only legal
   keys in the value. Required keys are those whose value type is *not*
   `Option`.
@@ -152,6 +152,9 @@ shapes:
 ```rust
 // Wildcard text map (≅ HashMap<String, U64>)
 Ft::Map([(TEXT_WILDCARD_KEY.clone(), Ft::U64)].into_iter().collect());
+
+// Wildcard integer-keyed map (≅ BTreeMap<i64, Text>)
+Ft::Map([(I64_WILDCARD_KEY.clone(), Ft::Text)].into_iter().collect());
 
 // Schema-bound (only "title" and optional "subtitle" allowed)
 Ft::Map([
@@ -171,19 +174,21 @@ A field whose type is *not* `Option` is treated as required by both
 ```rust
 pub enum FieldKey {
     Text(String),
+    I64(i64),
     Bytes(Vec<u8>),
 }
 ```
 
-Two pre-built constants are exposed for the wildcard convention:
+Three pre-built constants are exposed for the wildcard convention:
 
 ```rust
 pub static TEXT_WILDCARD_KEY:  LazyLock<FieldKey>; // "*"
+pub static I64_WILDCARD_KEY:   LazyLock<FieldKey>; // i64::MIN
 pub static BYTES_WILDCARD_KEY: LazyLock<FieldKey>; // b"*"
 ```
 
-Convertible from `String`, `&str`, `Vec<u8>`, `[u8; N]`, `&[u8]`, and
-`cbor2::Value` (text or bytes).
+Convertible from `String`, `&str`, signed integer types up to `i64`,
+`Vec<u8>`, `[u8; N]`, `&[u8]`, and `cbor2::Value` (text, integer or bytes).
 
 ### 2.5 Field name rules
 
@@ -246,7 +251,7 @@ types:
 | `Vec<T>` (where `T: Into<FieldValue>`)               | `Array`           |
 | `BTreeSet<T>`, `HashSet<T>`                          | `Array`           |
 | `BTreeMap<K, V>`, `HashMap<K, V>`, `serde_json::Map` | `Map`             |
-| `FieldKey`                                           | `Text` or `Bytes` |
+| `FieldKey`                                           | `Text`, `I64` or `Bytes` |
 
 #### From any `Serialize` value
 
@@ -623,6 +628,7 @@ diagnostics.
 
 |                             | Human-readable (JSON, …)              | Binary (CBOR, MessagePack, …) |
 | :-------------------------- | :------------------------------------ | :---------------------------- |
+| `FieldKey::I64`             | `i64:<decimal>` string                | native integer                |
 | `Bytes` / `FieldKey::Bytes` | URL-safe Base64 string                | native byte string            |
 | `Vector`                    | array of `u16` (bf16 bits)            | same                          |
 | `Json`                      | JSON delegated to `serde_json::Value` | same                          |
@@ -708,7 +714,7 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 | Type            | Notes                                      |
 | :-------------- | :----------------------------------------- |
 | `FieldType`     | Closed type enum.                          |
-| `FieldKey`      | Map key (`Text` / `Bytes`).                |
+| `FieldKey`      | Map key (`Text` / `I64` / `Bytes`).        |
 | `FieldValue`    | Runtime value.                             |
 | `FieldEntry`    | Field metadata, persists with each schema. |
 | `Schema`        | Versioned set of `FieldEntry`.             |
@@ -732,6 +738,7 @@ pub fn vector_from_f64(v: Vec<f64>) -> Vector;
 | :------------------- | :---------------------- |
 | `Schema::ID_KEY`     | `"_id"`                 |
 | `TEXT_WILDCARD_KEY`  | `FieldKey::Text("*")`   |
+| `I64_WILDCARD_KEY`   | `FieldKey::I64(i64::MIN)` |
 | `BYTES_WILDCARD_KEY` | `FieldKey::Bytes(b"*")` |
 
 ---

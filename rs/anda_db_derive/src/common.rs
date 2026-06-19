@@ -256,6 +256,94 @@ pub fn parse_field_serde_attrs(attrs: &[Attribute]) -> FieldSerdeAttrs {
     out
 }
 
+/// Field-level `cbor2::Cbor` options that affect nested `FieldTyped` maps.
+#[derive(Debug, Default)]
+pub struct FieldCborAttrs {
+    /// `#[cbor(key = N)]` -- the field serializes with an integer CBOR map
+    /// key instead of its serde text name.
+    pub key: Option<i64>,
+}
+
+/// Parse the field-level `#[cbor(...)]` attributes relevant to nested
+/// `FieldTyped` map generation.
+///
+/// Only `key = <integer>` is consumed. Other `cbor2::Cbor` options are left to
+/// cbor2 itself.
+pub fn parse_field_cbor_attrs(attrs: &[Attribute]) -> syn::Result<FieldCborAttrs> {
+    let mut out = FieldCborAttrs::default();
+    for attr in attrs {
+        if !attr.path().is_ident("cbor") {
+            continue;
+        }
+        let Ok(args) = attr.parse_args_with(Punctuated::<Meta, syn::Token![,]>::parse_terminated)
+        else {
+            continue;
+        };
+
+        for meta in args {
+            if let Meta::NameValue(name_value) = meta
+                && name_value.path.is_ident("key")
+            {
+                if out.key.is_some() {
+                    return Err(syn::Error::new_spanned(
+                        name_value,
+                        "duplicate #[cbor(key = ...)] attribute",
+                    ));
+                }
+                out.key = Some(parse_cbor_i64_key(&name_value.value)?);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn parse_cbor_i64_key(expr: &Expr) -> syn::Result<i64> {
+    match expr {
+        Expr::Lit(expr_lit) => match &expr_lit.lit {
+            Lit::Int(lit) => {
+                let value = lit.base10_parse::<i128>()?;
+                i64::try_from(value).map_err(|_| {
+                    syn::Error::new_spanned(
+                        expr,
+                        "#[cbor(key = ...)] must fit in an i64 for AndaDB FieldKey",
+                    )
+                })
+            }
+            _ => Err(syn::Error::new_spanned(
+                expr,
+                "#[cbor(key = ...)] must be an integer literal",
+            )),
+        },
+        Expr::Unary(expr_unary) if matches!(expr_unary.op, syn::UnOp::Neg(_)) => {
+            if let Expr::Lit(expr_lit) = expr_unary.expr.as_ref()
+                && let Lit::Int(lit) = &expr_lit.lit
+            {
+                let magnitude = lit.base10_parse::<i128>()?;
+                let value = magnitude.checked_neg().ok_or_else(|| {
+                    syn::Error::new_spanned(
+                        expr,
+                        "#[cbor(key = ...)] must fit in an i64 for AndaDB FieldKey",
+                    )
+                })?;
+                return i64::try_from(value).map_err(|_| {
+                    syn::Error::new_spanned(
+                        expr,
+                        "#[cbor(key = ...)] must fit in an i64 for AndaDB FieldKey",
+                    )
+                });
+            }
+            Err(syn::Error::new_spanned(
+                expr,
+                "#[cbor(key = ...)] must be an integer literal",
+            ))
+        }
+        _ => Err(syn::Error::new_spanned(
+            expr,
+            "#[cbor(key = ...)] must be an integer literal",
+        )),
+    }
+}
+
 /// Resolve the schema field name for a field: an explicit serde `rename`
 /// wins; otherwise the container-level `rename_all` rule (if any) is applied
 /// to the Rust identifier, mirroring serde's own precedence.
@@ -378,7 +466,7 @@ pub fn parse_field_type_str(type_str: &str, span: Span) -> syn::Result<TokenStre
             Ok(quote! { FieldType::Option(Box::new(#inner_type)) })
         }
 
-        // Map<String, T> / Map<Text, T> / Map<Bytes, T>.
+        // Map<String, T> / Map<Text, T> / Map<I64, T> / Map<Bytes, T>.
         //
         // `FieldType` represents string keys as `Text`, but `String` is
         // accepted as well so that the DSL can mirror plain Rust signatures.
@@ -410,12 +498,15 @@ pub fn parse_field_type_str(type_str: &str, span: Span) -> syn::Result<TokenStre
             };
             let key_token = match &inner[..idx] {
                 "String" | "Text" => quote! { FieldKey::from("*") },
+                "I64" | "i8" | "i16" | "i32" | "i64" | "isize" => {
+                    quote! { FieldKey::from(i64::MIN) }
+                }
                 "Bytes" => quote! { FieldKey::from(b"*") },
                 other => {
                     return Err(syn::Error::new(
                         span,
                         format!(
-                            "Unsupported Map key type: '{other}'. Expected 'String', 'Text' or 'Bytes'."
+                            "Unsupported Map key type: '{other}'. Expected 'String', 'Text', 'I64' or 'Bytes'."
                         ),
                     ));
                 }
@@ -433,7 +524,7 @@ pub fn parse_field_type_str(type_str: &str, span: Span) -> syn::Result<TokenStre
         _ => Err(syn::Error::new(
             span,
             format!(
-                "Unsupported field type: '{type_str}'. Supported types: Bytes, Text, U64, I64, F64, F32, Bool, Json, Vector, Array<T>, Option<T>, Map<String, T>, Map<Text, T>, Map<Bytes, T>"
+                "Unsupported field type: '{type_str}'. Supported types: Bytes, Text, U64, I64, F64, F32, Bool, Json, Vector, Array<T>, Option<T>, Map<String, T>, Map<Text, T>, Map<I64, T>, Map<Bytes, T>"
             ),
         )),
     }
@@ -449,7 +540,7 @@ pub fn parse_field_type_str(type_str: &str, span: Span) -> syn::Result<TokenStre
 /// - `Vec<bf16>` / `[bf16; N]` -> `Vector`
 /// - `Vec<T>` / `HashSet<T>` / `BTreeSet<T>` -> `Array(T)`
 /// - `HashMap<K, V>` / `BTreeMap<K, V>` -> `Map({*: V})` (key must be a
-///   string- or bytes-like type)
+///   string-, signed integer-, or bytes-like type)
 /// - `Option<T>` -> `Option(T)`
 /// - `Box<T>` / `Arc<T>` / `Rc<T>` / `Cow<'_, T>` -> the inner `T` (serde
 ///   serializes these wrappers transparently)
@@ -538,13 +629,15 @@ pub fn determine_field_type(ty: &Type) -> syn::Result<TokenStream> {
                     {
                         let key_token = if is_string_type(key_ty) {
                             quote! { FieldKey::from("*") }
+                        } else if is_signed_integer_type(key_ty) {
+                            quote! { FieldKey::from(i64::MIN) }
                         } else if is_bytes_type(key_ty) {
                             quote! { FieldKey::from(b"*") }
                         } else {
                             return Err(syn::Error::new_spanned(
                                 key_ty,
                                 format!(
-                                    "Map key type must be String or bytes (e.g., Vec<u8>, ByteArray, ByteBuf), found: {}",
+                                    "Map key type must be String, signed integer, or bytes (e.g., Vec<u8>, ByteArray, ByteBuf), found: {}",
                                     type_to_string(key_ty)
                                 ),
                             ));
@@ -664,6 +757,20 @@ pub fn is_string_type(ty: &Type) -> bool {
         && let Some(segment) = type_path.path.segments.last()
     {
         return segment.ident == "String" || segment.ident == "str";
+    }
+    false
+}
+
+/// Returns `true` if `ty` is one of the signed integer types represented as
+/// `FieldType::I64`.
+pub fn is_signed_integer_type(ty: &Type) -> bool {
+    if let Type::Path(type_path) = peel_type(ty)
+        && let Some(segment) = type_path.path.segments.last()
+    {
+        return matches!(
+            segment.ident.to_string().as_str(),
+            "i8" | "i16" | "i32" | "i64" | "isize"
+        );
     }
     false
 }
@@ -804,6 +911,34 @@ mod tests {
 
         let attrs: Vec<Attribute> = vec![parse_quote!(#[allow(dead_code)])];
         assert_eq!(parse_field_serde_attrs(&attrs).rename, None);
+    }
+
+    #[test]
+    fn parse_field_cbor_attrs_reads_integer_keys_and_rejects_bad_forms() {
+        let attrs: Vec<Attribute> = vec![parse_quote!(#[cbor(key = 4)])];
+        assert_eq!(parse_field_cbor_attrs(&attrs).unwrap().key, Some(4));
+
+        let attrs: Vec<Attribute> = vec![parse_quote!(#[cbor(key = -8)])];
+        assert_eq!(parse_field_cbor_attrs(&attrs).unwrap().key, Some(-8));
+
+        let attrs: Vec<Attribute> = vec![
+            parse_quote!(#[cbor(key = 1)]),
+            parse_quote!(#[cbor(key = 2)]),
+        ];
+        assert!(
+            parse_field_cbor_attrs(&attrs)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate")
+        );
+
+        let attrs: Vec<Attribute> = vec![parse_quote!(#[cbor(key = "iss")])];
+        assert!(
+            parse_field_cbor_attrs(&attrs)
+                .unwrap_err()
+                .to_string()
+                .contains("integer literal")
+        );
     }
 
     #[test]
@@ -961,6 +1096,13 @@ mod tests {
         assert!(map.contains("FieldKey :: from (\"*\")"));
         assert!(map.contains("FieldType :: Array"));
 
+        let i64_map = tokens(parse_ft("Map<I64, Text>").unwrap());
+        assert!(i64_map.contains("FieldKey :: from (i64 :: MIN)"));
+        assert!(i64_map.contains("FieldType :: Text"));
+        assert!(
+            tokens(parse_ft("Map<isize, Text>").unwrap()).contains("FieldKey :: from (i64 :: MIN)")
+        );
+
         assert!(
             parse_ft("Map<Text>")
                 .unwrap_err()
@@ -1045,13 +1187,18 @@ mod tests {
         let ty: Type = parse_quote!(HashMap<Vec<u8>, String>);
         assert!(tokens(determine_field_type(&ty).unwrap()).contains("FieldKey :: from (b\"*\")"));
 
+        let ty: Type = parse_quote!(BTreeMap<i64, String>);
+        assert!(
+            tokens(determine_field_type(&ty).unwrap()).contains("FieldKey :: from (i64 :: MIN)")
+        );
+
         // HashMap with a custom hasher still infers from the first two args.
         let ty: Type = parse_quote!(HashMap<String, u64, RandomState>);
         assert!(tokens(determine_field_type(&ty).unwrap()).contains("FieldType :: U64"));
 
         let ty: Type = parse_quote!(HashMap<[u8; 4], String>);
         let err = determine_field_type(&ty).unwrap_err().to_string();
-        assert!(err.contains("Map key type must be String or bytes"));
+        assert!(err.contains("Map key type must be String, signed integer, or bytes"));
         assert!(err.contains("[u8 ; 4]"));
 
         let ty: Type = parse_quote!(HashMap<String>);
@@ -1194,6 +1341,8 @@ mod tests {
         let u8_ty: Type = parse_quote!(u8);
         let u64_ty: Type = parse_quote!(u64);
         let string_ty: Type = parse_quote!(String);
+        let i64_ty: Type = parse_quote!(i64);
+        let isize_ty: Type = parse_quote!(isize);
         let vec_u8_ty: Type = parse_quote!(Vec<u8>);
         let bytes_ty: Type = parse_quote!(ByteBufB64);
         let bf16_ty: Type = parse_quote!(bf16);
@@ -1205,6 +1354,9 @@ mod tests {
         assert!(!is_u64_type(&u8_ty));
         assert!(is_string_type(&string_ty));
         assert!(!is_string_type(&u8_ty));
+        assert!(is_signed_integer_type(&i64_ty));
+        assert!(is_signed_integer_type(&isize_ty));
+        assert!(!is_signed_integer_type(&u64_ty));
         assert!(is_bytes_type(&vec_u8_ty));
         assert!(is_bytes_type(&bytes_ty));
         assert!(!is_bytes_type(&tuple_ty));

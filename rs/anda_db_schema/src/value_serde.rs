@@ -6,9 +6,11 @@
 //! and chooses the most precise variant for the input.
 //!
 //! In *human-readable* formats (e.g. JSON), [`FieldValue::Bytes`] and
-//! [`FieldKey::Bytes`] are encoded as URL-safe Base64 strings. On the way
-//! back, a textual value that successfully decodes as Base64 is treated as
-//! `Bytes`. This is the same trick used by `ic_auth_types::ByteBufB64`.
+//! [`FieldKey::Bytes`] are encoded as URL-safe Base64 strings, and
+//! [`FieldKey::I64`] is encoded as an `i64:<decimal>` string so JSON object
+//! keys can round-trip without colliding with byte keys. On the way back, a
+//! textual value that successfully decodes as Base64 is treated as `Bytes`.
+//! This is the same trick used by `ic_auth_types::ByteBufB64`.
 use base64::{Engine, prelude::BASE64_URL_SAFE};
 use serde::{
     de,
@@ -18,11 +20,20 @@ use std::collections::BTreeMap;
 
 use crate::{FieldKey, FieldValue};
 
+const I64_KEY_PREFIX: &str = "i64:";
+
 impl Serialize for FieldKey {
     #[inline]
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
             FieldKey::Text(x) => serializer.serialize_str(x),
+            FieldKey::I64(x) => {
+                if serializer.is_human_readable() {
+                    format!("{I64_KEY_PREFIX}{x}").serialize(serializer)
+                } else {
+                    serializer.serialize_i64(*x)
+                }
+            }
             FieldKey::Bytes(x) => {
                 if serializer.is_human_readable() {
                     BASE64_URL_SAFE.encode(x).serialize(serializer)
@@ -40,6 +51,14 @@ impl<'de> de::Deserialize<'de> for FieldKey {
         let is_human_readable = deserializer.is_human_readable();
         let val = deserializer.deserialize_any(KeyVisitor)?;
 
+        if is_human_readable
+            && let FieldKey::Text(x) = &val
+            && let Some(i) = x
+                .strip_prefix(I64_KEY_PREFIX)
+                .and_then(|raw| raw.parse::<i64>().ok())
+        {
+            return Ok(FieldKey::I64(i));
+        }
         if is_human_readable
             && let FieldKey::Text(x) = &val
             && let Ok(decoded) = BASE64_URL_SAFE.decode(x)
@@ -126,7 +145,63 @@ impl<'de> de::Visitor<'de> for KeyVisitor {
     type Value = FieldKey;
 
     fn expecting(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(formatter, "string or bytes")
+        write!(formatter, "string, signed integer or bytes")
+    }
+
+    #[inline]
+    fn visit_i8<E: de::Error>(self, v: i8) -> Result<Self::Value, E> {
+        Ok(FieldKey::I64(v.into()))
+    }
+
+    #[inline]
+    fn visit_i16<E: de::Error>(self, v: i16) -> Result<Self::Value, E> {
+        Ok(FieldKey::I64(v.into()))
+    }
+
+    #[inline]
+    fn visit_i32<E: de::Error>(self, v: i32) -> Result<Self::Value, E> {
+        Ok(FieldKey::I64(v.into()))
+    }
+
+    #[inline]
+    fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+        Ok(FieldKey::I64(v))
+    }
+
+    #[inline]
+    fn visit_i128<E: de::Error>(self, v: i128) -> Result<Self::Value, E> {
+        Ok(FieldKey::I64(
+            i64::try_from(v).map_err(|_| de::Error::custom("i128 overflow"))?,
+        ))
+    }
+
+    #[inline]
+    fn visit_u8<E: de::Error>(self, v: u8) -> Result<Self::Value, E> {
+        Ok(FieldKey::I64(v.into()))
+    }
+
+    #[inline]
+    fn visit_u16<E: de::Error>(self, v: u16) -> Result<Self::Value, E> {
+        Ok(FieldKey::I64(v.into()))
+    }
+
+    #[inline]
+    fn visit_u32<E: de::Error>(self, v: u32) -> Result<Self::Value, E> {
+        Ok(FieldKey::I64(v.into()))
+    }
+
+    #[inline]
+    fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+        Ok(FieldKey::I64(
+            i64::try_from(v).map_err(|_| de::Error::custom("u64 overflow"))?,
+        ))
+    }
+
+    #[inline]
+    fn visit_u128<E: de::Error>(self, v: u128) -> Result<Self::Value, E> {
+        Ok(FieldKey::I64(
+            i64::try_from(v).map_err(|_| de::Error::custom("u128 overflow"))?,
+        ))
     }
 
     #[inline]
@@ -375,6 +450,18 @@ mod tests {
             text
         );
 
+        let i64_key = FieldKey::I64(-7);
+        let encoded_i64 = serde_json::to_string(&i64_key).unwrap();
+        assert_eq!(encoded_i64, r#""i64:-7""#);
+        assert_eq!(
+            serde_json::from_str::<FieldKey>(&encoded_i64).unwrap(),
+            i64_key
+        );
+        assert_eq!(
+            serde_json::from_value::<FieldKey>(json!(-7)).unwrap(),
+            FieldKey::I64(-7)
+        );
+
         let bytes = FieldKey::Bytes(vec![1, 2, 3]);
         let encoded_bytes = serde_json::to_string(&bytes).unwrap();
         assert_eq!(encoded_bytes, r#""AQID""#);
@@ -386,6 +473,10 @@ mod tests {
         assert_eq!(
             cbor_roundtrip::<_, FieldKey>(&FieldKey::Bytes(vec![4, 5])),
             FieldKey::Bytes(vec![4, 5])
+        );
+        assert_eq!(
+            cbor_roundtrip::<_, FieldKey>(&FieldKey::I64(42)),
+            FieldKey::I64(42)
         );
         assert_eq!(
             serde_json::from_value::<FieldKey>(json!([7, 8])).unwrap(),
@@ -446,9 +537,11 @@ mod tests {
 
         let mut map = BTreeMap::new();
         map.insert(FieldKey::Text("not base64!".into()), FieldValue::Bool(true));
+        map.insert(FieldKey::I64(-7), FieldValue::Text("seven".into()));
         map.insert(FieldKey::Bytes(vec![9]), FieldValue::U64(9));
         let json_value = serde_json::to_value(FieldValue::Map(map.clone())).unwrap();
         assert_eq!(json_value["not base64!"], json!(true));
+        assert_eq!(json_value["i64:-7"], json!("seven"));
         assert_eq!(json_value[BASE64_URL_SAFE.encode([9])], json!(9));
         let decoded: FieldValue = serde_json::from_value(json_value).unwrap();
         assert_eq!(decoded, FieldValue::Map(map));
@@ -537,6 +630,37 @@ mod tests {
             KeyVisitor.visit_borrowed_bytes::<DeError>(b"key").unwrap(),
             FieldKey::Bytes(b"key".to_vec())
         );
+        assert_eq!(
+            KeyVisitor.visit_i8::<DeError>(-8).unwrap(),
+            FieldKey::I64(-8)
+        );
+        assert_eq!(
+            KeyVisitor.visit_i16::<DeError>(-16).unwrap(),
+            FieldKey::I64(-16)
+        );
+        assert_eq!(
+            KeyVisitor.visit_i32::<DeError>(-32).unwrap(),
+            FieldKey::I64(-32)
+        );
+        assert_eq!(
+            KeyVisitor.visit_i64::<DeError>(-64).unwrap(),
+            FieldKey::I64(-64)
+        );
+        assert_eq!(KeyVisitor.visit_u8::<DeError>(8).unwrap(), FieldKey::I64(8));
+        assert_eq!(
+            KeyVisitor.visit_u16::<DeError>(16).unwrap(),
+            FieldKey::I64(16)
+        );
+        assert_eq!(
+            KeyVisitor.visit_u32::<DeError>(32).unwrap(),
+            FieldKey::I64(32)
+        );
+        assert_eq!(
+            KeyVisitor.visit_u64::<DeError>(64).unwrap(),
+            FieldKey::I64(64)
+        );
+        assert!(KeyVisitor.visit_i128::<DeError>(i128::MAX).is_err());
+        assert!(KeyVisitor.visit_u128::<DeError>(u128::MAX).is_err());
         assert_eq!(
             KeyVisitor
                 .visit_byte_buf::<DeError>(b"owned-key".to_vec())

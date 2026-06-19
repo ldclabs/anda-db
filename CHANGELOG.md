@@ -2,6 +2,18 @@
 
 All notable changes to this workspace are documented in this file.
 
+## [0.8.3] — 2026-06-19
+
+### Added
+
+- **Integer schema map keys** — Added `FieldKey::I64`, integer wildcard map support via `I64_WILDCARD_KEY`, and signed-integer `Map<I64, T>` / `BTreeMap<i64, T>` schema inference.
+- **CBOR integer-keyed nested schemas** — Added `#[cbor(key = N)]` support to `FieldTyped` so nested CBOR-native structs can model integer map labels while keeping schema validation aligned with `cbor2` serialization.
+
+### Changed
+
+- **Schema and derive crates prepared for 0.8.3** — Bumped `anda_db_schema` and `anda_db_derive` to `0.8.3`, refreshed schema/derive documentation, and added `cbor2` derive test coverage for integer-keyed CBOR maps.
+- **Developer fix target formats first** — Updated `make fix` to run `cargo fmt --all` before applying clippy fixes.
+
 ## [0.8.2] — 2026-06-14
 
 ### Changed

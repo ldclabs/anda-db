@@ -73,8 +73,9 @@ pub type IndexedFieldValues = BTreeMap<usize, FieldValue>;
 ///   match it). With several inner types it is a fixed-size *tuple-like*
 ///   array.
 /// - [`FieldType::Map`] declares per-key types. A wildcard map
-///   (`{ "*": T }` or `{ b"*": T }`) matches any key with values of type
-///   `T`. See [`TEXT_WILDCARD_KEY`] / [`BYTES_WILDCARD_KEY`].
+///   (`{ "*": T }`, `{ i64::MIN: T }`, or `{ b"*": T }`) matches any key with
+///   values of type `T`. See [`TEXT_WILDCARD_KEY`] / [`BYTES_WILDCARD_KEY`] /
+///   [`I64_WILDCARD_KEY`].
 /// - [`FieldType::Option`] makes a field nullable.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FieldType {
@@ -99,7 +100,7 @@ pub enum FieldType {
     Vector,
     /// Array of field types
     Array(Vec<FieldType>),
-    /// Map with string keys and field type values
+    /// Map with typed field keys and field type values
     Map(BTreeMap<FieldKey, FieldType>),
     /// Optional field type
     Option(Box<FieldType>),
@@ -255,18 +256,21 @@ impl FieldType {
 
 /// A key in a [`FieldType::Map`] / [`FieldValue::Map`].
 ///
-/// Map keys may be either UTF-8 [`FieldKey::Text`] or arbitrary
-/// [`FieldKey::Bytes`]. The two are kept distinct in CBOR so that a `Bytes`
-/// key is never confused with the textual representation of the same
-/// payload.
+/// Map keys may be UTF-8 [`FieldKey::Text`], signed 64-bit
+/// [`FieldKey::I64`] integers, or arbitrary [`FieldKey::Bytes`]. The
+/// variants are kept distinct in CBOR so that a `Bytes` or `I64` key is never
+/// confused with the textual representation of the same payload.
 ///
-/// In JSON serialization, a `Bytes` key is rendered as a URL-safe Base64
-/// string. On the way back, a `Text` value that successfully decodes as
-/// Base64 is treated as a `Bytes` key.
+/// In JSON serialization, an `I64` key is rendered as `i64:<decimal>`, and a
+/// `Bytes` key is rendered as a URL-safe Base64 string. On the way back, a
+/// `Text` value with the `i64:` prefix is treated as an `I64` key, while one
+/// that successfully decodes as Base64 is treated as a `Bytes` key.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum FieldKey {
     /// A UTF-8 text key.
     Text(String),
+    /// A signed 64-bit integer key.
+    I64(i64),
     /// An arbitrary byte-string key.
     Bytes(Vec<u8>),
 }
@@ -279,20 +283,43 @@ pub static TEXT_WILDCARD_KEY: std::sync::LazyLock<FieldKey> =
 pub static BYTES_WILDCARD_KEY: std::sync::LazyLock<FieldKey> =
     std::sync::LazyLock::new(|| b"*".into());
 
+/// The wildcard integer key (`i64::MIN`) used to express a homogeneous
+/// `Map<I64, T>`.
+pub static I64_WILDCARD_KEY: std::sync::LazyLock<FieldKey> =
+    std::sync::LazyLock::new(|| FieldKey::I64(i64::MIN));
+
 impl FieldKey {
     /// Returns the [`FieldType`] that the key itself uses
-    /// ([`FieldType::Text`] for `Text`, [`FieldType::Bytes`] for `Bytes`).
+    /// ([`FieldType::Text`] for `Text`, [`FieldType::I64`] for `I64`,
+    /// [`FieldType::Bytes`] for `Bytes`).
     pub fn field_type(&self) -> FieldType {
         match self {
             FieldKey::Text(_) => FieldType::Text,
+            FieldKey::I64(_) => FieldType::I64,
             FieldKey::Bytes(_) => FieldType::Bytes,
         }
     }
 
     /// Borrow the raw bytes of this key, regardless of variant.
+    ///
+    /// Integer keys are exposed as native-endian bytes of the stored `i64`.
+    /// Use CBOR serialization when a stable cross-platform wire encoding is
+    /// required.
     pub fn as_bytes(&self) -> &[u8] {
         match self {
             FieldKey::Text(s) => s.as_bytes(),
+            FieldKey::I64(i) => {
+                // SAFETY: `i` is stored inside `self`, so the returned byte
+                // slice cannot outlive the referenced integer. Any bit pattern
+                // is valid for `u8`, and the slice length is exactly the size
+                // of the integer.
+                unsafe {
+                    std::slice::from_raw_parts(
+                        (i as *const i64).cast::<u8>(),
+                        std::mem::size_of::<i64>(),
+                    )
+                }
+            }
             FieldKey::Bytes(b) => b,
         }
     }
@@ -307,6 +334,36 @@ impl From<String> for FieldKey {
 impl From<&str> for FieldKey {
     fn from(s: &str) -> Self {
         FieldKey::Text(s.to_string())
+    }
+}
+
+impl From<i8> for FieldKey {
+    fn from(i: i8) -> Self {
+        FieldKey::I64(i.into())
+    }
+}
+
+impl From<i16> for FieldKey {
+    fn from(i: i16) -> Self {
+        FieldKey::I64(i.into())
+    }
+}
+
+impl From<i32> for FieldKey {
+    fn from(i: i32) -> Self {
+        FieldKey::I64(i.into())
+    }
+}
+
+impl From<i64> for FieldKey {
+    fn from(i: i64) -> Self {
+        FieldKey::I64(i)
+    }
+}
+
+impl From<isize> for FieldKey {
+    fn from(i: isize) -> Self {
+        FieldKey::I64(i as i64)
     }
 }
 
@@ -340,10 +397,14 @@ impl TryFrom<Value> for FieldKey {
     fn try_from(value: Value) -> Result<Self, Self::Error> {
         match value {
             Value::Text(s) => Ok(FieldKey::Text(s)),
+            Value::Integer(i) => Ok(FieldKey::I64(i.try_into().map_err(|v| {
+                SchemaError::FieldValue(format!("expected I64 map key, got {v:?}"))
+            })?)),
             Value::Bytes(b) => Ok(FieldKey::Bytes(b)),
-            _ => Err(
-                SchemaError::FieldValue(format!("expected Text or Bytes, got {value:?}")).into(),
-            ),
+            _ => Err(SchemaError::FieldValue(format!(
+                "expected Text, I64 or Bytes, got {value:?}"
+            ))
+            .into()),
         }
     }
 }
@@ -352,6 +413,7 @@ impl std::fmt::Display for FieldKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             FieldKey::Text(s) => write!(f, "{s}"),
+            FieldKey::I64(i) => write!(f, "{i}"),
             FieldKey::Bytes(b) => write!(f, "{}", BASE64_URL_SAFE.encode(b)),
         }
     }
@@ -391,7 +453,7 @@ pub enum FieldValue {
     Vector(Vec<bf16>),
     /// Array of field values
     Array(Vec<FieldValue>),
-    /// Map with string keys and field values
+    /// Map with typed field keys and field values
     Map(BTreeMap<FieldKey, FieldValue>),
     /// Null value (for optional fields)
     Null,
@@ -429,6 +491,7 @@ impl From<FieldValue> for Cbor {
                         (
                             match k {
                                 FieldKey::Text(s) => Cbor::Text(s),
+                                FieldKey::I64(i) => Cbor::Integer(i.into()),
                                 FieldKey::Bytes(b) => Cbor::Bytes(b),
                             },
                             Cbor::from(v),
@@ -554,6 +617,7 @@ impl From<FieldKey> for FieldValue {
     fn from(key: FieldKey) -> Self {
         match key {
             FieldKey::Text(s) => FieldValue::Text(s),
+            FieldKey::I64(i) => FieldValue::I64(i),
             FieldKey::Bytes(b) => FieldValue::Bytes(b),
         }
     }
@@ -1477,13 +1541,15 @@ pub fn vector_from_f64(v: Vec<f64>) -> Vector {
 }
 
 /// If `m` describes a *wildcard* map — i.e. it has exactly one entry whose
-/// key is [`TEXT_WILDCARD_KEY`] or [`BYTES_WILDCARD_KEY`] — return the value
-/// type of that entry. Otherwise return `None`.
+/// key is [`TEXT_WILDCARD_KEY`], [`BYTES_WILDCARD_KEY`], or
+/// [`I64_WILDCARD_KEY`] — return the value type of that entry. Otherwise
+/// return `None`.
 fn as_wildcard_map(m: &BTreeMap<FieldKey, FieldType>) -> Option<&FieldType> {
     match m.len() {
         1 => m
             .get(&TEXT_WILDCARD_KEY)
-            .or_else(|| m.get(&BYTES_WILDCARD_KEY)),
+            .or_else(|| m.get(&BYTES_WILDCARD_KEY))
+            .or_else(|| m.get(&I64_WILDCARD_KEY)),
         _ => None,
     }
 }
@@ -1554,6 +1620,23 @@ mod tests {
         let data = serde_json::to_string(&val).unwrap();
         println!("json: {}", data);
         assert_eq!(data, r#"{"Kg==":"Kg=="}"#);
+        let val2: FieldValue = serde_json::from_str(&data).unwrap();
+        assert_eq!(val, val2);
+
+        let val = FieldValue::Map(BTreeMap::from([(
+            FieldKey::I64(-7),
+            FieldValue::Text("seven".into()),
+        )]));
+        let data = cbor_into_vec(&Value::Map(vec![(
+            Value::Integer((-7).into()),
+            Value::Text("seven".into()),
+        )]))
+        .unwrap();
+        assert_eq!(cbor_into_vec(&val).unwrap(), data);
+        let val2: FieldValue = from_reader(data.as_slice()).unwrap();
+        assert_eq!(val, val2);
+        let data = serde_json::to_string(&val).unwrap();
+        assert_eq!(data, r#"{"i64:-7":"seven"}"#);
         let val2: FieldValue = serde_json::from_str(&data).unwrap();
         assert_eq!(val, val2);
     }
@@ -2136,6 +2219,12 @@ mod tests {
         assert_eq!(text_key.as_bytes(), b"name");
         assert_eq!(text_key.to_string(), "name");
 
+        let i64_key = FieldKey::from(-42_i64);
+        assert_eq!(i64_key.field_type(), FieldType::I64);
+        assert_eq!(i64_key.as_bytes(), &(-42_i64).to_ne_bytes());
+        assert_eq!(i64_key.to_string(), "-42");
+        assert_eq!(FieldKey::from(-2_isize), FieldKey::I64(-2));
+
         let bytes_from_vec = FieldKey::from(vec![1, 2, 3]);
         let bytes_from_array = FieldKey::from([4, 5, 6]);
         let bytes_from_slice = FieldKey::from(&[7, 8, 9][..]);
@@ -2149,8 +2238,13 @@ mod tests {
             FieldKey::try_from(Value::Bytes(vec![10, 11])).unwrap(),
             FieldKey::Bytes(vec![10, 11])
         );
+        assert_eq!(
+            FieldKey::try_from(Value::Integer((-42).into())).unwrap(),
+            FieldKey::I64(-42)
+        );
         assert!(FieldKey::try_from(Value::Bool(true)).is_err());
         assert_eq!(*BYTES_WILDCARD_KEY, FieldKey::Bytes(b"*".to_vec()));
+        assert_eq!(*I64_WILDCARD_KEY, FieldKey::I64(i64::MIN));
 
         let wildcard_type = FieldType::Map(BTreeMap::from([(
             FieldKey::from(b"*".as_slice()),
@@ -2165,6 +2259,24 @@ mod tests {
         let wildcard_cbor = Cbor::Map(vec![
             (Cbor::Bytes(vec![0]), Cbor::Integer(1.into())),
             (Cbor::Bytes(vec![1]), Cbor::Integer(2.into())),
+        ]);
+        assert_eq!(
+            wildcard_type.extract(wildcard_cbor).unwrap(),
+            wildcard_value
+        );
+
+        let wildcard_type = FieldType::Map(BTreeMap::from([(
+            FieldKey::from(i64::MIN),
+            FieldType::Text,
+        )]));
+        let wildcard_value = FieldValue::Map(BTreeMap::from([
+            (FieldKey::from(-1_i64), FieldValue::Text("neg".into())),
+            (FieldKey::from(2_i64), FieldValue::Text("pos".into())),
+        ]));
+        assert!(wildcard_type.validate(&wildcard_value).is_ok());
+        let wildcard_cbor = Cbor::Map(vec![
+            (Cbor::Integer((-1).into()), Cbor::Text("neg".into())),
+            (Cbor::Integer(2.into()), Cbor::Text("pos".into())),
         ]);
         assert_eq!(
             wildcard_type.extract(wildcard_cbor).unwrap(),
@@ -2255,6 +2367,24 @@ mod tests {
             Cbor::Map(vec![(Cbor::Bytes(vec![1, 2]), Cbor::Integer(9.into()))])
         );
 
+        let tree_map = BTreeMap::from([(-7_i64, "lucky".to_string())]);
+        let tree_map_value = FieldValue::from(tree_map);
+        assert_eq!(
+            tree_map_value,
+            FieldValue::Map(BTreeMap::from([(
+                FieldKey::I64(-7),
+                FieldValue::Text("lucky".to_string())
+            )]))
+        );
+        let cbor: Cbor = tree_map_value.into();
+        assert_eq!(
+            cbor,
+            Cbor::Map(vec![(
+                Cbor::Integer((-7).into()),
+                Cbor::Text("lucky".to_string())
+            )])
+        );
+
         let hash_map = HashMap::from([("answer".to_string(), 42_u64)]);
         assert_eq!(
             FieldValue::from(hash_map),
@@ -2277,6 +2407,7 @@ mod tests {
             FieldValue::from(FieldKey::Text("key".to_string())),
             FieldValue::Text("key".to_string())
         );
+        assert_eq!(FieldValue::from(FieldKey::I64(-7)), FieldValue::I64(-7));
         assert_eq!(
             FieldValue::from(FieldKey::Bytes(vec![1, 2])),
             FieldValue::Bytes(vec![1, 2])
@@ -2412,12 +2543,16 @@ mod tests {
             .is_err()
         );
         assert!(FieldValue::map_from(Cbor::Text("bad".into()), &BTreeMap::new()).is_err());
-        assert!(
+        assert_eq!(
             FieldValue::map_from(
-                Cbor::Map(vec![(Cbor::Integer(1.into()), Cbor::Text("bad".into()))]),
+                Cbor::Map(vec![(Cbor::Integer(1.into()), Cbor::Text("ok".into()))]),
                 &BTreeMap::new(),
             )
-            .is_err()
+            .unwrap(),
+            FieldValue::Map(BTreeMap::from([(
+                FieldKey::I64(1),
+                FieldValue::Text("ok".into())
+            )]))
         );
         assert!(
             FieldValue::map_from(
