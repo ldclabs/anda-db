@@ -762,9 +762,9 @@ mod tests {
                         subject: TargetTerm::Variable("drug".to_string()),
                         predicate: PredTerm::Literal("treats".to_string()),
                         object: TargetTerm::Concept(ConceptMatcher::Object {
-                                r#type: "Symptom".to_string(),
-                                name: "Headache".to_string(),
-                            }),
+                            r#type: "Symptom".to_string(),
+                            name: "Headache".to_string(),
+                        }),
                     }
                 );
             }
@@ -918,9 +918,9 @@ mod tests {
                     clause.matcher,
                     PropositionMatcher::Object {
                         subject: TargetTerm::Concept(ConceptMatcher::Object {
-                                r#type: "Person".to_string(),
-                                name: "张三".to_string(),
-                            }),
+                            r#type: "Person".to_string(),
+                            name: "张三".to_string(),
+                        }),
                         predicate: PredTerm::Literal("stated".to_string()),
                         object: TargetTerm::Proposition(Box::new(PropositionMatcher::Object {
                             subject: TargetTerm::Variable("paper".to_string()),
@@ -1660,7 +1660,9 @@ mod tests {
                             PropositionMatcher::Object {
                                 subject: TargetTerm::Variable("drug".to_string()),
                                 predicate: PredTerm::Literal("is_class_of".to_string()),
-                                object: TargetTerm::Concept(ConceptMatcher::Name("NSAID".to_string())),
+                                object: TargetTerm::Concept(ConceptMatcher::Name(
+                                    "NSAID".to_string()
+                                )),
                             }
                         );
                     }
@@ -1700,7 +1702,9 @@ mod tests {
                             PropositionMatcher::Object {
                                 subject: TargetTerm::Variable("drug".to_string()),
                                 predicate: PredTerm::Literal("treats".to_string()),
-                                object: TargetTerm::Concept(ConceptMatcher::Name("Fever".to_string())),
+                                object: TargetTerm::Concept(ConceptMatcher::Name(
+                                    "Fever".to_string()
+                                )),
                             }
                         );
                     }

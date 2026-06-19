@@ -148,11 +148,7 @@ fn parse_export_command(input: &str) -> VResult<'_, ExportCommand> {
         map(
             preceded(
                 ws(keyword("EXPORT")),
-                cut((
-                    ws(variable),
-                    parse_where_block,
-                    opt(ws(parse_limit_clause)),
-                )),
+                cut((ws(variable), parse_where_block, opt(ws(parse_limit_clause)))),
             ),
             |(target, where_clauses, limit)| ExportCommand {
                 target,
@@ -482,10 +478,7 @@ mod tests {
         }
 
         // EXPORT without LIMIT
-        let (_, command) = parse_meta_command(
-            r#"EXPORT ?x WHERE { ?x {type: "Drug"} }"#,
-        )
-        .unwrap();
+        let (_, command) = parse_meta_command(r#"EXPORT ?x WHERE { ?x {type: "Drug"} }"#).unwrap();
         match command {
             MetaCommand::Export(export) => {
                 assert_eq!(export.target, "x");

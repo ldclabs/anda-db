@@ -489,10 +489,7 @@ WITH METADATA {
             "#,
         )
         .unwrap();
-        assert!(matches!(
-            update,
-            Command::Kml(KmlStatement::Update(_))
-        ));
+        assert!(matches!(update, Command::Kml(KmlStatement::Update(_))));
 
         let merge = parse_kip(
             r#"
@@ -514,15 +511,10 @@ WITH METADATA {
             "#,
         )
         .unwrap();
-        assert!(matches!(
-            export,
-            Command::Meta(MetaCommand::Export(_))
-        ));
+        assert!(matches!(export, Command::Meta(MetaCommand::Export(_))));
 
-        let search = parse_kip(
-            r#"SEARCH CONCEPT "深色模式" MODE "hybrid" THRESHOLD 0.6 LIMIT 10"#,
-        )
-        .unwrap();
+        let search =
+            parse_kip(r#"SEARCH CONCEPT "深色模式" MODE "hybrid" THRESHOLD 0.6 LIMIT 10"#).unwrap();
         assert!(matches!(search, Command::Meta(MetaCommand::Search(_))));
     }
 

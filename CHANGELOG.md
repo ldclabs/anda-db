@@ -11,7 +11,7 @@ All notable changes to this workspace are documented in this file.
 
 ### Changed
 
-- **Schema and derive crates prepared for 0.8.3** — Bumped `anda_db_schema` and `anda_db_derive` to `0.8.3`, refreshed schema/derive documentation, and added `cbor2` derive test coverage for integer-keyed CBOR maps.
+- **Workspace crates prepared for 0.8.3** — Bumped `anda_db`, `anda_db_schema`, `anda_db_derive`, and `anda_cognitive_nexus` to `0.8.3`, refreshed schema/derive documentation, and added `cbor2` derive test coverage for integer-keyed CBOR maps.
 - **Developer fix target formats first** — Updated `make fix` to run `cargo fmt --all` before applying clippy fixes.
 
 ## [0.8.2] — 2026-06-14
