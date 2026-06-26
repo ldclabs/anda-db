@@ -111,6 +111,9 @@ struct Cli {
 async fn main() -> Result<(), BoxError> {
     dotenv::dotenv().ok();
     let cli = Cli::parse();
+    if matches!(cli.api_key.as_deref(), Some(key) if key.trim().is_empty()) {
+        return Err("API_KEY must not be empty".into());
+    }
 
     Builder::with_level(&get_env_level().to_string())
         .with_target_writer("*", new_writer(tokio::io::stdout()))

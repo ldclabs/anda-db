@@ -18,6 +18,8 @@ use crate::error::*;
 use crate::query::*;
 use crate::tokenizer::*;
 
+const MAX_NOT_COMPLEMENT_DOCS: usize = 10_000;
+
 fn cbor_serialized_size<T: ?Sized + Serialize>(value: &T) -> usize {
     cbor2::serialized_size(value)
         .expect("CBOR serialized size calculation failed")
@@ -945,16 +947,44 @@ where
         top_k: usize,
         params: Option<BM25Params>,
     ) -> Vec<(u64, f32)> {
+        self.try_search_advanced(query, top_k, params)
+            .unwrap_or_default()
+    }
+
+    /// Searches the index with a boolean query expression and resource guards.
+    pub fn try_search_advanced(
+        &self,
+        query: &str,
+        top_k: usize,
+        params: Option<BM25Params>,
+    ) -> Result<Vec<(u64, f32)>, BM25Error> {
         self.search_count.fetch_add(1, Ordering::Relaxed);
         if top_k == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
-        let query_expr = QueryType::parse(query);
+        let query_expr = QueryType::try_parse(query).map_err(|source| BM25Error::Generic {
+            name: self.name.clone(),
+            source: source.into(),
+        })?;
+        if query_expr.may_materialize_not_complement()
+            && self.doc_tokens.len() > MAX_NOT_COMPLEMENT_DOCS
+        {
+            return Err(BM25Error::Generic {
+                name: self.name.clone(),
+                source: format!(
+                    "logical NOT complement over {} documents exceeds maximum {}",
+                    self.doc_tokens.len(),
+                    MAX_NOT_COMPLEMENT_DOCS
+                )
+                .into(),
+            });
+        }
+
         let params = params.as_ref().unwrap_or(&self.config.bm25);
         let scored_docs = self.execute_query(&query_expr, params, false);
 
-        Self::top_k_results(scored_docs, top_k)
+        Ok(Self::top_k_results(scored_docs, top_k))
     }
 
     /// Extracts the top-k results from scored documents using partial sorting.
@@ -2130,6 +2160,19 @@ mod tests {
         let mut ids: Vec<u64> = results.iter().map(|(id, _)| *id).collect();
         ids.sort_unstable();
         assert_eq!(ids, vec![1, 2, 4]);
+    }
+
+    #[test]
+    fn test_nested_not_complement_guard_inside_and_filter() {
+        let index = BM25Index::new("nested_not_guard".to_string(), default_tokenizer(), None);
+        for id in 0..=MAX_NOT_COMPLEMENT_DOCS as u64 {
+            index.insert(id, "hello world", 0).unwrap();
+        }
+
+        let err = index
+            .try_search_advanced("hello AND NOT (NOT world)", 10, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("logical NOT complement"));
     }
 
     #[test]

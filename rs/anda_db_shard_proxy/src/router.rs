@@ -1,16 +1,14 @@
 //! Helpers for turning an incoming HTTP request into a shard-routing key.
 //!
-//! The default extractor first tries shard identifiers supplied through
-//! request headers, then falls back to a database name encoded in the request
-//! path.
+//! The default extractor resolves the database name from the request path.
 
 use crate::proxy::DbShardExtractor;
 
-/// Extracts shard routing keys from a path prefix or shard headers.
+/// Extracts shard routing keys from a path prefix.
 ///
-/// Header values named `Shard-ID` or `X-Shard` take precedence. When neither
-/// header is present, the extractor removes [`Self::prefix`] from the request
-/// path and treats the next path segment as the database name.
+/// The extractor removes [`Self::prefix`] from the request path and treats the
+/// next path segment as the database name. Client-supplied shard headers are
+/// ignored; shard IDs are selected from server-side routing metadata only.
 pub struct PrefixExtractor {
     /// Path prefix that precedes the database name.
     ///
@@ -23,17 +21,9 @@ impl DbShardExtractor for PrefixExtractor {
     fn extract(
         &self,
         uri: &axum::http::Uri,
-        headers: &axum::http::HeaderMap,
+        _headers: &axum::http::HeaderMap,
     ) -> (Option<u32>, Option<String>) {
-        // Prefer shard-id headers when present.
-        if let Some(v) = headers.get("Shard-ID").or_else(|| headers.get("X-Shard"))
-            && let Ok(shard_id) = v.to_str()
-            && let Ok(id) = shard_id.parse::<u32>()
-        {
-            return (Some(id), None);
-        }
-
-        // Fall back to extracting from path: prefix{db_name}/...
+        // Extract from path: prefix{db_name}/...
         if let Some(path) = uri.path().strip_prefix(&self.prefix)
             && let Some(db_name) = path.split('/').next()
             && !db_name.is_empty()
@@ -91,7 +81,7 @@ mod tests {
     }
 
     #[test]
-    fn prefix_extractor_falls_back_to_shard_header_when_path_missing() {
+    fn prefix_extractor_ignores_shard_header_when_path_missing() {
         let extractor = PrefixExtractor {
             prefix: "/db/".to_string(),
         };
@@ -99,7 +89,7 @@ mod tests {
         let uri: Uri = "/other-path".parse().unwrap();
         let mut headers = HeaderMap::new();
         headers.insert("Shard-ID", HeaderValue::from_static("42"));
-        assert_eq!(extractor.extract(&uri, &headers), (Some(42), None));
+        assert_eq!(extractor.extract(&uri, &headers), (None, None));
     }
 
     #[test]
@@ -114,7 +104,7 @@ mod tests {
     }
 
     #[test]
-    fn prefix_extractor_falls_back_to_x_shard_header() {
+    fn prefix_extractor_ignores_x_shard_header() {
         let extractor = PrefixExtractor {
             prefix: "/db/".to_string(),
         };
@@ -122,11 +112,11 @@ mod tests {
         let uri: Uri = "/db/".parse().unwrap();
         let mut headers = HeaderMap::new();
         headers.insert("X-Shard", HeaderValue::from_static("88"));
-        assert_eq!(extractor.extract(&uri, &headers), (Some(88), None));
+        assert_eq!(extractor.extract(&uri, &headers), (None, None));
     }
 
     #[test]
-    fn prefix_extractor_prefers_header_over_path() {
+    fn prefix_extractor_prefers_path_over_untrusted_header() {
         let extractor = PrefixExtractor {
             prefix: "/db/".to_string(),
         };
@@ -134,6 +124,9 @@ mod tests {
         let uri: Uri = "/db/mydb/query".parse().unwrap();
         let mut headers = HeaderMap::new();
         headers.insert("Shard-ID", HeaderValue::from_static("7"));
-        assert_eq!(extractor.extract(&uri, &headers), (Some(7), None));
+        assert_eq!(
+            extractor.extract(&uri, &headers),
+            (None, Some("mydb".into()))
+        );
     }
 }

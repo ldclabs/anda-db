@@ -192,19 +192,25 @@ async fn auth_middleware(
     request: axum::http::Request<axum::body::Body>,
     next: Next,
 ) -> Result<axum::response::Response, StatusCode> {
-    if let Some(expected) = state.api_key.as_deref() {
-        // The admin API accepts a conventional Bearer token and stays open when
-        // no API key is configured, which is convenient for local development.
-        let provided = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let provided = provided.trim_start_matches("Bearer ");
-        if provided != expected {
-            return Err(StatusCode::UNAUTHORIZED);
-        }
+    if !authorize_api_key(state.api_key.as_deref(), &headers) {
+        return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(next.run(request).await)
+}
+
+fn authorize_api_key(expected: Option<&str>, headers: &HeaderMap) -> bool {
+    let Some(expected) = expected else {
+        return true;
+    };
+    if expected.trim().is_empty() {
+        return false;
+    }
+
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        == Some(expected)
 }
 
 // ── Router construction ─────────────────────────────────────────────────────
@@ -232,4 +238,28 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/_admin", admin)
         .fallback(proxy_handler)
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    #[test]
+    fn admin_auth_rejects_empty_expected_key_and_missing_header() {
+        let headers = HeaderMap::new();
+        assert!(!authorize_api_key(Some(""), &headers));
+        assert!(!authorize_api_key(Some("secret"), &headers));
+        assert!(authorize_api_key(None, &headers));
+    }
+
+    #[test]
+    fn admin_auth_requires_bearer_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("secret"));
+        assert!(!authorize_api_key(Some("secret"), &headers));
+
+        headers.insert("authorization", HeaderValue::from_static("Bearer secret"));
+        assert!(authorize_api_key(Some("secret"), &headers));
+    }
 }

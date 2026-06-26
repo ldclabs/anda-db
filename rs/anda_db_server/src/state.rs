@@ -114,6 +114,10 @@ impl AppState {
         object_store: Arc<dyn ObjectStore>,
         options: ServerOptions,
     ) -> Result<Self, ApiError> {
+        if matches!(options.api_key.as_deref(), Some(key) if key.trim().is_empty()) {
+            return Err(ApiError::bad_request("API key must not be empty"));
+        }
+
         validate_field_name(&options.primary_db)
             .map_err(|e| ApiError::bad_request(format!("invalid primary database name: {e}")))?;
 

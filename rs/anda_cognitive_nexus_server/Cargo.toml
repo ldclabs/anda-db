@@ -1,6 +1,6 @@
 [package]
 name = "anda_cognitive_nexus_server"
-version = "0.8.0"
+version = "0.8.4"
 description = "A HTTP server for the Anda Cognitive Nexus, facilitating knowledge interaction via KIP."
 categories = ["database", "data-structures", "text-processing"]
 repository = "https://github.com/ldclabs/anda-db/tree/main/rs/anda_cognitive_nexus_server"

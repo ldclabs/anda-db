@@ -257,4 +257,14 @@ impl BM25 {
     ) -> Vec<(u64, f32)> {
         self.index.search_advanced(query, top_k, params)
     }
+
+    /// Searches with advanced query parsing and resource guards.
+    pub fn try_search_advanced(
+        &self,
+        query: &str,
+        top_k: usize,
+        params: Option<BM25Params>,
+    ) -> Result<Vec<(u64, f32)>, DBError> {
+        Ok(self.index.try_search_advanced(query, top_k, params)?)
+    }
 }

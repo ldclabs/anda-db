@@ -141,6 +141,21 @@ impl HnswConfig {
     /// Minimum useful value for `max_connections`.
     pub const MIN_MAX_CONNECTIONS: u8 = 2;
 
+    /// Maximum vector dimensionality accepted by public configuration.
+    pub const MAX_DIMENSION: usize = 16_384;
+
+    /// Maximum layer count accepted by public configuration.
+    pub const MAX_MAX_LAYERS: u8 = 64;
+
+    /// Maximum neighbor connections accepted by public configuration.
+    pub const MAX_MAX_CONNECTIONS: u8 = 128;
+
+    /// Maximum construction candidate-list breadth.
+    pub const MAX_EF_CONSTRUCTION: usize = 4_096;
+
+    /// Maximum search candidate-list breadth.
+    pub const MAX_EF_SEARCH: usize = 4_096;
+
     /// Creates a layer generator based on the configuration.
     ///
     /// # Returns
@@ -161,10 +176,15 @@ impl HnswConfig {
     /// compatible while preventing invalid public config values from causing
     /// panics in layer generation or zero-width searches.
     pub fn normalized(mut self) -> Self {
-        self.max_layers = self.max_layers.max(Self::MIN_MAX_LAYERS);
-        self.max_connections = self.max_connections.max(Self::MIN_MAX_CONNECTIONS);
-        self.ef_construction = self.ef_construction.max(1);
-        self.ef_search = self.ef_search.max(1);
+        self.dimension = self.dimension.clamp(1, Self::MAX_DIMENSION);
+        self.max_layers = self
+            .max_layers
+            .clamp(Self::MIN_MAX_LAYERS, Self::MAX_MAX_LAYERS);
+        self.max_connections = self
+            .max_connections
+            .clamp(Self::MIN_MAX_CONNECTIONS, Self::MAX_MAX_CONNECTIONS);
+        self.ef_construction = self.ef_construction.clamp(1, Self::MAX_EF_CONSTRUCTION);
+        self.ef_search = self.ef_search.clamp(1, Self::MAX_EF_SEARCH);
         if !matches!(self.scale_factor, Some(scale_factor) if scale_factor.is_finite() && scale_factor > 0.0)
         {
             self.scale_factor = None;
@@ -180,13 +200,34 @@ impl HnswConfig {
                 "dimension must be greater than 0",
             ));
         }
+        if self.dimension > Self::MAX_DIMENSION {
+            return Err(Self::invalid_config(
+                name,
+                format!("dimension must be at most {}", Self::MAX_DIMENSION),
+            ));
+        }
         if self.max_layers < Self::MIN_MAX_LAYERS {
             return Err(Self::invalid_config(name, "max_layers must be at least 1"));
+        }
+        if self.max_layers > Self::MAX_MAX_LAYERS {
+            return Err(Self::invalid_config(
+                name,
+                format!("max_layers must be at most {}", Self::MAX_MAX_LAYERS),
+            ));
         }
         if self.max_connections < Self::MIN_MAX_CONNECTIONS {
             return Err(Self::invalid_config(
                 name,
                 "max_connections must be at least 2",
+            ));
+        }
+        if self.max_connections > Self::MAX_MAX_CONNECTIONS {
+            return Err(Self::invalid_config(
+                name,
+                format!(
+                    "max_connections must be at most {}",
+                    Self::MAX_MAX_CONNECTIONS
+                ),
             ));
         }
         if self.ef_construction == 0 {
@@ -195,10 +236,25 @@ impl HnswConfig {
                 "ef_construction must be greater than 0",
             ));
         }
+        if self.ef_construction > Self::MAX_EF_CONSTRUCTION {
+            return Err(Self::invalid_config(
+                name,
+                format!(
+                    "ef_construction must be at most {}",
+                    Self::MAX_EF_CONSTRUCTION
+                ),
+            ));
+        }
         if self.ef_search == 0 {
             return Err(Self::invalid_config(
                 name,
                 "ef_search must be greater than 0",
+            ));
+        }
+        if self.ef_search > Self::MAX_EF_SEARCH {
+            return Err(Self::invalid_config(
+                name,
+                format!("ef_search must be at most {}", Self::MAX_EF_SEARCH),
             ));
         }
         if let Some(scale_factor) = self.scale_factor
@@ -1919,6 +1975,30 @@ mod tests {
                 ..Default::default()
             },
             HnswConfig {
+                dimension: HnswConfig::MAX_DIMENSION + 1,
+                ..Default::default()
+            },
+            HnswConfig {
+                max_layers: HnswConfig::MAX_MAX_LAYERS + 1,
+                dimension: 2,
+                ..Default::default()
+            },
+            HnswConfig {
+                max_connections: HnswConfig::MAX_MAX_CONNECTIONS + 1,
+                dimension: 2,
+                ..Default::default()
+            },
+            HnswConfig {
+                ef_construction: HnswConfig::MAX_EF_CONSTRUCTION + 1,
+                dimension: 2,
+                ..Default::default()
+            },
+            HnswConfig {
+                ef_search: HnswConfig::MAX_EF_SEARCH + 1,
+                dimension: 2,
+                ..Default::default()
+            },
+            HnswConfig {
                 scale_factor: Some(0.0),
                 dimension: 2,
                 ..Default::default()
@@ -1947,6 +2027,21 @@ mod tests {
         assert_eq!(normalized.ef_construction, 1);
         assert_eq!(normalized.ef_search, 1);
         assert_eq!(normalized.scale_factor, None);
+
+        let normalized = HnswConfig {
+            dimension: HnswConfig::MAX_DIMENSION + 1,
+            max_layers: HnswConfig::MAX_MAX_LAYERS + 1,
+            max_connections: HnswConfig::MAX_MAX_CONNECTIONS + 1,
+            ef_construction: HnswConfig::MAX_EF_CONSTRUCTION + 1,
+            ef_search: HnswConfig::MAX_EF_SEARCH + 1,
+            ..Default::default()
+        }
+        .normalized();
+        assert_eq!(normalized.dimension, HnswConfig::MAX_DIMENSION);
+        assert_eq!(normalized.max_layers, HnswConfig::MAX_MAX_LAYERS);
+        assert_eq!(normalized.max_connections, HnswConfig::MAX_MAX_CONNECTIONS);
+        assert_eq!(normalized.ef_construction, HnswConfig::MAX_EF_CONSTRUCTION);
+        assert_eq!(normalized.ef_search, HnswConfig::MAX_EF_SEARCH);
 
         let config = HnswConfig {
             dimension: 2,

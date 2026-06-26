@@ -91,7 +91,7 @@ structured-logger = { version = "1", default-features = false }
 smallvec = { version = "1.15", default-features = false }
 criterion = { version = "0.8", default-features = false }
 ic_auth_types = { version = "0.9", default-features = false }
-object_store = { version = "0.13", default-features = false }
+object_store = { version = "0.14", default-features = false }
 moka = { version = "0.12", default-features = false, features = ["future"] }
 zstd-safe = { version = "7", default-features = false, features = [
   "experimental",

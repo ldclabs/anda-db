@@ -10,6 +10,10 @@ pub use bm25::*;
 pub use btree::*;
 pub use hnsw::*;
 
+const MAX_SEARCHABLE_TEXT_DEPTH: usize = 64;
+const MAX_SEARCHABLE_TEXT_NODES: usize = 16_384;
+const MAX_SEARCHABLE_TEXT_FRAGMENTS: usize = 4_096;
+
 /// Customization point for deriving indexable values from stored documents.
 ///
 /// The default implementation indexes physical fields directly. Applications
@@ -117,20 +121,52 @@ pub fn virtual_searchable_text<'a>(vals: &[Option<&'a Fv>]) -> Option<Cow<'a, st
 }
 
 fn extract_text<'a>(texts: &mut Vec<&'a str>, val: &'a Fv) {
-    match val {
-        Fv::Text(text) => texts.push(text),
-        Fv::Array(vals) => {
-            for val in vals {
-                extract_text(texts, val);
-            }
+    enum Item<'a> {
+        Field(&'a Fv, usize),
+        Json(&'a Json, usize),
+    }
+
+    let mut nodes = 0usize;
+    let mut stack = vec![Item::Field(val, 0)];
+
+    while let Some(item) = stack.pop() {
+        if texts.len() >= MAX_SEARCHABLE_TEXT_FRAGMENTS {
+            return;
         }
-        Fv::Map(vals) => {
-            for val in vals.values() {
-                extract_text(texts, val);
-            }
+        nodes = nodes.saturating_add(1);
+        if nodes > MAX_SEARCHABLE_TEXT_NODES {
+            return;
         }
-        Fv::Json(json) => extract_json_text(texts, json),
-        _ => {}
+
+        match item {
+            Item::Field(Fv::Text(text), _) => texts.push(text),
+            Item::Field(Fv::Array(vals), depth) if depth < MAX_SEARCHABLE_TEXT_DEPTH => {
+                stack.extend(vals.iter().rev().map(|val| Item::Field(val, depth + 1)));
+            }
+            Item::Field(Fv::Map(vals), depth) if depth < MAX_SEARCHABLE_TEXT_DEPTH => {
+                let values: Vec<_> = vals.values().collect();
+                for val in values.into_iter().rev() {
+                    stack.push(Item::Field(val, depth + 1));
+                }
+            }
+            Item::Field(Fv::Json(json), depth) if depth < MAX_SEARCHABLE_TEXT_DEPTH => {
+                stack.push(Item::Json(json, depth + 1));
+            }
+            Item::Json(Json::String(s), _) => texts.push(s),
+            Item::Json(Json::Object(obj), depth) if depth < MAX_SEARCHABLE_TEXT_DEPTH => {
+                let values: Vec<_> = obj.values().collect();
+                for val in values.into_iter().rev() {
+                    stack.push(Item::Json(val, depth + 1));
+                }
+            }
+            Item::Json(Json::Array(arr), depth)
+                if depth < MAX_SEARCHABLE_TEXT_DEPTH
+                    && (arr.is_empty() || matches!(arr[0], Json::String(_) | Json::Object(_))) =>
+            {
+                stack.extend(arr.iter().rev().map(|val| Item::Json(val, depth + 1)));
+            }
+            _ => {}
+        }
     }
 }
 
@@ -139,23 +175,34 @@ fn extract_text<'a>(texts: &mut Vec<&'a str>, val: &'a Fv) {
 /// Arrays whose first element is not a string or object are treated as scalar
 /// arrays and skipped to avoid indexing arbitrary numeric/vector payloads.
 pub fn extract_json_text<'a>(texts: &mut Vec<&'a str>, val: &'a Json) {
-    match val {
-        Json::String(s) => texts.push(s),
-        Json::Object(obj) => {
-            for val in obj.values() {
-                extract_json_text(texts, val);
-            }
-        }
-        Json::Array(arr) => {
-            if !arr.is_empty() && !matches!(arr[0], Json::String(_) | Json::Object(_)) {
-                return;
-            }
+    let mut nodes = 0usize;
+    let mut stack = vec![(val, 0usize)];
 
-            for val in arr {
-                extract_json_text(texts, val);
-            }
+    while let Some((val, depth)) = stack.pop() {
+        if texts.len() >= MAX_SEARCHABLE_TEXT_FRAGMENTS {
+            return;
         }
-        _ => {}
+        nodes = nodes.saturating_add(1);
+        if nodes > MAX_SEARCHABLE_TEXT_NODES {
+            return;
+        }
+
+        match val {
+            Json::String(s) => texts.push(s),
+            Json::Object(obj) if depth < MAX_SEARCHABLE_TEXT_DEPTH => {
+                let values: Vec<_> = obj.values().collect();
+                for val in values.into_iter().rev() {
+                    stack.push((val, depth + 1));
+                }
+            }
+            Json::Array(arr)
+                if depth < MAX_SEARCHABLE_TEXT_DEPTH
+                    && (arr.is_empty() || matches!(arr[0], Json::String(_) | Json::Object(_))) =>
+            {
+                stack.extend(arr.iter().rev().map(|val| (val, depth + 1)));
+            }
+            _ => {}
+        }
     }
 }
 

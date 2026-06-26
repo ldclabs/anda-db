@@ -636,6 +636,18 @@ async fn test_auth() {
 }
 
 #[tokio::test]
+async fn test_empty_api_key_is_rejected_at_startup() {
+    let err = match AppState::connect(Arc::new(InMemory::new()), test_options(Some(String::new())))
+        .await
+    {
+        Ok(_) => panic!("empty API key should fail startup"),
+        Err(err) => err,
+    };
+    assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    assert!(err.message.contains("API key must not be empty"));
+}
+
+#[tokio::test]
 async fn test_encoding_negotiation() {
     let app = test_app().await;
 

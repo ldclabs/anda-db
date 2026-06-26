@@ -180,7 +180,7 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
         Ok(rt.unwrap().value().clone())
     }
 
-    async fn remove_meta_cache(&self, location: &Path) {
+    pub(crate) async fn remove_meta_cache(&self, location: &Path) {
         self.meta_cache.remove(location).await;
     }
 
@@ -320,6 +320,7 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
             return Ok(ListResult {
                 common_prefixes,
                 objects,
+                extensions: Extensions::default(),
             });
         }
 
@@ -343,6 +344,7 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
         Ok(ListResult {
             common_prefixes,
             objects,
+            extensions: Extensions::default(),
         })
     }
 

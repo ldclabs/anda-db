@@ -68,7 +68,7 @@ impl Hnsw {
         now_ms: u64,
     ) -> Result<Self, DBError> {
         let name = field.name().to_string();
-        let index = HnswIndex::new(name.clone(), Some(config));
+        let index = HnswIndex::try_new(name.clone(), Some(config))?;
         let mut metadata = Vec::new();
         let mut ids = Vec::new();
         index

@@ -41,18 +41,11 @@ pub async fn post_kip(
     header: header::HeaderMap,
     Json(req): Json<JsonRpcRequest>,
 ) -> Result<Json<Response>, (StatusCode, Json<Response>)> {
-    if let Some(expected_api_key) = &app.api_key {
-        let provided_api_key = header
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let provided_api_key = provided_api_key.trim_start_matches("Bearer ");
-        if provided_api_key != expected_api_key {
-            return Err((
-                StatusCode::UNAUTHORIZED,
-                Json(Response::err("invalid API key".to_string())),
-            ));
-        }
+    if !authorize_api_key(app.api_key.as_deref(), &header) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(Response::err("invalid API key".to_string())),
+        ));
     }
 
     match req.method.as_str() {
@@ -91,5 +84,44 @@ pub async fn post_kip(
             StatusCode::BAD_REQUEST,
             Json(Response::err(format!("unknown method: {}", req.method))),
         )),
+    }
+}
+
+fn authorize_api_key(expected: Option<&str>, header: &header::HeaderMap) -> bool {
+    let Some(expected) = expected else {
+        return true;
+    };
+    if expected.trim().is_empty() {
+        return false;
+    }
+
+    header
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        == Some(expected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    #[test]
+    fn api_key_auth_rejects_empty_expected_key_and_missing_header() {
+        let headers = header::HeaderMap::new();
+        assert!(!authorize_api_key(Some(""), &headers));
+        assert!(!authorize_api_key(Some("secret"), &headers));
+        assert!(authorize_api_key(None, &headers));
+    }
+
+    #[test]
+    fn api_key_auth_requires_bearer_token() {
+        let mut headers = header::HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("secret"));
+        assert!(!authorize_api_key(Some("secret"), &headers));
+
+        headers.insert("authorization", HeaderValue::from_static("Bearer secret"));
+        assert!(authorize_api_key(Some("secret"), &headers));
     }
 }

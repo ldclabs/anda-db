@@ -843,6 +843,14 @@ impl AndaDB {
     /// Sets a user-defined extension key-value pair and immediately persists the change.
     /// The extensions should not be large, as they are stored in the same object as database metadata which size is expected to be small (<= 1MB) and loaded frequently.
     pub async fn save_extension(&self, key: String, value: FieldValue) -> Result<(), DBError> {
+        if self.inner.read_only.load(Ordering::Relaxed) {
+            return Err(DBError::Generic {
+                name: self.inner.name.clone(),
+                source: "database is read-only".into(),
+            });
+        }
+        value.validate_complexity()?;
+
         {
             self.inner.metadata.write().extensions.insert(key, value);
         }
@@ -861,6 +869,13 @@ impl AndaDB {
     /// Removes a user-defined extension key and immediately persists the change.
     /// Returns the previous value if the key existed.
     pub async fn remove_extension(&self, key: &str) -> Result<Option<FieldValue>, DBError> {
+        if self.inner.read_only.load(Ordering::Relaxed) {
+            return Err(DBError::Generic {
+                name: self.inner.name.clone(),
+                source: "database is read-only".into(),
+            });
+        }
+
         let old = { self.inner.metadata.write().extensions.remove(key) };
         if old.is_some() {
             self.flush_metadata(unix_ms()).await?;
@@ -1178,6 +1193,15 @@ mod tests {
 
         // Set database to read-only
         db.set_read_only(true);
+
+        let err = db
+            .save_extension("blocked".to_string(), FieldValue::Text("value".to_string()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DBError::Generic { .. }));
+
+        let err = db.remove_extension("blocked").await.unwrap_err();
+        assert!(matches!(err, DBError::Generic { .. }));
 
         // Attempt to create another collection should fail
         let collection_config2 = CollectionConfig {

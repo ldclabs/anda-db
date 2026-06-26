@@ -4,6 +4,23 @@
 
 use super::*;
 
+const MAX_SUBJECT_OBJECT_RANGE_VARIANTS: usize = 4_096;
+
+fn checked_subject_object_variant_count(
+    subject_count: usize,
+    object_count: usize,
+) -> Result<usize, KipError> {
+    let variant_count = subject_count
+        .checked_mul(object_count)
+        .ok_or_else(|| KipError::resource_exhausted("subject/object matcher is too broad"))?;
+    if variant_count > MAX_SUBJECT_OBJECT_RANGE_VARIANTS {
+        return Err(KipError::resource_exhausted(format!(
+            "subject/object matcher expands to {variant_count} range branches, maximum is {MAX_SUBJECT_OBJECT_RANGE_VARIANTS}"
+        )));
+    }
+    Ok(variant_count)
+}
+
 impl CognitiveNexus {
     // 处理多跳匹配
     pub(super) async fn handle_multi_hop_matching(
@@ -102,9 +119,11 @@ impl CognitiveNexus {
             return Ok(result);
         }
 
+        let variant_count =
+            checked_subject_object_variant_count(subject_ids.len(), object_ids.len())?;
+
         let virtual_name = virtual_field_name(&["subject", "object"]);
-        let mut variants: Vec<Box<RangeQuery<Fv>>> =
-            Vec::with_capacity(subject_ids.len() * object_ids.len());
+        let mut variants: Vec<Box<RangeQuery<Fv>>> = Vec::with_capacity(variant_count);
         for subject_id in &subject_ids {
             for object_id in &object_ids {
                 let virtual_val = virtual_field_value(&[
@@ -602,5 +621,17 @@ impl CognitiveNexus {
                 Ok(result)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subject_object_variant_count_is_capped_before_allocation() {
+        assert_eq!(checked_subject_object_variant_count(64, 64).unwrap(), 4_096);
+        let err = checked_subject_object_variant_count(65, 64).unwrap_err();
+        assert_eq!(err.code, anda_kip::KipErrorCode::ResourceExhausted);
     }
 }

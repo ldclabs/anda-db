@@ -5,6 +5,11 @@ pub use anda_db_btree::RangeQuery;
 pub use anda_db_schema::{Fv, bf16};
 pub use anda_db_tfs::BM25Params;
 
+const MAX_FILTER_DEPTH: usize = 64;
+const MAX_FILTER_NODES: usize = 4_096;
+const MAX_FILTER_BRANCHES: usize = 1_024;
+const MAX_RANGE_INCLUDE_KEYS: usize = 4_096;
+
 /// A query for searching the database.
 ///
 /// This structure defines the parameters for performing searches against the database,
@@ -27,6 +32,16 @@ pub struct Query {
     ///
     /// Defaults to 10 if not specified.
     pub limit: Option<usize>,
+}
+
+impl Query {
+    /// Validates query-side structural complexity before recursive execution.
+    pub fn validate_complexity(&self) -> Result<(), String> {
+        if let Some(filter) = &self.filter {
+            filter.validate_complexity()?;
+        }
+        Ok(())
+    }
 }
 
 /// Configuration for full-text and vector search operations.
@@ -92,6 +107,110 @@ pub enum Filter {
     Not(Box<Filter>),
 }
 
+impl Filter {
+    /// Validates filter and range-query shape against conservative defaults.
+    pub fn validate_complexity(&self) -> Result<(), String> {
+        let mut stats = ComplexityStats::default();
+        validate_filter_complexity(self, 0, &mut stats)
+    }
+}
+
+#[derive(Default)]
+struct ComplexityStats {
+    nodes: usize,
+    branches: usize,
+}
+
+fn bump_node(stats: &mut ComplexityStats) -> Result<(), String> {
+    stats.nodes = stats.nodes.saturating_add(1);
+    if stats.nodes > MAX_FILTER_NODES {
+        return Err(format!(
+            "query filter exceeds maximum node count {MAX_FILTER_NODES}"
+        ));
+    }
+    Ok(())
+}
+
+fn bump_branches(stats: &mut ComplexityStats, count: usize) -> Result<(), String> {
+    stats.branches = stats.branches.saturating_add(count);
+    if stats.branches > MAX_FILTER_BRANCHES {
+        return Err(format!(
+            "query filter exceeds maximum branch count {MAX_FILTER_BRANCHES}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_filter_complexity(
+    filter: &Filter,
+    depth: usize,
+    stats: &mut ComplexityStats,
+) -> Result<(), String> {
+    if depth > MAX_FILTER_DEPTH {
+        return Err(format!(
+            "query filter exceeds maximum depth {MAX_FILTER_DEPTH}"
+        ));
+    }
+    bump_node(stats)?;
+
+    match filter {
+        Filter::Field((_name, range)) => validate_range_complexity(range, depth + 1, stats),
+        Filter::Or(filters) | Filter::And(filters) => {
+            bump_branches(stats, filters.len())?;
+            for filter in filters {
+                validate_filter_complexity(filter, depth + 1, stats)?;
+            }
+            Ok(())
+        }
+        Filter::Not(filter) => validate_filter_complexity(filter, depth + 1, stats),
+    }
+}
+
+fn validate_range_complexity(
+    range: &RangeQuery<Fv>,
+    depth: usize,
+    stats: &mut ComplexityStats,
+) -> Result<(), String> {
+    if depth > MAX_FILTER_DEPTH {
+        return Err(format!(
+            "range query exceeds maximum depth {MAX_FILTER_DEPTH}"
+        ));
+    }
+    bump_node(stats)?;
+
+    match range {
+        RangeQuery::Eq(value)
+        | RangeQuery::Gt(value)
+        | RangeQuery::Ge(value)
+        | RangeQuery::Lt(value)
+        | RangeQuery::Le(value) => value.validate_complexity().map_err(|err| err.to_string()),
+        RangeQuery::Between(start, end) => {
+            start.validate_complexity().map_err(|err| err.to_string())?;
+            end.validate_complexity().map_err(|err| err.to_string())
+        }
+        RangeQuery::Include(values) => {
+            if values.len() > MAX_RANGE_INCLUDE_KEYS {
+                return Err(format!(
+                    "range query include list length {} exceeds maximum {MAX_RANGE_INCLUDE_KEYS}",
+                    values.len()
+                ));
+            }
+            for value in values {
+                value.validate_complexity().map_err(|err| err.to_string())?;
+            }
+            Ok(())
+        }
+        RangeQuery::Or(ranges) | RangeQuery::And(ranges) => {
+            bump_branches(stats, ranges.len())?;
+            for range in ranges {
+                validate_range_complexity(range, depth + 1, stats)?;
+            }
+            Ok(())
+        }
+        RangeQuery::Not(range) => validate_range_complexity(range, depth + 1, stats),
+    }
+}
+
 /// Reranks search results using the Reciprocal Rank Fusion (RRF) algorithm.
 ///
 /// This algorithm combines multiple ranked lists (e.g., from text and vector searches)
@@ -154,5 +273,30 @@ impl RRFReranker {
         let mut results: Vec<(u64, f32)> = scores.into_iter().collect();
         results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         results
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filter_complexity_rejects_deep_recursive_filters() {
+        let mut filter = Filter::Field(("age".into(), RangeQuery::Eq(Fv::U64(1))));
+        for _ in 0..=MAX_FILTER_DEPTH {
+            filter = Filter::Not(Box::new(filter));
+        }
+
+        assert!(filter.validate_complexity().is_err());
+    }
+
+    #[test]
+    fn filter_complexity_rejects_oversized_include_values() {
+        let filter = Filter::Field((
+            "age".into(),
+            RangeQuery::Include(vec![Fv::U64(1); MAX_RANGE_INCLUDE_KEYS + 1]),
+        ));
+
+        assert!(filter.validate_complexity().is_err());
     }
 }

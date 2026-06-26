@@ -61,6 +61,30 @@ pub type Json = serde_json::Value;
 /// constant in space regardless of name length.
 pub type IndexedFieldValues = BTreeMap<usize, FieldValue>;
 
+/// Structural complexity budget for runtime field values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FieldValueBudget {
+    /// Maximum nesting depth across [`FieldValue`] and JSON containers.
+    pub max_depth: usize,
+    /// Maximum total [`FieldValue`] and JSON nodes traversed.
+    pub max_nodes: usize,
+    /// Maximum elements accepted in one array.
+    pub max_array_len: usize,
+    /// Maximum entries accepted in one map or JSON object.
+    pub max_map_entries: usize,
+}
+
+impl Default for FieldValueBudget {
+    fn default() -> Self {
+        Self {
+            max_depth: 64,
+            max_nodes: 16_384,
+            max_array_len: 4_096,
+            max_map_entries: 4_096,
+        }
+    }
+}
+
 /// The type of a field declared in a [`Schema`](crate::Schema).
 ///
 /// `FieldType` is the closed enum of every type supported by Anda DB.
@@ -181,6 +205,8 @@ impl FieldType {
     /// # Errors
     /// Returns [`SchemaError::FieldValue`] describing the first mismatch.
     pub fn validate(&self, value: &FieldValue) -> Result<(), SchemaError> {
+        value.validate_complexity()?;
+
         match (self, value) {
             (FieldType::Bool, FieldValue::Bool(_)) => Ok(()),
             (FieldType::I64, FieldValue::I64(_)) => Ok(()),
@@ -972,6 +998,95 @@ impl fmt::Debug for FieldValue {
 }
 
 impl FieldValue {
+    /// Validates this value against the default structural complexity budget.
+    ///
+    /// The check is iterative and covers nested [`FieldValue::Array`],
+    /// [`FieldValue::Map`], and [`FieldValue::Json`] containers.
+    pub fn validate_complexity(&self) -> Result<(), SchemaError> {
+        self.validate_complexity_with(FieldValueBudget::default())
+    }
+
+    /// Validates this value against an explicit structural complexity budget.
+    pub fn validate_complexity_with(&self, budget: FieldValueBudget) -> Result<(), SchemaError> {
+        enum Item<'a> {
+            Field(&'a FieldValue, usize),
+            Json(&'a Json, usize),
+        }
+
+        let mut nodes = 0usize;
+        let mut stack = vec![Item::Field(self, 0)];
+
+        while let Some(item) = stack.pop() {
+            nodes = nodes.saturating_add(1);
+            if nodes > budget.max_nodes {
+                return Err(SchemaError::FieldValue(format!(
+                    "FieldValue exceeds maximum node count {}",
+                    budget.max_nodes
+                )));
+            }
+
+            let depth = match &item {
+                Item::Field(_, depth) | Item::Json(_, depth) => *depth,
+            };
+            if depth > budget.max_depth {
+                return Err(SchemaError::FieldValue(format!(
+                    "FieldValue exceeds maximum depth {}",
+                    budget.max_depth
+                )));
+            }
+
+            match item {
+                Item::Field(FieldValue::Array(values), depth) => {
+                    if values.len() > budget.max_array_len {
+                        return Err(SchemaError::FieldValue(format!(
+                            "FieldValue array length {} exceeds maximum {}",
+                            values.len(),
+                            budget.max_array_len
+                        )));
+                    }
+                    stack.extend(values.iter().map(|value| Item::Field(value, depth + 1)));
+                }
+                Item::Field(FieldValue::Map(values), depth) => {
+                    if values.len() > budget.max_map_entries {
+                        return Err(SchemaError::FieldValue(format!(
+                            "FieldValue map entries {} exceed maximum {}",
+                            values.len(),
+                            budget.max_map_entries
+                        )));
+                    }
+                    stack.extend(values.values().map(|value| Item::Field(value, depth + 1)));
+                }
+                Item::Field(FieldValue::Json(value), depth) => {
+                    stack.push(Item::Json(value, depth + 1));
+                }
+                Item::Field(_, _) => {}
+                Item::Json(Json::Array(values), depth) => {
+                    if values.len() > budget.max_array_len {
+                        return Err(SchemaError::FieldValue(format!(
+                            "JSON array length {} exceeds maximum {}",
+                            values.len(),
+                            budget.max_array_len
+                        )));
+                    }
+                    stack.extend(values.iter().map(|value| Item::Json(value, depth + 1)));
+                }
+                Item::Json(Json::Object(values), depth) => {
+                    if values.len() > budget.max_map_entries {
+                        return Err(SchemaError::FieldValue(format!(
+                            "JSON object entries {} exceed maximum {}",
+                            values.len(),
+                            budget.max_map_entries
+                        )));
+                    }
+                    stack.extend(values.values().map(|value| Item::Json(value, depth + 1)));
+                }
+                Item::Json(_, _) => {}
+            }
+        }
+
+        Ok(())
+    }
+
     /// Create a Bool FieldValue from a CBOR value
     ///
     /// # Arguments
@@ -2608,5 +2723,45 @@ mod tests {
             FieldValue::Text("Ada".into())
         );
         assert!(entry.extract(Cbor::Integer(1.into()), true).is_err());
+    }
+
+    #[test]
+    fn field_value_complexity_budget_rejects_deep_and_wide_values() {
+        let budget = FieldValueBudget {
+            max_depth: 2,
+            max_nodes: 16,
+            max_array_len: 2,
+            max_map_entries: 2,
+        };
+
+        let ok = FieldValue::Array(vec![
+            FieldValue::Text("a".into()),
+            FieldValue::Map(BTreeMap::from([(
+                FieldKey::Text("k".into()),
+                FieldValue::Text("v".into()),
+            )])),
+        ]);
+        ok.validate_complexity_with(budget).unwrap();
+
+        let too_deep = FieldValue::Array(vec![FieldValue::Array(vec![FieldValue::Array(vec![
+            FieldValue::Text("x".into()),
+        ])])]);
+        assert!(too_deep.validate_complexity_with(budget).is_err());
+
+        let too_wide = FieldValue::Array(vec![
+            FieldValue::Text("a".into()),
+            FieldValue::Text("b".into()),
+            FieldValue::Text("c".into()),
+        ]);
+        assert!(too_wide.validate_complexity_with(budget).is_err());
+
+        let too_many_json_nodes = FieldValue::Json(serde_json::json!({
+            "a": ["x", "y", "z"]
+        }));
+        assert!(
+            too_many_json_nodes
+                .validate_complexity_with(budget)
+                .is_err()
+        );
     }
 }

@@ -83,11 +83,18 @@ pub async fn rpc_db(
 /// Verifies the `Authorization: Bearer <key>` header when an API key is set.
 fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
     if let Some(expected) = state.api_key() {
-        let provided = headers
+        if expected.trim().is_empty() {
+            return Err(ApiError::unauthorized());
+        }
+
+        let Some(provided) = headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .trim_start_matches("Bearer ");
+            .and_then(|v| v.strip_prefix("Bearer "))
+        else {
+            return Err(ApiError::unauthorized());
+        };
+
         if provided != expected {
             return Err(ApiError::unauthorized());
         }

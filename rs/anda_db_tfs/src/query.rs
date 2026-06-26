@@ -42,6 +42,11 @@ pub enum QueryType {
     Not(Box<QueryType>),
 }
 
+const MAX_LOGICAL_QUERY_LEN: usize = 8 * 1024;
+const MAX_LOGICAL_QUERY_DEPTH: usize = 64;
+const MAX_LOGICAL_QUERY_NODES: usize = 1_024;
+const MAX_LOGICAL_QUERY_BRANCHES: usize = 512;
+
 impl QueryType {
     /// Parses a query string into a QueryType structure.
     ///
@@ -70,6 +75,24 @@ impl QueryType {
         }
 
         Self::parse_or_expression(query)
+    }
+
+    /// Parses a query string after applying resource-exhaustion guards.
+    pub fn try_parse(query: &str) -> Result<Self, String> {
+        validate_query_input(query)?;
+        let query = Self::parse(query);
+        query.validate_complexity()?;
+        Ok(query)
+    }
+
+    /// Returns true when executing this AST may materialize a NOT complement.
+    pub fn may_materialize_not_complement(&self) -> bool {
+        may_materialize_not_complement(self, false)
+    }
+
+    fn validate_complexity(&self) -> Result<(), String> {
+        let mut stats = QueryStats::default();
+        validate_ast(self, 0, &mut stats)
     }
 
     /// Parses an OR expression, which has the lowest precedence in the query grammar.
@@ -269,6 +292,114 @@ impl QueryType {
     }
 }
 
+fn may_materialize_not_complement(query: &QueryType, negated_not: bool) -> bool {
+    match query {
+        QueryType::Term(_) => false,
+        QueryType::Not(subquery) => !negated_not || may_materialize_not_complement(subquery, false),
+        QueryType::Or(subqueries) => subqueries
+            .iter()
+            .any(|query| may_materialize_not_complement(query, false)),
+        QueryType::And(subqueries) => {
+            if subqueries.is_empty() {
+                return false;
+            }
+            if subqueries.len() == 1 {
+                return may_materialize_not_complement(&subqueries[0], false);
+            }
+
+            let has_positive = subqueries
+                .iter()
+                .any(|query| !matches!(query.as_ref(), QueryType::Not(_)));
+            if has_positive {
+                return subqueries
+                    .iter()
+                    .filter(|query| !matches!(query.as_ref(), QueryType::Not(_)))
+                    .any(|query| may_materialize_not_complement(query, false))
+                    || subqueries
+                        .iter()
+                        .filter(|query| matches!(query.as_ref(), QueryType::Not(_)))
+                        .any(|query| may_materialize_not_complement(query, true));
+            }
+
+            let mut negatives = subqueries.iter();
+            if let Some(first) = negatives.next()
+                && may_materialize_not_complement(first, false)
+            {
+                return true;
+            }
+
+            negatives.any(|query| may_materialize_not_complement(query, true))
+        }
+    }
+}
+
+#[derive(Default)]
+struct QueryStats {
+    nodes: usize,
+    branches: usize,
+}
+
+fn validate_query_input(query: &str) -> Result<(), String> {
+    if query.len() > MAX_LOGICAL_QUERY_LEN {
+        return Err(format!(
+            "logical query length {} exceeds maximum {MAX_LOGICAL_QUERY_LEN}",
+            query.len()
+        ));
+    }
+
+    let mut depth = 0usize;
+    let mut max_depth = 0usize;
+    for ch in query.chars() {
+        match ch {
+            '(' => {
+                depth = depth.saturating_add(1);
+                max_depth = max_depth.max(depth);
+                if max_depth > MAX_LOGICAL_QUERY_DEPTH {
+                    return Err(format!(
+                        "logical query parenthesis depth exceeds maximum {MAX_LOGICAL_QUERY_DEPTH}"
+                    ));
+                }
+            }
+            ')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_ast(query: &QueryType, depth: usize, stats: &mut QueryStats) -> Result<(), String> {
+    if depth > MAX_LOGICAL_QUERY_DEPTH {
+        return Err(format!(
+            "logical query AST depth exceeds maximum {MAX_LOGICAL_QUERY_DEPTH}"
+        ));
+    }
+
+    stats.nodes = stats.nodes.saturating_add(1);
+    if stats.nodes > MAX_LOGICAL_QUERY_NODES {
+        return Err(format!(
+            "logical query AST node count exceeds maximum {MAX_LOGICAL_QUERY_NODES}"
+        ));
+    }
+
+    match query {
+        QueryType::Term(_) => Ok(()),
+        QueryType::Not(query) => validate_ast(query, depth + 1, stats),
+        QueryType::Or(queries) | QueryType::And(queries) => {
+            stats.branches = stats.branches.saturating_add(queries.len());
+            if stats.branches > MAX_LOGICAL_QUERY_BRANCHES {
+                return Err(format!(
+                    "logical query AST branch count exceeds maximum {MAX_LOGICAL_QUERY_BRANCHES}"
+                ));
+            }
+            for query in queries {
+                validate_ast(query, depth + 1, stats)?;
+            }
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,5 +554,29 @@ mod tests {
                 Box::new(QueryType::Term("双鱼".to_string()))
             ])
         );
+    }
+
+    #[test]
+    fn try_parse_rejects_excessive_parenthesis_depth() {
+        let query = format!("{}hello{}", "(".repeat(MAX_LOGICAL_QUERY_DEPTH + 1), ")");
+        assert!(QueryType::try_parse(&query).is_err());
+    }
+
+    #[test]
+    fn not_complement_detection_distinguishes_and_not_filter() {
+        let query = QueryType::try_parse("hello AND NOT world").unwrap();
+        assert!(!query.may_materialize_not_complement());
+
+        let query = QueryType::try_parse("hello OR NOT world").unwrap();
+        assert!(query.may_materialize_not_complement());
+
+        let query = QueryType::try_parse("hello AND NOT (world AND NOT rust)").unwrap();
+        assert!(!query.may_materialize_not_complement());
+
+        let query = QueryType::try_parse("hello AND NOT (world OR NOT rust)").unwrap();
+        assert!(query.may_materialize_not_complement());
+
+        let query = QueryType::try_parse("hello AND NOT (NOT world)").unwrap();
+        assert!(query.may_materialize_not_complement());
     }
 }

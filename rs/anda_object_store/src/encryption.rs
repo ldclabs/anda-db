@@ -19,6 +19,8 @@ use crate::{
 };
 
 const DEFAULT_CHUNK_SIZE: u64 = 256 * 1024;
+const CHUNK_AAD_LEGACY: u8 = 0;
+const CHUNK_AAD_BOUND: u8 = 1;
 
 /// An object store implementation that provides transparent AES-256-GCM encryption and decryption
 /// for stored objects.
@@ -161,6 +163,23 @@ pub struct Metadata {
     /// store's configured chunk size.
     #[serde(rename = "c", default, skip_serializing_if = "Option::is_none")]
     chunk_size: Option<u64>,
+
+    /// Chunk authentication-data version.
+    ///
+    /// Older objects used an empty AAD for each AES-GCM chunk. New objects
+    /// bind the chunk size and index into the chunk tag. This field lets
+    /// path-authenticated metadata keep legacy objects readable after a
+    /// copy/rename migration.
+    #[serde(rename = "av", default, skip_serializing_if = "Option::is_none")]
+    chunk_aad_version: Option<u8>,
+
+    /// Nonce used to authenticate the sidecar metadata with AES-GCM GMAC.
+    #[serde(rename = "an", default, skip_serializing_if = "Option::is_none")]
+    auth_nonce: Option<ByteArray<12>>,
+
+    /// Authentication tag over the logical path and metadata fields.
+    #[serde(rename = "at", default, skip_serializing_if = "Option::is_none")]
+    auth_tag: Option<ByteArray<16>>,
 }
 
 impl SidecarMeta for Metadata {
@@ -307,6 +326,33 @@ impl<T: ObjectStore> EncryptedStore<T> {
             .map(normalize_chunk_size)
             .unwrap_or(self.chunk_size)
     }
+
+    fn seal_metadata(&self, location: &Path, meta: &mut Metadata) -> Result<()> {
+        seal_metadata(&self.cipher, location, meta)
+    }
+
+    fn verify_metadata(&self, location: &Path, meta: &Metadata) -> Result<MetadataAuth> {
+        verify_metadata(&self.cipher, location, meta)
+    }
+
+    async fn verified_metadata(&self, location: &Path) -> Result<Metadata> {
+        let meta = self.inner.get_meta(location).await?;
+        self.verify_metadata(location, &meta)?;
+        Ok((*meta).clone())
+    }
+
+    async fn put_rebound_metadata(&self, location: &Path, mut meta: Metadata) -> Result<()> {
+        let obj = self
+            .inner
+            .store
+            .head(&self.inner.full_path(location))
+            .await?;
+        meta.set_original(obj.e_tag, obj.version);
+        ensure_chunk_aad_version(&mut meta)?;
+        self.seal_metadata(location, &mut meta)?;
+        self.inner.put_meta(location, meta).await?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -325,6 +371,7 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
                 {
                     match meta {
                         Some(m) => {
+                            self.verify_metadata(location, m)?;
                             check_update_version(location, &m.e_tag, &m.original_version, v)?;
                         }
                         None => {
@@ -354,9 +401,10 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
                     Vec::with_capacity(data.len().div_ceil(chunk_size));
                 for (i, chunk) in data.chunks_mut(chunk_size).enumerate() {
                     let nonce = derive_gcm_nonce(&base_nonce, i as u64);
+                    let aad = chunk_aad(self.chunk_size, i as u64);
                     let tag = self
                         .cipher
-                        .encrypt_in_place_detached(Nonce::from_slice(&nonce), &[], chunk)
+                        .encrypt_in_place_detached(Nonce::from_slice(&nonce), &aad, chunk)
                         .map_err(|err| Error::Generic {
                             store: "EncryptedStore",
                             source: format!("AES256 encrypt failed for path {location}: {err:?}")
@@ -375,6 +423,9 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
                     aes_nonce: base_nonce.into(),
                     aes_tags,
                     chunk_size: Some(self.chunk_size),
+                    chunk_aad_version: Some(CHUNK_AAD_BOUND),
+                    auth_nonce: None,
+                    auth_tag: None,
                 };
 
                 let rt = self
@@ -385,6 +436,7 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
 
                 meta.original_tag = rt.e_tag;
                 meta.original_version = rt.version;
+                self.seal_metadata(location, &mut meta)?;
                 Ok(meta)
             })
             .await?;
@@ -393,11 +445,13 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
             Ok(PutResult {
                 e_tag: rt.e_tag.clone(),
                 version: rt.original_version.clone(),
+                extensions: Extensions::default(),
             })
         } else {
             Ok(PutResult {
                 e_tag: rt.original_tag.clone(),
                 version: rt.original_version.clone(),
+                extensions: Extensions::default(),
             })
         }
     }
@@ -433,6 +487,7 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
     async fn get_opts(&self, location: &Path, mut options: GetOptions) -> Result<GetResult> {
         let full_path = self.inner.full_path(location);
         let meta = self.inner.get_meta(location).await?;
+        self.verify_metadata(location, &meta)?;
 
         if self.conditional_put {
             apply_logical_etag_preconditions(
@@ -509,6 +564,7 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
             meta: obj,
             range,
             attributes,
+            extensions: Extensions::default(),
         })
     }
 
@@ -518,6 +574,7 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
         }
 
         let meta = self.inner.get_meta(location).await?;
+        self.verify_metadata(location, &meta)?;
         validate_ranges("EncryptedStore", ranges, meta.size)?;
 
         let chunk_size = self.read_chunk_size(&meta);
@@ -572,10 +629,11 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
                             .into(),
                         })?;
                     let nonce = derive_gcm_nonce(&meta.aes_nonce, idx);
+                    let aad = chunk_aad_for_meta(&meta, chunk_size, idx)?;
                     self.cipher
                         .decrypt_in_place_detached(
                             Nonce::from_slice(&nonce),
-                            &[],
+                            &aad,
                             chunk,
                             Tag::from_slice(tag.as_slice()),
                         )
@@ -632,11 +690,39 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
     }
 
     async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
-        self.inner.copy_opts(from, to, options).await
+        let meta = self.verified_metadata(from).await?;
+        self.inner
+            .store
+            .copy_opts(
+                &self.inner.full_path(from),
+                &self.inner.full_path(to),
+                options,
+            )
+            .await?;
+        self.put_rebound_metadata(to, meta).await
     }
 
     async fn rename_opts(&self, from: &Path, to: &Path, options: RenameOptions) -> Result<()> {
-        self.inner.rename_opts(from, to, options).await
+        let meta = self.verified_metadata(from).await?;
+        self.inner
+            .store
+            .rename_opts(
+                &self.inner.full_path(from),
+                &self.inner.full_path(to),
+                options,
+            )
+            .await?;
+        self.put_rebound_metadata(to, meta).await?;
+
+        let meta_from = self.inner.meta_path(from);
+        let meta_delete = self.inner.store.delete(&meta_from).await;
+        self.inner.remove_meta_cache(from).await;
+        match meta_delete {
+            Ok(()) | Err(Error::NotFound { .. }) => {}
+            Err(err) => return Err(err),
+        }
+
+        Ok(())
     }
 }
 
@@ -705,10 +791,11 @@ impl<T: ObjectStore> MultipartUpload for EncryptedStoreUploader<T> {
 
         for chunk in data.chunks_mut(chunk_size) {
             let nonce = derive_gcm_nonce(&self.aes_nonce, self.chunk_index);
+            let aad = chunk_aad(self.chunk_size, self.chunk_index);
             self.chunk_index = self.chunk_index.wrapping_add(1);
             match self
                 .cipher
-                .encrypt_in_place_detached(Nonce::from_slice(&nonce), &[], chunk)
+                .encrypt_in_place_detached(Nonce::from_slice(&nonce), &aad, chunk)
             {
                 Ok(tag) => {
                     let tag: [u8; 16] = tag.into();
@@ -738,10 +825,11 @@ impl<T: ObjectStore> MultipartUpload for EncryptedStoreUploader<T> {
             let mut data = std::mem::take(&mut self.buf);
             for chunk in data.chunks_mut(self.chunk_size as usize) {
                 let nonce = derive_gcm_nonce(&self.aes_nonce, self.chunk_index);
+                let aad = chunk_aad(self.chunk_size, self.chunk_index);
                 self.chunk_index = self.chunk_index.wrapping_add(1);
                 let tag = self
                     .cipher
-                    .encrypt_in_place_detached(Nonce::from_slice(&nonce), &[], chunk)
+                    .encrypt_in_place_detached(Nonce::from_slice(&nonce), &aad, chunk)
                     .map_err(|err| Error::Generic {
                         store: "EncryptedStore",
                         source: format!(
@@ -773,11 +861,16 @@ impl<T: ObjectStore> MultipartUpload for EncryptedStoreUploader<T> {
             aes_nonce: self.aes_nonce.into(),
             aes_tags: self.aes_tags.clone(),
             chunk_size: Some(self.chunk_size),
+            chunk_aad_version: Some(CHUNK_AAD_BOUND),
+            auth_nonce: None,
+            auth_tag: None,
         };
 
         if self.conditional_put {
             rt.e_tag = meta.e_tag.clone();
         }
+        let mut meta = meta;
+        seal_metadata(&self.cipher, &self.location, &mut meta)?;
         self.store.put_meta(&self.location, meta).await?;
         Ok(rt)
     }
@@ -838,9 +931,10 @@ fn create_decryption_stream(
                 })?;
 
                 let nonce = derive_gcm_nonce(&meta.aes_nonce, idx as u64);
+                let aad = chunk_aad_for_meta(&meta, chunk_size as u64, idx as u64)?;
                 cipher.decrypt_in_place_detached(
                     Nonce::from_slice(&nonce),
-                    &[],
+                    &aad,
                     &mut chunk,
                     Tag::from_slice(tag.as_slice())
                 )
@@ -874,9 +968,10 @@ fn create_decryption_stream(
                 source: format!("missing AES256 tag for chunk {idx} for path {location}").into(),
             })?;
             let nonce = derive_gcm_nonce(&meta.aes_nonce, idx as u64);
+            let aad = chunk_aad_for_meta(&meta, chunk_size as u64, idx as u64)?;
             cipher.decrypt_in_place_detached(
                 Nonce::from_slice(&nonce),
-                &[],
+                &aad,
                 &mut buf,
                 Tag::from_slice(tag.as_slice())
             )
@@ -931,6 +1026,158 @@ fn normalize_chunk_size(chunk_size: u64) -> u64 {
     chunk_size.clamp(1, usize::MAX as u64)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetadataAuth {
+    Authenticated,
+    Legacy,
+}
+
+fn seal_metadata(cipher: &Aes256Gcm, location: &Path, meta: &mut Metadata) -> Result<()> {
+    let nonce: [u8; 12] = rand_bytes();
+    let aad = metadata_auth_aad(location, meta);
+    let mut empty = [];
+    let tag = cipher
+        .encrypt_in_place_detached(Nonce::from_slice(&nonce), &aad, &mut empty)
+        .map_err(|err| Error::Generic {
+            store: "EncryptedStore",
+            source: format!("metadata authentication failed for path {location}: {err:?}").into(),
+        })?;
+    let tag: [u8; 16] = tag.into();
+    meta.auth_nonce = Some(nonce.into());
+    meta.auth_tag = Some(tag.into());
+    Ok(())
+}
+
+fn verify_metadata(cipher: &Aes256Gcm, location: &Path, meta: &Metadata) -> Result<MetadataAuth> {
+    let (nonce, tag) = match (meta.auth_nonce.as_ref(), meta.auth_tag.as_ref()) {
+        (Some(nonce), Some(tag)) => (nonce, tag),
+        (None, None) => {
+            chunk_aad_version(meta)?;
+            return Ok(MetadataAuth::Legacy);
+        }
+        (None, Some(_)) => {
+            return Err(Error::Generic {
+                store: "EncryptedStore",
+                source: format!("missing metadata authentication nonce for path {location}").into(),
+            });
+        }
+        (Some(_), None) => {
+            return Err(Error::Generic {
+                store: "EncryptedStore",
+                source: format!("missing metadata authentication tag for path {location}").into(),
+            });
+        }
+    };
+
+    let aad = metadata_auth_aad(location, meta);
+    let mut empty = [];
+    cipher
+        .decrypt_in_place_detached(
+            Nonce::from_slice(nonce.as_slice()),
+            &aad,
+            &mut empty,
+            Tag::from_slice(tag.as_slice()),
+        )
+        .map_err(|err| Error::Generic {
+            store: "EncryptedStore",
+            source: format!("metadata authentication failed for path {location}: {err:?}").into(),
+        })?;
+    chunk_aad_version(meta)?;
+    Ok(MetadataAuth::Authenticated)
+}
+
+fn metadata_auth_aad(location: &Path, meta: &Metadata) -> Vec<u8> {
+    let mut aad = Vec::new();
+    aad.extend_from_slice(b"anda_object_store.encrypted.metadata.v1");
+    push_bytes(&mut aad, location.to_string().as_bytes());
+    aad.extend_from_slice(&meta.size.to_le_bytes());
+    push_opt_str(&mut aad, meta.e_tag.as_deref());
+    push_opt_str(&mut aad, meta.original_tag.as_deref());
+    push_opt_str(&mut aad, meta.original_version.as_deref());
+    push_bytes(&mut aad, meta.aes_nonce.as_slice());
+    push_opt_u64(&mut aad, meta.chunk_size);
+    push_opt_u8(&mut aad, meta.chunk_aad_version);
+    aad.extend_from_slice(&(meta.aes_tags.len() as u64).to_le_bytes());
+    for tag in &meta.aes_tags {
+        push_bytes(&mut aad, tag.as_slice());
+    }
+    aad
+}
+
+fn ensure_chunk_aad_version(meta: &mut Metadata) -> Result<()> {
+    let version = chunk_aad_version(meta)?;
+    meta.chunk_aad_version = Some(version);
+    Ok(())
+}
+
+fn chunk_aad_version(meta: &Metadata) -> Result<u8> {
+    let version = meta.chunk_aad_version.unwrap_or_else(|| {
+        if meta.auth_nonce.is_some() && meta.auth_tag.is_some() {
+            CHUNK_AAD_BOUND
+        } else {
+            CHUNK_AAD_LEGACY
+        }
+    });
+    match version {
+        CHUNK_AAD_LEGACY | CHUNK_AAD_BOUND => Ok(version),
+        _ => Err(Error::Generic {
+            store: "EncryptedStore",
+            source: format!("unsupported encrypted chunk AAD version {version}").into(),
+        }),
+    }
+}
+
+fn chunk_aad_for_meta(meta: &Metadata, chunk_size: u64, chunk_index: u64) -> Result<Vec<u8>> {
+    match chunk_aad_version(meta)? {
+        CHUNK_AAD_LEGACY => Ok(Vec::new()),
+        CHUNK_AAD_BOUND => Ok(chunk_aad(chunk_size, chunk_index)),
+        _ => unreachable!("chunk_aad_version validates known versions"),
+    }
+}
+
+fn chunk_aad(chunk_size: u64, chunk_index: u64) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(48);
+    aad.extend_from_slice(b"anda_object_store.encrypted.chunk.v1");
+    aad.extend_from_slice(&chunk_size.to_le_bytes());
+    aad.extend_from_slice(&chunk_index.to_le_bytes());
+    aad
+}
+
+fn push_bytes(out: &mut Vec<u8>, value: &[u8]) {
+    out.extend_from_slice(&(value.len() as u64).to_le_bytes());
+    out.extend_from_slice(value);
+}
+
+fn push_opt_str(out: &mut Vec<u8>, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            out.push(1);
+            push_bytes(out, value.as_bytes());
+        }
+        None => out.push(0),
+    }
+}
+
+fn push_opt_u64(out: &mut Vec<u8>, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            out.push(1);
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        None => out.push(0),
+    }
+}
+
+fn push_opt_u8(out: &mut Vec<u8>, value: Option<u8>) {
+    match value {
+        Some(value) => {
+            out.push(1);
+            out.push(value);
+        }
+        None => out.push(0),
+    }
+}
+
 /// Generates `N` cryptographically-strong random bytes using the OS RNG.
 fn rand_bytes<const N: usize>() -> [u8; N] {
     let mut rng = rand::rng();
@@ -959,10 +1206,60 @@ fn derive_gcm_nonce(base: &[u8; 12], idx: u64) -> [u8; 12] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aes_gcm::KeyInit;
     use object_store::{integration::*, local::LocalFileSystem, memory::InMemory};
     use tempfile::TempDir;
 
     const NON_EXISTENT_NAME: &str = "nonexistentname";
+
+    async fn put_legacy_encrypted_object(
+        inner: &InMemory,
+        location: &Path,
+        plaintext: &'static [u8],
+        chunk_size: u64,
+    ) {
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&[0u8; 32]));
+        let base_nonce = [7u8; 12];
+        let chunk_size = normalize_chunk_size(chunk_size);
+        let mut ciphertext = plaintext.to_vec();
+        let mut aes_tags = Vec::with_capacity(ciphertext.len().div_ceil(chunk_size as usize));
+
+        for (idx, chunk) in ciphertext.chunks_mut(chunk_size as usize).enumerate() {
+            let nonce = derive_gcm_nonce(&base_nonce, idx as u64);
+            let tag = cipher
+                .encrypt_in_place_detached(Nonce::from_slice(&nonce), &[], chunk)
+                .unwrap();
+            let tag: [u8; 16] = tag.into();
+            aes_tags.push(tag.into());
+        }
+
+        let hash = sha3_256(&ciphertext);
+        let put = inner
+            .put(
+                &Path::from(format!("data/{location}")),
+                Bytes::from(ciphertext).into(),
+            )
+            .await
+            .unwrap();
+        let meta = Metadata {
+            size: plaintext.len() as u64,
+            e_tag: Some(BASE64_URL_SAFE.encode(hash)),
+            original_tag: put.e_tag,
+            original_version: put.version,
+            aes_nonce: base_nonce.into(),
+            aes_tags,
+            chunk_size: Some(chunk_size),
+            chunk_aad_version: None,
+            auth_nonce: None,
+            auth_tag: None,
+        };
+        let mut buf = Vec::new();
+        cbor2::to_writer(&meta, &mut buf).unwrap();
+        inner
+            .put(&Path::from(format!("meta/{location}")), buf.into())
+            .await
+            .unwrap();
+    }
 
     #[test]
     fn builder_custom_cache_and_display_debug_are_exercised() {
@@ -1154,6 +1451,204 @@ mod tests {
                 "range {range:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_metadata_without_auth_remains_readable() {
+        let inner = InMemory::new();
+        let location = Path::from("legacy-object");
+        let payload = b"legacy encrypted payload";
+        put_legacy_encrypted_object(&inner, &location, payload, 4).await;
+
+        let storage = EncryptedStoreBuilder::with_secret(inner, 100, [0u8; 32])
+            .with_chunk_size(16)
+            .build();
+        let bytes = storage.get(&location).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes.as_ref(), payload);
+
+        let ranges = storage.get_ranges(&location, &[0..6, 7..16]).await.unwrap();
+        assert_eq!(ranges[0].as_ref(), &payload[0..6]);
+        assert_eq!(ranges[1].as_ref(), &payload[7..16]);
+
+        let range = storage.get_range(&location, 3..19).await.unwrap();
+        assert_eq!(range.as_ref(), &payload[3..19]);
+    }
+
+    #[tokio::test]
+    async fn legacy_metadata_copy_and_rename_reseal_legacy_chunk_aad() {
+        let inner = InMemory::new();
+        let source = Path::from("legacy-copy-source");
+        let copied = Path::from("legacy-copy-target");
+        let renamed = Path::from("legacy-rename-target");
+        let payload = b"legacy copy rename payload";
+        put_legacy_encrypted_object(&inner, &source, payload, 4).await;
+
+        let storage = EncryptedStoreBuilder::with_secret(inner.clone(), 100, [0u8; 32])
+            .with_chunk_size(16)
+            .build();
+        storage.copy(&source, &copied).await.unwrap();
+
+        let copied_meta_bytes = inner
+            .get(&Path::from("meta/legacy-copy-target"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let copied_meta: Metadata = cbor2::from_reader(&copied_meta_bytes[..]).unwrap();
+        assert_eq!(copied_meta.chunk_aad_version, Some(CHUNK_AAD_LEGACY));
+        assert!(copied_meta.auth_nonce.is_some());
+        assert!(copied_meta.auth_tag.is_some());
+
+        let bytes = storage.get(&copied).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes.as_ref(), payload);
+
+        storage.rename(&copied, &renamed).await.unwrap();
+        let renamed_meta_bytes = inner
+            .get(&Path::from("meta/legacy-rename-target"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let renamed_meta: Metadata = cbor2::from_reader(&renamed_meta_bytes[..]).unwrap();
+        assert_eq!(renamed_meta.chunk_aad_version, Some(CHUNK_AAD_LEGACY));
+        assert!(renamed_meta.auth_nonce.is_some());
+        assert!(renamed_meta.auth_tag.is_some());
+
+        let bytes = storage.get(&renamed).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes.as_ref(), payload);
+    }
+
+    #[tokio::test]
+    async fn metadata_path_binding_rejects_swapped_data_and_sidecar() {
+        let inner = InMemory::new();
+        let storage = EncryptedStoreBuilder::with_secret(inner.clone(), 100, [0u8; 32])
+            .with_chunk_size(4)
+            .build();
+        let a = Path::from("object-a");
+        let b = Path::from("object-b");
+
+        storage
+            .put(&a, Bytes::from_static(b"aaaaaaaa").into())
+            .await
+            .unwrap();
+        storage
+            .put(&b, Bytes::from_static(b"bbbbbbbb").into())
+            .await
+            .unwrap();
+
+        let a_data = inner
+            .get(&Path::from("data/object-a"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let a_meta = inner
+            .get(&Path::from("meta/object-a"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        inner
+            .put(&Path::from("data/object-b"), a_data.into())
+            .await
+            .unwrap();
+        inner
+            .put(&Path::from("meta/object-b"), a_meta.into())
+            .await
+            .unwrap();
+
+        let reopened = EncryptedStoreBuilder::with_secret(inner, 100, [0u8; 32])
+            .with_chunk_size(4)
+            .build();
+        let err = match reopened.get(&b).await {
+            Ok(_) => panic!("swapped sidecar should fail metadata authentication"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("metadata authentication failed"));
+    }
+
+    #[tokio::test]
+    async fn metadata_authentication_rejects_sidecar_size_mutation() {
+        let inner = InMemory::new();
+        let storage = EncryptedStoreBuilder::with_secret(inner.clone(), 100, [0u8; 32])
+            .with_chunk_size(4)
+            .build();
+        let location = Path::from("tamper-meta");
+
+        storage
+            .put(&location, Bytes::from_static(b"abcdefgh").into())
+            .await
+            .unwrap();
+
+        let meta_path = Path::from("meta/tamper-meta");
+        let meta_bytes = inner.get(&meta_path).await.unwrap().bytes().await.unwrap();
+        let mut meta: Metadata = cbor2::from_reader(&meta_bytes[..]).unwrap();
+        meta.size += 1;
+        let mut tampered = Vec::new();
+        cbor2::to_writer(&meta, &mut tampered).unwrap();
+        inner.put(&meta_path, tampered.into()).await.unwrap();
+
+        let reopened = EncryptedStoreBuilder::with_secret(inner, 100, [0u8; 32])
+            .with_chunk_size(4)
+            .build();
+        let err = match reopened.get(&location).await {
+            Ok(_) => panic!("tampered sidecar should fail metadata authentication"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("metadata authentication failed"));
+    }
+
+    #[tokio::test]
+    async fn copy_and_rename_reject_tampered_source_metadata_without_resealing() {
+        let inner = InMemory::new();
+        let storage = EncryptedStoreBuilder::with_secret(inner.clone(), 100, [0u8; 32]).build();
+        let copy_source = Path::from("tamper-copy-source");
+        let copy_target = Path::from("tamper-copy-target");
+        let rename_source = Path::from("tamper-rename-source");
+        let rename_target = Path::from("tamper-rename-target");
+
+        storage
+            .put(&copy_source, Bytes::from_static(b"copy").into())
+            .await
+            .unwrap();
+        storage
+            .put(&rename_source, Bytes::from_static(b"rename").into())
+            .await
+            .unwrap();
+
+        for meta_path in [
+            Path::from("meta/tamper-copy-source"),
+            Path::from("meta/tamper-rename-source"),
+        ] {
+            let meta_bytes = inner.get(&meta_path).await.unwrap().bytes().await.unwrap();
+            let mut meta: Metadata = cbor2::from_reader(&meta_bytes[..]).unwrap();
+            meta.e_tag = Some("forged".to_string());
+            let mut tampered = Vec::new();
+            cbor2::to_writer(&meta, &mut tampered).unwrap();
+            inner.put(&meta_path, tampered.into()).await.unwrap();
+        }
+
+        let reopened = EncryptedStoreBuilder::with_secret(inner.clone(), 100, [0u8; 32]).build();
+        let err = reopened.copy(&copy_source, &copy_target).await.unwrap_err();
+        assert!(err.to_string().contains("metadata authentication failed"));
+        assert!(matches!(
+            inner.get(&Path::from("data/tamper-copy-target")).await,
+            Err(Error::NotFound { .. })
+        ));
+
+        let err = reopened
+            .rename(&rename_source, &rename_target)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("metadata authentication failed"));
+        assert!(matches!(
+            inner.get(&Path::from("data/tamper-rename-target")).await,
+            Err(Error::NotFound { .. })
+        ));
     }
 
     #[tokio::test]

@@ -27,6 +27,9 @@ mod meta; // META command parser for introspection
 
 use crate::error::{KipError, format_nom_error};
 
+const MAX_KIP_INPUT_LEN: usize = 256 * 1024;
+const MAX_KIP_NESTING_DEPTH: usize = 64;
+
 /// The main entry point for parsing any KIP command.
 ///
 /// This function serves as the unified parser that can handle all three types of KIP commands.
@@ -64,6 +67,8 @@ use crate::error::{KipError, format_nom_error};
 /// let meta_result = parse_kip("DESCRIBE PRIMER");
 /// ```
 pub fn parse_kip(input: &str) -> Result<Command, KipError> {
+    validate_parser_budget(input)?;
+
     let rt = all_consuming(json::ws(context(
         "KIP command: FIND (KQL) | UPSERT/UPDATE/MERGE/DELETE (KML) | DESCRIBE/SEARCH/EXPORT (META)",
         alt((
@@ -99,6 +104,8 @@ pub fn parse_kip(input: &str) -> Result<Command, KipError> {
 /// let query = parse_kql("FIND(?drug.name) WHERE { ?drug {type: \"Drug\"} }");
 /// ```
 pub fn parse_kql(input: &str) -> Result<KqlQuery, KipError> {
+    validate_parser_budget(input)?;
+
     let rt = all_consuming(json::ws(kql::parse_kql_query))
         .parse(input)
         .map_err(|err| format_nom_error(input, err))?;
@@ -127,6 +134,8 @@ pub fn parse_kql(input: &str) -> Result<KqlQuery, KipError> {
 /// let statement = parse_kml("UPSERT { CONCEPT ?drug { { name: \"Aspirin\" } SET ATTRIBUTES { type: \"NSAID\" } } }");
 /// ```
 pub fn parse_kml(input: &str) -> Result<KmlStatement, KipError> {
+    validate_parser_budget(input)?;
+
     let rt = all_consuming(json::ws(kml::parse_kml_statement))
         .parse(input)
         .map_err(|err| format_nom_error(input, err))?;
@@ -155,6 +164,8 @@ pub fn parse_kml(input: &str) -> Result<KmlStatement, KipError> {
 /// let meta_cmd = parse_meta("DESCRIBE PRIMER");
 /// ```
 pub fn parse_meta(input: &str) -> Result<MetaCommand, KipError> {
+    validate_parser_budget(input)?;
+
     let rt = all_consuming(json::ws(meta::parse_meta_command))
         .parse(input)
         .map_err(|err| format_nom_error(input, err))?;
@@ -185,10 +196,70 @@ pub fn parse_meta(input: &str) -> Result<MetaCommand, KipError> {
 /// let json_string = parse_json("\"hello world\"");
 /// ```
 pub fn parse_json(input: &str) -> Result<Json, KipError> {
+    validate_parser_budget(input)?;
+
     let rt = all_consuming(json::ws(json::json_value()))
         .parse(input)
         .map_err(|err| format_nom_error(input, err))?;
     Ok(rt.1)
+}
+
+fn validate_parser_budget(input: &str) -> Result<(), KipError> {
+    if input.len() > MAX_KIP_INPUT_LEN {
+        return Err(KipError::resource_exhausted(format!(
+            "KIP input length {} exceeds maximum {MAX_KIP_INPUT_LEN}",
+            input.len()
+        )));
+    }
+
+    let mut stack = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for ch in input.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '(' | '[' | '{' => {
+                stack.push(ch);
+                if stack.len() > MAX_KIP_NESTING_DEPTH {
+                    return Err(KipError::resource_exhausted(format!(
+                        "KIP input nesting exceeds maximum {MAX_KIP_NESTING_DEPTH}"
+                    )));
+                }
+            }
+            ')' => {
+                if matches!(stack.last(), Some('(')) {
+                    stack.pop();
+                }
+            }
+            ']' => {
+                if matches!(stack.last(), Some('[')) {
+                    stack.pop();
+                }
+            }
+            '}' => {
+                if matches!(stack.last(), Some('{')) {
+                    stack.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
 }
 
 /// Converts a string to its JSON-quoted representation.
@@ -1006,5 +1077,24 @@ WITH METADATA {
         );
         println!("=== Unclosed array ===\n{msg}\n");
         assert!(msg.contains("line"), "Should contain line number");
+    }
+
+    #[test]
+    fn parser_budget_rejects_excessive_nesting_before_parse() {
+        let json = format!(
+            "{}0{}",
+            "[".repeat(MAX_KIP_NESTING_DEPTH + 1),
+            "]".repeat(MAX_KIP_NESTING_DEPTH + 1)
+        );
+        let err = parse_json(&json).unwrap_err();
+        assert_eq!(err.code, crate::KipErrorCode::ResourceExhausted);
+
+        let mut target = "?a".to_string();
+        for _ in 0..=MAX_KIP_NESTING_DEPTH {
+            target = format!("({target}, \"related_to\", ?b)");
+        }
+        let kql = format!("FIND(?a) WHERE {{ {target} }}");
+        let err = parse_kql(&kql).unwrap_err();
+        assert_eq!(err.code, crate::KipErrorCode::ResourceExhausted);
     }
 }

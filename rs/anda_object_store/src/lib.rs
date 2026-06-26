@@ -233,6 +233,7 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
         Ok(PutResult {
             e_tag: rt.e_tag.clone(),
             version: rt.original_version.clone(),
+            extensions: Extensions::default(),
         })
     }
 

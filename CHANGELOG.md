@@ -2,6 +2,23 @@
 
 All notable changes to this workspace are documented in this file.
 
+## [0.8.4] — 2026-06-26
+
+### Added
+
+- **Resource-exhaustion guards** — Added structural complexity validation for runtime field values, query filters, BM25 logical queries, searchable text extraction, KIP parsing input, and HNSW public configuration limits.
+- **Authenticated encrypted object metadata** — Added AES-GCM authentication for encrypted object sidecar metadata and chunk associated data so swapped or tampered encrypted payload metadata is rejected, including copy/rename metadata rebinding.
+
+### Changed
+
+- **Workspace crates prepared for 0.8.4** — Bumped `anda_db`, `anda_db_schema`, `anda_db_hnsw`, `anda_db_tfs`, `anda_kip`, `anda_object_store`, and `anda_cognitive_nexus` to `0.8.4` for the new hardening release.
+- **Object store dependency updated** — Updated `object_store` from `0.13` to `0.14` and filled default extension metadata in wrapper object-store responses.
+- **Server and shard proxy request validation tightened** — Rejected empty API keys, required explicit `Authorization: Bearer <key>` headers, and ignored client-supplied shard headers in favor of server-side/path routing metadata.
+
+### Fixed
+
+- **Read-only extension mutation checks** — Enforced read-only mode for database and collection extension save/remove operations.
+
 ## [0.8.3] — 2026-06-19
 
 ### Added

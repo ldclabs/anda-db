@@ -1034,6 +1034,14 @@ impl Collection {
     /// Sets a user-defined extension key-value pair and immediately persists the change.
     /// The extensions should not be large, as they are stored in the same object as collection metadata which size is expected to be small (<= 1MB) and loaded frequently.
     pub async fn save_extension(&self, key: String, value: FieldValue) -> Result<(), DBError> {
+        if self.read_only.load(Ordering::Relaxed) {
+            return Err(DBError::Generic {
+                name: self.name.clone(),
+                source: "Collection is read-only".into(),
+            });
+        }
+        value.validate_complexity()?;
+
         self.update_metadata(|meta| {
             meta.extensions.insert(key, value);
         });
@@ -1052,6 +1060,13 @@ impl Collection {
     /// Removes a user-defined extension key and immediately persists the change.
     /// Returns the previous value if the key existed.
     pub async fn remove_extension(&self, key: &str) -> Result<Option<FieldValue>, DBError> {
+        if self.read_only.load(Ordering::Relaxed) {
+            return Err(DBError::Generic {
+                name: self.name.clone(),
+                source: "Collection is read-only".into(),
+            });
+        }
+
         let old = self.update_metadata(|meta| meta.extensions.remove(key));
         if old.is_some() {
             self.flush_metadata().await?;
@@ -2007,6 +2022,13 @@ impl Collection {
     /// # Returns
     /// A vector of matching document IDs, or an error if the search fails
     pub async fn search_ids(&self, query: Query) -> Result<Vec<DocumentId>, DBError> {
+        query
+            .validate_complexity()
+            .map_err(|source| DBError::Generic {
+                name: self.name.clone(),
+                source: source.into(),
+            })?;
+
         let limit = query.limit.unwrap_or(10).min(1000);
         let top_k = limit * 10;
         let mut candidates = Vec::with_capacity(top_k);
@@ -2019,7 +2041,7 @@ impl Collection {
             if let Some(ref text) = params.text {
                 for index in self.bm25_indexes.iter() {
                     let rt = if params.logical_search {
-                        index.search_advanced(text, top_k, params.bm25_params.clone())
+                        index.try_search_advanced(text, top_k, params.bm25_params.clone())?
                     } else {
                         index.search(text, top_k, params.bm25_params.clone())
                     };
@@ -2076,6 +2098,13 @@ impl Collection {
         filter: Filter,
         limit: Option<usize>,
     ) -> Result<Vec<DocumentId>, DBError> {
+        filter
+            .validate_complexity()
+            .map_err(|source| DBError::Generic {
+                name: self.name.clone(),
+                source: source.into(),
+            })?;
+
         self.search_count.fetch_add(1, Ordering::Relaxed);
         let limit = limit.unwrap_or(0);
         let truncate_head = Self::filter_has_lt_or_le(&filter);
@@ -3717,8 +3746,27 @@ mod tests {
         let doc_obj = Document::try_from(collection.schema(), &doc)?;
         collection.add(doc_obj).await?;
 
+        let mut too_deep = Fv::Text("leaf".to_string());
+        for _ in 0..70 {
+            too_deep = Fv::Array(vec![too_deep]);
+        }
+        let err = collection
+            .save_extension("too_deep".to_string(), too_deep)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DBError::Schema { .. }));
+
         // 设置为只读模式
         collection.set_read_only(true);
+
+        let err = collection
+            .save_extension("blocked".to_string(), Fv::Text("value".to_string()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DBError::Generic { .. }));
+
+        let err = collection.remove_extension("blocked").await.unwrap_err();
+        assert!(matches!(err, DBError::Generic { .. }));
 
         // 尝试添加另一个文档，应该失败
         let doc2 = create_test_doc(0, "Bob", 25, vec!["tall", "quiet"]);
@@ -3877,6 +3925,19 @@ mod tests {
                         .create_hnsw_index_nx("age", HnswConfig::default())
                         .await,
                     Err(DBError::Schema { .. })
+                ));
+                assert!(matches!(
+                    collection
+                        .create_hnsw_index_nx(
+                            "vector",
+                            HnswConfig {
+                                dimension: 10,
+                                ef_search: HnswConfig::MAX_EF_SEARCH + 1,
+                                ..Default::default()
+                            },
+                        )
+                        .await,
+                    Err(DBError::Index { .. })
                 ));
 
                 collection.set_index_hooks(Arc::new(BackfillErrorHooks::btree(Fv::I64(-1))));
