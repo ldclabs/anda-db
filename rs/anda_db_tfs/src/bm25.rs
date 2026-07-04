@@ -1446,6 +1446,73 @@ where
         Ok(true)
     }
 
+    /// Like [`Self::store_metadata`], but hands the serialized metadata to an
+    /// async persist callback and only commits the saved-version watermark
+    /// when the callback succeeds.
+    ///
+    /// Use this instead of `store_metadata` with an in-memory buffer when the
+    /// actual persistence step can fail (e.g. an object-store write): with
+    /// the plain variant, a failed external write would leave the watermark
+    /// advanced and this metadata version would never be retried, so a later
+    /// crash could load stale metadata (e.g. an old `max_bucket_id`) that
+    /// hides buckets written afterwards.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(true)` if metadata was serialized and persisted.
+    /// * `Ok(false)` if the version was already saved.
+    pub async fn store_metadata_with<F>(&self, now_ms: u64, f: F) -> Result<bool, BM25Error>
+    where
+        F: AsyncFnOnce(&[u8]) -> Result<(), BoxError>,
+    {
+        let current_version = { self.metadata.read().stats.version };
+        if self.last_saved_version.load(Ordering::Relaxed) >= current_version {
+            return Ok(false);
+        }
+
+        let mut meta = self.metadata();
+        let prev_saved_version = self
+            .last_saved_version
+            .fetch_max(meta.stats.version, Ordering::Relaxed);
+        if prev_saved_version >= meta.stats.version {
+            return Ok(false);
+        }
+
+        meta.stats.last_saved = now_ms.max(meta.stats.last_saved);
+        let revert_claim = || {
+            // Revert only if this call still owns the claimed version.
+            let _ = self.last_saved_version.compare_exchange(
+                meta.stats.version,
+                prev_saved_version,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        };
+
+        let mut buf = Vec::with_capacity(256);
+        if let Err(err) = cbor2::to_writer(&BM25IndexRef { metadata: &meta }, &mut buf) {
+            revert_claim();
+            return Err(BM25Error::Serialization {
+                name: self.name.clone(),
+                source: err.into(),
+            });
+        }
+
+        if let Err(err) = f(&buf).await {
+            revert_claim();
+            return Err(BM25Error::Generic {
+                name: self.name.clone(),
+                source: err,
+            });
+        }
+
+        self.update_metadata(|m| {
+            m.stats.last_saved = meta.stats.last_saved.max(m.stats.last_saved);
+        });
+
+        Ok(true)
+    }
+
     /// Stores dirty buckets to persistent storage using the provided async function.
     /// Serializes each dirty bucket synchronously and releases all DashMap locks
     /// before making async persistence calls to minimize lock contention.

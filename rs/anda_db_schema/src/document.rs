@@ -4,7 +4,7 @@ use cbor2::Value;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::sync::Arc;
 
-use super::{Cbor, Fv, IndexedFieldValues, Schema, SchemaError};
+use super::{Fv, IndexedFieldValues, Schema, SchemaError};
 
 /// The unique identifier for a document within a collection.
 ///
@@ -156,42 +156,83 @@ impl Document {
 
     /// Deserializes the document into the specified type.
     ///
+    /// The document is re-encoded as a CBOR byte stream and decoded from it,
+    /// rather than walked as a `cbor2::Value` tree: the streaming decoder
+    /// bridges CBOR byte strings into serde sequences, which is required to
+    /// deserialize `FieldType::Bytes` fields into `Vec<u8>` / `[u8; N]`.
+    ///
     /// # Returns
     /// * `Result<T, SchemaError>` - The deserialized value or an error
     ///
     /// # Type Parameters
     /// * `T` - The type to deserialize the document to
-    pub fn try_into<T>(mut self) -> Result<T, SchemaError>
+    pub fn try_into<T>(self) -> Result<T, SchemaError>
     where
         T: DeserializeOwned,
     {
-        let mut doc: Vec<(Cbor, Cbor)> = Vec::with_capacity(self.schema.len());
         for field in self.schema.iter() {
-            if let Some(value) = self.fields.remove(&field.idx()) {
-                doc.push((field.name().into(), value.into()));
-            } else if field.required() {
+            if field.required() && !self.fields.contains_key(&field.idx()) {
                 return Err(SchemaError::Validation(format!(
                     "field {:?} is required",
                     field.name()
                 )));
-            } else {
-                doc.push((field.name().into(), Cbor::Null));
             }
         }
 
-        Cbor::Map(doc)
-            .deserialized()
+        // Serializes the document as a name-keyed CBOR map. Missing optional
+        // fields are emitted as `null`.
+        struct DocAsNamedMap<'a> {
+            schema: &'a Schema,
+            fields: &'a IndexedFieldValues,
+        }
+
+        impl Serialize for DocAsNamedMap<'_> {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                use serde::ser::SerializeMap;
+
+                let mut map = serializer.serialize_map(Some(self.schema.len()))?;
+                for field in self.schema.iter() {
+                    map.serialize_entry(field.name(), &self.fields.get(&field.idx()))?;
+                }
+                map.end()
+            }
+        }
+
+        let mut buf = Vec::with_capacity(256);
+        cbor2::to_writer(
+            &DocAsNamedMap {
+                schema: &self.schema,
+                fields: &self.fields,
+            },
+            &mut buf,
+        )
+        .map_err(|err| SchemaError::Serialization(format!("Failed to serialize: {err}")))?;
+
+        cbor2::from_reader(&buf[..])
             .map_err(|err| SchemaError::Serialization(format!("Failed to deserialize: {err}")))
     }
 
     /// Gets the document's unique identifier.
     ///
+    /// Returns `0` when the `_id` field has not been set yet. Collections
+    /// assign ids starting from `1`, so `0` doubles as the "unassigned"
+    /// sentinel; use [`Document::try_id`] to distinguish the two explicitly.
+    ///
     /// # Returns
-    /// A reference to the document's ID
+    /// The document's ID, or `0` if unset.
     pub fn id(&self) -> DocumentId {
+        self.try_id().unwrap_or(0)
+    }
+
+    /// Gets the document's unique identifier, or `None` when the `_id` field
+    /// has not been set.
+    pub fn try_id(&self) -> Option<DocumentId> {
         match self.fields.get(&0) {
-            Some(Fv::U64(id)) => *id,
-            _ => 0,
+            Some(Fv::U64(id)) => Some(*id),
+            _ => None,
         }
     }
 
@@ -294,7 +335,7 @@ impl Document {
     {
         if let Some(field) = self.schema.get_field(name) {
             if let Some(value) = self.fields.get(&field.idx()) {
-                return value.to_owned().deserialized();
+                return value.deserialized();
             } else {
                 return Err(SchemaError::Validation(format!(
                     "field {name:?} not found in document"
@@ -358,7 +399,7 @@ impl Serialize for Document {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AndaDBSchema, FieldEntry, FieldKey, FieldType, Fv, Resource};
+    use crate::{AndaDBSchema, Fv, Resource};
     use serde::{Deserialize, Serialize};
     use std::collections::BTreeMap;
 

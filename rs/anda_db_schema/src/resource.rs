@@ -2,10 +2,10 @@
 //! external reference attached to a document.
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    AndaDBSchema, ByteArrayB64, ByteBufB64, FieldEntry, FieldKey, FieldType, FieldTyped, Json, Map,
-    Schema, SchemaError,
-};
+use crate::{AndaDBSchema, ByteArrayB64, ByteBufB64, FieldTyped, Json, Map};
+
+#[cfg(test)]
+use crate::FieldType;
 
 /// Represents a resource for AI Agents.
 ///

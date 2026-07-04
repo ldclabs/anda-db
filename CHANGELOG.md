@@ -2,6 +2,29 @@
 
 All notable changes to this workspace are documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **Striped document-level concurrency locks** — Added 128-stripe async lock set serializing `update`/`remove` per document id so concurrent mutations of the same document cannot race between index mutations and the versioned storage write, eliminating phantom index entries.
+- **`Collection::reconcile_storage` maintenance API** — Full data-directory scan that recovers orphaned documents into the id bitmap and drops dead ids whose objects no longer exist; complements the bounded crash-recovery scan by covering gaps beyond large id discontinuities.
+- **HNSW `removed_nodes` tombstone tracking and `purge_removed_nodes`** — Records removed node ids so the persistence layer can delete the corresponding on-disk node blobs during flush cleanup; without this, removed node files accumulated forever.
+- **BM25 `store_metadata_with` atomic persistence** — Persist callback variant that only advances the saved-version watermark after the external write succeeds, preventing stale metadata on a failed object-store write.
+- **`FieldValue::bytes_from` array coercion** — Accepts CBOR integer arrays in addition to byte strings so `Vec<u8>` and `[u8; N]` struct fields (whose serde serializers emit integer sequences) can populate `FieldType::Bytes` fields.
+- **`json_to_cbor` helper** — Replaces the panicking `Cbor::serialized(&obj).expect(...)` path for `FieldValue::Json` with a total conversion function.
+
+### Changed
+
+- **Derive macro auto-imports schema types** — Added `schema_crate_path()` resolution so `#[derive(AndaDBSchema)]` and `#[derive(FieldTyped)]` import `Schema`, `FieldType`, `FieldKey`, etc. through the correct crate path; callers no longer need explicit `use` statements.
+- **CJK tokenizer detection expanded** — `Script::Cjk` now also matches Japanese kana and Hangul syllables alongside Han ideographs, so mixed Japanese/Korean text routes correctly to the CJK tokenizer pipeline.
+- **HNSW `ef_search` capped** — `search_layer` caps the user-supplied top-k against `MAX_EF_SEARCH` so a large `Query::limit` cannot force an arbitrarily expensive beam search.
+
+### Fixed
+
+- **BTree bucket size drift** — Unified `posting_entry_size` to account for the field-value key's serialized size in every bucket-size estimate (create, migrate, remove-last, compaction); long string keys previously caused buckets to overshoot `bucket_overload_size`.
+- **`FieldValue::deserialized` ownership** — Takes `&self` instead of consuming `self`, allowing reuse of the same value for multiple deserialization targets.
+- **Re-insert safety** — HNSW `add` / `insert` clears any pending tombstone for the id so a re-inserted document does not have its new node blob deleted by a stale `removed_nodes` entry.
+
 ## [0.8.4] — 2026-06-26
 
 ### Added

@@ -189,13 +189,26 @@ impl BTree {
     }
 
     /// Loads an existing B-tree index from persisted metadata and bucket objects.
+    ///
+    /// The type resolution here must mirror [`BTree::new`] exactly: a field
+    /// type accepted at index creation must resolve to the same key type on
+    /// reload, otherwise a collection with such an index can never be
+    /// reopened. (Regression: `Map` fields were accepted by `new` but missing
+    /// here, bricking collections on restart.)
     pub async fn bootstrap(name: String, ft: &Ft, storage: Storage) -> Result<Self, DBError> {
         match ft {
             Ft::Option(ft) => match ft.as_ref() {
                 Ft::Array(v) if v.len() == 1 => BTree::inner_bootstrap(name, &v[0], storage).await,
+                Ft::Map(v) if v.len() == 1 => {
+                    BTree::inner_bootstrap(name, &v.keys().next().unwrap().field_type(), storage)
+                        .await
+                }
                 v => BTree::inner_bootstrap(name, v, storage).await,
             },
             Ft::Array(v) if v.len() == 1 => BTree::inner_bootstrap(name, &v[0], storage).await,
+            Ft::Map(v) if v.len() == 1 => {
+                BTree::inner_bootstrap(name, &v.keys().next().unwrap().field_type(), storage).await
+            }
             v => BTree::inner_bootstrap(name, v, storage).await,
         }
     }
@@ -663,59 +676,27 @@ impl BTree {
         }
     }
 
-    /// Compacts bucket layout and flushes if bucket count shrinks.
+    /// Compacts bucket layout and persists the new layout if the bucket count
+    /// shrinks.
+    ///
+    /// Unlike a regular [`BTree::flush`], compaction persists **buckets
+    /// before metadata**: compaction is the only operation that shrinks
+    /// `max_bucket_id`, and writing the smaller metadata first would open a
+    /// crash window in which reload only scans the shrunk id range while the
+    /// bucket files still hold the old layout — postings that lived only in
+    /// higher-numbered buckets would silently disappear. With buckets first,
+    /// a crash in between reloads the old (larger) id range over a mix of new
+    /// and stale bucket files, which the loader already reconciles.
+    ///
+    /// Bucket files beyond the compacted range are deleted best-effort at the
+    /// end; leftovers from a failed deletion are ignored by future loads.
     pub async fn compact_index(&self) -> Result<(), DBError> {
         match self {
-            BTree::I64(btree) => {
-                let (old_bucket_count, new_bucket_count) = btree.index.compact_buckets();
-                if new_bucket_count < old_bucket_count {
-                    log::warn!(
-                        "Compacted BTree index '{}': {} -> {} buckets",
-                        btree.name,
-                        old_bucket_count,
-                        new_bucket_count
-                    );
-                    btree.flush(unix_ms()).await?;
-                }
-            }
-            BTree::U64(btree) => {
-                let (old_bucket_count, new_bucket_count) = btree.index.compact_buckets();
-                if new_bucket_count < old_bucket_count {
-                    log::warn!(
-                        "Compacted BTree index '{}': {} -> {} buckets",
-                        btree.name,
-                        old_bucket_count,
-                        new_bucket_count
-                    );
-                    btree.flush(unix_ms()).await?;
-                }
-            }
-            BTree::String(btree) => {
-                let (old_bucket_count, new_bucket_count) = btree.index.compact_buckets();
-                if new_bucket_count < old_bucket_count {
-                    log::warn!(
-                        "Compacted BTree index '{}': {} -> {} buckets",
-                        btree.name,
-                        old_bucket_count,
-                        new_bucket_count
-                    );
-                    btree.flush(unix_ms()).await?;
-                }
-            }
-            BTree::Bytes(btree) => {
-                let (old_bucket_count, new_bucket_count) = btree.index.compact_buckets();
-                if new_bucket_count < old_bucket_count {
-                    log::warn!(
-                        "Compacted BTree index '{}': {} -> {} buckets",
-                        btree.name,
-                        old_bucket_count,
-                        new_bucket_count
-                    );
-                    btree.flush(unix_ms()).await?;
-                }
-            }
+            BTree::I64(btree) => btree.compact().await,
+            BTree::U64(btree) => btree.compact().await,
+            BTree::String(btree) => btree.compact().await,
+            BTree::Bytes(btree) => btree.compact().await,
         }
-        Ok(())
     }
 
     /// Persists dirty metadata and buckets.
@@ -823,27 +804,32 @@ where
         })
     }
 
-    async fn flush(&self, now_ms: u64) -> Result<bool, DBError> {
-        let mut buf = Vec::with_capacity(256);
-        let meta_saved = self.index.store_metadata(&mut buf, now_ms)?;
-        let had_dirty = self.index.has_dirty_buckets();
-
-        if !meta_saved && !had_dirty {
-            return Ok(false);
-        }
-
-        if meta_saved {
-            let path = BTree::metadata_path(&self.name);
-            let ver = { self.metadata_version.read().clone() };
-            let ver = self
-                .storage
-                .put_bytes(&path, buf.into(), PutMode::Update(ver.into()))
-                .await?;
-            {
+    /// Persists metadata through [`BTreeIndex::store_metadata_with`], so the
+    /// saved-version watermark only advances after the object-store write
+    /// succeeds and a failed write is retried by the next flush.
+    async fn store_metadata(&self, now_ms: u64) -> Result<bool, DBError> {
+        let path = BTree::metadata_path(&self.name);
+        let meta_saved = self
+            .index
+            .store_metadata_with(now_ms, async |data| {
+                let ver = { self.metadata_version.read().clone() };
+                let ver = self
+                    .storage
+                    .put_bytes(
+                        &path,
+                        Bytes::copy_from_slice(data),
+                        PutMode::Update(ver.into()),
+                    )
+                    .await
+                    .map_err(BoxError::from)?;
                 *self.metadata_version.write() = ver;
-            }
-        }
+                Ok(())
+            })
+            .await?;
+        Ok(meta_saved)
+    }
 
+    async fn store_dirty_buckets(&self) -> Result<(), DBError> {
         let n = Arc::new(self.name.clone());
         let s = Arc::new(self.storage.clone());
         self.index
@@ -856,8 +842,58 @@ where
                 Ok(true)
             })
             .await?;
+        Ok(())
+    }
+
+    async fn flush(&self, now_ms: u64) -> Result<bool, DBError> {
+        let meta_saved = self.store_metadata(now_ms).await?;
+        let had_dirty = self.index.has_dirty_buckets();
+
+        if !meta_saved && !had_dirty {
+            return Ok(false);
+        }
+
+        self.store_dirty_buckets().await?;
 
         Ok(meta_saved || had_dirty)
+    }
+
+    /// See [`BTree::compact_index`] for the persistence-ordering rationale.
+    async fn compact(&self) -> Result<(), DBError> {
+        let old_max_bucket_id = self.index.stats().max_bucket_id;
+        let (old_bucket_count, new_bucket_count) = self.index.compact_buckets();
+        if new_bucket_count >= old_bucket_count {
+            return Ok(());
+        }
+
+        log::warn!(
+            "Compacted BTree index '{}': {} -> {} buckets",
+            self.name,
+            old_bucket_count,
+            new_bucket_count
+        );
+
+        // Buckets first, then metadata (which shrinks max_bucket_id).
+        self.store_dirty_buckets().await?;
+        self.store_metadata(unix_ms()).await?;
+
+        // Best-effort cleanup of bucket files beyond the compacted range.
+        for id in (new_bucket_count as u32)..=old_max_bucket_id {
+            let path = BTree::bucket_path(&self.name, id);
+            match self.storage.delete(&path).await {
+                Ok(()) | Err(DBError::NotFound { .. }) => {}
+                Err(err) => {
+                    log::warn!(
+                        action = "BTree::compact",
+                        index = self.name,
+                        bucket = id;
+                        "Failed to delete stale bucket file: {err:?}",
+                    );
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn has_pending_flush(&self) -> bool {
@@ -1320,5 +1356,80 @@ mod tests {
         u64_tree.drop_data().await;
         text_tree.drop_data().await;
         bytes_tree.drop_data().await;
+    }
+
+    /// Regression: `BTree::bootstrap` must accept every field type that
+    /// `BTree::new` accepts. `Map` (and `Option<Map>`) fields were accepted
+    /// at creation but rejected on reload, which made collections with such
+    /// an index impossible to reopen.
+    #[tokio::test]
+    async fn map_indexes_survive_bootstrap() {
+        let storage = test_storage().await;
+        let now = unix_ms();
+
+        let map_tree = BTree::new(
+            field(
+                "map_boot",
+                Ft::Map(BTreeMap::from([("*".into(), Ft::U64)])),
+            ),
+            storage.clone(),
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(map_tree, BTree::String(_)));
+        assert!(
+            map_tree
+                .insert(
+                    7,
+                    &Fv::Map(BTreeMap::from([("k".into(), Fv::U64(1))])),
+                    now,
+                )
+                .unwrap()
+        );
+        assert!(map_tree.flush(now + 1).await.unwrap());
+
+        let reloaded = BTree::bootstrap(
+            "map_boot".to_string(),
+            &Ft::Map(BTreeMap::from([("*".into(), Ft::U64)])),
+            storage.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(reloaded, BTree::String(_)));
+        assert_eq!(
+            reloaded.query_with(&Fv::Text("k".into()), |ids| Some(ids.clone())),
+            Some(vec![7])
+        );
+
+        let option_map_tree = BTree::new(
+            field(
+                "option_map_boot",
+                Ft::Option(Box::new(Ft::Map(BTreeMap::from([(
+                    vec![1_u8].into(),
+                    Ft::Text,
+                )])))),
+            ),
+            storage.clone(),
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(option_map_tree, BTree::Bytes(_)));
+        // No mutations yet: flush is a no-op, the metadata object written at
+        // creation time is what bootstrap loads below.
+        assert!(!option_map_tree.flush(now + 1).await.unwrap());
+
+        let reloaded = BTree::bootstrap(
+            "option_map_boot".to_string(),
+            &Ft::Option(Box::new(Ft::Map(BTreeMap::from([(
+                vec![1_u8].into(),
+                Ft::Text,
+            )])))),
+            storage,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(reloaded, BTree::Bytes(_)));
     }
 }

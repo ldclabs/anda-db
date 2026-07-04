@@ -7,7 +7,7 @@ pub use anda_db_hnsw::{HnswConfig, HnswMetadata, HnswStats};
 
 use crate::{
     error::DBError,
-    schema::{Fe, Vector},
+    schema::{BoxError, Fe, Vector},
     storage::{ObjectVersion, PutMode, Storage},
 };
 
@@ -132,34 +132,44 @@ impl Hnsw {
         })
     }
 
-    /// Persists dirty metadata, id lists, and graph nodes.
+    /// Persists dirty metadata, id lists, and graph nodes, then deletes the
+    /// blobs of removed nodes.
     ///
-    /// Returns `true` when any object was written.
+    /// Node-blob deletion runs last: the ids bitmap persisted in this same
+    /// flush already excludes removed ids, so a crash right before the purge
+    /// only leaves orphaned blobs that are never loaded again, while a crash
+    /// right after is fully clean.
+    ///
+    /// Returns `true` when any object was written or deleted.
     pub async fn flush(&self, now_ms: u64) -> Result<bool, DBError> {
-        let mut buf = Vec::with_capacity(256);
-        let meta_saved = self.index.store_metadata(&mut buf, now_ms)?;
+        let meta_saved = {
+            let path = Hnsw::metadata_path(&self.name);
+            self.index
+                .store_metadata_with(now_ms, async |data| {
+                    let metadata_version = { self.metadata_version.read().clone() };
+                    let metadata_version = self
+                        .storage
+                        .put_bytes(
+                            &path,
+                            Bytes::copy_from_slice(data),
+                            PutMode::Update(metadata_version.into()),
+                        )
+                        .await
+                        .map_err(BoxError::from)?;
+                    *self.metadata_version.write() = metadata_version;
+                    Ok(())
+                })
+                .await?
+        };
         let had_dirty = self.index.has_dirty_nodes();
+        let had_removed = self.index.has_removed_nodes();
 
-        if !meta_saved && !had_dirty {
+        if !meta_saved && !had_dirty && !had_removed {
             return Ok(false);
         }
 
         if meta_saved {
-            let path = Hnsw::metadata_path(&self.name);
-            let metadata_version = { self.metadata_version.read().clone() };
-            let metadata_version = self
-                .storage
-                .put_bytes(
-                    &path,
-                    Bytes::copy_from_slice(&buf[..]),
-                    PutMode::Update(metadata_version.into()),
-                )
-                .await?;
-            {
-                *self.metadata_version.write() = metadata_version;
-            }
-
-            buf.clear();
+            let mut buf = Vec::with_capacity(256);
             self.index.store_ids(&mut buf)?;
             let path = Hnsw::ids_path(&self.name);
             let ids_version = { self.ids_version.read().clone() };
@@ -185,12 +195,27 @@ impl Hnsw {
             })
             .await?;
 
-        Ok(meta_saved || had_dirty)
+        // Delete the persisted blobs of removed nodes; without this they
+        // would leak forever. "Not found" is success (already deleted).
+        let n = Arc::new(self.name.clone());
+        let s = Arc::new(self.storage.clone());
+        self.index
+            .purge_removed_nodes(async move |id| {
+                let path = Hnsw::node_path(n.clone().as_str(), id);
+                match s.clone().delete(&path).await {
+                    Ok(()) | Err(DBError::NotFound { .. }) => Ok(true),
+                    Err(err) => Err(err.into()),
+                }
+            })
+            .await?;
+
+        Ok(meta_saved || had_dirty || had_removed)
     }
 
-    /// Returns whether metadata or nodes have in-memory changes to flush.
+    /// Returns whether metadata, nodes, or removed-node tombstones have
+    /// in-memory changes to flush.
     pub fn has_pending_flush(&self) -> bool {
-        if self.index.has_dirty_nodes() {
+        if self.index.has_dirty_nodes() || self.index.has_removed_nodes() {
             return true;
         }
 

@@ -69,6 +69,16 @@ pub struct Collection {
     metadata_version: RwLock<ObjectVersion>,
     ids_version: RwLock<ObjectVersion>,
     index_hooks: Arc<dyn IndexHooks>,
+
+    /// Striped async locks serializing `update` / `remove` per document id
+    /// (stripe = `id % DOC_LOCK_STRIPES`).
+    ///
+    /// Without this, two concurrent updates of the same document race between
+    /// their index mutations and the versioned storage write: the loser's
+    /// rollback can re-insert index entries for values the stored document no
+    /// longer has, leaving phantom matches that nothing cleans up. `add` does
+    /// not take a stripe: every add works on a freshly allocated unique id.
+    doc_locks: Vec<tokio::sync::Mutex<()>>,
 }
 
 /// Collection configuration parameters.
@@ -168,10 +178,29 @@ impl Collection {
     /// memory up front. Result vectors still grow on demand beyond this hint.
     const MAX_RESERVE_HINT: usize = 1024;
 
+    /// Number of stripes in `doc_locks`. Power of two so the modulo is cheap.
+    const DOC_LOCK_STRIPES: usize = 128;
+
+    /// Maximum accepted `Query::limit` for `search_ids`; larger values are
+    /// clamped. Bounds both the result size and the per-index recall breadth
+    /// (`limit * 10`).
+    pub const MAX_SEARCH_LIMIT: usize = 1000;
+
     /// Returns a safe pre-allocation size for a caller-supplied limit.
     #[inline]
     fn reserve_hint(limit: usize) -> usize {
         limit.min(Self::MAX_RESERVE_HINT)
+    }
+
+    fn new_doc_locks() -> Vec<tokio::sync::Mutex<()>> {
+        (0..Self::DOC_LOCK_STRIPES)
+            .map(|_| tokio::sync::Mutex::new(()))
+            .collect()
+    }
+
+    /// Returns the stripe lock guarding mutations of document `id`.
+    fn doc_lock(&self, id: DocumentId) -> &tokio::sync::Mutex<()> {
+        &self.doc_locks[(id as usize) % Self::DOC_LOCK_STRIPES]
     }
 
     /// Generates the storage path for a document with the given ID
@@ -265,6 +294,7 @@ impl Collection {
             metadata_version: RwLock::new(metadata_version),
             ids_version: RwLock::new(ids_version),
             index_hooks: Arc::new(DefaultIndexHooks),
+            doc_locks: Self::new_doc_locks(),
         })
     }
 
@@ -327,6 +357,7 @@ impl Collection {
             metadata_version: RwLock::new(metadata_version),
             ids_version: RwLock::new(ids_version),
             index_hooks: Arc::new(DefaultIndexHooks),
+            doc_locks: Self::new_doc_locks(),
         };
         collection.load_indexes().await?;
         let fixed = collection.auto_repair_indexes().await?;
@@ -395,6 +426,101 @@ impl Collection {
         Ok(())
     }
 
+    /// Reconciles the in-memory state with the document objects actually
+    /// present in storage, in both directions:
+    ///
+    /// - documents on disk that are missing from the id bitmap are recovered
+    ///   (added to the bitmap and re-indexed), and
+    /// - bitmap ids without a backing object are dropped.
+    ///
+    /// This is an explicit **maintenance API**: unlike the bounded
+    /// crash-recovery scan that runs on open ([`Self::auto_repair_indexes`],
+    /// which stops after a run of consecutive missing ids and can therefore
+    /// miss orphans beyond a large id gap), it lists the entire `data/`
+    /// prefix — O(number of documents) in listing cost. Call it during
+    /// quiescence (no concurrent writers), e.g. from an admin task after an
+    /// unclean shutdown or when `len()` looks inconsistent.
+    ///
+    /// Returns `(recovered, dropped)`: documents recovered into the bitmap
+    /// and dead ids removed from it. Changes are persisted by the next
+    /// `flush()`.
+    pub async fn reconcile_storage(&self) -> Result<(usize, usize), DBError> {
+        if self.read_only.load(Ordering::Relaxed) {
+            return Err(DBError::Generic {
+                name: self.name.clone(),
+                source: "Collection is read-only".into(),
+            });
+        }
+
+        let now_ms = unix_ms();
+
+        // Enumerate the ids of every document object under `data/`.
+        let mut stored_ids: BTreeSet<DocumentId> = BTreeSet::new();
+        {
+            let mut stream = self.storage.list_meta(Some("data/"), None);
+            while let Some(meta) = stream.next().await {
+                let meta = meta?;
+                if let Some(id) = meta
+                    .location
+                    .filename()
+                    .and_then(|name| name.strip_suffix(".cbor"))
+                    .and_then(|raw| raw.parse::<DocumentId>().ok())
+                {
+                    stored_ids.insert(id);
+                }
+            }
+        }
+
+        // Direction 1: recover documents that exist on disk but are missing
+        // from the bitmap.
+        let missing_in_bitmap: Vec<DocumentId> = {
+            let doc_ids = self.doc_ids.read();
+            stored_ids
+                .iter()
+                .copied()
+                .filter(|id| !doc_ids.contains(*id))
+                .collect()
+        };
+        let mut recovered = 0usize;
+        for id in missing_in_bitmap {
+            match self.storage.fetch::<DocumentOwned>(&Self::doc_path(id)).await {
+                Ok((doc, _)) => {
+                    if self.repair_document(id, doc, now_ms)? {
+                        recovered += 1;
+                    }
+                }
+                // Deleted between listing and fetch; nothing to recover.
+                Err(DBError::NotFound { .. }) => {}
+                Err(err) => return Err(err),
+            }
+        }
+
+        // Direction 2: drop bitmap ids whose object no longer exists.
+        let dead_ids: Vec<DocumentId> = {
+            let doc_ids = self.doc_ids.read();
+            doc_ids
+                .iter()
+                .filter(|id| !stored_ids.contains(id))
+                .collect()
+        };
+        let dropped = dead_ids.len();
+        for id in dead_ids {
+            self.heal_missing_doc(id);
+        }
+
+        if recovered > 0 || dropped > 0 {
+            log::warn!(
+                action = "Collection::reconcile_storage",
+                collection = self.name,
+                recovered = recovered,
+                dropped = dropped;
+                "Reconciled collection with storage: recovered={recovered}, dropped={dropped}",
+            );
+        }
+
+        Ok((recovered, dropped))
+    }
+
     /// Automatically repairs indexes if needed.
     /// This is called during collection opening to ensure index integrity.
     ///
@@ -402,6 +528,12 @@ impl Collection {
     /// max_document_id that may have been written but not indexed (due to crash
     /// or incomplete flush). It also scans slightly beyond max_document_id to
     /// recover documents written but not recorded in metadata.
+    ///
+    /// The scan is bounded (it stops after a run of consecutive missing ids),
+    /// so orphans beyond a large id gap — e.g. after many deletions or many
+    /// failed `add` calls, which also consume ids — may not be found here.
+    /// [`Self::reconcile_storage`] performs the unbounded, listing-based
+    /// reconciliation for those cases.
     async fn auto_repair_indexes(&self) -> Result<usize, DBError> {
         let persisted_max_document_id = self.storage.stats().check_point;
         let maybe_max_document_id = self.max_document_id.load(Ordering::Relaxed);
@@ -447,70 +579,8 @@ impl Collection {
                 Ok((doc, _)) => {
                     // Reset consecutive miss counter on successful fetch
                     consecutive_misses = 0;
-                    self.max_document_id.fetch_max(id, Ordering::AcqRel);
-
-                    let mut is_new = false;
-                    {
-                        let mut doc_ids = self.doc_ids.write();
-                        if !doc_ids.contains(id) {
-                            doc_ids.add(id);
-                            self.doc_ids_index.write().insert(id);
-                            fixed += 1;
-                            is_new = true;
-                        }
-                    }
-
-                    let doc = Document::try_from_doc(self.schema(), doc)?;
-                    // try to repair indexes
-                    for index in &self.btree_indexes {
-                        if let Some(fv) = self.index_hooks.btree_index_value(index, &doc) {
-                            if fv.as_ref() == &FieldValue::Null {
-                                continue;
-                            }
-                            if let Err(err) = index.insert(id, &fv, now_ms) {
-                                log::warn!(
-                                    action = "Collection::auto_repair_indexes",
-                                    collection = self.name,
-                                    doc_id = id,
-                                    index = index.name();
-                                    "Failed to repair BTree index: {err:?}",
-                                );
-                            }
-                        }
-                    }
-
-                    for index in &self.bm25_indexes {
-                        if let Some(text) = self.index_hooks.bm25_index_value(index, &doc)
-                            && let Err(err) = index.insert(id, &text, now_ms)
-                        {
-                            log::warn!(
-                                action = "Collection::auto_repair_indexes",
-                                collection = self.name,
-                                doc_id = id,
-                                index = index.name();
-                                "Failed to repair BM25 index: {err:?}",
-                            );
-                        }
-                    }
-
-                    for index in &self.hnsw_indexes {
-                        if let Some(vector) = self.index_hooks.hnsw_index_value(index, &doc)
-                            && let Err(err) = index.insert(id, vector.into_owned(), now_ms)
-                        {
-                            log::warn!(
-                                action = "Collection::auto_repair_indexes",
-                                collection = self.name,
-                                doc_id = id,
-                                index = index.name();
-                                "Failed to repair HNSW index: {err:?}",
-                            );
-                        }
-                    }
-
-                    if is_new {
-                        self.update_metadata(|meta| {
-                            meta.stats.version += 1;
-                        });
+                    if self.repair_document(id, doc, now_ms)? {
+                        fixed += 1;
                     }
                 }
             }
@@ -522,6 +592,87 @@ impl Collection {
         }
 
         Ok(fixed)
+    }
+
+    /// Registers a document found in storage into the in-memory id structures
+    /// and (best-effort) re-inserts it into every index. Index insert
+    /// failures are logged, not propagated: an idempotent re-insert of an
+    /// already-indexed document commonly reports duplicates.
+    ///
+    /// Returns `true` when the id was missing from the bitmap (i.e. an
+    /// orphan was recovered).
+    fn repair_document(
+        &self,
+        id: DocumentId,
+        doc: DocumentOwned,
+        now_ms: u64,
+    ) -> Result<bool, DBError> {
+        self.max_document_id.fetch_max(id, Ordering::AcqRel);
+
+        let mut is_new = false;
+        {
+            let mut doc_ids = self.doc_ids.write();
+            if !doc_ids.contains(id) {
+                doc_ids.add(id);
+                self.doc_ids_index.write().insert(id);
+                is_new = true;
+            }
+        }
+
+        let doc = Document::try_from_doc(self.schema(), doc)?;
+        // try to repair indexes
+        for index in &self.btree_indexes {
+            if let Some(fv) = self.index_hooks.btree_index_value(index, &doc) {
+                if fv.as_ref() == &FieldValue::Null {
+                    continue;
+                }
+                if let Err(err) = index.insert(id, &fv, now_ms) {
+                    log::warn!(
+                        action = "Collection::repair_document",
+                        collection = self.name,
+                        doc_id = id,
+                        index = index.name();
+                        "Failed to repair BTree index: {err:?}",
+                    );
+                }
+            }
+        }
+
+        for index in &self.bm25_indexes {
+            if let Some(text) = self.index_hooks.bm25_index_value(index, &doc)
+                && let Err(err) = index.insert(id, &text, now_ms)
+            {
+                log::warn!(
+                    action = "Collection::repair_document",
+                    collection = self.name,
+                    doc_id = id,
+                    index = index.name();
+                    "Failed to repair BM25 index: {err:?}",
+                );
+            }
+        }
+
+        for index in &self.hnsw_indexes {
+            if let Some(vector) = self.index_hooks.hnsw_index_value(index, &doc)
+                && let Err(err) = index.insert(id, vector.into_owned(), now_ms)
+            {
+                log::warn!(
+                    action = "Collection::repair_document",
+                    collection = self.name,
+                    doc_id = id,
+                    index = index.name();
+                    "Failed to repair HNSW index: {err:?}",
+                );
+            }
+        }
+
+        if is_new {
+            self.update_metadata(|meta| {
+                meta.stats.version += 1;
+            });
+        }
+
+        Ok(is_new)
     }
 
     async fn load_existing_documents(&self) -> Result<Vec<(DocumentId, Document)>, DBError> {
@@ -1089,6 +1240,16 @@ impl Collection {
 
     /// Creates a BTree index on the specified field.
     ///
+    /// # Uniqueness semantics
+    ///
+    /// - A **single-field** index enforces uniqueness only when the field is
+    ///   declared `unique` in the schema.
+    /// - A **multi-field** index (two or more fields) always acts as a
+    ///   composite **unique** index: inserting a second document with the
+    ///   same combination of field values is rejected. Existing documents
+    ///   are backfilled at creation time and can make creation fail if they
+    ///   already violate the constraint.
+    ///
     /// # Arguments
     /// * `fields` - Fields to index
     ///
@@ -1652,6 +1813,12 @@ impl Collection {
 
     /// Updates an existing document with new field values.
     ///
+    /// Concurrent `update` / `remove` calls for the same document id are
+    /// serialized internally (striped per-id locks), so index state and the
+    /// stored document cannot diverge under in-process concurrency. The
+    /// version precondition on the storage write additionally guards against
+    /// writers outside this process.
+    ///
     /// # Arguments
     /// * `id` - The ID of the document to update
     /// * `fields` - The new field values to apply
@@ -1694,6 +1861,12 @@ impl Collection {
                 source: "No fields to update".into(),
             });
         }
+
+        // Serialize mutations of the same document (see `doc_locks`): the
+        // read-modify-write below must not interleave with another update or
+        // remove of this id, or rolled-back index entries could diverge from
+        // the stored document.
+        let _doc_guard = self.doc_lock(id).lock().await;
 
         let (doc, ver) = self
             .storage
@@ -1852,6 +2025,9 @@ impl Collection {
             return Ok(None);
         }
 
+        // Serialize mutations of the same document (see `doc_locks`).
+        let _doc_guard = self.doc_lock(id).lock().await;
+
         let now_ms = unix_ms();
         let path = Self::doc_path(id);
 
@@ -1974,20 +2150,61 @@ impl Collection {
         let mut stream = futures::stream::iter(ids)
             .map(|id| {
                 let storage = self.storage.clone();
-                async move { storage.get::<DocumentOwned>(&Self::doc_path(id)).await }
+                async move { (id, storage.get::<DocumentOwned>(&Self::doc_path(id)).await) }
             })
             .buffered(8);
-        while let Some(result) = stream.next().await {
+        while let Some((id, result)) = stream.next().await {
             match result {
                 Ok((doc, _)) => {
                     let doc = Document::try_from_doc(schema.clone(), doc)?;
                     docs.push(doc);
                 }
-                Err(DBError::NotFound { .. }) => {}
+                Err(DBError::NotFound { .. }) => {
+                    self.heal_missing_doc(id);
+                }
                 Err(err) => return Err(err),
             }
         }
         Ok(docs)
+    }
+
+    /// Self-heals a document id whose object is missing from storage.
+    ///
+    /// A crash between deleting a document object and flushing the ids bitmap
+    /// leaves a dead id behind: it is present in the bitmap but has no
+    /// backing object, inflating `len()` forever with no cleanup path. When a
+    /// read discovers such an id, drop it from the in-memory id structures so
+    /// the next flush persists the repair. No-op in read-only mode or when
+    /// the id is not in the bitmap (e.g. a stale index entry).
+    fn heal_missing_doc(&self, id: DocumentId) {
+        if self.read_only.load(Ordering::Relaxed) {
+            return;
+        }
+
+        // Same lock order as add() / remove(): doc_ids, then doc_ids_index.
+        let removed = {
+            let mut doc_ids = self.doc_ids.write();
+            let mut doc_ids_index = self.doc_ids_index.write();
+            if doc_ids.contains(id) {
+                doc_ids.remove(id);
+                doc_ids_index.remove(&id);
+                true
+            } else {
+                false
+            }
+        };
+
+        if removed {
+            self.update_metadata(|meta| {
+                meta.stats.version += 1;
+            });
+            log::warn!(
+                action = "Collection::heal_missing_doc",
+                collection = self.name,
+                doc_id = id;
+                "Removed dead document id without a backing object",
+            );
+        }
     }
 
     /// Searches for documents matching the given query and deserializes them into the specified type.
@@ -2016,6 +2233,15 @@ impl Collection {
     ///
     /// This is more efficient than retrieving full documents when only IDs are needed.
     ///
+    /// # Limit semantics
+    ///
+    /// `Query::limit` defaults to `10` and is clamped to
+    /// [`Collection::MAX_SEARCH_LIMIT`]. An explicit `limit` of `0` returns
+    /// an empty result (consistent with the underlying indexes' `top_k = 0`
+    /// behavior). Each search index is asked for up to `limit * 10`
+    /// candidates before reranking and filtering, capped at 4096 to bound
+    /// the per-query search breadth.
+    ///
     /// # Arguments
     /// * `query` - The search query parameters
     ///
@@ -2029,12 +2255,19 @@ impl Collection {
                 source: source.into(),
             })?;
 
-        let limit = query.limit.unwrap_or(10).min(1000);
-        let top_k = limit * 10;
+        self.search_count.fetch_add(1, Ordering::Relaxed);
+        let limit = query.limit.unwrap_or(10).min(Self::MAX_SEARCH_LIMIT);
+        if limit == 0 {
+            // A zero limit previously behaved inconsistently: empty for
+            // search queries (top_k = 0) but unlimited for filter-only
+            // queries. Normalize to "no results" for both.
+            return Ok(Vec::new());
+        }
+
+        let top_k = (limit * 10).min(4096);
         let mut candidates = Vec::with_capacity(top_k);
         let mut result = Vec::new();
 
-        self.search_count.fetch_add(1, Ordering::Relaxed);
         if let Some(params) = query.search {
             let mut results: Vec<Vec<u64>> = Vec::new();
 
@@ -2090,7 +2323,9 @@ impl Collection {
     ///
     /// # Arguments
     /// * `filter` - The filter condition to apply
-    /// * `limit` - Maximum number of results to return (0 means no limit)
+    /// * `limit` - Maximum number of results to return. `None` means no
+    ///   limit; an explicit `Some(0)` returns an empty result, consistent
+    ///   with [`Collection::search_ids`].
     /// # Returns
     /// A vector of document IDs matching the filter, or an error if filtering fails.
     pub async fn query_ids(
@@ -2106,6 +2341,9 @@ impl Collection {
             })?;
 
         self.search_count.fetch_add(1, Ordering::Relaxed);
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
         let limit = limit.unwrap_or(0);
         let truncate_head = Self::filter_has_lt_or_le(&filter);
 
@@ -2156,7 +2394,9 @@ impl Collection {
                     let doc = Document::try_from_doc(self.schema(), doc)?;
                     return Ok(doc);
                 }
-                Err(DBError::NotFound { .. }) => {}
+                Err(DBError::NotFound { .. }) => {
+                    self.heal_missing_doc(id);
+                }
                 Err(err) => return Err(err),
             }
         }
@@ -2795,6 +3035,57 @@ mod tests {
         ) -> ObjectStoreResult<()> {
             self.inner.copy_opts(from, to, options).await
         }
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_storage_recovers_orphans_and_drops_dead_ids() -> Result<(), DBError> {
+        let db = setup_test_db().await?;
+        let collection = create_test_collection(&db, async |_| Ok(())).await?;
+
+        let id1 = collection
+            .add_from(&create_test_doc(0, "alice", 30, vec!["a"]))
+            .await?;
+        let id2 = collection
+            .add_from(&create_test_doc(0, "bob", 40, vec!["b"]))
+            .await?;
+        collection.flush(unix_ms()).await?;
+
+        // Simulate a crash between object deletion and the ids flush: the
+        // object is gone but the bitmap still references it.
+        collection
+            .storage
+            .delete(&Collection::doc_path(id2))
+            .await?;
+        // Simulate an orphan document written but never registered: present
+        // on disk, absent from the bitmap (well beyond any repair scan).
+        let orphan_id = id2 + 500;
+        let mut orphan = Document::new(collection.schema());
+        orphan.set_doc(
+            Document::try_from(
+                collection.schema(),
+                &create_test_doc(orphan_id, "carol", 50, vec!["c"]),
+            )?
+            .into(),
+        )?;
+        collection
+            .storage
+            .create(&Collection::doc_path(orphan_id), &orphan)
+            .await?;
+
+        let (recovered, dropped) = collection.reconcile_storage().await?;
+        assert_eq!(recovered, 1);
+        assert_eq!(dropped, 1);
+        assert!(collection.contains(id1));
+        assert!(!collection.contains(id2));
+        assert!(collection.contains(orphan_id));
+        // The recovered document is readable and indexed again.
+        let doc: TestDoc = collection.get_as(orphan_id).await?;
+        assert_eq!(doc.name, "carol");
+        assert!(collection.max_document_id() >= orphan_id);
+
+        // Idempotent: a second reconcile finds nothing.
+        assert_eq!(collection.reconcile_storage().await?, (0, 0));
+        Ok(())
     }
 
     #[tokio::test]

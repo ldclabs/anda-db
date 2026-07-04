@@ -26,7 +26,8 @@ pub enum Script {
     Cyrillic,
     /// Arabic alphabet.
     Arabic,
-    /// CJK unified ideographs.
+    /// CJK scripts: Han ideographs (incl. extensions and compatibility
+    /// ideographs), Japanese kana, and Hangul syllables.
     Cjk,
     /// No dominant supported script was detected.
     Other,
@@ -34,9 +35,12 @@ pub enum Script {
 
 /// Detects the dominant script family for a text slice.
 ///
-/// CJK wins as soon as any CJK character is present because Chinese/Japanese
-/// segmentation benefits from a specialized tokenizer even in mixed-script
-/// tokens. Otherwise the most frequent supported script family is returned.
+/// CJK wins as soon as any CJK character is present because Chinese, Japanese
+/// and Korean segmentation benefits from a specialized tokenizer even in
+/// mixed-script tokens: `SimpleTokenizer` treats a whole CJK run as one
+/// alphanumeric token, so without re-tokenization an entire sentence would be
+/// indexed as a single term. Otherwise the most frequent supported script
+/// family is returned.
 pub fn detect_script(text: &str) -> Script {
     let mut latin = 0;
     let mut cyrillic = 0;
@@ -48,7 +52,18 @@ pub fn detect_script(text: &str) -> Script {
             'a'..='z' | 'A'..='Z' | '\u{00C0}'..='\u{024F}' => latin += 1,
             '\u{0400}'..='\u{04FF}' => cyrillic += 1,
             '\u{0600}'..='\u{06FF}' | '\u{0750}'..='\u{077F}' => arabic += 1,
-            '\u{4e00}'..='\u{9fff}' | '\u{3400}'..='\u{4dbf}' => cjk += 1,
+            // Han: unified ideographs, extension A, compatibility ideographs,
+            // and extension B and beyond (supplementary planes).
+            '\u{4e00}'..='\u{9fff}'
+            | '\u{3400}'..='\u{4dbf}'
+            | '\u{f900}'..='\u{faff}'
+            | '\u{20000}'..='\u{2ebef}'
+            // Japanese hiragana and katakana (incl. phonetic extensions).
+            | '\u{3040}'..='\u{30ff}'
+            | '\u{31f0}'..='\u{31ff}'
+            // Hangul syllables and jamo.
+            | '\u{ac00}'..='\u{d7af}'
+            | '\u{1100}'..='\u{11ff}' => cjk += 1,
             _ => {}
         }
     }

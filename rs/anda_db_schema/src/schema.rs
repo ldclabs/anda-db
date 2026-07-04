@@ -105,6 +105,18 @@ impl Schema {
                         field.r#type()
                     )));
                 }
+
+                // The unique flag must not change either: indexes derive their
+                // duplicate policy from it at creation time and existing data
+                // is never re-validated, so a silent flip would leave the
+                // collection and its indexes inconsistent.
+                if field.unique() != old_field.unique() {
+                    return Err(SchemaError::Schema(format!(
+                        "field {name:?} unique flag changed from {} to {}, unique changes are not allowed",
+                        old_field.unique(),
+                        field.unique()
+                    )));
+                }
             } else {
                 if field.required() {
                     return Err(SchemaError::Schema(format!(
@@ -969,6 +981,30 @@ mod tests {
         // "age" must keep the builder-assigned idx 2, not the inherited 1.
         assert_eq!(new_schema, snapshot);
         assert_eq!(new_schema.get_field("age").unwrap().idx(), 2);
+    }
+
+    #[test]
+    fn test_upgrade_with_rejects_unique_change() {
+        let mut old_builder = SchemaBuilder::new();
+        old_builder.with_version(1);
+        old_builder
+            .add_field(Fe::new("email".to_string(), Ft::Text).unwrap())
+            .unwrap();
+        let old = old_builder.build().unwrap();
+
+        // Flip `unique` from false to true.
+        let mut new_builder = SchemaBuilder::new();
+        new_builder.with_version(2);
+        new_builder
+            .add_field(Fe::new("email".to_string(), Ft::Text).unwrap().with_unique())
+            .unwrap();
+        let mut new_schema = new_builder.build().unwrap();
+
+        let err = new_schema.upgrade_with(&old).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("unique flag changed"),
+            "expected unique change error, got: {err:?}"
+        );
     }
 
     #[test]

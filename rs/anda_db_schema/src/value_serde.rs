@@ -406,15 +406,20 @@ impl<'de> de::Visitor<'de> for Visitor {
 
     #[inline]
     fn visit_map<A: de::MapAccess<'de>>(self, mut acc: A) -> Result<Self::Value, A::Error> {
-        let mut map = Vec::<(FieldKey, FieldValue)>::with_capacity(
-            acc.size_hint().filter(|&l| l < 1024).unwrap_or(0),
-        );
+        let mut map = BTreeMap::<FieldKey, FieldValue>::new();
 
-        while let Some(kv) = acc.next_entry()? {
-            map.push(kv);
+        // Reject duplicate keys instead of silently keeping the last entry,
+        // matching the behaviour of `FieldValue::map_from` on the typed
+        // extraction path.
+        while let Some((key, value)) = acc.next_entry()? {
+            if let std::collections::btree_map::Entry::Vacant(e) = map.entry(key) {
+                e.insert(value);
+            } else {
+                return Err(de::Error::custom("duplicate map key"));
+            }
         }
 
-        Ok(FieldValue::Map(BTreeMap::from_iter(map)))
+        Ok(FieldValue::Map(map))
     }
 }
 
@@ -545,6 +550,23 @@ mod tests {
         assert_eq!(json_value[BASE64_URL_SAFE.encode([9])], json!(9));
         let decoded: FieldValue = serde_json::from_value(json_value).unwrap();
         assert_eq!(decoded, FieldValue::Map(map));
+    }
+
+    #[test]
+    fn field_value_map_rejects_duplicate_keys() {
+        // `serde_json::Value` object keys are already unique, so exercise the
+        // duplicate-key path through raw JSON text and through CBOR.
+        let err = serde_json::from_str::<FieldValue>(r#"{"k":1,"k":2}"#).unwrap_err();
+        assert!(err.to_string().contains("duplicate map key"));
+
+        let dup_map = cbor2::Value::Map(vec![
+            (cbor2::Value::Text("k".into()), cbor2::Value::Integer(1.into())),
+            (cbor2::Value::Text("k".into()), cbor2::Value::Integer(2.into())),
+        ]);
+        let mut bytes = Vec::new();
+        cbor2::to_writer(&dup_map, &mut bytes).unwrap();
+        let err = cbor2::from_reader::<FieldValue, _>(bytes.as_slice()).unwrap_err();
+        assert!(err.to_string().contains("duplicate map key"));
     }
 
     #[test]

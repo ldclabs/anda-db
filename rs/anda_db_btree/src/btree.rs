@@ -103,7 +103,25 @@ fn cbor_serialized_size<T: ?Sized + Serialize>(value: &T) -> usize {
         .expect("CBOR serialized size exceeds usize")
 }
 
-fn previous_posting_size_after_append<PK>(
+/// Estimated serialized size of one full `(field_value, posting)` bucket
+/// entry.
+///
+/// Every site that accounts for a whole posting entry (create, migrate,
+/// remove-last, compaction) must use this same formula: the field value key
+/// contributes to the serialized bucket alongside the posting payload, and
+/// mixing key-inclusive with key-exclusive estimates would let bucket sizes
+/// drift from reality (long string keys made buckets overshoot
+/// `bucket_overload_size` before this was unified).
+fn posting_entry_size<FV, P>(field_value: &FV, posting: &P) -> usize
+where
+    FV: Serialize,
+    P: Serialize,
+{
+    cbor_serialized_size(&(field_value, posting)) + 2
+}
+
+fn previous_posting_size_after_append<PK, FV>(
+    field_value: &FV,
     bucket_id: u32,
     version_after_append: u64,
     doc_ids_after_append: &UniqueVec<PK>,
@@ -111,6 +129,7 @@ fn previous_posting_size_after_append<PK>(
 ) -> usize
 where
     PK: Eq + Hash + Clone + Serialize,
+    FV: Serialize,
 {
     let mut previous_doc_ids = doc_ids_after_append.to_vec();
     let removed_doc_id = previous_doc_ids.pop();
@@ -124,7 +143,7 @@ where
         version_after_append.saturating_sub(1),
         UniqueVec::from(previous_doc_ids),
     );
-    cbor_serialized_size(&previous) + 2
+    posting_entry_size(field_value, &previous)
 }
 
 /// Thread-safe, bucket-based B-tree index with range query support.
@@ -637,7 +656,7 @@ where
                                 .swap_remove_if(|key| key == &field_value)
                                 .is_some()
                         {
-                            let previous_size = cbor_serialized_size(&previous) + 2;
+                            let previous_size = posting_entry_size(&field_value, &previous);
                             previous_bucket.0 = previous_bucket.0.saturating_sub(previous_size);
                             self.mark_bucket_dirty(&mut previous_bucket);
                         }
@@ -753,7 +772,7 @@ where
             dashmap::Entry::Vacant(entry) => {
                 // Create a new posting for this field value
                 let posting = (bucket, 1, vec![doc_id.clone()].into());
-                size_increase = cbor_serialized_size(&posting) + 2;
+                size_increase = posting_entry_size(&field_value, &posting);
                 entry.insert(posting);
                 is_new = true;
             }
@@ -806,6 +825,7 @@ where
                         // appended doc_id from the post-insert size is not exact.
                         source_size_decrease = if appended_existing_posting {
                             previous_posting_size_after_append(
+                                &field_value,
                                 target_bucket,
                                 posting.1,
                                 &posting.2,
@@ -816,7 +836,7 @@ where
                         };
 
                         posting.0 = new_bucket;
-                        let migrated_posting_size = cbor_serialized_size(&posting) + 2;
+                        let migrated_posting_size = posting_entry_size(&field_value, &*posting);
                         size_increase = migrated_posting_size;
                     } else {
                         size_increase = 0;
@@ -889,7 +909,7 @@ where
                 // holds a single doc_id — to avoid an O(n) CBOR pass on every
                 // removal from a large posting.
                 let prev_posting_size = if posting.2.len() == 1 {
-                    cbor_serialized_size(&*posting) + 2
+                    posting_entry_size(&field_value, &*posting)
                 } else {
                     0
                 };
@@ -1071,7 +1091,7 @@ where
                 dashmap::Entry::Vacant(entry) => {
                     // Create a new posting for this field value
                     let posting = (bucket_id, 1, vec![doc_id.clone()].into());
-                    size_increase = cbor_serialized_size(&posting) + 2;
+                    size_increase = posting_entry_size(&field_value, &posting);
                     // Insert the new posting
                     entry.insert(posting);
                     // Remember to add this to the B-tree for range queries
@@ -1127,7 +1147,7 @@ where
 
                 // Newly-created posting; decide whether it stays in this bucket or migrates.
                 let fv_size = if let Some(posting) = self.postings.get(&fv) {
-                    cbor_serialized_size(&posting) + 2
+                    posting_entry_size(&fv, &*posting)
                 } else {
                     // Posting was concurrently removed; nothing more to do.
                     continue;
@@ -1271,7 +1291,7 @@ where
                 // only for a single-element posting avoids an O(n) CBOR pass on
                 // every removal. See remove() for the rationale.
                 let prev_posting_size = if posting.2.len() == 1 {
-                    cbor_serialized_size(&*posting) + 2
+                    posting_entry_size(&field_value, &*posting)
                 } else {
                     0
                 };
@@ -1839,7 +1859,7 @@ where
             .postings
             .iter()
             .map(|entry| {
-                let size = cbor_serialized_size(&(entry.key(), entry.value())) + 2;
+                let size = posting_entry_size(entry.key(), entry.value());
                 (entry.key().clone(), size)
             })
             .collect();
@@ -1942,6 +1962,76 @@ where
             return Err(BTreeError::Serialization {
                 name: self.name.clone(),
                 source: err.into(),
+            });
+        }
+
+        self.update_metadata(|m| {
+            m.stats.last_saved = meta.stats.last_saved.max(m.stats.last_saved);
+        });
+
+        Ok(true)
+    }
+
+    /// Like [`Self::store_metadata`], but hands the serialized metadata to an
+    /// async persist callback and only commits the saved-version watermark
+    /// when the callback succeeds.
+    ///
+    /// Use this instead of `store_metadata` with an in-memory buffer when the
+    /// actual persistence step can fail (e.g. an object-store write): with
+    /// the plain variant, a failed external write would leave the watermark
+    /// advanced and this metadata version would never be retried, so a later
+    /// crash could load stale metadata (e.g. an old `max_bucket_id`) that
+    /// hides buckets written afterwards.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(true)` if metadata was serialized and persisted.
+    /// * `Ok(false)` if the version was already saved.
+    pub async fn store_metadata_with<F>(&self, now_ms: u64, f: F) -> Result<bool, BTreeError>
+    where
+        F: AsyncFnOnce(&[u8]) -> Result<(), BoxError>,
+    {
+        // Fast path: if the version is already saved, avoid cloning metadata.
+        let current_version = { self.metadata.read().stats.version };
+        if self.last_saved_version.load(Ordering::Relaxed) >= current_version {
+            return Ok(false);
+        }
+
+        let mut meta = self.metadata();
+        // Atomically claim the right to serialize this version.
+        let prev_saved_version = self
+            .last_saved_version
+            .fetch_max(meta.stats.version, Ordering::Relaxed);
+        if prev_saved_version >= meta.stats.version {
+            return Ok(false);
+        }
+
+        meta.stats.last_saved = now_ms.max(meta.stats.last_saved);
+        let revert_claim = || {
+            // Revert only if no other writer has already advanced this atomic
+            // to a newer version.
+            let _ = self.last_saved_version.compare_exchange(
+                meta.stats.version,
+                prev_saved_version,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        };
+
+        let mut buf = Vec::with_capacity(256);
+        if let Err(err) = cbor2::to_writer(&BTreeIndexRef { metadata: &meta }, &mut buf) {
+            revert_claim();
+            return Err(BTreeError::Serialization {
+                name: self.name.clone(),
+                source: err.into(),
+            });
+        }
+
+        if let Err(err) = f(&buf).await {
+            revert_claim();
+            return Err(BTreeError::Generic {
+                name: self.name.clone(),
+                source: err,
             });
         }
 
@@ -4182,7 +4272,7 @@ mod tests {
         let moving_key = "moving".to_string();
         let previous_posting_size = {
             let posting = index.postings.get(&moving_key).unwrap();
-            cbor_serialized_size(&*posting) + 2
+            posting_entry_size(&moving_key, &*posting)
         };
 
         let forced_source_size = {

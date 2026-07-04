@@ -38,6 +38,11 @@
 //! deterministic and small; floating point values disallow `NaN` so that
 //! [`FieldValue`] keeps a meaningful `PartialEq`.
 
+// The derive macros in `anda_db_derive` emit paths rooted at
+// `anda_db_schema::...`. This alias makes those paths resolve when the macros
+// are used inside this crate itself (e.g. by [`Resource`]).
+extern crate self as anda_db_schema;
+
 mod document;
 mod error;
 mod field;

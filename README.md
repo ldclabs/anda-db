@@ -138,7 +138,7 @@ Add the core dependencies to your `Cargo.toml`.
 ```toml
 [dependencies]
 anda_db = { version = "0.8", features = ["full"] }
-object_store = { version = "0.13", features = ["fs"] }
+object_store = { version = "0.14", features = ["fs"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 ```

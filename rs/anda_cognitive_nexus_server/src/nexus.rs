@@ -8,7 +8,7 @@ use anda_db::{
     unix_ms,
 };
 use anda_db_schema::{
-    AndaDBSchema, BoxError, FieldEntry, FieldKey, FieldType, Fv, Json, Schema, SchemaError,
+    AndaDBSchema, BoxError, Fv, Json,
 };
 use anda_kip::{
     CommandType, META_SELF_NAME, PERSON_SELF_KIP, PERSON_SYSTEM_KIP, PERSON_TYPE, Request,

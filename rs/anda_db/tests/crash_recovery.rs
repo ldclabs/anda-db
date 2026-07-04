@@ -21,7 +21,7 @@ use anda_db::{
     error::DBError,
     index::HnswConfig,
     query::{Filter, Query, RangeQuery},
-    schema::{AndaDBSchema, FieldEntry, FieldType, Fv, Schema, SchemaError, Vector, bf16},
+    schema::{AndaDBSchema, Fv, Vector, bf16},
     storage::StorageConfig,
     unix_ms,
 };

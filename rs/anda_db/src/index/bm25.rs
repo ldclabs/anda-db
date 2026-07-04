@@ -11,7 +11,7 @@ pub use anda_db_tfs::{
 
 use crate::{
     error::DBError,
-    schema::DocumentId,
+    schema::{BoxError, DocumentId},
     storage::{ObjectVersion, PutMode, Storage},
     unix_ms,
 };
@@ -143,30 +143,32 @@ impl BM25 {
         })
     }
 
-    /// Persists dirty metadata and buckets.
-    ///
-    /// Returns `true` when any object was written.
-    pub async fn flush(&self, now_ms: u64) -> Result<bool, DBError> {
-        let mut buf = Vec::with_capacity(256);
-        let meta_saved = self.index.store_metadata(&mut buf, now_ms)?;
-        let had_dirty = self.index.has_dirty_buckets();
-
-        if !meta_saved && !had_dirty {
-            return Ok(false);
-        }
-
-        if meta_saved {
-            let path = BM25::metadata_path(&self.name);
-            let ver = { self.metadata_version.read().clone() };
-            let ver = self
-                .storage
-                .put_bytes(&path, buf.into(), PutMode::Update(ver.into()))
-                .await?;
-            {
+    /// Persists metadata through [`BM25Index::store_metadata_with`], so the
+    /// saved-version watermark only advances after the object-store write
+    /// succeeds and a failed write is retried by the next flush.
+    async fn store_metadata(&self, now_ms: u64) -> Result<bool, DBError> {
+        let path = BM25::metadata_path(&self.name);
+        let meta_saved = self
+            .index
+            .store_metadata_with(now_ms, async |data| {
+                let ver = { self.metadata_version.read().clone() };
+                let ver = self
+                    .storage
+                    .put_bytes(
+                        &path,
+                        Bytes::copy_from_slice(data),
+                        PutMode::Update(ver.into()),
+                    )
+                    .await
+                    .map_err(BoxError::from)?;
                 *self.metadata_version.write() = ver;
-            }
-        }
+                Ok(())
+            })
+            .await?;
+        Ok(meta_saved)
+    }
 
+    async fn store_dirty_buckets(&self) -> Result<(), DBError> {
         let n = Arc::new(self.name.clone());
         let s = Arc::new(self.storage.clone());
         self.index
@@ -179,22 +181,66 @@ impl BM25 {
                 Ok(true)
             })
             .await?;
+        Ok(())
+    }
+
+    /// Persists dirty metadata and buckets.
+    ///
+    /// Returns `true` when any object was written.
+    pub async fn flush(&self, now_ms: u64) -> Result<bool, DBError> {
+        let meta_saved = self.store_metadata(now_ms).await?;
+        let had_dirty = self.index.has_dirty_buckets();
+
+        if !meta_saved && !had_dirty {
+            return Ok(false);
+        }
+
+        self.store_dirty_buckets().await?;
 
         Ok(meta_saved || had_dirty)
     }
 
-    /// Compacts bucket layout and flushes if bucket count shrinks.
+    /// Compacts bucket layout and persists the new layout if the bucket count
+    /// shrinks.
+    ///
+    /// Compaction persists **buckets before metadata** because it is the only
+    /// operation that shrinks `max_bucket_id`; see `BTree::compact_index` for
+    /// the crash-ordering rationale. Stale bucket files beyond the compacted
+    /// range are deleted best-effort afterwards.
     pub async fn compact_index(&self) -> Result<(), DBError> {
+        let old_max_bucket_id = self.index.stats().max_bucket_id;
         let (old_bucket_count, new_bucket_count) = self.index.compact_buckets();
-        if new_bucket_count < old_bucket_count {
-            log::warn!(
-                "Compacted BM25 index '{}': {} -> {} buckets",
-                self.name,
-                old_bucket_count,
-                new_bucket_count
-            );
-            self.flush(unix_ms()).await?;
+        if new_bucket_count >= old_bucket_count {
+            return Ok(());
         }
+
+        log::warn!(
+            "Compacted BM25 index '{}': {} -> {} buckets",
+            self.name,
+            old_bucket_count,
+            new_bucket_count
+        );
+
+        // Buckets first, then metadata (which shrinks max_bucket_id).
+        self.store_dirty_buckets().await?;
+        self.store_metadata(unix_ms()).await?;
+
+        // Best-effort cleanup of bucket files beyond the compacted range.
+        for id in (new_bucket_count as u32)..=old_max_bucket_id {
+            let path = BM25::bucket_path(&self.name, id);
+            match self.storage.delete(&path).await {
+                Ok(()) | Err(DBError::NotFound { .. }) => {}
+                Err(err) => {
+                    log::warn!(
+                        action = "BM25::compact_index",
+                        index = self.name,
+                        bucket = id;
+                        "Failed to delete stale bucket file: {err:?}",
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
 

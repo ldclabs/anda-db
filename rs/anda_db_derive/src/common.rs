@@ -2,8 +2,10 @@
 //!
 //! The functions in this module work on `syn` AST nodes and emit
 //! `proc_macro2::TokenStream` fragments that reference items from
-//! `anda_db_schema` (`FieldType`, `FieldKey`, ...). Generated code therefore
-//! requires those names to be in scope at the call site.
+//! `anda_db_schema` (`FieldType`, `FieldKey`, ...) by their bare names. The
+//! derive entry points wrap those fragments in a function body that imports
+//! the names through [`schema_crate_path`], so call sites do not need to
+//! import them.
 //!
 //! All fallible helpers return [`syn::Result`] with errors spanned at the
 //! offending field, type or attribute so that diagnostics point at the user's
@@ -15,6 +17,43 @@ use syn::{
     Attribute, Data, DeriveInput, Expr, Field, Fields, GenericArgument, Lit, LitStr, Meta, Path,
     PathArguments, PathSegment, Type, ext::IdentExt, punctuated::Punctuated, token::Comma,
 };
+
+/// Resolves the path of the `anda_db_schema` crate as seen from the call site.
+///
+/// Generated code must reference `FieldType`, `FieldKey`, `Schema`, ... through
+/// this path so that users do not have to import those names themselves.
+///
+/// Resolution order:
+/// 1. A direct dependency on `anda_db_schema` (possibly renamed).
+/// 2. A direct dependency on `anda_db` (the umbrella crate), using its
+///    `schema` re-export module.
+/// 3. Inside `anda_db_schema` itself the bare crate name is emitted, which
+///    resolves through the `extern crate self as anda_db_schema;` alias in its
+///    `lib.rs` (and through the normal dependency in its integration tests).
+pub fn schema_crate_path() -> TokenStream {
+    use proc_macro_crate::{FoundCrate, crate_name};
+
+    match crate_name("anda_db_schema") {
+        // Bare ident (no leading `::`) so it also resolves inside
+        // `anda_db_schema` itself via the `extern crate self` alias.
+        Ok(FoundCrate::Itself) => quote!(anda_db_schema),
+        Ok(FoundCrate::Name(name)) => {
+            let ident = syn::Ident::new(&name, Span::call_site());
+            quote!(::#ident)
+        }
+        Err(_) => match crate_name("anda_db") {
+            Ok(FoundCrate::Itself) => quote!(crate::schema),
+            Ok(FoundCrate::Name(name)) => {
+                let ident = syn::Ident::new(&name, Span::call_site());
+                quote!(::#ident::schema)
+            }
+            // Neither crate is a direct dependency (e.g. re-exported through a
+            // third crate): fall back to the bare name, which at least keeps
+            // pre-existing `use anda_db_schema::...` setups working.
+            Err(_) => quote!(anda_db_schema),
+        },
+    }
+}
 
 /// Extract the named fields of a struct, or report a spanned error for any
 /// other input shape (tuple/unit structs, enums, unions).

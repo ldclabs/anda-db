@@ -18,10 +18,10 @@
 //! - Propositions: `"P:{id}:{predicate}"` (e.g., "P:456:hasProperty")
 //!
 
-use anda_db_schema::{
-    AndaDBSchema, FieldEntry, FieldKey, FieldType, FieldTyped, FieldValue, Json, Map, Schema,
-    SchemaError,
-};
+use anda_db_schema::{AndaDBSchema, FieldTyped, FieldValue, Json, Map};
+
+#[cfg(test)]
+use anda_db_schema::FieldType;
 use anda_kip::{ConceptNode, ConceptNodeRef, EntityRef, PropositionLinkRef};
 use serde::{Deserialize, Serialize};
 use serde_json::json;

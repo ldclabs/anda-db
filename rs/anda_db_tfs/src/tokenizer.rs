@@ -115,6 +115,15 @@ pub fn default_tokenizer() -> TokenizerChain {
 
 /// Tokenizes text and optionally filters tokens
 ///
+/// # Token length filter
+///
+/// Tokens whose UTF-8 **byte** length is `<= 1` are dropped as noise. This
+/// means single ASCII letters and digits (`"a"`, `"5"`) are never indexed —
+/// and, since the same function tokenizes queries, never searchable — while
+/// single CJK characters (3 bytes in UTF-8, e.g. `"水"`) are kept. Both the
+/// indexing and query paths share this rule, so it never causes an
+/// index/query mismatch.
+///
 /// # Arguments
 ///
 /// * `tokenizer` - Tokenizer to use for processing text
@@ -133,6 +142,7 @@ pub fn collect_tokens<T: Tokenizer>(
     let mut stream = tokenizer.token_stream(text);
     let mut tokens = HashMap::new();
     while let Some(token) = stream.next() {
+        // See "Token length filter" above: byte length, deliberately.
         if token.text.len() <= 1 {
             continue;
         }

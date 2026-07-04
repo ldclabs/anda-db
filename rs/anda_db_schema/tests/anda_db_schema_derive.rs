@@ -1,5 +1,5 @@
 use anda_db_derive::{AndaDBSchema, FieldTyped};
-use anda_db_schema::{FieldEntry, FieldKey, FieldType, Json, Schema, SchemaError};
+use anda_db_schema::{FieldKey, FieldType, Json, Schema};
 use serde::{Deserialize, Serialize};
 use serde_json::Map;
 use std::collections::BTreeMap;
@@ -551,5 +551,50 @@ mod tests {
 
         let decoded: TestClaimsAsValue = doc.try_into().unwrap();
         assert_eq!(decoded, value);
+    }
+
+    /// Regression: `Vec<u8>` / `[u8; N]` fields serialize through serde as
+    /// integer sequences (not CBOR byte strings). `FieldType::Bytes` must
+    /// accept and coerce that shape, otherwise deriving a schema for such
+    /// fields produces documents that can never be stored.
+    #[test]
+    fn test_vec_u8_and_u8_array_round_trip_through_document() {
+        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, AndaDBSchema)]
+        struct BytesDoc {
+            _id: u64,
+            data: Vec<u8>,
+            arr: [u8; 4],
+            opt: Option<Vec<u8>>,
+        }
+
+        let schema = std::sync::Arc::new(BytesDoc::schema().unwrap());
+        assert_eq!(
+            schema.get_field("data").unwrap().r#type(),
+            &FieldType::Bytes
+        );
+        assert_eq!(schema.get_field("arr").unwrap().r#type(), &FieldType::Bytes);
+
+        let value = BytesDoc {
+            _id: 1,
+            data: vec![1, 2, 3],
+            arr: [9, 8, 7, 6],
+            opt: Some(vec![255, 0]),
+        };
+        let doc = Document::try_from(schema.clone(), &value).unwrap();
+        // The serde integer sequence must be normalized to real bytes.
+        assert_eq!(doc.get_field("data"), Some(&Fv::Bytes(vec![1, 2, 3])));
+        assert_eq!(doc.get_field("arr"), Some(&Fv::Bytes(vec![9, 8, 7, 6])));
+        assert_eq!(doc.get_field("opt"), Some(&Fv::Bytes(vec![255, 0])));
+
+        let decoded: BytesDoc = doc.try_into().unwrap();
+        assert_eq!(decoded, value);
+
+        // Out-of-range elements must still be rejected.
+        let err = FieldType::Bytes
+            .extract(anda_db_schema::Cbor::Array(vec![
+                anda_db_schema::Cbor::Integer(256.into()),
+            ]))
+            .unwrap_err();
+        assert!(err.to_string().contains("u8 range"));
     }
 }

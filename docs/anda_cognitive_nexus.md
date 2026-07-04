@@ -136,7 +136,7 @@ mutate through KQL/KML/META instructions.
 anda_cognitive_nexus = "0.8"
 anda_db = "0.8"
 anda_kip = "0.8"
-object_store = "0.13"
+object_store = "0.14"
 tokio = { version = "1", features = ["full"] }
 ```
 

@@ -9,6 +9,11 @@
 //!
 //! Both macros follow serde field naming rules where possible, so generated
 //! metadata matches the serialized document shape used by AndaDB.
+//!
+//! Generated code is self-contained: it resolves `Schema`, `SchemaError`,
+//! `FieldEntry`, `FieldType` and `FieldKey` through the `anda_db_schema`
+//! crate (or the `anda_db::schema` re-export when only `anda_db` is a
+//! dependency), so call sites do not need to import those names.
 
 use proc_macro::TokenStream;
 

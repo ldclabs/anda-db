@@ -45,6 +45,14 @@ struct InnerStorage {
     metadata: StorageMetadata,
     /// Optional cache for frequently accessed small objects.
     cache: Option<Cache<Path, Arc<(Bytes, ObjectVersion)>>>,
+    /// Monotonic counter bumped on every `put` / `delete`.
+    ///
+    /// `inner_get` snapshots it before fetching and only inserts the fetched
+    /// bytes into the cache when no write happened in between. Without this
+    /// guard, a concurrent read could re-populate the cache with pre-write
+    /// bytes *after* the writer's invalidation, serving a stale object until
+    /// the next write to that path. Coarse (any path) but cheap and safe.
+    write_seq: AtomicU64,
 }
 
 /// Configuration for the object store storage layer.
@@ -343,6 +351,7 @@ impl Storage {
                 stats: (&metadata.stats).into(),
                 metadata,
                 cache,
+                write_seq: AtomicU64::new(0),
             }),
         })
     }
@@ -483,6 +492,7 @@ impl Storage {
             return Ok((doc, arc.1.clone()));
         }
 
+        let write_seq = self.inner.write_seq.load(Ordering::Acquire);
         let (bytes, version) = self.inner_fetch(path).await?;
         let doc: T = from_reader(&bytes[..]).map_err(|err| DBError::Serialization {
             name: self.inner.base_path.to_string(),
@@ -491,6 +501,9 @@ impl Storage {
 
         if let Some(cache) = &self.inner.cache
             && bytes.len() <= self.inner.metadata.config.max_small_object_size
+            // Skip caching when any write raced with this fetch; see
+            // `InnerStorage::write_seq`.
+            && self.inner.write_seq.load(Ordering::Acquire) == write_seq
         {
             // Cache the document if it is small enough
             cache
@@ -701,6 +714,7 @@ impl Storage {
             .await
             .map_err(DBError::from)?;
 
+        self.inner.write_seq.fetch_add(1, Ordering::AcqRel);
         if let Some(cache) = &self.inner.cache {
             cache.remove(&path).await;
         }
@@ -861,6 +875,7 @@ impl InnerStorage {
             .await
             .map_err(DBError::from)?;
 
+        self.write_seq.fetch_add(1, Ordering::AcqRel);
         if let Some(cache) = &self.cache {
             cache.remove(&path).await;
         }

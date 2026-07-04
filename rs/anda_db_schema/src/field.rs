@@ -502,10 +502,7 @@ impl From<FieldValue> for Cbor {
             FieldValue::F32(f) => Cbor::Float(f as f64),
             FieldValue::Bytes(b) => Cbor::Bytes(b),
             FieldValue::Text(t) => Cbor::Text(t),
-            // JSON value can always be serialized to CBOR format!
-            FieldValue::Json(obj) => {
-                Cbor::serialized(&obj).expect("Failed to serialize JSON to CBOR")
-            }
+            FieldValue::Json(obj) => json_to_cbor(obj),
             FieldValue::Vector(arr) => {
                 Cbor::Array(arr.into_iter().map(|f| f.to_bits().into()).collect())
             }
@@ -1167,6 +1164,12 @@ impl FieldValue {
 
     /// Create a Bytes FieldValue from a CBOR value
     ///
+    /// Besides CBOR byte strings, a CBOR array whose elements are all
+    /// integers in `0..=255` is accepted and coerced into bytes. This is the
+    /// shape `Vec<u8>` / `[u8; N]` struct fields produce through serde: the
+    /// generic `Vec<T>` and array serializers emit an integer sequence, not a
+    /// byte string, so a `FieldType::Bytes` field must accept both.
+    ///
     /// # Arguments
     /// * `value` - The CBOR value to convert
     ///
@@ -1175,6 +1178,24 @@ impl FieldValue {
     pub fn bytes_from(value: Cbor) -> Result<Self, SchemaError> {
         match value {
             Cbor::Bytes(b) => Ok(FieldValue::Bytes(b)),
+            Cbor::Array(arr) => {
+                let mut bytes = Vec::with_capacity(arr.len());
+                for v in arr {
+                    match v {
+                        Cbor::Integer(i) => bytes.push(u8::try_from(i).map_err(|v| {
+                            SchemaError::FieldValue(format!(
+                                "expected Bytes, got array element {v:?} outside u8 range"
+                            ))
+                        })?),
+                        v => {
+                            return Err(SchemaError::FieldValue(format!(
+                                "expected Bytes, got array element {v:?}"
+                            )));
+                        }
+                    }
+                }
+                Ok(FieldValue::Bytes(bytes))
+            }
             v => Err(SchemaError::FieldValue(format!(
                 "expected Bytes, got {v:?}"
             ))),
@@ -1413,11 +1434,18 @@ impl FieldValue {
 
     /// Deserialize a FieldValue into a value of type T
     ///
+    /// The value is re-encoded as a CBOR byte stream and decoded from it:
+    /// the streaming decoder bridges CBOR byte strings into serde sequences,
+    /// which is required to deserialize [`FieldValue::Bytes`] into `Vec<u8>`
+    /// or `[u8; N]`.
+    ///
     /// # Returns
     /// * `Result<T, SchemaError>` - The deserialized value or an error message
-    pub fn deserialized<T: DeserializeOwned>(self) -> Result<T, SchemaError> {
-        let val: Cbor = self.into();
-        val.deserialized()
+    pub fn deserialized<T: DeserializeOwned>(&self) -> Result<T, SchemaError> {
+        let mut buf = Vec::with_capacity(128);
+        cbor2::to_writer(self, &mut buf)
+            .map_err(|v| SchemaError::FieldValue(format!("Failed to serialize: {v:?}")))?;
+        cbor2::from_reader(&buf[..])
             .map_err(|v| SchemaError::FieldValue(format!("Failed to deserialize: {v:?}")))
     }
 
@@ -1653,6 +1681,37 @@ pub fn vector_from_f32(v: Vec<f32>) -> Vector {
 /// conversion of every element.
 pub fn vector_from_f64(v: Vec<f64>) -> Vector {
     v.into_iter().map(bf16::from_f64).collect()
+}
+
+/// Converts a JSON value into a CBOR value.
+///
+/// This is a total function: every JSON value has a CBOR representation, so
+/// no error path (or panic) is required. Numbers map to the narrowest CBOR
+/// integer that fits, falling back to a float.
+fn json_to_cbor(value: Json) -> Cbor {
+    match value {
+        Json::Null => Cbor::Null,
+        Json::Bool(b) => Cbor::Bool(b),
+        Json::Number(n) => {
+            if let Some(u) = n.as_u64() {
+                Cbor::Integer(u.into())
+            } else if let Some(i) = n.as_i64() {
+                Cbor::Integer(i.into())
+            } else {
+                // `serde_json::Number` cannot hold NaN; `as_f64` is only
+                // `None` for out-of-range arbitrary-precision numbers, which
+                // saturate to an infinite float here.
+                Cbor::Float(n.as_f64().unwrap_or(f64::INFINITY))
+            }
+        }
+        Json::String(s) => Cbor::Text(s),
+        Json::Array(arr) => Cbor::Array(arr.into_iter().map(json_to_cbor).collect()),
+        Json::Object(obj) => Cbor::Map(
+            obj.into_iter()
+                .map(|(k, v)| (Cbor::Text(k), json_to_cbor(v)))
+                .collect(),
+        ),
+    }
 }
 
 /// If `m` describes a *wildcard* map — i.e. it has exactly one entry whose

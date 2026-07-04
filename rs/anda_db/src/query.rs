@@ -271,7 +271,14 @@ impl RRFReranker {
         }
 
         let mut results: Vec<(u64, f32)> = scores.into_iter().collect();
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Tie-break equal scores by ascending document id so the ordering is
+        // deterministic (hash-map iteration order would otherwise leak into
+        // the result and destabilize pagination).
+        results.sort_unstable_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
         results
     }
 }

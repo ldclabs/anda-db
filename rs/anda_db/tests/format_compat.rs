@@ -23,7 +23,7 @@ use anda_db::{
     index::HnswConfig,
     query::{Filter, Query, RangeQuery, Search},
     schema::{
-        AndaDBSchema, FieldEntry, FieldKey, FieldType, Fv, Schema, SchemaError, Vector, bf16,
+        AndaDBSchema, Fv, Vector, bf16,
     },
     storage::StorageConfig,
 };

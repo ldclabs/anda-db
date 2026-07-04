@@ -5,7 +5,7 @@ use anda_db::{
     index::{BM25, BTree, Hnsw, HnswConfig, default_tokenizer},
     query::{Filter, Query, RRFReranker, RangeQuery, Search},
     schema::{
-        AndaDBSchema, ByteBufB64, Document, FieldEntry, FieldKey, FieldType, Fv, Schema,
+        AndaDBSchema, ByteBufB64, Document, FieldEntry, FieldType, Fv, Schema,
         SchemaError, Vector, bf16,
     },
     storage::{PutMode, Storage, StorageConfig, StorageStats},

@@ -88,6 +88,12 @@ pub struct HnswIndex {
     /// by [`Self::store_dirty_nodes`].
     dirty_nodes: RwLock<BTreeSet<u64>>,
 
+    /// Ids removed since the last successful purge. Consumed by
+    /// [`Self::purge_removed_nodes`] so the caller can delete the
+    /// corresponding persisted node blobs; without this, removed node files
+    /// would accumulate forever.
+    removed_nodes: RwLock<BTreeSet<u64>>,
+
     /// Roaring-bitmap index of live node ids. Kept in sync with `nodes`.
     ids: RwLock<Treemap>,
 
@@ -456,6 +462,7 @@ impl HnswIndex {
                 stats,
             }),
             dirty_nodes: RwLock::new(BTreeSet::new()),
+            removed_nodes: RwLock::new(BTreeSet::new()),
             ids: RwLock::new(Treemap::new()),
             search_count: AtomicU64::new(0),
             last_saved_version: AtomicU64::new(0),
@@ -521,6 +528,7 @@ impl HnswIndex {
             entry_point: RwLock::new(entry_point),
             metadata: RwLock::new(index.metadata),
             dirty_nodes: RwLock::new(BTreeSet::new()),
+            removed_nodes: RwLock::new(BTreeSet::new()),
             ids: RwLock::new(Treemap::new()),
             search_count,
             last_saved_version,
@@ -892,6 +900,9 @@ impl HnswIndex {
             self.ids.write().add(id);
             *self.entry_point.write() = (id, layer);
             self.dirty_nodes.write().insert(id); // Mark the node as dirty for persistence
+            // A re-inserted id must not have its (new) blob purged by a
+            // pending tombstone from an earlier remove().
+            self.removed_nodes.write().remove(&id);
 
             self.update_metadata(|m| {
                 m.stats.version += 1;
@@ -1020,6 +1031,9 @@ impl HnswIndex {
 
         nodes.insert(id, new_node);
         self.ids.write().add(id);
+        // A re-inserted id must not have its (new) blob purged by a pending
+        // tombstone from an earlier remove().
+        self.removed_nodes.write().remove(&id);
 
         let mut local_dirty_nodes = BTreeSet::new();
         local_dirty_nodes.insert(id);
@@ -1126,9 +1140,10 @@ impl HnswIndex {
 
     /// Removes a node and prunes the reverse edges that point to it.
     ///
-    /// This method only mutates the in-memory graph. The corresponding on-disk
-    /// node blob (if any) must be deleted by the caller — see the `flush`
-    /// callback documentation.
+    /// This method only mutates the in-memory graph. The id is recorded as a
+    /// tombstone; call [`Self::purge_removed_nodes`] after flushing so the
+    /// persistence layer deletes the corresponding on-disk node blob,
+    /// otherwise removed node files accumulate forever.
     ///
     /// The implementation walks the deleted node's own neighbor list rather
     /// than scanning the whole map, reducing cost from O(N) to O(M*L).
@@ -1164,6 +1179,11 @@ impl HnswIndex {
         nodes.remove(&id);
 
         self.ids.write().remove(id);
+        // A dirty mark for a node that no longer exists is pointless; record
+        // the tombstone instead so `purge_removed_nodes` can delete the
+        // persisted blob.
+        self.dirty_nodes.write().remove(&id);
+        self.removed_nodes.write().insert(id);
         let recalculated_max_layer = if entry_was_removed {
             Some(replacement_entry.map_or(0, |(_, layer)| layer))
         } else if node.layer >= previous_max_layer {
@@ -1346,8 +1366,14 @@ impl HnswIndex {
             }
         }
 
-        // Layer 0 is fully searched with the user-requested breadth.
-        let ef = self.config.ef_search.max(top_k);
+        // Layer 0 is fully searched with the user-requested breadth. A huge
+        // caller-supplied `top_k` is capped at `MAX_EF_SEARCH` so it cannot
+        // force an arbitrarily expensive beam; in that case fewer than
+        // `top_k` results may be returned.
+        let ef = self
+            .config
+            .ef_search
+            .max(top_k.min(HnswConfig::MAX_EF_SEARCH));
         let mut results = self.search_layer(
             query,
             current_node,
@@ -1634,6 +1660,10 @@ impl HnswIndex {
     /// * `Ok(false)` — stop; unprocessed ids are placed back on the dirty set.
     /// * `Err(_)` — stop with an error; the failing id is also requeued.
     ///
+    /// Removed-node blobs are NOT deleted here (this method only has a write
+    /// callback); call [`Self::purge_removed_nodes`] afterwards with a delete
+    /// callback.
+    ///
     /// Returns `true` iff any work was actually committed.
     pub async fn flush<W: Write, F>(
         &self,
@@ -1659,6 +1689,63 @@ impl HnswIndex {
     /// Returns whether there are dirty nodes pending persistence.
     pub fn has_dirty_nodes(&self) -> bool {
         !self.dirty_nodes.read().is_empty()
+    }
+
+    /// Returns whether there are removed-node tombstones pending purge.
+    pub fn has_removed_nodes(&self) -> bool {
+        !self.removed_nodes.read().is_empty()
+    }
+
+    /// Hands every removed node id to the caller so it can delete the
+    /// corresponding persisted node blob.
+    ///
+    /// [`Self::remove`] only mutates the in-memory graph; the on-disk blob of
+    /// a removed node must be deleted by the persistence layer or it leaks
+    /// forever. Call this after [`Self::store_dirty_nodes`] on each flush.
+    ///
+    /// Ids whose node has been re-inserted in the meantime are skipped. The
+    /// callback returns `Ok(true)` to continue, `Ok(false)` to stop early;
+    /// unprocessed ids (and, on `Err`, the failing id) are put back and
+    /// retried on the next call. Treat "blob not found" as success in the
+    /// callback: a crash between a purge and the next flush simply retries
+    /// deletions that already happened.
+    pub async fn purge_removed_nodes<F>(&self, mut f: F) -> Result<(), HnswError>
+    where
+        F: AsyncFnMut(u64) -> Result<bool, BoxError>,
+    {
+        let mut removed = {
+            let mut guard = self.removed_nodes.write();
+            std::mem::take(&mut *guard)
+        };
+
+        while let Some(id) = removed.pop_first() {
+            // Skip ids that were re-inserted after the tombstone snapshot;
+            // deleting their blob would drop a live node's persisted state.
+            {
+                let nodes = self.nodes.pin();
+                if nodes.contains_key(&id) {
+                    continue;
+                }
+            }
+
+            match f(id).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.removed_nodes.write().append(&mut removed);
+                    return Ok(());
+                }
+                Err(err) => {
+                    removed.insert(id);
+                    self.removed_nodes.write().append(&mut removed);
+                    return Err(HnswError::Generic {
+                        name: self.name.clone(),
+                        source: err,
+                    });
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Returns whether metadata has a newer logical version than the last
@@ -1715,6 +1802,81 @@ impl HnswIndex {
             return Err(HnswError::Serialization {
                 name: self.name.clone(),
                 source: err.into(),
+            });
+        }
+
+        self.update_metadata(|m| {
+            m.stats.last_saved = meta.stats.last_saved.max(m.stats.last_saved);
+        });
+
+        Ok(true)
+    }
+
+    /// Like [`Self::store_metadata`], but hands the serialized metadata to an
+    /// async persist callback and only commits the saved-version watermark
+    /// when the callback succeeds.
+    ///
+    /// Use this instead of `store_metadata` with an in-memory buffer when the
+    /// actual persistence step can fail (e.g. an object-store write): with
+    /// the plain variant, a failed external write would leave the watermark
+    /// advanced and this metadata version would never be retried, so a later
+    /// crash could load stale metadata that hides state written afterwards.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(true)` if metadata was serialized and persisted.
+    /// * `Ok(false)` if the version was already saved.
+    pub async fn store_metadata_with<F>(&self, now_ms: u64, f: F) -> Result<bool, HnswError>
+    where
+        F: AsyncFnOnce(&[u8]) -> Result<(), BoxError>,
+    {
+        // Fast path: if the version is already saved, avoid cloning metadata.
+        let current_version = { self.metadata.read().stats.version };
+        if self.last_saved_version.load(Ordering::Relaxed) >= current_version {
+            return Ok(false);
+        }
+
+        let mut meta = self.metadata();
+        // Atomically claim the right to serialize this version.
+        let prev_saved_version = self
+            .last_saved_version
+            .fetch_max(meta.stats.version, Ordering::Relaxed);
+        if prev_saved_version >= meta.stats.version {
+            return Ok(false);
+        }
+
+        meta.stats.last_saved = now_ms.max(meta.stats.last_saved);
+        let revert_claim = || {
+            // Revert only if no other writer has already advanced this atomic
+            // to a newer version.
+            let _ = self.last_saved_version.compare_exchange(
+                meta.stats.version,
+                prev_saved_version,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        };
+
+        let mut buf = Vec::with_capacity(256);
+        if let Err(err) = cbor2::to_writer(
+            &HnswIndexRef {
+                entry_point: *self.entry_point.read(),
+                metadata: &meta,
+            },
+            &mut buf,
+        ) {
+            revert_claim();
+            return Err(HnswError::Serialization {
+                name: self.name.clone(),
+                source: err.into(),
+            });
+        }
+
+        if let Err(err) = f(&buf).await {
+            revert_claim();
+            return Err(HnswError::Generic {
+                name: self.name.clone(),
+                source: err,
             });
         }
 
@@ -2156,6 +2318,92 @@ mod tests {
         );
         assert_eq!(loaded.search_f32(&[1.5, 1.5], 10).unwrap().len(), 1);
         assert!(loaded.stats().version > index.stats().version);
+    }
+
+    #[tokio::test]
+    async fn test_purge_removed_nodes_deletes_tombstones_and_skips_reinserts() {
+        let config = HnswConfig {
+            dimension: 2,
+            ..Default::default()
+        };
+        let index = HnswIndex::new("anda_db_hnsw".to_string(), Some(config));
+        index.insert_f32(1, vec![1.0, 1.0], 0).unwrap();
+        index.insert_f32(2, vec![2.0, 2.0], 0).unwrap();
+
+        assert!(!index.has_removed_nodes());
+        assert!(index.remove(2, 1));
+        assert!(index.has_removed_nodes());
+
+        // Purge hands the tombstone to the delete callback exactly once.
+        let mut purged = Vec::new();
+        index
+            .purge_removed_nodes(async |id| {
+                purged.push(id);
+                Ok(true)
+            })
+            .await
+            .unwrap();
+        assert_eq!(purged, vec![2]);
+        assert!(!index.has_removed_nodes());
+
+        // A re-inserted id must not be purged: its blob belongs to the new node.
+        assert!(index.remove(1, 2));
+        index.insert_f32(1, vec![1.5, 1.5], 3).unwrap();
+        let mut purged = Vec::new();
+        index
+            .purge_removed_nodes(async |id| {
+                purged.push(id);
+                Ok(true)
+            })
+            .await
+            .unwrap();
+        assert!(purged.is_empty());
+
+        // On callback error the tombstone is refunded and retried later.
+        assert!(index.remove(1, 4));
+        let err = index
+            .purge_removed_nodes(async |_| Err("boom".into()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HnswError::Generic { .. }));
+        assert!(index.has_removed_nodes());
+        index
+            .purge_removed_nodes(async |_| Ok(true))
+            .await
+            .unwrap();
+        assert!(!index.has_removed_nodes());
+    }
+
+    #[tokio::test]
+    async fn test_store_metadata_with_reverts_claim_on_callback_error() {
+        let config = HnswConfig {
+            dimension: 2,
+            ..Default::default()
+        };
+        let index = HnswIndex::new("anda_db_hnsw".to_string(), Some(config));
+        index.insert_f32(1, vec![1.0, 1.0], 0).unwrap();
+
+        // A failing persist callback must not consume the version claim.
+        let err = index
+            .store_metadata_with(1, async |_| Err("io".into()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HnswError::Generic { .. }));
+
+        // The retry must still serialize this version.
+        let mut persisted = Vec::new();
+        assert!(
+            index
+                .store_metadata_with(2, async |data| {
+                    persisted.extend_from_slice(data);
+                    Ok(())
+                })
+                .await
+                .unwrap()
+        );
+        assert!(!persisted.is_empty());
+        // And now it is a no-op.
+        assert!(!index.store_metadata_with(3, async |_| Ok(())).await.unwrap());
     }
 
     #[test]
