@@ -22,11 +22,25 @@ pub(super) enum FilterBindingValue {
 /// A concrete assignment of filter variables to bindings for one evaluation.
 pub(super) type FilterAssignment = FxHashMap<String, FilterBindingValue>;
 
-/// Engine cap on the number of variable combinations a disconnected
-/// (no covering relation) cross-variable `FILTER` or cartesian `FIND`
-/// materializes. Beyond it the command fails with `KIP_4002` — connect the
-/// variables through graph patterns or narrow them first.
+/// Engine cap on the number of solution rows a single clause materializes:
+/// disconnected cross-variable `FILTER` / cartesian `FIND` combinations and
+/// the unconstrained `(?s, ?p, ?o)` full scan. Beyond it the command fails
+/// with `KIP_4002` — connect the variables through graph patterns or narrow
+/// them first.
 pub(super) const MAX_SOLUTION_COMBINATIONS: usize = 65_536;
+
+/// Parses a numeric offset cursor (issued by the relation-row / cartesian
+/// FIND paths and predicate-variable pagination). A token that is not a
+/// plain decimal offset is rejected instead of silently treated as `0`,
+/// which would hand the client duplicate pages.
+pub(super) fn parse_offset_cursor(raw_cursor: Option<&str>) -> Result<usize, KipError> {
+    match raw_cursor {
+        None => Ok(0),
+        Some(cursor) => cursor
+            .parse::<usize>()
+            .map_err(|_| KipError::invalid_syntax(format!("Invalid CURSOR token: {cursor:?}"))),
+    }
+}
 
 impl CognitiveNexus {
     pub(super) async fn execute_where_clause(
@@ -109,16 +123,6 @@ impl CognitiveNexus {
         Ok(())
     }
 
-    /// Evaluates a `FILTER` clause against the current bindings.
-    ///
-    /// Each iteration consumes one binding per referenced variable and drops
-    /// the consumed bindings when the expression evaluates to `false`. For a
-    /// filter over a **single** variable (the overwhelmingly common case)
-    /// this is exact per-binding semantics. A filter comparing fields of
-    /// **two different variables** is evaluated pairwise over the popped
-    /// bindings rather than over the full solution join — a known
-    /// approximation of KIP per-solution semantics; prefer restating such
-    /// conditions as graph patterns where exactness matters.
     /// Executes a `FILTER` clause with per-solution semantics.
     ///
     /// Dispatch:
@@ -348,23 +352,22 @@ impl CognitiveNexus {
             }
             let mut assign = FilterAssignment::default();
             for var in &slot_vars {
-                let binding = if let Some(entity) =
-                    Self::relation_row_entity(&relation_meta, &row, var)
-                {
-                    match entity {
-                        Some(entity) => FilterBindingValue::Entity(entity.clone()),
-                        None => FilterBindingValue::Null,
-                    }
-                } else if let Some(predicate) =
-                    Self::relation_row_predicate(&relation_meta, &row, var)
-                {
-                    match predicate {
-                        Some(predicate) => FilterBindingValue::Predicate(predicate.to_string()),
-                        None => FilterBindingValue::Null,
-                    }
-                } else {
-                    FilterBindingValue::Null
-                };
+                let binding =
+                    if let Some(entity) = Self::relation_row_entity(&relation_meta, &row, var) {
+                        match entity {
+                            Some(entity) => FilterBindingValue::Entity(entity.clone()),
+                            None => FilterBindingValue::Null,
+                        }
+                    } else if let Some(predicate) =
+                        Self::relation_row_predicate(&relation_meta, &row, var)
+                    {
+                        match predicate {
+                            Some(predicate) => FilterBindingValue::Predicate(predicate.to_string()),
+                            None => FilterBindingValue::Null,
+                        }
+                    } else {
+                        FilterBindingValue::Null
+                    };
                 assign.insert((*var).to_string(), binding);
             }
 
@@ -401,15 +404,27 @@ impl CognitiveNexus {
             }
         }
 
-        narrow_entities(ctx, relation_meta.proposition_var.as_deref(), &original_rows, &surviving, |row| {
-            row.proposition.as_ref()
-        });
-        narrow_entities(ctx, relation_meta.subject_var.as_deref(), &original_rows, &surviving, |row| {
-            row.subject.as_ref()
-        });
-        narrow_entities(ctx, relation_meta.object_var.as_deref(), &original_rows, &surviving, |row| {
-            row.object.as_ref()
-        });
+        narrow_entities(
+            ctx,
+            relation_meta.proposition_var.as_deref(),
+            &original_rows,
+            &surviving,
+            |row| row.proposition.as_ref(),
+        );
+        narrow_entities(
+            ctx,
+            relation_meta.subject_var.as_deref(),
+            &original_rows,
+            &surviving,
+            |row| row.subject.as_ref(),
+        );
+        narrow_entities(
+            ctx,
+            relation_meta.object_var.as_deref(),
+            &original_rows,
+            &surviving,
+            |row| row.object.as_ref(),
+        );
 
         if let Some(var) = relation_meta.predicate_var.as_deref() {
             let kept: FxHashSet<&str> = surviving
@@ -529,19 +544,20 @@ impl CognitiveNexus {
                 }
                 if can_record {
                     let entity_at = |slot: usize| -> Option<EntityID> {
-                        entity_dims.get(slot).and_then(|&i| {
-                            match &dims[i].values[odometer[i]] {
+                        entity_dims
+                            .get(slot)
+                            .and_then(|&i| match &dims[i].values[odometer[i]] {
                                 FilterBindingValue::Entity(id) => Some(id.clone()),
                                 _ => None,
-                            }
-                        })
+                            })
                     };
-                    let predicate = pred_dims.first().and_then(|&i| {
-                        match &dims[i].values[odometer[i]] {
-                            FilterBindingValue::Predicate(pred) => Some(pred.clone()),
-                            _ => None,
-                        }
-                    });
+                    let predicate =
+                        pred_dims
+                            .first()
+                            .and_then(|&i| match &dims[i].values[odometer[i]] {
+                                FilterBindingValue::Predicate(pred) => Some(pred.clone()),
+                                _ => None,
+                            });
                     rows.push(QueryRelationRow {
                         proposition: None,
                         subject: entity_at(0),
@@ -572,13 +588,11 @@ impl CognitiveNexus {
                 sat[i].iter().map(|&pos| &dim.values[pos]).collect();
             if dim.is_pred {
                 if let Some(existing) = ctx.predicates.get_mut(&dim.var) {
-                    existing.retain(|pred| {
-                        keep.contains(&FilterBindingValue::Predicate(pred.clone()))
-                    });
+                    existing
+                        .retain(|pred| keep.contains(&FilterBindingValue::Predicate(pred.clone())));
                 }
             } else if let Some(existing) = ctx.entities.get_mut(&dim.var) {
-                existing
-                    .retain(|id| keep.contains(&FilterBindingValue::Entity(id.clone())));
+                existing.retain(|id| keep.contains(&FilterBindingValue::Entity(id.clone())));
             }
         }
 
@@ -941,10 +955,7 @@ impl CognitiveNexus {
         // Check if it's a predicate variable
         if let Some(predicates) = ctx.predicates.get(var) {
             let values: Vec<Json> = predicates.iter().map(|p| Json::String(p.clone())).collect();
-            let start = raw_cursor
-                .and_then(|cursor| cursor.parse::<usize>().ok())
-                .unwrap_or(0)
-                .min(values.len());
+            let start = parse_offset_cursor(raw_cursor)?.min(values.len());
             let remaining = &values[start..];
             let next_cursor = if limit > 0 && limit < remaining.len() {
                 Some((start + limit).to_string())
@@ -1122,12 +1133,22 @@ impl CognitiveNexus {
         )))
     }
 
+    /// Row-based multi-variable `FIND`: when a single relation covers every
+    /// referenced variable, its rows are the solutions, keeping the columns
+    /// index-aligned (KIP §6.2.2).
+    ///
+    /// Pagination uses a numeric offset cursor over the deterministic row
+    /// order (dedup and ORDER BY are deterministic re-executions), the same
+    /// convention as [`Self::try_execute_cartesian_row_find`]. Rows are not
+    /// required to carry a proposition id (multi-hop paths, OPTIONAL padded
+    /// rows and synthetic FILTER relations do not), so the cursor cannot be
+    /// anchored to one.
     pub(super) async fn try_execute_relation_row_find(
         &self,
         ctx: &QueryContext,
         clause: &FindClause,
         order_by: &[OrderByCondition],
-        cursor: Option<&EntityID>,
+        raw_cursor: Option<&str>,
         limit: usize,
     ) -> Result<Option<(Vec<Json>, Option<String>)>, KipError> {
         let Some(groups) = Self::collect_find_variable_groups(clause) else {
@@ -1197,10 +1218,8 @@ impl CognitiveNexus {
         // Solution deduplication (KIP §3.3): solutions whose bindings agree
         // on every projected variable collapse before ORDER BY and LIMIT.
         let projected_vars: Vec<&str> = groups.iter().map(|(var, _)| var.as_str()).collect();
-        let mut seen: FxHashSet<String> = FxHashSet::with_capacity_and_hasher(
-            rows.len(),
-            Default::default(),
-        );
+        let mut seen: FxHashSet<String> =
+            FxHashSet::with_capacity_and_hasher(rows.len(), Default::default());
         rows.retain(|row| {
             let mut key = String::new();
             for var in &projected_vars {
@@ -1237,11 +1256,8 @@ impl CognitiveNexus {
 
             keyed_rows.sort_by(|(_, left_values), (_, right_values)| {
                 for (idx, cond) in order_conditions.iter().enumerate() {
-                    let ordering = compare_order_key(
-                        &left_values[idx],
-                        &right_values[idx],
-                        &cond.direction,
-                    );
+                    let ordering =
+                        compare_order_key(&left_values[idx], &right_values[idx], &cond.direction);
                     if ordering != std::cmp::Ordering::Equal {
                         return ordering;
                     }
@@ -1253,22 +1269,18 @@ impl CognitiveNexus {
             rows = keyed_rows.into_iter().map(|(row, _)| row).collect();
         }
 
-        if let Some(cursor) = cursor
-            && let Some(idx) = rows
-                .iter()
-                .position(|row| row.proposition.as_ref() == Some(cursor))
-            && idx < rows.len()
-        {
-            rows = rows.split_off(idx + 1);
-        }
-
+        // Numeric offset cursor over the deterministic row order (same
+        // convention as the cartesian path). An entity-anchored cursor would
+        // not work here: rows without a proposition id — multi-hop paths,
+        // OPTIONAL padding, synthetic FILTER relations — could neither issue
+        // a resumable cursor nor be matched by one, silently truncating the
+        // result at the first such page boundary.
+        let start = parse_offset_cursor(raw_cursor)?.min(rows.len());
+        let mut rows = rows.split_off(start);
         let mut next_cursor: Option<String> = None;
-        if limit > 0 && limit <= rows.len() {
+        if limit > 0 && limit < rows.len() {
             rows.truncate(limit);
-            next_cursor = rows
-                .last()
-                .and_then(|row| row.proposition.as_ref())
-                .and_then(BTree::to_cursor);
+            next_cursor = Some((start + limit).to_string());
         }
 
         let mut result: Vec<Json> = Vec::with_capacity(groups.len());
@@ -1397,25 +1409,24 @@ impl CognitiveNexus {
                     // agree on every projected relation variable.
                     let mut key = String::new();
                     for var in &in_relation {
-                        let binding = if let Some(entity) =
-                            Self::relation_row_entity(relation, row, var)
-                        {
-                            match entity {
-                                Some(entity) => FilterBindingValue::Entity(entity.clone()),
-                                None => FilterBindingValue::Null,
-                            }
-                        } else if let Some(predicate) =
-                            Self::relation_row_predicate(relation, row, var)
-                        {
-                            match predicate {
-                                Some(predicate) => {
-                                    FilterBindingValue::Predicate(predicate.to_string())
+                        let binding =
+                            if let Some(entity) = Self::relation_row_entity(relation, row, var) {
+                                match entity {
+                                    Some(entity) => FilterBindingValue::Entity(entity.clone()),
+                                    None => FilterBindingValue::Null,
                                 }
-                                None => FilterBindingValue::Null,
-                            }
-                        } else {
-                            FilterBindingValue::Null
-                        };
+                            } else if let Some(predicate) =
+                                Self::relation_row_predicate(relation, row, var)
+                            {
+                                match predicate {
+                                    Some(predicate) => {
+                                        FilterBindingValue::Predicate(predicate.to_string())
+                                    }
+                                    None => FilterBindingValue::Null,
+                                }
+                            } else {
+                                FilterBindingValue::Null
+                            };
                         if var_index[*var] < distinct_find_vars {
                             key.push('|');
                             match &binding {
@@ -1512,10 +1523,7 @@ impl CognitiveNexus {
         }
 
         // Numeric offset cursor over the deterministic row order.
-        let start = raw_cursor
-            .and_then(|cursor| cursor.parse::<usize>().ok())
-            .unwrap_or(0)
-            .min(rows.len());
+        let start = parse_offset_cursor(raw_cursor)?.min(rows.len());
         let mut rows = rows.split_off(start);
         let mut next_cursor: Option<String> = None;
         if limit > 0 && limit < rows.len() {
@@ -1579,13 +1587,14 @@ impl CognitiveNexus {
         }
 
         // 非分组模式
-        let cursor: Option<EntityID> = BTree::from_cursor(&cursor).ok().flatten();
         if let Some(row_result) = self
-            .try_execute_relation_row_find(ctx, &clause, &order_by, cursor.as_ref(), limit)
+            .try_execute_relation_row_find(ctx, &clause, &order_by, raw_cursor, limit)
             .await?
         {
             return Ok(row_result);
         }
+
+        let cursor: Option<EntityID> = BTree::from_cursor(&cursor).ok().flatten();
 
         // 多变量但无单一 relation 全覆盖：物化笛卡尔解行，保证列按解对齐
         // （KIP §6.2.2）。
@@ -2184,8 +2193,9 @@ impl CognitiveNexus {
                 match operator {
                     LogicalOperator::And if !left_result => Ok(false),
                     LogicalOperator::Or if left_result => Ok(true),
-                    _ => Box::pin(self.eval_filter_assigned(cache, regex_cache, right, assign))
-                        .await,
+                    _ => {
+                        Box::pin(self.eval_filter_assigned(cache, regex_cache, right, assign)).await
+                    }
                 }
             }
             FilterExpression::Not(inner) => {
@@ -2215,7 +2225,9 @@ impl CognitiveNexus {
                         "{func:?} requires exactly 1 argument"
                     )));
                 };
-                let val = self.resolve_filter_operand_assigned(cache, arg, assign).await?;
+                let val = self
+                    .resolve_filter_operand_assigned(cache, arg, assign)
+                    .await?;
                 Ok(match func {
                     FilterFunction::IsNull => val.is_null(),
                     _ => !val.is_null(),

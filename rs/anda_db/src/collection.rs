@@ -441,6 +441,11 @@ impl Collection {
     /// quiescence (no concurrent writers), e.g. from an admin task after an
     /// unclean shutdown or when `len()` looks inconsistent.
     ///
+    /// As a safety net against a concurrent `add`, the dead-id sweep only
+    /// considers ids at or below the `max_document_id` snapshot taken before
+    /// the listing: a document added after the listing started (present in
+    /// the bitmap, absent from the listing) is never dropped.
+    ///
     /// Returns `(recovered, dropped)`: documents recovered into the bitmap
     /// and dead ids removed from it. Changes are persisted by the next
     /// `flush()`.
@@ -453,6 +458,9 @@ impl Collection {
         }
 
         let now_ms = unix_ms();
+        // Ids allocated after this point belong to in-flight `add` calls
+        // whose objects may not have been visible to the listing below.
+        let scan_max_id = self.max_document_id.load(Ordering::Acquire);
 
         // Enumerate the ids of every document object under `data/`.
         let mut stored_ids: BTreeSet<DocumentId> = BTreeSet::new();
@@ -483,7 +491,11 @@ impl Collection {
         };
         let mut recovered = 0usize;
         for id in missing_in_bitmap {
-            match self.storage.fetch::<DocumentOwned>(&Self::doc_path(id)).await {
+            match self
+                .storage
+                .fetch::<DocumentOwned>(&Self::doc_path(id))
+                .await
+            {
                 Ok((doc, _)) => {
                     if self.repair_document(id, doc, now_ms)? {
                         recovered += 1;
@@ -495,12 +507,14 @@ impl Collection {
             }
         }
 
-        // Direction 2: drop bitmap ids whose object no longer exists.
+        // Direction 2: drop bitmap ids whose object no longer exists. Ids
+        // beyond the pre-listing snapshot are skipped — they belong to adds
+        // that raced the listing, not to dead documents.
         let dead_ids: Vec<DocumentId> = {
             let doc_ids = self.doc_ids.read();
             doc_ids
                 .iter()
-                .filter(|id| !stored_ids.contains(id))
+                .filter(|id| *id <= scan_max_id && !stored_ids.contains(id))
                 .collect()
         };
         let dropped = dead_ids.len();

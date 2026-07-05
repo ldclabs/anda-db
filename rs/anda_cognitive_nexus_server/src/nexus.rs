@@ -7,9 +7,7 @@ use anda_db::{
     query::{Filter, Query, RangeQuery},
     unix_ms,
 };
-use anda_db_schema::{
-    AndaDBSchema, BoxError, Fv, Json,
-};
+use anda_db_schema::{AndaDBSchema, BoxError, Fv, Json};
 use anda_kip::{
     CommandType, META_SELF_NAME, PERSON_SELF_KIP, PERSON_SYSTEM_KIP, PERSON_TYPE, Request,
     Response, parse_kml,

@@ -4,10 +4,7 @@ use anda_db::{
     error::DBError,
     index::HnswConfig,
     query::{Filter, Query, RangeQuery, Search},
-    schema::{
-        AndaDBSchema, FieldEntry, FieldKey, FieldType, Fv, Json, Resource, Schema, SchemaError,
-        Vector, vector_from_f32,
-    },
+    schema::{AndaDBSchema, Fv, Json, Resource, Vector, vector_from_f32},
     storage::StorageConfig,
 };
 use anda_db_tfs::jieba_tokenizer;

@@ -22,9 +22,7 @@ use anda_db::{
     error::DBError,
     index::HnswConfig,
     query::{Filter, Query, RangeQuery, Search},
-    schema::{
-        AndaDBSchema, Fv, Vector, bf16,
-    },
+    schema::{AndaDBSchema, Fv, Vector, bf16},
     storage::StorageConfig,
 };
 use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path as ObjPath};

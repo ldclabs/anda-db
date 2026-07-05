@@ -2367,10 +2367,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, HnswError::Generic { .. }));
         assert!(index.has_removed_nodes());
-        index
-            .purge_removed_nodes(async |_| Ok(true))
-            .await
-            .unwrap();
+        index.purge_removed_nodes(async |_| Ok(true)).await.unwrap();
         assert!(!index.has_removed_nodes());
     }
 
@@ -2403,7 +2400,12 @@ mod tests {
         );
         assert!(!persisted.is_empty());
         // And now it is a no-op.
-        assert!(!index.store_metadata_with(3, async |_| Ok(())).await.unwrap());
+        assert!(
+            !index
+                .store_metadata_with(3, async |_| Ok(()))
+                .await
+                .unwrap()
+        );
     }
 
     #[test]

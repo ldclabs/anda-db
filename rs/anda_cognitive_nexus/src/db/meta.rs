@@ -44,8 +44,7 @@ impl CognitiveNexus {
             self.query_concept_ids(&concept_type_matcher),
             self.query_concept_ids(&proposition_type_matcher)
         )?;
-        for (type_ids, is_concept_type) in
-            [(concept_type_ids, true), (proposition_type_ids, false)]
+        for (type_ids, is_concept_type) in [(concept_type_ids, true), (proposition_type_ids, false)]
         {
             for id in type_ids {
                 let name = self

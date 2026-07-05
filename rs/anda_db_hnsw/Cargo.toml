@@ -2,7 +2,7 @@
 name = "anda_db_hnsw"
 description = "A high-performance vector search library in Rust."
 repository = "https://github.com/ldclabs/anda-db/tree/main/rs/anda_db_hnsw"
-version = "0.8.4"
+version = "0.9.0"
 publish = true
 edition.workspace = true
 keywords.workspace = true
@@ -33,3 +33,6 @@ structured-logger = { workspace = true }
 
 [[example]]
 name = "hnsw_demo"
+
+[lib]
+doctest = false

@@ -4,6 +4,8 @@ All notable changes to this workspace are documented in this file.
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-07-05
+
 ### Added
 
 - **KIP v1.0-RC10 specification** — Per-command result shapes (columnar `FIND` result model, solution-set deduplication), `CURSOR` pagination for `EXPORT`, structural `(s, "p", o)` references for higher-order endpoints, `SEARCH PROPOSITION ... WITH TYPE` predicate semantics, `MERGE` source provenance chaining and "already merged" replay self-diagnosis, zero-hop path semantics, bare-variable `ORDER BY` keys, `System`/`Unsorted`/`Archived` operational domains in Genesis bootstrap.
@@ -27,6 +29,13 @@ All notable changes to this workspace are documented in this file.
 
 ### Fixed
 
+- **JSON `FieldValue`/`FieldKey` prefix disambiguation (breaking wire change)** — Human-readable serialization now uses explicit prefixes: `Bytes` is `"b64:<url-safe base64>"`, `I64` keys stay `"i64:<n>"`, and text that itself starts with a reserved prefix is escaped as `"txt:<original>"`. The old heuristic promoted *any* Base64-decodable string to `Bytes`, silently corrupting ordinary text like `"test"` on the JSON path (e.g. `anda_db_server` JSON requests). Malformed payloads after a prefix are now hard errors. CBOR encoding is unchanged.
+- **Row-based FIND pagination over proposition-less rows** — The relation-row FIND path now paginates with a numeric offset cursor (same convention as the cartesian path). The previous cursor was anchored to the row's proposition id, which multi-hop paths, OPTIONAL-padded rows, and synthetic FILTER relations do not have — a page boundary landing on such a row silently truncated the result with no `next_cursor`.
+- **Strict offset-cursor parsing** — The relation-row / cartesian FIND paths and predicate-variable pagination reject a cursor token that is not a plain decimal offset (`KIP_1001`) instead of silently restarting from page one and handing the client duplicate data.
+- **Unconstrained `(?s, ?p, ?o)` scan capped** — The full-scan pattern rejects graphs with more propositions than the solution-materialization cap (`KIP_4002`) instead of materializing an unbounded row set; `LIMIT` only bounds projection, not the scan itself.
+- **`LIMIT 0` rejected at parse time** — The engine's internal "no limit" sentinel is `0`, so `LIMIT 0` used to silently mean *unlimited* in `FIND`/`EXPORT`; the parser now requires a positive integer (omit `LIMIT` for unlimited).
+- **`apply_order_by` JSON pointer construction** — Uses `DotPathVar::to_pointer()` so path components containing `/` or `~` are escaped and a bare-variable key maps to the whole value (`""`) instead of the `""` object key (`"/"`).
+- **`reconcile_storage` concurrent-add guard** — The dead-id sweep only considers ids at or below the `max_document_id` snapshot taken before the storage listing, so a document added while the listing runs can no longer be mistaken for a dead id and dropped from the bitmap.
 - **Response deserialization** — Custom `Deserialize` dispatches on `error` key presence so a response with both `error` and partial `result` always deserializes as `Err`, not silently as `Ok`.
 - **Cross-variable FILTER join semantics** — `FILTER` comparing two different variables (e.g. `FILTER(?a.risk > ?b.risk)`) now evaluates per solution (join) instead of positionally zipping each variable's bindings, which silently returned wrong or empty results. Predicate-variable filters (`FILTER(?p != "…")`) narrow the covering proposition (`?link`) itself, so the memory-metabolism `UPDATE` idiom operates on the correct target set.
 - **Multi-variable FIND column alignment** — When no single relation connects all projected variables, the solution set is materialized as their (capped) cartesian product so the columnar `FIND` result stays index-aligned across solutions per KIP §6.2.2; previously the columns could have mismatched lengths and could not be zipped back into rows.

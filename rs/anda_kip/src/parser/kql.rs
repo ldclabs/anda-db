@@ -3,7 +3,7 @@ use nom::{
     branch::alt,
     bytes::complete::tag,
     character::complete::{char, multispace1},
-    combinator::{cut, map, map_res, opt},
+    combinator::{cut, map, map_res, opt, verify},
     error::context,
     multi::{fold, many0, many1, separated_list1},
     sequence::{delimited, pair, preceded, separated_pair, terminated},
@@ -549,11 +549,14 @@ fn parse_order_by_aggregation(input: &str) -> VResult<'_, OrderByCondition> {
 }
 
 pub fn parse_limit_clause(input: &str) -> VResult<'_, usize> {
+    // `LIMIT 0` is rejected: the engine's internal "no limit" sentinel is 0,
+    // and letting it through would make `LIMIT 0` silently mean "unlimited".
+    // Omit the LIMIT clause for an unlimited query.
     context(
-        "KQL LIMIT clause",
+        "KQL LIMIT clause (positive integer)",
         preceded(
             ws(keyword("LIMIT")),
-            map(nom::character::complete::usize, |n| n),
+            verify(nom::character::complete::usize, |n: &usize| *n > 0),
         ),
     )
     .parse(input)
@@ -1877,6 +1880,20 @@ mod tests {
         assert_eq!(query.find_clause.expressions.len(), 2);
         assert_eq!(query.where_clauses.len(), 2);
         assert_eq!(query.limit, Some(10));
+    }
+
+    #[test]
+    fn test_parse_limit_zero_is_rejected() {
+        // `LIMIT 0` would collide with the engine's internal "no limit"
+        // sentinel; the parser rejects it (omit LIMIT for unlimited).
+        let input = r#"
+            FIND(?drug.name)
+            WHERE { ?drug {type: "Drug"} }
+            LIMIT 0
+        "#;
+        assert!(crate::parse_kql(input).is_err());
+        assert!(parse_limit_clause("LIMIT 0").is_err());
+        assert!(parse_limit_clause("LIMIT 1").is_ok());
     }
 
     #[test]

@@ -5,12 +5,24 @@
 //! The visitor in this module walks the data model directly
 //! and chooses the most precise variant for the input.
 //!
-//! In *human-readable* formats (e.g. JSON), [`FieldValue::Bytes`] and
-//! [`FieldKey::Bytes`] are encoded as URL-safe Base64 strings, and
-//! [`FieldKey::I64`] is encoded as an `i64:<decimal>` string so JSON object
-//! keys can round-trip without colliding with byte keys. On the way back, a
-//! textual value that successfully decodes as Base64 is treated as `Bytes`.
-//! This is the same trick used by `ic_auth_types::ByteBufB64`.
+//! # Human-readable (JSON) encoding
+//!
+//! Strings are the only JSON shape shared by text, bytes and integer map
+//! keys, so *human-readable* formats use explicit prefixes to keep the
+//! variants apart:
+//!
+//! - [`FieldValue::Bytes`] / [`FieldKey::Bytes`] → `"b64:<url-safe base64>"`
+//! - [`FieldKey::I64`] → `"i64:<decimal>"`
+//! - text that itself starts with a reserved prefix → `"txt:<original>"`
+//!
+//! Ordinary text is emitted verbatim. On the way back only these prefixes
+//! are interpreted; a malformed payload after a prefix (invalid Base64,
+//! non-integer after `i64:`) is a hard error rather than a silent fallback.
+//! Earlier versions instead promoted any Base64-decodable string to `Bytes`,
+//! which corrupted ordinary text like `"test"` — that heuristic is gone.
+//!
+//! CBOR (non-human-readable) encoding is unchanged: byte strings, integers
+//! and text map to their native CBOR types with no prefixes.
 use base64::{Engine, prelude::BASE64_URL_SAFE};
 use serde::{
     de,
@@ -20,13 +32,33 @@ use std::collections::BTreeMap;
 
 use crate::{FieldKey, FieldValue};
 
+/// Human-readable encoding of a [`FieldKey::I64`] map key.
 const I64_KEY_PREFIX: &str = "i64:";
+/// Human-readable encoding of [`FieldValue::Bytes`] / [`FieldKey::Bytes`].
+const B64_PREFIX: &str = "b64:";
+/// Escape prefix for text that collides with one of the reserved prefixes.
+const TXT_PREFIX: &str = "txt:";
+
+/// Returns whether human-readable serialization must escape this text with
+/// [`TXT_PREFIX`] so it is not misread as an encoded value on the way back.
+///
+/// `i64:` is only interpreted in key position, but escaping it in values too
+/// costs nothing and keeps the rule uniform.
+fn needs_txt_escape(text: &str) -> bool {
+    text.starts_with(B64_PREFIX) || text.starts_with(TXT_PREFIX) || text.starts_with(I64_KEY_PREFIX)
+}
 
 impl Serialize for FieldKey {
     #[inline]
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
-            FieldKey::Text(x) => serializer.serialize_str(x),
+            FieldKey::Text(x) => {
+                if serializer.is_human_readable() && needs_txt_escape(x) {
+                    format!("{TXT_PREFIX}{x}").serialize(serializer)
+                } else {
+                    serializer.serialize_str(x)
+                }
+            }
             FieldKey::I64(x) => {
                 if serializer.is_human_readable() {
                     format!("{I64_KEY_PREFIX}{x}").serialize(serializer)
@@ -36,7 +68,7 @@ impl Serialize for FieldKey {
             }
             FieldKey::Bytes(x) => {
                 if serializer.is_human_readable() {
-                    BASE64_URL_SAFE.encode(x).serialize(serializer)
+                    format!("{B64_PREFIX}{}", BASE64_URL_SAFE.encode(x)).serialize(serializer)
                 } else {
                     serializer.serialize_bytes(x)
                 }
@@ -48,22 +80,27 @@ impl Serialize for FieldKey {
 impl<'de> de::Deserialize<'de> for FieldKey {
     #[inline]
     fn deserialize<D: de::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+
         let is_human_readable = deserializer.is_human_readable();
         let val = deserializer.deserialize_any(KeyVisitor)?;
 
-        if is_human_readable
-            && let FieldKey::Text(x) = &val
-            && let Some(i) = x
-                .strip_prefix(I64_KEY_PREFIX)
-                .and_then(|raw| raw.parse::<i64>().ok())
-        {
-            return Ok(FieldKey::I64(i));
-        }
-        if is_human_readable
-            && let FieldKey::Text(x) = &val
-            && let Ok(decoded) = BASE64_URL_SAFE.decode(x)
-        {
-            return Ok(FieldKey::Bytes(decoded));
+        if is_human_readable && let FieldKey::Text(x) = &val {
+            if let Some(raw) = x.strip_prefix(I64_KEY_PREFIX) {
+                let i = raw.parse::<i64>().map_err(|err| {
+                    D::Error::custom(format!("invalid {I64_KEY_PREFIX:?} key {x:?}: {err}"))
+                })?;
+                return Ok(FieldKey::I64(i));
+            }
+            if let Some(raw) = x.strip_prefix(B64_PREFIX) {
+                let decoded = BASE64_URL_SAFE.decode(raw).map_err(|err| {
+                    D::Error::custom(format!("invalid {B64_PREFIX:?} key {x:?}: {err}"))
+                })?;
+                return Ok(FieldKey::Bytes(decoded));
+            }
+            if let Some(raw) = x.strip_prefix(TXT_PREFIX) {
+                return Ok(FieldKey::Text(raw.to_string()));
+            }
         }
         Ok(val)
     }
@@ -90,12 +127,18 @@ impl Serialize for FieldValue {
             }
             FieldValue::Bytes(x) => {
                 if serializer.is_human_readable() {
-                    BASE64_URL_SAFE.encode(x).serialize(serializer)
+                    format!("{B64_PREFIX}{}", BASE64_URL_SAFE.encode(x)).serialize(serializer)
                 } else {
                     serializer.serialize_bytes(x)
                 }
             }
-            FieldValue::Text(x) => serializer.serialize_str(x),
+            FieldValue::Text(x) => {
+                if serializer.is_human_readable() && needs_txt_escape(x) {
+                    format!("{TXT_PREFIX}{x}").serialize(serializer)
+                } else {
+                    serializer.serialize_str(x)
+                }
+            }
             FieldValue::Json(x) => x.serialize(serializer),
             FieldValue::Null => serializer.serialize_unit(),
             FieldValue::Vector(x) => {
@@ -126,14 +169,21 @@ impl Serialize for FieldValue {
 impl<'de> de::Deserialize<'de> for FieldValue {
     #[inline]
     fn deserialize<D: de::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+
         let is_human_readable = deserializer.is_human_readable();
         let val = deserializer.deserialize_any(Visitor)?;
 
-        if is_human_readable
-            && let FieldValue::Text(x) = &val
-            && let Ok(decoded) = BASE64_URL_SAFE.decode(x)
-        {
-            return Ok(FieldValue::Bytes(decoded));
+        if is_human_readable && let FieldValue::Text(x) = &val {
+            if let Some(raw) = x.strip_prefix(B64_PREFIX) {
+                let decoded = BASE64_URL_SAFE.decode(raw).map_err(|err| {
+                    D::Error::custom(format!("invalid {B64_PREFIX:?} value {x:?}: {err}"))
+                })?;
+                return Ok(FieldValue::Bytes(decoded));
+            }
+            if let Some(raw) = x.strip_prefix(TXT_PREFIX) {
+                return Ok(FieldValue::Text(raw.to_string()));
+            }
         }
         Ok(val)
     }
@@ -446,14 +496,19 @@ mod tests {
     }
 
     #[test]
-    fn field_key_serde_covers_text_bytes_and_human_readable_base64() {
-        let text = FieldKey::Text("not base64!".into());
-        let encoded_text = serde_json::to_string(&text).unwrap();
-        assert_eq!(encoded_text, r#""not base64!""#);
-        assert_eq!(
-            serde_json::from_str::<FieldKey>(&encoded_text).unwrap(),
-            text
-        );
+    fn field_key_serde_covers_text_bytes_and_human_readable_prefixes() {
+        // Ordinary text keys are emitted verbatim — including ones that a
+        // Base64 decoder would happily accept ("test" was the old corruption
+        // case).
+        for raw in ["not base64!", "test", "cafe", "1234"] {
+            let text = FieldKey::Text(raw.into());
+            let encoded_text = serde_json::to_string(&text).unwrap();
+            assert_eq!(encoded_text, format!("{raw:?}"));
+            assert_eq!(
+                serde_json::from_str::<FieldKey>(&encoded_text).unwrap(),
+                text
+            );
+        }
 
         let i64_key = FieldKey::I64(-7);
         let encoded_i64 = serde_json::to_string(&i64_key).unwrap();
@@ -469,12 +524,26 @@ mod tests {
 
         let bytes = FieldKey::Bytes(vec![1, 2, 3]);
         let encoded_bytes = serde_json::to_string(&bytes).unwrap();
-        assert_eq!(encoded_bytes, r#""AQID""#);
+        assert_eq!(encoded_bytes, r#""b64:AQID""#);
         assert_eq!(
             serde_json::from_str::<FieldKey>(&encoded_bytes).unwrap(),
             bytes
         );
 
+        // Text keys colliding with a reserved prefix round-trip via `txt:`.
+        for raw in ["i64:-7", "b64:AQID", "txt:hello", "i64:not-an-int"] {
+            let text = FieldKey::Text(raw.into());
+            let encoded = serde_json::to_string(&text).unwrap();
+            assert_eq!(encoded, format!("\"txt:{raw}\""));
+            assert_eq!(serde_json::from_str::<FieldKey>(&encoded).unwrap(), text);
+        }
+
+        // Malformed payloads after a reserved prefix are hard errors, not
+        // silent text fallbacks.
+        assert!(serde_json::from_value::<FieldKey>(json!("i64:abc")).is_err());
+        assert!(serde_json::from_value::<FieldKey>(json!("b64:!!!")).is_err());
+
+        // CBOR keys keep their native types, no prefixes involved.
         assert_eq!(
             cbor_roundtrip::<_, FieldKey>(&FieldKey::Bytes(vec![4, 5])),
             FieldKey::Bytes(vec![4, 5])
@@ -484,9 +553,47 @@ mod tests {
             FieldKey::I64(42)
         );
         assert_eq!(
+            cbor_roundtrip::<_, FieldKey>(&FieldKey::Text("i64:-7".into())),
+            FieldKey::Text("i64:-7".into())
+        );
+        assert_eq!(
             serde_json::from_value::<FieldKey>(json!([7, 8])).unwrap(),
             FieldKey::Bytes(vec![7, 8])
         );
+    }
+
+    #[test]
+    fn field_value_text_json_roundtrip_never_corrupts() {
+        // Regression: the old heuristic promoted any Base64-decodable string
+        // to Bytes, so Text("test") came back as Bytes([0xb5, 0xeb, 0x2d]).
+        for raw in [
+            "test",
+            "cafe",
+            "1234",
+            "AQID",
+            "hello world",
+            "",
+            "b64:AQID",
+            "txt:x",
+            "i64:5",
+        ] {
+            let value = FieldValue::Text(raw.into());
+            let encoded = serde_json::to_string(&value).unwrap();
+            assert_eq!(
+                serde_json::from_str::<FieldValue>(&encoded).unwrap(),
+                value,
+                "JSON round-trip corrupted {raw:?} (encoded as {encoded})"
+            );
+        }
+
+        // Bytes round-trip through the b64: prefix.
+        let bytes = FieldValue::Bytes(b"test".to_vec());
+        let encoded = serde_json::to_string(&bytes).unwrap();
+        assert_eq!(encoded, r#""b64:dGVzdA==""#);
+        assert_eq!(serde_json::from_str::<FieldValue>(&encoded).unwrap(), bytes);
+
+        // Malformed b64: payloads error out instead of degrading to text.
+        assert!(serde_json::from_value::<FieldValue>(json!("b64:!!!")).is_err());
     }
 
     #[test]
@@ -530,7 +637,7 @@ mod tests {
         );
 
         let encoded = serde_json::to_string(&FieldValue::Bytes(vec![1, 2, 3])).unwrap();
-        assert_eq!(encoded, r#""AQID""#);
+        assert_eq!(encoded, r#""b64:AQID""#);
         assert_eq!(
             serde_json::from_str::<FieldValue>(&encoded).unwrap(),
             FieldValue::Bytes(vec![1, 2, 3])
@@ -547,7 +654,10 @@ mod tests {
         let json_value = serde_json::to_value(FieldValue::Map(map.clone())).unwrap();
         assert_eq!(json_value["not base64!"], json!(true));
         assert_eq!(json_value["i64:-7"], json!("seven"));
-        assert_eq!(json_value[BASE64_URL_SAFE.encode([9])], json!(9));
+        assert_eq!(
+            json_value[format!("b64:{}", BASE64_URL_SAFE.encode([9]))],
+            json!(9)
+        );
         let decoded: FieldValue = serde_json::from_value(json_value).unwrap();
         assert_eq!(decoded, FieldValue::Map(map));
     }
@@ -560,8 +670,14 @@ mod tests {
         assert!(err.to_string().contains("duplicate map key"));
 
         let dup_map = cbor2::Value::Map(vec![
-            (cbor2::Value::Text("k".into()), cbor2::Value::Integer(1.into())),
-            (cbor2::Value::Text("k".into()), cbor2::Value::Integer(2.into())),
+            (
+                cbor2::Value::Text("k".into()),
+                cbor2::Value::Integer(1.into()),
+            ),
+            (
+                cbor2::Value::Text("k".into()),
+                cbor2::Value::Integer(2.into()),
+            ),
         ]);
         let mut bytes = Vec::new();
         cbor2::to_writer(&dup_map, &mut bytes).unwrap();

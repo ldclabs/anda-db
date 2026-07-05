@@ -1368,10 +1368,7 @@ mod tests {
         let now = unix_ms();
 
         let map_tree = BTree::new(
-            field(
-                "map_boot",
-                Ft::Map(BTreeMap::from([("*".into(), Ft::U64)])),
-            ),
+            field("map_boot", Ft::Map(BTreeMap::from([("*".into(), Ft::U64)]))),
             storage.clone(),
             now,
         )
@@ -1380,11 +1377,7 @@ mod tests {
         assert!(matches!(map_tree, BTree::String(_)));
         assert!(
             map_tree
-                .insert(
-                    7,
-                    &Fv::Map(BTreeMap::from([("k".into(), Fv::U64(1))])),
-                    now,
-                )
+                .insert(7, &Fv::Map(BTreeMap::from([("k".into(), Fv::U64(1))])), now,)
                 .unwrap()
         );
         assert!(map_tree.flush(now + 1).await.unwrap());

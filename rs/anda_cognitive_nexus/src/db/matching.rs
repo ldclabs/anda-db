@@ -304,6 +304,10 @@ impl CognitiveNexus {
     // KIP §3.4.2 允许引擎以 KIP_4002 拒绝这种模式；本参考实现选择支持它，
     // 因为记忆代谢（如置信度衰减 UPDATE）依赖这一原语——调用方应配合
     // LIMIT 使用。`subject`/`object` 上的 AnyPropositions 约束在行加载时过滤。
+    //
+    // 行数超过 `MAX_SOLUTION_COMBINATIONS` 时报 KIP_4002：LIMIT 只在 FIND
+    // 投影阶段生效，管不住扫描本身的物化成本，必须在这里设上限，否则一条
+    // 无约束查询就能在大图上把内存拉爆。
     pub(super) async fn handle_full_scan_matching(
         &self,
         ctx: &QueryContext,
@@ -325,6 +329,16 @@ impl CognitiveNexus {
             )
             .await
             .map_err(db_to_kip_error)?;
+
+        if ids.len() > super::kql::MAX_SOLUTION_COMBINATIONS {
+            return Err(KipError::resource_exhausted(format!(
+                "unconstrained (?s, ?p, ?o) pattern would materialize {} proposition rows, \
+                 exceeding the engine cap of {}; constrain the subject, predicate or object \
+                 (e.g. a literal predicate or a typed subject) before matching",
+                ids.len(),
+                super::kql::MAX_SOLUTION_COMBINATIONS
+            )));
+        }
 
         for id in ids {
             if let Some((subj, preds, obj)) = self

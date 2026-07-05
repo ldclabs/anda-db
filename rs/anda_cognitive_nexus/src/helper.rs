@@ -348,7 +348,10 @@ pub fn apply_order_by<'a>(
                 continue; // Only process conditions for the current variable
             }
 
-            let path = format!("/{}", cond.variable.path.join("/"));
+            // `to_pointer` escapes `/` and `~` in path components and maps an
+            // empty (bare-variable) path to `""` — the whole value — instead
+            // of `"/"` (the `""` key), unlike a naive join.
+            let path = cond.variable.to_pointer();
             let a_val = a.pointer(&path).unwrap_or(&Json::Null);
             let b_val = b.pointer(&path).unwrap_or(&Json::Null);
 

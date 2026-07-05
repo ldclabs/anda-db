@@ -287,10 +287,11 @@ impl FieldType {
 /// variants are kept distinct in CBOR so that a `Bytes` or `I64` key is never
 /// confused with the textual representation of the same payload.
 ///
-/// In JSON serialization, an `I64` key is rendered as `i64:<decimal>`, and a
-/// `Bytes` key is rendered as a URL-safe Base64 string. On the way back, a
-/// `Text` value with the `i64:` prefix is treated as an `I64` key, while one
-/// that successfully decodes as Base64 is treated as a `Bytes` key.
+/// In JSON serialization, an `I64` key is rendered as `i64:<decimal>` and a
+/// `Bytes` key as `b64:<url-safe base64>`; a `Text` key that itself starts
+/// with a reserved prefix (`i64:`, `b64:`, `txt:`) is escaped as
+/// `txt:<original>`. Only these explicit prefixes are interpreted on the way
+/// back — ordinary text always round-trips verbatim.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum FieldKey {
     /// A UTF-8 text key.
@@ -1793,7 +1794,7 @@ mod tests {
         assert_eq!(val, val2);
         let data = serde_json::to_string(&val).unwrap();
         println!("json: {}", data);
-        assert_eq!(data, r#"{"Kg==":"Kg=="}"#);
+        assert_eq!(data, r#"{"b64:Kg==":"b64:Kg=="}"#);
         let val2: FieldValue = serde_json::from_str(&data).unwrap();
         assert_eq!(val, val2);
 

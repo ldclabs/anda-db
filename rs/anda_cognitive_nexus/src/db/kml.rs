@@ -1222,10 +1222,7 @@ impl CognitiveNexus {
                 }
             }
         }
-        let source_tag = Json::String(format!(
-            "{}:{}",
-            source_concept.r#type, source_concept.name
-        ));
+        let source_tag = Json::String(format!("{}:{}", source_concept.r#type, source_concept.name));
         if !merged_from.contains(&source_tag) {
             merged_from.push(source_tag);
         }

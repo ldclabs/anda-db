@@ -574,7 +574,10 @@ async fn test_kql_proposition_matching() {
     let (result, _) = nexus.execute_kql(query).await.unwrap();
     // Columnar result model (KIP §6.2.2): (Aspirin, Headache) and
     // (Aspirin, Fever) are two solutions, so the columns stay index-aligned.
-    assert_eq!(result, json!([["Aspirin", "Aspirin"], ["Headache", "Fever"]]));
+    assert_eq!(
+        result,
+        json!([["Aspirin", "Aspirin"], ["Headache", "Fever"]])
+    );
 
     let kql = r#"
         FIND(?drug.name, ?symptom.name)
@@ -586,7 +589,10 @@ async fn test_kql_proposition_matching() {
 
     let query = parse_kql(kql).unwrap();
     let (result, _) = nexus.execute_kql(query).await.unwrap();
-    assert_eq!(result, json!([["Aspirin", "Aspirin"], ["Headache", "Fever"]]));
+    assert_eq!(
+        result,
+        json!([["Aspirin", "Aspirin"], ["Headache", "Fever"]])
+    );
 
     let kql = r#"
         FIND(?drug.name, ?symptom.name)
@@ -2222,10 +2228,7 @@ async fn test_meta_describe_domains() {
     assert_eq!(domains.len(), 4);
     assert_eq!(domains[0]["type"], "Domain");
     assert_eq!(domains[0]["name"], "CoreSchema");
-    let names: Vec<&str> = domains
-        .iter()
-        .filter_map(|d| d["name"].as_str())
-        .collect();
+    let names: Vec<&str> = domains.iter().filter_map(|d| d["name"].as_str()).collect();
     for expected in ["CoreSchema", "Unsorted", "Archived", "System"] {
         assert!(names.contains(&expected), "missing domain {expected}");
     }
@@ -4649,10 +4652,7 @@ async fn test_kql_not_clause_preserves_unrelated_bindings() {
             }
         }
         "#;
-    let (result, _) = nexus
-        .execute_kql(parse_kql(kql).unwrap())
-        .await
-        .unwrap();
+    let (result, _) = nexus.execute_kql(parse_kql(kql).unwrap()).await.unwrap();
     assert_eq!(result, json!([["VitaminC"], ["Headache"]]));
 }
 
@@ -4691,13 +4691,13 @@ async fn test_kql_multi_hop_zero_hop_and_cap() {
             (?concept, "is_subclass_of"{0,5}, ?parent)
         }
         "#;
-    let (result, _) = nexus
-        .execute_kql(parse_kql(kql).unwrap())
-        .await
-        .unwrap();
+    let (result, _) = nexus.execute_kql(parse_kql(kql).unwrap()).await.unwrap();
     let names = result.as_array().unwrap();
     for expected in ["CatC", "CatB", "CatA"] {
-        assert!(names.contains(&json!(expected)), "missing {expected}: {names:?}");
+        assert!(
+            names.contains(&json!(expected)),
+            "missing {expected}: {names:?}"
+        );
     }
 
     // Explicit bounds beyond the cap are rejected, not silently truncated.
@@ -4752,10 +4752,7 @@ async fn test_kql_filter_on_predicate_variable() {
         }
         LIMIT 50
         "#;
-    let (result, _) = nexus
-        .execute_kql(parse_kql(kql).unwrap())
-        .await
-        .unwrap();
+    let (result, _) = nexus.execute_kql(parse_kql(kql).unwrap()).await.unwrap();
     let cols = result.as_array().unwrap();
     assert_eq!(cols[0], json!(["treats", "treats"]));
     let neighbors = cols[1].as_array().unwrap();
@@ -4920,9 +4917,7 @@ async fn test_kml_delete_propositions_cascades_higher_order() {
     assert_eq!(result["deleted_propositions"], json!(2));
 
     let (stated, _) = nexus
-        .execute_kql(
-            parse_kql(r#"FIND(?st) WHERE { ?st (?who, "stated", ?what) }"#).unwrap(),
-        )
+        .execute_kql(parse_kql(r#"FIND(?st) WHERE { ?st (?who, "stated", ?what) }"#).unwrap())
         .await
         .unwrap();
     assert_eq!(stated, json!([]));
@@ -5006,10 +5001,7 @@ async fn test_kql_order_by_nulls_last() {
                WHERE {{ ?drug {{type: "Drug"}} }}
                ORDER BY ?drug.attributes.risk_level {direction}"#
         );
-        let (result, _) = nexus
-            .execute_kql(parse_kql(&kql).unwrap())
-            .await
-            .unwrap();
+        let (result, _) = nexus.execute_kql(parse_kql(&kql).unwrap()).await.unwrap();
         let names = result.as_array().unwrap();
         assert_eq!(
             names.last(),
@@ -5062,15 +5054,16 @@ async fn test_kql_filter_cross_variable_join_pairs() {
             FILTER(?d1.attributes.risk_level > ?d2.attributes.risk_level)
         }
         "#;
-    let (result, _) = nexus
-        .execute_kql(parse_kql(kql).unwrap())
-        .await
-        .unwrap();
+    let (result, _) = nexus.execute_kql(parse_kql(kql).unwrap()).await.unwrap();
     let cols = result.as_array().unwrap();
     assert_eq!(cols.len(), 2);
     let c1 = cols[0].as_array().unwrap();
     let c2 = cols[1].as_array().unwrap();
-    assert_eq!(c1.len(), c2.len(), "columns must be index-aligned: {result}");
+    assert_eq!(
+        c1.len(),
+        c2.len(),
+        "columns must be index-aligned: {result}"
+    );
 
     let mut pairs: Vec<(String, String)> = c1
         .iter()
@@ -5084,12 +5077,12 @@ async fn test_kql_filter_cross_variable_join_pairs() {
         .collect();
     pairs.sort();
     let mut expected = vec![
-        ("Aspirin".to_string(), "LowRisk".to_string()),   // 2 > 1
-        ("HighRisk".to_string(), "Aspirin".to_string()),  // 5 > 2
-        ("HighRisk".to_string(), "MidRisk".to_string()),  // 5 > 3
-        ("HighRisk".to_string(), "LowRisk".to_string()),  // 5 > 1
-        ("MidRisk".to_string(), "Aspirin".to_string()),   // 3 > 2
-        ("MidRisk".to_string(), "LowRisk".to_string()),   // 3 > 1
+        ("Aspirin".to_string(), "LowRisk".to_string()), // 2 > 1
+        ("HighRisk".to_string(), "Aspirin".to_string()), // 5 > 2
+        ("HighRisk".to_string(), "MidRisk".to_string()), // 5 > 3
+        ("HighRisk".to_string(), "LowRisk".to_string()), // 5 > 1
+        ("MidRisk".to_string(), "Aspirin".to_string()), // 3 > 2
+        ("MidRisk".to_string(), "LowRisk".to_string()), // 3 > 1
     ];
     expected.sort();
     assert_eq!(pairs, expected);
@@ -5128,10 +5121,7 @@ async fn test_kql_filter_predicate_variable_narrows_link() {
         }
         LIMIT 50
         "#;
-    let (result, _) = nexus
-        .execute_kql(parse_kql(kql).unwrap())
-        .await
-        .unwrap();
+    let (result, _) = nexus.execute_kql(parse_kql(kql).unwrap()).await.unwrap();
     let predicates = result.as_array().unwrap();
     assert!(!predicates.is_empty());
     assert!(
@@ -5157,10 +5147,7 @@ async fn test_kql_find_disconnected_cartesian_alignment() {
         }
         ORDER BY ?symptom.name ASC
         "#;
-    let (result, _) = nexus
-        .execute_kql(parse_kql(kql).unwrap())
-        .await
-        .unwrap();
+    let (result, _) = nexus.execute_kql(parse_kql(kql).unwrap()).await.unwrap();
     let cols = result.as_array().unwrap();
     let c1 = cols[0].as_array().unwrap();
     let c2 = cols[1].as_array().unwrap();
@@ -5179,10 +5166,7 @@ async fn test_kql_find_disconnected_cartesian_alignment() {
         ORDER BY ?symptom.name ASC
         LIMIT 1
         "#;
-    let (page1, cursor) = nexus
-        .execute_kql(parse_kql(kql).unwrap())
-        .await
-        .unwrap();
+    let (page1, cursor) = nexus.execute_kql(parse_kql(kql).unwrap()).await.unwrap();
     assert_eq!(page1.as_array().unwrap()[1], json!(["Fever"]));
     let cursor = cursor.expect("first page must carry next_cursor");
 
@@ -5198,10 +5182,7 @@ async fn test_kql_find_disconnected_cartesian_alignment() {
         CURSOR "{cursor}"
         "#
     );
-    let (page2, cursor2) = nexus
-        .execute_kql(parse_kql(&kql).unwrap())
-        .await
-        .unwrap();
+    let (page2, cursor2) = nexus.execute_kql(parse_kql(&kql).unwrap()).await.unwrap();
     assert_eq!(page2.as_array().unwrap()[1], json!(["Headache"]));
     assert!(cursor2.is_none(), "no further pages expected");
 }
@@ -5232,16 +5213,10 @@ async fn test_kql_find_relation_with_loose_variable_alignment() {
         }
         ORDER BY ?symptom.name ASC
         "#;
-    let (result, _) = nexus
-        .execute_kql(parse_kql(kql).unwrap())
-        .await
-        .unwrap();
+    let (result, _) = nexus.execute_kql(parse_kql(kql).unwrap()).await.unwrap();
     let cols = result.as_array().unwrap();
     assert_eq!(cols.len(), 3);
-    let lens: Vec<usize> = cols
-        .iter()
-        .map(|c| c.as_array().unwrap().len())
-        .collect();
+    let lens: Vec<usize> = cols.iter().map(|c| c.as_array().unwrap().len()).collect();
     assert_eq!(lens, vec![2, 2, 2], "2 treats-rows × 1 tag: {result}");
     assert_eq!(cols[1], json!(["Fever", "Headache"]));
     assert_eq!(cols[2], json!(["Verified", "Verified"]));
@@ -5261,10 +5236,7 @@ async fn test_kql_filter_constant_expression() {
             FILTER("a" == "b")
         }
         "#;
-    let (result, _) = nexus
-        .execute_kql(parse_kql(kql).unwrap())
-        .await
-        .unwrap();
+    let (result, _) = nexus.execute_kql(parse_kql(kql).unwrap()).await.unwrap();
     assert_eq!(result, json!([]));
 
     // A constant-true FILTER keeps everything.
@@ -5275,10 +5247,7 @@ async fn test_kql_filter_constant_expression() {
             FILTER(1 < 2)
         }
         "#;
-    let (result, _) = nexus
-        .execute_kql(parse_kql(kql).unwrap())
-        .await
-        .unwrap();
+    let (result, _) = nexus.execute_kql(parse_kql(kql).unwrap()).await.unwrap();
     assert_eq!(result, json!(["Aspirin"]));
 }
 
@@ -5301,13 +5270,110 @@ async fn test_kql_filter_cross_variable_inside_not() {
             }
         }
         "#;
-    let (result, _) = nexus
-        .execute_kql(parse_kql(kql).unwrap())
-        .await
-        .unwrap();
+    let (result, _) = nexus.execute_kql(parse_kql(kql).unwrap()).await.unwrap();
     assert_eq!(
         result,
         json!(["LowRisk"]),
         "only the least risky drug survives"
+    );
+}
+
+/// Multi-hop relation rows carry no proposition id, so row-based FIND
+/// pagination must use offset cursors: an entity-anchored cursor could
+/// neither be issued for nor resume after such a row, silently truncating
+/// the result at the first page boundary.
+#[tokio::test]
+async fn test_kql_multi_hop_find_pagination() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_test_data(&nexus).await.unwrap();
+
+    let setup = r#"
+        UPSERT {
+            CONCEPT ?cat_type { {type: "$ConceptType", name: "Category"} }
+            CONCEPT ?isa { {type: "$PropositionType", name: "is_subclass_of"} }
+            CONCEPT ?a { {type: "Category", name: "CatA"} }
+            CONCEPT ?b {
+                {type: "Category", name: "CatB"}
+                SET PROPOSITIONS { ("is_subclass_of", ?a) }
+            }
+            CONCEPT ?c {
+                {type: "Category", name: "CatC"}
+                SET PROPOSITIONS { ("is_subclass_of", ?b) }
+            }
+        }
+        "#;
+    nexus
+        .execute_kml(parse_kml(setup).unwrap(), false)
+        .await
+        .unwrap();
+
+    // 1..=3 hops over the CatC -> CatB -> CatA chain yields three
+    // (?concept, ?parent) solutions: (B,A), (C,B), (C,A).
+    let query = |cursor: Option<&str>| {
+        let cursor_clause = cursor
+            .map(|cursor| format!("CURSOR \"{cursor}\""))
+            .unwrap_or_default();
+        format!(
+            r#"
+            FIND(?concept.name, ?parent.name)
+            WHERE {{
+                ?concept {{type: "Category"}}
+                (?concept, "is_subclass_of"{{1,3}}, ?parent)
+            }}
+            LIMIT 2
+            {cursor_clause}
+            "#
+        )
+    };
+
+    let (page1, cursor) = nexus
+        .execute_kql(parse_kql(&query(None)).unwrap())
+        .await
+        .unwrap();
+    let cols = page1.as_array().unwrap();
+    assert_eq!(cols[0].as_array().unwrap().len(), 2, "page 1: {page1}");
+    let cursor = cursor.expect("truncated multi-hop page must carry next_cursor");
+
+    let (page2, cursor2) = nexus
+        .execute_kql(parse_kql(&query(Some(&cursor))).unwrap())
+        .await
+        .unwrap();
+    let cols2 = page2.as_array().unwrap();
+    assert_eq!(cols2[0].as_array().unwrap().len(), 1, "page 2: {page2}");
+    assert!(cursor2.is_none(), "no further pages expected");
+
+    // The two pages together cover exactly the three distinct solutions.
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for (concepts, parents) in [(&cols[0], &cols[1]), (&cols2[0], &cols2[1])] {
+        let concepts = concepts.as_array().unwrap();
+        let parents = parents.as_array().unwrap();
+        assert_eq!(concepts.len(), parents.len(), "columns must stay aligned");
+        for (concept, parent) in concepts.iter().zip(parents) {
+            pairs.push((
+                concept.as_str().unwrap().to_string(),
+                parent.as_str().unwrap().to_string(),
+            ));
+        }
+    }
+    pairs.sort();
+    assert_eq!(
+        pairs,
+        vec![
+            ("CatB".to_string(), "CatA".to_string()),
+            ("CatC".to_string(), "CatA".to_string()),
+            ("CatC".to_string(), "CatB".to_string()),
+        ],
+        "pages must partition the solution set without loss or duplication"
+    );
+
+    // A cursor that is not a plain decimal offset is rejected, not treated
+    // as page one again.
+    let err = nexus
+        .execute_kql(parse_kql(&query(Some("bogus"))).unwrap())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err.code, KipErrorCode::InvalidSyntax),
+        "bogus cursor: {err:?}"
     );
 }

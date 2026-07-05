@@ -996,7 +996,11 @@ mod tests {
         let mut new_builder = SchemaBuilder::new();
         new_builder.with_version(2);
         new_builder
-            .add_field(Fe::new("email".to_string(), Ft::Text).unwrap().with_unique())
+            .add_field(
+                Fe::new("email".to_string(), Ft::Text)
+                    .unwrap()
+                    .with_unique(),
+            )
             .unwrap();
         let mut new_schema = new_builder.build().unwrap();
 

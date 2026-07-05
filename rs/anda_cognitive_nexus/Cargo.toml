@@ -1,6 +1,6 @@
 [package]
 name = "anda_cognitive_nexus"
-version = "0.8.4"
+version = "0.9.0"
 description = "A Rust implementation of KIP (Knowledge Interaction Protocol) base on Anda DB."
 keywords = [
   "KIP",
@@ -17,14 +17,13 @@ license.workspace = true
 
 [dependencies]
 anda_db_utils = { version = "0.8", path = "../anda_db_utils" }
-anda_db_schema = { version = "0.8", path = "../anda_db_schema" }
-anda_kip = { version = "0.8", path = "../anda_kip" }
-anda_db = { version = "0.8", path = "../anda_db", features = ["full"] }
-anda_db_tfs = { version = "0.8", path = "../anda_db_tfs", features = ["full"] }
+anda_db_schema = { version = "0.9", path = "../anda_db_schema" }
+anda_kip = { version = "0.9", path = "../anda_kip" }
+anda_db = { version = "0.9", path = "../anda_db", features = ["full"] }
+anda_db_tfs = { version = "0.9", path = "../anda_db_tfs", features = ["full"] }
 async-trait = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
-log = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -38,6 +37,10 @@ anda_object_store = { path = "../anda_object_store", version = "0.8" }
 tokio = { workspace = true, features = ["full"] }
 object_store = { workspace = true, features = ["fs"] }
 structured-logger = { workspace = true }
+log = { workspace = true }
 
 [[example]]
 name = "kip_demo"
+
+[lib]
+doctest = false
