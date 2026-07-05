@@ -144,16 +144,22 @@ fn parse_search_threshold(input: &str) -> VResult<'_, Number> {
 // --- EXPORT ---
 fn parse_export_command(input: &str) -> VResult<'_, ExportCommand> {
     context(
-        "EXPORT ?target WHERE { ... } [LIMIT N]",
+        "EXPORT ?target WHERE { ... } [LIMIT N] [CURSOR \"<token>\"]",
         map(
             preceded(
                 ws(keyword("EXPORT")),
-                cut((ws(variable), parse_where_block, opt(ws(parse_limit_clause)))),
+                cut((
+                    ws(variable),
+                    parse_where_block,
+                    opt(ws(parse_limit_clause)),
+                    opt(ws(parse_cursor_clause)),
+                )),
             ),
-            |(target, where_clauses, limit)| ExportCommand {
+            |(target, where_clauses, limit, cursor)| ExportCommand {
                 target,
                 where_clauses,
                 limit,
+                cursor,
             },
         ),
     )
@@ -473,6 +479,7 @@ mod tests {
                 assert_eq!(export.target, "n");
                 assert_eq!(export.where_clauses.len(), 1);
                 assert_eq!(export.limit, Some(500));
+                assert_eq!(export.cursor, None);
             }
             _ => panic!("Expected ExportCommand"),
         }
@@ -483,6 +490,21 @@ mod tests {
             MetaCommand::Export(export) => {
                 assert_eq!(export.target, "x");
                 assert_eq!(export.limit, None);
+                assert_eq!(export.cursor, None);
+            }
+            _ => panic!("Expected ExportCommand"),
+        }
+
+        // EXPORT with LIMIT and CURSOR (paginated continuation, KIP §5.3)
+        let (_, command) = parse_meta_command(
+            r#"EXPORT ?x WHERE { ?x {type: "Drug"} } LIMIT 100 CURSOR "abc123""#,
+        )
+        .unwrap();
+        match command {
+            MetaCommand::Export(export) => {
+                assert_eq!(export.target, "x");
+                assert_eq!(export.limit, Some(100));
+                assert_eq!(export.cursor, Some("abc123".to_string()));
             }
             _ => panic!("Expected ExportCommand"),
         }

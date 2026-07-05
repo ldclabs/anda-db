@@ -1262,7 +1262,7 @@ pub enum SearchTarget {
 /// into an idempotent UPSERT capsule for backup, migration, and agent-to-agent
 /// knowledge exchange. Read-only.
 ///
-/// Syntax: `EXPORT ?target WHERE { ... } [LIMIT N]`
+/// Syntax: `EXPORT ?target WHERE { ... } [LIMIT N] [CURSOR "<token>"]`
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct ExportCommand {
     /// The target variable bound in the WHERE clause (concept nodes and/or proposition links)
@@ -1271,6 +1271,11 @@ pub struct ExportCommand {
     pub where_clauses: Vec<WhereClause>,
     /// Optional limit on the number of exported elements
     pub limit: Option<usize>,
+    /// Optional CURSOR token to continue a paginated export where the
+    /// previous page ended (KIP §5.3); each page is an independently valid,
+    /// idempotent capsule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
 }
 
 /// Compares JSON scalar values using KIP filter ordering rules.

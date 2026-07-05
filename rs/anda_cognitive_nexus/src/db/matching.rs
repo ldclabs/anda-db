@@ -6,6 +6,29 @@ use super::*;
 
 const MAX_SUBJECT_OBJECT_RANGE_VARIANTS: usize = 4_096;
 
+/// Engine cap on multi-hop path traversal depth. An explicit quantifier
+/// beyond the cap is rejected with `KIP_4002` (rather than silently
+/// truncated); an unbounded `{m,}` quantifier traverses up to this depth.
+const MAX_MULTI_HOP: u16 = 10;
+
+/// Resolves a `{m,n}` quantifier against the engine cap: explicit bounds
+/// beyond [`MAX_MULTI_HOP`] return `KIP_4002`; `None` (unbounded) is capped.
+fn checked_max_hops(min: u16, max: Option<u16>) -> Result<u16, KipError> {
+    if min > MAX_MULTI_HOP {
+        return Err(KipError::resource_exhausted(format!(
+            "multi-hop quantifier minimum {min} exceeds the engine cap of {MAX_MULTI_HOP} hops"
+        )));
+    }
+    match max {
+        Some(max) if max > MAX_MULTI_HOP => Err(KipError::resource_exhausted(format!(
+            "multi-hop quantifier maximum {max} exceeds the engine cap of {MAX_MULTI_HOP} hops; \
+             lower the bound or traverse in stages"
+        ))),
+        Some(max) => Ok(max),
+        None => Ok(MAX_MULTI_HOP),
+    }
+}
+
 fn checked_subject_object_variant_count(
     subject_count: usize,
     object_count: usize,
@@ -40,7 +63,7 @@ impl CognitiveNexus {
                 _ => unreachable!(),
             };
 
-            let max_hops = max.unwrap_or(10).min(10);
+            let max_hops = checked_max_hops(min, max)?;
 
             for start_node in start_nodes {
                 let paths = self
@@ -56,9 +79,18 @@ impl CognitiveNexus {
                     .await?;
 
                 for path in paths {
-                    result.matched_subjects.push(path.start);
-                    result.matched_objects.push(path.end);
+                    result.matched_subjects.push(path.start.clone());
+                    result.matched_objects.push(path.end.clone());
                     result.matched_predicates.push(predicate.clone());
+                    // A path is not a single link, so the row carries no
+                    // proposition binding — but the (subject, object) pair
+                    // keeps multi-variable FIND columns solution-aligned.
+                    result.rows.push(QueryRelationRow {
+                        proposition: None,
+                        subject: Some(path.start),
+                        predicate: Some(predicate.clone()),
+                        object: Some(path.end),
+                    });
                     result
                         .matched_propositions
                         .extend(path.propositions.into_vec());
@@ -75,7 +107,7 @@ impl CognitiveNexus {
                 }
             };
 
-            let max_hops = max.unwrap_or(10).min(10);
+            let max_hops = checked_max_hops(min, max)?;
             for start_node in start_nodes {
                 let paths = self
                     .bfs_multi_hop(
@@ -90,9 +122,17 @@ impl CognitiveNexus {
                     .await?;
 
                 for path in paths {
-                    result.matched_subjects.push(path.end);
-                    result.matched_objects.push(path.start);
+                    result.matched_subjects.push(path.end.clone());
+                    result.matched_objects.push(path.start.clone());
                     result.matched_predicates.push(predicate.clone());
+                    // See the forward branch: align (subject, object) rows
+                    // even though the path itself binds no single link.
+                    result.rows.push(QueryRelationRow {
+                        proposition: None,
+                        subject: Some(path.end),
+                        predicate: Some(predicate.clone()),
+                        object: Some(path.start),
+                    });
                     result
                         .matched_propositions
                         .extend(path.propositions.into_vec());
@@ -259,6 +299,57 @@ impl CognitiveNexus {
         Ok(result)
     }
 
+    // 处理完全无约束的谓词变量模式 `(?s, ?p, ?o)`：枚举所有命题行。
+    //
+    // KIP §3.4.2 允许引擎以 KIP_4002 拒绝这种模式；本参考实现选择支持它，
+    // 因为记忆代谢（如置信度衰减 UPDATE）依赖这一原语——调用方应配合
+    // LIMIT 使用。`subject`/`object` 上的 AnyPropositions 约束在行加载时过滤。
+    pub(super) async fn handle_full_scan_matching(
+        &self,
+        ctx: &QueryContext,
+        predicate: PredTerm,
+        subject_must_be_proposition: bool,
+        object_must_be_proposition: bool,
+    ) -> Result<PropositionsMatchResult, KipError> {
+        let mut result = PropositionsMatchResult::default();
+        // Every stored row has a non-empty subject id ("C:..." / "P:..."),
+        // so `subject > ""` enumerates the whole collection via the index.
+        let ids = self
+            .propositions
+            .query_ids(
+                Filter::Field((
+                    "subject".to_string(),
+                    RangeQuery::Gt(Fv::Text(String::new())),
+                )),
+                None,
+            )
+            .await
+            .map_err(db_to_kip_error)?;
+
+        for id in ids {
+            if let Some((subj, preds, obj)) = self
+                .try_get_proposition_with(&ctx.cache, id, |proposition| {
+                    if subject_must_be_proposition
+                        && matches!(proposition.subject, EntityID::Concept(_))
+                    {
+                        return Ok(None);
+                    }
+                    if object_must_be_proposition
+                        && matches!(proposition.object, EntityID::Concept(_))
+                    {
+                        return Ok(None);
+                    }
+                    match_predicate_against_proposition(proposition, &predicate)
+                })
+                .await?
+            {
+                result.add_match(subj, obj, preds, id);
+            }
+        }
+
+        Ok(result)
+    }
+
     // 处理谓词匹配
     pub(super) async fn handle_predicate_matching(
         &self,
@@ -321,17 +412,41 @@ impl CognitiveNexus {
     ) -> Result<Vec<GraphPath>, KipError> {
         use std::collections::VecDeque;
 
+        // O(1) 目标匹配（targets 为 ID 列表时避免每个节点 O(n) 线性查找）
+        let target_ids: Option<FxHashSet<&EntityID>> = match targets {
+            TargetEntities::IDs(ids) => Some(ids.iter().collect()),
+            _ => None,
+        };
+        let path_matches_targets = |end: &EntityID| -> bool {
+            match targets {
+                TargetEntities::IDs(_) => target_ids
+                    .as_ref()
+                    .map(|ids| ids.contains(end))
+                    .unwrap_or(false),
+                TargetEntities::AnyPropositions => matches!(end, EntityID::Proposition(_, _)),
+                TargetEntities::Any => true,
+            }
+        };
+
         let mut queue: VecDeque<GraphPath> = VecDeque::new();
         let mut results: Vec<GraphPath> = Vec::new();
         let mut visited: FxHashSet<(EntityID, u16)> = FxHashSet::default(); // (node, depth) 防止循环
 
-        // 初始化队列
-        queue.push_back(GraphPath {
+        let initial_path = GraphPath {
             start: start.clone(),
             end: start.clone(),
             propositions: UniqueVec::new(),
             hops: 0,
-        });
+        };
+
+        // 零跳自反匹配（KIP §3.4.2）：`{0,n}` 必须包含 subject == object
+        // 的零跳解（无边遍历）。
+        if min_hops == 0 && path_matches_targets(&initial_path.end) {
+            results.push(initial_path.clone());
+        }
+
+        // 初始化队列
+        queue.push_back(initial_path);
 
         while let Some(current_path) = queue.pop_front() {
             // 检查是否已访问过此节点在此深度
@@ -341,25 +456,8 @@ impl CognitiveNexus {
             }
             visited.insert(state);
 
-            // 如果达到最大跳数，停止扩展此路径
+            // 达到最大跳数，停止扩展此路径（结果在扩展/零跳时已收集）
             if current_path.hops >= max_hops {
-                if current_path.hops >= min_hops {
-                    match targets {
-                        TargetEntities::IDs(ids) => {
-                            if ids.contains(&current_path.end) {
-                                results.push(current_path);
-                            }
-                        }
-                        TargetEntities::AnyPropositions => {
-                            if matches!(current_path.end, EntityID::Proposition(_, _)) {
-                                results.push(current_path);
-                            }
-                        }
-                        TargetEntities::Any => {
-                            results.push(current_path);
-                        }
-                    }
-                }
                 continue;
             }
 
@@ -375,22 +473,8 @@ impl CognitiveNexus {
                 new_path.hops += 1;
 
                 // 如果满足最小跳数要求，检查是否为有效结果
-                if new_path.hops >= min_hops {
-                    match targets {
-                        TargetEntities::IDs(ids) => {
-                            if ids.contains(&new_path.end) {
-                                results.push(new_path.clone());
-                            }
-                        }
-                        TargetEntities::AnyPropositions => {
-                            if matches!(new_path.end, EntityID::Proposition(_, _)) {
-                                results.push(new_path.clone());
-                            }
-                        }
-                        TargetEntities::Any => {
-                            results.push(new_path.clone());
-                        }
-                    }
+                if new_path.hops >= min_hops && path_matches_targets(&new_path.end) {
+                    results.push(new_path.clone());
                 }
 
                 // 如果未达到最大跳数，继续扩展
@@ -511,12 +595,22 @@ impl CognitiveNexus {
                 self.handle_any_to_object_ids_matching(ctx, object_ids, predicate, false)
                     .await?
             }
-            (_, predicate, _) => {
+            (subjects, predicate, objects) => {
                 if matches!(&predicate, PredTerm::Variable(_)) {
-                    return Ok(TargetEntities::AnyPropositions);
+                    // Fully unconstrained exploration `(?s, ?p, ?o)`:
+                    // enumerate every proposition so the variables actually
+                    // bind (the spec's memory-metabolism patterns rely on
+                    // this; pair with LIMIT).
+                    self.handle_full_scan_matching(
+                        ctx,
+                        predicate,
+                        matches!(subjects, TargetEntities::AnyPropositions),
+                        matches!(objects, TargetEntities::AnyPropositions),
+                    )
+                    .await?
+                } else {
+                    self.handle_predicate_matching(ctx, predicate).await?
                 }
-
-                self.handle_predicate_matching(ctx, predicate).await?
             }
         };
 

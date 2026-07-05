@@ -424,17 +424,25 @@ impl CognitiveNexus {
             KipError::reference_error(format!("Target term '{}' not found in context", target))
         })?;
 
-        if attributes.iter().any(|name| name == "core_directives") {
-            for entity_id in target_entities.as_ref() {
-                if let EntityID::Concept(id) = entity_id {
-                    let (ty, name) = self
-                        .try_get_concept_with(&ctx.cache, *id, |concept| {
-                            Ok((concept.r#type.clone(), concept.name.clone()))
-                        })
-                        .await?;
-                    if Self::is_system_actor(&ty, &name) {
-                        return Err(Self::immutable_core_directives_error(&ty, &name));
-                    }
+        // Protected-scope preflight (KIP_3004), aligned with UPDATE: removing
+        // attributes from the foundational schema nodes is a modification of
+        // a protected structure; `core_directives` of system actors stay
+        // immutable. Ordinary evolvable schema definitions are not covered.
+        let deletes_core_directives = attributes.iter().any(|name| name == "core_directives");
+        for entity_id in target_entities.as_ref() {
+            if let EntityID::Concept(id) = entity_id {
+                let (ty, name) = self
+                    .try_get_concept_with(&ctx.cache, *id, |concept| {
+                        Ok((concept.r#type.clone(), concept.name.clone()))
+                    })
+                    .await?;
+                if Self::is_protected_schema_concept(&ty, &name) {
+                    return Err(KipError::immutable_target(format!(
+                        "Concept {{type: \"{ty}\", name: \"{name}\"}} is system-protected; narrow the WHERE pattern"
+                    )));
+                }
+                if deletes_core_directives && Self::is_system_actor(&ty, &name) {
+                    return Err(Self::immutable_core_directives_error(&ty, &name));
                 }
             }
         }
@@ -539,13 +547,6 @@ impl CognitiveNexus {
         // agents can probe for safety.
         reject_reserved_metadata_keys(keys.iter())?;
 
-        if dry_run {
-            return Ok(json!({
-                "updated_concepts": 0,
-                "updated_propositions": 0,
-            }));
-        }
-
         let mut ctx = QueryContext::default();
         for clause in where_clauses {
             self.execute_where_clause(&mut ctx, clause).await?;
@@ -554,6 +555,31 @@ impl CognitiveNexus {
         let target_entities = ctx.entities.get(&target).cloned().ok_or_else(|| {
             KipError::reference_error(format!("Target term '{}' not found in context", target))
         })?;
+
+        // Protected-scope preflight (KIP_3004), aligned with UPDATE and
+        // DELETE ATTRIBUTES; also runs under dry_run so agents can probe.
+        for entity_id in target_entities.as_ref() {
+            if let EntityID::Concept(id) = entity_id {
+                let (ty, name) = self
+                    .try_get_concept_with(&ctx.cache, *id, |concept| {
+                        Ok((concept.r#type.clone(), concept.name.clone()))
+                    })
+                    .await?;
+                if Self::is_protected_schema_concept(&ty, &name) {
+                    return Err(KipError::immutable_target(format!(
+                        "Concept {{type: \"{ty}\", name: \"{name}\"}} is system-protected; narrow the WHERE pattern"
+                    )));
+                }
+            }
+        }
+
+        if dry_run {
+            return Ok(json!({
+                "updated_concepts": 0,
+                "updated_propositions": 0,
+            }));
+        }
+
         let mut updated_concepts: u64 = 0;
         let mut updated_propositions: u64 = 0;
         for entity_id in target_entities.as_ref() {
@@ -636,12 +662,6 @@ impl CognitiveNexus {
         where_clauses: Vec<WhereClause>,
         dry_run: bool,
     ) -> Result<Json, KipError> {
-        if dry_run {
-            return Ok(json!({
-                "deleted_propositions": 0
-            }));
-        }
-
         let mut ctx = QueryContext::default();
         for clause in where_clauses {
             self.execute_where_clause(&mut ctx, clause).await?;
@@ -651,7 +671,17 @@ impl CognitiveNexus {
             KipError::reference_error(format!("Target term '{}' not found in context", target))
         })?;
 
+        if dry_run {
+            return Ok(json!({
+                "deleted_propositions": 0
+            }));
+        }
+
         let mut deleted_propositions: u64 = 0;
+        // Deleted link ids seed the higher-order cascade below: propositions
+        // that referenced a removed link as subject/object would otherwise
+        // dangle (same no-dangling guarantee as DELETE CONCEPT ... DETACH).
+        let mut cascade_seeds: Vec<EntityID> = Vec::new();
         for entity_id in target_entities.as_ref() {
             match entity_id {
                 EntityID::Concept(_) => {
@@ -663,7 +693,9 @@ impl CognitiveNexus {
                         .await
                     {
                         // Remove specified predicates
-                        proposition.predicates.remove(predicate);
+                        if !proposition.predicates.remove(predicate) {
+                            continue; // already removed by an earlier iteration
+                        }
                         proposition.properties.remove(predicate);
 
                         // If no predicates left, delete the proposition
@@ -671,6 +703,7 @@ impl CognitiveNexus {
                             if self.propositions.remove(*id).await.is_ok() {
                                 ctx.cache.propositions.write().remove(id);
                                 deleted_propositions += 1;
+                                cascade_seeds.push(entity_id.clone());
                             }
                         } else {
                             // Otherwise, update the proposition with remaining predicates
@@ -694,11 +727,18 @@ impl CognitiveNexus {
                                 // resurrecting them.
                                 ctx.cache.propositions.write().remove(id);
                                 deleted_propositions += 1;
+                                cascade_seeds.push(entity_id.clone());
                             }
                         }
                     }
                 }
             }
+        }
+
+        // Transitively remove higher-order propositions that referenced the
+        // deleted links, so no dangling references remain.
+        if !cascade_seeds.is_empty() {
+            deleted_propositions += self.cascade_remove_propositions(cascade_seeds).await?;
         }
 
         Ok(json!({
@@ -1052,13 +1092,30 @@ impl CognitiveNexus {
             where_clauses,
         } = statement;
 
-        let mut ctx = QueryContext::default();
-        for clause in where_clauses {
-            self.execute_where_clause(&mut ctx, clause).await?;
-        }
+        // Remember the `{type, name}` identities the WHERE pattern states so
+        // a replay of an already-applied merge can be self-diagnosing
+        // (KIP §4.4 retry semantics).
+        let source_identity = Self::find_concept_identity(&where_clauses, &source);
+        let target_identity = Self::find_concept_identity(&where_clauses, &target);
 
-        let source_id = Self::single_merge_concept(&ctx, &source)?;
-        let target_id = Self::single_merge_concept(&ctx, &target)?;
+        let mut ctx = QueryContext::default();
+        let bind = async {
+            for clause in where_clauses {
+                self.execute_where_clause(&mut ctx, clause).await?;
+            }
+            let source_id = Self::single_merge_concept(&ctx, &source)?;
+            let target_id = Self::single_merge_concept(&ctx, &target)?;
+            Ok::<(u64, u64), KipError>((source_id, target_id))
+        };
+        let (source_id, target_id) = match bind.await {
+            Ok(ids) => ids,
+            Err(err) if err.code == KipErrorCode::NotFound => {
+                return Err(self
+                    .diagnose_already_merged(source_identity, target_identity, err)
+                    .await);
+            }
+            Err(err) => return Err(err),
+        };
 
         if source_id == target_id {
             // Source and target bind the same node: no-op success (KIP §4.4).
@@ -1149,15 +1206,29 @@ impl CognitiveNexus {
             attributes_filled += 1;
         }
 
-        // 3. Record `_merged_from` provenance, then delete the source.
+        // 3. Record `_merged_from` provenance, then delete the source. The
+        //    source's own `_merged_from` entries are carried over first
+        //    (duplicates dropped) so provenance survives chained merges
+        //    (KIP §4.4).
         let mut merged_from = match target_concept.metadata.get(METADATA_MERGED_FROM) {
             Some(Json::Array(values)) => values.clone(),
             _ => Vec::new(),
         };
-        merged_from.push(Json::String(format!(
+        if let Some(Json::Array(source_entries)) = source_concept.metadata.get(METADATA_MERGED_FROM)
+        {
+            for entry in source_entries {
+                if !merged_from.contains(entry) {
+                    merged_from.push(entry.clone());
+                }
+            }
+        }
+        let source_tag = Json::String(format!(
             "{}:{}",
             source_concept.r#type, source_concept.name
-        )));
+        ));
+        if !merged_from.contains(&source_tag) {
+            merged_from.push(source_tag);
+        }
         target_concept
             .metadata
             .insert(METADATA_MERGED_FROM.to_string(), Json::Array(merged_from));
@@ -1189,6 +1260,74 @@ impl CognitiveNexus {
             "links_deduplicated": links_deduplicated,
             "attributes_filled": attributes_filled,
         }))
+    }
+
+    /// Returns the `{type, name}` identity a WHERE pattern states for `var`
+    /// via a concept clause, if any.
+    pub(super) fn find_concept_identity(
+        where_clauses: &[WhereClause],
+        var: &str,
+    ) -> Option<(String, String)> {
+        for clause in where_clauses {
+            if let WhereClause::Concept(concept) = clause
+                && concept.variable == var
+                && let ConceptMatcher::Object { r#type, name } = &concept.matcher
+            {
+                return Some((r#type.clone(), name.clone()));
+            }
+        }
+        None
+    }
+
+    /// Makes a MERGE replay self-diagnosing (KIP §4.4): when the source no
+    /// longer exists but the target (looked up by the identity the WHERE
+    /// pattern stated) lists the source's `"<Type>:<name>"` in its
+    /// `_merged_from` provenance, the returned `KIP_3002` explains that the
+    /// merge already happened.
+    pub(super) async fn diagnose_already_merged(
+        &self,
+        source_identity: Option<(String, String)>,
+        target_identity: Option<(String, String)>,
+        original: KipError,
+    ) -> KipError {
+        let (Some((source_type, source_name)), Some((target_type, target_name))) =
+            (source_identity, target_identity)
+        else {
+            return original;
+        };
+        // Only diagnose when the source is indeed gone (the NotFound may
+        // otherwise concern a different element of the pattern).
+        if self
+            .has_concept(&ConceptPK::Object {
+                r#type: source_type.clone(),
+                name: source_name.clone(),
+            })
+            .await
+        {
+            return original;
+        }
+        let Ok(target_concept) = self
+            .get_concept(&ConceptPK::Object {
+                r#type: target_type,
+                name: target_name,
+            })
+            .await
+        else {
+            return original;
+        };
+
+        let source_tag = Json::String(format!("{source_type}:{source_name}"));
+        if let Some(Json::Array(merged_from)) = target_concept.metadata.get(METADATA_MERGED_FROM)
+            && merged_from.contains(&source_tag)
+        {
+            return KipError::not_found(format!(
+                "{}; note: {{type: {:?}, name: {:?}}} is already recorded in the target's \
+                 metadata._merged_from — this MERGE already happened, treat it as success",
+                original.message, source_type, source_name
+            ));
+        }
+
+        original
     }
 
     /// Resolves a MERGE variable to exactly one concept node id:
@@ -1523,8 +1662,12 @@ impl CognitiveNexus {
                 let subject = self.resolve_entity_id(subject.as_ref(), cached_pks).await?;
                 let object = self.resolve_entity_id(object.as_ref(), cached_pks).await?;
                 if subject == object {
+                    // Engine limitation: the storage model keys one row per
+                    // (subject, object) pair, so self-loop propositions are
+                    // not representable. Reify the relation via an
+                    // intermediate concept if a self-reference is needed.
                     return Err(KipError::invalid_syntax(format!(
-                        "Subject and object cannot be the same: {}",
+                        "Subject and object cannot be the same: {} (self-loop propositions are not supported by this engine)",
                         subject
                     )));
                 }
@@ -1862,8 +2005,10 @@ impl CognitiveNexus {
                 let object_id =
                     Box::pin(self.resolve_target_term(object, handle_map, cached_pks)).await?;
                 if subject_id == object_id {
+                    // See `upsert_proposition`: self-loop propositions are an
+                    // engine storage-model limitation.
                     return Err(KipError::invalid_syntax(format!(
-                        "Subject and object cannot be the same: {}",
+                        "Subject and object cannot be the same: {} (self-loop propositions are not supported by this engine)",
                         subject_id
                     )));
                 }

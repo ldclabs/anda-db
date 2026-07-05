@@ -549,6 +549,17 @@ impl CognitiveNexus {
     /// merges `{"merged": true, "links_repointed": N, …}`, for deletes a
     /// `{"deleted_*": N, "updated_*": N}` map. KML acquires the write lock
     /// so it executes exclusively.
+    ///
+    /// # Atomicity
+    ///
+    /// Statement-level failure modes (unknown types, missing targets,
+    /// `EXPECT VERSION` conflicts, protected-scope violations, …) are caught
+    /// by a validation preflight **before** any row is written, so they
+    /// leave the graph untouched. Mid-execution storage failures, however,
+    /// are not rolled back — the engine has no write-ahead transaction log —
+    /// so a crashed multi-block `UPSERT` may leave a prefix of its blocks
+    /// applied. Bundled capsules and well-formed `UPSERT`s are idempotent,
+    /// so the standard recovery is to re-run the statement.
     pub async fn execute_kml(
         &self,
         command: KmlStatement,
@@ -584,8 +595,9 @@ impl CognitiveNexus {
     /// META commands are read-only; they acquire the KML read lock and
     /// return `(value, next_cursor)` with the same conventions as
     /// [`execute_kql`](Self::execute_kql). `DESCRIBE PRIMER`, `DESCRIBE
-    /// DOMAINS`, `SEARCH` and `EXPORT` return non-paginated payloads
-    /// (`next_cursor == None`).
+    /// DOMAINS` and `SEARCH` return non-paginated payloads
+    /// (`next_cursor == None`); `DESCRIBE CONCEPT|PROPOSITION TYPES` and
+    /// `EXPORT` paginate via `LIMIT` / `CURSOR`.
     pub async fn execute_meta(
         &self,
         command: MetaCommand,
@@ -620,7 +632,7 @@ impl CognitiveNexus {
                 .await
                 .map(|rt| (rt, None)),
             MetaCommand::Search(command) => self.execute_search(command).await.map(|rt| (rt, None)),
-            MetaCommand::Export(command) => self.execute_export(command).await.map(|rt| (rt, None)),
+            MetaCommand::Export(command) => self.execute_export(command).await,
         }
     }
 

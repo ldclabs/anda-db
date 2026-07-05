@@ -6,12 +6,11 @@
 use anda_db::error::DBError;
 use anda_db_utils::Pipe;
 use anda_kip::{
-    EntityType, FilterExpression, FilterOperand, Json, KipError, METADATA_SCORE,
-    METADATA_UPDATED_AT, METADATA_VERSION, Map, OrderByCondition, OrderDirection, PredTerm,
-    is_reserved_metadata_key, validate_dot_path_var,
+    EntityType, Json, KipError, METADATA_SCORE, METADATA_UPDATED_AT, METADATA_VERSION, Map,
+    OrderByCondition, OrderDirection, PredTerm, compare_json, is_reserved_metadata_key,
+    validate_dot_path_var,
 };
-use rustc_hash::FxHashMap;
-use std::borrow::Cow;
+use std::{borrow::Cow, cmp::Ordering};
 
 use crate::entity::{Concept, EntityID, Properties, Proposition};
 
@@ -296,6 +295,27 @@ pub fn extract_proposition_field_value(
     }
 }
 
+/// Compares two ORDER BY sort key values per KIP §3.5.
+///
+/// `null` (or missing) values always sort **last regardless of direction**;
+/// non-null pairs are compared via [`compare_json`] (numeric, boolean,
+/// datetime-aware string ordering) with `direction` applied. Incomparable
+/// non-null pairs (e.g., string vs number) are treated as equal.
+pub fn compare_order_key(a: &Json, b: &Json, direction: &OrderDirection) -> Ordering {
+    match (a.is_null(), b.is_null()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater, // null last, direction-independent
+        (false, true) => Ordering::Less,
+        (false, false) => {
+            let ord = compare_json(a, b).unwrap_or(Ordering::Equal);
+            match direction {
+                OrderDirection::Asc => ord,
+                OrderDirection::Desc => ord.reverse(),
+            }
+        }
+    }
+}
+
 /// Applies sorting to entity-value pairs based on order conditions.
 ///
 /// # Arguments
@@ -308,11 +328,11 @@ pub fn extract_proposition_field_value(
 ///
 /// Sorted vector of entity-value pairs
 ///
-/// # Supported Types
+/// # Semantics
 ///
-/// * Numbers - Sorted numerically
-/// * Strings - Sorted lexicographically
-/// * Booleans - false < true
+/// Sort keys are compared with [`compare_order_key`]: numbers numerically,
+/// booleans by boolean order, strings with numeric / RFC 3339 awareness, and
+/// `null` (or missing) values always last regardless of direction (KIP §3.5).
 pub fn apply_order_by<'a>(
     mut values: Vec<(&'a EntityID, Json)>,
     var: &str,
@@ -329,32 +349,15 @@ pub fn apply_order_by<'a>(
             }
 
             let path = format!("/{}", cond.variable.path.join("/"));
+            let a_val = a.pointer(&path).unwrap_or(&Json::Null);
+            let b_val = b.pointer(&path).unwrap_or(&Json::Null);
 
-            let a_val = a.pointer(&path);
-            let b_val = b.pointer(&path);
-
-            let ordering = match (a_val, b_val) {
-                (Some(Json::Number(a)), Some(Json::Number(b))) => a
-                    .as_f64()
-                    .unwrap_or(0.0)
-                    .partial_cmp(&b.as_f64().unwrap_or(0.0)),
-                (Some(Json::String(a)), Some(Json::String(b))) => Some(a.cmp(b)),
-                (Some(Json::Bool(a)), Some(Json::Bool(b))) => Some(a.cmp(b)),
-                _ => None,
-            };
-
-            if let Some(ord) = ordering {
-                let result = match cond.direction {
-                    OrderDirection::Asc => ord,
-                    OrderDirection::Desc => ord.reverse(),
-                };
-
-                if result != std::cmp::Ordering::Equal {
-                    return result;
-                }
+            let result = compare_order_key(a_val, b_val, &cond.direction);
+            if result != Ordering::Equal {
+                return result;
             }
         }
-        std::cmp::Ordering::Equal
+        Ordering::Equal
     });
 
     values
@@ -445,43 +448,10 @@ pub fn db_to_kip_error(err: DBError) -> KipError {
     }
 }
 
-/// Extension trait for `FilterExpression` to check for unbound variables.
-pub trait FilterExpressionExt {
-    /// Returns `true` if the expression references any variable NOT already in `bound`.
-    fn has_unbound_variables(&self, bound: &FxHashMap<String, EntityID>) -> bool;
-}
-
-impl FilterExpressionExt for FilterExpression {
-    fn has_unbound_variables(&self, bound: &FxHashMap<String, EntityID>) -> bool {
-        match self {
-            FilterExpression::Comparison { left, right, .. } => {
-                operand_has_unbound(left, bound) || operand_has_unbound(right, bound)
-            }
-            FilterExpression::Logical { left, right, .. } => {
-                left.has_unbound_variables(bound) || right.has_unbound_variables(bound)
-            }
-            FilterExpression::Not(inner) => inner.has_unbound_variables(bound),
-            FilterExpression::Function { args, .. } => {
-                args.iter().any(|a| operand_has_unbound(a, bound))
-            }
-        }
-    }
-}
-
-fn operand_has_unbound(op: &FilterOperand, bound: &FxHashMap<String, EntityID>) -> bool {
-    match op {
-        FilterOperand::Variable(dot_path) => !bound.contains_key(&dot_path.var),
-        FilterOperand::Literal(_) | FilterOperand::List(_) => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anda_kip::{
-        AggregationFunction, ComparisonOperator, DotPathVar, FilterFunction, LogicalOperator,
-        OrderByCondition,
-    };
+    use anda_kip::{AggregationFunction, DotPathVar, OrderByCondition};
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -830,33 +800,49 @@ mod tests {
     }
 
     #[test]
-    fn filter_expression_ext_detects_unbound_variables_recursively() {
-        let bound = FxHashMap::from_iter([("x".to_string(), EntityID::Concept(1))]);
-        let x = FilterOperand::Variable(DotPathVar {
-            var: "x".to_string(),
-            path: vec![],
-        });
-        let y = FilterOperand::Variable(DotPathVar {
-            var: "y".to_string(),
-            path: vec!["name".to_string()],
-        });
+    fn compare_order_key_sorts_nulls_last_regardless_of_direction() {
+        use serde_json::json;
 
-        let comparison = FilterExpression::Comparison {
-            left: x.clone(),
-            operator: ComparisonOperator::Equal,
-            right: FilterOperand::Literal("Ada".into()),
-        };
-        assert!(!comparison.has_unbound_variables(&bound));
+        // null vs non-null: null last for both ASC and DESC.
+        assert_eq!(
+            compare_order_key(&Json::Null, &json!(1), &OrderDirection::Asc),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_order_key(&Json::Null, &json!(1), &OrderDirection::Desc),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_order_key(&json!(1), &Json::Null, &OrderDirection::Desc),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_order_key(&Json::Null, &Json::Null, &OrderDirection::Asc),
+            Ordering::Equal
+        );
 
-        let logical = FilterExpression::Logical {
-            left: Box::new(comparison),
-            operator: LogicalOperator::And,
-            right: Box::new(FilterExpression::Function {
-                func: FilterFunction::Contains,
-                args: vec![y.clone(), FilterOperand::List(vec!["Ada".into()])],
-            }),
-        };
-        assert!(logical.has_unbound_variables(&bound));
-        assert!(FilterExpression::Not(Box::new(logical)).has_unbound_variables(&bound));
+        // Non-null pairs follow compare_json with direction applied.
+        assert_eq!(
+            compare_order_key(&json!(1), &json!(2), &OrderDirection::Asc),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_order_key(&json!(1), &json!(2), &OrderDirection::Desc),
+            Ordering::Greater
+        );
+        // Datetime-aware string ordering (same rules as FILTER comparisons).
+        assert_eq!(
+            compare_order_key(
+                &json!("2025-01-01T00:00:00Z"),
+                &json!("2025-01-02T00:00:00Z"),
+                &OrderDirection::Asc
+            ),
+            Ordering::Less
+        );
+        // Incomparable non-null pairs are treated as equal.
+        assert_eq!(
+            compare_order_key(&json!("abc"), &json!(1), &OrderDirection::Asc),
+            Ordering::Equal
+        );
     }
 }

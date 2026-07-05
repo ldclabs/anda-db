@@ -25,7 +25,7 @@ pub static META_PROPOSITION_TYPE: &str = "$PropositionType";
 /// The agent itself: {type: "Person", name: "$self"}
 pub static META_SELF_NAME: &str = "$self";
 
-/// The system itself: {type: "System", name: "$system"}
+/// The system itself: {type: "Person", name: "$system"}
 pub static META_SYSTEM_NAME: &str = "$system";
 
 /// The type identifier for domain entities.

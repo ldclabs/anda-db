@@ -549,8 +549,9 @@ impl Request {
 /// Response structure from the Cognitive Nexus
 ///
 /// All responses from the Cognitive Nexus are JSON objects with this structure.
-/// Either `result` or `error` must be present, but never both.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+/// `result` must be present on success; `error` must be present on failure
+/// (optionally alongside a partial `result`).
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum Response {
     /// Successful response containing the request results
@@ -579,6 +580,50 @@ pub enum Response {
         #[serde(skip_serializing_if = "Option::is_none")]
         result: Option<Json>,
     },
+}
+
+/// Deserialization dispatches on the presence of `error` rather than relying
+/// on `#[serde(untagged)]` variant order: an error response that carries a
+/// partial `result` (`{"error": ..., "result": ...}`) would otherwise match
+/// the `Ok` variant first and silently drop the error.
+impl<'de> Deserialize<'de> for Response {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+
+        let mut value = Json::deserialize(deserializer)?;
+        let obj = value
+            .as_object_mut()
+            .ok_or_else(|| D::Error::custom("KIP response must be a JSON object"))?;
+
+        if let Some(error) = obj.remove("error") {
+            let error: ErrorObject = serde_json::from_value(error)
+                .map_err(|err| D::Error::custom(format!("invalid `error` object: {err}")))?;
+            return Ok(Response::Err {
+                error,
+                result: obj.remove("result"),
+            });
+        }
+
+        let result = obj
+            .remove("result")
+            .ok_or_else(|| D::Error::custom("KIP response requires `result` or `error`"))?;
+        let next_cursor = match obj.remove("next_cursor") {
+            None | Some(Json::Null) => None,
+            Some(Json::String(cursor)) => Some(cursor),
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "`next_cursor` must be a string, got: {other}"
+                )));
+            }
+        };
+        Ok(Response::Ok {
+            result,
+            next_cursor,
+        })
+    }
 }
 
 impl Response {
@@ -2091,5 +2136,47 @@ mod tests {
             }
             _ => panic!("Expected Ok response wrapping batch results"),
         }
+    }
+
+    #[test]
+    fn test_response_serde_roundtrip_preserves_variants() {
+        // Ok with cursor
+        let ok = Response::Ok {
+            result: json!([1, 2]),
+            next_cursor: Some("abc".to_string()),
+        };
+        let s = serde_json::to_string(&ok).unwrap();
+        assert_eq!(serde_json::from_str::<Response>(&s).unwrap(), ok);
+
+        // Err without partial result
+        let err = Response::err(ErrorObject {
+            code: "KIP_2001".to_string(),
+            message: "boom".to_string(),
+            hint: None,
+            data: None,
+        });
+        let s = serde_json::to_string(&err).unwrap();
+        assert_eq!(serde_json::from_str::<Response>(&s).unwrap(), err);
+
+        // Err WITH partial result: must not deserialize into Ok (the
+        // `error` key wins over the presence of `result`).
+        let err_partial = Response::Err {
+            error: ErrorObject {
+                code: "KIP_2001".to_string(),
+                message: "boom".to_string(),
+                hint: None,
+                data: None,
+            },
+            result: Some(json!([1, 2])),
+        };
+        let s = serde_json::to_string(&err_partial).unwrap();
+        let back: Response = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, err_partial);
+        assert!(matches!(back, Response::Err { .. }));
+
+        // Neither `result` nor `error` is invalid.
+        assert!(serde_json::from_str::<Response>("{}").is_err());
+        // Non-object responses are invalid.
+        assert!(serde_json::from_str::<Response>("[1,2]").is_err());
     }
 }

@@ -45,8 +45,9 @@ impl fmt::Display for ConceptPK {
     /// - Object variant: `{type: "<type>", name: "<name>"}`
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            // `{id: "<id>"}`
-            ConceptPK::ID(id) => write!(f, "{{id: {:?}}}", EntityID::Concept(*id)),
+            // `{id: "<id>"}` — valid KIP syntax so error messages remain
+            // directly reusable by self-correcting agents.
+            ConceptPK::ID(id) => write!(f, "{{id: \"{}\"}}", EntityID::Concept(*id)),
             // `{type: "<type>", name: "<name>"}`
             ConceptPK::Object { r#type, name } => {
                 write!(f, "{{type: {:?}, name: {:?}}}", r#type, name)
@@ -116,10 +117,11 @@ impl fmt::Display for PropositionPK {
     /// - Object variant: `(<subject>, "<predicate>", <object>)`
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            // `(id: "<link_id>")`
+            // `(id: "<link_id>")` — valid KIP syntax so error messages remain
+            // directly reusable by self-correcting agents.
             PropositionPK::ID(id, predicate) => write!(
                 f,
-                "(id: {:?})",
+                "(id: \"{}\")",
                 EntityID::Proposition(*id, predicate.clone()),
             ),
             // `(?subject, "<predicate>", ?object)`
@@ -298,6 +300,25 @@ pub struct QueryContext {
     pub regex_cache: FxHashMap<String, regex::Regex>,
 }
 
+impl QueryContext {
+    /// Lightweight child context for `NOT` / `OPTIONAL` sub-blocks: shares
+    /// the entity cache and copies only the variable bindings.
+    ///
+    /// Relations, groups, row-sensitive markers and the regex cache start
+    /// empty on purpose — sub-block execution only reads/narrows the
+    /// bindings, and the parent merges back exactly the state it needs.
+    /// This avoids cloning potentially large relation row sets on every
+    /// `NOT` / `OPTIONAL` clause.
+    pub fn scoped_child(&self) -> Self {
+        QueryContext {
+            entities: self.entities.clone(),
+            predicates: self.predicates.clone(),
+            cache: self.cache.clone(),
+            ..Default::default()
+        }
+    }
+}
+
 /// Thread-safe cache for storing loaded entities during query execution.
 ///
 /// This cache improves performance by avoiding redundant database queries
@@ -336,16 +357,20 @@ pub struct QueryRelationBinding {
 }
 
 /// One concrete proposition-clause match.
+///
+/// Fields are `Option` so that `OPTIONAL` blocks can contribute
+/// **left-join padded rows**: a row whose anchor variable is bound but whose
+/// other positions are `None` projects `null` per KIP §3.4.7.2.
 #[derive(Clone, Debug)]
 pub struct QueryRelationRow {
-    /// Matched proposition id.
-    pub proposition: EntityID,
-    /// Matched subject entity id.
-    pub subject: EntityID,
-    /// Matched predicate name.
-    pub predicate: String,
-    /// Matched object entity id.
-    pub object: EntityID,
+    /// Matched proposition id (`None` in an OPTIONAL-padded row).
+    pub proposition: Option<EntityID>,
+    /// Matched subject entity id (`None` in an OPTIONAL-padded row).
+    pub subject: Option<EntityID>,
+    /// Matched predicate name (`None` in an OPTIONAL-padded row).
+    pub predicate: Option<String>,
+    /// Matched object entity id (`None` in an OPTIONAL-padded row).
+    pub object: Option<EntityID>,
 }
 
 /// Specifies the target entities for query operations.
@@ -438,10 +463,10 @@ impl PropositionsMatchResult {
             self.matched_propositions.push(proposition.clone());
             self.matched_predicates.push(pred.clone());
             self.rows.push(QueryRelationRow {
-                proposition,
-                subject: subject.clone(),
-                predicate: pred,
-                object: object.clone(),
+                proposition: Some(proposition),
+                subject: Some(subject.clone()),
+                predicate: Some(pred),
+                object: Some(object.clone()),
             });
         }
     }
@@ -491,7 +516,7 @@ mod tests {
     #[test]
     fn concept_pk_display_and_try_from_matcher_cover_success_and_errors() {
         let by_id = ConceptPK::ID(7);
-        assert_eq!(by_id.to_string(), "{id: Concept(7)}");
+        assert_eq!(by_id.to_string(), r#"{id: "C:7"}"#);
 
         let by_object = ConceptPK::Object {
             r#type: "Person".to_string(),
@@ -520,7 +545,7 @@ mod tests {
     #[test]
     fn proposition_and_entity_pk_conversions_cover_nested_targets() {
         let proposition = PropositionPK::ID(9, "likes".to_string());
-        assert_eq!(proposition.to_string(), r#"(id: Proposition(9, "likes"))"#);
+        assert_eq!(proposition.to_string(), r#"(id: "P:9:likes")"#);
         assert_eq!(
             PropositionPK::try_from(PropositionMatcher::ID("P:9:likes".to_string())).unwrap(),
             proposition
@@ -537,7 +562,7 @@ mod tests {
         let object_pk = PropositionPK::try_from(matcher).unwrap();
         assert_eq!(
             object_pk.to_string(),
-            r#"({type: "Person", name: "Ada"}, "likes", {id: Concept(2)})"#
+            r#"({type: "Person", name: "Ada"}, "likes", {id: "C:2"})"#
         );
 
         assert!(PropositionPK::try_from(PropositionMatcher::ID("C:9".to_string())).is_err());
@@ -639,10 +664,10 @@ mod tests {
         );
 
         let row = QueryRelationRow {
-            proposition: EntityID::Proposition(2, "likes".to_string()),
-            subject: concept_ref(1),
-            predicate: "likes".to_string(),
-            object: concept_ref(3),
+            proposition: Some(EntityID::Proposition(2, "likes".to_string())),
+            subject: Some(concept_ref(1)),
+            predicate: Some("likes".to_string()),
+            object: Some(concept_ref(3)),
         };
         let binding = QueryRelationBinding {
             proposition_var: Some("p".to_string()),

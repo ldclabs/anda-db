@@ -519,11 +519,16 @@ async fn test_kql_find_concepts() {
             .and_then(|v| v.as_str().map(|s| s.ends_with('Z')))
             .unwrap_or(false)
     );
+    // Avoid asserting the raw doc id: it shifts whenever the bundled
+    // bootstrap capsules add or remove concepts.
+    let id = result[0]["id"].as_str().unwrap().to_string();
+    assert!(id.starts_with("C:"), "unexpected id: {id}");
+    result[0]["id"] = json!("C:<dyn>");
     assert_eq!(
         result,
         json!([{
             "_type":"ConceptNode",
-            "id":"C:28",
+            "id":"C:<dyn>",
             "type":"Drug",
             "name":"Aspirin",
             "attributes":{"dosage":"325mg","molecular_formula":"C9H8O4","risk_level":2},
@@ -567,7 +572,9 @@ async fn test_kql_proposition_matching() {
 
     let query = parse_kql(kql).unwrap();
     let (result, _) = nexus.execute_kql(query).await.unwrap();
-    assert_eq!(result, json!([["Aspirin"], ["Headache", "Fever"]]));
+    // Columnar result model (KIP §6.2.2): (Aspirin, Headache) and
+    // (Aspirin, Fever) are two solutions, so the columns stay index-aligned.
+    assert_eq!(result, json!([["Aspirin", "Aspirin"], ["Headache", "Fever"]]));
 
     let kql = r#"
         FIND(?drug.name, ?symptom.name)
@@ -579,7 +586,7 @@ async fn test_kql_proposition_matching() {
 
     let query = parse_kql(kql).unwrap();
     let (result, _) = nexus.execute_kql(query).await.unwrap();
-    assert_eq!(result, json!([["Aspirin"], ["Headache", "Fever"]]));
+    assert_eq!(result, json!([["Aspirin", "Aspirin"], ["Headache", "Fever"]]));
 
     let kql = r#"
         FIND(?drug.name, ?symptom.name)
@@ -1171,8 +1178,9 @@ async fn test_kql_multi_hop_bidirectional_matching() {
         "#;
     let query = parse_kql(kql).unwrap();
     let (result, _) = nexus.execute_kql(query).await.unwrap();
-    // 超出实际路径长度，应该为空
-    assert_eq!(result, json!([["Aspirin"], []]));
+    // 超出实际路径长度：最后一个模式无解，WHERE 各子句是 AND 关系，
+    // 因此整个解集为空 —— 所有投影列都为空。
+    assert_eq!(result, json!([[], []]));
 }
 
 #[tokio::test]
@@ -1298,7 +1306,12 @@ async fn test_kql_optional_clause() {
 
     let query = parse_kql(kql).unwrap();
     let (result, _) = nexus.execute_kql(query).await.unwrap();
-    assert_eq!(result, json!([["Headache", "Fever"], ["Aspirin"]]));
+    // Columnar result model (KIP §6.2.2): (Headache, Aspirin) and
+    // (Fever, Aspirin) are two solutions, so ?drug.name repeats.
+    assert_eq!(
+        result,
+        json!([["Headache", "Fever"], ["Aspirin", "Aspirin"]])
+    );
 
     let kql = r#"
         FIND(?symptom.name, ?drug.name)
@@ -1312,7 +1325,9 @@ async fn test_kql_optional_clause() {
 
     let query = parse_kql(kql).unwrap();
     let (result, _) = nexus.execute_kql(query).await.unwrap();
-    assert_eq!(result, json!([["Headache", "Fever"], []]));
+    // OPTIONAL miss keeps the solution and projects null for the unbound
+    // variable (KIP §3.4.7.2).
+    assert_eq!(result, json!([["Headache", "Fever"], [null, null]]));
 
     let kql = r#"
         FIND(?symptom.name, ?drug.name)
@@ -1642,10 +1657,13 @@ async fn test_kml_upsert_proposition() {
     let query = parse_kql(kql).unwrap();
     let (result, _) = nexus.execute_kql(query).await.unwrap();
     let result = result.as_array().unwrap();
+    // Columnar result model (KIP §6.2.2): the two solutions
+    // (link1, Aspirin, Headache) / (link2, Aspirin, Fever) keep every
+    // column index-aligned, so ?drug.name repeats per solution.
     assert_eq!(
         json!(result[1..]),
         json!([
-            ["Aspirin".to_string()],
+            ["Aspirin".to_string(), "Aspirin".to_string()],
             ["Headache".to_string(), "Fever".to_string()]
         ])
     );
@@ -1863,8 +1881,20 @@ async fn test_kml_delete_attributes_and_metadata_for_concepts_and_propositions()
         .await
         .unwrap();
 
-    let dry_run_metadata = r#"
+    // dry_run validates the statement's logic: an unbound target is a
+    // reference error even without executing.
+    let dry_run_metadata_missing = r#"
         DELETE METADATA {"drop_meta"} FROM ?missing
+        WHERE { ?person {type: "DeletePerson", name: "Alice"} }
+        "#;
+    let err = nexus
+        .execute_kml(parse_kml(dry_run_metadata_missing).unwrap(), true)
+        .await
+        .unwrap_err();
+    assert!(matches!(err.code, KipErrorCode::ReferenceError));
+
+    let dry_run_metadata = r#"
+        DELETE METADATA {"drop_meta"} FROM ?person
         WHERE { ?person {type: "DeletePerson", name: "Alice"} }
         "#;
     assert_eq!(
@@ -2143,20 +2173,16 @@ async fn test_meta_describe_primer() {
     let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
     setup_test_data(&nexus).await.unwrap();
 
+    // `$self` is applied by the application, not the bundled capsules: the
+    // PRIMER degrades its identity layer to `null` instead of failing, so
+    // agents still get the domain map on a fresh nexus.
     let meta_cmd = MetaCommand::Describe(DescribeTarget::Primer);
-    let result = nexus.execute_meta(meta_cmd).await;
-    assert!(result.is_err());
-    assert!(matches!(
-        result.as_ref().unwrap_err().code,
-        KipErrorCode::NotFound
-    ));
-    assert!(
-        result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains(r#"{type: "Person", name: "$self"}"#)
-    );
+    let (result, _) = nexus.execute_meta(meta_cmd).await.unwrap();
+    let primer = result.as_object().unwrap();
+    assert!(primer["identity"].is_null());
+    assert!(primer["domain_map"].is_array());
+    // Out-of-band SEARCH capability advertisement (KIP §5.2.1).
+    assert_eq!(primer["search_modes"], json!(["keyword"]));
 
     let kml = PERSON_SELF_KIP.replace(
         "$self_reserved_principal_id",
@@ -2176,7 +2202,7 @@ async fn test_meta_describe_primer() {
     assert!(result.is_object());
 
     let primer = result.as_object().unwrap();
-    assert!(primer.contains_key("identity"));
+    assert!(primer["identity"].is_object());
     assert!(primer.contains_key("domain_map"));
 }
 
@@ -2191,9 +2217,18 @@ async fn test_meta_describe_domains() {
         .unwrap();
     let domains = result.as_array().unwrap();
     // println!("{:#?}", domains);
-    assert_eq!(domains.len(), 3);
+    // Genesis bootstrap (KIP RC10 Appendix 2): CoreSchema plus the three
+    // operational domains Unsorted / Archived / System.
+    assert_eq!(domains.len(), 4);
     assert_eq!(domains[0]["type"], "Domain");
     assert_eq!(domains[0]["name"], "CoreSchema");
+    let names: Vec<&str> = domains
+        .iter()
+        .filter_map(|d| d["name"].as_str())
+        .collect();
+    for expected in ["CoreSchema", "Unsorted", "Archived", "System"] {
+        assert!(names.contains(&expected), "missing domain {expected}");
+    }
 }
 
 #[tokio::test]
@@ -2466,11 +2501,18 @@ async fn test_complex_query_scenario() {
     // println!("{:#?}", result);
     let result = result.as_array().unwrap();
     assert_eq!(result.len(), 3);
-    assert_eq!(result[0], json!(["Aspirin".to_string()]));
+    // Columnar result model (KIP §6.2.2): one column per FIND expression,
+    // index-aligned across solutions — (Aspirin, Headache) and
+    // (Aspirin, Fever) are two solutions, so ?drug.name repeats.
+    assert_eq!(
+        result[0],
+        json!(["Aspirin".to_string(), "Aspirin".to_string()])
+    );
     assert_eq!(
         result[1],
         json!(["Headache".to_string(), "Fever".to_string()])
     );
+    assert_eq!(result[2].as_array().unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -2659,21 +2701,21 @@ async fn test_kql_filter_not_and_invalid_function_arguments() {
     let (result, _) = nexus.execute_kql(query).await.unwrap();
     assert_eq!(result, json!(["Aspirin"]));
 
-    let mut ctx = QueryContext::default();
-    let mut bindings_snapshot = FxHashMap::default();
-    let mut bindings_cursor = FxHashMap::default();
+    let ctx = QueryContext::default();
+    let mut regex_cache = FxHashMap::default();
+    let assign = kql::FilterAssignment::default();
     let err = nexus
-        .evaluate_filter_expression(
-            &mut ctx,
-            FilterExpression::Function {
+        .eval_filter_assigned(
+            &ctx.cache,
+            &mut regex_cache,
+            &FilterExpression::Function {
                 func: FilterFunction::IsNull,
                 args: vec![
                     FilterOperand::Literal("a".into()),
                     FilterOperand::Literal("b".into()),
                 ],
             },
-            &mut bindings_snapshot,
-            &mut bindings_cursor,
+            &assign,
         )
         .await
         .unwrap_err();
@@ -2681,17 +2723,17 @@ async fn test_kql_filter_not_and_invalid_function_arguments() {
     assert!(err.message.contains("requires exactly 1 argument"));
 
     let err = nexus
-        .evaluate_filter_expression(
-            &mut ctx,
-            FilterExpression::Function {
+        .eval_filter_assigned(
+            &ctx.cache,
+            &mut regex_cache,
+            &FilterExpression::Function {
                 func: FilterFunction::In,
                 args: vec![
                     FilterOperand::Literal("Aspirin".into()),
                     FilterOperand::Literal("Aspirin".into()),
                 ],
             },
-            &mut bindings_snapshot,
-            &mut bindings_cursor,
+            &assign,
         )
         .await
         .unwrap_err();
@@ -2699,14 +2741,14 @@ async fn test_kql_filter_not_and_invalid_function_arguments() {
     assert!(err.message.contains("IN second argument"));
 
     let err = nexus
-        .evaluate_filter_expression(
-            &mut ctx,
-            FilterExpression::Function {
+        .eval_filter_assigned(
+            &ctx.cache,
+            &mut regex_cache,
+            &FilterExpression::Function {
                 func: FilterFunction::Contains,
                 args: vec![FilterOperand::Literal("Aspirin".into())],
             },
-            &mut bindings_snapshot,
-            &mut bindings_cursor,
+            &assign,
         )
         .await
         .unwrap_err();
@@ -2725,10 +2767,10 @@ async fn test_private_relation_row_helpers_and_predicate_value_loading() {
         rows: vec![],
     };
     let row = QueryRelationRow {
-        proposition: EntityID::Proposition(7, "knows".to_string()),
-        subject: EntityID::Concept(1),
-        predicate: "knows".to_string(),
-        object: EntityID::Concept(2),
+        proposition: Some(EntityID::Proposition(7, "knows".to_string())),
+        subject: Some(EntityID::Concept(1)),
+        predicate: Some("knows".to_string()),
+        object: Some(EntityID::Concept(2)),
     };
 
     assert!(CognitiveNexus::relation_covers_var(&relation, "link"));
@@ -2738,15 +2780,15 @@ async fn test_private_relation_row_helpers_and_predicate_value_loading() {
     assert!(!CognitiveNexus::relation_covers_var(&relation, "missing"));
     assert_eq!(
         CognitiveNexus::relation_row_entity(&relation, &row, "link"),
-        Some(&row.proposition)
+        Some(row.proposition.as_ref())
     );
     assert_eq!(
         CognitiveNexus::relation_row_entity(&relation, &row, "subject"),
-        Some(&row.subject)
+        Some(row.subject.as_ref())
     );
     assert_eq!(
         CognitiveNexus::relation_row_entity(&relation, &row, "object"),
-        Some(&row.object)
+        Some(row.object.as_ref())
     );
     assert_eq!(
         CognitiveNexus::relation_row_entity(&relation, &row, "pred"),
@@ -2754,11 +2796,28 @@ async fn test_private_relation_row_helpers_and_predicate_value_loading() {
     );
     assert_eq!(
         CognitiveNexus::relation_row_predicate(&relation, &row, "pred"),
-        Some("knows")
+        Some(Some("knows"))
     );
     assert_eq!(
         CognitiveNexus::relation_row_predicate(&relation, &row, "subject"),
         None
+    );
+
+    // OPTIONAL-padded rows: covered positions with `None` values project
+    // null and are unconstrained during context matching.
+    let padded = QueryRelationRow {
+        proposition: None,
+        subject: Some(EntityID::Concept(1)),
+        predicate: None,
+        object: None,
+    };
+    assert_eq!(
+        CognitiveNexus::relation_row_entity(&relation, &padded, "object"),
+        Some(None)
+    );
+    assert_eq!(
+        CognitiveNexus::relation_row_predicate(&relation, &padded, "pred"),
+        Some(None)
     );
 
     let mut ctx = QueryContext::default();
@@ -2922,7 +2981,9 @@ async fn test_kql_find_predicate_variable() {
     assert_eq!(page2.len(), 1);
     assert_ne!(page1[0], page2[0]);
 
-    // Test 3: FIND with literal predicate (not a variable) should still work
+    // Test 3: FIND with literal predicate (not a variable) should still work.
+    // Columnar result model (KIP §6.2.2): two solutions keep the columns
+    // index-aligned, so ?drug.name repeats.
     let kql = r#"
         FIND(?drug.name, ?symptom.name)
         WHERE {
@@ -2932,7 +2993,10 @@ async fn test_kql_find_predicate_variable() {
         "#;
     let query = parse_kql(kql).unwrap();
     let (result, _) = nexus.execute_kql(query).await.unwrap();
-    assert_eq!(result, json!([["Aspirin"], ["Headache", "Fever"]]));
+    assert_eq!(
+        result,
+        json!([["Aspirin", "Aspirin"], ["Headache", "Fever"]])
+    );
 
     // Test 4: Unbound variable should still produce an error
     let kql = r#"
@@ -4424,7 +4488,8 @@ async fn test_meta_export_round_trip() {
         )
         .await
         .unwrap();
-    assert_eq!(result, json!([[2], ["Headache", "Fever"]]));
+    // Columnar result model (KIP §6.2.2): two solutions, index-aligned.
+    assert_eq!(result, json!([[2, 2], ["Headache", "Fever"]]));
     let (result, _) = second
         .execute_kql(
             parse_kql(
@@ -4539,4 +4604,710 @@ async fn test_meta_search_modes_threshold_and_score() {
         assert_eq!(hit["predicate"], json!("treats"));
         assert!(hit["metadata"]["_score"].as_f64().unwrap() > 0.0);
     }
+}
+
+// --- Regression tests for the 2026-07 KIP RC10 review fixes ---
+
+/// NOT is a pure filter (KIP §3.4.7.1): it must only narrow variables its
+/// own pattern references — outer bindings it never mentions survive.
+#[tokio::test]
+async fn test_kql_not_clause_preserves_unrelated_bindings() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_test_data(&nexus).await.unwrap();
+
+    let setup = r#"
+        UPSERT {
+            CONCEPT ?cat_type { {type: "$ConceptType", name: "Category"} }
+            CONCEPT ?btc { {type: "$PropositionType", name: "belongs_to_class"} }
+            CONCEPT ?nsaid { {type: "Category", name: "NSAID"} }
+            CONCEPT ?aspirin {
+                {type: "Drug", name: "Aspirin"}
+                SET PROPOSITIONS { ("belongs_to_class", ?nsaid) }
+            }
+            CONCEPT ?vitamin {
+                {type: "Drug", name: "VitaminC"}
+                SET PROPOSITIONS {
+                    ("treats", {type: "Symptom", name: "Headache"})
+                }
+            }
+        }
+        "#;
+    nexus
+        .execute_kml(parse_kml(setup).unwrap(), false)
+        .await
+        .unwrap();
+
+    // ?headache is bound outside NOT and never mentioned inside it.
+    let kql = r#"
+        FIND(?drug.name, ?headache.name)
+        WHERE {
+            ?drug {type: "Drug"}
+            ?headache {type: "Symptom", name: "Headache"}
+            (?drug, "treats", ?headache)
+            NOT {
+                (?drug, "belongs_to_class", {type: "Category", name: "NSAID"})
+            }
+        }
+        "#;
+    let (result, _) = nexus
+        .execute_kql(parse_kql(kql).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(result, json!([["VitaminC"], ["Headache"]]));
+}
+
+/// `{0,n}` includes the zero-hop reflexive match (KIP §3.4.2), and explicit
+/// quantifiers beyond the engine cap fail with KIP_4002 instead of being
+/// silently truncated.
+#[tokio::test]
+async fn test_kql_multi_hop_zero_hop_and_cap() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_test_data(&nexus).await.unwrap();
+
+    let setup = r#"
+        UPSERT {
+            CONCEPT ?cat_type { {type: "$ConceptType", name: "Category"} }
+            CONCEPT ?isa { {type: "$PropositionType", name: "is_subclass_of"} }
+            CONCEPT ?a { {type: "Category", name: "CatA"} }
+            CONCEPT ?b {
+                {type: "Category", name: "CatB"}
+                SET PROPOSITIONS { ("is_subclass_of", ?a) }
+            }
+            CONCEPT ?c {
+                {type: "Category", name: "CatC"}
+                SET PROPOSITIONS { ("is_subclass_of", ?b) }
+            }
+        }
+        "#;
+    nexus
+        .execute_kml(parse_kml(setup).unwrap(), false)
+        .await
+        .unwrap();
+
+    let kql = r#"
+        FIND(?parent.name)
+        WHERE {
+            ?concept {type: "Category", name: "CatC"}
+            (?concept, "is_subclass_of"{0,5}, ?parent)
+        }
+        "#;
+    let (result, _) = nexus
+        .execute_kql(parse_kql(kql).unwrap())
+        .await
+        .unwrap();
+    let names = result.as_array().unwrap();
+    for expected in ["CatC", "CatB", "CatA"] {
+        assert!(names.contains(&json!(expected)), "missing {expected}: {names:?}");
+    }
+
+    // Explicit bounds beyond the cap are rejected, not silently truncated.
+    for quantifier in ["{1,20}", "{12,}"] {
+        let kql = format!(
+            r#"FIND(?parent.name)
+               WHERE {{
+                   ?concept {{type: "Category", name: "CatC"}}
+                   (?concept, "is_subclass_of"{quantifier}, ?parent)
+               }}"#
+        );
+        let err = nexus
+            .execute_kql(parse_kql(&kql).unwrap())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err.code, KipErrorCode::ResourceExhausted),
+            "{quantifier}: {err:?}"
+        );
+    }
+}
+
+/// Predicate variables participate in FILTER (KIP §3.4.2) — the associative
+/// recall pattern from the spec.
+#[tokio::test]
+async fn test_kql_filter_on_predicate_variable() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_test_data(&nexus).await.unwrap();
+
+    let setup = r#"
+        UPSERT {
+            CONCEPT ?cat_type { {type: "$ConceptType", name: "Category"} }
+            CONCEPT ?btc { {type: "$PropositionType", name: "belongs_to_class"} }
+            CONCEPT ?nsaid { {type: "Category", name: "NSAID"} }
+            CONCEPT ?aspirin {
+                {type: "Drug", name: "Aspirin"}
+                SET PROPOSITIONS { ("belongs_to_class", ?nsaid) }
+            }
+        }
+        "#;
+    nexus
+        .execute_kml(parse_kml(setup).unwrap(), false)
+        .await
+        .unwrap();
+
+    let kql = r#"
+        FIND(?pred, ?neighbor.name)
+        WHERE {
+            ?a {type: "Drug", name: "Aspirin"}
+            ?link (?a, ?pred, ?neighbor)
+            FILTER(?pred != "belongs_to_class")
+        }
+        LIMIT 50
+        "#;
+    let (result, _) = nexus
+        .execute_kql(parse_kql(kql).unwrap())
+        .await
+        .unwrap();
+    let cols = result.as_array().unwrap();
+    assert_eq!(cols[0], json!(["treats", "treats"]));
+    let neighbors = cols[1].as_array().unwrap();
+    assert!(neighbors.contains(&json!("Headache")));
+    assert!(neighbors.contains(&json!("Fever")));
+}
+
+/// The RC10 sleep-cycle confidence-decay UPDATE: fully unconstrained
+/// `(?s, ?p, ?o)` exploration plus predicate-variable FILTER plus update
+/// expressions, in one statement.
+#[tokio::test]
+async fn test_kml_update_decay_with_full_scan_pattern() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_test_data(&nexus).await.unwrap();
+
+    let update = r#"
+        UPDATE ?link
+        SET METADATA {
+            confidence: CLAMP(MUL(?link.metadata.confidence, 0.9), 0.0, 1.0),
+            decay_applied_at: "2026-07-05T00:00:00Z"
+        }
+        WHERE {
+            ?link (?s, ?p, ?o)
+            FILTER(?p != "belongs_to_domain")
+            FILTER(?link.metadata.confidence > 0.3 && ?link.metadata.confidence < 1.0)
+        }
+        LIMIT 500
+        "#;
+    let result = nexus
+        .execute_kml(parse_kml(update).unwrap(), false)
+        .await
+        .unwrap();
+    // Exactly the two `treats` links carry confidence 0.95; the bootstrap
+    // `belongs_to_domain` links (confidence 1.0) are spared twice over.
+    assert_eq!(result["updated"], json!(2));
+    assert_eq!(result["matched"], json!(2));
+
+    let (confidences, _) = nexus
+        .execute_kql(
+            parse_kql(
+                r#"FIND(?link.metadata.confidence)
+                   WHERE { ?link (?s, "treats", ?o) }"#,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    for value in confidences.as_array().unwrap() {
+        let v = value.as_f64().unwrap();
+        assert!((v - 0.855).abs() < 1e-9, "confidence not decayed: {v}");
+    }
+}
+
+/// MERGE provenance survives chained merges (source `_merged_from` entries
+/// carry over, deduplicated) and a replayed merge self-diagnoses via the
+/// target's `_merged_from` (KIP §4.4).
+#[tokio::test]
+async fn test_kml_merge_chained_provenance_and_replay_hint() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_test_data(&nexus).await.unwrap();
+
+    let setup = r#"
+        UPSERT {
+            CONCEPT ?cat_type { {type: "$ConceptType", name: "Category"} }
+            CONCEPT ?a { {type: "Category", name: "CatA"} }
+            CONCEPT ?b { {type: "Category", name: "CatB"} }
+            CONCEPT ?c { {type: "Category", name: "CatC"} }
+        }
+        "#;
+    nexus
+        .execute_kml(parse_kml(setup).unwrap(), false)
+        .await
+        .unwrap();
+
+    let merge_a_into_b = r#"
+        MERGE CONCEPT ?dup INTO ?canonical
+        WHERE {
+            ?dup {type: "Category", name: "CatA"}
+            ?canonical {type: "Category", name: "CatB"}
+        }
+        "#;
+    nexus
+        .execute_kml(parse_kml(merge_a_into_b).unwrap(), false)
+        .await
+        .unwrap();
+
+    let merge_b_into_c = r#"
+        MERGE CONCEPT ?dup INTO ?canonical
+        WHERE {
+            ?dup {type: "Category", name: "CatB"}
+            ?canonical {type: "Category", name: "CatC"}
+        }
+        "#;
+    nexus
+        .execute_kml(parse_kml(merge_b_into_c).unwrap(), false)
+        .await
+        .unwrap();
+
+    let cat_c = nexus
+        .get_concept(&ConceptPK::Object {
+            r#type: "Category".to_string(),
+            name: "CatC".to_string(),
+        })
+        .await
+        .unwrap();
+    // Chained provenance: CatA's trail rode along when CatB merged in.
+    assert_eq!(
+        cat_c.metadata["_merged_from"],
+        json!(["Category:CatA", "Category:CatB"])
+    );
+
+    // Replaying the second merge self-diagnoses as "already merged".
+    let err = nexus
+        .execute_kml(parse_kml(merge_b_into_c).unwrap(), false)
+        .await
+        .unwrap_err();
+    assert!(matches!(err.code, KipErrorCode::NotFound));
+    assert!(
+        err.message.contains("already"),
+        "hint missing from: {}",
+        err.message
+    );
+}
+
+/// DELETE PROPOSITIONS cascades to higher-order propositions referencing the
+/// deleted links, leaving no dangling references (same guarantee as
+/// DELETE CONCEPT ... DETACH).
+#[tokio::test]
+async fn test_kml_delete_propositions_cascades_higher_order() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_test_data(&nexus).await.unwrap();
+
+    let setup = r#"
+        UPSERT {
+            CONCEPT ?stated { {type: "$PropositionType", name: "stated"} }
+            CONCEPT ?alice { {type: "Person", name: "Alice"} }
+            PROPOSITION ?statement {
+                (
+                    {type: "Person", name: "Alice"},
+                    "stated",
+                    ({type: "Drug", name: "Aspirin"}, "treats", {type: "Symptom", name: "Headache"})
+                )
+            }
+        }
+        "#;
+    nexus
+        .execute_kml(parse_kml(setup).unwrap(), false)
+        .await
+        .unwrap();
+
+    let delete = r#"
+        DELETE PROPOSITIONS ?link
+        WHERE {
+            ?link (?s, "treats", {type: "Symptom", name: "Headache"})
+        }
+        "#;
+    let result = nexus
+        .execute_kml(parse_kml(delete).unwrap(), false)
+        .await
+        .unwrap();
+    // The treats link plus the higher-order stated link.
+    assert_eq!(result["deleted_propositions"], json!(2));
+
+    let (stated, _) = nexus
+        .execute_kql(
+            parse_kql(r#"FIND(?st) WHERE { ?st (?who, "stated", ?what) }"#).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stated, json!([]));
+}
+
+/// EXPORT paginates with LIMIT + CURSOR (KIP §5.3): each page is an
+/// independently valid capsule and the cursor resumes deterministically.
+#[tokio::test]
+async fn test_meta_export_pagination() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_test_data(&nexus).await.unwrap();
+
+    let page1_cmd = r#"EXPORT ?n WHERE { ?n {type: "Symptom"} } LIMIT 1"#;
+    let (page1, cursor) = nexus
+        .execute_meta(parse_meta(page1_cmd).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(page1["concepts"], json!(1));
+    let cursor = cursor.expect("first page must return a cursor");
+
+    let page2_cmd =
+        format!(r#"EXPORT ?n WHERE {{ ?n {{type: "Symptom"}} }} LIMIT 1 CURSOR "{cursor}""#);
+    let (page2, cursor2) = nexus
+        .execute_meta(parse_meta(&page2_cmd).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(page2["concepts"], json!(1));
+    assert_ne!(page1["capsule"], page2["capsule"]);
+    assert!(cursor2.is_none(), "two symptoms fit in two pages");
+
+    // Both pages import cleanly into a fresh nexus (given the schema).
+    let second = setup_test_db(async |_| Ok(())).await.unwrap();
+    second
+        .execute_kml(
+            parse_kml(r#"UPSERT { CONCEPT ?t { {type: "$ConceptType", name: "Symptom"} } }"#)
+                .unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+    for page in [&page1, &page2] {
+        let capsule = page["capsule"].as_str().unwrap();
+        second
+            .execute_kml(parse_kml(capsule).unwrap(), false)
+            .await
+            .unwrap();
+    }
+    let (symptoms, _) = second
+        .execute_kql(parse_kql(r#"FIND(?s.name) WHERE { ?s {type: "Symptom"} }"#).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(symptoms.as_array().unwrap().len(), 2);
+}
+
+/// ORDER BY sorts null (missing) keys last regardless of direction
+/// (KIP §3.5).
+#[tokio::test]
+async fn test_kql_order_by_nulls_last() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_test_data(&nexus).await.unwrap();
+
+    let setup = r#"
+        UPSERT {
+            CONCEPT ?unscored {
+                {type: "Drug", name: "UnscoredDrug"}
+            }
+            CONCEPT ?strong {
+                {type: "Drug", name: "StrongDrug"}
+                SET ATTRIBUTES { "risk_level": 5 }
+            }
+        }
+        "#;
+    nexus
+        .execute_kml(parse_kml(setup).unwrap(), false)
+        .await
+        .unwrap();
+
+    for direction in ["ASC", "DESC"] {
+        let kql = format!(
+            r#"FIND(?drug.name)
+               WHERE {{ ?drug {{type: "Drug"}} }}
+               ORDER BY ?drug.attributes.risk_level {direction}"#
+        );
+        let (result, _) = nexus
+            .execute_kql(parse_kql(&kql).unwrap())
+            .await
+            .unwrap();
+        let names = result.as_array().unwrap();
+        assert_eq!(
+            names.last(),
+            Some(&json!("UnscoredDrug")),
+            "null must sort last with {direction}: {names:?}"
+        );
+    }
+}
+
+/// Seeds three drugs with distinct risk levels for cross-variable FILTER and
+/// cartesian FIND tests.
+async fn setup_risk_ladder(nexus: &CognitiveNexus) {
+    let kml = r#"
+        UPSERT {
+            CONCEPT ?high {
+                {type: "Drug", name: "HighRisk"}
+                SET ATTRIBUTES { "risk_level": 5 }
+            }
+            CONCEPT ?mid {
+                {type: "Drug", name: "MidRisk"}
+                SET ATTRIBUTES { "risk_level": 3 }
+            }
+            CONCEPT ?low {
+                {type: "Drug", name: "LowRisk"}
+                SET ATTRIBUTES { "risk_level": 1 }
+            }
+        }
+        "#;
+    nexus
+        .execute_kml(parse_kml(kml).unwrap(), false)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_kql_filter_cross_variable_join_pairs() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_test_data(&nexus).await.unwrap();
+    setup_risk_ladder(&nexus).await;
+
+    // Two disconnected variables compared per solution (KIP §3.4.3): only
+    // combinations with d1.risk > d2.risk survive, and FIND must project the
+    // exact satisfying pairs, index-aligned (KIP §6.2.2).
+    // Risks: Aspirin 2, HighRisk 5, MidRisk 3, LowRisk 1.
+    let kql = r#"
+        FIND(?d1.name, ?d2.name)
+        WHERE {
+            ?d1 {type: "Drug"}
+            ?d2 {type: "Drug"}
+            FILTER(?d1.attributes.risk_level > ?d2.attributes.risk_level)
+        }
+        "#;
+    let (result, _) = nexus
+        .execute_kql(parse_kql(kql).unwrap())
+        .await
+        .unwrap();
+    let cols = result.as_array().unwrap();
+    assert_eq!(cols.len(), 2);
+    let c1 = cols[0].as_array().unwrap();
+    let c2 = cols[1].as_array().unwrap();
+    assert_eq!(c1.len(), c2.len(), "columns must be index-aligned: {result}");
+
+    let mut pairs: Vec<(String, String)> = c1
+        .iter()
+        .zip(c2.iter())
+        .map(|(a, b)| {
+            (
+                a.as_str().unwrap().to_string(),
+                b.as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    pairs.sort();
+    let mut expected = vec![
+        ("Aspirin".to_string(), "LowRisk".to_string()),   // 2 > 1
+        ("HighRisk".to_string(), "Aspirin".to_string()),  // 5 > 2
+        ("HighRisk".to_string(), "MidRisk".to_string()),  // 5 > 3
+        ("HighRisk".to_string(), "LowRisk".to_string()),  // 5 > 1
+        ("MidRisk".to_string(), "Aspirin".to_string()),   // 3 > 2
+        ("MidRisk".to_string(), "LowRisk".to_string()),   // 3 > 1
+    ];
+    expected.sort();
+    assert_eq!(pairs, expected);
+}
+
+#[tokio::test]
+async fn test_kql_filter_predicate_variable_narrows_link() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_test_data(&nexus).await.unwrap();
+
+    // Add a second predicate so the filter has something to exclude.
+    let kml = r#"
+        UPSERT {
+            CONCEPT ?p { {type: "$PropositionType", name: "alleviates"} }
+            CONCEPT ?a {
+                {type: "Drug", name: "Aspirin"}
+                SET PROPOSITIONS {
+                    ("alleviates", {type: "Symptom", name: "Headache"})
+                }
+            }
+        }
+        "#;
+    nexus
+        .execute_kml(parse_kml(kml).unwrap(), false)
+        .await
+        .unwrap();
+
+    // The memory-metabolism idiom: a predicate-variable FILTER must narrow
+    // the *link* variable too (the excluded predicate's links disappear from
+    // ?link), not just the predicate binding set.
+    let kql = r#"
+        FIND(?link.predicate)
+        WHERE {
+            ?link (?s, ?p, ?o)
+            FILTER(?p != "treats")
+        }
+        LIMIT 50
+        "#;
+    let (result, _) = nexus
+        .execute_kql(parse_kql(kql).unwrap())
+        .await
+        .unwrap();
+    let predicates = result.as_array().unwrap();
+    assert!(!predicates.is_empty());
+    assert!(
+        predicates.iter().all(|p| p != "treats"),
+        "links with the excluded predicate must be narrowed out: {result}"
+    );
+    assert!(predicates.contains(&json!("alleviates")));
+}
+
+#[tokio::test]
+async fn test_kql_find_disconnected_cartesian_alignment() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_test_data(&nexus).await.unwrap();
+
+    // Two variables with no connecting proposition: the solution set is the
+    // cartesian product, and the columns must stay index-aligned.
+    // 2 drugs would require another drug; setup has 1 drug × 2 symptoms.
+    let kql = r#"
+        FIND(?drug.name, ?symptom.name)
+        WHERE {
+            ?drug {type: "Drug"}
+            ?symptom {type: "Symptom"}
+        }
+        ORDER BY ?symptom.name ASC
+        "#;
+    let (result, _) = nexus
+        .execute_kql(parse_kql(kql).unwrap())
+        .await
+        .unwrap();
+    let cols = result.as_array().unwrap();
+    let c1 = cols[0].as_array().unwrap();
+    let c2 = cols[1].as_array().unwrap();
+    assert_eq!(c1.len(), 2, "1 drug × 2 symptoms = 2 solutions: {result}");
+    assert_eq!(c1.len(), c2.len(), "columns must be index-aligned");
+    assert_eq!(c1, &vec![json!("Aspirin"), json!("Aspirin")]);
+    assert_eq!(c2, &vec![json!("Fever"), json!("Headache")]);
+
+    // Offset-cursor pagination over the materialized rows.
+    let kql = r#"
+        FIND(?drug.name, ?symptom.name)
+        WHERE {
+            ?drug {type: "Drug"}
+            ?symptom {type: "Symptom"}
+        }
+        ORDER BY ?symptom.name ASC
+        LIMIT 1
+        "#;
+    let (page1, cursor) = nexus
+        .execute_kql(parse_kql(kql).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(page1.as_array().unwrap()[1], json!(["Fever"]));
+    let cursor = cursor.expect("first page must carry next_cursor");
+
+    let kql = format!(
+        r#"
+        FIND(?drug.name, ?symptom.name)
+        WHERE {{
+            ?drug {{type: "Drug"}}
+            ?symptom {{type: "Symptom"}}
+        }}
+        ORDER BY ?symptom.name ASC
+        LIMIT 1
+        CURSOR "{cursor}"
+        "#
+    );
+    let (page2, cursor2) = nexus
+        .execute_kql(parse_kql(&kql).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(page2.as_array().unwrap()[1], json!(["Headache"]));
+    assert!(cursor2.is_none(), "no further pages expected");
+}
+
+#[tokio::test]
+async fn test_kql_find_relation_with_loose_variable_alignment() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_test_data(&nexus).await.unwrap();
+
+    // A relation-connected pair (drug treats symptom) crossed with a loose
+    // variable (?tag): rows = relation rows × tag bindings, all aligned.
+    let kml = r#"
+        UPSERT {
+            CONCEPT ?tag_type { {type: "$ConceptType", name: "Tag"} }
+            CONCEPT ?t1 { {type: "Tag", name: "Verified"} }
+        }
+        "#;
+    nexus
+        .execute_kml(parse_kml(kml).unwrap(), false)
+        .await
+        .unwrap();
+
+    let kql = r#"
+        FIND(?drug.name, ?symptom.name, ?tag.name)
+        WHERE {
+            (?drug, "treats", ?symptom)
+            ?tag {type: "Tag"}
+        }
+        ORDER BY ?symptom.name ASC
+        "#;
+    let (result, _) = nexus
+        .execute_kql(parse_kql(kql).unwrap())
+        .await
+        .unwrap();
+    let cols = result.as_array().unwrap();
+    assert_eq!(cols.len(), 3);
+    let lens: Vec<usize> = cols
+        .iter()
+        .map(|c| c.as_array().unwrap().len())
+        .collect();
+    assert_eq!(lens, vec![2, 2, 2], "2 treats-rows × 1 tag: {result}");
+    assert_eq!(cols[1], json!(["Fever", "Headache"]));
+    assert_eq!(cols[2], json!(["Verified", "Verified"]));
+}
+
+#[tokio::test]
+async fn test_kql_filter_constant_expression() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_test_data(&nexus).await.unwrap();
+
+    // A constant-false FILTER discards every solution (and must not hang —
+    // the previous consume-based evaluator looped forever on it).
+    let kql = r#"
+        FIND(?drug.name)
+        WHERE {
+            ?drug {type: "Drug"}
+            FILTER("a" == "b")
+        }
+        "#;
+    let (result, _) = nexus
+        .execute_kql(parse_kql(kql).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(result, json!([]));
+
+    // A constant-true FILTER keeps everything.
+    let kql = r#"
+        FIND(?drug.name)
+        WHERE {
+            ?drug {type: "Drug"}
+            FILTER(1 < 2)
+        }
+        "#;
+    let (result, _) = nexus
+        .execute_kql(parse_kql(kql).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(result, json!(["Aspirin"]));
+}
+
+#[tokio::test]
+async fn test_kql_filter_cross_variable_inside_not() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_test_data(&nexus).await.unwrap();
+    setup_risk_ladder(&nexus).await;
+
+    // Cross-variable FILTER inside NOT (runs in the lightweight child
+    // context): exclude drugs that are riskier than some other drug —
+    // only the minimum-risk drug survives.
+    let kql = r#"
+        FIND(?d1.name)
+        WHERE {
+            ?d1 {type: "Drug"}
+            NOT {
+                ?d2 {type: "Drug"}
+                FILTER(?d1.attributes.risk_level > ?d2.attributes.risk_level)
+            }
+        }
+        "#;
+    let (result, _) = nexus
+        .execute_kql(parse_kql(kql).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        result,
+        json!(["LowRisk"]),
+        "only the least risky drug survives"
+    );
 }

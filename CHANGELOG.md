@@ -6,21 +6,47 @@ All notable changes to this workspace are documented in this file.
 
 ### Added
 
+- **KIP v1.0-RC10 specification** — Per-command result shapes (columnar `FIND` result model, solution-set deduplication), `CURSOR` pagination for `EXPORT`, structural `(s, "p", o)` references for higher-order endpoints, `SEARCH PROPOSITION ... WITH TYPE` predicate semantics, `MERGE` source provenance chaining and "already merged" replay self-diagnosis, zero-hop path semantics, bare-variable `ORDER BY` keys, `System`/`Unsorted`/`Archived` operational domains in Genesis bootstrap.
+- **EXPORT pagination** — `EXPORT` now supports `CURSOR` with deterministic, idempotent pages; each page is an independently valid capsule.
+- **FILTER predicate-variable support** — FILTER expressions over predicate variables (`(?s, ?p, ?o)` patterns) evaluate per-binding without per-iteration cloning.
+- **`handle_full_scan_matching`** — Supports the unconstrained `(?s, ?p, ?o)` proposition pattern for memory-metabolism operations (e.g., confidence-decay UPDATE).
+- **`compare_order_key`** — Numeric, boolean, datetime-aware string, and null-last ORDER BY semantics matching KIP §3.5.
+- **MERGE `diagnose_already_merged`** — Replay of an already-applied MERGE self-diagnoses when the source no longer exists but the target's `_merged_from` already records it.
+- **Genesis bootstrap: operational domains** — `Unsorted`, `Archived`, and `System` domains created by Genesis.kip; `Commitment` added to key concept types; `committed_to`/`owed_to` added to key predicates.
+
+### Changed
+
+- **`QueryRelationRow` fields are `Option`** — Enables OPTIONAL left-join padded rows: unbound positions project `null` per KIP §3.4.7.2.
+- **`ConceptPK`/`PropositionPK` Display emits valid KIP syntax** — `{id: "C:7"}` instead of `{id: Concept(7)}`, so error messages are directly reusable by self-correcting agents.
+- **`$system` type corrected** — From `System` to `Person`, consistent with `$self`.
+- **PRIMER degrades gracefully** — A nexus without `$self` still returns a complete domain map; `search_modes` advertises keyword-only capability out-of-band.
+- **Multi-hop traversal capped** — Explicit hop bounds beyond 10 return `KIP_4002`; `{m,}` unbounded quantifier is soft-capped.
+- **`instance_schema` meta-keys expanded** — Added `item_type` (for arrays), `enum`, and `default_value`; `Person.id` made optional.
+- **SleepTask domain** — Moved from CapsuleCreate to Genesis bootstrap; `SleepTask` instances belong to the `System` domain.
+- **Lightweight NOT/OPTIONAL sub-context** — `QueryContext::scoped_child` clones only variable bindings and shares the entity cache; `NOT` / `OPTIONAL` no longer clone the (potentially large) relation row sets, groups, or regex cache on every clause.
+
+### Fixed
+
+- **Response deserialization** — Custom `Deserialize` dispatches on `error` key presence so a response with both `error` and partial `result` always deserializes as `Err`, not silently as `Ok`.
+- **Cross-variable FILTER join semantics** — `FILTER` comparing two different variables (e.g. `FILTER(?a.risk > ?b.risk)`) now evaluates per solution (join) instead of positionally zipping each variable's bindings, which silently returned wrong or empty results. Predicate-variable filters (`FILTER(?p != "…")`) narrow the covering proposition (`?link`) itself, so the memory-metabolism `UPDATE` idiom operates on the correct target set.
+- **Multi-variable FIND column alignment** — When no single relation connects all projected variables, the solution set is materialized as their (capped) cartesian product so the columnar `FIND` result stays index-aligned across solutions per KIP §6.2.2; previously the columns could have mismatched lengths and could not be zipped back into rows.
+- **Constant FILTER no longer loops** — A variable-free `FILTER` (e.g. `FILTER("a" == "b")`) is evaluated once and clears the solution set on `false`; the previous consume-based evaluator could loop indefinitely on it.
+- **Disconnected-solution guard** — Cross-variable `FILTER` and cartesian `FIND` over disconnected variables are capped (`KIP_4002`) rather than materializing an unbounded product.
+- **NOT variable scoping** — Only narrows outer-bound variables the NOT block actually references; unrelated variables are preserved intact.
+- **OPTIONAL left-join padding** — Outer-bound entities without a match now receive padded rows (projecting `null` for unbound positions) instead of being silently dropped.
+- **MERGE provenance chaining** — Source's own `_merged_from` entries are carried forward (duplicates dropped) so provenance survives chains of merges.
+- **DELETE PREDICATE cascade** — Higher-order propositions referencing a deleted link are transitively removed; no dangling references.
+- **Self-loop proposition error clarity** — Error message now explains the engine storage-model limitation and suggests reification.
+- **PRIMER domain type performance** — Populates key schema types in O(#type definitions) instead of O(#members × #domains).
 - **Striped document-level concurrency locks** — Added 128-stripe async lock set serializing `update`/`remove` per document id so concurrent mutations of the same document cannot race between index mutations and the versioned storage write, eliminating phantom index entries.
 - **`Collection::reconcile_storage` maintenance API** — Full data-directory scan that recovers orphaned documents into the id bitmap and drops dead ids whose objects no longer exist; complements the bounded crash-recovery scan by covering gaps beyond large id discontinuities.
 - **HNSW `removed_nodes` tombstone tracking and `purge_removed_nodes`** — Records removed node ids so the persistence layer can delete the corresponding on-disk node blobs during flush cleanup; without this, removed node files accumulated forever.
 - **BM25 `store_metadata_with` atomic persistence** — Persist callback variant that only advances the saved-version watermark after the external write succeeds, preventing stale metadata on a failed object-store write.
 - **`FieldValue::bytes_from` array coercion** — Accepts CBOR integer arrays in addition to byte strings so `Vec<u8>` and `[u8; N]` struct fields (whose serde serializers emit integer sequences) can populate `FieldType::Bytes` fields.
 - **`json_to_cbor` helper** — Replaces the panicking `Cbor::serialized(&obj).expect(...)` path for `FieldValue::Json` with a total conversion function.
-
-### Changed
-
 - **Derive macro auto-imports schema types** — Added `schema_crate_path()` resolution so `#[derive(AndaDBSchema)]` and `#[derive(FieldTyped)]` import `Schema`, `FieldType`, `FieldKey`, etc. through the correct crate path; callers no longer need explicit `use` statements.
 - **CJK tokenizer detection expanded** — `Script::Cjk` now also matches Japanese kana and Hangul syllables alongside Han ideographs, so mixed Japanese/Korean text routes correctly to the CJK tokenizer pipeline.
 - **HNSW `ef_search` capped** — `search_layer` caps the user-supplied top-k against `MAX_EF_SEARCH` so a large `Query::limit` cannot force an arbitrarily expensive beam search.
-
-### Fixed
-
 - **BTree bucket size drift** — Unified `posting_entry_size` to account for the field-value key's serialized size in every bucket-size estimate (create, migrate, remove-last, compaction); long string keys previously caused buckets to overshoot `bucket_overload_size`.
 - **`FieldValue::deserialized` ownership** — Takes `&self` instead of consuming `self`, allowing reuse of the same value for multiple deserialization targets.
 - **Re-insert safety** — HNSW `add` / `insert` clears any pending tombstone for the id so a re-inserted document does not have its new node blob deleted by a stale `removed_nodes` entry.

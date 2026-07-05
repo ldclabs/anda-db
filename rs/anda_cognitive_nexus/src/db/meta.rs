@@ -11,19 +11,64 @@ impl CognitiveNexus {
             name: META_SELF_NAME.to_string(),
         };
 
-        // Query identity and domains in parallel
+        // `$self` is applied by the application, not the bundled capsules; a
+        // nexus without it still has a useful domain map, so degrade the
+        // identity layer to `null` instead of failing the whole PRIMER.
+        let me_ids = match self.query_concept_ids(&matcher).await {
+            Ok(ids) => ids,
+            Err(err) if err.code == KipErrorCode::NotFound => Vec::new(),
+            Err(err) => return Err(err),
+        };
         let domain_matcher = ConceptMatcher::Type(DOMAIN_TYPE.to_string());
-        let (me_ids, domain_ids) = try_join!(
-            self.query_concept_ids(&matcher),
-            self.query_concept_ids(&domain_matcher)
-        )?;
+        let domain_ids = self.query_concept_ids(&domain_matcher).await?;
 
-        let me_id = me_ids
-            .first()
-            .ok_or_else(|| KipError::not_found(format!("Concept {matcher} not found")))?;
-        let me = self
-            .try_get_concept_with(&cache, *me_id, |concept| Ok(ConceptInfo::from(concept)))
-            .await?;
+        let me = match me_ids.first() {
+            Some(me_id) => {
+                self.try_get_concept_with(&cache, *me_id, |concept| {
+                    Ok(json!(ConceptInfo::from(concept)))
+                })
+                .await?
+            }
+            None => Json::Null,
+        };
+
+        // Populate each domain's key schema types by walking the (bounded)
+        // set of `$ConceptType` / `$PropositionType` definition nodes and
+        // their `belongs_to_domain` links — O(#type definitions) queries,
+        // independent of how many ordinary members each domain has.
+        let mut domain_types: FxHashMap<EntityID, (Vec<String>, Vec<String>)> =
+            FxHashMap::default();
+        let concept_type_matcher = ConceptMatcher::Type(META_CONCEPT_TYPE.to_string());
+        let proposition_type_matcher = ConceptMatcher::Type(META_PROPOSITION_TYPE.to_string());
+        let (concept_type_ids, proposition_type_ids) = try_join!(
+            self.query_concept_ids(&concept_type_matcher),
+            self.query_concept_ids(&proposition_type_matcher)
+        )?;
+        for (type_ids, is_concept_type) in
+            [(concept_type_ids, true), (proposition_type_ids, false)]
+        {
+            for id in type_ids {
+                let name = self
+                    .try_get_concept_with(&cache, id, |concept| Ok(concept.name.clone()))
+                    .await?;
+                let links = self
+                    .find_propositions(
+                        &cache,
+                        &EntityID::Concept(id),
+                        BELONGS_TO_DOMAIN_TYPE,
+                        false,
+                    )
+                    .await?;
+                for (_, domain_id) in links {
+                    let entry = domain_types.entry(domain_id).or_default();
+                    if is_concept_type {
+                        entry.0.push(name.clone());
+                    } else {
+                        entry.1.push(name.clone());
+                    }
+                }
+            }
+        }
 
         let mut domain_map: Vec<DomainInfo> = Vec::with_capacity(domain_ids.len().min(256));
         let total_domains = domain_ids.len();
@@ -31,23 +76,12 @@ impl CognitiveNexus {
             let mut info = self
                 .try_get_concept_with(&cache, id, |concept| Ok(DomainInfo::from(concept)))
                 .await?;
-            let subjects = self
-                .find_propositions(&cache, &EntityID::Concept(id), BELONGS_TO_DOMAIN_TYPE, true)
-                .await?;
-            let subjects = subjects.into_iter().map(|(_, id)| id).collect::<Vec<_>>();
-            for sub in subjects {
-                if let EntityID::Concept(id) = sub {
-                    let _ = self
-                        .try_get_concept_with(&cache, id, |concept| {
-                            if concept.r#type == META_CONCEPT_TYPE {
-                                info.key_concept_types.push(concept.name.clone());
-                            } else if concept.r#type == META_PROPOSITION_TYPE {
-                                info.key_proposition_types.push(concept.name.clone());
-                            }
-                            Ok(())
-                        })
-                        .await;
-                }
+            if let Some((concept_types, proposition_types)) =
+                domain_types.get(&EntityID::Concept(id))
+            {
+                info.key_concept_types.extend(concept_types.iter().cloned());
+                info.key_proposition_types
+                    .extend(proposition_types.iter().cloned());
             }
 
             domain_map.push(info);
@@ -57,6 +91,10 @@ impl CognitiveNexus {
             "identity": me,
             "domain_map": domain_map,
             "total_domains": total_domains,
+            // Out-of-band capability advertisement (KIP §5.2.1): this engine
+            // has no embedding store, so SEARCH degrades semantic/hybrid to
+            // keyword retrieval.
+            "search_modes": ["keyword"],
         }))
     }
 
@@ -186,9 +224,12 @@ impl CognitiveNexus {
     ///
     /// This engine has no embedding store, so the `semantic` / `hybrid`
     /// retrieval modes degrade to `keyword` as the spec mandates (degraded
-    /// recall beats no recall). Every hit carries the transient normalized
-    /// relevance score `metadata._score` in `[0, 1]`; `THRESHOLD` drops hits
-    /// scoring below it and results are ordered by descending `_score`.
+    /// recall beats no recall); the degradation is advertised out of band
+    /// via `DESCRIBE PRIMER` (`search_modes`). Every hit carries the
+    /// transient normalized relevance score `metadata._score` in `[0, 1]`;
+    /// `THRESHOLD` drops hits scoring below it and results are ordered by
+    /// descending `_score`. `LIMIT` is capped at 100 hits per call (engine
+    /// resource guard).
     pub(super) async fn execute_search(&self, command: SearchCommand) -> Result<Json, KipError> {
         let SearchCommand {
             target,
@@ -316,11 +357,20 @@ impl CognitiveNexus {
     /// (`{type, name}` for concepts, nested `(s, "p", o)` clauses for links),
     /// so importing requires those targets to exist (`KIP_3002`). Reserved
     /// `_` metadata is never exported.
-    pub(super) async fn execute_export(&self, command: ExportCommand) -> Result<Json, KipError> {
+    ///
+    /// Pagination: matched elements are ordered deterministically (concepts
+    /// before links, by entity id). When `LIMIT` truncates the page, the
+    /// returned cursor resumes after the last exported element; each page is
+    /// an independently valid, idempotent capsule.
+    pub(super) async fn execute_export(
+        &self,
+        command: ExportCommand,
+    ) -> Result<(Json, Option<String>), KipError> {
         let ExportCommand {
             target,
             where_clauses,
             limit,
+            cursor,
         } = command;
 
         let mut ctx = QueryContext::default();
@@ -331,10 +381,24 @@ impl CognitiveNexus {
             KipError::reference_error(format!("Target term '{target}' not found in context"))
         })?;
         let mut targets: Vec<EntityID> = target_entities.into();
+        // Deterministic page order is what makes the cursor resumable:
+        // EntityID orders concepts (`Concept(id)`) before propositions.
+        targets.sort();
+        targets.dedup();
+
+        let cursor: Option<EntityID> = BTree::from_cursor(&cursor)
+            .map_err(|err| KipError::invalid_syntax(format!("Invalid CURSOR token: {err}")))?;
+        if let Some(cursor) = &cursor {
+            targets.retain(|eid| eid > cursor);
+        }
+
+        let mut next_cursor: Option<String> = None;
         if let Some(limit) = limit
+            && limit > 0
             && targets.len() > limit
         {
             targets.truncate(limit);
+            next_cursor = targets.last().and_then(BTree::to_cursor);
         }
 
         let mut concept_eids: Vec<EntityID> = Vec::new();
@@ -347,7 +411,10 @@ impl CognitiveNexus {
         }
 
         if concept_eids.is_empty() && link_eids.is_empty() {
-            return Ok(json!({ "capsule": "", "concepts": 0, "propositions": 0 }));
+            return Ok((
+                json!({ "capsule": "", "concepts": 0, "propositions": 0 }),
+                None,
+            ));
         }
 
         // Local handles: `?c<n>` for concepts, `?p<n>` for links.
@@ -467,11 +534,14 @@ impl CognitiveNexus {
         }
         capsule.push_str("}\n");
 
-        Ok(json!({
-            "capsule": capsule,
-            "concepts": concepts_count,
-            "propositions": links_count,
-        }))
+        Ok((
+            json!({
+                "capsule": capsule,
+                "concepts": concepts_count,
+                "propositions": links_count,
+            }),
+            next_cursor,
+        ))
     }
 
     /// Renders a proposition endpoint for `EXPORT`: a local handle when the
