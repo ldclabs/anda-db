@@ -1,6 +1,6 @@
 [package]
 name = "anda_db_server"
-version = "0.9.0"
+version = "0.9.1"
 description = "An HTTP server for Anda DB with a CBOR-first RPC API (JSON supported)."
 categories = ["database", "data-structures", "web-programming"]
 repository = "https://github.com/ldclabs/anda-db/tree/main/rs/anda_db_server"
@@ -10,7 +10,7 @@ license.workspace = true
 
 [dependencies]
 anda_db = { version = "0.9", path = "../anda_db", features = ["full"] }
-anda_object_store = { version = "0.8", path = "../anda_object_store" }
+anda_object_store = { version = "0.9", path = "../anda_object_store" }
 axum = { workspace = true }
 cbor2 = { workspace = true }
 clap = { workspace = true }

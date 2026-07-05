@@ -138,14 +138,14 @@ front of the on-disk truth.
 
 ### 3.3 Semantic guarantees
 
-| Operation                   | Behaviour                                                                                          |
-| --------------------------- | -------------------------------------------------------------------------------------------------- |
-| `put_opts`                  | Writes data, then metadata, then updates cache. Atomic from the cache's point of view.             |
-| `put_multipart`             | Streams parts to the inner uploader; finalises metadata in `complete()`.                           |
-| `get_opts`                  | Forwards range/preconditions, swaps the response ETag for the content-addressable one.             |
+| Operation                   | Behaviour                                                                                                                                                                               |
+| --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `put_opts`                  | Writes data, then metadata, then updates cache. Atomic from the cache's point of view.                                                                                                  |
+| `put_multipart`             | Streams parts to the inner uploader; finalises metadata in `complete()`.                                                                                                                |
+| `get_opts`                  | Forwards range/preconditions, swaps the response ETag for the content-addressable one.                                                                                                  |
 | `delete_stream`             | Per location: deletes data, then metadata. Tolerates missing metadata; a missing data object surfaces as `NotFound` under the logical path while orphaned metadata is still cleaned up. |
-| `copy_opts` / `rename_opts` | Performs the operation on both `data/` and `meta/` paths (metadata always with Overwrite — the data phase enforces the requested mode), invalidates caches. |
-| `list*`                     | Lists data, fetches metadata concurrently (8-way), restores ETag.                                  |
+| `copy_opts` / `rename_opts` | Performs the operation on both `data/` and `meta/` paths (metadata always with Overwrite — the data phase enforces the requested mode), invalidates caches.                             |
+| `list*`                     | Lists data, fetches metadata concurrently (8-way), restores ETag.                                                                                                                       |
 
 > ⚠️ **Crash atomicity.** A crash between writing data and writing metadata
 > can leave the side-car missing. Subsequent reads of that key surface as
@@ -507,7 +507,7 @@ Enable whichever backend(s) you need at the application layer:
 
 ```toml
 [dependencies]
-anda_object_store = "0.3"
+anda_object_store = "0.9"
 object_store      = { version = "*", features = ["aws", "fs"] }
 ```
 

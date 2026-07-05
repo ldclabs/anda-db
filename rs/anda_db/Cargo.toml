@@ -1,6 +1,6 @@
 [package]
 name = "anda_db"
-version = "0.9.0"
+version = "0.9.1"
 description = "Anda DB is a Rust library designed as a specialized database for AI Agents, focusing on knowledge & memory."
 keywords = ["database", "vector", "search", "embedding", "ai"]
 categories = ["database", "data-structures", "text-processing"]
@@ -10,7 +10,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-anda_db_utils = { version = "0.8", path = "../anda_db_utils" }
+anda_db_utils = { version = "0.9", path = "../anda_db_utils" }
 anda_db_schema = { path = "../anda_db_schema", version = "0.9" }
 anda_db_hnsw = { path = "../anda_db_hnsw", version = "0.9" }
 anda_db_btree = { path = "../anda_db_btree", version = "0.9" }
@@ -44,7 +44,7 @@ rustc-hash = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 structured-logger = { workspace = true }
-anda_object_store = { path = "../anda_object_store", version = "0.8" }
+anda_object_store = { path = "../anda_object_store", version = "0.9" }
 serde_json = { workspace = true }
 
 [features]

@@ -24,7 +24,7 @@ Add the crate to your project:
 
 ```toml
 [dependencies]
-anda_db_utils = "0.8"
+anda_db_utils = "0.9"
 ```
 
 This crate is most often consumed indirectly through higher-level workspace

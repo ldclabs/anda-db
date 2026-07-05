@@ -8,15 +8,15 @@ examples that used unwrapped object stores, borrowed `Query` values, or direct
 
 ```toml
 [dependencies]
-anda_db = { version = "0.8", features = ["full"] }
-object_store = { version = "0.13", features = ["fs"] }
+anda_db = { version = "0.9", features = ["full"] }
+object_store = { version = "0.14", features = ["fs"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # Optional direct dependencies for low-level APIs
-anda_db_hnsw = "0.8"
-anda_object_store = "0.8"
+anda_db_hnsw = "0.9"
+anda_object_store = "0.9"
 cbor2 = "1"
 ```
 
@@ -224,14 +224,14 @@ configuration.
 
 ## HnswConfig Options
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `dimension` | `512` | Vector dimension |
-| `max_layers` | `16` | Maximum graph layers |
-| `max_connections` | `32` | HNSW M parameter |
-| `ef_construction` | `200` | Build-time candidate count |
-| `ef_search` | `50` | Search-time candidate count |
-| `distance_metric` | `Euclidean` | Distance function |
+| Option            | Default     | Description                 |
+| ----------------- | ----------- | --------------------------- |
+| `dimension`       | `512`       | Vector dimension            |
+| `max_layers`      | `16`        | Maximum graph layers        |
+| `max_connections` | `32`        | HNSW M parameter            |
+| `ef_construction` | `200`       | Build-time candidate count  |
+| `ef_search`       | `50`        | Search-time candidate count |
+| `distance_metric` | `Euclidean` | Distance function           |
 
 ```rust
 use anda_db_hnsw::DistanceMetric;

@@ -1,4 +1,4 @@
-use aes_gcm::{AeadInPlace, Aes256Gcm, Key, Nonce, Tag};
+use aes_gcm::{AeadInOut, Aes256Gcm, Key, Nonce, Tag};
 use async_stream::try_stream;
 use async_trait::async_trait;
 use base64::{Engine, prelude::BASE64_URL_SAFE};
@@ -404,7 +404,7 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
                     let aad = chunk_aad(self.chunk_size, i as u64);
                     let tag = self
                         .cipher
-                        .encrypt_in_place_detached(Nonce::from_slice(&nonce), &aad, chunk)
+                        .encrypt_inout_detached(&Nonce::from(nonce), &aad, chunk.into())
                         .map_err(|err| Error::Generic {
                             store: "EncryptedStore",
                             source: format!("AES256 encrypt failed for path {location}: {err:?}")
@@ -631,11 +631,11 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
                     let nonce = derive_gcm_nonce(&meta.aes_nonce, idx);
                     let aad = chunk_aad_for_meta(&meta, chunk_size, idx)?;
                     self.cipher
-                        .decrypt_in_place_detached(
-                            Nonce::from_slice(&nonce),
+                        .decrypt_inout_detached(
+                            &Nonce::from(nonce),
                             &aad,
-                            chunk,
-                            Tag::from_slice(tag.as_slice()),
+                            chunk.into(),
+                            &Tag::from(**tag),
                         )
                         .map_err(|err| Error::Generic {
                             store: "EncryptedStore",
@@ -795,7 +795,7 @@ impl<T: ObjectStore> MultipartUpload for EncryptedStoreUploader<T> {
             self.chunk_index = self.chunk_index.wrapping_add(1);
             match self
                 .cipher
-                .encrypt_in_place_detached(Nonce::from_slice(&nonce), &aad, chunk)
+                .encrypt_inout_detached(&Nonce::from(nonce), &aad, chunk.into())
             {
                 Ok(tag) => {
                     let tag: [u8; 16] = tag.into();
@@ -829,7 +829,7 @@ impl<T: ObjectStore> MultipartUpload for EncryptedStoreUploader<T> {
                 self.chunk_index = self.chunk_index.wrapping_add(1);
                 let tag = self
                     .cipher
-                    .encrypt_in_place_detached(Nonce::from_slice(&nonce), &aad, chunk)
+                    .encrypt_inout_detached(&Nonce::from(nonce), &aad, chunk.into())
                     .map_err(|err| Error::Generic {
                         store: "EncryptedStore",
                         source: format!(
@@ -932,11 +932,11 @@ fn create_decryption_stream(
 
                 let nonce = derive_gcm_nonce(&meta.aes_nonce, idx as u64);
                 let aad = chunk_aad_for_meta(&meta, chunk_size as u64, idx as u64)?;
-                cipher.decrypt_in_place_detached(
-                    Nonce::from_slice(&nonce),
+                cipher.decrypt_inout_detached(
+                    &Nonce::from(nonce),
                     &aad,
-                    &mut chunk,
-                    Tag::from_slice(tag.as_slice())
+                    (&mut chunk[..]).into(),
+                    &Tag::from(**tag)
                 )
                 .map_err(|err| Error::Generic {
                     store: "EncryptedStore",
@@ -969,11 +969,11 @@ fn create_decryption_stream(
             })?;
             let nonce = derive_gcm_nonce(&meta.aes_nonce, idx as u64);
             let aad = chunk_aad_for_meta(&meta, chunk_size as u64, idx as u64)?;
-            cipher.decrypt_in_place_detached(
-                Nonce::from_slice(&nonce),
+            cipher.decrypt_inout_detached(
+                &Nonce::from(nonce),
                 &aad,
-                &mut buf,
-                Tag::from_slice(tag.as_slice())
+                (&mut buf[..]).into(),
+                &Tag::from(**tag)
             )
             .map_err(|err| Error::Generic {
                 store: "EncryptedStore",
@@ -1037,7 +1037,7 @@ fn seal_metadata(cipher: &Aes256Gcm, location: &Path, meta: &mut Metadata) -> Re
     let aad = metadata_auth_aad(location, meta);
     let mut empty = [];
     let tag = cipher
-        .encrypt_in_place_detached(Nonce::from_slice(&nonce), &aad, &mut empty)
+        .encrypt_inout_detached(&Nonce::from(nonce), &aad, (&mut empty[..]).into())
         .map_err(|err| Error::Generic {
             store: "EncryptedStore",
             source: format!("metadata authentication failed for path {location}: {err:?}").into(),
@@ -1072,11 +1072,11 @@ fn verify_metadata(cipher: &Aes256Gcm, location: &Path, meta: &Metadata) -> Resu
     let aad = metadata_auth_aad(location, meta);
     let mut empty = [];
     cipher
-        .decrypt_in_place_detached(
-            Nonce::from_slice(nonce.as_slice()),
+        .decrypt_inout_detached(
+            &Nonce::from(**nonce),
             &aad,
-            &mut empty,
-            Tag::from_slice(tag.as_slice()),
+            (&mut empty[..]).into(),
+            &Tag::from(**tag),
         )
         .map_err(|err| Error::Generic {
             store: "EncryptedStore",
@@ -1218,7 +1218,7 @@ mod tests {
         plaintext: &'static [u8],
         chunk_size: u64,
     ) {
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&[0u8; 32]));
+        let cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from([0u8; 32]));
         let base_nonce = [7u8; 12];
         let chunk_size = normalize_chunk_size(chunk_size);
         let mut ciphertext = plaintext.to_vec();
@@ -1227,7 +1227,7 @@ mod tests {
         for (idx, chunk) in ciphertext.chunks_mut(chunk_size as usize).enumerate() {
             let nonce = derive_gcm_nonce(&base_nonce, idx as u64);
             let tag = cipher
-                .encrypt_in_place_detached(Nonce::from_slice(&nonce), &[], chunk)
+                .encrypt_inout_detached(&Nonce::from(nonce), &[], chunk.into())
                 .unwrap();
             let tag: [u8; 16] = tag.into();
             aes_tags.push(tag.into());

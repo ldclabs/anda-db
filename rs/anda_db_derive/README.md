@@ -34,8 +34,8 @@ Add the derive crate alongside `anda_db_schema`:
 
 ```toml
 [dependencies]
-anda_db_schema = "0.4"
-anda_db_derive = "0.5"
+anda_db_schema = "0.9"
+anda_db_derive = "0.9"
 serde = { version = "1", features = ["derive"] }
 ```
 

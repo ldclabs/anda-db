@@ -36,7 +36,7 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 async-trait = "0.1"
 async-stream = "0.3"
 axum = { version = "0.8", default-features = false, features = [
@@ -89,7 +89,7 @@ tantivy-jieba = { version = "0.20", default-features = false }
 structured-logger = { version = "1", default-features = false }
 smallvec = { version = "1.15", default-features = false }
 criterion = { version = "0.8", default-features = false }
-ic_auth_types = { version = "0.9", default-features = false }
+ic_auth_types = { version = "0.10", default-features = false }
 object_store = { version = "0.14", default-features = false }
 moka = { version = "0.12", default-features = false, features = ["future"] }
 zstd-safe = { version = "7", default-features = false, features = [
