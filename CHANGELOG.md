@@ -4,6 +4,65 @@ All notable changes to this workspace are documented in this file.
 
 ## [Unreleased]
 
+## [0.9.2] — 2026-07-10
+
+Workspace-wide hardening release driven by a full per-crate code review. All 13
+crates were audited and fixed; ~60 regression tests were added and the full
+workspace test suite passes.
+
+### Added
+
+- **`AndaDB::close_collection`** — Closes a collection and releases its handle from the database registry so the collection can be reopened later; previously a closed collection's handle lingered forever and the name could never be reopened in-process.
+- **Multi-dimension HNSW routing** — A collection with several HNSW indexes now routes `Search.vector` to the index whose dimension matches the query vector (new `Hnsw::dimension()` accessor); previously any vector search on such a collection always errored.
+- **`BTree::try_range_query_ids` and `BTree::flush_with`** — Error-reporting range-query variant (type-mismatched filter values surface `DBError::Index` instead of a silent empty set) and a persist-callback flush that only advances the saved-version watermark after the external write succeeds.
+- **Strict metadata authentication mode** — `EncryptedStoreBuilder::with_strict_metadata_auth()` rejects even genuine legacy (pre-auth) metadata; the default mode is now fail-closed against auth stripping (see Fixed) and logs a warning when it accepts legacy metadata.
+- **Server operational controls** — `anda_db_server`: `REQUEST_TIMEOUT_SECS` (408 on expiry), `MAX_BODY_SIZE`, `SHUTDOWN_TIMEOUT_SECS` drain deadline. `anda_cognitive_nexus_server`: background auto-flush task (`FLUSH_INTERVAL_SECS`), `kip_logs` retention pruning (`LOG_RETENTION_DAYS`, default off), `SELF_PRINCIPAL_ID`, request timeout and body-limit knobs. Shard proxy: `X-Forwarded-For/-Host/-Proto` injection.
+- **RangeQuery depth cap** — `RangeQuery::MAX_DEPTH` (64) with an iterative depth check; hostile deeply-nested filters return an error (or an empty result on the infallible path) instead of overflowing the stack.
+- **Derive-macro trybuild UI tests** — Compile-pass and compile-fail coverage for generated code, including shadowed user type names and bare generic fields.
+
+### Changed
+
+- **Search and filter misuse now error instead of returning empty results** — `Search.text` without a BM25 index, `Search.vector` without a dimension-matching HNSW index, and filter values whose type does not match the B-Tree index key now return `DBError::Index`; previously all three silently returned empty result sets.
+- **Hybrid search truncation keeps the most-relevant results** — With `Lt`/`Le` filters, result truncation now keeps the head of the RRF-ranked candidates; the tail-keeping strategy only applies to the pure-filter (id-ascending) path. Previously hybrid queries returned the *least* relevant `limit` documents.
+- **KQL default result order is deterministic** — Solutions without `ORDER BY` are returned in ascending `EntityID` order (previously clause-insertion order), which also fixes cursor pagination skipping pages over unordered bindings.
+- **KIP comparison semantics unified** — `==`/`!=` now use the same loose numeric/datetime comparison as the ordering operators (`3.0 == 3` is true; arrays/objects never compare equal); previously `3.0 == 3` was false while `3.0 <= 3` was true.
+- **KIP aggregate integer semantics** — `SUM`/`MIN`/`MAX` over all-integer inputs return integers (i128 accumulation, no precision loss above 2^53); `SUM` of an empty set is integer `0`, `AVG` of an empty set is `null`.
+- **KIP duplicate keys are parse errors** — Duplicate keys in concept matchers, `SET ATTRIBUTES`/`WITH METADATA` blocks, and nested JSON objects now fail with `KIP_1001` instead of silently keeping the last value; `SEARCH ... LIMIT 0` is likewise rejected at parse time.
+- **`UPDATE` response `matched` counts pre-truncation hits** — `updated < matched` now signals `LIMIT` truncation; dangling `{id:}`/`(id:)` references fail fast with `KIP_3002` instead of matching an empty set.
+- **Shard proxy refuses insecure exposure** — Listening on a non-loopback address without `API_KEY` now aborts startup unless `INSECURE_NO_API_KEY` is set; `backend_addr` must be an absolute `http://` URI; backend PostgreSQL failures return 503 instead of being misreported as 404, with a 5s negative cache and db-name pre-validation protecting the connection pool.
+- **Storage cache capacity is weight-based** — `cache_max_capacity` now counts approximate KiB weight instead of entry count, bounding worst-case memory for large objects.
+- **Server 500 responses are generic** — Internal error details go to logs; query-usage errors surfaced by the engine's new `DBError::Index` behavior map to 400.
+
+### Fixed
+
+- **Collection flush checkpoint vs. concurrent adds** — `flush` clamps the crash-recovery checkpoint below the smallest in-flight `add` (ids allocated but not yet in the bitmap), so a crash between id allocation and bitmap update can no longer permanently hide the document from `auto_repair_indexes`.
+- **`set_extension` persistence** — `set_extension`/`set_extension_with`/`set_extension_from_with` now bump the metadata version so extension data actually persists on the next flush; the prior test passed spuriously against the in-memory cache and has been rewritten to reconnect from storage.
+- **Collection lifecycle races** — `delete_collection` vs. `open_collection` can no longer resurrect a zombie collection; `open_or_create_collection` serializes creation and falls back to open on `AlreadyExists`; `inner_drop_prefix` bumps `write_seq` so deleted objects stop being served from cache.
+- **Grouped aggregation respects FILTER/NOT narrowing** — Group members are intersected with the narrowed bindings before aggregation, so `COUNT` no longer includes filtered-out members; grouped `FIND` also honors `ORDER BY ?group_var` (previously a silent no-op).
+- **Row-wise UNION and sequential pattern joins** — Multi-variable `FIND` no longer keeps only the last covering relation: UNION branches with the same variable signature merge row-wise per KIP §3.4.7.3 (disjoint branches null-pad), and sequential dual patterns over the same variable pair perform a true row-level equi-join instead of an endpoint approximation that produced phantom solutions.
+- **Cross-variable NOT anti-join** — `NOT` blocks referencing multiple outer variables prune per solution tuple instead of over-pruning by column; literal-predicate branches retain the `AnyPropositions` constraint.
+- **`SET PROPOSITIONS` self-loop preflight** — Self-loops are rejected during validation, before any concept writes, honoring the documented reject-before-write contract; UPSERT preflight was hardened so all detectable failures reject before mutation (true rollback still requires a WAL and remains out of scope).
+- **Cascade paths no longer swallow storage errors** — DELETE/UPDATE cascades propagate real storage failures (only "already gone" is tolerated) and removal counts reflect actual deletions; predicates containing `:` now round-trip through `EntityID`.
+- **I64/F32 stored-document read-back** — Untyped CBOR deserialization restores non-negative integers as `U64` and `f32` as `F64`; validation and typed conversion now accept these read-back forms (mirroring the existing `Vector` compatibility branch), so such documents no longer fail to load after a flush.
+- **JSON prefix escaping inside `FieldValue::Json`** — Strings embedded in `Json` values are `b64:`/`txt:`-escaped symmetrically with deserialization, so values like `"b64:AQID"` survive a human-readable round trip instead of being mangled into `Bytes`.
+- **Deep-nesting stack overflow guards** — `FieldValue` recursive conversions enforce `MAX_CONVERSION_DEPTH` (128); the BM25 logical-query parser handles trailing-`)` floods iteratively with a 64-level nesting budget (an 8K-`)` input previously aborted the process); KIP nesting/input limits are now exported as public constants.
+- **HNSW deletion repairs the graph** — Removing a node reconnects its former neighbors through neighbor-selection repair, preventing monotonic recall degradation over delete-heavy workloads (recall@10 after deleting 50% of nodes: 0.81 → 0.90 in the new regression test); tombstones persist with metadata so purge survives reload, and entry-point replacement uses a per-layer tracker instead of an O(N) scan.
+- **BM25 statistics consistency** — `avg_doc_tokens` updates are serialized under one lock so concurrent insert/remove can no longer leave a permanently skewed average; flush persists buckets before advancing the metadata version watermark (HNSW likewise).
+- **B-Tree ghost keys after crash** — Empty postings persisted during a remove/flush crash window are treated as tombstones on load (skipped, marked dirty for self-heal), so reloaded trees no longer report keys with no documents; serialization failures during insert return errors instead of panicking.
+- **Encrypted metadata auth stripping** — Metadata carrying an auth version but missing `auth_nonce`/`auth_tag` is rejected by default (previously it silently downgraded to legacy verification, allowing cross-path object moves and chunk-boundary truncation by an attacker with storage write access).
+- **Sidecar store self-healing** — Corrupted (torn-write) sidecar metadata no longer permanently bricks a key: overwrite puts rebuild it; orphaned data objects (crash between data and meta writes) no longer fail whole `list` scans; `rename(from == to)` no longer deletes the object; concurrent multipart completes serialize per key.
+- **`list_logs` remote panic** — `limit=0` (or an empty page) in `anda_cognitive_nexus_server` no longer panics the handler via `rt.last().unwrap()`; limits are clamped and cursors derived safely.
+- **Shard proxy stale routing** — The PostgreSQL LISTEN reconnect path clears `db_cache` (missed NOTIFY events could route tenants to shards that no longer own them), with a TTL as a last line of defense; management mutations write and notify inside one transaction.
+- **Server registry durability** — `anda_db_server` performs open/create I/O outside the registry lock (a slow S3 open no longer stalls all RPCs), keeps databases that failed to reopen in the registry for retry after restart, and refuses to start on a corrupted registry instead of silently overwriting it.
+- **Derive-macro diagnostics and hygiene** — Bare generic fields produce a targeted compile error at the field span (instead of a misleading E0599); generated code uses fully-qualified paths so user types named `FieldType`/`Schema` no longer collide; `#[cbor(key)]` on `AndaDBSchema` top-level fields and container-level `#[unique]` are compile errors.
+
+## [0.9.1] — 2026-07-05
+
+### Changed
+
+- **AES-GCM dependency migrated 0.10 → 0.11** — `anda_object_store` moved to the `aes-gcm` 0.11 `AeadInOut` API; no wire-format change.
+- **Workspace dependency alignment** — Internal crate dependency requirements aligned to the `0.9.x` line.
+
 ## [0.9.0] — 2026-07-05
 
 ### Added
