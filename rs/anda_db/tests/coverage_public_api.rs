@@ -540,6 +540,11 @@ async fn collection_public_error_paths_and_id_filters() -> Result<(), DBError> {
         })
         .await?;
     assert!(search_none.is_empty());
+    // Hybrid search results are relevance-ordered, so truncation keeps the
+    // head (the most relevant hits). All docs here have identical BM25
+    // scores, and RRF tie-breaks by ascending id: candidates [1..5], filter
+    // Lt(5) leaves [1..4], limit 2 keeps [1, 2]. ("keep the tail" truncation
+    // only applies to pure filter queries, whose results are id-ordered.)
     assert_eq!(
         collection
             .search_ids(Query {
@@ -551,7 +556,7 @@ async fn collection_public_error_paths_and_id_filters() -> Result<(), DBError> {
                 limit: Some(2),
             })
             .await?,
-        vec![3, 4]
+        vec![1, 2]
     );
 
     Ok(())

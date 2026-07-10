@@ -7,6 +7,13 @@
 //! - [`CountingWriter`], a writer that counts serialized bytes without storing
 //!   the payload.
 //! - [`Pipe`], a small functional-style chaining trait.
+//!
+//! # Hashing
+//!
+//! Hash-based structures in this crate use `rustc-hash` (FxHash) without a
+//! random seed, matching the rest of the AndaDB workspace. FxHash has no
+//! collision resistance: do not use these types where an adversary controls
+//! the hashed keys and hash-flooding (O(n²) degradation) is a concern.
 
 use core::ops::Deref;
 use rustc_hash::{FxBuildHasher, FxHashSet};
@@ -50,6 +57,14 @@ impl<T> Pipe<T> for T {
 /// This struct maintains an internal `HashSet` to keep track of existing items,
 /// providing an optimized way to perform multiple non-existent insertions.
 /// It is designed to be used with a `Vec` that it helps manage.
+///
+/// # Memory cost
+///
+/// Every element is stored **twice** — once in the ordered `Vec` and once in
+/// the membership `HashSet` — trading roughly 2x memory for O(1) duplicate
+/// checks. For large owned elements (e.g. long `String` keys) this doubles
+/// the payload memory; callers holding many large collections should weigh
+/// this against a plain `Vec` with linear-scan deduplication.
 ///
 /// # Examples
 ///
@@ -195,12 +210,16 @@ where
     ///
     /// `true` if the item was added, `false` otherwise.
     pub fn push(&mut self, item: T) -> bool {
-        if self.set.insert(item.clone()) {
-            self.vec.push(item);
-            true
-        } else {
-            false
+        // Membership test first: duplicates are rejected without paying for a
+        // clone. For new items, update `vec` before `set` so that if the
+        // `Vec` push panics (e.g. capacity overflow), the set has not been
+        // touched and the set/vec invariant still holds.
+        if self.set.contains(&item) {
+            return false;
         }
+        self.vec.push(item.clone());
+        self.set.insert(item);
+        true
     }
 
     /// Extends the vector with items from an iterator that do not already exist.
@@ -233,6 +252,11 @@ where
     }
 
     /// Removes and returns the element at `index`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is out of bounds (same semantics as
+    /// [`Vec::remove`]).
     pub fn remove(&mut self, index: usize) -> T {
         let item = self.vec.remove(index);
         self.set.remove(&item);
@@ -307,16 +331,28 @@ where
     }
 }
 
+impl<T: PartialEq> PartialEq for UniqueVec<T> {
+    /// Two `UniqueVec`s are equal when their vectors are equal (same elements
+    /// in the same order). The membership set mirrors the vector, so it does
+    /// not need to be compared.
+    fn eq(&self, other: &Self) -> bool {
+        self.vec == other.vec
+    }
+}
+
+impl<T: Eq> Eq for UniqueVec<T> {}
+
 impl<T> Extend<T> for UniqueVec<T>
 where
     T: Eq + Hash + Clone,
 {
     /// Extends the vector with items from an iterator that do not already exist.
     fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
-        self.vec.extend(
-            iter.into_iter()
-                .filter(|item| self.set.insert(item.clone())),
-        );
+        // Element-by-element via `push` so the set/vec invariant holds after
+        // every step, even if the iterator (or an allocation) panics midway.
+        for item in iter {
+            self.push(item);
+        }
     }
 }
 
@@ -344,6 +380,12 @@ where
 }
 
 /// Utility for counting the size of serialized CBOR data.
+///
+/// Note: for computing the encoded size of a CBOR value, prefer
+/// `cbor2::serialized_size` (the workspace convention); it avoids driving a
+/// full serializer through the `Write` trait. This type is kept as a
+/// general-purpose byte-counting `Write` sink for other serialization
+/// formats and for backwards compatibility.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CountingWriter {
     count: usize,
@@ -791,5 +833,69 @@ mod tests {
 
         assert_eq!(err.kind(), std::io::ErrorKind::Other);
         assert_eq!(writer.size(), usize::MAX);
+    }
+
+    #[test]
+    fn test_unique_vec_extend_panicking_iterator_keeps_set_consistent() {
+        let mut uv = UniqueVec::from(vec![1, 2]);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            uv.extend((3..10).inspect(|&x| {
+                if x == 5 {
+                    panic!("intentional extend panic");
+                }
+            }));
+        }));
+        assert!(result.is_err());
+
+        // Elements yielded before the panic are applied; set and vec agree.
+        assert_eq!(uv.as_ref(), &[1, 2, 3, 4]);
+        for value in 1..10 {
+            assert_eq!(uv.contains(&value), uv.as_ref().contains(&value));
+        }
+        // The set still rejects duplicates and accepts new items.
+        assert!(!uv.push(4));
+        assert!(uv.push(5));
+        assert_eq!(uv.as_ref(), &[1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn test_unique_vec_cbor_round_trip_and_dedup() {
+        // Round-trip through CBOR (the workspace's on-disk format).
+        let uv = UniqueVec::from(vec![1u64, 2, 3]);
+        let mut buf = Vec::new();
+        cbor2::to_writer(&uv, &mut buf).unwrap();
+        let decoded: UniqueVec<u64> = cbor2::from_reader(&buf[..]).unwrap();
+        assert_eq!(decoded, uv);
+
+        // CBOR input containing duplicates (e.g. a corrupted or crash-window
+        // bucket file in anda_db_btree) is deduplicated on load, preserving
+        // first-occurrence order.
+        let mut buf = Vec::new();
+        cbor2::to_writer(&vec![5u64, 1, 5, 2, 1], &mut buf).unwrap();
+        let decoded: UniqueVec<u64> = cbor2::from_reader(&buf[..]).unwrap();
+        assert_eq!(decoded.as_ref(), &[5, 1, 2]);
+        assert!(decoded.contains(&2));
+        assert!(!decoded.contains(&9));
+    }
+
+    #[test]
+    fn test_counting_writer_matches_cbor2_serialized_size() {
+        let value = (42u64, "hello".to_string(), vec![1u8, 2, 3]);
+        let mut writer = CountingWriter::new();
+        cbor2::to_writer(&value, &mut writer).unwrap();
+        assert_eq!(
+            writer.size() as u64,
+            cbor2::serialized_size(&value).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_unique_vec_partial_eq() {
+        let a = UniqueVec::from(vec![1, 2, 3]);
+        let b = UniqueVec::from(vec![1, 2, 2, 3]);
+        let c = UniqueVec::from(vec![3, 2, 1]);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
     }
 }

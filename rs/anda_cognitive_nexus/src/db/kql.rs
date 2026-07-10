@@ -96,6 +96,9 @@ impl CognitiveNexus {
                         "Invalid proposition link ID: {id:?}"
                     )));
                 }
+                // Match-only `(id:)` target: KIP_3002 when dangling (spec RC8).
+                self.ensure_proposition_link_exists(&ctx.cache, &entity_id)
+                    .await?;
                 TargetEntities::IDs(vec![entity_id])
             }
             PropositionMatcher::Object {
@@ -344,8 +347,9 @@ impl CognitiveNexus {
         .flatten()
         .collect();
 
-        let mut original_rows: Vec<QueryRelationRow> = Vec::with_capacity(rows.len());
-        let mut surviving: Vec<QueryRelationRow> = Vec::with_capacity(rows.len());
+        // Rows are evaluated in place and tagged with a keep flag — no
+        // duplicate copies of the row set are materialized.
+        let mut evaluated: Vec<(QueryRelationRow, bool)> = Vec::with_capacity(rows.len());
         for row in rows {
             if !Self::relation_row_matches_context(ctx, &relation_meta, &row) {
                 continue;
@@ -374,10 +378,7 @@ impl CognitiveNexus {
             let keep = self
                 .eval_filter_assigned(cache, regex_cache, expr, &assign)
                 .await?;
-            original_rows.push(row.clone());
-            if keep {
-                surviving.push(row);
-            }
+            evaluated.push((row, keep));
         }
 
         // Narrow each relation variable: remove bindings that appeared in the
@@ -385,15 +386,19 @@ impl CognitiveNexus {
         fn narrow_entities(
             ctx: &mut QueryContext,
             var: Option<&str>,
-            original: &[QueryRelationRow],
-            surviving: &[QueryRelationRow],
+            evaluated: &[(QueryRelationRow, bool)],
             slot: impl Fn(&QueryRelationRow) -> Option<&EntityID>,
         ) {
             let Some(var) = var else { return };
-            let kept: FxHashSet<&EntityID> = surviving.iter().filter_map(&slot).collect();
-            let removed: FxHashSet<&EntityID> = original
+            let kept: FxHashSet<&EntityID> = evaluated
                 .iter()
-                .filter_map(&slot)
+                .filter(|(_, keep)| *keep)
+                .filter_map(|(row, _)| slot(row))
+                .collect();
+            let removed: FxHashSet<&EntityID> = evaluated
+                .iter()
+                .filter(|(_, keep)| !*keep)
+                .filter_map(|(row, _)| slot(row))
                 .filter(|id| !kept.contains(*id))
                 .collect();
             if removed.is_empty() {
@@ -407,33 +412,26 @@ impl CognitiveNexus {
         narrow_entities(
             ctx,
             relation_meta.proposition_var.as_deref(),
-            &original_rows,
-            &surviving,
+            &evaluated,
             |row| row.proposition.as_ref(),
         );
-        narrow_entities(
-            ctx,
-            relation_meta.subject_var.as_deref(),
-            &original_rows,
-            &surviving,
-            |row| row.subject.as_ref(),
-        );
-        narrow_entities(
-            ctx,
-            relation_meta.object_var.as_deref(),
-            &original_rows,
-            &surviving,
-            |row| row.object.as_ref(),
-        );
+        narrow_entities(ctx, relation_meta.subject_var.as_deref(), &evaluated, |row| {
+            row.subject.as_ref()
+        });
+        narrow_entities(ctx, relation_meta.object_var.as_deref(), &evaluated, |row| {
+            row.object.as_ref()
+        });
 
         if let Some(var) = relation_meta.predicate_var.as_deref() {
-            let kept: FxHashSet<&str> = surviving
+            let kept: FxHashSet<&str> = evaluated
                 .iter()
-                .filter_map(|row| row.predicate.as_deref())
+                .filter(|(_, keep)| *keep)
+                .filter_map(|(row, _)| row.predicate.as_deref())
                 .collect();
-            let removed: FxHashSet<&str> = original_rows
+            let removed: FxHashSet<&str> = evaluated
                 .iter()
-                .filter_map(|row| row.predicate.as_deref())
+                .filter(|(_, keep)| !*keep)
+                .filter_map(|(row, _)| row.predicate.as_deref())
                 .filter(|pred| !kept.contains(*pred))
                 .collect();
             if !removed.is_empty()
@@ -443,7 +441,11 @@ impl CognitiveNexus {
             }
         }
 
-        ctx.relations[idx].rows = surviving;
+        ctx.relations[idx].rows = evaluated
+            .into_iter()
+            .filter(|(_, keep)| *keep)
+            .map(|(row, _)| row)
+            .collect();
         Ok(())
     }
 
@@ -605,7 +607,16 @@ impl CognitiveNexus {
                 predicate_var: pred_dims.first().map(|&i| dims[i].var.clone()),
                 object_var: entity_dims.get(1).map(|&i| dims[i].var.clone()),
                 rows,
+                origin: RelationOrigin::Pattern,
             });
+        } else {
+            // The exact combinations are lost: a later multi-column FIND
+            // over these variables would re-materialize a full cross
+            // product (misaligned columns). Mark them so FIND can reject
+            // that projection with KIP_4002 instead.
+            for dim in &dims {
+                ctx.unaligned_filter_vars.insert(dim.var.clone());
+            }
         }
 
         Ok(())
@@ -652,8 +663,112 @@ impl CognitiveNexus {
             Box::pin(self.execute_where_clause(&mut not_context, clause)).await?;
         }
 
+        // Per-solution anti-join (KIP §3.4.7.1: "exclude solutions that make
+        // the internal pattern valid"). When the NOT pattern references two
+        // or more outer-bound entity variables and both sides expose a
+        // relation covering them, excluded *tuples* are removed from the
+        // outer relation rows instead of subtracting whole binding columns
+        // — column subtraction would also kill unrelated solutions sharing
+        // one endpoint. Variables consumed here are exempted from the
+        // column-level subtraction below; bindings are narrowed to the
+        // values that still appear in some surviving row.
+        let mut anti_joined_vars: FxHashSet<String> = FxHashSet::default();
+        let shared_vars: Vec<String> = not_vars
+            .iter()
+            .filter(|var| ctx.entities.contains_key(*var))
+            .cloned()
+            .collect();
+        if shared_vars.len() >= 2
+            && let Some(not_relation) = not_context.relations.iter().rev().find(|relation| {
+                shared_vars
+                    .iter()
+                    .all(|var| Self::relation_covers_var(relation, var))
+            })
+            && ctx.relations.iter().any(|relation| {
+                relation.origin != RelationOrigin::Optional
+                    && shared_vars
+                        .iter()
+                        .all(|var| Self::relation_covers_var(relation, var))
+            })
+        {
+            let project = |relation: &QueryRelationBinding,
+                           row: &QueryRelationRow|
+             -> Option<Vec<EntityID>> {
+                let mut tuple = Vec::with_capacity(shared_vars.len());
+                for var in &shared_vars {
+                    match Self::relation_row_entity(relation, row, var) {
+                        Some(Some(entity)) => tuple.push(entity.clone()),
+                        // Padded/unbound positions never contribute an
+                        // excluded tuple and are never excluded themselves.
+                        _ => return None,
+                    }
+                }
+                Some(tuple)
+            };
+            let excluded_tuples: FxHashSet<Vec<EntityID>> = not_relation
+                .rows
+                .iter()
+                .filter_map(|row| project(not_relation, row))
+                .collect();
+
+            for idx in 0..ctx.relations.len() {
+                if ctx.relations[idx].origin == RelationOrigin::Optional
+                    || !shared_vars
+                        .iter()
+                        .all(|var| Self::relation_covers_var(&ctx.relations[idx], var))
+                {
+                    continue;
+                }
+                let relation_meta = &ctx.relations[idx];
+                let mut survivors: FxHashMap<&str, FxHashSet<EntityID>> = FxHashMap::default();
+                let mut removed_any: FxHashMap<&str, FxHashSet<EntityID>> = FxHashMap::default();
+                let kept: Vec<QueryRelationRow> = relation_meta
+                    .rows
+                    .iter()
+                    .filter(|row| {
+                        let keep = match project(relation_meta, row) {
+                            Some(tuple) => !excluded_tuples.contains(&tuple),
+                            None => true,
+                        };
+                        for var in &shared_vars {
+                            if let Some(Some(entity)) =
+                                Self::relation_row_entity(relation_meta, row, var)
+                            {
+                                let bucket = if keep {
+                                    survivors.entry(var.as_str()).or_default()
+                                } else {
+                                    removed_any.entry(var.as_str()).or_default()
+                                };
+                                bucket.insert(entity.clone());
+                            }
+                        }
+                        keep
+                    })
+                    .cloned()
+                    .collect();
+
+                // Narrow bindings: drop values that appeared in this
+                // relation's rows but survive in none of them.
+                for var in &shared_vars {
+                    let empty = FxHashSet::default();
+                    let kept_vals = survivors.get(var.as_str()).unwrap_or(&empty);
+                    if let Some(removed) = removed_any.get(var.as_str()) {
+                        let lost: FxHashSet<&EntityID> =
+                            removed.iter().filter(|id| !kept_vals.contains(*id)).collect();
+                        if !lost.is_empty()
+                            && let Some(existing) = ctx.entities.get_mut(var)
+                        {
+                            existing.retain(|id| !lost.contains(id));
+                        }
+                    }
+                }
+                ctx.relations[idx].rows = kept;
+            }
+            anti_joined_vars.extend(shared_vars);
+        }
+
         for (var, ids) in &not_context.entities {
-            if ids.is_empty() || !not_vars.contains(var) {
+            if ids.is_empty() || !not_vars.contains(var) || anti_joined_vars.contains(var) {
                 continue;
             }
             // 如果 NOT 子句中有变量绑定，则从当前上下文中移除这些绑定
@@ -885,9 +1000,17 @@ impl CognitiveNexus {
             }
         }
 
-        ctx.relations.extend(optional_context.relations);
+        // Relations produced inside OPTIONAL must never restrict the outer
+        // solution set (KIP §3.4.7.2) — tag them so FIND excludes them from
+        // conjunctive equi-joins.
+        for mut relation in optional_context.relations {
+            relation.origin = RelationOrigin::Optional;
+            ctx.relations.push(relation);
+        }
         ctx.row_sensitive_vars
             .extend(optional_context.row_sensitive_vars);
+        ctx.unaligned_filter_vars
+            .extend(optional_context.unaligned_filter_vars);
 
         Ok(())
     }
@@ -923,9 +1046,36 @@ impl CognitiveNexus {
                 entry.entry(gid).or_default().extend(mids.into_vec());
             }
         }
-        ctx.relations.extend(union_context.relations);
+
+        // Row-wise union (KIP §3.4.7.3): when a UNION-branch relation binds
+        // exactly the same variables as one or more outer relations, its
+        // rows are appended to each of them so the branch's solutions
+        // survive both projection (which reads one covering relation) and
+        // conjunctive equi-joins over sequential patterns. Deduplication
+        // happens at FIND time (§3.3). Branch relations with a new variable
+        // signature stay separate, tagged `Union` for null-padded merging.
+        for mut relation in union_context.relations {
+            relation.origin = RelationOrigin::Union;
+            let mut merged = false;
+            for existing in ctx.relations.iter_mut() {
+                if existing.origin != RelationOrigin::Optional
+                    && existing.proposition_var == relation.proposition_var
+                    && existing.subject_var == relation.subject_var
+                    && existing.predicate_var == relation.predicate_var
+                    && existing.object_var == relation.object_var
+                {
+                    existing.rows.extend(relation.rows.iter().cloned());
+                    merged = true;
+                }
+            }
+            if !merged {
+                ctx.relations.push(relation);
+            }
+        }
         ctx.row_sensitive_vars
             .extend(union_context.row_sensitive_vars);
+        ctx.unaligned_filter_vars
+            .extend(union_context.unaligned_filter_vars);
 
         Ok(())
     }
@@ -934,6 +1084,11 @@ impl CognitiveNexus {
     ///
     /// Predicate variables (bound via triple patterns like `(?s, ?p, ?o)`) are stored
     /// separately from entity variables. This method handles both cases.
+    ///
+    /// The cursor is decoded lazily per branch — entity columns use a
+    /// `BTree` entity cursor, predicate columns a numeric offset — and an
+    /// unparseable token is rejected (`KIP_1001`) instead of silently
+    /// replaying from the start with duplicate pages.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn resolve_find_var(
         &self,
@@ -942,13 +1097,24 @@ impl CognitiveNexus {
         var: &str,
         fields: &[String],
         order_by: &[OrderByCondition],
-        cursor: Option<&EntityID>,
         raw_cursor: Option<&str>,
         limit: usize,
     ) -> Result<(Vec<Json>, Option<String>), KipError> {
         if bindings.contains_key(var) {
+            let cursor: Option<EntityID> =
+                BTree::from_cursor(&raw_cursor.map(|cursor| cursor.to_string())).map_err(|err| {
+                    KipError::invalid_syntax(format!("Invalid CURSOR token: {err}"))
+                })?;
             return self
-                .resolve_result(&ctx.cache, bindings, var, fields, order_by, cursor, limit)
+                .resolve_result(
+                    &ctx.cache,
+                    bindings,
+                    var,
+                    fields,
+                    order_by,
+                    cursor.as_ref(),
+                    limit,
+                )
                 .await;
         }
 
@@ -1155,15 +1321,20 @@ impl CognitiveNexus {
             return Ok(None);
         };
 
-        let mut referenced: FxHashSet<String> = FxHashSet::default();
+        // Referenced variables in a stable order: FIND order first, then
+        // ORDER BY-only variables. The order defines the projected solution
+        // tuple used to join/union rows across relations.
+        let mut referenced: Vec<String> = Vec::new();
         for (_, dot_paths) in &groups {
             for dot_path in dot_paths {
-                referenced.insert(dot_path.var.clone());
+                if !referenced.iter().any(|v| v == &dot_path.var) {
+                    referenced.push(dot_path.var.clone());
+                }
             }
         }
         for cond in order_by {
-            if !cond.is_aggregation() {
-                referenced.insert(cond.variable.var.clone());
+            if !cond.is_aggregation() && !referenced.iter().any(|v| v == &cond.variable.var) {
+                referenced.push(cond.variable.var.clone());
             }
         }
 
@@ -1174,46 +1345,175 @@ impl CognitiveNexus {
         let distinct_find_vars: FxHashSet<&str> =
             groups.iter().map(|(var, _)| var.as_str()).collect();
 
-        let relation = ctx.relations.iter().rev().find(|relation| {
-            let covers_all = referenced
-                .iter()
-                .all(|var| Self::relation_covers_var(relation, var));
-            if !covers_all {
-                return false;
-            }
-            if distinct_find_vars.len() >= 2 {
-                return true;
-            }
+        let covering: Vec<&QueryRelationBinding> = ctx
+            .relations
+            .iter()
+            .filter(|relation| {
+                let covers_all = referenced
+                    .iter()
+                    .all(|var| Self::relation_covers_var(relation, var));
+                if !covers_all {
+                    return false;
+                }
+                if distinct_find_vars.len() >= 2 {
+                    return true;
+                }
 
-            // Single-variable projections only need row semantics when a
-            // proposition-field sort or filter makes rows distinguishable.
-            let proposition_var = relation.proposition_var.as_deref();
-            let orders_by_proposition_field = proposition_var
-                .map(|var| {
-                    order_by.iter().any(|cond| {
-                        !cond.is_aggregation()
-                            && cond.variable.var == var
-                            && !cond.variable.path.is_empty()
+                // Single-variable projections only need row semantics when a
+                // proposition-field sort or filter makes rows distinguishable.
+                let proposition_var = relation.proposition_var.as_deref();
+                let orders_by_proposition_field = proposition_var
+                    .map(|var| {
+                        order_by.iter().any(|cond| {
+                            !cond.is_aggregation()
+                                && cond.variable.var == var
+                                && !cond.variable.path.is_empty()
+                        })
                     })
-                })
-                .unwrap_or(false);
-            let filters_by_proposition_field = proposition_var
-                .map(|var| ctx.row_sensitive_vars.contains(var))
-                .unwrap_or(false);
+                    .unwrap_or(false);
+                let filters_by_proposition_field = proposition_var
+                    .map(|var| ctx.row_sensitive_vars.contains(var))
+                    .unwrap_or(false);
 
-            orders_by_proposition_field || filters_by_proposition_field
-        });
-
-        let Some(relation) = relation.cloned() else {
+                orders_by_proposition_field || filters_by_proposition_field
+            })
+            .collect();
+        if covering.is_empty() {
             return Ok(None);
+        }
+
+        // Combining semantics by clause origin (KIP §3.4, §3.4.7):
+        // - `Pattern` relations are conjunctive — solutions must satisfy
+        //   every one of them (row-level equi-join on the referenced tuple);
+        // - `Union` relations contribute a row-wise union of solutions;
+        // - `Optional` relations never restrict the outer solution set and
+        //   only serve as the row source when nothing else covers the
+        //   variables (left-join padded rows).
+        let patterns: Vec<&QueryRelationBinding> = covering
+            .iter()
+            .copied()
+            .filter(|r| r.origin == RelationOrigin::Pattern)
+            .collect();
+        let unions: Vec<&QueryRelationBinding> = covering
+            .iter()
+            .copied()
+            .filter(|r| r.origin == RelationOrigin::Union)
+            .collect();
+        let base: &QueryRelationBinding = patterns
+            .last()
+            .or(unions.last())
+            .copied()
+            .unwrap_or_else(|| covering.last().copied().unwrap());
+
+        // The synthesized rows use the base relation's variable→slot layout.
+        let relation = QueryRelationBinding {
+            proposition_var: base.proposition_var.clone(),
+            subject_var: base.subject_var.clone(),
+            predicate_var: base.predicate_var.clone(),
+            object_var: base.object_var.clone(),
+            rows: Vec::new(),
+            origin: base.origin,
         };
 
-        let mut rows: Vec<QueryRelationRow> = relation
-            .rows
-            .iter()
-            .filter(|row| Self::relation_row_matches_context(ctx, &relation, row))
-            .cloned()
-            .collect();
+        // Projects one relation row onto the referenced-variable tuple.
+        let project_row =
+            |relation: &QueryRelationBinding, row: &QueryRelationRow| -> Vec<FilterBindingValue> {
+                referenced
+                    .iter()
+                    .map(|var| {
+                        if let Some(entity) = Self::relation_row_entity(relation, row, var) {
+                            match entity {
+                                Some(entity) => FilterBindingValue::Entity(entity.clone()),
+                                None => FilterBindingValue::Null,
+                            }
+                        } else if let Some(Some(predicate)) =
+                            Self::relation_row_predicate(relation, row, var)
+                        {
+                            FilterBindingValue::Predicate(predicate.to_string())
+                        } else {
+                            FilterBindingValue::Null
+                        }
+                    })
+                    .collect()
+            };
+        // Rebuilds a row in the base slot layout from a projected tuple.
+        let synthesize_row = |tuple: &[FilterBindingValue]| -> QueryRelationRow {
+            let mut row = QueryRelationRow {
+                proposition: None,
+                subject: None,
+                predicate: None,
+                object: None,
+            };
+            for (var, value) in referenced.iter().zip(tuple) {
+                match value {
+                    FilterBindingValue::Entity(id) => {
+                        if relation.proposition_var.as_deref() == Some(var) {
+                            row.proposition = Some(id.clone());
+                        } else if relation.subject_var.as_deref() == Some(var) {
+                            row.subject = Some(id.clone());
+                        } else if relation.object_var.as_deref() == Some(var) {
+                            row.object = Some(id.clone());
+                        }
+                    }
+                    FilterBindingValue::Predicate(pred) => {
+                        if relation.predicate_var.as_deref() == Some(var) {
+                            row.predicate = Some(pred.clone());
+                        }
+                    }
+                    FilterBindingValue::Null => {}
+                }
+            }
+            row
+        };
+
+        let mut rows: Vec<QueryRelationRow> = if covering.len() == 1 {
+            base.rows
+                .iter()
+                .filter(|row| Self::relation_row_matches_context(ctx, base, row))
+                .cloned()
+                .collect()
+        } else if patterns.is_empty() && unions.is_empty() {
+            // Only OPTIONAL relations cover the variables: project the last
+            // one's (left-join padded) rows, as before.
+            base.rows
+                .iter()
+                .filter(|row| Self::relation_row_matches_context(ctx, base, row))
+                .cloned()
+                .collect()
+        } else {
+            let mut combined: Vec<QueryRelationRow> = Vec::new();
+            if let Some((join_base, others)) = patterns.split_last() {
+                let other_sets: Vec<FxHashSet<Vec<FilterBindingValue>>> = others
+                    .iter()
+                    .map(|relation| {
+                        relation
+                            .rows
+                            .iter()
+                            .filter(|row| Self::relation_row_matches_context(ctx, relation, row))
+                            .map(|row| project_row(relation, row))
+                            .collect()
+                    })
+                    .collect();
+                for row in &join_base.rows {
+                    if !Self::relation_row_matches_context(ctx, join_base, row) {
+                        continue;
+                    }
+                    let tuple = project_row(join_base, row);
+                    if other_sets.iter().all(|set| set.contains(&tuple)) {
+                        combined.push(synthesize_row(&tuple));
+                    }
+                }
+            }
+            for relation in &unions {
+                for row in &relation.rows {
+                    if !Self::relation_row_matches_context(ctx, relation, row) {
+                        continue;
+                    }
+                    combined.push(synthesize_row(&project_row(relation, row)));
+                }
+            }
+            combined
+        };
 
         // Solution deduplication (KIP §3.3): solutions whose bindings agree
         // on every projected variable collapse before ORDER BY and LIMIT.
@@ -1365,6 +1665,48 @@ impl CognitiveNexus {
             }
         }
 
+        // A cross-variable FILTER over more than two entity variables (or
+        // more than one predicate variable) could not record its satisfying
+        // combinations; projecting two or more of those variables together
+        // would re-materialize a full cross product with the filter's
+        // alignment lost. Reject with KIP_4002 instead of silently returning
+        // misaligned columns (KIP §6.2.2).
+        if !ctx.unaligned_filter_vars.is_empty()
+            && referenced[..distinct_find_vars]
+                .iter()
+                .filter(|var| ctx.unaligned_filter_vars.contains(*var))
+                .count()
+                >= 2
+        {
+            return Err(KipError::resource_exhausted(
+                "FIND projects two or more variables whose cross-variable FILTER exceeded the \
+                 recordable slots (more than two entity variables or more than one predicate \
+                 variable), so the columns cannot stay solution-aligned; split the FILTER or \
+                 project the variables separately"
+                    .to_string(),
+            ));
+        }
+
+        let var_index: FxHashMap<&str, usize> = referenced
+            .iter()
+            .enumerate()
+            .map(|(i, var)| (var.as_str(), i))
+            .collect();
+
+        // Row-wise union with null padding (KIP §3.4.7.3): when the
+        // referenced variables partition across relations with disjoint
+        // variable sets and at least one partition is a UNION branch, the
+        // solutions are the concatenation of each branch's rows padded with
+        // `null` in the other branches' columns — not the cross product.
+        if let Some(union_rows) =
+            Self::try_union_padded_rows(ctx, &referenced, &var_index, distinct_find_vars)
+        {
+            return self
+                .finish_cartesian_rows(ctx, groups, order_by, raw_cursor, limit, union_rows, var_index)
+                .await
+                .map(Some);
+        }
+
         // Split into relation-bound and loose variables.
         let in_relation: Vec<&str> = referenced
             .iter()
@@ -1388,12 +1730,6 @@ impl CognitiveNexus {
                 None => return Ok(None),
             }
         };
-
-        let var_index: FxHashMap<&str, usize> = referenced
-            .iter()
-            .enumerate()
-            .map(|(i, var)| (var.as_str(), i))
-            .collect();
 
         // Base rows from the covering relation (or a single empty row).
         let mut rows: Vec<Vec<FilterBindingValue>> = match relation {
@@ -1490,6 +1826,117 @@ impl CognitiveNexus {
             rows = expanded;
         }
 
+        self.finish_cartesian_rows(ctx, groups, order_by, raw_cursor, limit, rows, var_index)
+            .await
+            .map(Some)
+    }
+
+    /// Detects the "disjoint UNION branches" projection shape (KIP §3.4.7.3
+    /// Execution Flow Example 1): every referenced variable is covered by
+    /// exactly one non-OPTIONAL relation, those relations partition the
+    /// variables into two or more groups, and at least one group comes from
+    /// a UNION branch. Returns the row-wise union of the branches' rows,
+    /// null-padded in the other branches' columns, deduplicated on the
+    /// projected columns (KIP §3.3). Returns `None` when the shape does not
+    /// apply (shared or loose variables fall back to the join/cross-product
+    /// paths).
+    fn try_union_padded_rows(
+        ctx: &QueryContext,
+        referenced: &[String],
+        var_index: &FxHashMap<&str, usize>,
+        distinct_find_vars: usize,
+    ) -> Option<Vec<Vec<FilterBindingValue>>> {
+        // Map each referenced variable to the unique non-OPTIONAL relation
+        // covering it.
+        let mut assignment: Vec<usize> = Vec::with_capacity(referenced.len());
+        for var in referenced {
+            let mut covering = ctx.relations.iter().enumerate().filter(|(_, relation)| {
+                relation.origin != RelationOrigin::Optional
+                    && Self::relation_covers_var(relation, var)
+            });
+            // Uncovered (loose) variable: not this shape.
+            let (idx, _) = covering.next()?;
+            if covering.next().is_some() {
+                return None; // shared variable: join semantics, not a union
+            }
+            assignment.push(idx);
+        }
+        let distinct_relations: FxHashSet<usize> = assignment.iter().copied().collect();
+        if distinct_relations.len() < 2
+            || !distinct_relations
+                .iter()
+                .any(|idx| ctx.relations[*idx].origin == RelationOrigin::Union)
+        {
+            return None;
+        }
+
+        // Emit each partition's rows in relation order (main block first),
+        // padded with `Null` in the other partitions' columns.
+        let mut rows: Vec<Vec<FilterBindingValue>> = Vec::new();
+        let mut seen: FxHashSet<String> = FxHashSet::default();
+        let mut ordered: Vec<usize> = distinct_relations.into_iter().collect();
+        ordered.sort_unstable();
+        for rel_idx in ordered {
+            let relation = &ctx.relations[rel_idx];
+            let vars: Vec<&str> = referenced
+                .iter()
+                .zip(&assignment)
+                .filter(|(_, idx)| **idx == rel_idx)
+                .map(|(var, _)| var.as_str())
+                .collect();
+            for row in &relation.rows {
+                if !Self::relation_row_matches_context(ctx, relation, row) {
+                    continue;
+                }
+                let mut solution = vec![FilterBindingValue::Null; referenced.len()];
+                for var in &vars {
+                    let binding = if let Some(entity) =
+                        Self::relation_row_entity(relation, row, var)
+                    {
+                        match entity {
+                            Some(entity) => FilterBindingValue::Entity(entity.clone()),
+                            None => FilterBindingValue::Null,
+                        }
+                    } else if let Some(Some(predicate)) =
+                        Self::relation_row_predicate(relation, row, var)
+                    {
+                        FilterBindingValue::Predicate(predicate.to_string())
+                    } else {
+                        FilterBindingValue::Null
+                    };
+                    solution[var_index[*var]] = binding;
+                }
+                let mut key = String::new();
+                for slot in solution.iter().take(distinct_find_vars) {
+                    key.push('|');
+                    match slot {
+                        FilterBindingValue::Entity(entity) => key.push_str(&entity.to_string()),
+                        FilterBindingValue::Predicate(pred) => key.push_str(pred),
+                        FilterBindingValue::Null => {}
+                    }
+                }
+                if seen.insert(key) {
+                    rows.push(solution);
+                }
+            }
+        }
+        Some(rows)
+    }
+
+    /// Shared tail of the cartesian / union-padded `FIND` paths: ORDER BY
+    /// over the materialized solution rows, numeric offset cursor, and
+    /// index-aligned column projection.
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_cartesian_rows(
+        &self,
+        ctx: &QueryContext,
+        groups: Vec<(String, Vec<DotPathVar>)>,
+        order_by: &[OrderByCondition],
+        raw_cursor: Option<&str>,
+        limit: usize,
+        mut rows: Vec<Vec<FilterBindingValue>>,
+        var_index: FxHashMap<&str, usize>,
+    ) -> Result<(Vec<Json>, Option<String>), KipError> {
         // ORDER BY over the materialized rows.
         let order_conditions: Vec<&OrderByCondition> = order_by
             .iter()
@@ -1556,7 +2003,7 @@ impl CognitiveNexus {
             result.push(Json::Array(column));
         }
 
-        Ok(Some((result, next_cursor)))
+        Ok((result, next_cursor))
     }
 
     pub(super) async fn execute_find_clause(
@@ -1594,8 +2041,6 @@ impl CognitiveNexus {
             return Ok(row_result);
         }
 
-        let cursor: Option<EntityID> = BTree::from_cursor(&cursor).ok().flatten();
-
         // 多变量但无单一 relation 全覆盖：物化笛卡尔解行，保证列按解对齐
         // （KIP §6.2.2）。
         if let Some(row_result) = self
@@ -1605,6 +2050,10 @@ impl CognitiveNexus {
             return Ok(row_result);
         }
 
+        // Legacy per-variable projection. Cursor decoding happens inside
+        // `resolve_find_var`, per column kind (entity cursor vs numeric
+        // offset for predicate columns); an unparseable token is rejected
+        // there with KIP_1001 instead of silently replaying from the start.
         let mut result: Vec<Json> = Vec::with_capacity(clause.expressions.len());
         let mut next_cursor: Option<String> = None;
         let mut group_var: Option<(String, Vec<String>)> = None;
@@ -1622,7 +2071,6 @@ impl CognitiveNexus {
                                     var,
                                     fields,
                                     &order_by,
-                                    cursor.as_ref(),
                                     raw_cursor,
                                     limit,
                                 )
@@ -1661,7 +2109,6 @@ impl CognitiveNexus {
                                 var,
                                 fields,
                                 &order_by,
-                                cursor.as_ref(),
                                 raw_cursor,
                                 limit,
                             )
@@ -1699,7 +2146,6 @@ impl CognitiveNexus {
                                 &[var.to_pointer_or("id")],
                                 &[],
                                 None,
-                                None,
                                 0,
                             )
                             .await?;
@@ -1719,7 +2165,6 @@ impl CognitiveNexus {
                     var,
                     fields,
                     &order_by,
-                    cursor.as_ref(),
                     raw_cursor,
                     limit,
                 )
@@ -1812,6 +2257,12 @@ impl CognitiveNexus {
             .cloned()
             .unwrap_or_default();
 
+        // 成员收窄：groups 只在建组时写入一次，后续 FILTER/NOT/其它子句
+        // 对成员变量的收窄只反映在 bindings 里，因此这里必须与 bindings[mvar]
+        // 求交集，否则 COUNT 等聚合会把已被过滤掉的成员计进去。
+        let surviving_members: Option<FxHashSet<&EntityID>> =
+            bindings.get(mvar).map(|ids| ids.iter().collect());
+
         // 构造每行数据：(group_entity_id, member_count, member_ids)
         struct GroupRow {
             gid: EntityID,
@@ -1819,7 +2270,10 @@ impl CognitiveNexus {
         }
         let mut rows: Vec<GroupRow> = Vec::with_capacity(group_ids.len());
         for gid in &group_ids {
-            let member_ids = groups_map.get(gid).map(|v| v.to_vec()).unwrap_or_default();
+            let mut member_ids = groups_map.get(gid).map(|v| v.to_vec()).unwrap_or_default();
+            if let Some(surviving) = &surviving_members {
+                member_ids.retain(|id| surviving.contains(id));
+            }
             rows.push(GroupRow {
                 gid: gid.clone(),
                 member_ids,
@@ -1849,12 +2303,41 @@ impl CognitiveNexus {
                 }
             });
         } else if has_var_order {
-            // 按 group variable 字段排序 — 需要加载实体数据才能排序
-            // 这里延迟到 resolve 阶段处理
+            // 按 group variable 字段排序：加载各分组实体的排序字段值后按
+            // KIP §3.5 比较（数值/布尔/日期感知字符串，null 恒排最后）。
+            // 必须在游标切分之前完成，游标基于排序后的行序恢复。
+            let order_conditions: Vec<&OrderByCondition> = order_by
+                .iter()
+                .filter(|o| !o.is_aggregation() && o.variable.var == gvar)
+                .collect();
+            let mut keyed: Vec<(GroupRow, Vec<Json>)> = Vec::with_capacity(rows.len());
+            for row in rows {
+                let mut sort_values = Vec::with_capacity(order_conditions.len());
+                for cond in &order_conditions {
+                    sort_values.push(
+                        self.load_entity_field(&ctx.cache, &row.gid, &cond.variable.to_pointer())
+                            .await?,
+                    );
+                }
+                keyed.push((row, sort_values));
+            }
+            keyed.sort_by(|(_, left_values), (_, right_values)| {
+                for (idx, cond) in order_conditions.iter().enumerate() {
+                    let ordering =
+                        compare_order_key(&left_values[idx], &right_values[idx], &cond.direction);
+                    if ordering != std::cmp::Ordering::Equal {
+                        return ordering;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+            rows = keyed.into_iter().map(|(row, _)| row).collect();
         }
 
-        // 应用 cursor (基于 group entity ID)
-        let cursor_id: Option<EntityID> = BTree::from_cursor(cursor).ok().flatten();
+        // 应用 cursor (基于 group entity ID)；非法游标一律报 KIP_1001，
+        // 与其它分页路径一致（静默从头重放会产生重复页）。
+        let cursor_id: Option<EntityID> = BTree::from_cursor(cursor)
+            .map_err(|err| KipError::invalid_syntax(format!("Invalid CURSOR token: {err}")))?;
         if let Some(ref cid) = cursor_id
             && let Some(pos) = rows.iter().position(|r| &r.gid == cid)
         {
@@ -1885,8 +2368,6 @@ impl CognitiveNexus {
                         result.push(Json::Array(col));
                     } else {
                         // 非 group variable — 按全局绑定解析
-                        let eid_cursor: Option<EntityID> =
-                            BTree::from_cursor(cursor).ok().flatten();
                         let (col, _) = self
                             .resolve_find_var(
                                 ctx,
@@ -1894,7 +2375,6 @@ impl CognitiveNexus {
                                 &dot_path.var,
                                 &[dot_path.to_pointer()],
                                 order_by,
-                                eid_cursor.as_ref(),
                                 cursor.as_deref(),
                                 limit,
                             )
@@ -1939,7 +2419,6 @@ impl CognitiveNexus {
                                     &agg_dot_path.var,
                                     &[agg_dot_path.to_pointer_or("id")],
                                     &[],
-                                    None,
                                     None,
                                     0,
                                 )
@@ -2081,13 +2560,30 @@ impl CognitiveNexus {
             .get(var)
             .ok_or_else(|| KipError::reference_error(format!("Unbound variable: {var:?}")))?;
 
-        let mut result = Vec::with_capacity(ids.len());
         let has_order_by = order_by
             .iter()
             .any(|v| !v.is_aggregation() && v.variable.var == var);
-        for eid in ids {
+
+        // Without ORDER BY the cursor skips entities with `eid <= cursor`,
+        // which is only complete over an ascending iteration order. Bindings
+        // keep clause insertion order (UNION/OPTIONAL append at the tail),
+        // so sort explicitly — otherwise a page boundary can silently skip
+        // smaller ids appended by a later branch.
+        let mut ordered: Vec<&EntityID> = ids.iter().collect();
+        if !has_order_by {
+            ordered.sort();
+        }
+
+        let mut result = Vec::with_capacity(ordered.len());
+        let mut has_more = false;
+        for eid in ordered {
             if !has_order_by && cursor.map(|v| eid <= v).unwrap_or(false) {
                 continue;
+            }
+            if !has_order_by && limit > 0 && result.len() >= limit {
+                // A further post-cursor entity exists: the page is truly full.
+                has_more = true;
+                break;
             }
 
             match eid {
@@ -2108,10 +2604,6 @@ impl CognitiveNexus {
                     result.push((eid, rt));
                 }
             };
-
-            if !has_order_by && limit > 0 && result.len() >= limit {
-                break;
-            }
         }
 
         if has_order_by {
@@ -2124,8 +2616,11 @@ impl CognitiveNexus {
             }
         }
 
+        // A cursor is only issued when more rows actually remain (strict
+        // `<`), matching the relation/cartesian paths — `<=` would hand the
+        // client one extra empty page.
         let mut next_cursor: Option<String> = None;
-        if limit > 0 && limit <= result.len() {
+        if limit > 0 && (has_more || limit < result.len()) {
             result.truncate(limit);
             next_cursor = result.last().and_then(|(eid, _)| BTree::to_cursor(eid));
         }
@@ -2283,7 +2778,11 @@ impl CognitiveNexus {
                         regex_cache.insert(pattern.to_string(), compiled);
                         Ok(rt)
                     }
-                    _ => unreachable!(),
+                    // Defensive: a future FilterFunction variant must fail the
+                    // query, not panic the engine.
+                    other => Err(KipError::invalid_syntax(format!(
+                        "Unsupported filter function: {other:?}"
+                    ))),
                 }
             }
         }

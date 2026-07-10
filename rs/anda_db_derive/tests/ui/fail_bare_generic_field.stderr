@@ -1,0 +1,5 @@
+error: cannot infer a FieldType for generic type parameter `T`; add #[field_type = "..."] to declare this field's schema type
+ --> tests/ui/fail_bare_generic_field.rs:7:12
+  |
+7 |     inner: T,
+  |            ^

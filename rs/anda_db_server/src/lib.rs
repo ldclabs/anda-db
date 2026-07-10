@@ -48,7 +48,7 @@
 //!
 //! See the crate README for parameter shapes and examples.
 
-use axum::{Router, routing};
+use axum::{Router, extract::DefaultBodyLimit, middleware, routing};
 
 pub mod api;
 pub mod encoding;
@@ -61,10 +61,15 @@ pub use state::{AppState, OpenMode, ServerInfo, ServerOptions};
 /// Builds the axum [`Router`] for the server.
 ///
 /// `GET /` is unauthenticated; the RPC endpoints check the configured
-/// API key (if any) on every request.
+/// API key (if any) on every request. The request body size limit comes
+/// from [`ServerOptions::max_body_size`] and over-limit requests receive
+/// the RPC error envelope (`payload_too_large`) instead of axum's plain
+/// text 413.
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/", routing::get(api::get_info).post(api::rpc_root))
         .route("/{db_name}", routing::post(api::rpc_db))
+        .layer(DefaultBodyLimit::max(state.max_body_size()))
+        .layer(middleware::from_fn(api::normalize_rejections))
         .with_state(state)
 }

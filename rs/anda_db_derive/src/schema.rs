@@ -5,7 +5,8 @@ use syn::{Attribute, DeriveInput, Expr, Lit, ext::IdentExt, parse_macro_input};
 
 use crate::common::{
     effective_field_name, is_u64_type, named_fields, parse_container_serde_attrs,
-    parse_field_serde_attrs, resolve_field_type, schema_crate_path, validate_schema_field_name,
+    parse_field_cbor_attrs, parse_field_serde_attrs, resolve_field_type, schema_crate_path,
+    validate_schema_field_name,
 };
 
 /// Implementation of `#[derive(AndaDBSchema)]`.
@@ -29,6 +30,12 @@ pub fn anda_db_schema_derive(input: TokenStream) -> TokenStream {
 pub(crate) fn expand_anda_db_schema_derive(input: DeriveInput) -> TokenStream2 {
     let name = &input.ident;
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
+    let root = schema_crate_path();
+    let type_params: std::collections::BTreeSet<String> = input
+        .generics
+        .type_params()
+        .map(|p| p.ident.to_string())
+        .collect();
 
     // Only structs with named fields are supported.
     let fields = match named_fields(&input, "AndaDBSchema") {
@@ -47,6 +54,15 @@ pub(crate) fn expand_anda_db_schema_derive(input: DeriveInput) -> TokenStream2 {
         )
         .to_compile_error();
     }
+    // `#[unique]` is a field-level constraint; on the container it would be
+    // silently meaningless, so reject it.
+    if has_unique_attr(&input.attrs) {
+        return syn::Error::new_spanned(
+            &input.ident,
+            "#[unique] must be applied to a field, not to the struct itself",
+        )
+        .to_compile_error();
+    }
 
     // Build one `builder.add_field(...)` invocation per serialized field
     // (except `_id`). Errors are emitted in place so that every offending
@@ -61,6 +77,21 @@ pub(crate) fn expand_anda_db_schema_derive(input: DeriveInput) -> TokenStream2 {
         // The `_id` column is provided automatically by `SchemaBuilder`; the
         // user-declared field is validated and then skipped.
         if rust_name == "_id" {
+            // `_id` is always `FieldType::U64`; a `#[field_type]` override
+            // would be silently ignored, so reject it.
+            if let Some(attr) = field
+                .attrs
+                .iter()
+                .find(|attr| attr.path().is_ident("field_type"))
+            {
+                field_entries.push(
+                    syn::Error::new_spanned(
+                        attr,
+                        "#[field_type] is not allowed on `_id`: the primary key is always FieldType::U64",
+                    )
+                    .to_compile_error(),
+                );
+            }
             if !is_u64_type(&field.ty) {
                 field_entries.push(
                     syn::Error::new_spanned(&field.ty, "The '_id' field must be of type u64")
@@ -89,6 +120,30 @@ pub(crate) fn expand_anda_db_schema_derive(input: DeriveInput) -> TokenStream2 {
         // Fields serde never serializes must not appear in the schema.
         if serde_attrs.skip_serializing {
             continue;
+        }
+        // Top-level document fields are stored under their text names;
+        // an integer CBOR key (honoured by nested `FieldTyped` structs)
+        // would make the serialized document unreadable, so reject it here
+        // instead of failing at runtime.
+        match parse_field_cbor_attrs(&field.attrs) {
+            Ok(cbor_attrs) => {
+                if cbor_attrs.key.is_some() {
+                    field_entries.push(
+                        syn::Error::new_spanned(
+                            field_ident,
+                            "#[cbor(key = ...)] is not supported on top-level document fields: \
+                             AndaDB documents are stored with text field names. Integer CBOR \
+                             keys are only supported in nested structs deriving FieldTyped",
+                        )
+                        .to_compile_error(),
+                    );
+                    continue;
+                }
+            }
+            Err(err) => {
+                field_entries.push(err.to_compile_error());
+                continue;
+            }
         }
         if serde_attrs.flatten {
             field_entries.push(
@@ -146,7 +201,7 @@ pub(crate) fn expand_anda_db_schema_derive(input: DeriveInput) -> TokenStream2 {
         }
 
         // `#[field_type = "..."]` wins over auto-inference.
-        let field_type = match resolve_field_type(field) {
+        let field_type = match resolve_field_type(field, &root, &type_params) {
             Ok(field_type) => field_type,
             Err(err) => {
                 field_entries.push(err.to_compile_error());
@@ -156,7 +211,7 @@ pub(crate) fn expand_anda_db_schema_derive(input: DeriveInput) -> TokenStream2 {
 
         // Doc comments become the schema field description, and `#[unique]`
         // adds a unique constraint to the generated entry.
-        let mut entry = quote! { FieldEntry::new(#schema_name.to_string(), #field_type)? };
+        let mut entry = quote! { #root::FieldEntry::new(#schema_name.to_string(), #field_type)? };
         let description = extract_doc_comments(&field.attrs);
         if !description.is_empty() {
             entry = quote! { #entry.with_description(#description.to_string()) };
@@ -173,22 +228,19 @@ pub(crate) fn expand_anda_db_schema_derive(input: DeriveInput) -> TokenStream2 {
     // Avoid an `unused_mut` warning when the struct declares no field other
     // than `_id`.
     let builder_binding = if field_entries.is_empty() {
-        quote! { let builder = Schema::builder(); }
+        quote! { let builder = #root::Schema::builder(); }
     } else {
-        quote! { let mut builder = Schema::builder(); }
+        quote! { let mut builder = #root::Schema::builder(); }
     };
 
-    // Generate the schema function implementation. The generated body imports
-    // the schema types through the resolved crate path so callers do not need
-    // `Schema` / `SchemaError` / `FieldEntry` / `FieldType` in scope.
-    let root = schema_crate_path();
+    // Generate the schema function implementation. Every schema item is
+    // referenced through the resolved crate path (never imported into the
+    // generated scope) so that user types named `Schema` / `FieldEntry` /
+    // `FieldType` / ... are not shadowed.
     quote! {
         impl #impl_generics #name #ty_generics #where_clause {
             #[doc = "Returns the AndaDB `Schema` derived from this struct's serialized fields.\n\nThe `_id` primary-key column is injected automatically by the schema builder.\nGenerated by `#[derive(AndaDBSchema)]`."]
             pub fn schema() -> ::core::result::Result<#root::Schema, #root::SchemaError> {
-                #[allow(unused_imports)]
-                use #root::{FieldEntry, FieldKey, FieldType, Schema, SchemaError};
-
                 #builder_binding
 
                 #(#field_entries)*
@@ -250,20 +302,41 @@ mod tests {
                 name: String,
                 #[field_type = "Option<Array<Text>>"]
                 tags: Vec<String>,
+                #[field_type = "Json"]
                 nested: T,
+                wrapped: Wrapper<T>,
             }
         };
 
         let expanded = tokens(expand_anda_db_schema_derive(input));
         assert!(expanded.contains("impl < T > User < T > where T : Clone"));
-        assert!(expanded.contains("Schema :: builder"));
+        assert!(expanded.contains(":: anda_db_schema :: Schema :: builder"));
+        assert!(expanded.contains(":: anda_db_schema :: FieldEntry :: new"));
         assert!(expanded.contains("\"display_name\""));
         assert!(expanded.contains("with_description (\"Display name\""));
         assert!(expanded.contains("with_unique"));
-        assert!(expanded.contains("FieldType :: Option"));
-        assert!(expanded.contains("< T > :: field_type ()"));
+        assert!(expanded.contains(":: anda_db_schema :: FieldType :: Option"));
+        // Generic *user* types keep working through their own field_type().
+        assert!(expanded.contains("< Wrapper < T > > :: field_type ()"));
+        // The generated body must not import bare schema names into scope.
+        assert!(!expanded.contains("use ::"));
+        assert!(!expanded.contains("use anda_db_schema"));
         assert!(!expanded.contains("\"_id\" . to_string"));
         assert!(!expanded.contains("compile_error"));
+    }
+
+    #[test]
+    fn expand_schema_rejects_bare_generic_fields_with_clear_error() {
+        let input: DeriveInput = parse_quote! {
+            struct Doc<T> {
+                _id: u64,
+                payload: T,
+            }
+        };
+
+        let expanded = tokens(expand_anda_db_schema_derive(input));
+        assert!(expanded.contains("compile_error"));
+        assert!(expanded.contains("generic type parameter `T`"));
     }
 
     #[test]
@@ -382,6 +455,55 @@ mod tests {
             }
         };
         assert!(tokens(expand_anda_db_schema_derive(bad_type)).contains("Unsupported type"));
+    }
+
+    #[test]
+    fn expand_schema_rejects_cbor_integer_keys_on_top_level_fields() {
+        // `#[cbor(key = N)]` changes the serialized map key to an integer,
+        // which a top-level document (text field names) can never match.
+        let input: DeriveInput = parse_quote! {
+            struct Claims {
+                _id: u64,
+                #[cbor(key = 1)]
+                issuer: Option<String>,
+            }
+        };
+
+        let expanded = tokens(expand_anda_db_schema_derive(input));
+        assert!(expanded.contains("compile_error"));
+        assert!(
+            expanded.contains("#[cbor(key = ...)] is not supported on top-level document fields")
+        );
+    }
+
+    #[test]
+    fn expand_schema_rejects_container_level_unique() {
+        let input: DeriveInput = parse_quote! {
+            #[unique]
+            struct Doc {
+                _id: u64,
+                name: String,
+            }
+        };
+
+        let expanded = tokens(expand_anda_db_schema_derive(input));
+        assert!(expanded.contains("compile_error"));
+        assert!(expanded.contains("#[unique] must be applied to a field"));
+    }
+
+    #[test]
+    fn expand_schema_rejects_field_type_override_on_id() {
+        let input: DeriveInput = parse_quote! {
+            struct Doc {
+                #[field_type = "Text"]
+                _id: u64,
+                name: String,
+            }
+        };
+
+        let expanded = tokens(expand_anda_db_schema_derive(input));
+        assert!(expanded.contains("compile_error"));
+        assert!(expanded.contains("#[field_type] is not allowed on `_id`"));
     }
 
     #[test]

@@ -1,0 +1,5 @@
+error: #[field_type] is not allowed on `_id`: the primary key is always FieldType::U64
+ --> tests/ui/fail_field_type_on_id.rs:7:5
+  |
+7 |     #[field_type = "Text"]
+  |     ^^^^^^^^^^^^^^^^^^^^^^

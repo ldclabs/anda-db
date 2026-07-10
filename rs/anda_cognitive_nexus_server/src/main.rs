@@ -6,13 +6,14 @@
 use anda_db::{
     database::{AndaDB, DBConfig},
     storage::StorageConfig,
+    unix_ms,
 };
 use anda_object_store::MetaStoreBuilder;
-use axum::{BoxError, Router, routing};
+use axum::{BoxError, Router, extract::DefaultBodyLimit, middleware, routing};
 use clap::{Parser, Subcommand};
 use mimalloc::MiMalloc;
-use object_store::{ObjectStore, aws::AmazonS3Builder, local::LocalFileSystem, memory::InMemory};
-use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};
+use object_store::{ObjectStore, local::LocalFileSystem, memory::InMemory};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 use structured_logger::{Builder, async_json::new_writer, get_env_level};
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
@@ -37,6 +38,28 @@ struct Cli {
 
     #[clap(long, env = "API_KEY")]
     api_key: Option<String>,
+
+    /// Reserved principal id injected into the `$self` genesis KML on
+    /// first start
+    #[clap(long, env = "SELF_PRINCIPAL_ID", default_value = "uuc56-gyb")]
+    self_principal_id: String,
+
+    /// Background flush interval in seconds for the database
+    #[clap(long, env = "FLUSH_INTERVAL_SECS", default_value = "30")]
+    flush_interval_secs: u64,
+
+    /// Per-request processing timeout in seconds for `/kip`
+    #[clap(long, env = "REQUEST_TIMEOUT_SECS", default_value = "300")]
+    request_timeout_secs: u64,
+
+    /// Maximum accepted request body size in bytes
+    #[clap(long, env = "MAX_BODY_SIZE", default_value = "2097152")]
+    max_body_size: usize,
+
+    /// Retention window for the `kip_logs` collection in days;
+    /// 0 disables pruning (default)
+    #[clap(long, env = "LOG_RETENTION_DAYS", default_value = "0")]
+    log_retention_days: u64,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -72,8 +95,8 @@ async fn main() -> Result<(), BoxError> {
         .init();
 
     let object_store = match cli.command {
-        Some(Commands::Local { db }) => build_object_store(db, None).unwrap(),
-        None => build_object_store("memory".to_string(), None).unwrap(),
+        Some(Commands::Local { db }) => build_object_store(db)?,
+        None => build_object_store("memory".to_string())?,
     };
 
     let db_config = DBConfig {
@@ -89,28 +112,70 @@ async fn main() -> Result<(), BoxError> {
         lock: None,
     };
 
-    let db = AndaDB::connect(object_store.clone(), db_config).await?;
-    let nexus = nexus::Nexus::connect(Arc::new(db)).await?;
+    let db = Arc::new(AndaDB::connect(object_store.clone(), db_config).await?);
+    let nexus = nexus::Nexus::connect(db.clone(), cli.self_principal_id).await?;
 
     let state = AppState {
-        nexus,
+        nexus: nexus.clone(),
         name: APP_NAME.to_string(),
         version: APP_VERSION.to_string(),
         api_key: cli.api_key,
+        request_timeout: Duration::from_secs(cli.request_timeout_secs.max(1)),
     };
     let app = Router::new()
         .route("/", routing::get(get_information))
         .route("/kip", routing::post(post_kip))
+        .layer(DefaultBodyLimit::max(cli.max_body_size.max(1024)))
+        .layer(middleware::from_fn(normalize_rejections))
         .with_state(state);
     let cancel_token = CancellationToken::new();
+
+    // Periodic flush of database/collection metadata; when the token is
+    // cancelled the task flushes and closes the database before exiting.
+    let flush_task = tokio::spawn({
+        let db = db.clone();
+        let cancel = cancel_token.child_token();
+        let interval = Duration::from_secs(cli.flush_interval_secs.max(1));
+        async move { db.auto_flush(cancel, interval).await }
+    });
+
+    // Optional retention cleanup for the `kip_logs` collection, driven by
+    // the indexed `period` field (hours since the Unix epoch).
+    if cli.log_retention_days > 0 {
+        let nexus = nexus.clone();
+        let cancel = cancel_token.child_token();
+        let retention_hours = cli.log_retention_days * 24;
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = tokio::time::sleep(Duration::from_secs(3600)) => {}
+                }
+                let before_period = (unix_ms() / 3_600_000).saturating_sub(retention_hours);
+                match nexus.prune_logs(before_period).await {
+                    Ok(0) => {}
+                    Ok(n) => log::info!("pruned {n} expired KIP logs"),
+                    Err(err) => log::error!("failed to prune KIP logs: {err:?}"),
+                }
+            }
+        });
+    }
+
     let addr: SocketAddr = cli.addr.parse()?;
     let listener = create_reuse_port_listener(addr).await?;
     log::warn!("{}@{} listening on {:?}", APP_NAME, APP_VERSION, addr);
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(cancel_token))
-        .await?;
+    let result = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(cancel_token.clone()))
+        .await;
 
+    // Flush and close the database before exiting, even when the server
+    // loop returned an error.
+    cancel_token.cancel();
+    if let Err(err) = flush_task.await {
+        log::error!("flush task failed: {err:?}");
+    }
+    result?;
     Ok(())
 }
 
@@ -157,25 +222,11 @@ pub async fn create_reuse_port_listener(
     Ok(listener)
 }
 
-fn build_object_store(
-    ty: String,
-    cfg: Option<BTreeMap<String, String>>,
-) -> Result<Arc<dyn ObjectStore>, BoxError> {
+fn build_object_store(ty: String) -> Result<Arc<dyn ObjectStore>, BoxError> {
     match ty.as_str() {
         "" | "memory" | "in_memory" => Ok(Arc::new(InMemory::new())),
-        "s3" => {
-            let mut builder: AmazonS3Builder = Default::default();
-            for (k, v) in cfg.unwrap_or_default().iter() {
-                if let Ok(config_key) = k.to_ascii_lowercase().parse() {
-                    builder = builder.with_config(config_key, v);
-                }
-            }
-
-            let os = builder.build()?;
-            Ok(Arc::new(os))
-        }
-        _ => {
-            let os = LocalFileSystem::new_with_prefix(ty)?;
+        path => {
+            let os = LocalFileSystem::new_with_prefix(path)?;
             let os = MetaStoreBuilder::new(os, 100000).build();
             Ok(Arc::new(os))
         }

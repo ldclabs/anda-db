@@ -1,0 +1,5 @@
+error: #[unique] must be applied to a field, not to the struct itself
+ --> tests/ui/fail_container_unique.rs:7:8
+  |
+7 | struct Doc {
+  |        ^^^

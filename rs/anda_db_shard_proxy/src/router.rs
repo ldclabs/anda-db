@@ -12,9 +12,37 @@ use crate::proxy::DbShardExtractor;
 pub struct PrefixExtractor {
     /// Path prefix that precedes the database name.
     ///
-    /// For example, a prefix of `/db/` extracts `tenant-a` from
-    /// `/db/tenant-a/query`.
+    /// For example, a prefix of `/db/` extracts `tenant_a` from
+    /// `/db/tenant_a/query`. Use [`PrefixExtractor::new`] to normalize the
+    /// prefix; a raw prefix without a trailing slash (e.g. `/db`) would also
+    /// match `/dbfoo/x` and extract the wrong name.
     pub prefix: String,
+}
+
+impl PrefixExtractor {
+    /// Creates an extractor, normalizing the prefix to start and end with
+    /// `/` so `/db` cannot match `/dbfoo/x`.
+    pub fn new(prefix: impl Into<String>) -> Self {
+        let mut prefix = prefix.into();
+        if !prefix.starts_with('/') {
+            prefix.insert(0, '/');
+        }
+        if !prefix.ends_with('/') {
+            prefix.push('/');
+        }
+        Self { prefix }
+    }
+}
+
+/// Mirrors the backend's database-name rules (`[a-z0-9_]{1,64}`, see
+/// `anda_db_schema::validate_field_name`) so invalid names are rejected
+/// before they reach the routing store (PostgreSQL).
+fn is_valid_db_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_'))
 }
 
 impl DbShardExtractor for PrefixExtractor {
@@ -26,7 +54,7 @@ impl DbShardExtractor for PrefixExtractor {
         // Extract from path: prefix{db_name}/...
         if let Some(path) = uri.path().strip_prefix(&self.prefix)
             && let Some(db_name) = path.split('/').next()
-            && !db_name.is_empty()
+            && is_valid_db_name(db_name)
         {
             return (None, Some(db_name.to_string()));
         }
@@ -78,6 +106,49 @@ mod tests {
             extractor.extract(&uri, &headers),
             (None, Some("mydb".into()))
         );
+    }
+
+    #[test]
+    fn prefix_extractor_new_normalizes_prefix() {
+        assert_eq!(PrefixExtractor::new("/db").prefix, "/db/");
+        assert_eq!(PrefixExtractor::new("db/").prefix, "/db/");
+        assert_eq!(PrefixExtractor::new("/").prefix, "/");
+
+        // Without normalization, `/db` would extract `foo` from `/dbfoo/x`.
+        let extractor = PrefixExtractor::new("/db");
+        let uri: Uri = "/dbfoo/x".parse().unwrap();
+        let headers = HeaderMap::new();
+        assert_eq!(extractor.extract(&uri, &headers), (None, None));
+
+        let uri: Uri = "/db/mydb/x".parse().unwrap();
+        assert_eq!(
+            extractor.extract(&uri, &headers),
+            (None, Some("mydb".into()))
+        );
+    }
+
+    #[test]
+    fn prefix_extractor_rejects_invalid_db_names() {
+        let extractor = PrefixExtractor::new("/");
+        let headers = HeaderMap::new();
+
+        // Double slash yields an empty first segment.
+        let uri: Uri = "//mydb".parse().unwrap();
+        assert_eq!(extractor.extract(&uri, &headers), (None, None));
+
+        // Characters outside [a-z0-9_] never reach the routing store.
+        for path in ["/My-Db/x", "/db%20name/x", "/db.name/x"] {
+            let uri: Uri = path.parse().unwrap();
+            assert_eq!(
+                extractor.extract(&uri, &headers),
+                (None, None),
+                "path: {path}"
+            );
+        }
+
+        // Over-long names are rejected as well.
+        let uri: Uri = format!("/{}/x", "a".repeat(65)).parse().unwrap();
+        assert_eq!(extractor.extract(&uri, &headers), (None, None));
     }
 
     #[test]

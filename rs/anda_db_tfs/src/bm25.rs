@@ -20,11 +20,18 @@ use crate::tokenizer::*;
 
 const MAX_NOT_COMPLEMENT_DOCS: usize = 10_000;
 
+/// Estimates the CBOR-serialized size of `value`.
+///
+/// The result only drives the bucket-packing heuristic
+/// ([`BM25Config::bucket_overload_size`]), never correctness, so failures —
+/// which cannot happen for the plain integer/string shapes this index
+/// serializes — degrade to `0` instead of panicking on the insert/remove
+/// hot path.
 fn cbor_serialized_size<T: ?Sized + Serialize>(value: &T) -> usize {
     cbor2::serialized_size(value)
-        .expect("CBOR serialized size calculation failed")
-        .try_into()
-        .expect("CBOR serialized size exceeds usize")
+        .ok()
+        .and_then(|size| usize::try_from(size).ok())
+        .unwrap_or(0)
 }
 
 /// Concurrent, bucket-sharded full-text index using BM25 scoring.
@@ -635,16 +642,22 @@ where
                 let _ = self.max_document_id.fetch_max(id, Ordering::Relaxed);
 
                 {
-                    // Recalculate average document length using consistent snapshots.
-                    // Reading `doc_tokens.len()` AFTER inserting the entry above ensures
-                    // it reflects this insertion. Concurrent inserts may make the avg
-                    // briefly approximate, but it converges as updates settle.
+                    // Recalculate the average document length. The counter
+                    // update, the `doc_tokens.len()` read and the `avg` write
+                    // are all performed under the `avg_doc_tokens` write lock
+                    // (every insert/remove updates its map entry BEFORE taking
+                    // this lock), so the last writer to release the lock always
+                    // leaves `avg == total_tokens / doc_tokens.len()` exactly.
+                    // Values observed while writers are in flight may briefly
+                    // mix snapshots, but the cached average converges instead
+                    // of drifting persistently.
+                    let mut avg_doc_tokens = self.avg_doc_tokens.write();
                     let new_total = self
                         .total_tokens
                         .fetch_add(tokens as u64, Ordering::Relaxed)
                         + tokens as u64;
                     let doc_count = self.doc_tokens.len().max(1) as f32;
-                    *self.avg_doc_tokens.write() = new_total as f32 / doc_count;
+                    *avg_doc_tokens = new_total as f32 / doc_count;
                 }
 
                 // Update inverted index
@@ -791,18 +804,21 @@ where
         };
 
         {
-            // Recalculate average document length
+            // Recalculate the average document length under the
+            // `avg_doc_tokens` write lock; see the matching block in
+            // `insert` for why this makes the cached average converge to
+            // `total_tokens / doc_tokens.len()` once in-flight writers drain.
+            let mut avg_doc_tokens = self.avg_doc_tokens.write();
             let prev_total = self
                 .total_tokens
                 .fetch_sub(removed_tokens as u64, Ordering::Relaxed);
             let new_total = prev_total.saturating_sub(removed_tokens as u64);
             let remaining = self.doc_tokens.len();
-            let new_avg = if remaining == 0 {
+            *avg_doc_tokens = if remaining == 0 {
                 0.0
             } else {
                 new_total as f32 / remaining as f32
             };
-            *self.avg_doc_tokens.write() = new_avg;
         }
 
         // Tokenize the document
@@ -914,13 +930,15 @@ where
     ///
     /// A vector of `(document_id, score)` pairs sorted by descending score.
     pub fn search(&self, query: &str, top_k: usize, params: Option<BM25Params>) -> Vec<(u64, f32)> {
-        self.search_count.fetch_add(1, Ordering::Relaxed);
         if top_k == 0 {
             return Vec::new();
         }
 
         let params = params.as_ref().unwrap_or(&self.config.bm25);
         let scored_docs = self.score_term(query.trim(), params);
+        // Count only queries that actually reached scoring (`top_k == 0`
+        // short-circuits above), matching the HNSW index's semantics.
+        self.search_count.fetch_add(1, Ordering::Relaxed);
 
         Self::top_k_results(scored_docs, top_k)
     }
@@ -958,7 +976,6 @@ where
         top_k: usize,
         params: Option<BM25Params>,
     ) -> Result<Vec<(u64, f32)>, BM25Error> {
-        self.search_count.fetch_add(1, Ordering::Relaxed);
         if top_k == 0 {
             return Ok(Vec::new());
         }
@@ -983,6 +1000,10 @@ where
 
         let params = params.as_ref().unwrap_or(&self.config.bm25);
         let scored_docs = self.execute_query(&query_expr, params, false);
+        // Count only queries that actually reached scoring: `top_k == 0`,
+        // parse failures and rejected NOT complements all return above,
+        // matching the HNSW index's search_count semantics.
+        self.search_count.fetch_add(1, Ordering::Relaxed);
 
         Ok(Self::top_k_results(scored_docs, top_k))
     }
@@ -1216,11 +1237,17 @@ where
 
     /// Persists metadata and every currently-dirty bucket.
     ///
-    /// This is a convenience wrapper that calls [`store_metadata`](Self::store_metadata)
-    /// followed by [`store_dirty_buckets`](Self::store_dirty_buckets). The
-    /// closure `f` is invoked once per dirty bucket with `(bucket_id, cbor_bytes)`;
-    /// returning `Ok(false)` from `f` aborts the bucket loop without producing
-    /// an error (useful for co-operative shutdown).
+    /// This is a convenience wrapper that calls
+    /// [`store_dirty_buckets`](Self::store_dirty_buckets) followed by
+    /// [`store_metadata_with`](Self::store_metadata_with). Buckets are written
+    /// **before** the metadata so the metadata version watermark (and the
+    /// `max_bucket_id` it carries) is only committed once the buckets it
+    /// describes have been persisted; a bucket-write failure therefore leaves
+    /// both the buckets and the metadata pending for the next flush instead of
+    /// a committed metadata pointing at missing buckets. The closure `f` is
+    /// invoked once per dirty bucket with `(bucket_id, cbor_bytes)`; returning
+    /// `Ok(false)` from `f` aborts the bucket loop without producing an error
+    /// (useful for co-operative shutdown).
     ///
     /// # Arguments
     ///
@@ -1235,20 +1262,25 @@ where
     /// * `Err` on serialization or I/O failure.
     pub async fn flush<W: Write, F>(
         &self,
-        metadata: W,
+        mut metadata: W,
         now_ms: u64,
         f: F,
     ) -> Result<bool, BM25Error>
     where
         F: AsyncFnMut(u32, &[u8]) -> Result<bool, BoxError>,
     {
-        let meta_saved = self.store_metadata(metadata, now_ms)?;
         let has_dirty = self.has_dirty_buckets();
-        if !meta_saved && !has_dirty {
+        if !self.has_pending_metadata_flush() && !has_dirty {
             return Ok(false);
         }
 
         self.store_dirty_buckets(f).await?;
+        let meta_saved = self
+            .store_metadata_with(now_ms, async |data| {
+                metadata.write_all(data)?;
+                Ok(())
+            })
+            .await?;
         Ok(meta_saved || has_dirty)
     }
 
@@ -2040,6 +2072,102 @@ mod tests {
         assert!(saved);
         assert!(*writes.lock().await > 0);
         assert!(!index.has_dirty_buckets());
+    }
+
+    #[tokio::test]
+    async fn test_flush_does_not_commit_metadata_when_bucket_write_fails() {
+        let index = create_test_index();
+        assert!(index.has_pending_metadata_flush());
+        assert!(index.has_dirty_buckets());
+
+        // Bucket persistence fails: flush must NOT have committed the
+        // metadata version watermark (buckets are written first).
+        let mut metadata_buf = Vec::new();
+        let err = index
+            .flush(&mut metadata_buf, 1, async |_, _| {
+                Err::<bool, BoxError>("bucket write failed".into())
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BM25Error::Generic { .. }));
+        assert!(metadata_buf.is_empty());
+        assert!(index.has_pending_metadata_flush());
+        assert!(index.has_dirty_buckets());
+
+        // The next flush retries both buckets and metadata.
+        let mut metadata_buf = Vec::new();
+        assert!(
+            index
+                .flush(&mut metadata_buf, 2, async |_, _| Ok(true))
+                .await
+                .unwrap()
+        );
+        assert!(!metadata_buf.is_empty());
+        assert!(!index.has_pending_metadata_flush());
+        assert!(!index.has_dirty_buckets());
+    }
+
+    #[test]
+    fn test_search_count_only_counts_scored_queries() {
+        let index = create_test_index();
+        assert_eq!(index.stats().search_count, 0);
+
+        // top_k == 0 short-circuits and is not counted.
+        assert!(index.search("fox", 0, None).is_empty());
+        assert!(index.try_search_advanced("fox", 0, None).unwrap().is_empty());
+        assert_eq!(index.stats().search_count, 0);
+
+        // Parse failures are not counted.
+        let flood = format!("x{}", ")".repeat(100));
+        assert!(index.try_search_advanced(&flood, 10, None).is_err());
+        assert_eq!(index.stats().search_count, 0);
+
+        // Successful searches are counted.
+        assert!(!index.search("fox", 10, None).is_empty());
+        assert!(!index.search_advanced("fox AND lazy", 10, None).is_empty());
+        assert_eq!(index.stats().search_count, 2);
+    }
+
+    #[test]
+    fn test_avg_doc_tokens_converges_under_concurrent_insert_remove() {
+        use std::thread;
+
+        let index = Arc::new(BM25Index::new(
+            "avg_convergence".to_string(),
+            default_tokenizer(),
+            None,
+        ));
+        // A stable base corpus so the index is never empty.
+        index.insert(1, "base document alpha bravo charlie", 0).unwrap();
+        index.insert(2, "base document delta echo", 0).unwrap();
+
+        const ITERS: usize = 300;
+        let mut handles = Vec::new();
+        for t in 0..4u64 {
+            let index = index.clone();
+            handles.push(thread::spawn(move || {
+                let id = 100 + t;
+                let text = format!("churn document number {id} with token payload");
+                for _ in 0..ITERS {
+                    index.insert(id, &text, 0).unwrap();
+                    assert!(index.remove(id, &text, 0));
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Once all writers drained, the cached average must exactly match
+        // total_tokens / doc_tokens.len() — the race previously left a stale
+        // mixed-snapshot value here until the next write.
+        let total = index.total_tokens.load(Ordering::Relaxed) as f32;
+        let expected = total / index.doc_tokens.len() as f32;
+        let cached = *index.avg_doc_tokens.read();
+        assert_eq!(
+            cached, expected,
+            "cached avg_doc_tokens {cached} != recomputed {expected}"
+        );
     }
 
     #[test]

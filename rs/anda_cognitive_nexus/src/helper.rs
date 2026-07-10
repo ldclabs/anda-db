@@ -235,7 +235,10 @@ pub fn extract_proposition_field_value(
     validate_dot_path_var(path, EntityType::PropositionLink)?;
 
     if !proposition.predicates.contains(predicate) {
-        return Err(KipError::internal_error(format!(
+        // An expected data-shape miss (the row no longer carries this
+        // predicate), not an engine invariant violation: report NotFound
+        // (KIP_3002) rather than an internal error.
+        return Err(KipError::not_found(format!(
             "Invalid predicate: {}",
             predicate
         )));
@@ -438,10 +441,10 @@ pub fn match_predicate_against_proposition(
 ///
 /// # Error Mappings
 ///
-/// * `Schema` → `Parse`
-/// * `NotFound` → `NotFound`
-/// * `AlreadyExists` → `AlreadyExists`
-/// * Others → `Execution`
+/// * `Schema` → `InvalidSyntax` (KIP_1001)
+/// * `NotFound` → `NotFound` (KIP_3002)
+/// * `AlreadyExists` → `DuplicateExists` (KIP_3003)
+/// * Others → `InternalError` (KIP_4003)
 pub fn db_to_kip_error(err: DBError) -> KipError {
     match &err {
         DBError::Schema { .. } => KipError::invalid_syntax(format!("{err}")),

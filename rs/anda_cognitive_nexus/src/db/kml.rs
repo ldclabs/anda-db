@@ -4,6 +4,11 @@
 
 use super::*;
 
+/// Batch size for cascade-closure index queries: each frontier round is
+/// split into chunks of this many entities (2 OR branches per entity) so a
+/// large cascade never builds one oversized OR filter.
+const CASCADE_QUERY_BATCH: usize = 512;
+
 impl CognitiveNexus {
     pub(super) async fn execute_upsert(
         &self,
@@ -149,9 +154,24 @@ impl CognitiveNexus {
         }
 
         if let Some(propositions) = &concept_block.set_propositions {
+            // Resolve the subject's prospective id (real when the concept
+            // already exists, the id assigned earlier in this statement
+            // otherwise) so self-loop targets are rejected during preflight,
+            // before any row is written — the execution-time check in
+            // `upsert_proposition` would otherwise fire after the concept
+            // block itself was already applied.
+            let subject_id: Option<EntityID> = self
+                .resolve_entity_id(&EntityPK::Concept(concept_pk.clone()), cached_pks)
+                .await
+                .ok();
             for set_prop in propositions {
-                self.validate_set_proposition_for_kml(set_prop, handle_map, cached_pks)
-                    .await?;
+                self.validate_set_proposition_for_kml(
+                    subject_id.as_ref(),
+                    set_prop,
+                    handle_map,
+                    cached_pks,
+                )
+                .await?;
             }
         }
 
@@ -317,6 +337,18 @@ impl CognitiveNexus {
         Ok(entity_id)
     }
 
+    /// Distinguishes "row already gone" (tolerable in idempotent cascade /
+    /// multi-predicate loops: stale index hits, rows removed earlier in the
+    /// same statement) from real storage failures, which must abort the
+    /// statement instead of being silently reported as success.
+    pub(super) fn tolerate_not_found<T>(result: Result<T, KipError>) -> Result<Option<T>, KipError> {
+        match result {
+            Ok(value) => Ok(Some(value)),
+            Err(err) if err.code == KipErrorCode::NotFound => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
     /// Returns true if the concept identified by `(type, name)` belongs to the
     /// protected schema infrastructure per `KIP_3004` — meta-type definition
     /// nodes (`$ConceptType`, `$PropositionType`), the foundational `Domain`
@@ -459,71 +491,74 @@ impl CognitiveNexus {
         for entity_id in target_entities.as_ref() {
             match entity_id {
                 EntityID::Concept(id) => {
-                    if let Ok(mut concept) = self
-                        .try_get_concept_with(&ctx.cache, *id, |concept| Ok(concept.clone()))
-                        .await
-                    {
-                        let length = concept.attributes.len();
-                        for attr in &attributes {
-                            concept.attributes.remove(attr);
-                        }
-                        if concept.attributes.len() < length {
-                            bump_system_metadata(&mut concept.metadata, unix_ms());
-                            if self
-                                .concepts
-                                .update(
-                                    *id,
-                                    BTreeMap::from([
-                                        ("attributes".to_string(), concept.attributes.into()),
-                                        ("metadata".to_string(), concept.metadata.into()),
-                                    ]),
-                                )
-                                .await
-                                .is_ok()
-                            {
-                                // Invalidate stale cache entry so subsequent
-                                // iterations on the same id (rare for concepts,
-                                // but defensive) re-read the freshest version.
-                                ctx.cache.concepts.write().remove(id);
-                                updated_concepts += 1;
-                            }
-                        }
+                    // A missing row (stale index hit) is "nothing matched";
+                    // any other load/write failure aborts the statement so
+                    // the agent never sees success with data left behind.
+                    let Some(mut concept) = Self::tolerate_not_found(
+                        self.try_get_concept_with(&ctx.cache, *id, |concept| Ok(concept.clone()))
+                            .await,
+                    )?
+                    else {
+                        continue;
+                    };
+                    let length = concept.attributes.len();
+                    for attr in &attributes {
+                        concept.attributes.remove(attr);
+                    }
+                    if concept.attributes.len() < length {
+                        bump_system_metadata(&mut concept.metadata, unix_ms());
+                        self.concepts
+                            .update(
+                                *id,
+                                BTreeMap::from([
+                                    ("attributes".to_string(), concept.attributes.into()),
+                                    ("metadata".to_string(), concept.metadata.into()),
+                                ]),
+                            )
+                            .await
+                            .map_err(db_to_kip_error)?;
+                        // Invalidate stale cache entry so subsequent
+                        // iterations on the same id (rare for concepts,
+                        // but defensive) re-read the freshest version.
+                        ctx.cache.concepts.write().remove(id);
+                        updated_concepts += 1;
                     }
                 }
                 EntityID::Proposition(id, predicate) => {
-                    if let Ok(mut proposition) = self
-                        .try_get_proposition_with(&ctx.cache, *id, |prop| Ok(prop.clone()))
-                        .await
-                        && let Some(prop) = proposition.properties.get_mut(predicate)
-                    {
-                        let length = prop.attributes.len();
-                        for attr in &attributes {
-                            prop.attributes.remove(attr);
-                        }
+                    let Some(mut proposition) = Self::tolerate_not_found(
+                        self.try_get_proposition_with(&ctx.cache, *id, |prop| Ok(prop.clone()))
+                            .await,
+                    )?
+                    else {
+                        continue;
+                    };
+                    let Some(prop) = proposition.properties.get_mut(predicate) else {
+                        continue;
+                    };
+                    let length = prop.attributes.len();
+                    for attr in &attributes {
+                        prop.attributes.remove(attr);
+                    }
 
-                        if prop.attributes.len() < length {
-                            bump_system_metadata(&mut prop.metadata, unix_ms());
-                            if self
-                                .propositions
-                                .update(
-                                    *id,
-                                    BTreeMap::from([(
-                                        "properties".to_string(),
-                                        proposition.properties.into(),
-                                    )]),
-                                )
-                                .await
-                                .is_ok()
-                            {
-                                // A single proposition may appear multiple times
-                                // in target_entities (one (id, predicate) per
-                                // predicate). Invalidate the cache so the next
-                                // iteration sees the post-update state and does
-                                // not resurrect already-removed attributes.
-                                ctx.cache.propositions.write().remove(id);
-                                updated_propositions += 1;
-                            }
-                        }
+                    if prop.attributes.len() < length {
+                        bump_system_metadata(&mut prop.metadata, unix_ms());
+                        self.propositions
+                            .update(
+                                *id,
+                                BTreeMap::from([(
+                                    "properties".to_string(),
+                                    proposition.properties.into(),
+                                )]),
+                            )
+                            .await
+                            .map_err(db_to_kip_error)?;
+                        // A single proposition may appear multiple times
+                        // in target_entities (one (id, predicate) per
+                        // predicate). Invalidate the cache so the next
+                        // iteration sees the post-update state and does
+                        // not resurrect already-removed attributes.
+                        ctx.cache.propositions.write().remove(id);
+                        updated_propositions += 1;
                     }
                 }
             }
@@ -585,66 +620,68 @@ impl CognitiveNexus {
         for entity_id in target_entities.as_ref() {
             match entity_id {
                 EntityID::Concept(id) => {
-                    if let Ok(mut concept) = self
-                        .try_get_concept_with(&ctx.cache, *id, |concept| Ok(concept.clone()))
-                        .await
-                    {
-                        let length = concept.metadata.len();
-                        for name in &keys {
-                            concept.metadata.remove(name);
-                        }
-                        if concept.metadata.len() < length {
-                            bump_system_metadata(&mut concept.metadata, unix_ms());
-                            if self
-                                .concepts
-                                .update(
-                                    *id,
-                                    BTreeMap::from([(
-                                        "metadata".to_string(),
-                                        concept.metadata.into(),
-                                    )]),
-                                )
-                                .await
-                                .is_ok()
-                            {
-                                ctx.cache.concepts.write().remove(id);
-                                updated_concepts += 1;
-                            }
-                        }
+                    // See execute_delete_attributes: stale index hits are
+                    // "nothing matched", every other failure aborts.
+                    let Some(mut concept) = Self::tolerate_not_found(
+                        self.try_get_concept_with(&ctx.cache, *id, |concept| Ok(concept.clone()))
+                            .await,
+                    )?
+                    else {
+                        continue;
+                    };
+                    let length = concept.metadata.len();
+                    for name in &keys {
+                        concept.metadata.remove(name);
+                    }
+                    if concept.metadata.len() < length {
+                        bump_system_metadata(&mut concept.metadata, unix_ms());
+                        self.concepts
+                            .update(
+                                *id,
+                                BTreeMap::from([(
+                                    "metadata".to_string(),
+                                    concept.metadata.into(),
+                                )]),
+                            )
+                            .await
+                            .map_err(db_to_kip_error)?;
+                        ctx.cache.concepts.write().remove(id);
+                        updated_concepts += 1;
                     }
                 }
                 EntityID::Proposition(id, predicate) => {
-                    if let Ok(mut proposition) = self
-                        .try_get_proposition_with(&ctx.cache, *id, |prop| Ok(prop.clone()))
-                        .await
-                        && let Some(prop) = proposition.properties.get_mut(predicate)
-                    {
-                        let length = prop.metadata.len();
-                        for name in &keys {
-                            prop.metadata.remove(name);
-                        }
+                    let Some(mut proposition) = Self::tolerate_not_found(
+                        self.try_get_proposition_with(&ctx.cache, *id, |prop| Ok(prop.clone()))
+                            .await,
+                    )?
+                    else {
+                        continue;
+                    };
+                    let Some(prop) = proposition.properties.get_mut(predicate) else {
+                        continue;
+                    };
+                    let length = prop.metadata.len();
+                    for name in &keys {
+                        prop.metadata.remove(name);
+                    }
 
-                        if prop.metadata.len() < length {
-                            bump_system_metadata(&mut prop.metadata, unix_ms());
-                            if self
-                                .propositions
-                                .update(
-                                    *id,
-                                    BTreeMap::from([(
-                                        "properties".to_string(),
-                                        proposition.properties.into(),
-                                    )]),
-                                )
-                                .await
-                                .is_ok()
-                            {
-                                // See execute_delete_attributes for rationale:
-                                // the same proposition id may appear under
-                                // multiple predicates in target_entities.
-                                ctx.cache.propositions.write().remove(id);
-                                updated_propositions += 1;
-                            }
-                        }
+                    if prop.metadata.len() < length {
+                        bump_system_metadata(&mut prop.metadata, unix_ms());
+                        self.propositions
+                            .update(
+                                *id,
+                                BTreeMap::from([(
+                                    "properties".to_string(),
+                                    proposition.properties.into(),
+                                )]),
+                            )
+                            .await
+                            .map_err(db_to_kip_error)?;
+                        // See execute_delete_attributes for rationale:
+                        // the same proposition id may appear under
+                        // multiple predicates in target_entities.
+                        ctx.cache.propositions.write().remove(id);
+                        updated_propositions += 1;
                     }
                 }
             }
@@ -688,48 +725,53 @@ impl CognitiveNexus {
                     // ignore
                 }
                 EntityID::Proposition(id, predicate) => {
-                    if let Ok(mut proposition) = self
-                        .try_get_proposition_with(&ctx.cache, *id, |prop| Ok(prop.clone()))
-                        .await
-                    {
-                        // Remove specified predicates
-                        if !proposition.predicates.remove(predicate) {
-                            continue; // already removed by an earlier iteration
-                        }
-                        proposition.properties.remove(predicate);
+                    // The same row may already be gone: removed by an earlier
+                    // iteration under another predicate, or a stale index
+                    // hit. Anything else must abort instead of reporting
+                    // success with links left behind.
+                    let Some(mut proposition) = Self::tolerate_not_found(
+                        self.try_get_proposition_with(&ctx.cache, *id, |prop| Ok(prop.clone()))
+                            .await,
+                    )?
+                    else {
+                        continue;
+                    };
+                    // Remove specified predicates
+                    if !proposition.predicates.remove(predicate) {
+                        continue; // already removed by an earlier iteration
+                    }
+                    proposition.properties.remove(predicate);
 
-                        // If no predicates left, delete the proposition
-                        if proposition.predicates.is_empty() {
-                            if self.propositions.remove(*id).await.is_ok() {
-                                ctx.cache.propositions.write().remove(id);
-                                deleted_propositions += 1;
-                                cascade_seeds.push(entity_id.clone());
-                            }
-                        } else {
-                            // Otherwise, update the proposition with remaining predicates
-                            if self
-                                .propositions
-                                .update(
-                                    *id,
-                                    BTreeMap::from([
-                                        ("predicates".to_string(), proposition.predicates.into()),
-                                        ("properties".to_string(), proposition.properties.into()),
-                                    ]),
-                                )
-                                .await
-                                .is_ok()
-                            {
-                                // CRITICAL: a single proposition row may be
-                                // listed under multiple predicates in the
-                                // target set. Without invalidating the cache,
-                                // the next iteration would read the pre-update
-                                // state and write back removed predicates,
-                                // resurrecting them.
-                                ctx.cache.propositions.write().remove(id);
-                                deleted_propositions += 1;
-                                cascade_seeds.push(entity_id.clone());
-                            }
-                        }
+                    // If no predicates left, delete the proposition
+                    if proposition.predicates.is_empty() {
+                        self.propositions
+                            .remove(*id)
+                            .await
+                            .map_err(db_to_kip_error)?;
+                        ctx.cache.propositions.write().remove(id);
+                        deleted_propositions += 1;
+                        cascade_seeds.push(entity_id.clone());
+                    } else {
+                        // Otherwise, update the proposition with remaining predicates
+                        self.propositions
+                            .update(
+                                *id,
+                                BTreeMap::from([
+                                    ("predicates".to_string(), proposition.predicates.into()),
+                                    ("properties".to_string(), proposition.properties.into()),
+                                ]),
+                            )
+                            .await
+                            .map_err(db_to_kip_error)?;
+                        // CRITICAL: a single proposition row may be
+                        // listed under multiple predicates in the
+                        // target set. Without invalidating the cache,
+                        // the next iteration would read the pre-update
+                        // state and write back removed predicates,
+                        // resurrecting them.
+                        ctx.cache.propositions.write().remove(id);
+                        deleted_propositions += 1;
+                        cascade_seeds.push(entity_id.clone());
                     }
                 }
             }
@@ -795,7 +837,9 @@ impl CognitiveNexus {
         // Compute the transitive cascade closure: every proposition whose subject
         // or object refers (directly or via higher-order chains) to one of the
         // concepts being deleted must also be removed so no dangling references
-        // remain after a DETACH (KIP v1.0-RC7 §4.2.4).
+        // remain after a DETACH (KIP v1.0-RC7 §4.2.4). A failed closure query
+        // aborts the statement: treating it as "no references" would leave
+        // dangling higher-order propositions behind while reporting success.
         let mut to_delete_proposition_ids: BTreeSet<u64> = BTreeSet::new();
         let mut frontier: Vec<EntityID> = concept_ids
             .iter()
@@ -803,39 +847,49 @@ impl CognitiveNexus {
             .collect();
 
         while !frontier.is_empty() {
-            let mut filters: Vec<Box<Filter>> = Vec::with_capacity(frontier.len() * 2);
-            for eid in &frontier {
-                let v: Fv = eid.to_string().into();
-                filters.push(Box::new(Filter::Field((
-                    "subject".to_string(),
-                    RangeQuery::Eq(v.clone()),
-                ))));
-                filters.push(Box::new(Filter::Field((
-                    "object".to_string(),
-                    RangeQuery::Eq(v),
-                ))));
-            }
-            let filter = if filters.len() == 1 {
-                *filters.into_iter().next().unwrap()
-            } else {
-                Filter::Or(filters)
-            };
-
-            let ids = self
-                .propositions
-                .query_ids(filter, None)
-                .await
-                .unwrap_or_default();
-
             let mut next: Vec<EntityID> = Vec::new();
-            for id in ids {
-                if to_delete_proposition_ids.insert(id)
-                    && let Ok(predicates) = self
-                        .try_get_proposition_with(&ctx.cache, id, |p| {
+            // Query in fixed-size batches so a large cascade does not build
+            // one oversized OR filter.
+            for chunk in frontier.chunks(CASCADE_QUERY_BATCH) {
+                let mut filters: Vec<Box<Filter>> = Vec::with_capacity(chunk.len() * 2);
+                for eid in chunk {
+                    let v: Fv = eid.to_string().into();
+                    filters.push(Box::new(Filter::Field((
+                        "subject".to_string(),
+                        RangeQuery::Eq(v.clone()),
+                    ))));
+                    filters.push(Box::new(Filter::Field((
+                        "object".to_string(),
+                        RangeQuery::Eq(v),
+                    ))));
+                }
+                let filter = if filters.len() == 1 {
+                    *filters.into_iter().next().unwrap()
+                } else {
+                    Filter::Or(filters)
+                };
+
+                let ids = self
+                    .propositions
+                    .query_ids(filter, None)
+                    .await
+                    .map_err(db_to_kip_error)?;
+
+                for id in ids {
+                    if !to_delete_proposition_ids.insert(id) {
+                        continue;
+                    }
+                    // A stale index hit (row already gone) contributes no
+                    // further references; real load failures abort.
+                    let Some(predicates) = Self::tolerate_not_found(
+                        self.try_get_proposition_with(&ctx.cache, id, |p| {
                             Ok(p.predicates.iter().cloned().collect::<Vec<_>>())
                         })
-                        .await
-                {
+                        .await,
+                    )?
+                    else {
+                        continue;
+                    };
                     // Newly discovered proposition — enqueue all of its EntityID
                     // forms (one per predicate) so higher-order propositions that
                     // reference it can be picked up on the next iteration.
@@ -849,14 +903,26 @@ impl CognitiveNexus {
 
         let mut deleted_propositions: u64 = 0;
         for id in to_delete_proposition_ids {
-            if self.propositions.remove(id).await.is_ok() {
+            if self
+                .propositions
+                .remove(id)
+                .await
+                .map_err(db_to_kip_error)?
+                .is_some()
+            {
                 deleted_propositions += 1;
             }
         }
 
         let mut deleted_concepts: u64 = 0;
         for id in concept_ids {
-            if self.concepts.remove(id).await.is_ok() {
+            if self
+                .concepts
+                .remove(id)
+                .await
+                .map_err(db_to_kip_error)?
+                .is_some()
+            {
                 deleted_concepts += 1;
             }
         }
@@ -927,6 +993,10 @@ impl CognitiveNexus {
             KipError::reference_error(format!("Target term '{target}' not found in context"))
         })?;
         let mut targets: Vec<EntityID> = target_entities.into();
+        // `matched` reports how many elements the pattern actually matched,
+        // counted before the LIMIT cap so the agent can detect truncation
+        // (`updated < matched`).
+        let matched = targets.len() as u64;
         if let Some(limit) = limit
             && targets.len() > limit
         {
@@ -958,7 +1028,6 @@ impl CognitiveNexus {
             }
         }
 
-        let matched = targets.len() as u64;
         if dry_run {
             return Ok(json!({ "updated": 0, "matched": matched }));
         }
@@ -983,8 +1052,9 @@ impl CognitiveNexus {
                     concept.attributes.extend(attributes);
                     concept.metadata.extend(metadata);
                     bump_system_metadata(&mut concept.metadata, now_ms);
-                    if self
-                        .concepts
+                    // A write failure aborts the statement (partial progress
+                    // is reported by the error, not folded into "updated").
+                    self.concepts
                         .update(
                             *id,
                             BTreeMap::from([
@@ -993,11 +1063,9 @@ impl CognitiveNexus {
                             ]),
                         )
                         .await
-                        .is_ok()
-                    {
-                        ctx.cache.concepts.write().remove(id);
-                        updated += 1;
-                    }
+                        .map_err(db_to_kip_error)?;
+                    ctx.cache.concepts.write().remove(id);
+                    updated += 1;
                 }
                 EntityID::Proposition(id, predicate) => {
                     let mut proposition = self
@@ -1021,8 +1089,7 @@ impl CognitiveNexus {
                     prop.attributes.extend(attributes);
                     prop.metadata.extend(metadata);
                     bump_system_metadata(&mut prop.metadata, now_ms);
-                    if self
-                        .propositions
+                    self.propositions
                         .update(
                             *id,
                             BTreeMap::from([(
@@ -1031,14 +1098,12 @@ impl CognitiveNexus {
                             )]),
                         )
                         .await
-                        .is_ok()
-                    {
-                        // The same proposition row may appear under multiple
-                        // predicates in the target set; invalidate so the next
-                        // iteration reads the post-update state.
-                        ctx.cache.propositions.write().remove(id);
-                        updated += 1;
-                    }
+                        .map_err(db_to_kip_error)?;
+                    // The same proposition row may appear under multiple
+                    // predicates in the target set; invalidate so the next
+                    // iteration reads the post-update state.
+                    ctx.cache.propositions.write().remove(id);
+                    updated += 1;
                 }
             }
         }
@@ -1396,7 +1461,9 @@ impl CognitiveNexus {
             for row_id in row_ids {
                 let mut row: Proposition = match self.propositions.get_as(row_id).await {
                     Ok(row) => row,
-                    Err(_) => continue, // already merged away by an earlier step
+                    // Already merged away by an earlier worklist step.
+                    Err(DBError::NotFound { .. }) => continue,
+                    Err(err) => return Err(db_to_kip_error(err)),
                 };
                 let mut subject = row.subject.clone();
                 let mut object = row.object.clone();
@@ -1541,7 +1608,9 @@ impl CognitiveNexus {
 
     /// Removes every proposition row that (transitively) references one of
     /// the seed link ids as subject or object, returning the number of
-    /// removed links.
+    /// removed links. Closure-query and removal failures abort the statement
+    /// — swallowing them would report success while leaving dangling
+    /// higher-order references behind.
     pub(super) async fn cascade_remove_propositions(
         &self,
         seeds: Vec<EntityID>,
@@ -1551,40 +1620,53 @@ impl CognitiveNexus {
         let mut visited_rows: FxHashSet<u64> = FxHashSet::default();
 
         while !frontier.is_empty() {
-            let mut filters: Vec<Box<Filter>> = Vec::with_capacity(frontier.len() * 2);
-            for eid in &frontier {
-                let v: Fv = eid.to_string().into();
-                filters.push(Box::new(Filter::Field((
-                    "subject".to_string(),
-                    RangeQuery::Eq(v.clone()),
-                ))));
-                filters.push(Box::new(Filter::Field((
-                    "object".to_string(),
-                    RangeQuery::Eq(v),
-                ))));
-            }
-            let filter = if filters.len() == 1 {
-                *filters.into_iter().next().unwrap()
-            } else {
-                Filter::Or(filters)
-            };
-            let ids = self
-                .propositions
-                .query_ids(filter, None)
-                .await
-                .unwrap_or_default();
-
             let mut next: Vec<EntityID> = Vec::new();
-            for id in ids {
-                if !visited_rows.insert(id) {
-                    continue;
+            for chunk in frontier.chunks(CASCADE_QUERY_BATCH) {
+                let mut filters: Vec<Box<Filter>> = Vec::with_capacity(chunk.len() * 2);
+                for eid in chunk {
+                    let v: Fv = eid.to_string().into();
+                    filters.push(Box::new(Filter::Field((
+                        "subject".to_string(),
+                        RangeQuery::Eq(v.clone()),
+                    ))));
+                    filters.push(Box::new(Filter::Field((
+                        "object".to_string(),
+                        RangeQuery::Eq(v),
+                    ))));
                 }
-                if let Ok(row) = self.propositions.get_as::<Proposition>(id).await {
-                    removed_links += row.predicates.len() as u64;
+                let filter = if filters.len() == 1 {
+                    *filters.into_iter().next().unwrap()
+                } else {
+                    Filter::Or(filters)
+                };
+                let ids = self
+                    .propositions
+                    .query_ids(filter, None)
+                    .await
+                    .map_err(db_to_kip_error)?;
+
+                for id in ids {
+                    if !visited_rows.insert(id) {
+                        continue;
+                    }
+                    let row = match self.propositions.get_as::<Proposition>(id).await {
+                        Ok(row) => row,
+                        // Stale index hit: the row is already gone.
+                        Err(DBError::NotFound { .. }) => continue,
+                        Err(err) => return Err(db_to_kip_error(err)),
+                    };
                     for pred in row.predicates.iter() {
                         next.push(EntityID::Proposition(id, pred.clone()));
                     }
-                    let _ = self.propositions.remove(id).await;
+                    if self
+                        .propositions
+                        .remove(id)
+                        .await
+                        .map_err(db_to_kip_error)?
+                        .is_some()
+                    {
+                        removed_links += row.predicates.len() as u64;
+                    }
                 }
             }
             frontier = next;
@@ -1826,50 +1908,57 @@ impl CognitiveNexus {
     pub(super) async fn ensure_concept_type_for_kml(
         &self,
         type_name: &str,
-        cached_pks: &FxHashMap<EntityPK, EntityID>,
+        cached_pks: &mut FxHashMap<EntityPK, EntityID>,
     ) -> Result<(), KipError> {
-        if type_name == META_CONCEPT_TYPE
-            || self
-                .has_concept(&ConceptPK::Object {
-                    r#type: META_CONCEPT_TYPE.to_string(),
-                    name: type_name.to_string(),
-                })
-                .await
-            || cached_pks.contains_key(&EntityPK::Concept(ConceptPK::Object {
-                r#type: META_CONCEPT_TYPE.to_string(),
-                name: type_name.to_string(),
-            }))
-        {
-            Ok(())
-        } else {
-            Err(KipError::type_mismatch(format!(
-                "Concept type {type_name} is not defined"
-            )))
+        if type_name == META_CONCEPT_TYPE {
+            return Ok(());
         }
+        let entity_pk = EntityPK::Concept(ConceptPK::Object {
+            r#type: META_CONCEPT_TYPE.to_string(),
+            name: type_name.to_string(),
+        });
+        // Statement-scope memo: `cached_pks` holds both the definitions this
+        // statement creates and the pre-existing ones already verified, so
+        // repeated checks (large batch imports run this per block, twice —
+        // preflight and execution) cost one index query per distinct type.
+        if cached_pks.contains_key(&entity_pk) {
+            return Ok(());
+        }
+        if let Ok(id) = self.query_concept_id(META_CONCEPT_TYPE, type_name).await
+            && self.concepts.contains(id)
+        {
+            cached_pks.insert(entity_pk, EntityID::Concept(id));
+            return Ok(());
+        }
+        Err(KipError::type_mismatch(format!(
+            "Concept type {type_name} is not defined"
+        )))
     }
 
     pub(super) async fn ensure_proposition_type_for_kml(
         &self,
         predicate: &str,
-        cached_pks: &FxHashMap<EntityPK, EntityID>,
+        cached_pks: &mut FxHashMap<EntityPK, EntityID>,
     ) -> Result<(), KipError> {
-        if self
-            .has_concept(&ConceptPK::Object {
-                r#type: META_PROPOSITION_TYPE.to_string(),
-                name: predicate.to_string(),
-            })
-            .await
-            || cached_pks.contains_key(&EntityPK::Concept(ConceptPK::Object {
-                r#type: META_PROPOSITION_TYPE.to_string(),
-                name: predicate.to_string(),
-            }))
-        {
-            Ok(())
-        } else {
-            Err(KipError::type_mismatch(format!(
-                "Proposition type {predicate} is not defined"
-            )))
+        let entity_pk = EntityPK::Concept(ConceptPK::Object {
+            r#type: META_PROPOSITION_TYPE.to_string(),
+            name: predicate.to_string(),
+        });
+        // See `ensure_concept_type_for_kml` for the memo rationale.
+        if cached_pks.contains_key(&entity_pk) {
+            return Ok(());
         }
+        if let Ok(id) = self
+            .query_concept_id(META_PROPOSITION_TYPE, predicate)
+            .await
+            && self.concepts.contains(id)
+        {
+            cached_pks.insert(entity_pk, EntityID::Concept(id));
+            return Ok(());
+        }
+        Err(KipError::type_mismatch(format!(
+            "Proposition type {predicate} is not defined"
+        )))
     }
 
     pub(super) async fn ensure_concept_attributes_mutable_for_kml(
@@ -1919,6 +2008,7 @@ impl CognitiveNexus {
 
     pub(super) async fn validate_set_proposition_for_kml(
         &self,
+        subject: Option<&EntityID>,
         set_prop: &SetProposition,
         handle_map: &FxHashMap<String, EntityID>,
         cached_pks: &mut FxHashMap<EntityPK, EntityID>,
@@ -1928,30 +2018,30 @@ impl CognitiveNexus {
         if let Some(metadata) = &set_prop.metadata {
             reject_reserved_metadata_keys(metadata.keys())?;
         }
-        self.validate_target_term_for_kml(&set_prop.object, handle_map, cached_pks)
-            .await
-    }
-
-    pub(super) async fn validate_target_term_for_kml(
-        &self,
-        target: &TargetTerm,
-        handle_map: &FxHashMap<String, EntityID>,
-        cached_pks: &mut FxHashMap<EntityPK, EntityID>,
-    ) -> Result<(), KipError> {
-        match target {
-            TargetTerm::Variable(handle) => {
-                if !handle_map.contains_key(handle) {
+        let object_id: Option<EntityID> = match &set_prop.object {
+            TargetTerm::Variable(handle) => match handle_map.get(handle) {
+                Some(id) => Some(id.clone()),
+                None => {
                     return Err(KipError::reference_error(format!(
                         "Undefined handle: {handle}"
                     )));
                 }
-            }
-            TargetTerm::Concept(_) | TargetTerm::Proposition(_) => {
+            },
+            target => Some(
                 self.resolve_target_term(target.clone(), handle_map, cached_pks)
-                    .await?;
-            }
+                    .await?,
+            ),
+        };
+        // Self-loop preflight: mirror the execution-time check in
+        // `upsert_proposition` so the whole statement is rejected before any
+        // row is written.
+        if let (Some(subject), Some(object)) = (subject, &object_id)
+            && subject == object
+        {
+            return Err(KipError::invalid_syntax(format!(
+                "Subject and object cannot be the same: {subject} (self-loop propositions are not supported by this engine)"
+            )));
         }
-
         Ok(())
     }
 

@@ -49,12 +49,19 @@ pub mod storage;
 ///
 /// The crate uses millisecond timestamps for metadata bookkeeping,
 /// collection statistics, and periodic flush coordination.
+///
+/// Returns `0` (with a warning) if the system clock is set before the Unix
+/// epoch instead of panicking: timestamps here are advisory bookkeeping, not
+/// correctness-critical state.
 #[inline]
 pub fn unix_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time before Unix epoch");
-    ts.as_millis() as u64
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(ts) => ts.as_millis() as u64,
+        Err(err) => {
+            log::warn!("system time is before the Unix epoch: {err:?}");
+            0
+        }
+    }
 }

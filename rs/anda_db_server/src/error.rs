@@ -75,6 +75,16 @@ impl ApiError {
         Self::new(StatusCode::CONFLICT, "already_exists", message)
     }
 
+    /// `408 Request Timeout` — the request exceeded the configured
+    /// processing deadline.
+    pub fn timeout() -> Self {
+        Self::new(
+            StatusCode::REQUEST_TIMEOUT,
+            "timeout",
+            "request processing exceeded the configured timeout",
+        )
+    }
+
     /// `500 Internal Server Error` — storage or index failure.
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", message)
@@ -112,8 +122,25 @@ impl From<DBError> for ApiError {
             DBError::Schema { .. } | DBError::Serialization { .. } | DBError::Generic { .. } => {
                 Self::new(StatusCode::BAD_REQUEST, "bad_request", message)
             }
-            DBError::Collection { .. } | DBError::Index { .. } | DBError::Storage { .. } => {
-                Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", message)
+            // The engine reports query-usage errors as `Index` (text search
+            // without a BM25 index, no HNSW index matching the query vector
+            // dimension, filter type mismatch). The messages only reference
+            // client-visible index/collection names, so they are safe to
+            // return as 400s.
+            DBError::Index { .. } => Self::new(StatusCode::BAD_REQUEST, "bad_request", message),
+            // Real internal failures: log the details (which may include
+            // object-store paths or bucket names) and return a generic
+            // message to the client.
+            DBError::Collection { .. } | DBError::Storage { .. } => {
+                log::error!(
+                    action = "ApiError::from";
+                    "internal error: {message}",
+                );
+                Self::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    "internal server error",
+                )
             }
         }
     }

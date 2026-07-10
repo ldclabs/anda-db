@@ -35,7 +35,9 @@ mod schema;
 ///   accepts a small DSL: primitives (`Bytes`, `Text`, `U64`, ...), as well
 ///   as `Array<T>`, `Option<T>`, `Map<String, T>`, `Map<Text, T>`,
 ///   `Map<I64, T>` and `Map<Bytes, T>` (where `T` is itself any supported
-///   type, including nested wrappers).
+///   type, including nested wrappers). For the map key, the Rust spellings
+///   `i8` / `i16` / `i32` / `i64` / `isize` are accepted as synonyms of
+///   `I64`.
 /// - `#[cbor(key = N)]` -- for nested structs that also derive
 ///   `cbor2::Cbor`, use the integer CBOR map key as the generated
 ///   `FieldKey` instead of the serde text name.
@@ -52,6 +54,12 @@ mod schema;
 /// - Other serde options are ignored. Note that `#[serde(with = "...")]` /
 ///   `serialize_with` may change the serialized shape -- combine them with
 ///   an explicit `#[field_type = "..."]` override when they do.
+///
+/// **Warning:** `#[serde(skip_serializing_if = "...")]` on a **non-`Option`**
+/// field is a trap: the field is described as *required*, but serde may omit
+/// it at runtime, which then fails `Document::try_from` with
+/// `field ... is required`. Either use an `Option<T>` field or make the
+/// declared type optional via `#[field_type = "Option<...>"]`.
 ///
 /// # Type inference
 ///
@@ -70,6 +78,15 @@ mod schema;
 /// - `serde_json::Value`, `Json` -> `Json`
 /// - any other path -> the type's `field_type()` function (so the type must
 ///   itself derive `FieldTyped`)
+///
+/// Inference matches on the *name* of the type (last path segment), like
+/// serde does: a user-defined type that happens to be called `Option`,
+/// `Vec`, `Json`, `Vector`, `Bytes`, ... will be misidentified. Use an
+/// explicit `#[field_type = "..."]` override for such types.
+///
+/// A field whose type is a bare generic parameter (e.g. `value: T`) cannot
+/// be inferred and is rejected with a compile error; annotate it with
+/// `#[field_type = "..."]`.
 ///
 /// Standalone `bf16` values are intentionally rejected -- vectors, not
 /// scalars, are the supported abstraction.
@@ -117,8 +134,18 @@ pub fn field_typed_derive(input: TokenStream) -> TokenStream {
 /// - `#[serde(flatten)]` and `#[serde(transparent)]` are rejected with a
 ///   compile error: they change the serialized shape in ways a per-field
 ///   schema cannot describe.
+/// - `#[cbor(key = N)]` is rejected with a compile error: top-level document
+///   fields are stored under their text names, so an integer CBOR key could
+///   never match the schema. (It remains supported in nested structs
+///   deriving `FieldTyped`.)
 /// - Doc comments (`/// ...`) are concatenated and used as the field
 ///   description (`FieldEntry::with_description`).
+///
+/// **Warning:** `#[serde(skip_serializing_if = "...")]` on a **non-`Option`**
+/// field is a trap: the schema marks the field *required*, but serde may
+/// omit it at runtime, which then fails `Document::try_from` with
+/// `field ... is required`. Either use an `Option<T>` field or make the
+/// declared type optional via `#[field_type = "Option<...>"]`.
 ///
 /// Two fields that would serialize under the same schema name (e.g. via
 /// renames) are rejected at compile time.
@@ -129,7 +156,9 @@ pub fn field_typed_derive(input: TokenStream) -> TokenStream {
 /// automatically, so declaring it on the struct is optional. When declared,
 /// it must be of type `u64` and keep serializing as `"_id"` (beware
 /// `rename_all` rules: add `#[serde(rename = "_id")]` if needed); it is
-/// validated at compile time and skipped during code generation.
+/// validated at compile time and skipped during code generation. A
+/// `#[field_type]` override on `_id` is rejected: the primary key is always
+/// `FieldType::U64`.
 ///
 /// # Example
 ///

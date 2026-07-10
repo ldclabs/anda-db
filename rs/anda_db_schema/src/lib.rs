@@ -8,8 +8,13 @@
 //! - [`FieldType`] (alias [`Ft`]): a closed enum of every type a field may declare,
 //!   including primitive, composite (`Array`, `Map`) and `Option` variants.
 //! - [`FieldValue`] (alias [`Fv`]): the runtime representation of an actual value.
-//!   It can losslessly round-trip with [`Cbor`](cbor2::Value) and is
-//!   serde-compatible for both human-readable (JSON) and binary (CBOR) formats.
+//!   It round-trips with [`Cbor`](cbor2::Value) and is serde-compatible for both
+//!   human-readable (JSON) and binary (CBOR) formats. An *untyped* round trip
+//!   preserves the data but normalizes some variants (`F32` → `F64`,
+//!   non-negative `I64` → `U64`, `Vector` → `Array(U64)`, `Json` → `Map` or a
+//!   primitive); providing the field's [`FieldType`] (via [`FieldType::extract`])
+//!   restores the declared variant, and [`FieldType::validate`] accepts the
+//!   normalized read-back shapes.
 //! - [`FieldEntry`] (alias [`Fe`]): metadata for a single field — name, type,
 //!   description, uniqueness flag and a stable numeric `idx` used as the on-disk
 //!   key (instead of the field name) to keep records compact.

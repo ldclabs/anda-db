@@ -6,6 +6,7 @@
 //! separately.
 
 use anda_db_server::{AppState, ServerOptions, build_router};
+use anda_object_store::{FaultKind, FaultOp, FaultRule, FaultStore};
 use axum::{
     Router,
     body::Body,
@@ -828,4 +829,104 @@ async fn test_vector_collection_with_hnsw_index() {
     assert_eq!(docs.len(), 2);
     assert_eq!(docs[0]["text"], "alpha");
     assert_eq!(docs[1]["text"], "gamma");
+}
+
+#[tokio::test]
+async fn test_payload_too_large_uses_rpc_error_envelope() {
+    let mut options = test_options(None);
+    options.max_body_size = 1024;
+    let state = AppState::connect(Arc::new(InMemory::new()), options)
+        .await
+        .expect("failed to connect AppState");
+    let app = build_router(state);
+
+    let body = format!(
+        r#"{{"method": "info", "params": {{"junk": "{}"}}}}"#,
+        "x".repeat(4096)
+    );
+    let resp = app
+        .oneshot(
+            Request::post("/")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        resp.headers().get(header::CONTENT_TYPE).unwrap(),
+        "application/json"
+    );
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["error"]["code"], "payload_too_large");
+}
+
+#[tokio::test]
+async fn test_corrupt_registry_refuses_start() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let state = test_state(store.clone(), None).await;
+    let app = build_router(state.clone());
+
+    // Corrupt the registry extension in the primary database, then restart.
+    rpc_ok(
+        &app,
+        &format!("/{PRIMARY_DB}"),
+        "db.save_extension",
+        json!({"key": "server:databases", "value": "not a set"}),
+    )
+    .await;
+    state.shutdown().await;
+
+    let err = match AppState::connect(store, test_options(None)).await {
+        Ok(_) => panic!("startup must fail instead of overwriting a corrupt registry"),
+        Err(err) => err,
+    };
+    assert!(
+        err.message.contains("registry"),
+        "unexpected error: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn test_failed_reopen_keeps_database_registered() {
+    let (fault_store, handle) = FaultStore::wrap(InMemory::new());
+    let store: Arc<dyn ObjectStore> = Arc::new(fault_store);
+
+    // Register an extra database, then stop the server.
+    let state = test_state(store.clone(), None).await;
+    let app = build_router(state.clone());
+    rpc_ok(&app, "/", "db.create", json!({"name": "auxdb"})).await;
+    state.shutdown().await;
+
+    // Every read of auxdb fails: the reopen on startup fails, but the
+    // registry entry must survive later registry rewrites.
+    handle.push_rule(FaultRule {
+        op: FaultOp::Get,
+        path_contains: Some("auxdb".to_string()),
+        skip: 0,
+        times: u64::MAX,
+        kind: FaultKind::Error,
+    });
+    let state = test_state(store.clone(), None).await;
+    let app = build_router(state.clone());
+    let names = rpc_ok(&app, "/", "db.list", Value::Null).await;
+    let names: Vec<String> = serde_json::from_value(names).unwrap();
+    assert!(!names.contains(&"auxdb".to_string()));
+
+    // Rewrites the registry; auxdb must not be dropped from it.
+    rpc_ok(&app, "/", "db.create", json!({"name": "otherdb"})).await;
+    state.shutdown().await;
+
+    // Storage recovers: auxdb is reopened automatically on the next start.
+    handle.reset();
+    let state = test_state(store, None).await;
+    let app = build_router(state.clone());
+    let names = rpc_ok(&app, "/", "db.list", Value::Null).await;
+    let names: Vec<String> = serde_json::from_value(names).unwrap();
+    assert!(names.contains(&"auxdb".to_string()), "names: {names:?}");
+    assert!(names.contains(&"otherdb".to_string()), "names: {names:?}");
+    state.shutdown().await;
 }

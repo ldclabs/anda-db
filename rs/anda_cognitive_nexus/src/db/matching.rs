@@ -369,6 +369,8 @@ impl CognitiveNexus {
         &self,
         ctx: &QueryContext,
         predicate: PredTerm,
+        subject_must_be_proposition: bool,
+        object_must_be_proposition: bool,
     ) -> Result<PropositionsMatchResult, KipError> {
         let mut result = PropositionsMatchResult::default();
         let predicates = match &predicate {
@@ -401,6 +403,18 @@ impl CognitiveNexus {
         for id in ids {
             if let Some((subj, preds, obj)) = self
                 .try_get_proposition_with(&ctx.cache, id, |proposition| {
+                    // Nested `(…)` endpoint patterns require the endpoint to
+                    // be a proposition link, exactly as in the full-scan path.
+                    if subject_must_be_proposition
+                        && matches!(proposition.subject, EntityID::Concept(_))
+                    {
+                        return Ok(None);
+                    }
+                    if object_must_be_proposition
+                        && matches!(proposition.object, EntityID::Concept(_))
+                    {
+                        return Ok(None);
+                    }
                     match_predicate_against_proposition(proposition, &predicate)
                 })
                 .await?
@@ -572,11 +586,16 @@ impl CognitiveNexus {
             _ => None,
         };
         let subject_var_clone = subject_var.clone();
+        // `(?x, "p", ?x)` — the same variable at both endpoints is an
+        // equality constraint on the solution rows, not two independent
+        // bindings (which would silently bind ?x to every object).
+        let same_endpoint_var = matches!((&subject_var, &object_var),
+            (Some(s), Some(o)) if s == o);
 
         let subjects = self.resolve_target_term_ids(ctx, subject).await?;
         let objects = self.resolve_target_term_ids(ctx, object).await?;
 
-        let result = match (subjects, predicate, objects) {
+        let mut result = match (subjects, predicate, objects) {
             (
                 subjects,
                 PredTerm::MultiHop {
@@ -610,6 +629,10 @@ impl CognitiveNexus {
                     .await?
             }
             (subjects, predicate, objects) => {
+                let subject_must_be_proposition =
+                    matches!(subjects, TargetEntities::AnyPropositions);
+                let object_must_be_proposition =
+                    matches!(objects, TargetEntities::AnyPropositions);
                 if matches!(&predicate, PredTerm::Variable(_)) {
                     // Fully unconstrained exploration `(?s, ?p, ?o)`:
                     // enumerate every proposition so the variables actually
@@ -618,15 +641,50 @@ impl CognitiveNexus {
                     self.handle_full_scan_matching(
                         ctx,
                         predicate,
-                        matches!(subjects, TargetEntities::AnyPropositions),
-                        matches!(objects, TargetEntities::AnyPropositions),
+                        subject_must_be_proposition,
+                        object_must_be_proposition,
                     )
                     .await?
                 } else {
-                    self.handle_predicate_matching(ctx, predicate).await?
+                    self.handle_predicate_matching(
+                        ctx,
+                        predicate,
+                        subject_must_be_proposition,
+                        object_must_be_proposition,
+                    )
+                    .await?
                 }
             }
         };
+
+        if same_endpoint_var {
+            // Keep only rows whose subject equals their object (single-link
+            // self-loops are not storable by this engine, but multi-hop
+            // zero-hop and cyclic paths legitimately satisfy the equality),
+            // then rebuild the aggregate match sets from the survivors.
+            let rows: Vec<QueryRelationRow> = result
+                .rows
+                .into_iter()
+                .filter(|row| {
+                    matches!((&row.subject, &row.object), (Some(s), Some(o)) if s == o)
+                })
+                .collect();
+            let mut filtered = PropositionsMatchResult::default();
+            for row in rows {
+                if let (Some(subject), Some(object)) = (&row.subject, &row.object) {
+                    filtered.matched_subjects.push(subject.clone());
+                    filtered.matched_objects.push(object.clone());
+                }
+                if let Some(predicate) = &row.predicate {
+                    filtered.matched_predicates.push(predicate.clone());
+                }
+                if let Some(proposition) = &row.proposition {
+                    filtered.matched_propositions.push(proposition.clone());
+                }
+                filtered.rows.push(row);
+            }
+            result = filtered;
+        }
 
         if proposition_var.is_some()
             || subject_var.is_some()
@@ -639,6 +697,7 @@ impl CognitiveNexus {
                 predicate_var: predicate_var.clone(),
                 object_var: object_var.clone(),
                 rows: result.rows.clone(),
+                origin: RelationOrigin::Pattern,
             });
         }
 
@@ -708,6 +767,10 @@ impl CognitiveNexus {
                                 "Invalid proposition link ID: {id:?}"
                             )));
                         }
+                        // Match-only `(id:)` target: KIP_3002 when dangling
+                        // (spec RC8).
+                        self.ensure_proposition_link_exists(&ctx.cache, &entity_id)
+                            .await?;
                         TargetEntities::IDs(vec![entity_id])
                     }
                     PropositionMatcher::Object {

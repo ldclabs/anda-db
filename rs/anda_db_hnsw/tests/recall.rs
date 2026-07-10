@@ -113,14 +113,22 @@ struct Bench {
 
 impl Bench {
     fn build(metric: DistanceMetric, n: usize, dim: usize, num_queries: usize, seed: u64) -> Self {
-        let index = HnswIndex::new(
-            "recall".to_string(),
-            Some(HnswConfig {
+        Self::build_with(
+            HnswConfig {
                 dimension: dim,
                 distance_metric: metric,
                 ..Default::default()
-            }),
-        );
+            },
+            n,
+            num_queries,
+            seed,
+        )
+    }
+
+    fn build_with(config: HnswConfig, n: usize, num_queries: usize, seed: u64) -> Self {
+        let dim = config.dimension;
+        let metric = config.distance_metric;
+        let index = HnswIndex::new("recall".to_string(), Some(config));
         let mut rng = SplitMix64(seed);
         let mut data = BTreeMap::new();
         for id in 1..=(n as u64) {
@@ -216,6 +224,103 @@ fn recall_survives_deletions() {
         min >= 0.50,
         "worst-case recall@10 after deletions too low: {min:.4}"
     );
+}
+
+/// Deleting most of the corpus in several waves must not collapse recall:
+/// the neighbor re-linking performed by `remove` keeps the surviving graph
+/// connected. Without the repair step, connectivity (and recall) degrades
+/// monotonically with every wave of deletions.
+#[test]
+fn recall_survives_heavy_deletions() {
+    // A deliberately sparse graph (small M / ef) so that lost connectivity
+    // actually shows up as lost recall instead of being masked by the very
+    // dense default configuration.
+    let mut bench = Bench::build_with(
+        HnswConfig {
+            dimension: 32,
+            distance_metric: DistanceMetric::Euclidean,
+            max_connections: 6,
+            ef_construction: 40,
+            ef_search: 40,
+            ..Default::default()
+        },
+        2000,
+        50,
+        4242,
+    );
+
+    let (avg_before, _) = bench.measure(&bench.index);
+    println!("before deletions: avg recall@10 = {avg_before:.4}");
+
+    // Wave 1: delete 50% of the corpus.
+    for id in 1..=2000u64 {
+        if id % 2 == 0 {
+            assert!(bench.index.remove(id, 2_000), "remove({id}) returned false");
+            bench.data.remove(&id);
+        }
+    }
+    let (avg50, min50) = bench.measure(&bench.index);
+    println!("after 50% deletions: avg recall@10 = {avg50:.4}, min = {min50:.4}");
+    // Deleting half the corpus must not cost more than a few recall points;
+    // without the neighbor re-linking in `remove` the drop here exceeds 0.10.
+    assert!(
+        avg50 >= avg_before - 0.06,
+        "average recall@10 dropped too much after 50% deletions: before {avg_before:.4}, after {avg50:.4}"
+    );
+    assert!(
+        min50 >= 0.50,
+        "worst-case recall@10 after 50% deletions too low: {min50:.4}"
+    );
+
+    // Wave 2: delete down to 20% of the original corpus.
+    for id in 1..=2000u64 {
+        if id % 2 == 1 && id % 5 != 0 {
+            assert!(bench.index.remove(id, 3_000), "remove({id}) returned false");
+            bench.data.remove(&id);
+        }
+    }
+    assert_eq!(bench.index.len(), bench.data.len());
+    let (avg80, min80) = bench.measure(&bench.index);
+    println!("after 80% deletions: avg recall@10 = {avg80:.4}, min = {min80:.4}");
+    assert!(
+        avg80 >= avg_before - 0.08,
+        "average recall@10 dropped too much after 80% deletions: before {avg_before:.4}, after {avg80:.4}"
+    );
+    assert!(
+        min80 >= 0.50,
+        "worst-case recall@10 after 80% deletions too low: {min80:.4}"
+    );
+}
+
+/// Repeatedly deleting and re-inserting nodes (including the entry point)
+/// must leave the graph fully searchable with healthy recall.
+#[test]
+fn recall_survives_delete_reinsert_churn() {
+    let mut bench = Bench::build(DistanceMetric::Euclidean, 600, 16, 30, 777);
+    let mut rng = SplitMix64(0xC0FFEE);
+
+    for round in 0..5u64 {
+        // Delete a third of the corpus, always including the entry point.
+        let victims: Vec<u64> = (1..=600u64).filter(|id| (id + round) % 3 == 0).collect();
+        for id in &victims {
+            assert!(bench.index.remove(*id, round), "remove({id}) returned false");
+            bench.data.remove(id);
+        }
+        // Re-insert fresh vectors under the same ids.
+        for id in &victims {
+            let v = rng.next_vector(16);
+            bench
+                .index
+                .insert_f32(*id, v.clone(), round)
+                .expect("re-insert failed");
+            bench.data.insert(*id, v);
+        }
+    }
+
+    let (avg, min) = bench.measure(&bench.index);
+    println!("after churn: avg recall@10 = {avg:.4}, min = {min:.4}");
+    assert!(avg >= 0.93, "average recall@10 after churn too low: {avg:.4}");
+    assert!(min >= 0.60, "worst-case recall@10 after churn too low: {min:.4}");
 }
 
 /// A flush/load round-trip must preserve retrieval quality.

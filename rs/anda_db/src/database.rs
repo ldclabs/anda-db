@@ -47,6 +47,10 @@ struct InnerDB {
     read_only: AtomicBool,
     /// Set of collection names being dropped
     dropping_collections: RwLock<BTreeSet<String>>,
+    /// Serializes collection creation, so concurrent
+    /// `open_or_create_collection` callers racing on the same name observe
+    /// the winner's registration instead of failing with `AlreadyExists`.
+    create_lock: tokio::sync::Mutex<()>,
 }
 
 /// Database configuration parameters.
@@ -163,6 +167,7 @@ impl AndaDB {
                 collections: RwLock::new(BTreeMap::new()),
                 read_only: AtomicBool::new(false),
                 dropping_collections: RwLock::new(BTreeSet::new()),
+                create_lock: tokio::sync::Mutex::new(()),
             }),
         })
     }
@@ -229,6 +234,7 @@ impl AndaDB {
                         collections: RwLock::new(BTreeMap::new()),
                         read_only: AtomicBool::new(false),
                         dropping_collections: RwLock::new(BTreeSet::new()),
+                create_lock: tokio::sync::Mutex::new(()),
                     }),
                 };
 
@@ -474,9 +480,25 @@ impl AndaDB {
             }
         }
 
-        let start = Instant::now();
+        // Serialize creation so a concurrent creator of the same name is
+        // observed through its registration rather than a storage conflict.
+        let _create_guard = self.inner.create_lock.lock().await;
         // self.metadata.collections will check it exists again in Collection::create
-        let mut collection = Collection::create(self.clone(), schema, config).await?;
+        let collection = Collection::create(self.clone(), schema, config).await?;
+        self.register_created_collection(collection, f).await
+    }
+
+    /// Runs the creation callback on a freshly created collection, registers
+    /// it in the database, and persists collection and database metadata.
+    async fn register_created_collection<F>(
+        &self,
+        mut collection: Collection,
+        f: F,
+    ) -> Result<Arc<Collection>, DBError>
+    where
+        F: AsyncFnOnce(&mut Collection) -> Result<(), DBError>,
+    {
+        let start = Instant::now();
         if let Err(err) = f(&mut collection).await {
             // The collection is not registered in the database metadata yet;
             // delete the files written so far so the name can be created again.
@@ -564,15 +586,49 @@ impl AndaDB {
             }
         }
 
+        if !self
+            .inner
+            .metadata
+            .read()
+            .collections
+            .contains(&config.name)
         {
-            if !self
-                .inner
-                .metadata
-                .read()
-                .collections
-                .contains(&config.name)
-            {
-                return self.create_collection(schema, config, f).await;
+            // Serialize with other creators: when a concurrent
+            // `open_or_create_collection` of the same name wins the race, we
+            // observe its registration after acquiring the lock and fall
+            // through to the open path instead of failing with
+            // `AlreadyExists`.
+            let create_guard = self.inner.create_lock.lock().await;
+            let exists_now = self.inner.collections.read().contains_key(&config.name)
+                || self
+                    .inner
+                    .metadata
+                    .read()
+                    .collections
+                    .contains(&config.name);
+            if !exists_now {
+                match Collection::create(self.clone(), schema.clone(), config.clone()).await {
+                    Ok(collection) => {
+                        return self.register_created_collection(collection, f).await;
+                    }
+                    Err(err @ DBError::AlreadyExists { .. }) => {
+                        // Lost to a writer outside this process (or leftover
+                        // files from a crashed create): fall back to opening.
+                        drop(create_guard);
+                        return match self
+                            .open_collection_with_schema(config.name, Some(schema), f)
+                            .await
+                        {
+                            // Not a registered collection (e.g. leftover files
+                            // from a crashed create): surface the original
+                            // AlreadyExists so the caller can clean up with
+                            // `delete_collection`.
+                            Err(DBError::NotFound { .. }) => Err(err),
+                            other => other,
+                        };
+                    }
+                    Err(err) => return Err(err),
+                }
             }
         }
 
@@ -648,6 +704,30 @@ impl AndaDB {
             if let Some(existing) = collections.get(collection.name()) {
                 return Ok(existing.clone());
             }
+            // Re-validate against a concurrent `delete_collection` that
+            // completed while `Collection::open` was loading: registering now
+            // would resurrect a "zombie" handle whose storage prefix has been
+            // (or is being) deleted, and whose future flushes would write
+            // objects back under the deleted prefix.
+            if self
+                .inner
+                .dropping_collections
+                .read()
+                .contains(collection.name())
+                || !self
+                    .inner
+                    .metadata
+                    .read()
+                    .collections
+                    .contains(collection.name())
+            {
+                return Err(DBError::NotFound {
+                    name: collection.name().to_string(),
+                    path: self.inner.name.clone(),
+                    source: "collection was deleted while being opened".into(),
+                    _id: 0,
+                });
+            }
             collections.insert(collection.name().to_string(), collection.clone());
         }
         let now = unix_ms();
@@ -655,11 +735,36 @@ impl AndaDB {
         Ok(collection)
     }
 
+    /// Closes an open collection and removes it from the database's in-memory
+    /// registry, so a subsequent open reloads it from storage.
+    ///
+    /// Use this instead of calling [`Collection::close`] directly: a closed
+    /// collection that stays registered would keep being returned by
+    /// [`AndaDB::open_collection`] / [`AndaDB::open_or_create_collection`] as
+    /// a permanently read-only handle.
+    ///
+    /// Returns `Ok(())` when the collection is not currently open.
+    pub async fn close_collection(&self, name: &str) -> Result<(), DBError> {
+        let collection = { self.inner.collections.write().remove(name) };
+        if let Some(collection) = collection {
+            collection.close().await?;
+        }
+        Ok(())
+    }
+
     /// Deletes a collection's metadata, cached instance, and storage prefix.
     ///
     /// The deletion first persists database metadata so reopening the database
     /// does not try to load the removed collection. Object deletion is then
     /// performed under the collection prefix.
+    ///
+    /// # Concurrency
+    ///
+    /// Deletion should run during a write quiescence for the collection: an
+    /// `add` that already passed the read-only check when the deletion starts
+    /// can still write its document object after the prefix listing, leaving
+    /// a residual object behind. Re-running `delete_collection` for the same
+    /// name cleans such leftovers.
     pub async fn delete_collection(&self, name: &str) -> Result<(), DBError> {
         if self.inner.read_only.load(Ordering::Relaxed) {
             return Err(DBError::Generic {
@@ -771,14 +876,23 @@ impl AndaDB {
     where
         T: DeserializeOwned,
     {
-        self.get_extension(key)
-            .and_then(|v| v.clone().deserialized().ok())
+        self.get_extension(key).and_then(|v| v.deserialized().ok())
     }
 
     /// Sets a user-defined extension key-value pair.
     /// The change is persisted on the next `flush()` or `flush_metadata()`.
     /// The extensions should not be large, as they are stored in the same object as database metadata which size is expected to be small (<= 1MB) and loaded frequently.
+    /// Values that fail [`FieldValue::validate_complexity`] are dropped with a warning.
     pub fn set_extension(&self, key: String, value: FieldValue) {
+        if let Err(err) = value.validate_complexity() {
+            log::warn!(
+                action = "AndaDB::set_extension",
+                database = self.inner.name,
+                key = key;
+                "Dropping extension value that exceeds complexity limits: {err:?}",
+            );
+            return;
+        }
         self.inner.metadata.write().extensions.insert(key, value);
     }
 
@@ -816,6 +930,15 @@ impl AndaDB {
         let old_value = meta.extensions.get(&key);
         let new_value = f(old_value);
         if let Some(value) = new_value {
+            if let Err(err) = value.validate_complexity() {
+                log::warn!(
+                    action = "AndaDB::set_extension_with",
+                    database = self.inner.name,
+                    key = key;
+                    "Dropping extension value that exceeds complexity limits: {err:?}",
+                );
+                return None;
+            }
             meta.extensions.insert(key, value)
         } else {
             None
@@ -834,6 +957,15 @@ impl AndaDB {
         if let Some(value) = new_value
             && let Ok(value) = FieldValue::serialized(&value, None)
         {
+            if let Err(err) = value.validate_complexity() {
+                log::warn!(
+                    action = "AndaDB::set_extension_from_with",
+                    database = self.inner.name,
+                    key = key;
+                    "Dropping extension value that exceeds complexity limits: {err:?}",
+                );
+                return None;
+            }
             let old = meta.extensions.insert(key, value);
             return old.and_then(|v| v.deserialized().ok());
         }
@@ -1459,6 +1591,130 @@ mod tests {
             db.get_extension("lazy_key"),
             Some(FieldValue::Bytes(vec![1, 2, 3]))
         );
+
+        db.close().await.unwrap();
+    }
+
+    fn test_schema() -> Schema {
+        let mut schema = Schema::builder();
+        schema
+            .add_field(Fe::new("name".to_string(), Ft::Text).unwrap())
+            .unwrap();
+        schema.build().unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_close_collection_unregisters_handle() {
+        let object_store = Arc::new(InMemory::new());
+        let db = AndaDB::create(object_store, DBConfig::default()).await.unwrap();
+
+        let config = CollectionConfig {
+            name: "c1".to_string(),
+            description: "".to_string(),
+        };
+        let collection = db
+            .create_collection(test_schema(), config, async |_| Ok(()))
+            .await
+            .unwrap();
+
+        // Close through the database so the handle is unregistered; a later
+        // open must reload a fresh, writable instance instead of returning
+        // the closed (permanently read-only) one.
+        db.close_collection("c1").await.unwrap();
+        assert!(collection.metadata().stats.read_only);
+
+        let reopened = db
+            .open_collection("c1".to_string(), async |_| Ok(()))
+            .await
+            .unwrap();
+        assert!(!Arc::ptr_eq(&collection, &reopened));
+        assert!(!reopened.metadata().stats.read_only);
+
+        // Closing a collection that is not open is a no-op.
+        db.close_collection("nonexistent").await.unwrap();
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_open_or_create_collection() {
+        let object_store = Arc::new(InMemory::new());
+        let db = AndaDB::create(object_store, DBConfig::default()).await.unwrap();
+        let schema = test_schema();
+
+        // All concurrent callers must succeed: the losers of the create race
+        // fall through to opening the winner's collection instead of
+        // surfacing AlreadyExists.
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let db = db.clone();
+            let schema = schema.clone();
+            handles.push(tokio::spawn(async move {
+                db.open_or_create_collection(
+                    schema,
+                    CollectionConfig {
+                        name: "racing".to_string(),
+                        description: "".to_string(),
+                    },
+                    async |_| Ok(()),
+                )
+                .await
+            }));
+        }
+        for handle in handles {
+            let collection = handle
+                .await
+                .unwrap()
+                .expect("open_or_create_collection must not fail on a create race");
+            assert_eq!(collection.name(), "racing");
+        }
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_open_collection_racing_delete_is_not_registered() {
+        let object_store = Arc::new(InMemory::new());
+        let db = AndaDB::create(object_store, DBConfig::default()).await.unwrap();
+        let config = CollectionConfig {
+            name: "racy".to_string(),
+            description: "".to_string(),
+        };
+        db.create_collection(test_schema(), config, async |_| Ok(()))
+            .await
+            .unwrap();
+        // Drop the cached handle so the open below performs a real load.
+        db.close_collection("racy").await.unwrap();
+
+        // Stall the open inside its callback (fully loaded, but not yet
+        // registered) while a concurrent delete_collection completes.
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel::<()>();
+        let open_task = {
+            let db = db.clone();
+            tokio::spawn(async move {
+                db.open_collection("racy".to_string(), async move |_| {
+                    let _ = entered_tx.send(());
+                    let _ = resume_rx.await;
+                    Ok(())
+                })
+                .await
+            })
+        };
+        entered_rx.await.unwrap();
+        db.delete_collection("racy").await.unwrap();
+        resume_tx.send(()).unwrap();
+
+        // The open must observe the completed delete instead of registering a
+        // zombie handle over the deleted storage prefix.
+        let result = open_task.await.unwrap();
+        assert!(
+            matches!(result, Err(DBError::NotFound { .. })),
+            "open racing a completed delete must fail with NotFound, got {result:?}",
+        );
+        let err = db
+            .open_collection("racy".to_string(), async |_| Ok(()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DBError::NotFound { .. }));
 
         db.close().await.unwrap();
     }

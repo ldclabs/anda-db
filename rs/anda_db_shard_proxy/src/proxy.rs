@@ -6,21 +6,24 @@
 
 use axum::{
     body::Body,
-    extract::State,
+    extract::{ConnectInfo, State},
     http::{
-        HeaderMap, Request, Response, StatusCode, Uri,
+        HeaderMap, HeaderValue, Request, Response, StatusCode, Uri,
         header::{self, HeaderName},
     },
     response::IntoResponse,
 };
 use hyper_util::client::legacy::Client;
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 use tokio::time::{Duration, timeout};
 
 use crate::store::{ResolvedRoute, ShardStore};
 
 const KEEP_ALIVE_HEADER: HeaderName = HeaderName::from_static("keep-alive");
 const SHARD_ID_HEADER: HeaderName = HeaderName::from_static("shard-id");
+const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
+const X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host");
+const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
 
 /// A pluggable extractor that resolves either database name or shard id
 /// from an incoming request.
@@ -47,10 +50,33 @@ pub struct AppState {
     /// Custom extractor to read the database name or shard ID from requests.
     /// Defaults to [`crate::router::PrefixExtractor`].
     pub db_name_extractor: Arc<dyn DbShardExtractor>,
-    /// Upper bound for a proxied backend request.
+    /// Upper bound for a proxied backend request **up to the response
+    /// headers**: it covers connecting, sending the request, and waiting for
+    /// the backend to start responding. Streaming the response body is not
+    /// bounded by this timeout.
     pub proxy_request_timeout: Duration,
     /// Default backend address to use if no shard mapping is found.
     pub default_backend: Option<ResolvedRoute>,
+}
+
+/// Validates a shard backend address: an absolute `http://` URI with a host.
+///
+/// The proxy's HTTP client is built with `build_http()` (plain HTTP), so an
+/// `https://` backend would always fail with `BAD_GATEWAY`; rejecting bad
+/// addresses at write time avoids taking a shard down with a typo.
+pub fn validate_backend_addr(addr: &str) -> Result<(), String> {
+    let uri: Uri = addr
+        .parse()
+        .map_err(|err| format!("invalid backend_addr {addr:?}: {err}"))?;
+    if uri.scheme_str() != Some("http") {
+        return Err(format!(
+            "backend_addr {addr:?} must use the http scheme (the proxy forwards plain HTTP)"
+        ));
+    }
+    if uri.authority().is_none() {
+        return Err(format!("backend_addr {addr:?} must include a host"));
+    }
+    Ok(())
 }
 
 /// The catch-all reverse proxy handler.
@@ -65,7 +91,15 @@ pub async fn proxy_handler(
     let original_uri = req.uri().clone();
     let route = match state.db_name_extractor.extract(req.uri(), req.headers()) {
         (Some(id), _) => state.store.resolve_by_shard(id).await,
-        (_, Some(name)) => state.store.resolve(&name).await,
+        (_, Some(name)) => match state.store.resolve(&name).await {
+            Ok(route) => route,
+            // A routing-store failure is not "database not found": answer 503
+            // so clients retry instead of assuming the database is gone.
+            Err(err) => {
+                log::error!("failed to resolve route for {name:?}: {err}");
+                return Err((StatusCode::SERVICE_UNAVAILABLE, "routing store unavailable"));
+            }
+        },
         _ => state.default_backend.clone(),
     };
 
@@ -73,10 +107,18 @@ pub async fn proxy_handler(
     *req.uri_mut() = build_target_uri(&route.backend_addr, &original_uri)
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "invalid backend URI"))?;
 
+    // Capture forwarding metadata before the hop-by-hop cleanup drops Host.
+    let client_ip = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|info| info.0.ip());
+    let original_host = req.headers().get(header::HOST).cloned();
+
     remove_hop_by_hop_headers(req.headers_mut());
     // add the shard ID header so backends can know which shard the request is for (required)
     req.headers_mut()
         .insert(SHARD_ID_HEADER, route.shard_id.into());
+    add_forwarded_headers(req.headers_mut(), client_ip, original_host);
 
     let mut resp = timeout(state.proxy_request_timeout, state.client.request(req))
         .await
@@ -101,6 +143,36 @@ fn build_target_uri(backend_addr: &str, request_uri: &Uri) -> Result<Uri, ()> {
     format!("{}{}", backend_addr.trim_end_matches('/'), path_and_query)
         .parse::<Uri>()
         .map_err(|_| ())
+}
+
+/// Append the standard `X-Forwarded-*` headers so backends keep the client
+/// IP, original Host, and scheme for auditing and rate limiting. Existing
+/// values from an upstream load balancer are preserved: the client IP is
+/// appended to `X-Forwarded-For`, while `X-Forwarded-Host`/`-Proto` are only
+/// set when absent.
+fn add_forwarded_headers(
+    headers: &mut HeaderMap,
+    client_ip: Option<std::net::IpAddr>,
+    original_host: Option<HeaderValue>,
+) {
+    if let Some(ip) = client_ip {
+        let xff = match headers.get(X_FORWARDED_FOR).and_then(|v| v.to_str().ok()) {
+            Some(existing) => format!("{existing}, {ip}"),
+            None => ip.to_string(),
+        };
+        if let Ok(value) = HeaderValue::from_str(&xff) {
+            headers.insert(X_FORWARDED_FOR, value);
+        }
+    }
+    if !headers.contains_key(X_FORWARDED_HOST)
+        && let Some(host) = original_host
+    {
+        headers.insert(X_FORWARDED_HOST, host);
+    }
+    if !headers.contains_key(X_FORWARDED_PROTO) {
+        // The proxy itself only terminates plain HTTP.
+        headers.insert(X_FORWARDED_PROTO, HeaderValue::from_static("http"));
+    }
 }
 
 /// Remove headers named inside the `Connection` header, as required by RFC 9110.
@@ -180,6 +252,65 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("https")
         );
+    }
+
+    #[test]
+    fn add_forwarded_headers_appends_client_ip_and_sets_missing_headers() {
+        let mut headers = HeaderMap::new();
+        add_forwarded_headers(
+            &mut headers,
+            Some("10.1.2.3".parse().unwrap()),
+            Some(HeaderValue::from_static("proxy.example.com")),
+        );
+        assert_eq!(
+            headers.get(X_FORWARDED_FOR).and_then(|v| v.to_str().ok()),
+            Some("10.1.2.3")
+        );
+        assert_eq!(
+            headers.get(X_FORWARDED_HOST).and_then(|v| v.to_str().ok()),
+            Some("proxy.example.com")
+        );
+        assert_eq!(
+            headers.get(X_FORWARDED_PROTO).and_then(|v| v.to_str().ok()),
+            Some("http")
+        );
+    }
+
+    #[test]
+    fn add_forwarded_headers_preserves_upstream_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert(X_FORWARDED_FOR, HeaderValue::from_static("192.0.2.9"));
+        headers.insert(X_FORWARDED_HOST, HeaderValue::from_static("lb.example.com"));
+        headers.insert(X_FORWARDED_PROTO, HeaderValue::from_static("https"));
+
+        add_forwarded_headers(
+            &mut headers,
+            Some("10.1.2.3".parse().unwrap()),
+            Some(HeaderValue::from_static("proxy.example.com")),
+        );
+
+        assert_eq!(
+            headers.get(X_FORWARDED_FOR).and_then(|v| v.to_str().ok()),
+            Some("192.0.2.9, 10.1.2.3")
+        );
+        assert_eq!(
+            headers.get(X_FORWARDED_HOST).and_then(|v| v.to_str().ok()),
+            Some("lb.example.com")
+        );
+        assert_eq!(
+            headers.get(X_FORWARDED_PROTO).and_then(|v| v.to_str().ok()),
+            Some("https")
+        );
+    }
+
+    #[test]
+    fn validate_backend_addr_accepts_http_and_rejects_others() {
+        assert!(validate_backend_addr("http://10.0.0.12:8080").is_ok());
+        assert!(validate_backend_addr("http://db.internal").is_ok());
+        assert!(validate_backend_addr("https://db.internal").is_err());
+        assert!(validate_backend_addr("db.internal:8080").is_err());
+        assert!(validate_backend_addr("not a uri").is_err());
+        assert!(validate_backend_addr("/relative/path").is_err());
     }
 
     #[test]

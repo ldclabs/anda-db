@@ -27,8 +27,19 @@ mod meta; // META command parser for introspection
 
 use crate::error::{KipError, format_nom_error};
 
-const MAX_KIP_INPUT_LEN: usize = 256 * 1024;
-const MAX_KIP_NESTING_DEPTH: usize = 64;
+/// Maximum accepted length (in bytes) of a single KIP command string.
+///
+/// Inputs longer than this are rejected by all `parse_*` entry points before
+/// any parsing work happens, bounding parser memory/CPU for server-facing
+/// deployments (e.g. `anda_db_server`, Cognitive Nexus).
+pub const MAX_KIP_INPUT_LEN: usize = 256 * 1024;
+
+/// Maximum accepted `(`/`{`/`[` nesting depth of a single KIP command string.
+///
+/// Inputs nested deeper than this are rejected by all `parse_*` entry points
+/// before any parsing work happens, protecting the recursive-descent parser
+/// from stack exhaustion.
+pub const MAX_KIP_NESTING_DEPTH: usize = 64;
 
 /// The main entry point for parsing any KIP command.
 ///

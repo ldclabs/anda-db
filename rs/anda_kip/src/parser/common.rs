@@ -2,15 +2,15 @@ use nom::{
     IResult, Parser,
     branch::alt,
     bytes::complete::{tag, tag_no_case},
-    character::complete::{alpha1, alphanumeric1, char, multispace1},
-    combinator::{cut, map, opt, recognize, value},
+    character::complete::{anychar, char, multispace1},
+    combinator::{cut, map, not, opt, value, verify},
     error::{ErrorKind, ParseError, context},
     multi::{many0, separated_list1},
     sequence::{delimited, pair, preceded, separated_pair, terminated},
 };
 use nom_language::error::VerboseError;
 
-use super::json::{json_value, parse_number};
+use super::json::{ensure_unique_keys, json_value, parse_number};
 use crate::ast::{DotPathVar, Json, KeyValue, Map, Value};
 
 pub use super::json::{quoted_string, ws};
@@ -67,15 +67,26 @@ pub fn keywords<'a>(
     }
 }
 
+/// Matches a keyword at a word boundary: the keyword must not be immediately
+/// followed by an identifier character (letter, digit, or underscore), so
+/// `FIND` does not match the prefix of `FINDX`. Unlike [`keyword`], no
+/// trailing whitespace is required or consumed, which makes it safe for
+/// keywords directly followed by `(`, `{`, or end of input.
+pub fn word<'a>(
+    w: &'static str,
+) -> impl Parser<&'a str, Output = &'a str, Error = VerboseError<&'a str>> {
+    terminated(
+        tag(w),
+        not(verify(anychar, |c: &char| c.is_alphanumeric() || *c == '_')),
+    )
+}
+
 /// Parses a valid identifier (e.g., for variables, types, predicates).
 /// An identifier starts with a letter or underscore, followed by any combination of letters, digits, or underscores.
 pub fn identifier(input: &str) -> VResult<'_, &str> {
     context(
         "identifier (letter or underscore, followed by letters, digits, underscores)",
-        recognize(pair(
-            alt((alpha1, tag("_"))),
-            many0(alt((alphanumeric1, tag("_")))),
-        )),
+        super::json::identifier(),
     )
     .parse(input)
 }
@@ -144,24 +155,26 @@ pub fn key_value_pair(input: &str) -> VResult<'_, KeyValue> {
 }
 
 /// Parses a list of key-value pairs inside braces, like `{ key1: val1, key2: val2 }`.
+/// Duplicate keys are rejected as a parse error.
 pub fn json_value_map(input: &str) -> VResult<'_, Map<String, Json>> {
-    map(
-        context(
-            "KIP key-value map",
-            preceded(
-                ws(char('{')),
-                cut(terminated(
-                    opt(terminated(
-                        separated_list1(ws(char(',')), key_json_pair),
-                        opt(ws(char(','))), // Allow trailing comma
-                    )),
-                    ws(char('}')),
+    let (remaining, opt_kvs) = context(
+        "KIP key-value map",
+        preceded(
+            ws(char('{')),
+            cut(terminated(
+                opt(terminated(
+                    separated_list1(ws(char(',')), key_json_pair),
+                    opt(ws(char(','))), // Allow trailing comma
                 )),
-            ),
+                ws(char('}')),
+            )),
         ),
-        |opt_kvs| opt_kvs.unwrap_or_default().into_iter().collect(),
     )
-    .parse(input)
+    .parse(input)?;
+
+    let kvs = opt_kvs.unwrap_or_default();
+    ensure_unique_keys(input, &kvs)?;
+    Ok((remaining, kvs.into_iter().collect()))
 }
 
 fn key_json_pair(input: &str) -> VResult<'_, (String, Json)> {
@@ -460,6 +473,21 @@ mod tests {
         assert!(result.is_ok());
         let (_, map) = result.unwrap();
         assert_eq!(map.len(), 1);
+
+        // Duplicate keys are rejected (quoted and identifier spellings alike).
+        assert!(json_value_map(r#"{ a: 1, a: 2 }"#).is_err());
+        assert!(json_value_map(r#"{ "a": 1, a: 2 }"#).is_err());
+    }
+
+    #[test]
+    fn test_word_boundary_matcher() {
+        let mut parser = word("FIND");
+        assert_eq!(parser.parse("FIND(?x)"), Ok(("(?x)", "FIND")));
+        assert_eq!(parser.parse("FIND ?x"), Ok((" ?x", "FIND")));
+        assert_eq!(parser.parse("FIND"), Ok(("", "FIND")));
+        assert!(parser.parse("FINDX").is_err());
+        assert!(parser.parse("FIND_ALL").is_err());
+        assert!(parser.parse("FIND1").is_err());
     }
 
     #[test]

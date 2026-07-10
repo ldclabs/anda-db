@@ -6,9 +6,10 @@
 //! - `POST /{db_name}` — database-scoped methods (`db.*`, `collection.*`, `doc.*`)
 
 use axum::{
-    body::Bytes,
-    extract::{Path, State},
-    http::{HeaderMap, header},
+    body::{Body, Bytes},
+    extract::{Path, Request, State},
+    http::{HeaderMap, StatusCode, header},
+    middleware::Next,
     response::Response,
 };
 use serde::Serialize;
@@ -54,12 +55,13 @@ pub async fn get_info(State(state): State<AppState>, headers: HeaderMap) -> Resp
 /// `POST /` — root-scope RPC endpoint.
 pub async fn rpc_root(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     let enc = Encoding::negotiate(&headers);
-    let result = async {
+    let result = tokio::time::timeout(state.request_timeout(), async {
         authorize(&state, &headers)?;
         let req = RpcRequest::parse(&headers, &body)?;
         dispatch_root(&state, enc, req).await
-    }
-    .await;
+    })
+    .await
+    .unwrap_or_else(|_| Err(ApiError::timeout()));
     result.unwrap_or_else(|err| err.respond(enc))
 }
 
@@ -71,13 +73,33 @@ pub async fn rpc_db(
     body: Bytes,
 ) -> Response {
     let enc = Encoding::negotiate(&headers);
-    let result = async {
+    let result = tokio::time::timeout(state.request_timeout(), async {
         authorize(&state, &headers)?;
         let req = RpcRequest::parse(&headers, &body)?;
         dispatch_db(&state, &db_name, enc, req).await
-    }
-    .await;
+    })
+    .await
+    .unwrap_or_else(|_| Err(ApiError::timeout()));
     result.unwrap_or_else(|err| err.respond(enc))
+}
+
+/// Rewrites extractor-level rejections (e.g. the body-limit 413, which axum
+/// emits as plain text) into the RPC error envelope in the negotiated
+/// encoding. Responses that already carry a CBOR/JSON body pass through.
+pub async fn normalize_rejections(req: Request<Body>, next: Next) -> Response {
+    let enc = Encoding::negotiate(req.headers());
+    let resp = next.run(req).await;
+    if resp.status() == StatusCode::PAYLOAD_TOO_LARGE
+        && Encoding::from_content_type(resp.headers()).is_none()
+    {
+        return ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "payload_too_large",
+            "request body exceeds the configured size limit",
+        )
+        .respond(enc);
+    }
+    resp
 }
 
 /// Verifies the `Authorization: Bearer <key>` header when an API key is set.
@@ -95,11 +117,24 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
             return Err(ApiError::unauthorized());
         };
 
-        if provided != expected {
+        if !constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
             return Err(ApiError::unauthorized());
         }
     }
     Ok(())
+}
+
+/// Constant-time byte comparison to avoid a timing side channel on the API
+/// key. Only the length may leak, which is not considered secret.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 async fn dispatch_root(

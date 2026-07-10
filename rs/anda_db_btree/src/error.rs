@@ -27,6 +27,10 @@ pub enum BTreeError {
     },
 
     /// Error when a token is not found.
+    ///
+    /// Note: this variant is not constructed by this crate itself; it is
+    /// reserved for downstream callers (e.g. `anda_db`) that map lookup
+    /// misses onto the index's error type.
     #[error("BTree index {name:?}, value {value:?} not found in document {id}")]
     NotFound {
         /// Name of the B-tree index that was searched.

@@ -13,7 +13,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::proxy::{AppState, proxy_handler};
+use crate::proxy::{AppState, proxy_handler, validate_backend_addr};
 use crate::store::ShardBackend;
 
 // ── Management API request/response types ───────────────────────────────────
@@ -94,9 +94,18 @@ pub struct DeleteBackendRequest {
 async fn get_db_shard(
     State(state): State<AppState>,
     Path(db_name): Path<String>,
-) -> impl IntoResponse {
-    let rt = state.store.get_db_shard(&db_name).await;
-    Json(RpcResponse::ok(rt))
+) -> Result<impl IntoResponse, (StatusCode, impl IntoResponse)> {
+    match state.store.get_db_shard(&db_name).await {
+        Ok(Some(rt)) => Ok(Json(RpcResponse::ok(rt))),
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            Json(RpcResponse::<()>::err("db shard binding not found")),
+        )),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(RpcResponse::<()>::err(e.to_string())),
+        )),
+    }
 }
 
 async fn assign_db(
@@ -113,6 +122,20 @@ async fn assign_db(
                 Json(RpcResponse::<()>::err(e.to_string())),
             )
         })?;
+
+    // Assigning to a shard without a backend is allowed (the backend may be
+    // registered later) but every request for the database will 404 until
+    // then, so surface it.
+    if state.store.resolve_by_shard(req.shard_id).await.is_none() {
+        log::warn!(
+            "db {:?} assigned to shard {} which has no registered backend",
+            req.db_name,
+            req.shard_id
+        );
+        return Ok(Json(RpcResponse::ok(
+            "db assigned to shard (warning: the shard has no registered backend yet)",
+        )));
+    }
     Ok(Json(RpcResponse::ok("db assigned to shard")))
 }
 
@@ -146,6 +169,11 @@ async fn upsert_backend(
     State(state): State<AppState>,
     Json(req): Json<UpsertBackendRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, impl IntoResponse)> {
+    // A malformed or non-http address would take the whole shard down with
+    // 500/BAD_GATEWAY on every request; reject it before it reaches the store.
+    validate_backend_addr(&req.backend_addr)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(RpcResponse::<()>::err(e))))?;
+
     let backend = ShardBackend {
         shard_id: req.shard_id,
         backend_addr: req.backend_addr,
@@ -210,7 +238,20 @@ fn authorize_api_key(expected: Option<&str>, headers: &HeaderMap) -> bool {
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        == Some(expected)
+        .is_some_and(|provided| constant_time_eq(provided.as_bytes(), expected.as_bytes()))
+}
+
+/// Constant-time byte comparison to avoid a timing side channel on the API
+/// key. Only the length may leak, which is not considered secret.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 // ── Router construction ─────────────────────────────────────────────────────

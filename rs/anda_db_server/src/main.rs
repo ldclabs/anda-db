@@ -23,6 +23,7 @@ use object_store::{ObjectStore, aws::AmazonS3Builder, local::LocalFileSystem, me
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use structured_logger::{Builder, async_json::new_writer, get_env_level};
 use tokio::signal;
+use tokio_util::sync::CancellationToken;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -49,6 +50,18 @@ struct Cli {
     /// Background flush interval in seconds for every open database
     #[clap(long, env = "FLUSH_INTERVAL_SECS", default_value = "30")]
     flush_interval_secs: u64,
+
+    /// Per-request processing timeout in seconds for the RPC endpoints
+    #[clap(long, env = "REQUEST_TIMEOUT_SECS", default_value = "300")]
+    request_timeout_secs: u64,
+
+    /// Maximum accepted request body size in bytes
+    #[clap(long, env = "MAX_BODY_SIZE", default_value = "2097152")]
+    max_body_size: usize,
+
+    /// Grace period in seconds to drain in-flight requests on shutdown
+    #[clap(long, env = "SHUTDOWN_TIMEOUT_SECS", default_value = "30")]
+    shutdown_timeout_secs: u64,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -97,6 +110,8 @@ async fn main() -> Result<(), BoxError> {
             primary_db: cli.primary_db,
             api_key: cli.api_key,
             flush_interval: Duration::from_secs(cli.flush_interval_secs.max(1)),
+            request_timeout: Duration::from_secs(cli.request_timeout_secs.max(1)),
+            max_body_size: cli.max_body_size.max(1024),
             ..Default::default()
         },
     )
@@ -108,12 +123,38 @@ async fn main() -> Result<(), BoxError> {
     let listener = create_reuse_port_listener(addr).await?;
     log::warn!("{APP_NAME}@{APP_VERSION} listening on {addr:?}");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    // A termination signal cancels the token; graceful shutdown then drains
+    // in-flight connections, bounded by `shutdown_timeout_secs` so a hung
+    // client cannot keep the process alive forever.
+    let shutdown = CancellationToken::new();
+    tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            shutdown_signal().await;
+            shutdown.cancel();
+        }
+    });
 
-    // Flush and close every open database before exiting.
+    let drain = Duration::from_secs(cli.shutdown_timeout_secs.max(1));
+    let serve = axum::serve(listener, app).with_graceful_shutdown({
+        let shutdown = shutdown.clone();
+        async move { shutdown.cancelled().await }
+    });
+    let result = tokio::select! {
+        result = serve => result,
+        _ = async {
+            shutdown.cancelled().await;
+            tokio::time::sleep(drain).await;
+        } => {
+            log::warn!("graceful shutdown drain deadline exceeded, closing now");
+            Ok(())
+        }
+    };
+
+    // Flush and close every open database before exiting, even when the
+    // server loop returned an error.
     state.shutdown().await;
+    result?;
     Ok(())
 }
 

@@ -85,6 +85,30 @@ impl Default for FieldValueBudget {
     }
 }
 
+/// Maximum container nesting depth accepted by the recursive
+/// `Cbor` ⇄ [`FieldValue`] conversion routines ([`FieldType::extract`],
+/// [`FieldValue::try_from`], [`FieldValue::array_from`],
+/// [`FieldValue::map_from`]).
+///
+/// This is a stack-safety bound, not a semantic budget: it must stay well
+/// below the recursion depth that would exhaust the stack, while remaining
+/// larger than [`FieldValueBudget::max_depth`] (the default per-value budget
+/// enforced by validation) so that it never rejects a value that validation
+/// would accept. The serde deserialization entry is bounded separately by
+/// the data format itself (`cbor2` caps recursion at 256, `serde_json` at
+/// 128).
+pub const MAX_CONVERSION_DEPTH: usize = 128;
+
+/// Returns an error when `depth` exceeds [`MAX_CONVERSION_DEPTH`].
+fn check_conversion_depth(depth: usize) -> Result<(), SchemaError> {
+    if depth > MAX_CONVERSION_DEPTH {
+        return Err(SchemaError::FieldValue(format!(
+            "value exceeds maximum nesting depth {MAX_CONVERSION_DEPTH}"
+        )));
+    }
+    Ok(())
+}
+
 /// The type of a field declared in a [`Schema`](crate::Schema).
 ///
 /// `FieldType` is the closed enum of every type supported by Anda DB.
@@ -169,8 +193,19 @@ impl FieldType {
     ///
     /// # Errors
     /// Returns [`SchemaError::FieldValue`] when the CBOR shape does not
-    /// match `self` (e.g. extracting a `Text` from CBOR `Bytes`).
+    /// match `self` (e.g. extracting a `Text` from CBOR `Bytes`), or when
+    /// the value is nested deeper than [`MAX_CONVERSION_DEPTH`].
     pub fn extract(&self, value: Cbor) -> Result<FieldValue, SchemaError> {
+        self.extract_at(value, 0)
+    }
+
+    /// Depth-tracked body of [`FieldType::extract`]: `depth` counts the
+    /// container nesting level of `value` and is bounded by
+    /// [`MAX_CONVERSION_DEPTH`] so that deeply nested payloads fail with an
+    /// error instead of exhausting the stack.
+    fn extract_at(&self, value: Cbor, depth: usize) -> Result<FieldValue, SchemaError> {
+        check_conversion_depth(depth)?;
+
         match &self {
             FieldType::Bool => FieldValue::bool_from(value),
             FieldType::I64 => FieldValue::i64_from(value),
@@ -181,35 +216,56 @@ impl FieldType {
             FieldType::Text => FieldValue::text_from(value),
             FieldType::Json => FieldValue::json_from(value),
             FieldType::Vector => FieldValue::vector_from(value),
-            FieldType::Array(types) => FieldValue::array_from(value, types),
-            FieldType::Map(types) => FieldValue::map_from(value, types),
+            FieldType::Array(types) => FieldValue::array_from_at(value, types, depth),
+            FieldType::Map(types) => FieldValue::map_from_at(value, types, depth),
             FieldType::Option(ft) => {
                 if value == Cbor::Null {
                     return Ok(FieldValue::Null);
                 }
-                ft.extract(value)
+                // `Option` wrapping is type-level nesting only; the CBOR
+                // value itself is not a container level.
+                ft.extract_at(value, depth)
             }
         }
     }
 
     /// Validate that `value` is acceptable for this type.
     ///
-    /// `Vector` accepts both [`FieldValue::Vector`] and an
-    /// [`Array`](FieldValue::Array) of `U64` (the latter is how a `Vector`
-    /// is observed when it is read back through generic CBOR without type
-    /// information). `Json` accepts any value because JSON is itself
-    /// dynamically typed.
+    /// Some declared types accept a *read-back* shape in addition to their
+    /// canonical variant, because generic CBOR deserialization (without type
+    /// information) cannot restore the original variant:
+    ///
+    /// - `Vector` accepts an [`Array`](FieldValue::Array) of `U64 <= u16::MAX`
+    ///   (bf16 bit patterns),
+    /// - `I64` accepts a non-negative [`U64`](FieldValue::U64) within `i64`
+    ///   range,
+    /// - `F32` accepts an [`F64`](FieldValue::F64) that converts to `f32`
+    ///   losslessly (exactly the values an `F32` produces when read back).
+    ///
+    /// `Json` accepts any value because JSON is itself dynamically typed.
     ///
     /// `Option(T)` accepts [`FieldValue::Null`]; non-`Option` types reject it.
     ///
     /// # Errors
     /// Returns [`SchemaError::FieldValue`] describing the first mismatch.
     pub fn validate(&self, value: &FieldValue) -> Result<(), SchemaError> {
+        // The complexity budget covers the whole tree in one iterative pass,
+        // so it only needs to run once at the top level; the recursive
+        // structural checks below use `validate_inner`.
         value.validate_complexity()?;
+        self.validate_inner(value)
+    }
 
+    /// Structural validation without the complexity-budget pass.
+    /// See [`FieldType::validate`] for the accepted shapes.
+    fn validate_inner(&self, value: &FieldValue) -> Result<(), SchemaError> {
         match (self, value) {
             (FieldType::Bool, FieldValue::Bool(_)) => Ok(()),
             (FieldType::I64, FieldValue::I64(_)) => Ok(()),
+            // Mirror of the Vector ↔ Array(U64) rule below: a non-negative
+            // I64 value is observed as U64 when read back through generic
+            // CBOR without type information.
+            (FieldType::I64, FieldValue::U64(v)) if *v <= i64::MAX as u64 => Ok(()),
             (FieldType::U64, FieldValue::U64(_)) => Ok(()),
             (FieldType::F64, FieldValue::F64(v)) if !v.is_nan() => Ok(()),
             (FieldType::F64, FieldValue::F64(v)) => Err(SchemaError::FieldValue(format!(
@@ -219,6 +275,13 @@ impl FieldType {
             (FieldType::F32, FieldValue::F32(v)) => Err(SchemaError::FieldValue(format!(
                 "expected non-NaN F32, got {v:?}"
             ))),
+            // An F32 value is observed as F64 when read back through generic
+            // CBOR without type information; only values that convert to f32
+            // losslessly (exactly the values such a read-back can produce)
+            // are accepted.
+            (FieldType::F32, FieldValue::F64(v)) if !v.is_nan() && (*v as f32) as f64 == *v => {
+                Ok(())
+            }
             (FieldType::Bytes, FieldValue::Bytes(_)) => Ok(()),
             (FieldType::Text, FieldValue::Text(_)) => Ok(()),
             (FieldType::Json, _) => Ok(()),
@@ -241,7 +304,7 @@ impl FieldType {
                 1 => {
                     let ft = types.first().unwrap();
                     for fv in values.iter() {
-                        ft.validate(fv)?;
+                        ft.validate_inner(fv)?;
                     }
                     Ok(())
                 }
@@ -256,7 +319,7 @@ impl FieldType {
 
                     for (i, ft) in types.iter().enumerate() {
                         if let Some(fv) = values.get(i) {
-                            ft.validate(fv)?;
+                            ft.validate_inner(fv)?;
                         } else {
                             return Err(SchemaError::FieldValue(format!(
                                 "no value at array[{i}], expected type {ft:?}",
@@ -271,7 +334,7 @@ impl FieldType {
                 if val == &FieldValue::Null {
                     return Ok(());
                 }
-                ft.validate(val)
+                ft.validate_inner(val)
             }
             _ => Err(SchemaError::FieldValue(format!(
                 "expected type {self:?}, got value {value:?}"
@@ -450,8 +513,13 @@ impl std::fmt::Display for FieldKey {
 ///
 /// Each variant corresponds 1:1 to a [`FieldType`] variant, with the
 /// addition of [`FieldValue::Null`] which represents an absent value for
-/// [`FieldType::Option`]. All variants serialize losslessly to and from
-/// CBOR via [`From<FieldValue> for Cbor`] and [`FieldValue::try_from`].
+/// [`FieldType::Option`]. Values convert to and from CBOR via
+/// [`From<FieldValue> for Cbor`] and [`FieldValue::try_from`]. The *data*
+/// is preserved, but an untyped round trip normalizes some variants
+/// (`F32` → `F64`, non-negative `I64` → `U64`, `Vector` → `Array(U64)`,
+/// `Json` → `Map`/primitive); pairing the CBOR with a [`FieldType`] via
+/// [`FieldType::extract`] restores the declared variant, and
+/// [`FieldType::validate`] accepts the normalized read-back shapes.
 ///
 /// `FieldValue` derives `PartialEq`, but float values are required to be
 /// non-NaN (we don't enforce this in the type system, but it is
@@ -675,6 +743,9 @@ impl TryFrom<FieldValue> for i64 {
     fn try_from(value: FieldValue) -> Result<Self, Self::Error> {
         match value {
             FieldValue::I64(v) => Ok(v),
+            // Read-back shape: a non-negative I64 comes back as U64 through
+            // generic CBOR (see `FieldType::validate`).
+            FieldValue::U64(v) if v <= i64::MAX as u64 => Ok(v as i64),
             _ => Err(SchemaError::FieldValue(format!("expected I64, got {value:?}")).into()),
         }
     }
@@ -686,6 +757,9 @@ impl<'a> TryFrom<&'a FieldValue> for i64 {
     fn try_from(value: &'a FieldValue) -> Result<Self, Self::Error> {
         match value {
             FieldValue::I64(v) => Ok(*v),
+            // Read-back shape: a non-negative I64 comes back as U64 through
+            // generic CBOR (see `FieldType::validate`).
+            FieldValue::U64(v) if *v <= i64::MAX as u64 => Ok(*v as i64),
             _ => Err(SchemaError::FieldValue(format!("expected I64, got {value:?}")).into()),
         }
     }
@@ -763,6 +837,9 @@ impl TryFrom<FieldValue> for f32 {
     fn try_from(value: FieldValue) -> Result<Self, Self::Error> {
         match value {
             FieldValue::F32(v) => Ok(v),
+            // Read-back shape: an F32 comes back as a losslessly convertible
+            // F64 through generic CBOR (see `FieldType::validate`).
+            FieldValue::F64(v) if !v.is_nan() && (v as f32) as f64 == v => Ok(v as f32),
             _ => Err(SchemaError::FieldValue(format!("expected F32, got {value:?}")).into()),
         }
     }
@@ -774,6 +851,9 @@ impl<'a> TryFrom<&'a FieldValue> for f32 {
     fn try_from(value: &'a FieldValue) -> Result<Self, Self::Error> {
         match value {
             FieldValue::F32(v) => Ok(*v),
+            // Read-back shape: an F32 comes back as a losslessly convertible
+            // F64 through generic CBOR (see `FieldType::validate`).
+            FieldValue::F64(v) if !v.is_nan() && (*v as f32) as f64 == *v => Ok(*v as f32),
             _ => Err(SchemaError::FieldValue(format!("expected F32, got {value:?}")).into()),
         }
     }
@@ -886,6 +966,21 @@ impl TryFrom<FieldValue> for Vec<bf16> {
     fn try_from(value: FieldValue) -> Result<Self, Self::Error> {
         match value {
             FieldValue::Vector(v) => Ok(v),
+            // Read-back shape: a Vector comes back as an Array of bf16 bit
+            // patterns through generic CBOR (see `FieldType::validate`).
+            FieldValue::Array(arr)
+                if arr
+                    .iter()
+                    .all(|v| matches!(v, FieldValue::U64(u) if *u <= u16::MAX as u64)) =>
+            {
+                Ok(arr
+                    .into_iter()
+                    .map(|v| match v {
+                        FieldValue::U64(u) => bf16::from_bits(u as u16),
+                        _ => unreachable!("checked above"),
+                    })
+                    .collect())
+            }
             _ => Err(SchemaError::FieldValue(format!("expected Vector, got {value:?}")).into()),
         }
     }
@@ -1151,6 +1246,10 @@ impl FieldValue {
 
     /// Create an F32 FieldValue from a CBOR value
     ///
+    /// Precision truncation (f64 → f32) is accepted, but a finite value
+    /// outside the f32 range is rejected instead of silently becoming
+    /// infinite. Explicit infinities pass through unchanged.
+    ///
     /// # Arguments
     /// * `value` - The CBOR value to convert
     ///
@@ -1158,7 +1257,15 @@ impl FieldValue {
     /// * `Result<Self, SchemaError>` - The converted FieldValue or an error message
     pub fn f32_from(value: Cbor) -> Result<Self, SchemaError> {
         match value {
-            Cbor::Float(f) if !f.is_nan() => Ok(FieldValue::F32(f as f32)),
+            Cbor::Float(f) if !f.is_nan() => {
+                let v = f as f32;
+                if v.is_infinite() && f.is_finite() {
+                    return Err(SchemaError::FieldValue(format!(
+                        "expected F32, got out-of-range F64 {f:?}"
+                    )));
+                }
+                Ok(FieldValue::F32(v))
+            }
             v => Err(SchemaError::FieldValue(format!("expected F32, got {v:?}"))),
         }
     }
@@ -1278,12 +1385,20 @@ impl FieldValue {
     /// # Returns
     /// * `Result<Self, SchemaError>` - The converted FieldValue or an error message
     pub fn array_from(value: Cbor, types: &[FieldType]) -> Result<Self, SchemaError> {
+        Self::array_from_at(value, types, 0)
+    }
+
+    /// Depth-tracked body of [`FieldValue::array_from`]; see
+    /// [`MAX_CONVERSION_DEPTH`].
+    fn array_from_at(value: Cbor, types: &[FieldType], depth: usize) -> Result<Self, SchemaError> {
+        check_conversion_depth(depth)?;
+
         match value {
             Cbor::Array(values) => match types.len() {
                 0 => Ok(FieldValue::Array(
                     values
                         .into_iter()
-                        .map(FieldValue::try_from)
+                        .map(|v| FieldValue::try_from_at(v, depth + 1))
                         .collect::<Result<Vec<_>, _>>()?,
                 )),
                 1 => {
@@ -1291,7 +1406,7 @@ impl FieldValue {
                     Ok(FieldValue::Array(
                         values
                             .into_iter()
-                            .map(|v| ft.extract(v))
+                            .map(|v| ft.extract_at(v, depth + 1))
                             .collect::<Result<Vec<_>, _>>()?,
                     ))
                 }
@@ -1306,7 +1421,7 @@ impl FieldValue {
 
                     let mut rt: Vec<FieldValue> = Vec::with_capacity(types.len());
                     for (ft, val) in types.iter().zip(values) {
-                        rt.push(ft.extract(val)?);
+                        rt.push(ft.extract_at(val, depth + 1)?);
                     }
 
                     Ok(FieldValue::Array(rt))
@@ -1330,6 +1445,18 @@ impl FieldValue {
         value: Cbor,
         types: &BTreeMap<FieldKey, FieldType>,
     ) -> Result<Self, SchemaError> {
+        Self::map_from_at(value, types, 0)
+    }
+
+    /// Depth-tracked body of [`FieldValue::map_from`]; see
+    /// [`MAX_CONVERSION_DEPTH`].
+    fn map_from_at(
+        value: Cbor,
+        types: &BTreeMap<FieldKey, FieldType>,
+        depth: usize,
+    ) -> Result<Self, SchemaError> {
+        check_conversion_depth(depth)?;
+
         match value {
             Cbor::Map(values) => {
                 let wildcard_map = as_wildcard_map(types);
@@ -1341,11 +1468,11 @@ impl FieldValue {
                     })?;
 
                     let v = if types.is_empty() {
-                        FieldValue::try_from(v)?
+                        FieldValue::try_from_at(v, depth + 1)?
                     } else if let Some(ft) = wildcard_map {
-                        ft.extract(v)?
+                        ft.extract_at(v, depth + 1)?
                     } else if let Some(ft) = types.get(&k) {
-                        ft.extract(v)?
+                        ft.extract_at(v, depth + 1)?
                     } else {
                         return Err(SchemaError::FieldValue(format!("invalid map key {k:?}")));
                     };
@@ -1390,6 +1517,14 @@ impl FieldValue {
     /// # Returns
     /// * `Result<Self, SchemaError>` - The converted FieldValue or an error message
     pub fn try_from(value: Cbor) -> Result<Self, SchemaError> {
+        Self::try_from_at(value, 0)
+    }
+
+    /// Depth-tracked body of [`FieldValue::try_from`]; see
+    /// [`MAX_CONVERSION_DEPTH`].
+    fn try_from_at(value: Cbor, depth: usize) -> Result<Self, SchemaError> {
+        check_conversion_depth(depth)?;
+
         match value {
             Cbor::Bool(_) => Self::bool_from(value),
             Cbor::Integer(i) => {
@@ -1403,10 +1538,10 @@ impl FieldValue {
             Cbor::Float(_) => Self::f64_from(value),
             Cbor::Bytes(_) => Self::bytes_from(value),
             Cbor::Text(_) => Self::text_from(value),
-            Cbor::Array(_) => Self::array_from(value, &[]),
-            Cbor::Map(_) => Self::map_from(value, &BTreeMap::new()),
+            Cbor::Array(_) => Self::array_from_at(value, &[], depth),
+            Cbor::Map(_) => Self::map_from_at(value, &BTreeMap::new(), depth),
             Cbor::Null => Ok(FieldValue::Null),
-            Cbor::Tag(_, val) => Self::try_from(*val),
+            Cbor::Tag(_, val) => Self::try_from_at(*val, depth + 1),
             v => Err(SchemaError::FieldValue(format!(
                 "invalid CBOR value: {v:?}"
             ))),
@@ -1701,8 +1836,14 @@ fn json_to_cbor(value: Json) -> Cbor {
             } else {
                 // `serde_json::Number` cannot hold NaN; `as_f64` is only
                 // `None` for out-of-range arbitrary-precision numbers, which
-                // saturate to an infinite float here.
-                Cbor::Float(n.as_f64().unwrap_or(f64::INFINITY))
+                // saturate to an infinite float of the matching sign here.
+                Cbor::Float(n.as_f64().unwrap_or_else(|| {
+                    if n.to_string().starts_with('-') {
+                        f64::NEG_INFINITY
+                    } else {
+                        f64::INFINITY
+                    }
+                }))
             }
         }
         Json::String(s) => Cbor::Text(s),
@@ -1739,7 +1880,7 @@ fn validate_map_fields(
 
     if let Some(ft) = as_wildcard_map(types) {
         for fv in values.values() {
-            ft.validate(fv)?;
+            ft.validate_inner(fv)?;
         }
         return Ok(());
     }
@@ -1750,8 +1891,8 @@ fn validate_map_fields(
 
     for (k, ft) in types {
         let rt = match values.get(k) {
-            None => ft.validate(&FieldValue::Null),
-            Some(v) => ft.validate(v),
+            None => ft.validate_inner(&FieldValue::Null),
+            Some(v) => ft.validate_inner(v),
         };
 
         rt.map_err(|err| {
@@ -1991,19 +2132,44 @@ mod tests {
         assert!(FieldType::U64.validate(&FieldValue::U64(42)).is_ok());
         assert!(FieldType::U64.validate(&FieldValue::I64(42)).is_err());
 
-        // I64
+        // I64: the canonical variant, plus the U64 read-back shape produced
+        // by untyped CBOR deserialization of non-negative values.
         assert!(FieldType::I64.validate(&FieldValue::I64(-42)).is_ok());
-        assert!(FieldType::I64.validate(&FieldValue::U64(42)).is_err());
+        assert!(FieldType::I64.validate(&FieldValue::U64(42)).is_ok());
+        assert!(
+            FieldType::I64
+                .validate(&FieldValue::U64(i64::MAX as u64))
+                .is_ok()
+        );
+        assert!(
+            FieldType::I64
+                .validate(&FieldValue::U64(i64::MAX as u64 + 1))
+                .is_err()
+        );
 
         // F64
         assert!(FieldType::F64.validate(&FieldValue::F64(3.15)).is_ok());
         assert!(FieldType::F64.validate(&FieldValue::F64(f64::NAN)).is_err());
         assert!(FieldType::F64.validate(&FieldValue::F32(3.15)).is_err());
 
-        // F32
+        // F32: the canonical variant, plus the F64 read-back shape (which is
+        // always losslessly convertible back to f32).
         assert!(FieldType::F32.validate(&FieldValue::F32(2.71)).is_ok());
         assert!(FieldType::F32.validate(&FieldValue::F32(f32::NAN)).is_err());
+        assert!(
+            FieldType::F32
+                .validate(&FieldValue::F64(2.71f32 as f64))
+                .is_ok()
+        );
+        assert!(
+            FieldType::F32
+                .validate(&FieldValue::F64(f64::INFINITY))
+                .is_ok()
+        );
+        // Not a possible F32 read-back: precision beyond f32.
         assert!(FieldType::F32.validate(&FieldValue::F64(2.71)).is_err());
+        assert!(FieldType::F32.validate(&FieldValue::F64(1e308)).is_err());
+        assert!(FieldType::F32.validate(&FieldValue::F64(f64::NAN)).is_err());
 
         // Bytes
         assert!(
@@ -2600,8 +2766,12 @@ mod tests {
         assert_eq!(i64::try_from(i64_value.clone()).unwrap(), -9);
         assert_eq!(i64::try_from(&i64_value).unwrap(), -9);
         assert_eq!(<&i64>::try_from(&i64_value).unwrap(), &-9);
-        assert!(i64::try_from(FieldValue::U64(9)).is_err());
-        assert!(i64::try_from(&FieldValue::U64(9)).is_err());
+        // The U64 read-back shape converts when it fits in i64.
+        assert_eq!(i64::try_from(FieldValue::U64(9)).unwrap(), 9);
+        assert_eq!(i64::try_from(&FieldValue::U64(9)).unwrap(), 9);
+        assert!(i64::try_from(FieldValue::U64(u64::MAX)).is_err());
+        assert!(i64::try_from(&FieldValue::U64(u64::MAX)).is_err());
+        // The reference conversion cannot reinterpret a U64 in place.
         assert!(<&i64>::try_from(&FieldValue::U64(9)).is_err());
 
         let u64_value = FieldValue::U64(9);
@@ -2619,8 +2789,11 @@ mod tests {
 
         assert_eq!(f32::try_from(FieldValue::F32(1.25)).unwrap(), 1.25);
         assert_eq!(f32::try_from(&FieldValue::F32(1.25)).unwrap(), 1.25);
-        assert!(f32::try_from(FieldValue::F64(1.25)).is_err());
-        assert!(f32::try_from(&FieldValue::F64(1.25)).is_err());
+        // The F64 read-back shape converts when it is lossless as f32.
+        assert_eq!(f32::try_from(FieldValue::F64(1.25)).unwrap(), 1.25);
+        assert_eq!(f32::try_from(&FieldValue::F64(1.25)).unwrap(), 1.25);
+        assert!(f32::try_from(FieldValue::F64(2.71)).is_err());
+        assert!(f32::try_from(&FieldValue::F64(2.71)).is_err());
 
         let bytes = FieldValue::Bytes(vec![1, 2, 3]);
         assert_eq!(Vec::<u8>::try_from(bytes.clone()).unwrap(), vec![1, 2, 3]);
@@ -2665,7 +2838,26 @@ mod tests {
             [bf16::from_f32(1.0), bf16::from_f32(2.0)]
         );
         assert!(<[bf16; 3]>::try_from(vector.clone()).is_err());
-        assert!(Vec::<bf16>::try_from(FieldValue::Array(vec![])).is_err());
+        // The Array(U64) read-back shape converts element-wise from bf16 bits.
+        assert_eq!(
+            Vec::<bf16>::try_from(FieldValue::Array(vec![
+                FieldValue::U64(bf16::from_f32(1.0).to_bits() as u64),
+                FieldValue::U64(bf16::from_f32(2.0).to_bits() as u64),
+            ]))
+            .unwrap(),
+            vec![bf16::from_f32(1.0), bf16::from_f32(2.0)]
+        );
+        assert_eq!(
+            Vec::<bf16>::try_from(FieldValue::Array(vec![])).unwrap(),
+            vec![]
+        );
+        assert!(
+            Vec::<bf16>::try_from(FieldValue::Array(vec![FieldValue::U64(
+                u16::MAX as u64 + 1
+            )]))
+            .is_err()
+        );
+        assert!(Vec::<bf16>::try_from(FieldValue::Array(vec![FieldValue::I64(-1)])).is_err());
         assert!(<&Vec<bf16>>::try_from(&FieldValue::Array(vec![])).is_err());
         assert!(<[bf16; 2]>::try_from(FieldValue::Array(vec![])).is_err());
 
@@ -2823,5 +3015,92 @@ mod tests {
                 .validate_complexity_with(budget)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn f32_extract_rejects_out_of_range_f64() {
+        // Values outside the finite f32 range must error instead of silently
+        // becoming infinite.
+        assert!(FieldType::F32.extract(Cbor::Float(1e308)).is_err());
+        assert!(FieldType::F32.extract(Cbor::Float(-1e308)).is_err());
+        assert!(FieldType::F32.extract(Cbor::Float(f64::MAX)).is_err());
+
+        // Explicit infinities are representable and pass through.
+        assert_eq!(
+            FieldType::F32.extract(Cbor::Float(f64::INFINITY)).unwrap(),
+            FieldValue::F32(f32::INFINITY)
+        );
+        assert_eq!(
+            FieldType::F32
+                .extract(Cbor::Float(f64::NEG_INFINITY))
+                .unwrap(),
+            FieldValue::F32(f32::NEG_INFINITY)
+        );
+
+        // Subnormal f64 values truncate (here to zero); truncation is allowed.
+        assert_eq!(
+            FieldType::F32.extract(Cbor::Float(1e-320)).unwrap(),
+            FieldValue::F32(0.0)
+        );
+        // Ordinary precision truncation is allowed too.
+        assert_eq!(
+            FieldType::F32.extract(Cbor::Float(2.71)).unwrap(),
+            FieldValue::F32(2.71f64 as f32)
+        );
+    }
+
+    /// Builds `depth` levels of single-element CBOR arrays around a Bool.
+    fn deeply_nested_cbor(depth: usize) -> Cbor {
+        let mut v = Cbor::Bool(true);
+        for _ in 0..depth {
+            v = Cbor::Array(vec![v]);
+        }
+        v
+    }
+
+    #[test]
+    fn deeply_nested_values_error_instead_of_overflowing_the_stack() {
+        // Depths within the conversion bound still work.
+        let ok = deeply_nested_cbor(MAX_CONVERSION_DEPTH);
+        assert!(FieldValue::try_from(ok).is_ok());
+
+        // Untyped conversion entry.
+        let err = FieldValue::try_from(deeply_nested_cbor(2000)).unwrap_err();
+        assert!(err.to_string().contains("maximum nesting depth"));
+
+        // Typed extraction entry (open-ended Array type).
+        let err = FieldType::Array(vec![])
+            .extract(deeply_nested_cbor(2000))
+            .unwrap_err();
+        assert!(err.to_string().contains("maximum nesting depth"));
+
+        // Deeply nested tags are bounded as well.
+        let mut tagged = Cbor::Bool(true);
+        for _ in 0..2000 {
+            tagged = Cbor::Tag(1, Box::new(tagged));
+        }
+        let err = FieldValue::try_from(tagged).unwrap_err();
+        assert!(err.to_string().contains("maximum nesting depth"));
+
+        // Nested maps are bounded too.
+        let mut map = Cbor::Bool(true);
+        for _ in 0..2000 {
+            map = Cbor::Map(vec![(Cbor::Text("k".into()), map)]);
+        }
+        let err = FieldValue::try_from(map).unwrap_err();
+        assert!(err.to_string().contains("maximum nesting depth"));
+    }
+
+    #[test]
+    fn deeply_nested_serde_inputs_error_instead_of_overflowing_the_stack() {
+        // The CBOR wire format is bounded by cbor2's recursion limit (256):
+        // 2000 nested arrays are `0x81` headers followed by one `0xf5` (true).
+        let mut bytes = vec![0x81u8; 2000];
+        bytes.push(0xf5);
+        assert!(from_reader::<Fv, _>(bytes.as_slice()).is_err());
+
+        // JSON is bounded by serde_json's recursion limit (128).
+        let deep_json = format!("{}true{}", "[".repeat(2000), "]".repeat(2000));
+        assert!(serde_json::from_str::<Fv>(&deep_json).is_err());
     }
 }

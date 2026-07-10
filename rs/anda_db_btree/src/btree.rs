@@ -85,7 +85,6 @@ use dashmap::DashMap;
 use parking_lot::RwLock;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::json;
 use std::{
     collections::BTreeSet,
     fmt::Debug,
@@ -96,11 +95,32 @@ use std::{
 
 use crate::{BTreeError, BoxError};
 
+/// Exact CBOR-serialized size of `value`, propagating serialization failures.
+///
+/// Use this on write paths *before* any state is mutated, so a PK/FV whose
+/// `Serialize` impl fails is rejected as [`BTreeError::Serialization`] instead
+/// of panicking mid-operation.
+fn try_cbor_serialized_size<T: ?Sized + Serialize>(value: &T) -> Result<usize, BoxError> {
+    let size = cbor2::serialized_size(value)?;
+    usize::try_from(size).map_err(BoxError::from)
+}
+
+/// Infallible CBOR size estimate for bookkeeping on already-validated values.
+///
+/// Serialization is deterministic, and every value reaching this helper was
+/// already serialized successfully on the insert path, so a failure here is
+/// not expected. If it does happen, fall back to `0`: bucket sizes are
+/// advisory packing estimates combined with saturating arithmetic everywhere,
+/// so a degraded estimate can only worsen bucket packing, never corrupt data.
 fn cbor_serialized_size<T: ?Sized + Serialize>(value: &T) -> usize {
-    cbor2::serialized_size(value)
-        .expect("CBOR serialized size calculation failed")
-        .try_into()
-        .expect("CBOR serialized size exceeds usize")
+    try_cbor_serialized_size(value).unwrap_or(0)
+}
+
+/// Converts a PK/FV into a `serde_json::Value` for error reporting without
+/// panicking on values that cannot be represented as JSON (e.g. maps with
+/// non-string keys); such values degrade to `Value::Null`.
+fn json_value<T: ?Sized + Serialize>(value: &T) -> serde_json::Value {
+    serde_json::to_value(value).unwrap_or(serde_json::Value::Null)
 }
 
 /// Estimated serialized size of one full `(field_value, posting)` bucket
@@ -120,23 +140,35 @@ where
     cbor_serialized_size(&(field_value, posting)) + 2
 }
 
+/// Fallible variant of [`posting_entry_size`] for paths that can still reject
+/// the value before mutating any state.
+fn try_posting_entry_size<FV, P>(field_value: &FV, posting: &P) -> Result<usize, BoxError>
+where
+    FV: Serialize,
+    P: Serialize,
+{
+    Ok(try_cbor_serialized_size(&(field_value, posting))? + 2)
+}
+
 fn previous_posting_size_after_append<PK, FV>(
     field_value: &FV,
     bucket_id: u32,
     version_after_append: u64,
     doc_ids_after_append: &UniqueVec<PK>,
-    appended_doc_id: &PK,
 ) -> usize
 where
     PK: Eq + Hash + Clone + Serialize,
     FV: Serialize,
 {
+    // Drop the most recently appended doc_id to approximate the pre-append
+    // posting. Between the append and this call another thread may have
+    // appended its own doc_id to the same posting, so the popped element is
+    // not necessarily the one appended by the current caller; the resulting
+    // size is still a valid one-element-smaller estimate, and any residual
+    // drift in bucket accounting is bounded by the saturating arithmetic at
+    // the call sites. Do not assert on the popped element here.
     let mut previous_doc_ids = doc_ids_after_append.to_vec();
-    let removed_doc_id = previous_doc_ids.pop();
-    debug_assert!(matches!(
-        removed_doc_id.as_ref(),
-        Some(id) if id == appended_doc_id
-    ));
+    previous_doc_ids.pop();
 
     let previous = (
         bucket_id,
@@ -226,7 +258,9 @@ where
 ///
 /// - `bucket_id`      — the bucket currently storing this posting.
 /// - `update_version` — monotonic counter bumped on every doc-id add/remove.
-/// - `doc_ids`        — unique, insertion-ordered list of primary keys.
+/// - `doc_ids`        — unique list of primary keys. Appends preserve order,
+///   but removals use swap-remove, so the remaining ids may be reordered
+///   after any deletion. Do not rely on insertion order.
 type PostingValue<PK> = (u32, u64, UniqueVec<PK>);
 
 /// Configuration parameters for the B-tree index
@@ -235,11 +269,31 @@ pub struct BTreeConfig {
     /// Maximum size of a bucket before creating a new one
     /// When a bucket's stored data exceeds this size,
     /// a new bucket should be created for new data
+    ///
+    /// Values below [`BTreeConfig::MIN_BUCKET_OVERLOAD_SIZE`] are clamped up
+    /// by [`BTreeIndex::new`] / [`BTreeIndex::load_metadata`].
     pub bucket_overload_size: usize,
 
     /// Whether to allow duplicate primary keys in an indexed field value
     /// If false, attempting to insert a duplicate key will result in an error
     pub allow_duplicates: bool,
+}
+
+impl BTreeConfig {
+    /// Minimum accepted `bucket_overload_size`.
+    ///
+    /// A zero (or tiny) value would make almost every new field value spill
+    /// into its own bucket, exploding the bucket/file count without any
+    /// correctness benefit, so constructors clamp smaller values up to this
+    /// floor. The floor is deliberately low to keep small bucket sizes usable
+    /// for testing.
+    pub const MIN_BUCKET_OVERLOAD_SIZE: usize = 64;
+
+    fn clamp(&mut self) {
+        self.bucket_overload_size = self
+            .bucket_overload_size
+            .max(Self::MIN_BUCKET_OVERLOAD_SIZE);
+    }
 }
 
 impl Default for BTreeConfig {
@@ -386,12 +440,64 @@ pub enum RangeQuery<FV> {
 }
 
 impl<FV> RangeQuery<FV> {
+    /// Maximum supported nesting depth for composed queries.
+    ///
+    /// Query evaluation is recursive, so an unbounded depth would let a
+    /// deeply nested query built from untrusted input (e.g. a parsed filter
+    /// expression) overflow the stack. Queries nested deeper than this are
+    /// rejected: [`Self::try_convert_from`] returns an error and
+    /// [`BTreeIndex::range_query_with`] returns an empty result.
+    pub const MAX_DEPTH: usize = 64;
+
+    /// Returns the nesting depth of this query (a leaf query has depth 1).
+    ///
+    /// Computed iteratively so that arbitrarily deep queries can be measured
+    /// without recursing.
+    pub fn depth(&self) -> usize {
+        let mut max_depth = 0;
+        let mut stack: Vec<(&RangeQuery<FV>, usize)> = vec![(self, 1)];
+        while let Some((query, depth)) = stack.pop() {
+            max_depth = max_depth.max(depth);
+            match query {
+                RangeQuery::And(queries) | RangeQuery::Or(queries) => {
+                    stack.extend(queries.iter().map(|q| (q.as_ref(), depth + 1)));
+                }
+                RangeQuery::Not(query) => stack.push((query.as_ref(), depth + 1)),
+                _ => {}
+            }
+        }
+        max_depth
+    }
+
     /// Translates a `RangeQuery<FV1>` into a `RangeQuery<FV>` by applying a
     /// `TryFrom<FV1>` conversion to every key.
     ///
     /// Useful for adapting user-facing typed queries (e.g. JSON values) to the
     /// storage-level field value type without rewriting query shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any key conversion fails, or when the query is
+    /// nested deeper than [`Self::MAX_DEPTH`].
     pub fn try_convert_from<FV1>(value: RangeQuery<FV1>) -> Result<Self, BoxError>
+    where
+        FV: Ord,
+        FV: TryFrom<FV1, Error = BoxError>,
+    {
+        // Depth is checked once at the outermost call; the recursion below
+        // then stays within a bounded stack budget. `depth()` is iterative,
+        // and recursive calls go through `try_convert_from_inner`.
+        if value.depth() > Self::MAX_DEPTH {
+            return Err(format!(
+                "range query nesting depth exceeds the maximum of {}",
+                Self::MAX_DEPTH
+            )
+            .into());
+        }
+        Self::try_convert_from_inner(value)
+    }
+
+    fn try_convert_from_inner<FV1>(value: RangeQuery<FV1>) -> Result<Self, BoxError>
     where
         FV: Ord,
         FV: TryFrom<FV1, Error = BoxError>,
@@ -416,7 +522,7 @@ impl<FV> RangeQuery<FV> {
             RangeQuery::And(queries) => {
                 let converted_queries = queries
                     .into_iter()
-                    .map(|query| RangeQuery::try_convert_from(*query))
+                    .map(|query| RangeQuery::try_convert_from_inner(*query))
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(RangeQuery::And(
                     converted_queries.into_iter().map(Box::new).collect(),
@@ -425,14 +531,14 @@ impl<FV> RangeQuery<FV> {
             RangeQuery::Or(queries) => {
                 let converted_queries = queries
                     .into_iter()
-                    .map(|query| RangeQuery::try_convert_from(*query))
+                    .map(|query| RangeQuery::try_convert_from_inner(*query))
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(RangeQuery::Or(
                     converted_queries.into_iter().map(Box::new).collect(),
                 ))
             }
             RangeQuery::Not(query) => {
-                let converted_query = RangeQuery::try_convert_from(*query)?;
+                let converted_query = RangeQuery::try_convert_from_inner(*query)?;
                 Ok(RangeQuery::Not(Box::new(converted_query)))
             }
         }
@@ -518,7 +624,8 @@ where
     ///
     /// * `BTreeIndex` - A new instance of the B-tree index
     pub fn new(name: String, config: Option<BTreeConfig>) -> Self {
-        let config = config.unwrap_or_default();
+        let mut config = config.unwrap_or_default();
+        config.clamp();
         let stats = BTreeStats {
             version: 1,
             ..Default::default()
@@ -572,11 +679,14 @@ where
     /// * `Result<Self, Error>` - Loaded index or error
     pub fn load_metadata<R: Read>(r: R) -> Result<Self, BTreeError> {
         // Deserialize the index metadata
-        let index: BTreeIndexOwned =
+        let mut index: BTreeIndexOwned =
             cbor2::from_reader(r).map_err(|err| BTreeError::Serialization {
                 name: "unknown".to_string(),
                 source: err.into(),
             })?;
+        // Same floor as `new()`: persisted metadata may carry a degenerate
+        // (e.g. zero) bucket_overload_size from an older or corrupted file.
+        index.metadata.config.clamp();
 
         // Extract configuration values
         let max_bucket_id = AtomicU32::new(index.metadata.stats.max_bucket_id);
@@ -639,12 +749,47 @@ where
                     })?;
                 let mut bks = UniqueVec::with_capacity(bucket.postings.len());
                 let mut loaded_keys = Vec::with_capacity(bucket.postings.len());
+                // Set when this bucket file contains stale entries (an empty
+                // posting persisted by a crash window); the bucket is loaded
+                // as dirty so the next flush rewrites the file without them.
+                let mut needs_repair = false;
 
                 // Higher bucket ids are the newer state when a migrated posting
                 // appears in more than one bucket. Reconcile the old in-memory
                 // bucket ownership and mark it dirty so the stale lower bucket
                 // is repaired on the next flush.
                 for (field_value, mut posting) in bucket.postings {
+                    // An empty posting can only reach disk when a flush
+                    // sampled the bucket between "posting emptied by remove()"
+                    // and "posting entry removed", and a crash followed before
+                    // the next flush repaired the file. Registering it would
+                    // create a "ghost" key visible to `keys()`, range queries
+                    // and `len()` with no backing documents. Treat it as a
+                    // tombstone instead: skip it, drop any stale copy already
+                    // loaded from an older bucket, and mark the affected
+                    // buckets dirty to self-heal on the next flush.
+                    if posting.2.is_empty() {
+                        needs_repair = true;
+                        if let Some((_, previous)) = self.postings.remove(&field_value) {
+                            let previous_bucket_id = previous.0;
+                            if previous_bucket_id != i
+                                && let Some(mut previous_bucket) =
+                                    self.buckets.get_mut(&previous_bucket_id)
+                                && previous_bucket
+                                    .2
+                                    .swap_remove_if(|key| key == &field_value)
+                                    .is_some()
+                            {
+                                let previous_size = posting_entry_size(&field_value, &previous);
+                                previous_bucket.0 =
+                                    previous_bucket.0.saturating_sub(previous_size);
+                                self.mark_bucket_dirty(&mut previous_bucket);
+                            }
+                            self.btree.write().remove(&field_value);
+                        }
+                        continue;
+                    }
+
                     posting.0 = i;
                     if let Some(previous) = self.postings.insert(field_value.clone(), posting) {
                         let previous_bucket_id = previous.0;
@@ -667,7 +812,16 @@ where
                 }
 
                 self.btree.write().extend(loaded_keys);
-                self.buckets.insert(i, (data.len(), false, bks, 0));
+                if needs_repair {
+                    self.dirty_bucket_count.fetch_add(1, Ordering::Release);
+                }
+                // `data.len()` (the on-disk payload length) seeds the bucket
+                // size here, while runtime mutations apply estimated deltas
+                // (`posting_entry_size` + fudge). The two baselines can drift
+                // slightly; the size is only used for packing decisions and
+                // is always combined with saturating arithmetic.
+                self.buckets
+                    .insert(i, (data.len(), needs_repair, bks, u64::from(needs_repair)));
             }
         }
 
@@ -726,6 +880,16 @@ where
     /// * `Ok(bool)` if the document_id-field_value pair was successfully added
     /// * `Err(BTreeError)` if failed
     pub fn insert(&self, doc_id: PK, field_value: FV, now_ms: u64) -> Result<bool, BTreeError> {
+        // Validate `doc_id` serialization up-front, before any state is
+        // mutated, so a failing `Serialize` impl surfaces as an error instead
+        // of a panic (and never leaves a half-applied insert behind).
+        let doc_id_size = try_cbor_serialized_size(&doc_id)
+            .map_err(|err| BTreeError::Serialization {
+                name: self.name.clone(),
+                source: err,
+            })?
+            + 2;
+
         let bucket = self.max_bucket_id.load(Ordering::Relaxed);
 
         // Ensure the current bucket exists.
@@ -755,8 +919,8 @@ where
                 if !self.config.allow_duplicates && !posting.2.contains(&doc_id) {
                     return Err(BTreeError::AlreadyExists {
                         name: self.name.clone(),
-                        id: json!(doc_id),
-                        value: json!(field_value),
+                        id: json_value(&doc_id),
+                        value: json_value(&field_value),
                     });
                 }
 
@@ -764,7 +928,7 @@ where
                 // doc_id, never the whole posting: doing the latter on every
                 // insert would make growing a single posting O(n^2).
                 if posting.2.push(doc_id.clone()) {
-                    size_increase = cbor_serialized_size(&doc_id) + 2;
+                    size_increase = doc_id_size;
                     appended_existing_posting = true;
                     posting.1 += 1; // increment version
                 }
@@ -772,7 +936,14 @@ where
             dashmap::Entry::Vacant(entry) => {
                 // Create a new posting for this field value
                 let posting = (bucket, 1, vec![doc_id.clone()].into());
-                size_increase = posting_entry_size(&field_value, &posting);
+                // Reject an unserializable field value before inserting it:
+                // nothing has been mutated yet, so returning here is clean.
+                size_increase = try_posting_entry_size(&field_value, &posting).map_err(|err| {
+                    BTreeError::Serialization {
+                        name: self.name.clone(),
+                        source: err,
+                    }
+                })?;
                 entry.insert(posting);
                 is_new = true;
             }
@@ -810,7 +981,18 @@ where
                 // Add field value to bucket if not already present
                 b.2.push(field_value.clone());
             } else {
-                // If the current bucket is full, create a new one
+                // If the current bucket is full, create a new one.
+                //
+                // Known benign drift: this migration writes `posting.0 =
+                // new_bucket` before the destination bucket entry is created
+                // below. A concurrent `remove` that empties the posting in
+                // that window skips its bucket accounting (the destination
+                // entry does not exist yet), so the in-memory bucket size may
+                // over-count and `bucket.2` may keep the field value until the
+                // next compaction. This only degrades packing decisions —
+                // flush filters postings through the live `postings` map, so
+                // the persisted state stays correct — and all size arithmetic
+                // saturates.
                 let mut source_size_decrease = 0;
                 new_bucket = self.max_bucket_id.fetch_add(1, Ordering::Relaxed) + 1;
                 {
@@ -829,7 +1011,6 @@ where
                                 target_bucket,
                                 posting.1,
                                 &posting.2,
-                                &doc_id,
                             )
                         } else {
                             0
@@ -1021,6 +1202,15 @@ where
             return Ok(0);
         }
 
+        // Validate `doc_id` serialization up-front, before any state is
+        // mutated (see `insert`).
+        let doc_id_size = try_cbor_serialized_size(&doc_id)
+            .map_err(|err| BTreeError::Serialization {
+                name: self.name.clone(),
+                source: err,
+            })?
+            + 2;
+
         // Track which values were successfully inserted
         let mut inserted_count = 0;
         // Track which buckets were modified and need updates
@@ -1037,8 +1227,8 @@ where
                 {
                     return Err(BTreeError::AlreadyExists {
                         name: self.name.clone(),
-                        id: json!(doc_id),
-                        value: json!(field_value),
+                        id: json_value(&doc_id),
+                        value: json_value(field_value),
                     });
                 }
             }
@@ -1052,13 +1242,14 @@ where
                 .or_insert_with(|| (0, false, UniqueVec::default(), 0));
         }
 
-        // A uniqueness violation detected mid-loop must NOT return early:
-        // postings already modified in this call still need their btree keys
-        // and bucket accounting (phases below), otherwise they would be
-        // invisible to range queries and silently dropped by the next flush.
-        // Record the error, stop processing further values, finish the
-        // bookkeeping for what was applied, then surface the error.
-        let mut uniqueness_conflict: Option<BTreeError> = None;
+        // An error detected mid-loop (uniqueness violation, or a field value
+        // whose serialization fails) must NOT return early: postings already
+        // modified in this call still need their btree keys and bucket
+        // accounting (phases below), otherwise they would be invisible to
+        // range queries and silently dropped by the next flush. Record the
+        // error, stop processing further values, finish the bookkeeping for
+        // what was applied, then surface the error.
+        let mut deferred_error: Option<BTreeError> = None;
 
         for field_value in field_values {
             let mut size_increase = 0;
@@ -1073,10 +1264,10 @@ where
                     // The pre-check above may have passed, but a concurrent insert could have
                     // added a different doc_id between the pre-check and here.
                     if !self.config.allow_duplicates && !posting.2.contains(&doc_id) {
-                        uniqueness_conflict = Some(BTreeError::AlreadyExists {
+                        deferred_error = Some(BTreeError::AlreadyExists {
                             name: self.name.clone(),
-                            id: json!(doc_id),
-                            value: json!(field_value),
+                            id: json_value(&doc_id),
+                            value: json_value(&field_value),
                         });
                         break;
                     }
@@ -1084,14 +1275,27 @@ where
                     // Only add the doc_id if it's not already present
                     if posting.2.push(doc_id.clone()) {
                         // Calculate size increase for this insertion
-                        size_increase = cbor_serialized_size(&doc_id) + 2;
+                        size_increase = doc_id_size;
                         posting.1 += 1; // Increment version
                     }
                 }
                 dashmap::Entry::Vacant(entry) => {
                     // Create a new posting for this field value
                     let posting = (bucket_id, 1, vec![doc_id.clone()].into());
-                    size_increase = posting_entry_size(&field_value, &posting);
+                    // Reject an unserializable field value before inserting
+                    // it; nothing has been mutated for this value yet, so
+                    // stop the loop and surface the error after finishing the
+                    // bookkeeping for the values already applied.
+                    match try_posting_entry_size(&field_value, &posting) {
+                        Ok(size) => size_increase = size,
+                        Err(err) => {
+                            deferred_error = Some(BTreeError::Serialization {
+                                name: self.name.clone(),
+                                source: err,
+                            });
+                            break;
+                        }
+                    }
                     // Insert the new posting
                     entry.insert(posting);
                     // Remember to add this to the B-tree for range queries
@@ -1146,6 +1350,13 @@ where
                 }
 
                 // Newly-created posting; decide whether it stays in this bucket or migrates.
+                //
+                // Known benign drift: `fv_size` is recomputed here from the
+                // current posting state, which under concurrent writers may
+                // differ from the delta accumulated in Phase 1 (so the
+                // rollback below can be slightly off). This only degrades
+                // packing decisions; the persisted state stays correct and
+                // all size arithmetic saturates.
                 let fv_size = if let Some(posting) = self.postings.get(&fv) {
                     posting_entry_size(&fv, &*posting)
                 } else {
@@ -1243,7 +1454,7 @@ where
             });
         }
 
-        if let Some(err) = uniqueness_conflict {
+        if let Some(err) = deferred_error {
             return Err(err);
         }
 
@@ -1475,12 +1686,24 @@ where
     /// `f` runs while internal locks are held (including the btree read lock
     /// during range scans). It must not call back into the same index, or it
     /// may deadlock.
+    ///
+    /// # Depth limit
+    ///
+    /// Queries nested deeper than [`RangeQuery::MAX_DEPTH`] are rejected and
+    /// return an empty result (query evaluation is recursive; the cap
+    /// prevents a stack overflow on maliciously deep queries). Validate the
+    /// depth up-front (e.g. via [`RangeQuery::depth`] or
+    /// [`RangeQuery::try_convert_from`]) if you need to distinguish this from
+    /// a genuinely empty result.
     pub fn range_query_with<F, R>(&self, query: RangeQuery<FV>, mut f: F) -> Vec<R>
     where
         F: FnMut(&FV, &Vec<PK>) -> (bool, Vec<R>),
     {
         let mut results = Vec::new();
         if self.postings.is_empty() {
+            return results;
+        }
+        if query.depth() > RangeQuery::<FV>::MAX_DEPTH {
             return results;
         }
 
@@ -1751,7 +1974,14 @@ where
                     self.range_keys(seed_query).into_iter().collect();
 
                 for query in queries {
-                    intersection.retain(|key| Self::range_key_matches_query(key, &query));
+                    // `Include` is the common expensive predicate here: probe
+                    // a hash set instead of an O(m) linear scan per key.
+                    if let RangeQuery::Include(keys) = query.as_ref() {
+                        let keys: FxHashSet<&FV> = keys.iter().collect();
+                        intersection.retain(|key| keys.contains(key));
+                    } else {
+                        intersection.retain(|key| Self::range_key_matches_query(key, &query));
+                    }
                     if intersection.is_empty() {
                         return vec![];
                     }
@@ -1802,6 +2032,20 @@ where
     ///
     /// `true` if anything was written (metadata and/or at least one bucket),
     /// `false` if the index was already fully persisted.
+    ///
+    /// # Durability caveats
+    ///
+    /// - Metadata goes through [`Self::store_metadata`], whose saved-version
+    ///   watermark advances as soon as serialization into `metadata` succeeds.
+    ///   `W` must therefore be a "written means durable" target (e.g. a file
+    ///   opened for writing). If the actual persistence happens *after* the
+    ///   write into `W` and can fail (e.g. an in-memory buffer later uploaded
+    ///   to an object store), use [`Self::flush_with`] instead, otherwise a
+    ///   failed upload would never be retried for this metadata version.
+    /// - This method writes metadata *before* buckets, which is correct for
+    ///   normal incremental flushes but **not** after
+    ///   [`Self::compact_buckets`]; see the persistence contract documented
+    ///   there.
     pub async fn flush<W: Write, F>(
         &self,
         metadata: W,
@@ -1817,6 +2061,46 @@ where
             return Ok(false);
         }
         self.store_dirty_buckets(f).await?;
+        Ok(meta_saved || had_dirty)
+    }
+
+    /// Like [`Self::flush`], but persists metadata through
+    /// [`Self::store_metadata_with`]: the saved-version watermark only
+    /// advances after `metadata_writer` returns `Ok(())`, so a failed
+    /// external write (e.g. an object-store upload) is retried by the next
+    /// flush instead of being silently skipped forever.
+    ///
+    /// Prefer this variant whenever the metadata persistence step can fail
+    /// after serialization succeeded.
+    ///
+    /// # Arguments
+    ///
+    /// * `now_ms` - current unix-ms timestamp, recorded into `stats.last_saved`.
+    /// * `metadata_writer` - async callback receiving the CBOR-encoded
+    ///   metadata blob; must return `Ok(())` only once it is durably stored.
+    /// * `bucket_writer` - async callback receiving `(bucket_id, cbor_bytes)`
+    ///   for each dirty bucket, as in [`Self::store_dirty_buckets`].
+    ///
+    /// # Returns
+    ///
+    /// `true` if anything was written (metadata and/or at least one bucket),
+    /// `false` if the index was already fully persisted.
+    pub async fn flush_with<F1, F2>(
+        &self,
+        now_ms: u64,
+        metadata_writer: F1,
+        bucket_writer: F2,
+    ) -> Result<bool, BTreeError>
+    where
+        F1: AsyncFnOnce(&[u8]) -> Result<(), BoxError>,
+        F2: AsyncFnMut(u32, &[u8]) -> Result<bool, BoxError>,
+    {
+        let meta_saved = self.store_metadata_with(now_ms, metadata_writer).await?;
+        let had_dirty = self.has_dirty_buckets();
+        if !meta_saved && !had_dirty {
+            return Ok(false);
+        }
+        self.store_dirty_buckets(bucket_writer).await?;
         Ok(meta_saved || had_dirty)
     }
 
@@ -1844,6 +2128,35 @@ where
     /// This method rebuilds the bucket map non-atomically and must NOT run
     /// concurrently with writers (`insert*` / `remove*`) or flushes. Call it
     /// during startup/offline maintenance, before the index is shared.
+    ///
+    /// # Persistence contract
+    ///
+    /// Compaction re-bins postings into low bucket ids, clears bucket entries
+    /// with higher ids, and moves `max_bucket_id` *backwards*. This
+    /// intentionally breaks two invariants that crash recovery via
+    /// [`Self::load_buckets`] otherwise relies on: the "higher bucket id is
+    /// the newer state" reconciliation and the monotonicity of
+    /// `max_bucket_id`. After calling this method the caller MUST persist in
+    /// this exact order before resuming writes:
+    ///
+    /// 1. write all dirty buckets ([`Self::store_dirty_buckets`]);
+    /// 2. then write the metadata ([`Self::store_metadata_with`] /
+    ///    [`Self::store_metadata`]), which records the shrunken
+    ///    `max_bucket_id`;
+    /// 3. then delete on-disk bucket files with ids above the new
+    ///    `max_bucket_id` (orphans). Stale high-id files must not survive:
+    ///    they are never rewritten again, so if `max_bucket_id` later grows
+    ///    back over them and a crash hits the "metadata written, bucket file
+    ///    not yet written" window, `load_buckets` would read the stale file
+    ///    and resurrect long-deleted postings. Deleting them is part of the
+    ///    contract, not an optional cleanup.
+    ///
+    /// Do NOT persist a compaction with the plain [`Self::flush`] /
+    /// [`Self::flush_with`], which write metadata before buckets: a crash
+    /// between the two steps would leave metadata pointing at bucket files
+    /// whose postings were compacted away (or into lower ids the "higher id
+    /// wins" reconciliation resolves the wrong way). See `anda_db`'s
+    /// `BTree::compact` for a reference implementation of this sequence.
     ///
     /// # Returns
     ///
@@ -2104,10 +2417,22 @@ where
             // Scope the postings Ref guards so they are dropped before the
             // potentially slow async write, reducing lock contention.
             {
+                // Skip postings that no longer exist, and postings that are
+                // transiently empty (a concurrent `remove` emptied the posting
+                // but has not yet removed the entry): persisting an empty
+                // posting would resurrect the key as a "ghost" after a crash
+                // and reload. The concurrent remove bumps this bucket's
+                // `dirty_version` when it finishes, so the bucket stays dirty
+                // and the final state is rewritten by a later flush.
                 let postings: FxHashMap<_, _> = bucket
                     .2
                     .iter()
-                    .filter_map(|fv| self.postings.get(fv).map(|p| (fv, p)))
+                    .filter_map(|fv| {
+                        self.postings
+                            .get(fv)
+                            .filter(|posting| !posting.2.is_empty())
+                            .map(|p| (fv, p))
+                    })
                     .collect();
 
                 buf.clear();
@@ -2283,6 +2608,21 @@ mod tests {
 
     #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
     struct TestKey(String);
+
+    /// A value whose serialization fails on demand (`.1 == true`), used to
+    /// exercise the non-panicking serialization error paths.
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+    struct Flaky(u8, bool);
+
+    impl Serialize for Flaky {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            if self.1 {
+                Err(serde::ser::Error::custom("flaky serialization failure"))
+            } else {
+                self.0.serialize(serializer)
+            }
+        }
+    }
 
     impl TryFrom<String> for TestKey {
         type Error = BoxError;
@@ -4786,5 +5126,495 @@ mod tests {
                 assert_eq!(original, reloaded, "posting for {key} differs after reload");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_load_buckets_skips_empty_posting_ghost_key() {
+        // Regression test: a crash between "remove() empties the posting" and
+        // the next repairing flush can persist a bucket containing an empty
+        // posting. Loading it must not register a "ghost" key.
+        let metadata = BTreeMetadata {
+            name: "ghost".to_string(),
+            config: BTreeConfig {
+                bucket_overload_size: 256,
+                allow_duplicates: true,
+            },
+            stats: BTreeStats {
+                version: 3,
+                max_bucket_id: 0,
+                ..Default::default()
+            },
+        };
+        let mut metadata_buf = Vec::new();
+        cbor2::to_writer(
+            &BTreeIndexRef {
+                metadata: &metadata,
+            },
+            &mut metadata_buf,
+        )
+        .unwrap();
+
+        let mut postings = FxHashMap::default();
+        postings.insert("alive".to_string(), (0u32, 1u64, vec![1u64].into()));
+        postings.insert("ghost".to_string(), (0u32, 2u64, UniqueVec::<u64>::default()));
+        let mut bucket_buf = Vec::new();
+        cbor2::to_writer(&BucketOwned { postings }, &mut bucket_buf).unwrap();
+
+        let mut loaded: BTreeIndex<u64, String> =
+            BTreeIndex::load_metadata(&metadata_buf[..]).unwrap();
+        loaded
+            .load_buckets(async |id| Ok(if id == 0 { Some(bucket_buf.clone()) } else { None }))
+            .await
+            .unwrap();
+
+        assert_eq!(loaded.len(), 1, "empty posting must not count as a key");
+        assert_eq!(loaded.keys(None, None), vec!["alive".to_string()]);
+        assert_eq!(
+            loaded.query_with(&"ghost".to_string(), |ids| Some(ids.clone())),
+            None
+        );
+        let not_alive: Vec<String> = loaded.range_query_with(
+            RangeQuery::Not(Box::new(RangeQuery::Eq("alive".to_string()))),
+            |k, _| (true, vec![k.clone()]),
+        );
+        assert!(
+            not_alive.is_empty(),
+            "Not query must not surface the ghost key"
+        );
+        assert!(
+            loaded.has_dirty_buckets(),
+            "bucket containing the ghost must be loaded dirty to self-heal"
+        );
+
+        // The self-heal flush rewrites bucket 0 without the ghost posting.
+        let mut repaired: std::collections::HashMap<u32, Vec<u8>> = Default::default();
+        loaded
+            .store_dirty_buckets(async |id, data| {
+                repaired.insert(id, data.to_vec());
+                Ok(true)
+            })
+            .await
+            .unwrap();
+        let bucket: BucketOwned<u64, String> =
+            cbor2::from_reader(&repaired.get(&0).unwrap()[..]).unwrap();
+        assert!(bucket.postings.contains_key("alive"));
+        assert!(
+            !bucket.postings.contains_key("ghost"),
+            "repaired bucket must not contain the empty posting"
+        );
+        assert!(!loaded.has_dirty_buckets());
+    }
+
+    #[tokio::test]
+    async fn test_load_buckets_empty_posting_tombstones_stale_lower_bucket_copy() {
+        // A migrated posting that was emptied and sampled into the higher
+        // bucket acts as a tombstone: it must also drop the stale non-empty
+        // copy loaded from the lower (older) bucket.
+        let metadata = BTreeMetadata {
+            name: "tombstone".to_string(),
+            config: BTreeConfig {
+                bucket_overload_size: 256,
+                allow_duplicates: true,
+            },
+            stats: BTreeStats {
+                version: 5,
+                max_bucket_id: 1,
+                ..Default::default()
+            },
+        };
+        let mut metadata_buf = Vec::new();
+        cbor2::to_writer(
+            &BTreeIndexRef {
+                metadata: &metadata,
+            },
+            &mut metadata_buf,
+        )
+        .unwrap();
+
+        let mut old_postings = FxHashMap::default();
+        old_postings.insert("same".to_string(), (0u32, 1u64, vec![1u64].into()));
+        let mut old_bucket = Vec::new();
+        cbor2::to_writer(
+            &BucketOwned {
+                postings: old_postings,
+            },
+            &mut old_bucket,
+        )
+        .unwrap();
+
+        let mut new_postings = FxHashMap::default();
+        new_postings.insert("same".to_string(), (1u32, 2u64, UniqueVec::<u64>::default()));
+        let mut new_bucket = Vec::new();
+        cbor2::to_writer(
+            &BucketOwned {
+                postings: new_postings,
+            },
+            &mut new_bucket,
+        )
+        .unwrap();
+
+        let mut loaded: BTreeIndex<u64, String> =
+            BTreeIndex::load_metadata(&metadata_buf[..]).unwrap();
+        loaded
+            .load_buckets(async |bucket_id| {
+                Ok(match bucket_id {
+                    0 => Some(old_bucket.clone()),
+                    1 => Some(new_bucket.clone()),
+                    _ => None,
+                })
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(loaded.len(), 0, "tombstoned key must not survive reload");
+        assert!(loaded.keys(None, None).is_empty());
+        assert_eq!(
+            loaded.query_with(&"same".to_string(), |ids| Some(ids.clone())),
+            None
+        );
+        let stale_bucket = loaded.buckets.get(&0).unwrap();
+        assert!(stale_bucket.1, "stale lower bucket must be marked dirty");
+        assert!(!stale_bucket.2.contains(&"same".to_string()));
+        drop(stale_bucket);
+        assert!(loaded.has_dirty_buckets());
+    }
+
+    #[tokio::test]
+    async fn test_store_dirty_buckets_filters_transiently_empty_posting() {
+        // Simulates the remove() crash window: the posting has been emptied
+        // but the entry has not been removed yet. A flush sampling this state
+        // must not persist the empty posting.
+        let index = create_test_index();
+        index.insert(1, "a".to_string(), now_ms()).unwrap();
+        index.insert(2, "b".to_string(), now_ms()).unwrap();
+        {
+            let mut posting = index.postings.get_mut(&"a".to_string()).unwrap();
+            posting.2.swap_remove_if(|id| *id == 1);
+            posting.1 += 1;
+        }
+
+        let mut written: std::collections::HashMap<u32, Vec<u8>> = Default::default();
+        index
+            .store_dirty_buckets(async |id, data| {
+                written.insert(id, data.to_vec());
+                Ok(true)
+            })
+            .await
+            .unwrap();
+
+        let bucket: BucketOwned<u64, String> =
+            cbor2::from_reader(&written.get(&0).unwrap()[..]).unwrap();
+        assert!(
+            !bucket.postings.contains_key("a"),
+            "transiently empty posting must not be persisted"
+        );
+        assert!(bucket.postings.contains_key("b"));
+    }
+
+    #[test]
+    fn test_compact_buckets_restores_ownership_invariants() {
+        let index = create_test_index();
+        for i in 0..200u64 {
+            index.insert(i, format!("key-{i:03}"), now_ms()).unwrap();
+        }
+        // Fragment the buckets before compacting.
+        for i in (0..200u64).step_by(2) {
+            assert!(index.remove(i, format!("key-{i:03}"), now_ms()));
+        }
+
+        let (old_count, new_count) = index.compact_buckets();
+        assert!(new_count <= old_count);
+        assert_eq!(
+            index.stats().max_bucket_id as usize,
+            new_count - 1,
+            "max_bucket_id must match the compacted bucket range"
+        );
+        assert_eq!(index.buckets.len(), new_count);
+
+        // Every bucket's tracked field values point back at that bucket, and
+        // every posting is tracked by exactly one bucket.
+        let mut tracked = 0usize;
+        for bucket in index.buckets.iter() {
+            let id = *bucket.key();
+            assert!((id as usize) < new_count, "bucket id beyond compacted range");
+            assert!(bucket.1, "compacted buckets must be dirty for persistence");
+            for fv in bucket.2.iter() {
+                let posting = index
+                    .postings
+                    .get(fv)
+                    .expect("bucket must track only live postings");
+                assert_eq!(posting.0, id, "posting bucket id must match owner");
+            }
+            tracked += bucket.2.len();
+        }
+        assert_eq!(
+            tracked,
+            index.postings.len(),
+            "every posting must be tracked by exactly one bucket"
+        );
+    }
+
+    #[test]
+    fn test_range_query_depth_cap() {
+        let max_depth = RangeQuery::<String>::MAX_DEPTH;
+
+        assert_eq!(RangeQuery::Eq("a".to_string()).depth(), 1);
+        assert_eq!(
+            RangeQuery::Not(Box::new(RangeQuery::Eq("a".to_string()))).depth(),
+            2
+        );
+        assert_eq!(
+            RangeQuery::And(vec![
+                Box::new(RangeQuery::Eq("a".to_string())),
+                Box::new(RangeQuery::Not(Box::new(RangeQuery::Gt("b".to_string())))),
+            ])
+            .depth(),
+            3
+        );
+
+        let index = create_populated_index();
+
+        // Exactly at the cap: still evaluated (odd number of Nots ->
+        // complement of Eq("apple")).
+        let mut at_cap = RangeQuery::Eq("apple".to_string());
+        for _ in 0..(max_depth - 1) {
+            at_cap = RangeQuery::Not(Box::new(at_cap));
+        }
+        assert_eq!(at_cap.depth(), max_depth);
+        let keys: Vec<String> = index.range_query_with(at_cap, |k, _| (true, vec![k.clone()]));
+        assert_eq!(
+            keys,
+            vec![
+                "banana".to_string(),
+                "cherry".to_string(),
+                "date".to_string(),
+                "eggplant".to_string(),
+            ]
+        );
+
+        // Far over the cap: rejected with an empty result instead of
+        // recursing 4000+ frames deep.
+        let mut over = RangeQuery::Eq("apple".to_string());
+        for _ in 0..4096 {
+            over = RangeQuery::Not(Box::new(over));
+        }
+        assert_eq!(over.depth(), 4097);
+        let keys: Vec<String> = index.range_query_with(over, |k, _| (true, vec![k.clone()]));
+        assert!(keys.is_empty(), "over-deep query must be rejected");
+
+        // try_convert_from rejects over-deep queries up-front.
+        let mut deep = RangeQuery::Eq("ok".to_string());
+        for _ in 0..max_depth {
+            deep = RangeQuery::Not(Box::new(deep));
+        }
+        let err = RangeQuery::<TestKey>::try_convert_from(deep).unwrap_err();
+        assert!(err.to_string().contains("depth"), "unexpected error: {err}");
+
+        let shallow = RangeQuery::Not(Box::new(RangeQuery::Eq("ok".to_string())));
+        assert!(RangeQuery::<TestKey>::try_convert_from(shallow).is_ok());
+    }
+
+    #[test]
+    fn test_concurrent_appends_to_same_posting_with_migrations() {
+        // Regression test for the removed debug_assert in
+        // previous_posting_size_after_append: two threads appending to the
+        // same field value while bucket migrations run means the popped doc
+        // id is not necessarily this thread's; that used to panic in debug
+        // builds.
+        let index = BTreeIndex::<u64, String>::new(
+            "hot_fv".to_string(),
+            Some(BTreeConfig {
+                bucket_overload_size: 128,
+                allow_duplicates: true,
+            }),
+        );
+        let n = 400u64;
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|s| {
+            for t in 0..2u64 {
+                let index = &index;
+                let barrier = &barrier;
+                s.spawn(move || {
+                    barrier.wait();
+                    for i in 0..n {
+                        assert!(index.insert(t * n + i, "hot".to_string(), now_ms()).unwrap());
+                    }
+                });
+            }
+        });
+
+        let len = index
+            .query_with(&"hot".to_string(), |ids| Some(ids.len()))
+            .unwrap();
+        assert_eq!(len, (2 * n) as usize);
+    }
+
+    #[tokio::test]
+    async fn test_store_metadata_with_failure_then_retry() {
+        let index = create_test_index();
+        index.insert(1, "apple".to_string(), now_ms()).unwrap();
+
+        let err = index
+            .store_metadata_with(now_ms(), async |_| Err("upload failed".into()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BTreeError::Generic { .. }));
+        assert!(
+            index.has_pending_metadata_flush(),
+            "failed external write must keep the metadata version pending"
+        );
+
+        let saved = index
+            .store_metadata_with(now_ms(), async |data| {
+                assert!(!data.is_empty());
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(saved, "retry after failure must persist the same version");
+        assert!(!index.has_pending_metadata_flush());
+
+        let again = index
+            .store_metadata_with(now_ms(), async |_| Ok(()))
+            .await
+            .unwrap();
+        assert!(!again, "already-saved version must be skipped");
+    }
+
+    #[tokio::test]
+    async fn test_flush_with_round_trip() {
+        let index = create_test_index();
+        index.insert(1, "apple".to_string(), now_ms()).unwrap();
+
+        let mut metadata_buf = Vec::new();
+        let mut bucket_data: std::collections::HashMap<u32, Vec<u8>> = Default::default();
+        let wrote = index
+            .flush_with(
+                now_ms(),
+                async |data| {
+                    metadata_buf.extend_from_slice(data);
+                    Ok(())
+                },
+                async |id, data| {
+                    bucket_data.insert(id, data.to_vec());
+                    Ok(true)
+                },
+            )
+            .await
+            .unwrap();
+        assert!(wrote);
+
+        let loaded: BTreeIndex<u64, String> =
+            BTreeIndex::load_all(&metadata_buf[..], async |id| {
+                Ok(bucket_data.get(&id).cloned())
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            loaded.query_with(&"apple".to_string(), |ids| Some(ids.clone())),
+            Some(vec![1])
+        );
+
+        let idle = index
+            .flush_with(now_ms(), async |_| Ok(()), async |_, _| Ok(true))
+            .await
+            .unwrap();
+        assert!(!idle, "fully persisted index must short-circuit");
+    }
+
+    #[test]
+    fn test_bucket_overload_size_is_clamped() {
+        let index = BTreeIndex::<u64, String>::new(
+            "clamped".to_string(),
+            Some(BTreeConfig {
+                bucket_overload_size: 0,
+                allow_duplicates: true,
+            }),
+        );
+        assert_eq!(
+            index.metadata().config.bucket_overload_size,
+            BTreeConfig::MIN_BUCKET_OVERLOAD_SIZE
+        );
+
+        // Persisted metadata carrying a degenerate value is clamped on load.
+        let metadata = BTreeMetadata {
+            name: "clamped_load".to_string(),
+            config: BTreeConfig {
+                bucket_overload_size: 1,
+                allow_duplicates: true,
+            },
+            stats: BTreeStats {
+                version: 1,
+                ..Default::default()
+            },
+        };
+        let mut buf = Vec::new();
+        cbor2::to_writer(
+            &BTreeIndexRef {
+                metadata: &metadata,
+            },
+            &mut buf,
+        )
+        .unwrap();
+        let loaded = BTreeIndex::<u64, String>::load_metadata(&buf[..]).unwrap();
+        assert_eq!(
+            loaded.metadata().config.bucket_overload_size,
+            BTreeConfig::MIN_BUCKET_OVERLOAD_SIZE
+        );
+    }
+
+    #[test]
+    fn test_insert_rejects_unserializable_values_without_mutation() {
+        // PK whose serialization fails: rejected before any mutation.
+        let index = BTreeIndex::<Flaky, String>::new("bad_pk".to_string(), None);
+        let err = index
+            .insert(Flaky(1, true), "k".to_string(), now_ms())
+            .unwrap_err();
+        assert!(matches!(err, BTreeError::Serialization { .. }));
+        assert_eq!(index.len(), 0);
+        assert!(index.keys(None, None).is_empty());
+        assert!(!index.has_dirty_buckets());
+        assert!(index.insert(Flaky(1, false), "k".to_string(), now_ms()).unwrap());
+
+        // FV whose serialization fails: rejected before the posting exists.
+        let index = BTreeIndex::<u64, Flaky>::new("bad_fv".to_string(), None);
+        let err = index.insert(1, Flaky(2, true), now_ms()).unwrap_err();
+        assert!(matches!(err, BTreeError::Serialization { .. }));
+        assert_eq!(index.len(), 0);
+        assert!(index.keys(None, None).is_empty());
+        assert!(!index.has_dirty_buckets());
+        assert!(index.insert(1, Flaky(2, false), now_ms()).unwrap());
+    }
+
+    #[test]
+    fn test_insert_array_defers_serialization_error_and_keeps_applied_values() {
+        let index = BTreeIndex::<u64, Flaky>::new("bad_fv_array".to_string(), None);
+        let err = index
+            .insert_array(
+                1,
+                vec![Flaky(1, false), Flaky(2, true), Flaky(3, false)],
+                now_ms(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, BTreeError::Serialization { .. }));
+
+        // The value applied before the failure keeps consistent bookkeeping.
+        assert_eq!(index.len(), 1);
+        assert_eq!(index.keys(None, None), vec![Flaky(1, false)]);
+        assert_eq!(
+            index.query_with(&Flaky(1, false), |ids| Some(ids.clone())),
+            Some(vec![1])
+        );
+        // The failing value and the values after it were not applied.
+        assert!(
+            index
+                .query_with(&Flaky(2, true), |ids| Some(ids.clone()))
+                .is_none()
+        );
+        assert!(
+            index
+                .query_with(&Flaky(3, false), |ids| Some(ids.clone()))
+                .is_none()
+        );
     }
 }

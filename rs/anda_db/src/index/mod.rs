@@ -90,7 +90,14 @@ pub fn from_virtual_field_name(name: &str) -> Vec<String> {
 /// Builds a deterministic byte key for a multi-field B-tree index.
 ///
 /// Each field value, including `None`, is encoded as deterministic CBOR and
-/// concatenated so the resulting key has stable ordering and equality.
+/// concatenated, so the resulting key is deterministic and supports equality
+/// comparison (the same field values always produce the same key).
+///
+/// Note: the byte-wise **ordering** of composite keys does not correspond to
+/// the lexicographic ordering of the field-value tuples (e.g. CBOR length
+/// prefixes make `"b" < "aa"` in byte order). Range queries over a composite
+/// index therefore iterate in an encoding-defined order; only `Eq` lookups
+/// carry tuple semantics.
 pub fn virtual_field_value(vals: &[Option<&Fv>]) -> Option<Fv> {
     if vals.is_empty() {
         return None;

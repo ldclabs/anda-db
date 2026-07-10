@@ -593,7 +593,58 @@ impl BTree {
         }
     }
 
+    /// Runs a range query and feeds each matching id list to `f`.
+    ///
+    /// `f` returns `false` to stop the scan early. Unlike
+    /// [`BTree::range_query_with`], this variant:
+    ///
+    /// - returns an error when the query value type does not match the index
+    ///   key type (instead of silently returning an empty result), so a
+    ///   mistyped filter is distinguishable from "no match";
+    /// - does not materialize an owned key per hit (Text/Bytes keys are not
+    ///   cloned), which matters on large range scans.
+    pub fn try_range_query_ids<F>(&self, query: RangeQuery<Fv>, mut f: F) -> Result<(), DBError>
+    where
+        F: FnMut(&[DocumentId]) -> bool,
+    {
+        let type_error = |source: BoxError| DBError::Index {
+            name: self.name().to_string(),
+            source,
+        };
+        match self {
+            BTree::I64(btree) => {
+                let q = RangeQuery::<i64>::try_convert_from(query).map_err(type_error)?;
+                btree
+                    .index
+                    .range_query_with(q, |_, pks| (f(pks), Vec::<()>::new()));
+            }
+            BTree::U64(btree) => {
+                let q = RangeQuery::<u64>::try_convert_from(query).map_err(type_error)?;
+                btree
+                    .index
+                    .range_query_with(q, |_, pks| (f(pks), Vec::<()>::new()));
+            }
+            BTree::String(btree) => {
+                let q = RangeQuery::<String>::try_convert_from(query).map_err(type_error)?;
+                btree
+                    .index
+                    .range_query_with(q, |_, pks| (f(pks), Vec::<()>::new()));
+            }
+            BTree::Bytes(btree) => {
+                let q = RangeQuery::<Vec<u8>>::try_convert_from(query).map_err(type_error)?;
+                btree
+                    .index
+                    .range_query_with(q, |_, pks| (f(pks), Vec::<()>::new()));
+            }
+        }
+        Ok(())
+    }
+
     /// Runs a range query and maps each matching key/id-list pair through `f`.
+    ///
+    /// A query value type that does not match the index key type yields an
+    /// empty result; use [`BTree::try_range_query_ids`] to surface the
+    /// mismatch as an error.
     pub fn range_query_with<F, R>(&self, query: RangeQuery<Fv>, mut f: F) -> Vec<R>
     where
         F: FnMut(Fv, &Vec<DocumentId>) -> (bool, Vec<R>),

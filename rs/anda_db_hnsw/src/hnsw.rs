@@ -26,7 +26,7 @@ use smallvec::SmallVec;
 use std::{
     borrow::Cow,
     cmp::{self, Reverse},
-    collections::{BTreeSet, BinaryHeap, hash_map::Entry},
+    collections::{BTreeMap, BTreeSet, BinaryHeap, hash_map::Entry},
     io::{Read, Write},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -91,11 +91,19 @@ pub struct HnswIndex {
     /// Ids removed since the last successful purge. Consumed by
     /// [`Self::purge_removed_nodes`] so the caller can delete the
     /// corresponding persisted node blobs; without this, removed node files
-    /// would accumulate forever.
+    /// would accumulate forever. Also persisted alongside the metadata so a
+    /// crash between a flush and the next purge re-queues the pending
+    /// deletions on reload.
     removed_nodes: RwLock<BTreeSet<u64>>,
 
     /// Roaring-bitmap index of live node ids. Kept in sync with `nodes`.
     ids: RwLock<Treemap>,
+
+    /// Live node ids grouped by their highest layer. Kept in sync with
+    /// `nodes` (all mutations happen under `structural_lock`; the loaders
+    /// rebuild it) so that removing the entry point or a top-layer node can
+    /// find a replacement without an O(N) scan over all nodes.
+    nodes_by_layer: Mutex<BTreeMap<u8, BTreeSet<u64>>>,
 
     /// Total number of queries served (exposed via `stats()`).
     search_count: AtomicU64,
@@ -347,6 +355,13 @@ pub struct HnswNode {
 
 /// Serializes a node to CBOR. Used by [`HnswIndex::store_dirty_nodes`] and by
 /// external tools that snapshot individual nodes.
+///
+/// # Panics
+///
+/// Panics if CBOR encoding fails. Encoding into a `Vec` cannot fail for any
+/// well-formed [`HnswNode`] (plain integers, `bf16` vectors and adjacency
+/// lists), so this is unreachable in practice; the signature stays infallible
+/// for backward compatibility.
 pub fn serialize_node(node: &HnswNode) -> Vec<u8> {
     let mut buf = Vec::new();
     cbor2::to_writer(node, &mut buf).expect("Failed to serialize node");
@@ -403,6 +418,13 @@ pub struct HnswStats {
 struct HnswIndexOwned {
     pub entry_point: (u64, u8),
     pub metadata: HnswMetadata,
+    /// Tombstones of removed nodes whose persisted blobs have not been purged
+    /// yet. Persisted with the metadata so a crash between a flush and the
+    /// next [`HnswIndex::purge_removed_nodes`] re-queues the deletions on
+    /// reload instead of leaking the blobs forever. Missing in metadata
+    /// written by older versions, hence the default.
+    #[serde(default)]
+    pub removed_nodes: Vec<u64>,
 }
 
 /// Serializable HNSW index structure (reference version).
@@ -410,6 +432,7 @@ struct HnswIndexOwned {
 struct HnswIndexRef<'a> {
     entry_point: (u64, u8),
     metadata: &'a HnswMetadata,
+    removed_nodes: Vec<u64>,
 }
 
 impl HnswIndex {
@@ -464,6 +487,7 @@ impl HnswIndex {
             dirty_nodes: RwLock::new(BTreeSet::new()),
             removed_nodes: RwLock::new(BTreeSet::new()),
             ids: RwLock::new(Treemap::new()),
+            nodes_by_layer: Mutex::new(BTreeMap::new()),
             search_count: AtomicU64::new(0),
             last_saved_version: AtomicU64::new(0),
         }
@@ -528,8 +552,9 @@ impl HnswIndex {
             entry_point: RwLock::new(entry_point),
             metadata: RwLock::new(index.metadata),
             dirty_nodes: RwLock::new(BTreeSet::new()),
-            removed_nodes: RwLock::new(BTreeSet::new()),
+            removed_nodes: RwLock::new(index.removed_nodes.into_iter().collect()),
             ids: RwLock::new(Treemap::new()),
+            nodes_by_layer: Mutex::new(BTreeMap::new()),
             search_count,
             last_saved_version,
         })
@@ -631,6 +656,8 @@ impl HnswIndex {
                 LoadedNode::Missing(id) => missing_ids.push(id),
             }
         }
+
+        self.rebuild_nodes_by_layer();
 
         if !missing_ids.is_empty() {
             {
@@ -898,6 +925,7 @@ impl HnswIndex {
                 },
             );
             self.ids.write().add(id);
+            self.track_node_layer(id, layer);
             *self.entry_point.write() = (id, layer);
             self.dirty_nodes.write().insert(id); // Mark the node as dirty for persistence
             // A re-inserted id must not have its (new) blob purged by a
@@ -1031,6 +1059,7 @@ impl HnswIndex {
 
         nodes.insert(id, new_node);
         self.ids.write().add(id);
+        self.track_node_layer(id, layer);
         // A re-inserted id must not have its (new) blob purged by a pending
         // tombstone from an earlier remove().
         self.removed_nodes.write().remove(&id);
@@ -1138,7 +1167,8 @@ impl HnswIndex {
         self.insert(id, vector.into_iter().map(bf16::from_f32).collect(), now_ms)
     }
 
-    /// Removes a node and prunes the reverse edges that point to it.
+    /// Removes a node, prunes the reverse edges that point to it and re-links
+    /// its former neighbors to each other.
     ///
     /// This method only mutates the in-memory graph. The id is recorded as a
     /// tombstone; call [`Self::purge_removed_nodes`] after flushing so the
@@ -1146,10 +1176,19 @@ impl HnswIndex {
     /// otherwise removed node files accumulate forever.
     ///
     /// The implementation walks the deleted node's own neighbor list rather
-    /// than scanning the whole map, reducing cost from O(N) to O(M*L).
+    /// than scanning the whole map, reducing cost from O(N) to O(M²·L).
     /// Stale back-references from nodes that were not in the deleted node's
     /// neighbor list (e.g. after a prior prune) are harmless: they are skipped
     /// at search time when `nodes.get()` returns `None`.
+    ///
+    /// For every layer where a neighbor lost its edge to the deleted node,
+    /// the deleted node's remaining neighbors at that layer are merged into
+    /// the neighbor's candidate set and the configured
+    /// [`SelectNeighborsStrategy`] re-selects its edges (the local repair
+    /// used by hnswlib). Without this step every deletion strictly reduces
+    /// the survivors' connectivity, so recall degrades monotonically over
+    /// many deletions and a cluster reachable only through the deleted node
+    /// can become unreachable entirely.
     ///
     /// # Returns
     /// * `true` if a node with `id` existed and was removed.
@@ -1162,13 +1201,20 @@ impl HnswIndex {
         };
 
         let previous_max_layer = self.metadata.read().stats.max_layer;
+        self.untrack_node_layer(id, node.layer);
         let entry_was_removed = self.entry_point.read().0 == id;
         let replacement_entry = if entry_was_removed {
-            nodes
-                .iter()
-                .filter(|(node_id, _)| **node_id != id)
-                .max_by_key(|(_, node)| node.layer)
-                .map(|(_, node)| (node.id, node.layer))
+            // O(log N): pick a live node on the highest tracked layer. Fall
+            // back to a full scan if the tracker ever desynchronizes from
+            // `nodes` (e.g. state assembled without going through `insert`).
+            match self.highest_tracked_node() {
+                Some((nid, layer)) if nodes.contains_key(&nid) => Some((nid, layer)),
+                _ => nodes
+                    .iter()
+                    .filter(|(node_id, _)| **node_id != id)
+                    .max_by_key(|(_, node)| node.layer)
+                    .map(|(_, node)| (node.id, node.layer)),
+            }
         } else {
             None
         };
@@ -1187,7 +1233,9 @@ impl HnswIndex {
         let recalculated_max_layer = if entry_was_removed {
             Some(replacement_entry.map_or(0, |(_, layer)| layer))
         } else if node.layer >= previous_max_layer {
-            Some(nodes.iter().map(|(_, node)| node.layer).max().unwrap_or(0))
+            Some(self.max_tracked_layer().unwrap_or_else(|| {
+                nodes.iter().map(|(_, node)| node.layer).max().unwrap_or(0)
+            }))
         } else {
             None
         };
@@ -1201,7 +1249,6 @@ impl HnswIndex {
         });
 
         // Only iterate the deleted node's known neighbors instead of scanning ALL nodes.
-        // This reduces complexity from O(N) to O(K*L) where K=max_connections, L=max_layers.
         // Note: nodes that reference the deleted node but are NOT in the deleted node's
         // neighbor list (due to pruning) will retain stale references. These stale references
         // are harmlessly skipped during search (nodes.get() returns None).
@@ -1211,19 +1258,99 @@ impl HnswIndex {
         );
         for layer_neighbors in &node.neighbors {
             for &(nid, _) in layer_neighbors {
-                neighbor_ids.insert(nid);
+                if nid != id {
+                    neighbor_ids.insert(nid);
+                }
             }
         }
 
+        // Distance cache shared by the re-link candidates and `select_neighbors`.
+        let mut pair_distance_cache: FxHashMap<(u64, u64), f32> = FxHashMap::default();
         let mut dirty_nodes = BTreeSet::new();
         for &neighbor_id in &neighbor_ids {
             if let Some(n) = nodes.get(&neighbor_id) {
                 let mut updated = false;
                 let mut o = Cow::Borrowed(n);
                 for layer in 0..=(n.layer as usize) {
-                    if let Some(pos) = n.neighbors[layer].iter().position(|&(idx, _)| idx == id) {
-                        o.to_mut().neighbors[layer].swap_remove(pos);
-                        updated = true;
+                    let Some(pos) = n.neighbors[layer].iter().position(|&(idx, _)| idx == id)
+                    else {
+                        continue;
+                    };
+                    o.to_mut().neighbors[layer].swap_remove(pos);
+                    updated = true;
+
+                    // Re-link: merge the deleted node's other neighbors at
+                    // this layer into this node's candidate set and re-select
+                    // the best edges, so the local subgraph stays connected.
+                    let Some(peers) = node.neighbors.get(layer) else {
+                        continue;
+                    };
+                    let current_list = &o.to_mut().neighbors[layer];
+                    let mut candidate_ids: FxHashSet<u64> =
+                        current_list.iter().map(|&(cid, _)| cid).collect();
+                    let mut candidates: Vec<(u64, f32, u8)> = current_list
+                        .iter()
+                        .map(|&(cid, dist)| (cid, dist.to_f32(), 0)) // layer unused here
+                        .collect();
+                    let existing_len = candidates.len();
+                    for &(peer, _) in peers {
+                        if peer == neighbor_id || peer == id || !candidate_ids.insert(peer) {
+                            continue;
+                        }
+                        let Some(peer_node) = nodes.get(&peer) else {
+                            continue;
+                        };
+                        if (peer_node.layer as usize) < layer {
+                            // The peer does not exist at this layer.
+                            continue;
+                        }
+                        let cache_key = if neighbor_id < peer {
+                            (neighbor_id, peer)
+                        } else {
+                            (peer, neighbor_id)
+                        };
+                        let dist = match pair_distance_cache.entry(cache_key) {
+                            Entry::Occupied(entry) => *entry.get(),
+                            Entry::Vacant(entry) => {
+                                match self
+                                    .config
+                                    .distance_metric
+                                    .compute(&n.vector, &peer_node.vector)
+                                {
+                                    Ok(dist) => {
+                                        entry.insert(dist);
+                                        dist
+                                    }
+                                    // Defensive: vectors are validated on
+                                    // insert/load, so this is unreachable.
+                                    Err(_) => continue,
+                                }
+                            }
+                        };
+                        candidates.push((peer, dist, 0));
+                    }
+
+                    if candidates.len() > existing_len {
+                        let max_conns = if layer > 0 {
+                            self.config.max_connections as usize
+                        } else {
+                            // Layer 0 uses 2×M connections (standard HNSW convention).
+                            self.config.max_connections as usize * 2
+                        };
+                        if let Ok(selected) = self.select_neighbors(
+                            candidates,
+                            max_conns,
+                            self.config.select_neighbors_strategy,
+                            &mut pair_distance_cache,
+                        ) {
+                            let layer_list = &mut o.to_mut().neighbors[layer];
+                            layer_list.clear();
+                            layer_list.extend(
+                                selected
+                                    .into_iter()
+                                    .map(|(cid, dist, _)| (cid, bf16::from_f32(dist))),
+                            );
+                        }
                     }
                 }
                 if updated {
@@ -1488,8 +1615,15 @@ impl HnswIndex {
                                 }
                             }
                             Err(e) => {
+                                // Defensive: `compute_mixed` only fails on a
+                                // dimension mismatch, which cannot happen for
+                                // vectors validated at insert/load time. Skip
+                                // the neighbor for this search (it is already
+                                // marked visited) WITHOUT caching a fake
+                                // distance: a cached `f32::MAX` would keep
+                                // mis-ranking the node as "farthest" for the
+                                // rest of the query.
                                 log::warn!("Distance calculation error: {e:?}");
-                                distance_cache.insert(neighbor, f32::MAX);
                             }
                         };
                     }
@@ -1651,9 +1785,13 @@ impl HnswIndex {
     /// Persists metadata, ids and dirty nodes in one coordinated pass.
     ///
     /// The sequence is:
-    /// 1. [`Self::store_metadata`] — a no-op if the version hasn't advanced.
-    /// 2. If either the metadata actually changed **or** dirty nodes are pending,
-    ///    call [`Self::store_ids`] and [`Self::store_dirty_nodes`].
+    /// 1. If neither the metadata version advanced nor dirty nodes are
+    ///    pending, return `Ok(false)` without writing anything.
+    /// 2. [`Self::store_ids`] and [`Self::store_dirty_nodes`].
+    /// 3. [`Self::store_metadata_with`] — the metadata version watermark is
+    ///    only committed after the ids and nodes it describes were written,
+    ///    so a node-write failure leaves the whole flush pending for retry
+    ///    instead of committed metadata pointing at missing node blobs.
     ///
     /// `f` receives `(id, &cbor_bytes)` and returns:
     /// * `Ok(true)` — continue with the next dirty node.
@@ -1667,7 +1805,7 @@ impl HnswIndex {
     /// Returns `true` iff any work was actually committed.
     pub async fn flush<W: Write, F>(
         &self,
-        metadata: W,
+        mut metadata: W,
         ids: W,
         now_ms: u64,
         f: F,
@@ -1675,14 +1813,19 @@ impl HnswIndex {
     where
         F: AsyncFnMut(u64, &[u8]) -> Result<bool, BoxError>,
     {
-        let meta_saved = self.store_metadata(metadata, now_ms)?;
         let had_dirty = self.has_dirty_nodes();
-        if !meta_saved && !had_dirty {
+        if !self.has_pending_metadata_flush() && !had_dirty {
             return Ok(false);
         }
 
         self.store_ids(ids)?;
         self.store_dirty_nodes(f).await?;
+        let meta_saved = self
+            .store_metadata_with(now_ms, async |data| {
+                metadata.write_all(data)?;
+                Ok(())
+            })
+            .await?;
         Ok(meta_saved || had_dirty)
     }
 
@@ -1788,6 +1931,7 @@ impl HnswIndex {
             &HnswIndexRef {
                 entry_point: *self.entry_point.read(),
                 metadata: &meta,
+                removed_nodes: self.removed_nodes.read().iter().copied().collect(),
             },
             w,
         ) {
@@ -1862,6 +2006,7 @@ impl HnswIndex {
             &HnswIndexRef {
                 entry_point: *self.entry_point.read(),
                 metadata: &meta,
+                removed_nodes: self.removed_nodes.read().iter().copied().collect(),
             },
             &mut buf,
         ) {
@@ -1977,7 +2122,11 @@ impl HnswIndex {
     }
 
     /// Repairs the entry point by selecting the live node with the highest layer.
+    ///
+    /// Also resynchronizes the per-layer id tracker from the authoritative
+    /// node map, since this method is the self-heal path for corrupted state.
     fn repair_entry_point(&self) -> u8 {
+        self.rebuild_nodes_by_layer();
         let nodes = self.nodes.pin();
         let max_layer = if let Some((_, node)) = nodes.iter().max_by_key(|(_, node)| node.layer) {
             *self.entry_point.write() = (node.id, node.layer);
@@ -1997,6 +2146,51 @@ impl HnswIndex {
         }
 
         max_layer
+    }
+
+    /// Records `id` as living on `layer` in the per-layer tracker.
+    fn track_node_layer(&self, id: u64, layer: u8) {
+        self.nodes_by_layer
+            .lock()
+            .entry(layer)
+            .or_default()
+            .insert(id);
+    }
+
+    /// Removes `id` from the per-layer tracker.
+    fn untrack_node_layer(&self, id: u64, layer: u8) {
+        let mut by_layer = self.nodes_by_layer.lock();
+        if let Some(ids) = by_layer.get_mut(&layer) {
+            ids.remove(&id);
+            if ids.is_empty() {
+                by_layer.remove(&layer);
+            }
+        }
+    }
+
+    /// Rebuilds the per-layer tracker from the authoritative node map.
+    fn rebuild_nodes_by_layer(&self) {
+        let nodes = self.nodes.pin();
+        let mut by_layer: BTreeMap<u8, BTreeSet<u64>> = BTreeMap::new();
+        for (id, node) in nodes.iter() {
+            by_layer.entry(node.layer).or_default().insert(*id);
+        }
+        *self.nodes_by_layer.lock() = by_layer;
+    }
+
+    /// Returns `(id, layer)` of some node on the highest tracked layer, or
+    /// `None` when the tracker is empty.
+    fn highest_tracked_node(&self) -> Option<(u64, u8)> {
+        let by_layer = self.nodes_by_layer.lock();
+        by_layer
+            .iter()
+            .next_back()
+            .and_then(|(layer, ids)| ids.iter().next().map(|id| (*id, *layer)))
+    }
+
+    /// Returns the highest tracked layer, or `None` when the tracker is empty.
+    fn max_tracked_layer(&self) -> Option<u8> {
+        self.nodes_by_layer.lock().keys().next_back().copied()
     }
 
     /// Removes all edges that point to node blobs missing during bootstrap.
@@ -2094,6 +2288,7 @@ mod tests {
             &HnswIndexRef {
                 entry_point,
                 metadata,
+                removed_nodes: Vec::new(),
             },
             &mut buf,
         )
@@ -2369,6 +2564,121 @@ mod tests {
         assert!(index.has_removed_nodes());
         index.purge_removed_nodes(async |_| Ok(true)).await.unwrap();
         assert!(!index.has_removed_nodes());
+    }
+
+    #[tokio::test]
+    async fn test_removed_tombstones_survive_flush_and_reload() {
+        let index = HnswIndex::new("tombstones".to_string(), Some(test_config()));
+        index.insert_f32(1, vec![1.0, 1.0], 0).unwrap();
+        index.insert_f32(2, vec![2.0, 2.0], 0).unwrap();
+
+        let mut metadata = Vec::new();
+        let mut ids = Vec::new();
+        let mut blobs: HashMap<u64, Vec<u8>> = HashMap::new();
+        index
+            .flush(&mut metadata, &mut ids, 1, async |id, data| {
+                blobs.insert(id, data.to_vec());
+                Ok(true)
+            })
+            .await
+            .unwrap();
+
+        // Remove a node and flush again, but crash BEFORE purge: the
+        // tombstone must be persisted with the metadata.
+        assert!(index.remove(2, 2));
+        let mut metadata = Vec::new();
+        let mut ids = Vec::new();
+        index
+            .flush(&mut metadata, &mut ids, 3, async |id, data| {
+                blobs.insert(id, data.to_vec());
+                Ok(true)
+            })
+            .await
+            .unwrap();
+
+        // Reload: the pending deletion is re-queued and handed to purge, so
+        // the orphaned blob does not leak.
+        let reloaded = HnswIndex::load_all(metadata.as_slice(), ids.as_slice(), async |id| {
+            Ok(blobs.get(&id).cloned())
+        })
+        .await
+        .unwrap();
+        assert_eq!(reloaded.len(), 1);
+        assert!(reloaded.has_removed_nodes());
+        let mut purged = Vec::new();
+        reloaded
+            .purge_removed_nodes(async |id| {
+                purged.push(id);
+                Ok(true)
+            })
+            .await
+            .unwrap();
+        assert_eq!(purged, vec![2]);
+
+        // Metadata written by older versions (without the tombstone field)
+        // must still load.
+        #[derive(Serialize)]
+        struct LegacyIndexRef<'a> {
+            entry_point: (u64, u8),
+            metadata: &'a HnswMetadata,
+        }
+        let mut legacy = Vec::new();
+        cbor2::to_writer(
+            &LegacyIndexRef {
+                entry_point: (1, 0),
+                metadata: &index.metadata(),
+            },
+            &mut legacy,
+        )
+        .unwrap();
+        let legacy_index = HnswIndex::load_metadata(legacy.as_slice()).unwrap();
+        assert!(!legacy_index.has_removed_nodes());
+    }
+
+    #[tokio::test]
+    async fn test_flush_does_not_commit_metadata_when_node_write_fails() {
+        let index = HnswIndex::new("flush_order".to_string(), Some(test_config()));
+        index.insert_f32(1, vec![1.0, 1.0], 0).unwrap();
+
+        // Node persistence fails: the metadata version watermark must NOT
+        // have been committed (ids and nodes are written first).
+        let mut metadata = Vec::new();
+        let mut ids = Vec::new();
+        let err = index
+            .flush(&mut metadata, &mut ids, 1, async |_, _| {
+                Err::<bool, _>("node write failed".into())
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HnswError::Generic { .. }));
+        assert!(metadata.is_empty());
+        assert!(index.has_pending_metadata_flush());
+        assert!(index.has_dirty_nodes());
+
+        // The next flush retries nodes, ids and metadata together.
+        let mut metadata = Vec::new();
+        let mut ids = Vec::new();
+        let mut blobs: HashMap<u64, Vec<u8>> = HashMap::new();
+        assert!(
+            index
+                .flush(&mut metadata, &mut ids, 2, async |id, data| {
+                    blobs.insert(id, data.to_vec());
+                    Ok(true)
+                })
+                .await
+                .unwrap()
+        );
+        assert!(!metadata.is_empty());
+        assert!(!index.has_pending_metadata_flush());
+        assert!(!index.has_dirty_nodes());
+
+        let reloaded = HnswIndex::load_all(metadata.as_slice(), ids.as_slice(), async |id| {
+            Ok(blobs.get(&id).cloned())
+        })
+        .await
+        .unwrap();
+        assert_eq!(reloaded.len(), 1);
+        assert_eq!(reloaded.search_f32(&[1.0, 1.0], 1).unwrap()[0].0, 1);
     }
 
     #[tokio::test]

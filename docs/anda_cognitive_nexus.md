@@ -506,19 +506,26 @@ arrays, preserving alignment across rows.
 | `?c {type: "T", name: "N"}`                  | `execute_concept_clause` — composite `(type,name)` BTree lookup.        |
 | `(?s, "p", ?o)`                              | `execute_proposition_clause` — see §8.3.                                |
 | `FILTER(...)`                                | `execute_filter_clause` — see §8.4.                                     |
-| `OPTIONAL { ... }` / `NOT { ... }` / `UNION` | `execute_optional_scope` / `execute_not_scope` / `execute_union_scope`. |
+| `OPTIONAL { ... }` / `NOT { ... }` / `UNION` | `execute_optional_clause` / `execute_not_clause` / `execute_union_clause`. |
 
-Each routine is allowed to *narrow* an existing variable binding or to
-*introduce* new ones; it never widens an already-bound variable.
+Top-level pattern clauses and `NOT` / `FILTER` only *narrow* an
+existing variable binding or *introduce* new ones. `OPTIONAL` and
+`UNION` merge their sub-block bindings back into the outer context and
+**may widen** a same-named variable — per KIP §3.4.7.2/§3.4.7.3 both
+blocks contribute independent solutions (left-join padding for
+`OPTIONAL`, row-wise union for `UNION`).
 
 ### 8.3 Multi-hop matching
 
 A proposition pattern with a `{m,n}` repetition compiles to a BFS over
 the `subject`-keyed BTree index, using `EntityID::to_string()` as the
 seed. The BFS skips zero-hop unless the user explicitly wrote `{0,n}`
-(introduced in RC6 §3.1.3); each hop merges newly-reachable entities
-into the current frontier and stops when (a) the frontier stabilises
-or (b) the upper bound is reached.
+(introduced in RC6 §3.1.3). It enumerates *paths* (`bfs_multi_hop`):
+each queue entry is a path whose end node is extended one hop at a
+time, a `(node, depth)` visited set prevents re-expanding the same
+state, and every path whose length falls inside `[m, n]` (engine cap:
+10 hops) and whose end matches the target term is collected as a
+result row.
 
 The matching helpers
 `handle_subject_object_ids_matching`,

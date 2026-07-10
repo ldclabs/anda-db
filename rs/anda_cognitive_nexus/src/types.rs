@@ -280,6 +280,14 @@ pub struct QueryContext {
     /// Variables whose field-level values participate in row-sensitive filtering.
     pub row_sensitive_vars: FxHashSet<String>,
 
+    /// Variables that passed through a cross-variable `FILTER` whose
+    /// satisfying combinations could **not** be recorded as a synthetic
+    /// relation (more than two entity variables or more than one predicate
+    /// variable). Their bindings are existentially narrowed only, so a
+    /// multi-column `FIND` over two or more of them cannot stay
+    /// solution-aligned and is rejected with `KIP_4002`.
+    pub unaligned_filter_vars: FxHashSet<String>,
+
     /// Row-level bindings produced by proposition clauses.
     ///
     /// These preserve the tuple relationship between a proposition link and its
@@ -341,6 +349,22 @@ pub struct QueryCache {
     pub propositions: RwLock<FxHashMap<u64, Proposition>>,
 }
 
+/// Provenance of a relation binding. `FIND` and `NOT` use it to pick the
+/// correct combining semantics: `Pattern` relations are conjunctive
+/// (row-level equi-join, KIP §3.4), `Union` relations contribute a row-wise
+/// union (KIP §3.4.7.3), and `Optional` relations never restrict the outer
+/// solution set (KIP §3.4.7.2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RelationOrigin {
+    /// Produced by a top-level (mandatory) graph pattern clause.
+    #[default]
+    Pattern,
+    /// Produced inside an `OPTIONAL { … }` block.
+    Optional,
+    /// Produced inside a `UNION { … }` block.
+    Union,
+}
+
 /// Variables attached to the rows emitted by one proposition clause.
 #[derive(Clone, Debug)]
 pub struct QueryRelationBinding {
@@ -354,6 +378,8 @@ pub struct QueryRelationBinding {
     pub object_var: Option<String>,
     /// Concrete relation rows produced by the clause.
     pub rows: Vec<QueryRelationRow>,
+    /// Which kind of clause produced this relation (see [`RelationOrigin`]).
+    pub origin: RelationOrigin,
 }
 
 /// One concrete proposition-clause match.
@@ -675,6 +701,7 @@ mod tests {
             predicate_var: Some("pred".to_string()),
             object_var: Some("o".to_string()),
             rows: vec![row.clone()],
+            origin: RelationOrigin::default(),
         };
         assert_eq!(binding.rows[0].predicate, row.predicate);
 

@@ -56,9 +56,18 @@ struct InnerStorage {
 }
 
 /// Configuration for the object store storage layer.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+///
+/// **All fields are fixed at first initialization**: once a storage instance
+/// has persisted its metadata (`storage_meta.cbor`), reconnecting reuses the
+/// persisted configuration and the caller-supplied values are ignored (a
+/// mismatch is logged as a warning).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct StorageConfig {
-    /// Maximum number of items in the cache. 0 disables the cache.
+    /// Maximum cache capacity in weighted units. An entry weighs
+    /// `max(1, object_size_in_bytes / 1024)`: small objects (≤ 1 KiB) weigh 1,
+    /// so this behaves like an entry count for small objects while bounding
+    /// total cache memory to roughly `cache_max_capacity` KiB for large ones.
+    /// 0 disables the cache.
     pub cache_max_capacity: u64,
     /// Zstd compression level. 0 disables compression, 1-22 represent compression levels.
     /// Default is 3. 22 indicates the highest compression ratio.
@@ -278,8 +287,21 @@ impl Storage {
         };
 
         let storage = Storage::new(object_store.clone(), metadata)?;
-        match storage.fetch(Storage::METADATA_PATH).await {
-            Ok((metadata, _)) => Storage::new(object_store, metadata),
+        match storage.fetch::<StorageMetadata>(Storage::METADATA_PATH).await {
+            Ok((metadata, _)) => {
+                // The persisted configuration is authoritative; the
+                // caller-supplied config is only used at first initialization.
+                if metadata.config != storage.inner.metadata.config {
+                    log::warn!(
+                        action = "Storage::connect",
+                        path = metadata.path;
+                        "Ignoring caller-supplied storage config that differs from the persisted one: persisted={:?}, supplied={:?}",
+                        metadata.config,
+                        storage.inner.metadata.config,
+                    );
+                }
+                Storage::new(object_store, metadata)
+            }
             Err(DBError::NotFound { .. }) => Ok(storage),
             Err(err) => Err(err),
         }
@@ -317,6 +339,15 @@ impl Storage {
 
         if prev_last_saved >= now_ms && !check_point_advanced {
             // Skip only when both timestamp and checkpoint are unchanged.
+            //
+            // Known limitations (accepted, low risk):
+            // - `last_saved` uses wall-clock time; a backwards clock jump can
+            //   keep this branch skipping writes until the clock catches up
+            //   with the previously persisted timestamp (a forward-advancing
+            //   checkpoint still forces a write).
+            // - `version` below is incremented before the write and not rolled
+            //   back on failure, so it may drift ahead; it is only used for
+            //   statistics, never for preconditions.
             return Ok(());
         }
 
@@ -333,11 +364,18 @@ impl Storage {
         object_store: Arc<dyn ObjectStore>,
         metadata: StorageMetadata,
     ) -> Result<Storage, DBError> {
-        // Create a cache with a size limit
+        // Create a cache with a size limit. Entries are weighed by size
+        // (`max(1, bytes / 1024)`) instead of counted, so a workload of large
+        // objects cannot blow up memory to `capacity * max_small_object_size`;
+        // for small objects the weight is 1 and the capacity still behaves
+        // like an entry count.
         let cache = if metadata.config.cache_max_capacity > 0 {
             Some(
                 Cache::builder()
                     .max_capacity(metadata.config.cache_max_capacity)
+                    .weigher(|_key: &Path, value: &Arc<(Bytes, ObjectVersion)>| {
+                        (value.0.len() / 1024).max(1).min(u32::MAX as usize) as u32
+                    })
                     .build(),
             )
         } else {
@@ -406,6 +444,9 @@ impl Storage {
 
     /// Fetches the raw bytes of a document directly from the object store, bypassing the cache.
     ///
+    /// Objects that start with the zstd magic bytes are transparently
+    /// decompressed; see the round-trip caveat on [`Storage::put_bytes`].
+    ///
     /// # Arguments
     ///
     /// * `doc_path` - The relative path of the document within the storage base path.
@@ -438,7 +479,10 @@ impl Storage {
         // max_small_object_size, so normal data always fits within this limit.
         let max_decompress_size =
             (self.inner.metadata.config.max_small_object_size as u64).saturating_mul(16);
-        let bytes = try_decompress(bytes, max_decompress_size);
+        let bytes = try_decompress(bytes, max_decompress_size).map_err(|err| DBError::Storage {
+            name: path.to_string(),
+            source: err.into(),
+        })?;
         self.inner
             .stats
             .total_fetch_count
@@ -625,6 +669,16 @@ impl Storage {
     /// Compresses the data if enabled.
     /// This method is suitable only for data smaller than `max_small_object_size`.
     /// Use `stream_writer` for larger data.
+    ///
+    /// # Round-trip caveat
+    ///
+    /// The read path ([`Storage::fetch_bytes`]) decides whether to decompress
+    /// solely by the zstd magic bytes at the start of the stored object.
+    /// Storing a payload that itself begins with the zstd magic (e.g. user
+    /// data that is already zstd-compressed) is therefore **not byte-stable**:
+    /// reading it back returns the decompressed frame, not the stored bytes.
+    /// All data written by this crate (CBOR documents, index objects) never
+    /// starts with the magic, so this only affects external payloads.
     ///
     /// # Arguments
     ///
@@ -826,14 +880,23 @@ impl Storage {
             .list(Some(&prefix))
             .map_err(DBError::from)
             .try_for_each_concurrent(16, move |meta| {
-                let object_store = self.inner.object_store.clone();
-                let cache = self.inner.cache.clone();
+                let inner = self.inner.clone();
                 async move {
                     // 删除对象
-                    object_store.delete(&meta.location).await?;
-                    if let Some(cache) = &cache {
+                    inner.object_store.delete(&meta.location).await?;
+                    // Bump the write sequence before invalidating the cache,
+                    // mirroring `Storage::delete`: a concurrent `inner_get`
+                    // that fetched the pre-delete bytes must not re-populate
+                    // the cache after our removal, or the deleted object would
+                    // keep being served from the cache.
+                    inner.write_seq.fetch_add(1, Ordering::AcqRel);
+                    if let Some(cache) = &inner.cache {
                         cache.remove(&meta.location).await;
                     }
+                    inner
+                        .stats
+                        .total_delete_count
+                        .fetch_add(1, Ordering::Relaxed);
                     Ok(())
                 }
             })
@@ -1013,46 +1076,36 @@ fn try_compress(data: Bytes, compress_level: i32) -> Bytes {
 }
 
 /// Decompresses bytes using zstd-safe.
+///
+/// Data without the zstd magic passes through unchanged. Data with the magic
+/// that cannot be decompressed (corrupt frame, or a decompressed size beyond
+/// `max_size`) returns an error: silently passing the still-compressed bytes
+/// downstream would surface as an unrelated deserialization error that is much
+/// harder to diagnose.
 #[inline]
-fn try_decompress(data: Bytes, max_size: u64) -> Bytes {
+fn try_decompress(data: Bytes, max_size: u64) -> Result<Bytes, String> {
     if !zstd_compressed(data.as_ref()) {
-        return data;
+        return Ok(data);
     }
 
     match zstd_safe::find_decompressed_size(data.as_ref()) {
         Ok(Some(size)) => {
             if size > max_size {
-                log::warn!(
-                    "Decompressed size {} exceeds max_size {}, skip decompress",
-                    size,
-                    max_size
-                );
-                return data;
+                return Err(format!(
+                    "decompressed size {size} exceeds the maximum of {max_size}"
+                ));
             }
             let mut buf = Vec::with_capacity(size as usize);
             match zstd_safe::decompress(&mut buf, &data[..]) {
-                Ok(_) => buf.into(),
-                Err(err) => {
-                    log::error!("Failed to decompress (known size): {err:?}");
-                    data
-                }
+                Ok(_) => Ok(buf.into()),
+                Err(err) => Err(format!("failed to decompress (known size): {err:?}")),
             }
         }
         // Unknown decompressed size: fall back to streaming decompression with a
         // growing output buffer, capped by `max_size` to mitigate decompression
-        // bombs. Returning the still-compressed bytes (the previous behaviour)
-        // would silently corrupt downstream deserialization.
-        Ok(None) => match streaming_decompress(&data, max_size) {
-            Ok(buf) => buf.into(),
-            Err(err) => {
-                log::error!("Failed to streaming-decompress: {err}");
-                data
-            }
-        },
-        Err(err) => {
-            log::error!("find_decompressed_size error: {err:?}");
-            data
-        }
+        // bombs.
+        Ok(None) => streaming_decompress(&data, max_size).map(Bytes::from),
+        Err(err) => Err(format!("find_decompressed_size error: {err:?}")),
     }
 }
 
@@ -1497,6 +1550,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_single_writer_one_shot_contract() {
+        let storage = create_test_storage().await;
+
+        let mut writer = storage.to_writer("one_shot", PutMode::Create);
+        tokio::io::AsyncWriteExt::write_all(&mut writer, b"first")
+            .await
+            .unwrap();
+        tokio::io::AsyncWriteExt::flush(&mut writer).await.unwrap();
+        assert!(writer.take_version().is_some());
+        assert!(writer.take_version().is_none());
+
+        // The buffer is consumed by the first flush. Writing again and
+        // flushing performs a second independent put with the same mode; with
+        // PutMode::Create it fails (the object already exists) and the second
+        // buffer is lost — SingleWriter is effectively a one-shot writer.
+        tokio::io::AsyncWriteExt::write_all(&mut writer, b"second")
+            .await
+            .unwrap();
+        let err = tokio::io::AsyncWriteExt::flush(&mut writer)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+
+        // The stored object still holds the first flush's contents, and a
+        // subsequent empty flush is a no-op.
+        let (data, _) = storage.fetch_bytes("one_shot").await.unwrap();
+        assert_eq!(&data[..], b"first");
+        tokio::io::AsyncWriteExt::flush(&mut writer).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_drop_prefix_updates_write_seq_and_delete_count() {
+        let storage = create_test_storage().await;
+
+        #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+        struct T {
+            k: u32,
+        }
+
+        storage.create("del/a", &T { k: 1 }).await.unwrap();
+        storage.create("del/b", &T { k: 2 }).await.unwrap();
+        let _ = storage.get::<T>("del/a").await.unwrap();
+
+        let seq_before = storage.inner.write_seq.load(Ordering::Acquire);
+        let deletes_before = storage.stats().total_delete_count;
+        storage.drop_prefix("del/").await.unwrap();
+
+        // Each deleted object bumps the write sequence (so a racing get
+        // cannot re-populate the cache with pre-delete bytes) and the delete
+        // counter.
+        assert!(storage.inner.write_seq.load(Ordering::Acquire) >= seq_before + 2);
+        assert_eq!(storage.stats().total_delete_count, deletes_before + 2);
+        assert!(matches!(
+            storage.get::<T>("del/a").await,
+            Err(DBError::NotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
     async fn test_private_cache_list_and_compression_edges() {
         let storage = create_test_storage().await;
 
@@ -1544,15 +1656,18 @@ mod tests {
         let original = Bytes::from(vec![b'a'; 8192]);
         let compressed = try_compress(original.clone(), 3);
         assert!(zstd_compressed(compressed.as_ref()));
-        assert_eq!(try_decompress(compressed.clone(), u64::MAX), original);
-        assert_eq!(try_decompress(compressed.clone(), 1), compressed);
+        assert_eq!(try_decompress(compressed.clone(), u64::MAX).unwrap(), original);
+        // Oversized or corrupt frames error out instead of silently returning
+        // the compressed bytes (which would surface as an unrelated
+        // deserialization error downstream).
+        assert!(try_decompress(compressed.clone(), 1).is_err());
         assert_eq!(
-            try_decompress(Bytes::from_static(b"plain"), 100),
+            try_decompress(Bytes::from_static(b"plain"), 100).unwrap(),
             Bytes::from_static(b"plain")
         );
 
         let invalid_frame = Bytes::from_static(b"\x28\xb5\x2f\xfdinvalid");
-        assert_eq!(try_decompress(invalid_frame.clone(), 100), invalid_frame);
+        assert!(try_decompress(invalid_frame.clone(), 100).is_err());
         assert!(streaming_decompress(compressed.as_ref(), u64::MAX).is_ok());
         assert!(streaming_decompress(compressed.as_ref(), 1).is_err());
         assert!(!zstd_compressed(b"abc"));

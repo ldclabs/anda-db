@@ -1,6 +1,6 @@
 [package]
 name = "anda_object_store"
-version = "0.9.0"
+version = "0.9.2"
 description = "A Rust library that extends the functionality of the object_store crate with metadata management and encryption."
 keywords = ["database", "object_store", "encryption", "anda", "AndaDB"]
 categories = ["database", "data-structures", "text-processing"]
@@ -15,6 +15,7 @@ base64 = { workspace = true }
 bytes = { workspace = true }
 cbor2 = { workspace = true }
 futures = { workspace = true }
+log = { workspace = true }
 serde = { workspace = true }
 serde_bytes = { workspace = true }
 sha3 = { workspace = true }

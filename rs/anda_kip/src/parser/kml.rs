@@ -1,7 +1,6 @@
 use nom::{
     Parser,
     branch::alt,
-    bytes::complete::tag,
     character::complete::{char, multispace1},
     combinator::{cut, map, map_res, opt},
     error::context,
@@ -10,7 +9,7 @@ use nom::{
 };
 
 use super::common::*;
-use super::json::{json_value, parse_number};
+use super::json::{ensure_unique_keys, json_value, parse_number};
 use super::kql::{
     parse_concept_matcher, parse_limit_clause, parse_prop_mather, parse_target_term,
     parse_where_block,
@@ -219,24 +218,26 @@ fn parse_update_statement(input: &str) -> VResult<'_, UpdateStatement> {
 }
 
 /// Parses an UPDATE SET map whose values may be JSON values or update expressions.
+/// Duplicate keys are rejected as a parse error.
 fn parse_update_value_map(input: &str) -> VResult<'_, Vec<(String, UpdateValue)>> {
-    map(
-        context(
-            "UPDATE SET map",
-            preceded(
-                ws(char('{')),
-                cut(terminated(
-                    opt(terminated(
-                        separated_list1(ws(char(',')), parse_update_key_value),
-                        opt(ws(char(','))), // Allow trailing comma
-                    )),
-                    ws(char('}')),
+    let (remaining, opt_kvs) = context(
+        "UPDATE SET map",
+        preceded(
+            ws(char('{')),
+            cut(terminated(
+                opt(terminated(
+                    separated_list1(ws(char(',')), parse_update_key_value),
+                    opt(ws(char(','))), // Allow trailing comma
                 )),
-            ),
+                ws(char('}')),
+            )),
         ),
-        |kvs| kvs.unwrap_or_default(),
     )
-    .parse(input)
+    .parse(input)?;
+
+    let kvs = opt_kvs.unwrap_or_default();
+    ensure_unique_keys(input, &kvs)?;
+    Ok((remaining, kvs))
 }
 
 fn parse_update_key_value(input: &str) -> VResult<'_, (String, UpdateValue)> {
@@ -290,10 +291,10 @@ fn parse_update_expr_function(input: &str) -> VResult<'_, UpdateExpr> {
 
 fn parse_update_function(input: &str) -> VResult<'_, UpdateFunction> {
     alt((
-        map(tag("ADD"), |_| UpdateFunction::Add),
-        map(tag("MUL"), |_| UpdateFunction::Mul),
-        map(tag("CLAMP"), |_| UpdateFunction::Clamp),
-        map(tag("COALESCE"), |_| UpdateFunction::Coalesce),
+        map(word("ADD"), |_| UpdateFunction::Add),
+        map(word("MUL"), |_| UpdateFunction::Mul),
+        map(word("CLAMP"), |_| UpdateFunction::Clamp),
+        map(word("COALESCE"), |_| UpdateFunction::Coalesce),
     ))
     .parse(input)
 }
@@ -327,7 +328,7 @@ fn parse_merge_statement(input: &str) -> VResult<'_, MergeStatement> {
                 ws(keywords(&["MERGE", "CONCEPT"])),
                 cut((
                     ws(variable),
-                    preceded(ws(tag("INTO")), ws(variable)),
+                    preceded(ws(word("INTO")), ws(variable)),
                     parse_where_block,
                 )),
             ),
@@ -364,10 +365,10 @@ fn parse_delete_attributes(input: &str) -> VResult<'_, DeleteStatement> {
         "DELETE ATTRIBUTES ...",
         map(
             preceded(
-                ws(tag("ATTRIBUTES")),
+                ws(word("ATTRIBUTES")),
                 cut((
                     braced_block(separated_list1(ws(char(',')), quoted_string)),
-                    preceded(ws(tag("FROM")), variable),
+                    preceded(ws(word("FROM")), variable),
                     parse_where_block,
                 )),
             ),
@@ -386,10 +387,10 @@ fn parse_delete_metadata(input: &str) -> VResult<'_, DeleteStatement> {
         "DELETE METADATA ...",
         map(
             preceded(
-                ws(tag("METADATA")),
+                ws(word("METADATA")),
                 cut((
                     braced_block(separated_list1(ws(char(',')), quoted_string)),
-                    preceded(ws(tag("FROM")), variable),
+                    preceded(ws(word("FROM")), variable),
                     parse_where_block,
                 )),
             ),
@@ -408,7 +409,7 @@ fn parse_delete_propositions(input: &str) -> VResult<'_, DeleteStatement> {
         "DELETE PROPOSITIONS ...",
         map(
             preceded(
-                ws(tag("PROPOSITIONS")),
+                ws(word("PROPOSITIONS")),
                 cut((ws(variable), parse_where_block)),
             ),
             |(target, where_clauses)| DeleteStatement::DeletePropositions {
@@ -425,8 +426,8 @@ fn parse_delete_concept(input: &str) -> VResult<'_, DeleteStatement> {
         "DELETE CONCEPT ...",
         map(
             preceded(
-                ws(tag("CONCEPT")),
-                cut((terminated(variable, ws(tag("DETACH"))), parse_where_block)),
+                ws(word("CONCEPT")),
+                cut((terminated(variable, ws(word("DETACH"))), parse_where_block)),
             ),
             |(target, where_clauses)| DeleteStatement::DeleteConcept {
                 target,
@@ -1374,5 +1375,61 @@ mod tests {
         );
         // MERGE without WHERE is invalid
         assert!(parse_kml_statement("MERGE CONCEPT ?dup INTO ?canonical").is_err());
+    }
+
+    #[test]
+    fn test_duplicate_keys_rejected_in_kml_maps() {
+        // SET ATTRIBUTES with a duplicate key must fail instead of last-wins,
+        // and the error must point at the duplicate key.
+        let err = crate::parse_kml(
+            r#"UPSERT { CONCEPT ?c { {type: "T", name: "x"} SET ATTRIBUTES { a: 1, a: 2 } } }"#,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("duplicate key"),
+            "unexpected error: {err:?}"
+        );
+        // WITH METADATA with a duplicate key must fail.
+        assert!(
+            crate::parse_kml(
+                r#"UPSERT { CONCEPT ?c { {type: "T", name: "x"} } WITH METADATA { s: "a", s: "b" } }"#
+            )
+            .is_err()
+        );
+        // Duplicate keys in a nested JSON object value must fail.
+        assert!(
+            crate::parse_kml(
+                r#"UPSERT { CONCEPT ?c { {type: "T", name: "x"} SET ATTRIBUTES { a: { b: 1, b: 2 } } } }"#
+            )
+            .is_err()
+        );
+        // UPDATE SET map with a duplicate key must fail.
+        assert!(
+            crate::parse_kml(
+                r#"UPDATE ?t SET ATTRIBUTES { n: 1, n: ADD(?t.attributes.n, 1) } WHERE { ?t {type: "T"} }"#
+            )
+            .is_err()
+        );
+
+        // Unique keys still parse everywhere.
+        assert!(
+            crate::parse_kml(
+                r#"UPSERT { CONCEPT ?c { {type: "T", name: "x"} SET ATTRIBUTES { a: 1, b: { c: 2 } } } WITH METADATA { s: "a" } }"#
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_kml_keywords_require_word_boundary() {
+        // Keyword prefixes of longer identifiers must not silently match.
+        assert!(
+            crate::parse_kml(r#"MERGE CONCEPT ?a INTOX ?b WHERE { ?a {id: "1"} ?b {id: "2"} }"#)
+                .is_err()
+        );
+        assert!(crate::parse_kml(r#"DELETE CONCEPT ?c DETACHX WHERE { ?c {id: "1"} }"#).is_err());
+        assert!(crate::parse_kml(r#"DELETE CONCEPTS ?c DETACH WHERE { ?c {id: "1"} }"#).is_err());
+        // The regular spellings still parse.
+        assert!(crate::parse_kml(r#"DELETE CONCEPT ?c DETACH WHERE { ?c {id: "1"} }"#).is_ok());
     }
 }

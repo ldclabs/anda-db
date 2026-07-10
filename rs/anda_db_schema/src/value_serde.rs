@@ -21,6 +21,11 @@
 //! Earlier versions instead promoted any Base64-decodable string to `Bytes`,
 //! which corrupted ordinary text like `"test"` — that heuristic is gone.
 //!
+//! Strings and object keys embedded in a [`FieldValue::Json`] payload are
+//! escaped with the same rules (see [`JsonEscaped`]): the deserializer cannot
+//! tell them apart from top-level text, so a colliding string such as
+//! `"b64:AQID"` inside a JSON document must round-trip as `"txt:b64:AQID"`.
+//!
 //! CBOR (non-human-readable) encoding is unchanged: byte strings, integers
 //! and text map to their native CBOR types with no prefixes.
 use base64::{Engine, prelude::BASE64_URL_SAFE};
@@ -30,7 +35,7 @@ use serde::{
 };
 use std::collections::BTreeMap;
 
-use crate::{FieldKey, FieldValue};
+use crate::{FieldKey, FieldValue, Json};
 
 /// Human-readable encoding of a [`FieldKey::I64`] map key.
 const I64_KEY_PREFIX: &str = "i64:";
@@ -46,6 +51,45 @@ const TXT_PREFIX: &str = "txt:";
 /// costs nothing and keeps the rule uniform.
 fn needs_txt_escape(text: &str) -> bool {
     text.starts_with(B64_PREFIX) || text.starts_with(TXT_PREFIX) || text.starts_with(I64_KEY_PREFIX)
+}
+
+/// Human-readable serialization of the JSON payload inside
+/// [`FieldValue::Json`].
+///
+/// The deserializer interprets the reserved prefixes on *every* string it
+/// sees, including strings that used to live inside a `Json` variant, so the
+/// serializer must escape embedded strings and object keys symmetrically.
+/// Without this, `Json("b64:AQID")` would come back as `Bytes([1, 2, 3])`
+/// and `Json("txt:x")` would be silently stripped to `"x"`.
+struct JsonEscaped<'a>(&'a Json);
+
+impl Serialize for JsonEscaped<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.0 {
+            Json::String(s) if needs_txt_escape(s) => {
+                format!("{TXT_PREFIX}{s}").serialize(serializer)
+            }
+            Json::Array(arr) => {
+                let mut seq = serializer.serialize_seq(Some(arr.len()))?;
+                for v in arr {
+                    seq.serialize_element(&JsonEscaped(v))?;
+                }
+                seq.end()
+            }
+            Json::Object(obj) => {
+                let mut map = serializer.serialize_map(Some(obj.len()))?;
+                for (k, v) in obj {
+                    if needs_txt_escape(k) {
+                        map.serialize_entry(&format!("{TXT_PREFIX}{k}"), &JsonEscaped(v))?;
+                    } else {
+                        map.serialize_entry(k, &JsonEscaped(v))?;
+                    }
+                }
+                map.end()
+            }
+            v => v.serialize(serializer),
+        }
+    }
 }
 
 impl Serialize for FieldKey {
@@ -139,7 +183,13 @@ impl Serialize for FieldValue {
                     serializer.serialize_str(x)
                 }
             }
-            FieldValue::Json(x) => x.serialize(serializer),
+            FieldValue::Json(x) => {
+                if serializer.is_human_readable() {
+                    JsonEscaped(x).serialize(serializer)
+                } else {
+                    x.serialize(serializer)
+                }
+            }
             FieldValue::Null => serializer.serialize_unit(),
             FieldValue::Vector(x) => {
                 let mut seq = serializer.serialize_seq(Some(x.len()))?;
@@ -660,6 +710,73 @@ mod tests {
         );
         let decoded: FieldValue = serde_json::from_value(json_value).unwrap();
         assert_eq!(decoded, FieldValue::Map(map));
+    }
+
+    #[test]
+    fn field_value_json_escapes_reserved_prefixes_in_human_readable() {
+        // Strings and object keys inside a Json payload must survive a JSON
+        // round trip even when they collide with the reserved prefixes.
+        let val = FieldValue::Json(json!({
+            "plain": "hello",
+            "b64:key": "b64:AQID",
+            "nested": ["txt:x", {"i64:5": "i64:7"}],
+        }));
+        let encoded = serde_json::to_string(&val).unwrap();
+        assert!(encoded.contains("txt:b64:AQID"), "encoded: {encoded}");
+        assert!(encoded.contains("txt:b64:key"), "encoded: {encoded}");
+
+        // Untyped readback yields a Map (JSON objects are indistinguishable
+        // from maps), but every embedded string comes back verbatim.
+        let decoded: FieldValue = serde_json::from_str(&encoded).unwrap();
+        let expected = FieldValue::Map(BTreeMap::from([
+            (
+                FieldKey::Text("plain".into()),
+                FieldValue::Text("hello".into()),
+            ),
+            (
+                FieldKey::Text("b64:key".into()),
+                FieldValue::Text("b64:AQID".into()),
+            ),
+            (
+                FieldKey::Text("nested".into()),
+                FieldValue::Array(vec![
+                    FieldValue::Text("txt:x".into()),
+                    FieldValue::Map(BTreeMap::from([(
+                        FieldKey::Text("i64:5".into()),
+                        FieldValue::Text("i64:7".into()),
+                    )])),
+                ]),
+            ),
+        ]));
+        assert_eq!(decoded, expected);
+
+        // A bare Json string that collides with a prefix round-trips too.
+        let val = FieldValue::Json(json!("b64:AQID"));
+        let encoded = serde_json::to_string(&val).unwrap();
+        assert_eq!(encoded, r#""txt:b64:AQID""#);
+        assert_eq!(
+            serde_json::from_str::<FieldValue>(&encoded).unwrap(),
+            FieldValue::Text("b64:AQID".into())
+        );
+
+        // Ordinary Json payloads are emitted unchanged.
+        assert_eq!(
+            serde_json::to_value(FieldValue::Json(json!({"a": [1, true, null, "x"]}))).unwrap(),
+            json!({"a": [1, true, null, "x"]})
+        );
+
+        // CBOR (non-human-readable) encoding never escapes.
+        let val = FieldValue::Json(json!({"k": "b64:AQID"}));
+        let mut bytes = Vec::new();
+        cbor2::to_writer(&val, &mut bytes).unwrap();
+        let decoded: FieldValue = cbor2::from_reader(bytes.as_slice()).unwrap();
+        assert_eq!(
+            decoded,
+            FieldValue::Map(BTreeMap::from([(
+                FieldKey::Text("k".into()),
+                FieldValue::Text("b64:AQID".into()),
+            )]))
+        );
     }
 
     #[test]

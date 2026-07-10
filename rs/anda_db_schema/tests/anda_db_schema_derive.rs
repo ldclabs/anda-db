@@ -597,4 +597,48 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("u8 range"));
     }
+
+    #[test]
+    fn test_skip_serializing_if_on_non_option_field_semantics() {
+        // Pins the documented semantics: `skip_serializing_if` on a
+        // non-Option field keeps the field *required* in the schema (the
+        // condition is data-dependent, so the macro cannot know it always
+        // fires). When the condition does fire, serialization omits the
+        // field and `Document::try_from` fails at runtime.
+        #[derive(Debug, Serialize, Deserialize, AndaDBSchema)]
+        struct TaggedDoc {
+            _id: u64,
+            #[serde(skip_serializing_if = "Vec::is_empty", default)]
+            tags: Vec<String>,
+        }
+
+        let schema = std::sync::Arc::new(TaggedDoc::schema().unwrap());
+        let tags = schema.get_field("tags").unwrap();
+        assert!(tags.required());
+
+        // Condition does not fire: everything works.
+        let doc = Document::try_from(
+            schema.clone(),
+            &TaggedDoc {
+                _id: 1,
+                tags: vec!["a".to_string()],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            doc.get_field("tags"),
+            Some(&Fv::Array(vec![Fv::Text("a".to_string())]))
+        );
+
+        // Condition fires: the omitted required field is a runtime error.
+        let err = Document::try_from(
+            schema,
+            &TaggedDoc {
+                _id: 2,
+                tags: vec![],
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("required"), "err: {err}");
+    }
 }

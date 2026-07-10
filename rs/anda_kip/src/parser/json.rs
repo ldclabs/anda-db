@@ -14,7 +14,8 @@ use nom::{
     number::complete::recognize_float,
     sequence::{delimited, pair, preceded, separated_pair, terminated},
 };
-use nom_language::error::VerboseError;
+use nom_language::error::{VerboseError, VerboseErrorKind};
+use std::collections::HashSet;
 use std::str::FromStr;
 
 use crate::{Json, Map, Number};
@@ -106,38 +107,63 @@ fn array<'a>() -> impl Parser<&'a str, Output = Vec<Json>, Error = VerboseError<
 }
 
 // An identifier starts with a letter or underscore, followed by any combination of letters, digits, or underscores.
-fn identifier<'a>() -> impl Parser<&'a str, Output = &'a str, Error = VerboseError<&'a str>> {
+// Uses the `complete` tag so a trailing identifier at end of input parses
+// instead of returning `Incomplete` (KIP inputs are always complete strings).
+pub(super) fn identifier<'a>()
+-> impl Parser<&'a str, Output = &'a str, Error = VerboseError<&'a str>> {
     recognize(pair(
-        alt((alpha1, tag("_"))),
-        many0(alt((alphanumeric1, tag("_")))),
+        alt((alpha1, nom::bytes::complete::tag("_"))),
+        many0(alt((alphanumeric1, nom::bytes::complete::tag("_")))),
     ))
 }
 
+/// Rejects duplicate keys in an object literal.
+///
+/// In an LLM-facing protocol, a duplicate key is almost always a generation
+/// error; silently keeping the last value would mask it, so parsing fails
+/// (`nom::Err::Failure` anchored at `input`, the start of the object).
+pub(super) fn ensure_unique_keys<'a, V>(
+    input: &'a str,
+    entries: &[(String, V)],
+) -> Result<(), nom::Err<VerboseError<&'a str>>> {
+    let mut seen: HashSet<&str> = HashSet::with_capacity(entries.len());
+    for (key, _) in entries {
+        if !seen.insert(key.as_str()) {
+            return Err(nom::Err::Failure(VerboseError {
+                errors: vec![(
+                    input,
+                    VerboseErrorKind::Context("duplicate key in object (keys must be unique)"),
+                )],
+            }));
+        }
+    }
+    Ok(())
+}
+
 fn object<'a>() -> impl Parser<&'a str, Output = Map<String, Json>, Error = VerboseError<&'a str>> {
-    context(
-        "JSON object { key: value, ... }",
-        map(
-            delimited(
-                char('{'),
-                cut(ws(terminated(
-                    separated_list0(
-                        ws(char(',')),
-                        context(
-                            "JSON key-value pair: key: value",
-                            separated_pair(
-                                alt((string(), map(identifier(), |s| s.to_string()))),
-                                cut(ws(char(':'))),
-                                cut(json_value()),
-                            ),
+    context("JSON object { key: value, ... }", |input: &'a str| {
+        let (remaining, key_values) = delimited(
+            char('{'),
+            cut(ws(terminated(
+                separated_list0(
+                    ws(char(',')),
+                    context(
+                        "JSON key-value pair: key: value",
+                        separated_pair(
+                            alt((string(), map(identifier(), |s| s.to_string()))),
+                            cut(ws(char(':'))),
+                            cut(json_value()),
                         ),
                     ),
-                    opt(ws(char(','))),
-                ))),
-                cut(char('}')),
-            ),
-            |key_values| key_values.into_iter().collect(),
-        ),
-    )
+                ),
+                opt(ws(char(','))),
+            ))),
+            cut(char('}')),
+        )
+        .parse(input)?;
+        ensure_unique_keys(input, &key_values)?;
+        Ok((remaining, key_values.into_iter().collect()))
+    })
 }
 
 fn u16_hex<'a>() -> impl Parser<&'a str, Output = u16, Error = VerboseError<&'a str>> {
@@ -259,5 +285,21 @@ mod tests {
 
         let result = json_value().parse(input.trim()).unwrap();
         println!("{:?}", result);
+    }
+
+    #[test]
+    fn test_duplicate_object_keys_rejected() {
+        // Duplicate keys are almost always an LLM generation error; failing
+        // loudly beats silently keeping the last value.
+        assert!(json_value().parse(r#"{ a: 1, a: 2 }"#).is_err());
+        assert!(json_value().parse(r#"{ "a": 1, a: 2 }"#).is_err());
+        // Nested objects are checked as well.
+        assert!(json_value().parse(r#"{ a: { b: 1, b: 2 } }"#).is_err());
+        // Same key at different nesting levels is fine.
+        assert!(
+            json_value()
+                .parse(r#"{ a: { a: 1 }, b: { a: 2 } }"#)
+                .is_ok()
+        );
     }
 }

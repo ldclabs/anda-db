@@ -13,7 +13,18 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use sqlx::postgres::PgListener;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
+
+/// How long a positive db→shard cache entry is trusted before it is
+/// re-validated against PostgreSQL. A last line of defense against missed
+/// NOTIFY events; incremental events keep the cache fresh well before this.
+const DB_CACHE_POSITIVE_TTL: Duration = Duration::from_secs(60);
+
+/// How long a negative ("no such database") cache entry suppresses
+/// PostgreSQL lookups. Short, so a fresh assignment becomes visible quickly
+/// even if its NOTIFY event was missed.
+const DB_CACHE_NEGATIVE_TTL: Duration = Duration::from_secs(5);
 
 /// Mapping from database name to its assigned shard ID.
 /// This binding can be updated by administrators when needed.
@@ -33,9 +44,52 @@ pub struct ShardBackend {
     pub shard_id: u32,
     /// Base URL of the shard backend that should receive proxied traffic.
     pub backend_addr: String,
-    /// If true, the backend is in read-only mode (e.g. during migration).
+    /// Advisory flag: the backend is in read-only mode (e.g. during
+    /// migration). The proxy forwards it in routing metadata but does **not**
+    /// enforce it — the RPC protocol is POST-based, so the HTTP method cannot
+    /// distinguish reads from writes; enforcement is the backend's job.
     #[serde(default)]
     pub read_only: bool,
+}
+
+/// A cached db→shard lookup result. Both positive and negative entries
+/// expire (see [`DB_CACHE_POSITIVE_TTL`] / [`DB_CACHE_NEGATIVE_TTL`]) so
+/// missed NOTIFY events have bounded impact.
+#[derive(Debug, Clone, Copy)]
+enum DbCacheEntry {
+    /// The database is assigned to this shard.
+    Found { shard_id: u32, cached_at: Instant },
+    /// PostgreSQL had no row for this database name.
+    NotFound { cached_at: Instant },
+}
+
+impl DbCacheEntry {
+    fn found(shard_id: u32) -> Self {
+        Self::Found {
+            shard_id,
+            cached_at: Instant::now(),
+        }
+    }
+
+    fn not_found() -> Self {
+        Self::NotFound {
+            cached_at: Instant::now(),
+        }
+    }
+
+    /// Returns the cached result if the entry is still fresh.
+    fn get(&self) -> Option<Option<u32>> {
+        match *self {
+            Self::Found {
+                shard_id,
+                cached_at,
+            } if cached_at.elapsed() < DB_CACHE_POSITIVE_TTL => Some(Some(shard_id)),
+            Self::NotFound { cached_at } if cached_at.elapsed() < DB_CACHE_NEGATIVE_TTL => {
+                Some(None)
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Fully resolved routing information returned to the proxy layer.
@@ -84,8 +138,8 @@ enum BackendEvent {
 #[derive(Clone)]
 pub struct ShardStore {
     pool: PgPool,
-    /// db_name → shard_id
-    db_cache: Arc<DashMap<String, u32>>,
+    /// db_name → cached lookup result (positive or negative, with TTL)
+    db_cache: Arc<DashMap<String, DbCacheEntry>>,
     /// shard_id → ShardBackend
     backend_cache: Arc<DashMap<u32, ShardBackend>>,
 }
@@ -159,32 +213,57 @@ impl ShardStore {
 
     // ── Lookups ─────────────────────────────────────────────────────────────
 
+    /// Look up the shard for a database name, using the cache first.
+    ///
+    /// On a fresh cache miss the result — including "not assigned" — is
+    /// cached, so unknown database names cannot stampede PostgreSQL.
+    /// PostgreSQL errors are propagated instead of being folded into
+    /// "not found".
+    async fn lookup_db_shard(&self, db_name: &str) -> Result<Option<u32>, sqlx::Error> {
+        if let Some(entry) = self.db_cache.get(db_name)
+            && let Some(cached) = entry.get()
+        {
+            return Ok(cached);
+        }
+
+        let row: Option<(i32,)> =
+            sqlx::query_as("SELECT shard_id FROM db_shards WHERE db_name = $1")
+                .bind(db_name)
+                .fetch_optional(&self.pool)
+                .await?;
+        match row {
+            Some((sid,)) => {
+                let shard_id = sid as u32;
+                self.db_cache
+                    .insert(db_name.to_string(), DbCacheEntry::found(shard_id));
+                Ok(Some(shard_id))
+            }
+            None => {
+                self.db_cache
+                    .insert(db_name.to_string(), DbCacheEntry::not_found());
+                Ok(None)
+            }
+        }
+    }
+
     /// Resolve a database name to its full route (shard + backend).
     ///
-    /// On cache miss, queries the database and caches the result.
-    pub async fn resolve(&self, db_name: &str) -> Option<ResolvedRoute> {
-        let shard_id = match self.db_cache.get(db_name) {
-            Some(entry) => *entry,
-            None => {
-                let row: Option<(i32,)> =
-                    sqlx::query_as("SELECT shard_id FROM db_shards WHERE db_name = $1")
-                        .bind(db_name)
-                        .fetch_optional(&self.pool)
-                        .await
-                        .ok()?;
-                let (sid,) = row?;
-                let shard_id = sid as u32;
-                self.db_cache.insert(db_name.to_string(), shard_id);
-                shard_id
-            }
+    /// Returns `Ok(None)` when the database has no assignment (or the shard
+    /// has no backend) and `Err` when PostgreSQL could not be queried, so the
+    /// proxy can answer 404 and 503 respectively.
+    pub async fn resolve(&self, db_name: &str) -> Result<Option<ResolvedRoute>, sqlx::Error> {
+        let Some(shard_id) = self.lookup_db_shard(db_name).await? else {
+            return Ok(None);
         };
-        let backend = self.backend_cache.get(&shard_id)?;
-        Some(ResolvedRoute {
+        let Some(backend) = self.backend_cache.get(&shard_id) else {
+            return Ok(None);
+        };
+        Ok(Some(ResolvedRoute {
             db_name: Some(db_name.to_string()),
             shard_id,
             backend_addr: backend.backend_addr.clone(),
             read_only: backend.read_only,
-        })
+        }))
     }
 
     /// Resolve routing information directly from a shard identifier.
@@ -203,30 +282,17 @@ impl ShardStore {
 
     /// Fetch one database-to-shard assignment.
     ///
-    /// The lookup uses the cache first and falls back to PostgreSQL on a miss.
-    /// If PostgreSQL returns a row, the cache is populated before returning.
-    pub async fn get_db_shard(&self, db_name: &str) -> Option<DbShard> {
-        match self.db_cache.get(db_name) {
-            Some(entry) => Some(DbShard {
+    /// The lookup uses the cache first and falls back to PostgreSQL on a
+    /// miss. Query errors are propagated so callers can distinguish "not
+    /// assigned" (`Ok(None)`) from "PostgreSQL unavailable" (`Err`).
+    pub async fn get_db_shard(&self, db_name: &str) -> Result<Option<DbShard>, sqlx::Error> {
+        Ok(self
+            .lookup_db_shard(db_name)
+            .await?
+            .map(|shard_id| DbShard {
                 db_name: db_name.to_string(),
-                shard_id: *entry,
-            }),
-            None => {
-                let row: Option<(i32,)> =
-                    sqlx::query_as("SELECT shard_id FROM db_shards WHERE db_name = $1")
-                        .bind(db_name)
-                        .fetch_optional(&self.pool)
-                        .await
-                        .ok()?;
-                let (sid,) = row?;
-                let shard_id = sid as u32;
-                self.db_cache.insert(db_name.to_string(), shard_id);
-                Some(DbShard {
-                    db_name: db_name.to_string(),
-                    shard_id,
-                })
-            }
-        }
+                shard_id,
+            }))
     }
 
     /// Return a snapshot of all cached shard backend entries.
@@ -244,19 +310,22 @@ impl ShardStore {
 
     /// Assign a database to a shard.
     ///
-    /// If the database already exists, its shard binding is updated.
+    /// If the database already exists, its shard binding is updated. The
+    /// write and its `NOTIFY` run in one transaction, so either both take
+    /// effect or neither does, and other instances receive the event exactly
+    /// when the row becomes visible.
     pub async fn assign_db(&self, db_name: &str, shard_id: u32) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO db_shards (db_name, shard_id) VALUES ($1, $2) \
              ON CONFLICT (db_name) DO UPDATE SET shard_id = EXCLUDED.shard_id",
         )
         .bind(db_name)
         .bind(shard_id as i32)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-
-        self.db_cache.insert(db_name.to_string(), shard_id);
-        self.notify(
+        Self::notify_tx(
+            &mut tx,
             "db_shards_changed",
             &DbShardEvent::Assign {
                 db_name: db_name.to_string(),
@@ -264,6 +333,10 @@ impl ShardStore {
             },
         )
         .await?;
+        tx.commit().await?;
+
+        self.db_cache
+            .insert(db_name.to_string(), DbCacheEntry::found(shard_id));
         Ok(())
     }
 
@@ -272,19 +345,22 @@ impl ShardStore {
     /// Returns `true` when a row was deleted and `false` when the binding was
     /// already absent.
     pub async fn unassign_db(&self, db_name: &str) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query("DELETE FROM db_shards WHERE db_name = $1")
             .bind(db_name)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
-
-        self.db_cache.remove(db_name);
-        self.notify(
+        Self::notify_tx(
+            &mut tx,
             "db_shards_changed",
             &DbShardEvent::Unassign {
                 db_name: db_name.to_string(),
             },
         )
         .await?;
+        tx.commit().await?;
+
+        self.db_cache.remove(db_name);
         Ok(result.rows_affected() > 0)
     }
 
@@ -295,6 +371,7 @@ impl ShardStore {
     /// This operation is intentionally mutable so operators can redirect a
     /// shard to a new backend during maintenance, failover, or migration.
     pub async fn upsert_backend(&self, backend: &ShardBackend) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             r#"
             INSERT INTO shard_backends (shard_id, backend_addr, read_only, updated_at)
@@ -308,11 +385,10 @@ impl ShardStore {
         .bind(backend.shard_id as i32)
         .bind(&backend.backend_addr)
         .bind(backend.read_only)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-
-        self.backend_cache.insert(backend.shard_id, backend.clone());
-        self.notify(
+        Self::notify_tx(
+            &mut tx,
             "shard_backends_changed",
             &BackendEvent::Upsert {
                 shard_id: backend.shard_id,
@@ -321,6 +397,9 @@ impl ShardStore {
             },
         )
         .await?;
+        tx.commit().await?;
+
+        self.backend_cache.insert(backend.shard_id, backend.clone());
         Ok(())
     }
 
@@ -328,27 +407,40 @@ impl ShardStore {
     ///
     /// Returns `true` when the entry existed and was removed.
     pub async fn delete_backend(&self, shard_id: u32) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query("DELETE FROM shard_backends WHERE shard_id = $1")
             .bind(shard_id as i32)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        Self::notify_tx(
+            &mut tx,
+            "shard_backends_changed",
+            &BackendEvent::Delete { shard_id },
+        )
+        .await?;
+        tx.commit().await?;
 
         self.backend_cache.remove(&shard_id);
-        self.notify("shard_backends_changed", &BackendEvent::Delete { shard_id })
-            .await?;
         Ok(result.rows_affected() > 0)
     }
 
     // ── NOTIFY / LISTEN ─────────────────────────────────────────────────────
 
-    /// Send a PostgreSQL `NOTIFY` event so other proxy instances can refresh
-    /// their in-memory caches without polling.
-    async fn notify<T: Serialize>(&self, channel: &str, event: &T) -> Result<(), sqlx::Error> {
-        let payload = serde_json::to_string(event).unwrap_or_default();
+    /// Queue a PostgreSQL `NOTIFY` inside the given transaction; it is
+    /// delivered to other proxy instances when the transaction commits, so
+    /// cache updates cannot be observed before the data change itself.
+    async fn notify_tx<T: Serialize>(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        channel: &str,
+        event: &T,
+    ) -> Result<(), sqlx::Error> {
+        // The event enums serialize infallibly; a failure here would be a bug
+        // that must not be masked by an empty payload.
+        let payload = serde_json::to_string(event).expect("event serialization must not fail");
         sqlx::query("SELECT pg_notify($1, $2)")
             .bind(channel)
             .bind(&payload)
-            .execute(&self.pool)
+            .execute(&mut **tx)
             .await?;
         Ok(())
     }
@@ -357,7 +449,7 @@ impl ShardStore {
     fn apply_db_event(&self, payload: &str) {
         match serde_json::from_str::<DbShardEvent>(payload) {
             Ok(DbShardEvent::Assign { db_name, shard_id }) => {
-                self.db_cache.insert(db_name, shard_id);
+                self.db_cache.insert(db_name, DbCacheEntry::found(shard_id));
             }
             Ok(DbShardEvent::Unassign { db_name }) => {
                 self.db_cache.remove(&db_name);
@@ -421,10 +513,15 @@ impl ShardStore {
             .listen_all(["db_shards_changed", "shard_backends_changed"])
             .await?;
 
-        // Reload backends on (re)connect to catch any events missed during downtime.
+        // Recover from any events missed while the listener was offline:
+        // reload the (small) backend table and drop every db→shard entry so
+        // the lazy path re-resolves against PostgreSQL. Without the clear, a
+        // missed unassign/assign would keep routing a tenant to a shard that
+        // no longer owns it.
         if let Err(e) = self.reload_backend_cache().await {
             log::error!("failed to reload backend cache on connect: {}", e);
         }
+        self.db_cache.clear();
 
         loop {
             tokio::select! {
@@ -466,12 +563,16 @@ mod tests {
         }
     }
 
+    fn cached_shard(store: &ShardStore, db_name: &str) -> Option<Option<u32>> {
+        store.db_cache.get(db_name).and_then(|entry| entry.get())
+    }
+
     #[tokio::test]
     async fn apply_db_event_assign_and_unassign_updates_cache() {
         let store = test_store();
 
         store.apply_db_event(r#"{"op":"assign","db_name":"db_a","shard_id":3}"#);
-        assert_eq!(store.db_cache.get("db_a").map(|v| *v), Some(3));
+        assert_eq!(cached_shard(&store, "db_a"), Some(Some(3)));
 
         store.apply_db_event(r#"{"op":"unassign","db_name":"db_a"}"#);
         assert!(store.db_cache.get("db_a").is_none());
@@ -480,12 +581,33 @@ mod tests {
     #[tokio::test]
     async fn apply_db_event_invalid_payload_does_not_change_cache() {
         let store = test_store();
-        store.db_cache.insert("db_keep".to_string(), 9);
+        store
+            .db_cache
+            .insert("db_keep".to_string(), DbCacheEntry::found(9));
 
         store.apply_db_event("not-json");
 
-        assert_eq!(store.db_cache.get("db_keep").map(|v| *v), Some(9));
+        assert_eq!(cached_shard(&store, "db_keep"), Some(Some(9)));
         assert_eq!(store.db_cache.len(), 1);
+    }
+
+    #[test]
+    fn db_cache_entries_expire() {
+        let fresh_hit = DbCacheEntry::found(7);
+        assert_eq!(fresh_hit.get(), Some(Some(7)));
+        let fresh_miss = DbCacheEntry::not_found();
+        assert_eq!(fresh_miss.get(), Some(None));
+
+        let old = Instant::now() - DB_CACHE_POSITIVE_TTL;
+        let stale_hit = DbCacheEntry::Found {
+            shard_id: 7,
+            cached_at: old,
+        };
+        assert_eq!(stale_hit.get(), None);
+        let stale_miss = DbCacheEntry::NotFound {
+            cached_at: Instant::now() - DB_CACHE_NEGATIVE_TTL,
+        };
+        assert_eq!(stale_miss.get(), None);
     }
 
     #[tokio::test]

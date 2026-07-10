@@ -1,21 +1,23 @@
 //! Internal helpers shared by the `FieldTyped` and `AndaDBSchema` derive macros.
 //!
 //! The functions in this module work on `syn` AST nodes and emit
-//! `proc_macro2::TokenStream` fragments that reference items from
-//! `anda_db_schema` (`FieldType`, `FieldKey`, ...) by their bare names. The
-//! derive entry points wrap those fragments in a function body that imports
-//! the names through [`schema_crate_path`], so call sites do not need to
-//! import them.
+//! `proc_macro2::TokenStream` fragments. Every reference to an
+//! `anda_db_schema` item (`FieldType`, `FieldKey`, ...) is fully qualified
+//! through the `root` path resolved by [`schema_crate_path`], and every
+//! `std`/`core` item is referenced through `::std`/`::core`, so the generated
+//! code never shadows (or gets hijacked by) user items with the same names.
 //!
 //! All fallible helpers return [`syn::Result`] with errors spanned at the
 //! offending field, type or attribute so that diagnostics point at the user's
 //! code instead of the `#[derive(...)]` invocation.
 
 use proc_macro2::{Span, TokenStream};
-use quote::{ToTokens, quote};
+use quote::{ToTokens, quote, quote_spanned};
+use std::collections::BTreeSet;
 use syn::{
     Attribute, Data, DeriveInput, Expr, Field, Fields, GenericArgument, Lit, LitStr, Meta, Path,
-    PathArguments, PathSegment, Type, ext::IdentExt, punctuated::Punctuated, token::Comma,
+    PathArguments, PathSegment, Type, ext::IdentExt, punctuated::Punctuated, spanned::Spanned,
+    token::Comma,
 };
 
 /// Resolves the path of the `anda_db_schema` crate as seen from the call site.
@@ -423,10 +425,18 @@ pub fn validate_schema_field_name(name: &str) -> Result<(), String> {
 
 /// Resolve a field's `FieldType` tokens: an explicit `#[field_type = "..."]`
 /// override wins; otherwise the type is inferred from the Rust type.
-pub fn resolve_field_type(field: &Field) -> syn::Result<TokenStream> {
-    match find_field_type_attr(&field.attrs)? {
+///
+/// `root` is the resolved `anda_db_schema` crate path (see
+/// [`schema_crate_path`]); `type_params` holds the names of the container's
+/// generic type parameters so that bare generic fields get a targeted error.
+pub fn resolve_field_type(
+    field: &Field,
+    root: &TokenStream,
+    type_params: &BTreeSet<String>,
+) -> syn::Result<TokenStream> {
+    match find_field_type_attr(&field.attrs, root)? {
         Some(field_type) => Ok(field_type),
-        None => determine_field_type(&field.ty),
+        None => determine_field_type(&field.ty, root, type_params),
     }
 }
 
@@ -435,7 +445,10 @@ pub fn resolve_field_type(field: &Field) -> syn::Result<TokenStream> {
 ///
 /// Returns `Ok(None)` when no such attribute is present, in which case
 /// callers should fall back to [`determine_field_type`].
-pub fn find_field_type_attr(attrs: &[Attribute]) -> syn::Result<Option<TokenStream>> {
+pub fn find_field_type_attr(
+    attrs: &[Attribute],
+    root: &TokenStream,
+) -> syn::Result<Option<TokenStream>> {
     for attr in attrs {
         if attr.path().is_ident("field_type") {
             let meta_name_value = attr.meta.require_name_value().map_err(|_| {
@@ -448,7 +461,7 @@ pub fn find_field_type_attr(attrs: &[Attribute]) -> syn::Result<Option<TokenStre
             if let Expr::Lit(expr_lit) = &meta_name_value.value
                 && let Lit::Str(lit_str) = &expr_lit.lit
             {
-                return parse_field_type_str(&lit_str.value(), lit_str.span()).map(Some);
+                return parse_field_type_str(&lit_str.value(), lit_str.span(), root).map(Some);
             }
 
             return Err(syn::Error::new_spanned(
@@ -481,28 +494,32 @@ pub fn find_field_type_attr(attrs: &[Attribute]) -> syn::Result<Option<TokenStre
 ///
 /// Unrecognised input produces an error spanned at `span` (the attribute's
 /// string literal) so that the user gets a precise diagnostic.
-pub fn parse_field_type_str(type_str: &str, span: Span) -> syn::Result<TokenStream> {
+pub fn parse_field_type_str(
+    type_str: &str,
+    span: Span,
+    root: &TokenStream,
+) -> syn::Result<TokenStream> {
     let normalized: String = type_str.chars().filter(|ch| !ch.is_whitespace()).collect();
     match normalized.as_str() {
         // Primitive types.
-        "Bytes" => Ok(quote! { FieldType::Bytes }),
-        "Text" => Ok(quote! { FieldType::Text }),
-        "U64" => Ok(quote! { FieldType::U64 }),
-        "I64" => Ok(quote! { FieldType::I64 }),
-        "F64" => Ok(quote! { FieldType::F64 }),
-        "F32" => Ok(quote! { FieldType::F32 }),
-        "Bool" => Ok(quote! { FieldType::Bool }),
-        "Json" => Ok(quote! { FieldType::Json }),
-        "Vector" => Ok(quote! { FieldType::Vector }),
+        "Bytes" => Ok(quote! { #root::FieldType::Bytes }),
+        "Text" => Ok(quote! { #root::FieldType::Text }),
+        "U64" => Ok(quote! { #root::FieldType::U64 }),
+        "I64" => Ok(quote! { #root::FieldType::I64 }),
+        "F64" => Ok(quote! { #root::FieldType::F64 }),
+        "F32" => Ok(quote! { #root::FieldType::F32 }),
+        "Bool" => Ok(quote! { #root::FieldType::Bool }),
+        "Json" => Ok(quote! { #root::FieldType::Json }),
+        "Vector" => Ok(quote! { #root::FieldType::Vector }),
 
         // Compound wrappers: Array<T>, Option<T>.
         s if s.starts_with("Array<") && s.ends_with('>') => {
-            let inner_type = parse_field_type_str(&s[6..s.len() - 1], span)?;
-            Ok(quote! { FieldType::Array(vec![#inner_type]) })
+            let inner_type = parse_field_type_str(&s[6..s.len() - 1], span, root)?;
+            Ok(quote! { #root::FieldType::Array(::std::vec![#inner_type]) })
         }
         s if s.starts_with("Option<") && s.ends_with('>') => {
-            let inner_type = parse_field_type_str(&s[7..s.len() - 1], span)?;
-            Ok(quote! { FieldType::Option(Box::new(#inner_type)) })
+            let inner_type = parse_field_type_str(&s[7..s.len() - 1], span, root)?;
+            Ok(quote! { #root::FieldType::Option(::std::boxed::Box::new(#inner_type)) })
         }
 
         // Map<String, T> / Map<Text, T> / Map<I64, T> / Map<Bytes, T>.
@@ -536,11 +553,11 @@ pub fn parse_field_type_str(type_str: &str, span: Span) -> syn::Result<TokenStre
                 ));
             };
             let key_token = match &inner[..idx] {
-                "String" | "Text" => quote! { FieldKey::from("*") },
+                "String" | "Text" => quote! { #root::FieldKey::from("*") },
                 "I64" | "i8" | "i16" | "i32" | "i64" | "isize" => {
-                    quote! { FieldKey::from(i64::MIN) }
+                    quote! { #root::FieldKey::from(::core::primitive::i64::MIN) }
                 }
-                "Bytes" => quote! { FieldKey::from(b"*") },
+                "Bytes" => quote! { #root::FieldKey::from(b"*") },
                 other => {
                     return Err(syn::Error::new(
                         span,
@@ -550,9 +567,9 @@ pub fn parse_field_type_str(type_str: &str, span: Span) -> syn::Result<TokenStre
                     ));
                 }
             };
-            let value_type = parse_field_type_str(&inner[idx + 1..], span)?;
+            let value_type = parse_field_type_str(&inner[idx + 1..], span, root)?;
             Ok(quote! {
-                FieldType::Map(std::collections::BTreeMap::from([(
+                #root::FieldType::Map(::std::collections::BTreeMap::from([(
                     #key_token,
                     #value_type
                 )]))
@@ -591,7 +608,16 @@ pub fn parse_field_type_str(type_str: &str, span: Span) -> syn::Result<TokenStre
 /// Parenthesized and macro-generated (invisibly grouped) types are unwrapped
 /// transparently. On failure, an error spanned at the offending type is
 /// returned so the compiler points at the user's code.
-pub fn determine_field_type(ty: &Type) -> syn::Result<TokenStream> {
+///
+/// `type_params` holds the container's generic type parameter names: a field
+/// whose type is a bare generic parameter (e.g. `T`) cannot provide a
+/// `field_type()` associated function, so it gets a targeted error pointing
+/// at the field type instead of an inscrutable E0599 on the derive.
+pub fn determine_field_type(
+    ty: &Type,
+    root: &TokenStream,
+    type_params: &BTreeSet<String>,
+) -> syn::Result<TokenStream> {
     let ty = peel_type(ty);
     match ty {
         Type::Path(type_path) if !type_path.path.segments.is_empty() => {
@@ -600,10 +626,27 @@ pub fn determine_field_type(ty: &Type) -> syn::Result<TokenStream> {
             let type_name = segment.ident.unraw().to_string();
             let full_path = path_to_string(path);
 
+            // A bare generic type parameter has no inherent `field_type()`;
+            // report it here instead of emitting code that cannot compile.
+            if type_path.qself.is_none()
+                && path.leading_colon.is_none()
+                && path.segments.len() == 1
+                && segment.arguments.is_none()
+                && type_params.contains(&type_name)
+            {
+                return Err(syn::Error::new_spanned(
+                    ty,
+                    format!(
+                        "cannot infer a FieldType for generic type parameter `{type_name}`; \
+                         add #[field_type = \"...\"] to declare this field's schema type"
+                    ),
+                ));
+            }
+
             match full_path.as_str() {
-                "serde_json::Value" => return Ok(quote! { FieldType::Json }),
+                "serde_json::Value" => return Ok(quote! { #root::FieldType::Json }),
                 "serde_bytes::ByteArray" | "serde_bytes::ByteBuf" | "serde_bytes::Bytes" => {
-                    return Ok(quote! { FieldType::Bytes });
+                    return Ok(quote! { #root::FieldType::Bytes });
                 }
                 "half::bf16" => return unsupported_scalar_bf16(ty),
                 _ => {}
@@ -612,24 +655,28 @@ pub fn determine_field_type(ty: &Type) -> syn::Result<TokenStream> {
             match type_name.as_str() {
                 "Option" => {
                     if let Some(inner_type) = first_type_argument(segment) {
-                        let inner_field_type = determine_field_type(inner_type)?;
-                        return Ok(quote! { FieldType::Option(Box::new(#inner_field_type)) });
+                        let inner_field_type = determine_field_type(inner_type, root, type_params)?;
+                        return Ok(quote! {
+                            #root::FieldType::Option(::std::boxed::Box::new(#inner_field_type))
+                        });
                     }
                     Err(syn::Error::new_spanned(
                         ty,
                         "Unable to determine Option element type",
                     ))
                 }
-                "String" | "str" => Ok(quote! { FieldType::Text }),
+                "String" | "str" => Ok(quote! { #root::FieldType::Text }),
                 "Vec" | "HashSet" | "BTreeSet" => {
                     if let Some(inner_type) = first_type_argument(segment) {
                         if is_u8_type(inner_type) {
-                            return Ok(quote! { FieldType::Bytes });
+                            return Ok(quote! { #root::FieldType::Bytes });
                         } else if is_bf16_type(inner_type) {
-                            return Ok(quote! { FieldType::Vector });
+                            return Ok(quote! { #root::FieldType::Vector });
                         }
-                        let inner_field_type = determine_field_type(inner_type)?;
-                        return Ok(quote! { FieldType::Array(vec![#inner_field_type]) });
+                        let inner_field_type = determine_field_type(inner_type, root, type_params)?;
+                        return Ok(
+                            quote! { #root::FieldType::Array(::std::vec![#inner_field_type]) },
+                        );
                     }
                     Err(syn::Error::new_spanned(
                         ty,
@@ -640,23 +687,23 @@ pub fn determine_field_type(ty: &Type) -> syn::Result<TokenStream> {
                 // schema type is the inner type's.
                 "Box" | "Arc" | "Rc" | "Cow" => {
                     if let Some(inner_type) = first_type_argument(segment) {
-                        return determine_field_type(inner_type);
+                        return determine_field_type(inner_type, root, type_params);
                     }
                     Err(syn::Error::new_spanned(
                         ty,
                         format!("Unable to determine the inner type of: {type_name}"),
                     ))
                 }
-                "bool" => Ok(quote! { FieldType::Bool }),
-                "i8" | "i16" | "i32" | "i64" | "isize" => Ok(quote! { FieldType::I64 }),
-                "u8" | "u16" | "u32" | "u64" | "usize" => Ok(quote! { FieldType::U64 }),
-                "f32" => Ok(quote! { FieldType::F32 }),
-                "f64" => Ok(quote! { FieldType::F64 }),
+                "bool" => Ok(quote! { #root::FieldType::Bool }),
+                "i8" | "i16" | "i32" | "i64" | "isize" => Ok(quote! { #root::FieldType::I64 }),
+                "u8" | "u16" | "u32" | "u64" | "usize" => Ok(quote! { #root::FieldType::U64 }),
+                "f32" => Ok(quote! { #root::FieldType::F32 }),
+                "f64" => Ok(quote! { #root::FieldType::F64 }),
                 "Bytes" | "ByteArray" | "ByteBuf" | "BytesB64" | "ByteArrayB64" | "ByteBufB64" => {
-                    Ok(quote! { FieldType::Bytes })
+                    Ok(quote! { #root::FieldType::Bytes })
                 }
-                "Json" => Ok(quote! { FieldType::Json }),
-                "Vector" => Ok(quote! { FieldType::Vector }),
+                "Json" => Ok(quote! { #root::FieldType::Json }),
+                "Vector" => Ok(quote! { #root::FieldType::Vector }),
                 "bf16" => unsupported_scalar_bf16(ty),
                 "HashMap" | "BTreeMap" | "Map" => {
                     // Handle HashMap / BTreeMap / serde_json::Map. Extra
@@ -667,11 +714,11 @@ pub fn determine_field_type(ty: &Type) -> syn::Result<TokenStream> {
                             (&args.args[0], &args.args[1])
                     {
                         let key_token = if is_string_type(key_ty) {
-                            quote! { FieldKey::from("*") }
+                            quote! { #root::FieldKey::from("*") }
                         } else if is_signed_integer_type(key_ty) {
-                            quote! { FieldKey::from(i64::MIN) }
+                            quote! { #root::FieldKey::from(::core::primitive::i64::MIN) }
                         } else if is_bytes_type(key_ty) {
-                            quote! { FieldKey::from(b"*") }
+                            quote! { #root::FieldKey::from(b"*") }
                         } else {
                             return Err(syn::Error::new_spanned(
                                 key_ty,
@@ -681,9 +728,9 @@ pub fn determine_field_type(ty: &Type) -> syn::Result<TokenStream> {
                                 ),
                             ));
                         };
-                        let value_field_type = determine_field_type(value_ty)?;
+                        let value_field_type = determine_field_type(value_ty, root, type_params)?;
                         return Ok(quote! {
-                            FieldType::Map(std::collections::BTreeMap::from([(
+                            #root::FieldType::Map(::std::collections::BTreeMap::from([(
                                 #key_token,
                                 #value_field_type
                             )]))
@@ -698,25 +745,29 @@ pub fn determine_field_type(ty: &Type) -> syn::Result<TokenStream> {
                     // Fallback: assume a user-defined struct that derives
                     // `FieldTyped`, and call its `field_type()` accessor. The
                     // `<...>` form keeps generic types like `Wrapper<T>`
-                    // valid in expression position.
-                    Ok(quote! {
+                    // valid in expression position, and `quote_spanned` makes
+                    // any resolution error (e.g. a type without
+                    // `field_type()`) point at the field's type instead of
+                    // the `#[derive(...)]` attribute.
+                    let span = ty.span();
+                    Ok(quote_spanned! {span=>
                         <#ty>::field_type()
                     })
                 }
             }
         }
-        Type::Reference(reference) => determine_field_type(&reference.elem),
-        Type::Slice(slice) if is_u8_type(&slice.elem) => Ok(quote! { FieldType::Bytes }),
-        Type::Slice(slice) if is_bf16_type(&slice.elem) => Ok(quote! { FieldType::Vector }),
+        Type::Reference(reference) => determine_field_type(&reference.elem, root, type_params),
+        Type::Slice(slice) if is_u8_type(&slice.elem) => Ok(quote! { #root::FieldType::Bytes }),
+        Type::Slice(slice) if is_bf16_type(&slice.elem) => Ok(quote! { #root::FieldType::Vector }),
         Type::Slice(slice) => {
-            let inner_type = determine_field_type(&slice.elem)?;
-            Ok(quote! { FieldType::Array(vec![#inner_type]) })
+            let inner_type = determine_field_type(&slice.elem, root, type_params)?;
+            Ok(quote! { #root::FieldType::Array(::std::vec![#inner_type]) })
         }
-        Type::Array(array) if is_u8_type(&array.elem) => Ok(quote! { FieldType::Bytes }),
-        Type::Array(array) if is_bf16_type(&array.elem) => Ok(quote! { FieldType::Vector }),
+        Type::Array(array) if is_u8_type(&array.elem) => Ok(quote! { #root::FieldType::Bytes }),
+        Type::Array(array) if is_bf16_type(&array.elem) => Ok(quote! { #root::FieldType::Vector }),
         Type::Array(array) => {
-            let inner_type = determine_field_type(&array.elem)?;
-            Ok(quote! { FieldType::Array(vec![#inner_type]) })
+            let inner_type = determine_field_type(&array.elem, root, type_params)?;
+            Ok(quote! { #root::FieldType::Array(::std::vec![#inner_type]) })
         }
         _ => {
             // Tuple, trait object, bare function, etc. -- not representable.
@@ -873,8 +924,19 @@ mod tests {
         value.to_string()
     }
 
+    /// The schema crate path used by these unit tests. Mirrors what
+    /// `schema_crate_path()` resolves for a crate that depends on
+    /// `anda_db_schema` directly.
+    fn root() -> TokenStream {
+        quote!(::anda_db_schema)
+    }
+
     fn parse_ft(input: &str) -> syn::Result<TokenStream> {
-        parse_field_type_str(input, Span::call_site())
+        parse_field_type_str(input, Span::call_site(), &root())
+    }
+
+    fn dft(ty: &Type) -> syn::Result<TokenStream> {
+        determine_field_type(ty, &root(), &BTreeSet::new())
     }
 
     #[test]
@@ -1087,16 +1149,16 @@ mod tests {
     #[test]
     fn find_field_type_attr_accepts_string_and_rejects_bad_forms() {
         let attrs: Vec<Attribute> = vec![parse_quote!(#[field_type = "Map<Bytes, U64>"])];
-        let parsed = tokens(find_field_type_attr(&attrs).unwrap().unwrap());
-        assert!(parsed.contains("FieldType :: Map"));
-        assert!(parsed.contains("FieldKey :: from (b\"*\")"));
+        let parsed = tokens(find_field_type_attr(&attrs, &root()).unwrap().unwrap());
+        assert!(parsed.contains(":: anda_db_schema :: FieldType :: Map"));
+        assert!(parsed.contains(":: anda_db_schema :: FieldKey :: from (b\"*\")"));
 
         let attrs: Vec<Attribute> = vec![parse_quote!(#[serde(default)])];
-        assert!(find_field_type_attr(&attrs).unwrap().is_none());
+        assert!(find_field_type_attr(&attrs, &root()).unwrap().is_none());
 
         let attrs: Vec<Attribute> = vec![parse_quote!(#[field_type("Text")])];
         assert!(
-            find_field_type_attr(&attrs)
+            find_field_type_attr(&attrs, &root())
                 .unwrap_err()
                 .to_string()
                 .contains("must use the form")
@@ -1104,7 +1166,7 @@ mod tests {
 
         let attrs: Vec<Attribute> = vec![parse_quote!(#[field_type = 7])];
         assert!(
-            find_field_type_attr(&attrs)
+            find_field_type_attr(&attrs, &root())
                 .unwrap_err()
                 .to_string()
                 .contains("must be a string literal")
@@ -1114,33 +1176,35 @@ mod tests {
     #[test]
     fn parse_field_type_str_covers_primitives_nested_maps_and_errors() {
         for (input, expected) in [
-            ("Bytes", "FieldType :: Bytes"),
-            ("Text", "FieldType :: Text"),
-            ("U64", "FieldType :: U64"),
-            ("I64", "FieldType :: I64"),
-            ("F64", "FieldType :: F64"),
-            ("F32", "FieldType :: F32"),
-            ("Bool", "FieldType :: Bool"),
-            ("Json", "FieldType :: Json"),
-            ("Vector", "FieldType :: Vector"),
+            ("Bytes", ":: anda_db_schema :: FieldType :: Bytes"),
+            ("Text", ":: anda_db_schema :: FieldType :: Text"),
+            ("U64", ":: anda_db_schema :: FieldType :: U64"),
+            ("I64", ":: anda_db_schema :: FieldType :: I64"),
+            ("F64", ":: anda_db_schema :: FieldType :: F64"),
+            ("F32", ":: anda_db_schema :: FieldType :: F32"),
+            ("Bool", ":: anda_db_schema :: FieldType :: Bool"),
+            ("Json", ":: anda_db_schema :: FieldType :: Json"),
+            ("Vector", ":: anda_db_schema :: FieldType :: Vector"),
         ] {
             assert_eq!(tokens(parse_ft(input).unwrap()), expected);
         }
 
         let array = tokens(parse_ft("Array<Option<Text>>").unwrap());
-        assert!(array.contains("FieldType :: Array"));
-        assert!(array.contains("FieldType :: Option"));
+        assert!(array.contains(":: anda_db_schema :: FieldType :: Array"));
+        assert!(array.contains(":: anda_db_schema :: FieldType :: Option"));
 
         let map = tokens(parse_ft("Map<Text, Array<U64>>").unwrap());
-        assert!(map.contains("FieldKey :: from (\"*\")"));
-        assert!(map.contains("FieldType :: Array"));
+        assert!(map.contains(":: anda_db_schema :: FieldKey :: from (\"*\")"));
+        assert!(map.contains(":: anda_db_schema :: FieldType :: Array"));
 
         let i64_map = tokens(parse_ft("Map<I64, Text>").unwrap());
-        assert!(i64_map.contains("FieldKey :: from (i64 :: MIN)"));
-        assert!(i64_map.contains("FieldType :: Text"));
-        assert!(
-            tokens(parse_ft("Map<isize, Text>").unwrap()).contains("FieldKey :: from (i64 :: MIN)")
-        );
+        assert!(i64_map.contains(
+            ":: anda_db_schema :: FieldKey :: from (:: core :: primitive :: i64 :: MIN)"
+        ));
+        assert!(i64_map.contains(":: anda_db_schema :: FieldType :: Text"));
+        assert!(tokens(parse_ft("Map<isize, Text>").unwrap()).contains(
+            ":: anda_db_schema :: FieldKey :: from (:: core :: primitive :: i64 :: MIN)"
+        ));
 
         assert!(
             parse_ft("Map<Text>")
@@ -1172,77 +1236,79 @@ mod tests {
     fn determine_field_type_covers_paths_collections_maps_and_errors() {
         let ty: Type = parse_quote!(serde_json::Value);
         assert_eq!(
-            tokens(determine_field_type(&ty).unwrap()),
-            "FieldType :: Json"
+            tokens(dft(&ty).unwrap()),
+            ":: anda_db_schema :: FieldType :: Json"
         );
 
         // A bare `Option` (no generic argument) cannot be inferred.
         let ty: Type = parse_quote!(Option);
         assert!(
-            determine_field_type(&ty)
+            dft(&ty)
                 .unwrap_err()
                 .to_string()
                 .contains("Option element type")
         );
 
         let ty: Type = parse_quote!(Option<Vec<String>>);
-        let inferred = tokens(determine_field_type(&ty).unwrap());
-        assert!(inferred.contains("FieldType :: Option"));
-        assert!(inferred.contains("FieldType :: Array"));
+        let inferred = tokens(dft(&ty).unwrap());
+        assert!(inferred.contains(":: anda_db_schema :: FieldType :: Option"));
+        assert!(inferred.contains(":: anda_db_schema :: FieldType :: Array"));
 
         for input in ["String", "str", "bool", "i32", "u32", "f32", "f64"] {
             let ty: Type = syn::parse_str(input).unwrap();
-            assert!(tokens(determine_field_type(&ty).unwrap()).contains("FieldType"));
+            assert!(tokens(dft(&ty).unwrap()).contains("FieldType"));
         }
 
         let ty: Type = parse_quote!(Vec<u8>);
         assert_eq!(
-            tokens(determine_field_type(&ty).unwrap()),
-            "FieldType :: Bytes"
+            tokens(dft(&ty).unwrap()),
+            ":: anda_db_schema :: FieldType :: Bytes"
         );
 
         let ty: Type = parse_quote!(Vec<bf16>);
         assert_eq!(
-            tokens(determine_field_type(&ty).unwrap()),
-            "FieldType :: Vector"
+            tokens(dft(&ty).unwrap()),
+            ":: anda_db_schema :: FieldType :: Vector"
         );
 
         let ty: Type = parse_quote!(Vec<String>);
-        assert!(tokens(determine_field_type(&ty).unwrap()).contains("FieldType :: Array"));
+        assert!(tokens(dft(&ty).unwrap()).contains(":: anda_db_schema :: FieldType :: Array"));
 
         let ty: Type = parse_quote!(Vec);
         assert!(
-            determine_field_type(&ty)
+            dft(&ty)
                 .unwrap_err()
                 .to_string()
                 .contains("Unable to determine Vec element type")
         );
 
         let ty: Type = parse_quote!(BTreeMap<String, Vec<u8>>);
-        let inferred = tokens(determine_field_type(&ty).unwrap());
-        assert!(inferred.contains("FieldKey :: from (\"*\")"));
-        assert!(inferred.contains("FieldType :: Bytes"));
+        let inferred = tokens(dft(&ty).unwrap());
+        assert!(inferred.contains(":: anda_db_schema :: FieldKey :: from (\"*\")"));
+        assert!(inferred.contains(":: anda_db_schema :: FieldType :: Bytes"));
 
         let ty: Type = parse_quote!(HashMap<Vec<u8>, String>);
-        assert!(tokens(determine_field_type(&ty).unwrap()).contains("FieldKey :: from (b\"*\")"));
+        assert!(
+            tokens(dft(&ty).unwrap()).contains(":: anda_db_schema :: FieldKey :: from (b\"*\")")
+        );
 
         let ty: Type = parse_quote!(BTreeMap<i64, String>);
-        assert!(
-            tokens(determine_field_type(&ty).unwrap()).contains("FieldKey :: from (i64 :: MIN)")
-        );
+        assert!(tokens(dft(&ty).unwrap()).contains(
+            ":: anda_db_schema :: FieldKey :: from (:: core :: primitive :: i64 :: MIN)"
+        ));
 
         // HashMap with a custom hasher still infers from the first two args.
         let ty: Type = parse_quote!(HashMap<String, u64, RandomState>);
-        assert!(tokens(determine_field_type(&ty).unwrap()).contains("FieldType :: U64"));
+        assert!(tokens(dft(&ty).unwrap()).contains(":: anda_db_schema :: FieldType :: U64"));
 
         let ty: Type = parse_quote!(HashMap<[u8; 4], String>);
-        let err = determine_field_type(&ty).unwrap_err().to_string();
+        let err = dft(&ty).unwrap_err().to_string();
         assert!(err.contains("Map key type must be String, signed integer, or bytes"));
         assert!(err.contains("[u8 ; 4]"));
 
         let ty: Type = parse_quote!(HashMap<String>);
         assert!(
-            determine_field_type(&ty)
+            dft(&ty)
                 .unwrap_err()
                 .to_string()
                 .contains("Invalid map type")
@@ -1250,26 +1316,23 @@ mod tests {
 
         let ty: Type = parse_quote!(serde_bytes::ByteBuf);
         assert_eq!(
-            tokens(determine_field_type(&ty).unwrap()),
-            "FieldType :: Bytes"
+            tokens(dft(&ty).unwrap()),
+            ":: anda_db_schema :: FieldType :: Bytes"
         );
 
         let ty: Type = parse_quote!(CustomType);
-        assert_eq!(
-            tokens(determine_field_type(&ty).unwrap()),
-            "< CustomType > :: field_type ()"
-        );
+        assert_eq!(tokens(dft(&ty).unwrap()), "< CustomType > :: field_type ()");
 
         // Generic user-defined types stay valid in expression position.
         let ty: Type = parse_quote!(Wrapper<Inner>);
         assert_eq!(
-            tokens(determine_field_type(&ty).unwrap()),
+            tokens(dft(&ty).unwrap()),
             "< Wrapper < Inner > > :: field_type ()"
         );
 
         let ty: Type = parse_quote!(half::bf16);
         assert!(
-            determine_field_type(&ty)
+            dft(&ty)
                 .unwrap_err()
                 .to_string()
                 .contains("Standalone `bf16`")
@@ -1277,7 +1340,7 @@ mod tests {
 
         let ty: Type = parse_quote!(bf16);
         assert!(
-            determine_field_type(&ty)
+            dft(&ty)
                 .unwrap_err()
                 .to_string()
                 .contains("Standalone `bf16`")
@@ -1285,38 +1348,71 @@ mod tests {
     }
 
     #[test]
+    fn determine_field_type_rejects_bare_generic_parameters() {
+        let params = BTreeSet::from(["T".to_string()]);
+
+        // A bare generic parameter cannot provide `field_type()`.
+        let ty: Type = parse_quote!(T);
+        let err = determine_field_type(&ty, &root(), &params)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("generic type parameter `T`"), "err: {err}");
+        assert!(err.contains("#[field_type"), "err: {err}");
+
+        // ... including when nested inside a container type.
+        let ty: Type = parse_quote!(Vec<T>);
+        let err = determine_field_type(&ty, &root(), &params)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("generic type parameter `T`"), "err: {err}");
+
+        // A generic *user* type is fine: `<Wrapper<T>>::field_type()` resolves
+        // through Wrapper's own generated impl.
+        let ty: Type = parse_quote!(Wrapper<T>);
+        assert_eq!(
+            tokens(determine_field_type(&ty, &root(), &params).unwrap()),
+            "< Wrapper < T > > :: field_type ()"
+        );
+
+        // A type merely sharing the parameter's name via a path is not a
+        // parameter.
+        let ty: Type = parse_quote!(module::T);
+        assert_eq!(
+            tokens(determine_field_type(&ty, &root(), &params).unwrap()),
+            "< module :: T > :: field_type ()"
+        );
+    }
+
+    #[test]
     fn determine_field_type_unwraps_transparent_wrappers() {
         for (input, expected) in [
-            ("Box<str>", "FieldType :: Text"),
-            ("std::sync::Arc<String>", "FieldType :: Text"),
-            ("Rc<Vec<u8>>", "FieldType :: Bytes"),
-            ("Cow<'a, str>", "FieldType :: Text"),
-            ("std::borrow::Cow<'static, str>", "FieldType :: Text"),
-            ("Box<[u8]>", "FieldType :: Bytes"),
+            ("Box<str>", ":: anda_db_schema :: FieldType :: Text"),
+            (
+                "std::sync::Arc<String>",
+                ":: anda_db_schema :: FieldType :: Text",
+            ),
+            ("Rc<Vec<u8>>", ":: anda_db_schema :: FieldType :: Bytes"),
+            ("Cow<'a, str>", ":: anda_db_schema :: FieldType :: Text"),
+            (
+                "std::borrow::Cow<'static, str>",
+                ":: anda_db_schema :: FieldType :: Text",
+            ),
+            ("Box<[u8]>", ":: anda_db_schema :: FieldType :: Bytes"),
         ] {
             let ty: Type = syn::parse_str(input).unwrap();
-            assert_eq!(
-                tokens(determine_field_type(&ty).unwrap()),
-                expected,
-                "{input}"
-            );
+            assert_eq!(tokens(dft(&ty).unwrap()), expected, "{input}");
         }
 
         let ty: Type = parse_quote!(Box);
-        assert!(
-            determine_field_type(&ty)
-                .unwrap_err()
-                .to_string()
-                .contains("inner type")
-        );
+        assert!(dft(&ty).unwrap_err().to_string().contains("inner type"));
     }
 
     #[test]
     fn determine_field_type_peels_parens_and_invisible_groups() {
         let ty: Type = parse_quote!((String));
         assert_eq!(
-            tokens(determine_field_type(&ty).unwrap()),
-            "FieldType :: Text"
+            tokens(dft(&ty).unwrap()),
+            ":: anda_db_schema :: FieldType :: Text"
         );
 
         // `macro_rules!` substitution wraps types in invisible groups.
@@ -1325,8 +1421,8 @@ mod tests {
             elem: Box::new(parse_quote!(Vec<u8>)),
         });
         assert_eq!(
-            tokens(determine_field_type(&grouped).unwrap()),
-            "FieldType :: Bytes"
+            tokens(dft(&grouped).unwrap()),
+            ":: anda_db_schema :: FieldType :: Bytes"
         );
     }
 
@@ -1334,42 +1430,42 @@ mod tests {
     fn determine_field_type_covers_references_slices_arrays_and_unsupported() {
         let ty: Type = parse_quote!(&String);
         assert_eq!(
-            tokens(determine_field_type(&ty).unwrap()),
-            "FieldType :: Text"
+            tokens(dft(&ty).unwrap()),
+            ":: anda_db_schema :: FieldType :: Text"
         );
 
         let ty: Type = syn::parse_str("[u8]").unwrap();
         assert_eq!(
-            tokens(determine_field_type(&ty).unwrap()),
-            "FieldType :: Bytes"
+            tokens(dft(&ty).unwrap()),
+            ":: anda_db_schema :: FieldType :: Bytes"
         );
 
         let ty: Type = syn::parse_str("[bf16]").unwrap();
         assert_eq!(
-            tokens(determine_field_type(&ty).unwrap()),
-            "FieldType :: Vector"
+            tokens(dft(&ty).unwrap()),
+            ":: anda_db_schema :: FieldType :: Vector"
         );
 
         let ty: Type = syn::parse_str("[String]").unwrap();
-        assert!(tokens(determine_field_type(&ty).unwrap()).contains("FieldType :: Array"));
+        assert!(tokens(dft(&ty).unwrap()).contains(":: anda_db_schema :: FieldType :: Array"));
 
         let ty: Type = parse_quote!([u8; 16]);
         assert_eq!(
-            tokens(determine_field_type(&ty).unwrap()),
-            "FieldType :: Bytes"
+            tokens(dft(&ty).unwrap()),
+            ":: anda_db_schema :: FieldType :: Bytes"
         );
 
         let ty: Type = parse_quote!([bf16; 3]);
         assert_eq!(
-            tokens(determine_field_type(&ty).unwrap()),
-            "FieldType :: Vector"
+            tokens(dft(&ty).unwrap()),
+            ":: anda_db_schema :: FieldType :: Vector"
         );
 
         let ty: Type = parse_quote!([String; 2]);
-        assert!(tokens(determine_field_type(&ty).unwrap()).contains("FieldType :: Array"));
+        assert!(tokens(dft(&ty).unwrap()).contains(":: anda_db_schema :: FieldType :: Array"));
 
         let ty: Type = parse_quote!((u64, u64));
-        let err = determine_field_type(&ty).unwrap_err().to_string();
+        let err = dft(&ty).unwrap_err().to_string();
         assert!(err.contains("Unsupported type"));
         // The message shows the Rust type, not an AST debug dump.
         assert!(err.contains("u64 , u64"));

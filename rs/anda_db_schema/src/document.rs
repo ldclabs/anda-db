@@ -84,13 +84,20 @@ impl Document {
 
     /// Creates a Document from a DocumentOwned, validating against the schema.
     ///
+    /// Values stored under an index the schema does not declare are dropped
+    /// instead of failing validation: [`Schema::upgrade_with`] allows field
+    /// removal and never reuses removed indexes, so such values can only be
+    /// stale data written under an older schema. They disappear from storage
+    /// the next time the document is rewritten.
+    ///
     /// # Arguments
     /// * `schema` - The schema to validate against
     /// * `doc` - The DocumentOwned to convert
     ///
     /// # Returns
     /// * `Result<Self, SchemaError>` - The validated Document or an error
-    pub fn try_from_doc(schema: Arc<Schema>, doc: DocumentOwned) -> Result<Self, SchemaError> {
+    pub fn try_from_doc(schema: Arc<Schema>, mut doc: DocumentOwned) -> Result<Self, SchemaError> {
+        doc.fields.retain(|idx, _| schema.contains_idx(*idx));
         schema.validate(&doc.fields)?;
 
         Ok(Self {
@@ -133,6 +140,12 @@ impl Document {
 
             let field = schema.get_field_or_err(&k)?;
             let value = field.extract(v, false)?;
+            // `extract` is strict about types, but the structural complexity
+            // budget still has to be enforced here: a value that exceeds it
+            // could be written but would fail validation on read-back.
+            value.validate_complexity().map_err(|err| {
+                SchemaError::FieldValue(format!("field {k:?} is invalid, error: {err}"))
+            })?;
             if fields.insert(field.idx(), value).is_some() {
                 return Err(SchemaError::Validation(format!(
                     "duplicate field {k:?} in document"
@@ -371,12 +384,16 @@ impl Document {
 
     /// Updates the document with values from a DocumentOwned.
     ///
+    /// Values stored under an index the schema does not declare are dropped,
+    /// mirroring [`Document::try_from_doc`].
+    ///
     /// # Arguments
     /// * `doc` - The DocumentOwned containing the new values
     ///
     /// # Returns
     /// * `Result<(), SchemaError>` - Success or an error
-    pub fn set_doc(&mut self, doc: DocumentOwned) -> Result<(), SchemaError> {
+    pub fn set_doc(&mut self, mut doc: DocumentOwned) -> Result<(), SchemaError> {
+        doc.fields.retain(|idx, _| self.schema.contains_idx(*idx));
         self.schema.validate(&doc.fields)?;
         self.fields = doc.fields;
 
@@ -727,6 +744,143 @@ mod tests {
 
         let result = Document::try_from(schema.clone(), &test_user_wrong_type);
         assert!(result.is_err());
+    }
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq, AndaDBSchema)]
+    struct NumDoc {
+        _id: u64,
+        /// Signed counter; non-negative values drift to U64 on read-back.
+        count: i64,
+        /// f32 values drift to F64 on read-back.
+        ratio: f32,
+        maybe: Option<i64>,
+        nums: Vec<i64>,
+    }
+
+    #[test]
+    fn stored_documents_with_i64_and_f32_fields_read_back() {
+        // Regression: untyped CBOR deserialization returns non-negative I64
+        // values as U64 and f32 values as F64. Documents written with such
+        // fields must still validate and decode after a storage round trip.
+        let schema = Arc::new(NumDoc::schema().unwrap());
+        let value = NumDoc {
+            _id: 1,
+            count: 5,
+            ratio: 2.71,
+            maybe: Some(7),
+            nums: vec![0, 1, -2, i64::MAX],
+        };
+
+        let doc = Document::try_from(schema.clone(), &value).unwrap();
+        let owned: DocumentOwned = doc.into();
+
+        // Full storage chain: DocumentOwned -> CBOR bytes -> DocumentOwned.
+        let mut bytes = Vec::new();
+        cbor2::to_writer(&owned, &mut bytes).unwrap();
+        let restored: DocumentOwned = cbor2::from_reader(bytes.as_slice()).unwrap();
+
+        // Read-back shapes are accepted by validation...
+        let doc = Document::try_from_doc(schema.clone(), restored).unwrap();
+        assert_eq!(doc.get_field("count").unwrap(), &Fv::U64(5));
+        if let Fv::F64(f) = doc.get_field("ratio").unwrap() {
+            assert_eq!(*f, 2.71f32 as f64);
+        } else {
+            panic!("expected F64 read-back shape");
+        }
+
+        // ...and decode back into the original struct losslessly.
+        let round: NumDoc = doc.try_into().unwrap();
+        assert_eq!(round, value);
+
+        // Negative values keep the canonical I64 shape.
+        let negative = NumDoc {
+            _id: 2,
+            count: -5,
+            ratio: -1.5,
+            maybe: None,
+            nums: vec![-1],
+        };
+        let doc = Document::try_from(schema.clone(), &negative).unwrap();
+        let owned: DocumentOwned = doc.into();
+        let mut bytes = Vec::new();
+        cbor2::to_writer(&owned, &mut bytes).unwrap();
+        let restored: DocumentOwned = cbor2::from_reader(bytes.as_slice()).unwrap();
+        let round: NumDoc = Document::try_from_doc(schema, restored)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(round, negative);
+    }
+
+    #[test]
+    fn try_from_doc_drops_values_of_removed_schema_fields() {
+        // Simulate a schema upgrade that removed a field: the stored document
+        // still carries a value under the removed idx. It must be readable,
+        // with the stale value dropped.
+        let schema = Arc::new(TestUser::schema().unwrap());
+        let stale_idx = 99usize; // not declared by the schema
+        assert!(!schema.contains_idx(stale_idx));
+
+        let mut fields = IndexedFieldValues::new();
+        fields.insert(0, Fv::U64(7));
+        fields.insert(1, Fv::Text("John".to_string()));
+        fields.insert(2, Fv::U64(30));
+        fields.insert(stale_idx, Fv::Text("stale".to_string()));
+
+        let doc = Document::try_from_doc(
+            schema.clone(),
+            DocumentOwned {
+                fields: fields.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(doc.fields().len(), 3);
+        assert!(!doc.fields().contains_key(&stale_idx));
+
+        // set_doc mirrors the lenient behaviour.
+        let mut doc2 = Document::new(schema);
+        doc2.set_doc(DocumentOwned { fields }).unwrap();
+        assert_eq!(doc2.fields().len(), 3);
+        assert!(!doc2.fields().contains_key(&stale_idx));
+    }
+
+    #[test]
+    fn try_from_enforces_the_complexity_budget() {
+        #[derive(Debug, Serialize, Deserialize, AndaDBSchema)]
+        struct JsonDoc {
+            _id: u64,
+            data: Option<serde_json::Value>,
+        }
+
+        let schema = Arc::new(JsonDoc::schema().unwrap());
+
+        // A JSON value nested beyond FieldValueBudget::max_depth (64) must be
+        // rejected at write time; it could not be read back if stored.
+        let mut deep = serde_json::json!(true);
+        for _ in 0..100 {
+            deep = serde_json::json!([deep]);
+        }
+        let err = Document::try_from(
+            schema.clone(),
+            &JsonDoc {
+                _id: 1,
+                data: Some(deep),
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("maximum depth"), "err: {err}");
+
+        // A shallow value is unaffected.
+        assert!(
+            Document::try_from(
+                schema,
+                &JsonDoc {
+                    _id: 1,
+                    data: Some(serde_json::json!({"a": [1, 2, 3]})),
+                },
+            )
+            .is_ok()
+        );
     }
 
     #[test]

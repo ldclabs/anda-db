@@ -232,6 +232,11 @@ impl Hnsw {
         &self.name
     }
 
+    /// Returns the vector dimension this index was configured with.
+    pub fn dimension(&self) -> usize {
+        self.index.dimension()
+    }
+
     /// Returns a snapshot of HNSW runtime statistics.
     pub fn stats(&self) -> HnswStats {
         self.index.stats()

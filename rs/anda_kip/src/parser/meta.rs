@@ -1,7 +1,6 @@
 use nom::{
     Parser,
     branch::alt,
-    bytes::complete::tag,
     combinator::{cut, map, map_res, opt, value},
     error::context,
     sequence::preceded,
@@ -35,11 +34,11 @@ fn parse_describe_command(input: &str) -> VResult<'_, DescribeTarget> {
         ws(alt((
             context(
                 "DESCRIBE PRIMER",
-                value(DescribeTarget::Primer, ws(tag("PRIMER"))),
+                value(DescribeTarget::Primer, ws(word("PRIMER"))),
             ),
             context(
                 "DESCRIBE DOMAINS",
-                value(DescribeTarget::Domains, ws(tag("DOMAINS"))),
+                value(DescribeTarget::Domains, ws(word("DOMAINS"))),
             ),
             context(
                 "DESCRIBE CONCEPT TYPES",
@@ -99,10 +98,7 @@ fn parse_search_command(input: &str) -> VResult<'_, SearchCommand> {
                         keyword("THRESHOLD"),
                         cut(ws(parse_search_threshold)),
                     )),
-                    opt(preceded(
-                        keyword("LIMIT"),
-                        ws(nom::character::complete::usize),
-                    )),
+                    opt(ws(parse_limit_clause)),
                 ),
             ),
             |(target, term, in_type, mode, threshold, limit)| SearchCommand {
@@ -513,6 +509,22 @@ mod tests {
         assert!(parse_meta_command("EXPORT ?x LIMIT 10").is_err());
         // EXPORT requires a target variable
         assert!(parse_meta_command(r#"EXPORT WHERE { ?x {type: "Drug"} }"#).is_err());
+    }
+
+    #[test]
+    fn test_search_limit_zero_is_rejected() {
+        // Like KQL/EXPORT/DESCRIBE, SEARCH must reject `LIMIT 0`: 0 is the
+        // engine's internal "no limit" sentinel and letting it through would
+        // silently mean "unlimited". Omit LIMIT for the engine default.
+        assert!(crate::parse_meta(r#"SEARCH CONCEPT "aspirin" LIMIT 0"#).is_err());
+        assert!(crate::parse_meta(r#"SEARCH PROPOSITION "treats" LIMIT 0"#).is_err());
+        // Positive limits (including large ones) still parse.
+        assert!(crate::parse_meta(r#"SEARCH CONCEPT "aspirin" LIMIT 1"#).is_ok());
+        assert!(
+            crate::parse_meta(r#"SEARCH CONCEPT "aspirin" LIMIT 18446744073709551615"#).is_ok()
+        );
+        // DESCRIBE keeps rejecting LIMIT 0 as before.
+        assert!(crate::parse_meta("DESCRIBE CONCEPT TYPES LIMIT 0").is_err());
     }
 
     #[test]

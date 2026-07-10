@@ -336,15 +336,27 @@ impl TryFrom<Vec<KeyValue>> for ConceptMatcher {
         let mut id: Option<String> = None;
         let mut r#type: Option<String> = None;
         let mut name: Option<String> = None;
+        // Duplicate keys in an LLM-generated matcher are almost always a
+        // generation error; reject them instead of silently keeping the last.
+        let mut seen = [false; 3];
 
         for val in values {
-            match val.key.as_str() {
-                "id" => id = val.value.into_opt_string()?,
-                "type" => r#type = val.value.into_opt_string()?,
-                "name" => name = val.value.into_opt_string()?,
+            let idx = match val.key.as_str() {
+                "id" => 0,
+                "type" => 1,
+                "name" => 2,
                 key => {
                     return Err(format!("Invalid key in Concept clause: {}", key));
                 }
+            };
+            if seen[idx] {
+                return Err(format!("Duplicate key in Concept clause: {}", val.key));
+            }
+            seen[idx] = true;
+            match idx {
+                0 => id = val.value.into_opt_string()?,
+                1 => r#type = val.value.into_opt_string()?,
+                _ => name = val.value.into_opt_string()?,
             }
         }
 
@@ -586,6 +598,16 @@ impl AggregationFunction {
     ///
     /// Non-numeric values are ignored by numeric aggregations. `distinct`
     /// de-duplicates values before `COUNT`, matching KQL `DISTINCT` behavior.
+    ///
+    /// Boundary conventions:
+    /// - `SUM` of all-integer inputs accumulates in `i128` and returns an
+    ///   integer (no f64 precision loss above 2^53); mixed/float inputs — or
+    ///   integer sums outside the `i64`/`u64` range — fall back to `f64`.
+    ///   `SUM` of an empty/non-numeric input is integer `0` (the additive
+    ///   identity); a non-finite `f64` sum (overflow) yields `Json::Null`.
+    /// - `AVG` is always `f64`; empty/non-numeric input yields `Json::Null`.
+    /// - `MIN`/`MAX` return the original input value (integers stay
+    ///   integers); empty/non-numeric input yields `Json::Null`.
     pub fn calculate(&self, values: &Vec<Json>, distinct: bool) -> Json {
         match self {
             AggregationFunction::Count => {
@@ -597,8 +619,20 @@ impl AggregationFunction {
                 }
             }
             AggregationFunction::Sum => {
-                let sum: f64 = values.iter().filter_map(|v| v.as_f64()).sum();
-                Number::from_f64(sum).map(|v| v.into()).unwrap_or_default()
+                let numeric: Vec<&Json> = values.iter().filter(|v| v.is_number()).collect();
+                let int_sum = numeric
+                    .iter()
+                    .try_fold(0i128, |acc, v| as_i128(v).and_then(|i| acc.checked_add(i)))
+                    .and_then(i128_to_number);
+                match int_sum {
+                    Some(sum) => Json::Number(sum),
+                    None => {
+                        let sum: f64 = numeric.iter().filter_map(|v| v.as_f64()).sum();
+                        Number::from_f64(sum)
+                            .map(|v| v.into())
+                            .unwrap_or(Json::Null)
+                    }
+                }
             }
             AggregationFunction::Avg => {
                 let nums: Vec<f64> = values.iter().filter_map(|v| v.as_f64()).collect();
@@ -606,20 +640,22 @@ impl AggregationFunction {
                     Json::Null
                 } else {
                     let avg = nums.iter().sum::<f64>() / nums.len() as f64;
-                    Number::from_f64(avg).map(|v| v.into()).unwrap_or_default()
+                    Number::from_f64(avg)
+                        .map(|v| v.into())
+                        .unwrap_or(Json::Null)
                 }
             }
             AggregationFunction::Min => values
                 .iter()
-                .filter_map(|v| v.as_f64())
-                .min_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal))
-                .map(|min| Number::from_f64(min).map(|v| v.into()).unwrap_or_default())
+                .filter(|v| v.is_number())
+                .min_by(|a, b| compare_json(a, b).unwrap_or(Ordering::Equal))
+                .cloned()
                 .unwrap_or(Json::Null),
             AggregationFunction::Max => values
                 .iter()
-                .filter_map(|v| v.as_f64())
-                .max_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal))
-                .map(|max| Number::from_f64(max).map(|v| v.into()).unwrap_or_default())
+                .filter(|v| v.is_number())
+                .max_by(|a, b| compare_json(a, b).unwrap_or(Ordering::Equal))
+                .cloned()
                 .unwrap_or(Json::Null),
         }
     }
@@ -719,12 +755,18 @@ pub enum ComparisonOperator {
 impl ComparisonOperator {
     /// Compares two JSON values according to this operator.
     ///
-    /// Ordering comparisons use [`compare_json`] and return `false` for value
-    /// pairs that do not have a defined ordering.
+    /// All six operators share [`compare_json`]'s loose comparison semantics
+    /// so that equality and ordering never contradict each other: numbers
+    /// compare numerically (`3.0 == 3` is `true`), and strings first try
+    /// numeric, then RFC 3339 / RFC 2822 datetime, then lexical comparison
+    /// (two spellings of the same instant, e.g. `...Z` vs `...+00:00`, are
+    /// equal). Value pairs without a defined ordering (mixed types, arrays,
+    /// objects; see KIP spec §2.7) are never `Equal` and never ordered, so
+    /// only `NotEqual` returns `true` for them.
     pub fn compare(&self, left: &Json, right: &Json) -> bool {
         match self {
-            ComparisonOperator::Equal => left == right,
-            ComparisonOperator::NotEqual => left != right,
+            ComparisonOperator::Equal => compare_json(left, right) == Some(Ordering::Equal),
+            ComparisonOperator::NotEqual => compare_json(left, right) != Some(Ordering::Equal),
             ComparisonOperator::LessThan => compare_json(left, right)
                 .map(|o| o == Ordering::Less)
                 .unwrap_or(false),
@@ -1167,23 +1209,23 @@ pub enum DescribeTarget {
     Primer,
     /// DESCRIBE DOMAINS - lists all knowledge domains
     Domains,
-    /// DESCRIBE CONCEPT_TYPES - lists all concept types
+    /// DESCRIBE CONCEPT TYPES - lists all concept types
     ConceptTypes {
         /// Optional LIMIT for result count restriction
         limit: Option<usize>,
         /// Optional CURSOR for result pagination
         cursor: Option<String>,
     },
-    /// DESCRIBE CONCEPT_TYPE "TypeName" - details about a specific concept type
+    /// DESCRIBE CONCEPT TYPE "TypeName" - details about a specific concept type
     ConceptType(String),
-    /// DESCRIBE PROPOSITION_TYPES - lists all proposition types
+    /// DESCRIBE PROPOSITION TYPES - lists all proposition types
     PropositionTypes {
         /// Optional LIMIT for result count restriction
         limit: Option<usize>,
         /// Optional CURSOR for result pagination
         cursor: Option<String>,
     },
-    /// DESCRIBE PROPOSITION_TYPE "TypeName" - details about a specific proposition type
+    /// DESCRIBE PROPOSITION TYPE "predicate" - details about a specific proposition type
     PropositionType(String),
 }
 
@@ -1701,14 +1743,9 @@ mod tests {
             AggregationFunction::Avg.calculate(&values, false),
             json!(5.0 / 3.0)
         );
-        assert_eq!(
-            AggregationFunction::Min.calculate(&values, false),
-            json!(1.0)
-        );
-        assert_eq!(
-            AggregationFunction::Max.calculate(&values, false),
-            json!(2.0)
-        );
+        // MIN/MAX return the original input value: integers stay integers.
+        assert_eq!(AggregationFunction::Min.calculate(&values, false), json!(1));
+        assert_eq!(AggregationFunction::Max.calculate(&values, false), json!(2));
         assert_eq!(
             AggregationFunction::Avg.calculate(&vec![json!("x")], false),
             Json::Null
@@ -1745,5 +1782,124 @@ mod tests {
             Some(Ordering::Less)
         );
         assert_eq!(compare_json(&json!("abc"), &json!(1)), None);
+    }
+
+    #[test]
+    fn comparison_equality_and_ordering_are_consistent() {
+        use ComparisonOperator::*;
+
+        // Numbers compare numerically regardless of int/float representation:
+        // equality can never contradict the ordering operators.
+        assert!(Equal.compare(&json!(3.0), &json!(3)));
+        assert!(!NotEqual.compare(&json!(3.0), &json!(3)));
+        assert!(LessEqual.compare(&json!(3.0), &json!(3)));
+        assert!(GreaterEqual.compare(&json!(3.0), &json!(3)));
+        assert!(!LessThan.compare(&json!(3.0), &json!(3)));
+        assert!(!GreaterThan.compare(&json!(3.0), &json!(3)));
+        assert!(Equal.compare(&json!(1), &json!(1)));
+        assert!(NotEqual.compare(&json!(1), &json!(2)));
+
+        // Numeric strings compare numerically on both sides.
+        assert!(Equal.compare(&json!("3"), &json!("3.0")));
+        assert!(!NotEqual.compare(&json!("3"), &json!("3.0")));
+
+        // Different spellings of the same instant are equal, like `<=`/`>=`.
+        let z = json!("2025-01-01T00:00:00Z");
+        let offset = json!("2025-01-01T00:00:00+00:00");
+        assert!(Equal.compare(&z, &offset));
+        assert!(!NotEqual.compare(&z, &offset));
+        assert!(LessEqual.compare(&z, &offset));
+        assert!(!LessThan.compare(&z, &offset));
+
+        // Mixed types have no defined ordering: never Equal, never ordered,
+        // only NotEqual is true.
+        assert!(!Equal.compare(&json!("3"), &json!(3)));
+        assert!(NotEqual.compare(&json!("3"), &json!(3)));
+        assert!(!LessEqual.compare(&json!("3"), &json!(3)));
+        assert!(!GreaterEqual.compare(&json!("3"), &json!(3)));
+        assert!(!Equal.compare(&json!(true), &json!(1)));
+        assert!(NotEqual.compare(&json!(true), &json!(1)));
+
+        // Arrays/objects are not comparable in FILTER (KIP spec §2.7).
+        assert!(!Equal.compare(&json!([1]), &json!([1])));
+        assert!(NotEqual.compare(&json!([1]), &json!([1])));
+        assert!(!Equal.compare(&json!({"a": 1}), &json!({"a": 1})));
+
+        // Null equals only null.
+        assert!(Equal.compare(&Json::Null, &Json::Null));
+        assert!(NotEqual.compare(&Json::Null, &json!(0)));
+    }
+
+    #[test]
+    fn concept_matcher_rejects_duplicate_keys() {
+        let kv = |k: &str, v: &str| KeyValue {
+            key: k.to_string(),
+            value: Value::String(v.to_string()),
+        };
+
+        let err = ConceptMatcher::try_from(vec![kv("type", "A"), kv("type", "B")]).unwrap_err();
+        assert!(err.contains("Duplicate key"), "unexpected error: {err}");
+
+        let err = ConceptMatcher::try_from(vec![kv("id", "1"), kv("id", "2")]).unwrap_err();
+        assert!(err.contains("Duplicate key"), "unexpected error: {err}");
+
+        // Non-duplicate combinations still work.
+        assert_eq!(
+            ConceptMatcher::try_from(vec![kv("type", "A"), kv("name", "B")]).unwrap(),
+            ConceptMatcher::Object {
+                r#type: "A".to_string(),
+                name: "B".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn aggregation_sum_avg_boundary_semantics() {
+        // All-integer inputs keep integer precision beyond 2^53.
+        let big = 9_007_199_254_740_993i64; // 2^53 + 1, not representable in f64
+        let values = vec![json!(big), json!(1), json!("skip")];
+        assert_eq!(
+            AggregationFunction::Sum.calculate(&values, false),
+            json!(big + 1)
+        );
+
+        // Empty (or non-numeric-only) input sums to integer 0.
+        assert_eq!(AggregationFunction::Sum.calculate(&vec![], false), json!(0));
+        assert_eq!(
+            AggregationFunction::Sum.calculate(&vec![json!("x")], false),
+            json!(0)
+        );
+
+        // Mixed int/float input falls back to f64.
+        assert_eq!(
+            AggregationFunction::Sum.calculate(&vec![json!(1), json!(0.5)], false),
+            json!(1.5)
+        );
+
+        // f64 overflow (non-finite sum) yields Null instead of a bogus number.
+        assert_eq!(
+            AggregationFunction::Sum.calculate(&vec![json!(f64::MAX), json!(f64::MAX)], false),
+            Json::Null
+        );
+
+        // AVG: empty input is Null, otherwise f64.
+        assert_eq!(
+            AggregationFunction::Avg.calculate(&vec![], false),
+            Json::Null
+        );
+        assert_eq!(
+            AggregationFunction::Avg.calculate(&vec![json!(1), json!(2)], false),
+            json!(1.5)
+        );
+
+        // MIN/MAX: empty input is Null; original values are preserved.
+        assert_eq!(
+            AggregationFunction::Min.calculate(&vec![], false),
+            Json::Null
+        );
+        assert_eq!(
+            AggregationFunction::Max.calculate(&vec![json!(big), json!(1)], false),
+            json!(big)
+        );
     }
 }

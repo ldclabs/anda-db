@@ -21,7 +21,10 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::{sync::RwLock, task::JoinHandle};
+use tokio::{
+    sync::{Mutex, RwLock},
+    task::JoinHandle,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::error::ApiError;
@@ -48,6 +51,10 @@ pub struct ServerOptions {
     pub api_key: Option<String>,
     /// Interval of the per-database background flush task.
     pub flush_interval: Duration,
+    /// Per-request processing deadline for the RPC endpoints.
+    pub request_timeout: Duration,
+    /// Maximum accepted request body size in bytes.
+    pub max_body_size: usize,
 }
 
 impl Default for ServerOptions {
@@ -60,6 +67,8 @@ impl Default for ServerOptions {
             storage: StorageConfig::default(),
             api_key: None,
             flush_interval: Duration::from_secs(30),
+            request_timeout: Duration::from_secs(300),
+            max_body_size: 2 * 1024 * 1024,
         }
     }
 }
@@ -99,6 +108,16 @@ struct Inner {
     object_store: Arc<dyn ObjectStore>,
     cancel: CancellationToken,
     databases: RwLock<BTreeMap<String, DbEntry>>,
+    /// Names of non-primary databases that should be reopened on the next
+    /// start. Kept separate from `databases` so a database that failed to
+    /// reopen stays registered (and is retried on the next start or via
+    /// `db.open`) instead of being silently dropped by `persist_registry`.
+    registry: RwLock<BTreeSet<String>>,
+    /// Serializes database lifecycle operations (`register_db`/`close_db`).
+    /// Storage I/O such as `AndaDB::open` runs while holding only this mutex,
+    /// never the `databases` lock, so data RPCs are not blocked by a slow
+    /// open/create/close.
+    lifecycle: Mutex<()>,
 }
 
 /// Shared state for all RPC handlers. Cheap to clone.
@@ -132,9 +151,18 @@ impl AppState {
         )
         .await?;
 
-        let registered: BTreeSet<String> = primary
-            .get_extension_as(DB_REGISTRY_KEY)
-            .unwrap_or_default();
+        // Distinguish "no registry yet" from "registry corrupted": starting
+        // with an unreadable registry and then persisting would overwrite it
+        // with an empty set, silently dropping every registered database.
+        let registered: BTreeSet<String> = match primary.get_extension(DB_REGISTRY_KEY) {
+            Some(value) => value.deserialized().map_err(|err| {
+                ApiError::internal(format!(
+                    "failed to parse database registry extension {DB_REGISTRY_KEY:?}: {err}; \
+                     refusing to start to avoid overwriting the registry"
+                ))
+            })?,
+            None => BTreeSet::new(),
+        };
 
         let state = Self {
             inner: Arc::new(Inner {
@@ -142,11 +170,14 @@ impl AppState {
                 object_store,
                 cancel: CancellationToken::new(),
                 databases: RwLock::new(BTreeMap::new()),
+                registry: RwLock::new(BTreeSet::new()),
+                lifecycle: Mutex::new(()),
             }),
         };
 
         {
             let mut dbs = state.inner.databases.write().await;
+            let mut registry = state.inner.registry.write().await;
             let entry = state.new_entry(primary);
             dbs.insert(state.inner.options.primary_db.clone(), entry);
 
@@ -154,6 +185,11 @@ impl AppState {
                 if name == state.inner.options.primary_db {
                     continue;
                 }
+                // Keep the name registered even when the open fails, so a
+                // transient storage error does not permanently remove the
+                // database from the registry; it is retried on the next
+                // start (or reopened at runtime via `db.open`).
+                registry.insert(name.clone());
                 let config = DBConfig {
                     name: name.clone(),
                     description: name.clone(),
@@ -182,6 +218,16 @@ impl AppState {
     /// Returns the configured API key, if any.
     pub fn api_key(&self) -> Option<&str> {
         self.inner.options.api_key.as_deref()
+    }
+
+    /// Returns the per-request processing deadline for the RPC endpoints.
+    pub fn request_timeout(&self) -> Duration {
+        self.inner.options.request_timeout
+    }
+
+    /// Returns the maximum accepted request body size in bytes.
+    pub fn max_body_size(&self) -> usize {
+        self.inner.options.max_body_size
     }
 
     /// Returns server information including all open database names.
@@ -221,14 +267,20 @@ impl AppState {
         validate_field_name(name)
             .map_err(|e| ApiError::bad_request(format!("invalid database name: {e}")))?;
 
-        let mut dbs = self.inner.databases.write().await;
-        if let Some(entry) = dbs.get(name) {
-            return match mode {
-                OpenMode::Create => Err(ApiError::already_exists(format!(
-                    "database {name:?} already exists"
-                ))),
-                OpenMode::Open | OpenMode::Connect => Ok(entry.db.metadata()),
-            };
+        // Serialize lifecycle operations; this also prevents two concurrent
+        // requests from opening the same database twice.
+        let _guard = self.inner.lifecycle.lock().await;
+
+        {
+            let dbs = self.inner.databases.read().await;
+            if let Some(entry) = dbs.get(name) {
+                return match mode {
+                    OpenMode::Create => Err(ApiError::already_exists(format!(
+                        "database {name:?} already exists"
+                    ))),
+                    OpenMode::Open | OpenMode::Connect => Ok(entry.db.metadata()),
+                };
+            }
         }
 
         let config = DBConfig {
@@ -237,6 +289,8 @@ impl AppState {
             storage: self.inner.options.storage.clone(),
             lock: None,
         };
+        // Real object-store I/O; runs without holding the `databases` lock so
+        // a slow open/create does not stall unrelated RPCs.
         let db = match mode {
             OpenMode::Create => AndaDB::create(self.inner.object_store.clone(), config).await?,
             OpenMode::Open => AndaDB::open(self.inner.object_store.clone(), config).await?,
@@ -245,8 +299,14 @@ impl AppState {
 
         let metadata = db.metadata();
         let entry = self.new_entry(db);
-        dbs.insert(name.to_string(), entry);
-        self.persist_registry(&dbs).await;
+        {
+            let mut dbs = self.inner.databases.write().await;
+            dbs.insert(name.to_string(), entry);
+        }
+        {
+            self.inner.registry.write().await.insert(name.to_string());
+        }
+        self.persist_registry().await;
         Ok(metadata)
     }
 
@@ -259,24 +319,28 @@ impl AppState {
             ));
         }
 
-        let entry = {
-            let mut dbs = self.inner.databases.write().await;
-            let entry = dbs
-                .remove(name)
-                .ok_or_else(|| ApiError::not_found(format!("database {name:?} not found")))?;
-            self.persist_registry(&dbs).await;
-            entry
-        };
+        let _guard = self.inner.lifecycle.lock().await;
 
-        // Cancelling the flush task makes `AndaDB::auto_flush` close the
-        // database (flushing all collections) before the task exits.
-        entry.cancel.cancel();
-        if let Err(err) = entry.flush_task.await {
-            log::error!(
-                action = "AppState::close_db",
-                database = name;
-                "flush task failed: {err:?}",
-            );
+        let entry = { self.inner.databases.write().await.remove(name) };
+        // A registered database that failed to reopen has no open entry;
+        // closing it just removes it from the registry.
+        let registered = { self.inner.registry.write().await.remove(name) };
+        if entry.is_none() && !registered {
+            return Err(ApiError::not_found(format!("database {name:?} not found")));
+        }
+        self.persist_registry().await;
+
+        if let Some(entry) = entry {
+            // Cancelling the flush task makes `AndaDB::auto_flush` close the
+            // database (flushing all collections) before the task exits.
+            entry.cancel.cancel();
+            if let Err(err) = entry.flush_task.await {
+                log::error!(
+                    action = "AppState::close_db",
+                    database = name;
+                    "flush task failed: {err:?}",
+                );
+            }
         }
         Ok(())
     }
@@ -316,22 +380,25 @@ impl AppState {
         }
     }
 
-    /// Persists the set of non-primary database names into the primary
+    /// Persists the registered non-primary database names into the primary
     /// database's extensions. Best-effort: a failure is logged and the
     /// affected database stays usable, but it will not be reopened
     /// automatically until the registry is written again.
-    async fn persist_registry(&self, dbs: &BTreeMap<String, DbEntry>) {
-        let primary = &self.inner.options.primary_db;
-        let names: BTreeSet<&String> = dbs.keys().filter(|name| *name != primary).collect();
-        if let Some(entry) = dbs.get(primary)
-            && let Err(err) = entry
-                .db
+    async fn persist_registry(&self) {
+        let names: BTreeSet<String> = { self.inner.registry.read().await.clone() };
+        let primary = {
+            let dbs = self.inner.databases.read().await;
+            dbs.get(&self.inner.options.primary_db)
+                .map(|entry| entry.db.clone())
+        };
+        if let Some(db) = primary
+            && let Err(err) = db
                 .save_extension_from(DB_REGISTRY_KEY.to_string(), &names)
                 .await
         {
             log::error!(
                 action = "AppState::persist_registry",
-                database = primary;
+                database = self.inner.options.primary_db;
                 "failed to persist database registry: {err:?}",
             );
         }

@@ -22,27 +22,26 @@
 //!
 //! ## Request Routing
 //!
-//! The database name is extracted from:
-//! 1. The first path segment: `/{db_name}/...`
-//! 2. Or the `X-Database` header
+//! The database name is extracted from the first path segment after the
+//! configured `--path-prefix`: `{prefix}{db_name}/...`. Client-supplied
+//! shard headers are ignored; only server-side routing metadata selects a
+//! shard. Names must match the backend rules (`[a-z0-9_]{1,64}`).
+//!
+//! The `read_only` flag on a shard backend is advisory routing metadata: the
+//! RPC protocol is POST-based, so the proxy cannot tell reads from writes by
+//! HTTP method and does not enforce it; enforcement is up to the backend
+//! (e.g. `db.set_read_only`).
 //!
 //! ## Management API (auth required)
 //!
-//! | Method   | Path             | Description              |
-//! |----------|------------------|--------------------------|
-//! | `GET`    | `/_admin/shards` | List all shard entries   |
-//! | `PUT`    | `/_admin/shards` | Add or update a shard    |
-//! | `DELETE` | `/_admin/shards` | Delete a shard entry     |
-//!
-//! ### PUT body
-//! ```json
-//! {"db_name": "mydb", "shard_id": 1, "backend_addr": "http://10.0.0.1:8080"}
-//! ```
-//!
-//! ### DELETE body
-//! ```json
-//! {"db_name": "mydb"}
-//! ```
+//! | Method   | Path                        | Body                                                | Description                    |
+//! |----------|-----------------------------|-----------------------------------------------------|--------------------------------|
+//! | `GET`    | `/_admin/db_shards/{db}`    | –                                                   | Get one db→shard binding       |
+//! | `PUT`    | `/_admin/db_shards`         | `{"db_name": "mydb", "shard_id": 1}`                | Assign a database to a shard   |
+//! | `DELETE` | `/_admin/db_shards`         | `{"db_name": "mydb"}`                               | Remove a db→shard binding      |
+//! | `GET`    | `/_admin/shard_backends`    | –                                                   | List all shard backends        |
+//! | `PUT`    | `/_admin/shard_backends`    | `{"shard_id": 1, "backend_addr": "http://10.0.0.1:8080", "read_only": false}` | Add or update a shard backend |
+//! | `DELETE` | `/_admin/shard_backends`    | `{"shard_id": 1}`                                   | Delete a shard backend         |
 //!
 //! ## Usage
 //!
@@ -51,6 +50,10 @@
 //! export API_KEY="my-secret"
 //! cargo run -p anda_db_shard_proxy -- --addr 0.0.0.0:8080
 //! ```
+//!
+//! Listening on a non-loopback address requires `API_KEY` (or the explicit
+//! `--insecure-no-api-key` override); otherwise the management API would be
+//! open to anyone who can reach the proxy.
 
 use axum::{BoxError, body::Body};
 use clap::Parser;
@@ -63,7 +66,7 @@ use tokio::signal;
 use tokio_util::sync::CancellationToken;
 
 use anda_db_shard_proxy::handler::build_router;
-use anda_db_shard_proxy::proxy::AppState;
+use anda_db_shard_proxy::proxy::{AppState, validate_backend_addr};
 use anda_db_shard_proxy::router;
 use anda_db_shard_proxy::store::{ResolvedRoute, ShardStore};
 
@@ -90,15 +93,23 @@ struct Cli {
     #[clap(long, env = "PATH_PREFIX", default_value = "/")]
     path_prefix: String,
 
-    /// API key for management endpoints (optional but recommended)
+    /// API key for management endpoints. Required when listening on a
+    /// non-loopback address unless --insecure-no-api-key is passed.
     #[clap(long, env = "API_KEY")]
     api_key: Option<String>,
+
+    /// Allow running without API_KEY on a non-loopback address, leaving the
+    /// management API open to anyone who can reach the proxy (dangerous)
+    #[clap(long, env = "INSECURE_NO_API_KEY")]
+    insecure_no_api_key: bool,
 
     /// Maximum PostgreSQL connections in the pool
     #[clap(long, env = "PG_MAX_CONNECTIONS", default_value = "5")]
     pg_max_connections: u32,
 
-    /// Maximum timeout for proxy requests in seconds
+    /// Timeout in seconds for a proxied request up to the response headers
+    /// (connect + send + wait for the backend to start responding); the
+    /// response body stream itself is not bounded by this timeout
     #[clap(long, env = "PROXY_REQUEST_TIMEOUT", default_value = "300")]
     proxy_request_timeout: u32,
 
@@ -113,6 +124,20 @@ async fn main() -> Result<(), BoxError> {
     let cli = Cli::parse();
     if matches!(cli.api_key.as_deref(), Some(key) if key.trim().is_empty()) {
         return Err("API_KEY must not be empty".into());
+    }
+
+    let addr: SocketAddr = cli.addr.parse()?;
+    // Without an API key the management API (which can redirect every
+    // tenant's traffic to an arbitrary backend) would be open to anyone who
+    // can reach the listener; only allow that on loopback or with an
+    // explicit override.
+    if cli.api_key.is_none() && !addr.ip().is_loopback() && !cli.insecure_no_api_key {
+        return Err(format!(
+            "refusing to listen on non-loopback address {addr} without API_KEY: \
+             the management API would be open to anyone; set API_KEY or pass \
+             --insecure-no-api-key to override"
+        )
+        .into());
     }
 
     Builder::with_level(&get_env_level().to_string())
@@ -142,24 +167,31 @@ async fn main() -> Result<(), BoxError> {
         .http2_only(false)
         .build_http();
 
+    // Reject a misconfigured default backend at startup instead of failing
+    // every request with 500/BAD_GATEWAY later.
+    let default_backend = match cli.default_backend_addr {
+        Some(addr) => {
+            validate_backend_addr(&addr).map_err(|e| format!("invalid default backend: {e}"))?;
+            Some(ResolvedRoute {
+                db_name: None,
+                shard_id: 0,
+                backend_addr: addr,
+                read_only: true,
+            })
+        }
+        None => None,
+    };
+
     let state = AppState {
         store,
         client: Arc::new(http_client),
         api_key: Arc::new(cli.api_key),
-        db_name_extractor: Arc::new(router::PrefixExtractor {
-            prefix: cli.path_prefix.clone(),
-        }),
-        proxy_request_timeout: Duration::from_secs(cli.proxy_request_timeout as u64),
-        default_backend: cli.default_backend_addr.map(|addr| ResolvedRoute {
-            db_name: None,
-            shard_id: 0,
-            backend_addr: addr,
-            read_only: true,
-        }),
+        db_name_extractor: Arc::new(router::PrefixExtractor::new(cli.path_prefix.clone())),
+        proxy_request_timeout: Duration::from_secs(cli.proxy_request_timeout.max(1) as u64),
+        default_backend,
     };
 
     let app = build_router(state);
-    let addr: SocketAddr = cli.addr.parse()?;
     let listener = create_reuse_port_listener(addr).await?;
     let shutdown_token = global_cancel_token.clone();
 
@@ -169,9 +201,14 @@ async fn main() -> Result<(), BoxError> {
         APP_VERSION,
         cli.addr
     );
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(shutdown_token))
-        .await?;
+    // `into_make_service_with_connect_info` exposes the client address so the
+    // proxy can append it to `X-Forwarded-For`.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal(shutdown_token))
+    .await?;
 
     log::warn!("shut down gracefully");
     Ok(())

@@ -91,17 +91,36 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
         path
     }
 
+    /// Fetches the raw metadata document from the underlying store,
+    /// bypassing the cache. A missing document is reported as
+    /// [`Error::NotFound`] under the caller's logical `location`, not the
+    /// internal `meta/` path.
+    async fn fetch_meta_bytes(&self, location: &Path) -> Result<bytes::Bytes> {
+        let meta_path = self.meta_path(location);
+        let data = self.store.get(&meta_path).await.map_err(|err| match err {
+            Error::NotFound { source, .. } => Error::NotFound {
+                path: location.to_string(),
+                source,
+            },
+            err => err,
+        })?;
+        data.bytes().await
+    }
+
+    /// Deserializes a metadata document fetched by
+    /// [`SidecarStore::fetch_meta_bytes`].
+    fn decode_meta(&self, location: &Path, data: &[u8]) -> Result<M> {
+        from_reader(data).map_err(|err| Error::Generic {
+            store: M::STORE_NAME,
+            source: format!("Failed to deserialize Metadata for path {location}: {err:?}").into(),
+        })
+    }
+
     /// Loads and deserializes the metadata document from the underlying
     /// store, bypassing the cache.
     async fn load_meta(&self, location: &Path) -> Result<M> {
-        let meta_path = self.meta_path(location);
-        let data = self.store.get(&meta_path).await?;
-        let data = data.bytes().await?;
-        let meta: M = from_reader(&data[..]).map_err(|err| Error::Generic {
-            store: M::STORE_NAME,
-            source: format!("Failed to deserialize Metadata for path {location}: {err:?}").into(),
-        })?;
-        Ok(meta)
+        let data = self.fetch_meta_bytes(location).await?;
+        self.decode_meta(location, &data)
     }
 
     /// Returns the metadata for `location`, loading and caching it on miss.
@@ -157,8 +176,22 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
             .and_try_compute_with(|entry| async {
                 let val = match entry {
                     Some(meta) => f(Some(meta.value())).await?,
-                    None => match self.load_meta(location).await {
-                        Ok(meta) => f(Some(&meta)).await?,
+                    None => match self.fetch_meta_bytes(location).await {
+                        Ok(data) => match self.decode_meta(location, &data) {
+                            Ok(meta) => f(Some(&meta)).await?,
+                            Err(err) => {
+                                // A corrupted sidecar (e.g. a torn write
+                                // followed by a crash) must not make the key
+                                // permanently unwritable: treat it as absent
+                                // so an overwriting put can rebuild both the
+                                // data object and its metadata.
+                                log::warn!(
+                                    "{}: replacing corrupted metadata for {location}: {err}",
+                                    M::STORE_NAME
+                                );
+                                f(None).await?
+                            }
+                        },
                         Err(Error::NotFound { .. }) => f(None).await?,
                         Err(err) => return Err(err),
                     },
@@ -282,14 +315,32 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
                 let store = inner.clone();
                 async move {
                     let location = store.strip_prefix(obj.location);
-                    let meta = store.get_meta(&location).await?;
+                    obj.e_tag = store.logical_e_tag(&location).await?;
                     obj.location = location;
-                    obj.e_tag = meta.e_tag().map(String::from);
                     Ok::<ObjectMeta, Error>(obj)
                 }
             })
             .try_buffered(8) // fetch metadata concurrently
             .boxed()
+    }
+
+    /// Resolves the logical ETag of `location` for listings. An orphaned
+    /// data object (metadata lost, e.g. after a crash between the data and
+    /// metadata writes) must not fail the whole listing — typically the very
+    /// recovery scan that would heal it — so a missing sidecar document maps
+    /// to `Ok(None)` instead of an error.
+    async fn logical_e_tag(&self, location: &Path) -> Result<Option<String>> {
+        match self.get_meta(location).await {
+            Ok(meta) => Ok(meta.e_tag().map(String::from)),
+            Err(Error::NotFound { .. }) => {
+                log::warn!(
+                    "{}: listing orphaned data object without metadata: {location}",
+                    M::STORE_NAME
+                );
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// Shared implementation of [`ObjectStore::list_with_delimiter`]; see
@@ -328,8 +379,7 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
         // the original listing order.
         let mut indexed = futures::stream::iter(objects.into_iter().enumerate().map(
             move |(idx, mut obj)| async move {
-                let meta = self.get_meta(&obj.location).await?;
-                obj.e_tag = meta.e_tag().map(String::from);
+                obj.e_tag = self.logical_e_tag(&obj.location).await?;
                 Ok::<(usize, ObjectMeta), Error>((idx, obj))
             },
         ))
@@ -387,6 +437,14 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
         to: &Path,
         options: RenameOptions,
     ) -> Result<()> {
+        if from == to {
+            // A self-rename must not be forwarded: the default rename
+            // implementation is copy + delete, which would destroy the
+            // object on some backends. Validate existence and target mode,
+            // then leave the object untouched.
+            return self.check_self_rename(from, &options).await;
+        }
+
         let full_from = self.full_path(from);
         let full_to = self.full_path(to);
         self.store
@@ -408,5 +466,23 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
         self.remove_meta_cache(to).await;
         self.refresh_meta_original_tag(to).await?;
         Ok(())
+    }
+
+    /// Validates a rename where `from == to`: the object must exist, and a
+    /// [`RenameTargetMode::Create`] rename fails because the target (the
+    /// object itself) already exists. The object is left untouched.
+    pub(crate) async fn check_self_rename(
+        &self,
+        location: &Path,
+        options: &RenameOptions,
+    ) -> Result<()> {
+        self.get_meta(location).await?;
+        match options.target_mode {
+            RenameTargetMode::Overwrite => Ok(()),
+            RenameTargetMode::Create => Err(Error::AlreadyExists {
+                path: location.to_string(),
+                source: "rename target already exists".into(),
+            }),
+        }
     }
 }

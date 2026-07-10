@@ -1078,9 +1078,12 @@ async fn test_kql_multi_hop_bidirectional_matching() {
             "#;
     let query = parse_kql(kql).unwrap();
     let (result, _) = nexus.execute_kql(query).await.unwrap();
+    // Unordered legacy projections iterate bindings in ascending EntityID
+    // order (deterministic pagination); Medicine was created before
+    // PainReliever in this fixture.
     assert_eq!(
         result,
-        json!([["Aspirin"], ["NSAID"], ["PainReliever", "Medicine"]])
+        json!([["Aspirin"], ["NSAID"], ["Medicine", "PainReliever"]])
     );
 
     // 测试2: 反向多跳查询 - 从Medicine分类查找所有下级药物（1-3跳）
@@ -1291,7 +1294,9 @@ async fn test_kql_aggregation() {
 
     let query = parse_kql(kql).unwrap();
     let (result, _) = nexus.execute_kql(query).await.unwrap();
-    assert_eq!(result, json!([["Aspirin"], 2.0, 2.0, 2.0, 2.0]));
+    // SUM/MIN/MAX keep integer typing for integer inputs; AVG is a float
+    // (anda_kip aggregation semantics).
+    assert_eq!(result, json!([["Aspirin"], 2, 2.0, 2, 2]));
 }
 
 #[tokio::test]
@@ -1531,12 +1536,15 @@ async fn test_kql_union_clause() {
 
     let query = parse_kql(kql).unwrap();
     let (result, _) = nexus.execute_kql(query).await.unwrap();
+    // Unordered projections iterate bindings in ascending EntityID order
+    // (deterministic pagination); the Symptom fixtures were created before
+    // Aspirin. The solution set itself is unchanged.
     assert_eq!(
         result,
         json!([
-            "Aspirin".to_string(),
             "Headache".to_string(),
             "Fever".to_string(),
+            "Aspirin".to_string(),
         ])
     );
 
@@ -2768,6 +2776,7 @@ async fn test_private_relation_row_helpers_and_predicate_value_loading() {
         predicate_var: Some("pred".to_string()),
         object_var: Some("object".to_string()),
         rows: vec![],
+        origin: RelationOrigin::default(),
     };
     let row = QueryRelationRow {
         proposition: Some(EntityID::Proposition(7, "knows".to_string())),
@@ -3440,7 +3449,8 @@ async fn test_kql_grouped_find_with_limit() {
     assert_eq!(columns.len(), 4);
     assert_eq!(columns[0], json!(["Headache"]));
     assert_eq!(columns[2], json!([2]));
-    assert_eq!(columns[3], json!(5.0));
+    // Integer inputs keep integer typing under SUM (anda_kip semantics).
+    assert_eq!(columns[3], json!(5));
 }
 
 #[tokio::test]
@@ -4071,7 +4081,9 @@ async fn test_kml_update_statement() {
     // consistent with KQL concept matching.
     assert!(result.is_err());
 
-    // LIMIT caps the blast radius; dry_run reports matched only.
+    // LIMIT caps the blast radius; dry_run reports matched only. `matched`
+    // counts the pattern's actual matches before the LIMIT cap so the agent
+    // can detect truncation (2 symptoms matched, at most 1 updated).
     let result = nexus
         .execute_kml(
             parse_kml(
@@ -4085,7 +4097,7 @@ async fn test_kml_update_statement() {
         )
         .await
         .unwrap();
-    assert_eq!(result, json!({ "updated": 0, "matched": 1 }));
+    assert_eq!(result, json!({ "updated": 0, "matched": 2 }));
 
     // Proposition links update with the decay idiom on metadata.
     let result = nexus
@@ -5376,4 +5388,676 @@ async fn test_kql_multi_hop_find_pagination() {
         matches!(err.code, KipErrorCode::InvalidSyntax),
         "bogus cursor: {err:?}"
     );
+}
+
+#[tokio::test]
+async fn test_kql_grouped_find_count_respects_filter_and_not() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_test_data(&nexus).await.unwrap();
+
+    // Headache: Aspirin(2), Ibuprofen(3), Paracetamol(1); Fever: Aspirin(2),
+    // Paracetamol(1).
+    let kml = r#"
+        UPSERT {
+            CONCEPT ?ibuprofen {
+                {type: "Drug", name: "Ibuprofen"}
+                SET ATTRIBUTES { "risk_level": 3 }
+                SET PROPOSITIONS { ("treats", {type: "Symptom", name: "Headache"}) }
+            }
+            CONCEPT ?paracetamol {
+                {type: "Drug", name: "Paracetamol"}
+                SET ATTRIBUTES { "risk_level": 1 }
+                SET PROPOSITIONS {
+                    ("treats", {type: "Symptom", name: "Headache"})
+                    ("treats", {type: "Symptom", name: "Fever"})
+                }
+            }
+        }
+        "#;
+    nexus
+        .execute_kml(parse_kml(kml).unwrap(), false)
+        .await
+        .unwrap();
+
+    // FILTER narrows the member variable after the groups were built: the
+    // grouped COUNT must only count surviving members (risk_level >= 2 keeps
+    // Aspirin and Ibuprofen).
+    let kql = r#"
+        FIND(?symptom.name, COUNT(?drug))
+        WHERE {
+            ?symptom {type: "Symptom"}
+            (?drug, "treats", ?symptom)
+            FILTER(?drug.attributes.risk_level >= 2)
+        }
+        "#;
+    let (result, _) = nexus.execute_kql(parse_kql(kql).unwrap()).await.unwrap();
+    let arr = result.as_array().unwrap();
+    let names = arr[0].as_array().unwrap();
+    let counts = arr[1].as_array().unwrap();
+    assert_eq!(names.len(), counts.len());
+    for (i, name) in names.iter().enumerate() {
+        match name.as_str().unwrap() {
+            "Headache" => assert_eq!(counts[i], json!(2), "filtered grouped count: {result}"),
+            "Fever" => assert_eq!(counts[i], json!(1), "filtered grouped count: {result}"),
+            other => panic!("Unexpected symptom: {other}"),
+        }
+    }
+
+    // NOT excludes members the same way: drugs that treat Fever are removed
+    // from ?drug entirely, so Headache only counts Ibuprofen.
+    let kql = r#"
+        FIND(?symptom.name, COUNT(?drug))
+        WHERE {
+            ?symptom {type: "Symptom"}
+            (?drug, "treats", ?symptom)
+            NOT { (?drug, "treats", {type: "Symptom", name: "Fever"}) }
+        }
+        "#;
+    let (result, _) = nexus.execute_kql(parse_kql(kql).unwrap()).await.unwrap();
+    let arr = result.as_array().unwrap();
+    let names = arr[0].as_array().unwrap();
+    let counts = arr[1].as_array().unwrap();
+    for (i, name) in names.iter().enumerate() {
+        match name.as_str().unwrap() {
+            "Headache" => assert_eq!(counts[i], json!(1), "NOT-narrowed grouped count: {result}"),
+            "Fever" => assert_eq!(counts[i], json!(0), "NOT-narrowed grouped count: {result}"),
+            other => panic!("Unexpected symptom: {other}"),
+        }
+    }
+}
+
+/// Seeds two relation predicates over shared endpoints for join/union tests:
+/// p1: (A1,B1), (A2,B2); p2: (A1,B2), (A2,B2).
+async fn setup_pair_graph(nexus: &CognitiveNexus) {
+    let kml = r#"
+        UPSERT {
+            CONCEPT ?t { {type: "$ConceptType", name: "PairNode"} }
+            CONCEPT ?p1 { {type: "$PropositionType", name: "p1"} }
+            CONCEPT ?p2 { {type: "$PropositionType", name: "p2"} }
+            CONCEPT ?a1 { {type: "PairNode", name: "A1"} }
+            CONCEPT ?a2 { {type: "PairNode", name: "A2"} }
+            CONCEPT ?b1 { {type: "PairNode", name: "B1"} }
+            CONCEPT ?b2 { {type: "PairNode", name: "B2"} }
+            PROPOSITION ?l1 { (?a1, "p1", ?b1) }
+            PROPOSITION ?l2 { (?a2, "p1", ?b2) }
+            PROPOSITION ?l3 { (?a1, "p2", ?b2) }
+            PROPOSITION ?l4 { (?a2, "p2", ?b2) }
+        }
+        "#;
+    nexus
+        .execute_kml(parse_kml(kml).unwrap(), false)
+        .await
+        .unwrap();
+}
+
+fn collect_pairs(result: &Json) -> Vec<(String, String)> {
+    let cols = result.as_array().unwrap();
+    assert_eq!(cols.len(), 2, "expected two columns: {result}");
+    let c1 = cols[0].as_array().unwrap();
+    let c2 = cols[1].as_array().unwrap();
+    assert_eq!(c1.len(), c2.len(), "columns must be index-aligned: {result}");
+    let mut pairs: Vec<(String, String)> = c1
+        .iter()
+        .zip(c2.iter())
+        .map(|(a, b)| {
+            (
+                a.as_str().unwrap_or("null").to_string(),
+                b.as_str().unwrap_or("null").to_string(),
+            )
+        })
+        .collect();
+    pairs.sort();
+    pairs
+}
+
+#[tokio::test]
+async fn test_kql_union_multi_var_row_union() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_pair_graph(&nexus).await;
+
+    // Row-wise union (KIP §3.4.7.3): both branches bind the same (?a, ?b)
+    // pair; the result must contain every branch's rows, deduplicated.
+    let kql = r#"
+        FIND(?a.name, ?b.name)
+        WHERE {
+            (?a, "p1", ?b)
+            UNION { (?a, "p2", ?b) }
+        }
+        "#;
+    let (result, _) = nexus.execute_kql(parse_kql(kql).unwrap()).await.unwrap();
+    assert_eq!(
+        collect_pairs(&result),
+        vec![
+            ("A1".to_string(), "B1".to_string()), // p1
+            ("A1".to_string(), "B2".to_string()), // p2
+            ("A2".to_string(), "B2".to_string()), // p1 and p2, deduplicated
+        ],
+        "row-wise union must keep both branches' solutions: {result}"
+    );
+}
+
+#[tokio::test]
+async fn test_kql_sequential_patterns_pair_join() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_pair_graph(&nexus).await;
+
+    // Sequential patterns are conjunctive per solution: (?a, ?b) must
+    // satisfy both p1 and p2 as a pair. Endpoint-set approximation would
+    // also produce (A1, B2) (A1 ∈ p1 subjects, B2 ∈ p1 objects, (A1,B2) ∈ p2)
+    // — a false pair, since (A1,B2) does not satisfy p1.
+    let kql = r#"
+        FIND(?a.name, ?b.name)
+        WHERE {
+            (?a, "p1", ?b)
+            (?a, "p2", ?b)
+        }
+        "#;
+    let (result, _) = nexus.execute_kql(parse_kql(kql).unwrap()).await.unwrap();
+    assert_eq!(
+        collect_pairs(&result),
+        vec![("A2".to_string(), "B2".to_string())],
+        "pair-wise join must not produce endpoint-approximate rows: {result}"
+    );
+}
+
+#[tokio::test]
+async fn test_kql_cross_variable_not_keeps_valid_solutions() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_pair_graph(&nexus).await;
+
+    // Outer solutions via p1: (A1,B1), (A2,B2). NOT { (?a, "p2", ?b) }
+    // matches (A1,B2) and (A2,B2): only the (A2,B2) *solution* is excluded.
+    // Column-level subtraction would also kill (A1,B1) via B2's column, or
+    // A1 via the (A1,B2) cross pair.
+    let kql = r#"
+        FIND(?a.name, ?b.name)
+        WHERE {
+            (?a, "p1", ?b)
+            NOT { (?a, "p2", ?b) }
+        }
+        "#;
+    let (result, _) = nexus.execute_kql(parse_kql(kql).unwrap()).await.unwrap();
+    assert_eq!(
+        collect_pairs(&result),
+        vec![("A1".to_string(), "B1".to_string())],
+        "NOT must exclude solutions, not binding columns: {result}"
+    );
+}
+
+#[tokio::test]
+async fn test_kql_nested_literal_predicate_requires_proposition_endpoint() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_pair_graph(&nexus).await;
+
+    // confirmed_by links: one whose subject is a proposition (the (A1,p1,B1)
+    // link) and one whose subject is a plain concept (A2).
+    let kml = r#"
+        UPSERT {
+            CONCEPT ?cb { {type: "$PropositionType", name: "confirmed_by"} }
+            CONCEPT ?w1 { {type: "PairNode", name: "WitnessLink"} }
+            CONCEPT ?w2 { {type: "PairNode", name: "WitnessConcept"} }
+            PROPOSITION ?c1 {
+                (({type: "PairNode", name: "A1"}, "p1", {type: "PairNode", name: "B1"}), "confirmed_by", ?w1)
+            }
+            PROPOSITION ?c2 { ({type: "PairNode", name: "A2"}, "confirmed_by", ?w2) }
+        }
+        "#;
+    nexus
+        .execute_kml(parse_kml(kml).unwrap(), false)
+        .await
+        .unwrap();
+
+    // The nested subject pattern requires the endpoint to be a proposition
+    // link: the concept-subject confirmed_by row must not pollute ?x.
+    let kql = r#"
+        FIND(?x.name)
+        WHERE {
+            ((?s, ?p, ?o), "confirmed_by", ?x)
+        }
+        "#;
+    let (result, _) = nexus.execute_kql(parse_kql(kql).unwrap()).await.unwrap();
+    assert_eq!(
+        result,
+        json!(["WitnessLink"]),
+        "concept-subject rows must be filtered out: {result}"
+    );
+}
+
+#[tokio::test]
+async fn test_kml_set_propositions_self_loop_preflight() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_test_data(&nexus).await.unwrap();
+
+    let version_of = async |nexus: &CognitiveNexus| -> u64 {
+        let concept = nexus
+            .get_concept(&ConceptPK::Object {
+                r#type: "Drug".to_string(),
+                name: "Aspirin".to_string(),
+            })
+            .await
+            .unwrap();
+        system_metadata_version(&concept.metadata)
+    };
+    let before = version_of(&nexus).await;
+
+    // A SET PROPOSITIONS target equal to the (pre-existing) subject is a
+    // self-loop: rejected by the preflight in both dry-run and real mode,
+    // with no partial write (the concept block itself must not be applied).
+    let kml = r#"
+        UPSERT {
+            CONCEPT ?x {
+                {type: "Drug", name: "Aspirin"}
+                SET ATTRIBUTES { "poisoned": true }
+                SET PROPOSITIONS { ("treats", {type: "Drug", name: "Aspirin"}) }
+            }
+        }
+        "#;
+    for dry_run in [true, false] {
+        let err = nexus
+            .execute_kml(parse_kml(kml).unwrap(), dry_run)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err.code, KipErrorCode::InvalidSyntax),
+            "dry_run={dry_run}: {err:?}"
+        );
+        assert!(err.message.contains("self-loop"), "{err:?}");
+    }
+
+    let concept = nexus
+        .get_concept(&ConceptPK::Object {
+            r#type: "Drug".to_string(),
+            name: "Aspirin".to_string(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        system_metadata_version(&concept.metadata),
+        before,
+        "failed statement must not bump the concept version"
+    );
+    assert!(
+        !concept.attributes.contains_key("poisoned"),
+        "failed statement must not leave partial attribute writes"
+    );
+}
+
+#[tokio::test]
+async fn test_kql_union_pagination_no_missing_pages() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+
+    // TypeA concepts are created first (smaller ids), TypeB after (larger
+    // ids). The main pattern binds TypeB, then UNION appends the smaller
+    // TypeA ids at the tail of the binding list.
+    let kml = r#"
+        UPSERT {
+            CONCEPT ?ta { {type: "$ConceptType", name: "TypeA"} }
+            CONCEPT ?tb { {type: "$ConceptType", name: "TypeB"} }
+            CONCEPT ?a1 { {type: "TypeA", name: "a1"} }
+            CONCEPT ?a2 { {type: "TypeA", name: "a2"} }
+            CONCEPT ?b1 { {type: "TypeB", name: "b1"} }
+            CONCEPT ?b2 { {type: "TypeB", name: "b2"} }
+        }
+        "#;
+    nexus
+        .execute_kml(parse_kml(kml).unwrap(), false)
+        .await
+        .unwrap();
+
+    let query = |cursor: Option<&str>| {
+        let cursor_clause = cursor
+            .map(|c| format!("CURSOR \"{c}\""))
+            .unwrap_or_default();
+        format!(
+            r#"
+            FIND(?c.name)
+            WHERE {{
+                ?c {{type: "TypeB"}}
+                UNION {{ ?c {{type: "TypeA"}} }}
+            }}
+            LIMIT 3
+            {cursor_clause}
+            "#
+        )
+    };
+
+    let mut names: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..4 {
+        let (result, next) = nexus
+            .execute_kql(parse_kql(&query(cursor.as_deref())).unwrap())
+            .await
+            .unwrap();
+        names.extend(
+            result
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string()),
+        );
+        cursor = next;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["a1", "a2", "b1", "b2"],
+        "pages must cover every binding exactly once regardless of branch id order"
+    );
+}
+
+#[tokio::test]
+async fn test_kql_union_disjoint_vars_null_padding() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_test_data(&nexus).await.unwrap();
+
+    let kml = r#"
+        UPSERT {
+            CONCEPT ?pt { {type: "$ConceptType", name: "Product"} }
+            CONCEPT ?mb { {type: "$PropositionType", name: "manufactured_by"} }
+            CONCEPT ?mk { {type: "$ConceptType", name: "Maker"} }
+            CONCEPT ?bayer { {type: "Maker", name: "Bayer"} }
+            CONCEPT ?prod {
+                {type: "Product", name: "AspirinPlus"}
+                SET PROPOSITIONS { ("manufactured_by", {type: "Maker", name: "Bayer"}) }
+            }
+        }
+        "#;
+    nexus
+        .execute_kml(parse_kml(kml).unwrap(), false)
+        .await
+        .unwrap();
+
+    // Spec §3.4.7.3 Execution Flow Example 1: disjoint variables across the
+    // main block and the UNION branch produce a row-wise union with `null`
+    // padding, not a cross product.
+    let kql = r#"
+        FIND(?drug.name, ?product.name)
+        WHERE {
+            ?drug {type: "Drug"}
+            (?drug, "treats", {type: "Symptom", name: "Headache"})
+            UNION {
+                ?product {type: "Product"}
+                (?product, "manufactured_by", {type: "Maker", name: "Bayer"})
+            }
+        }
+        "#;
+    let (result, _) = nexus.execute_kql(parse_kql(kql).unwrap()).await.unwrap();
+    assert_eq!(
+        collect_pairs(&result),
+        vec![
+            ("Aspirin".to_string(), "null".to_string()),
+            ("null".to_string(), "AspirinPlus".to_string()),
+        ],
+        "disjoint UNION branches must union rows with null padding: {result}"
+    );
+}
+
+#[tokio::test]
+async fn test_entity_id_colon_predicate_roundtrip() {
+    // Unit-level: `P:<id>:<predicate>` round-trips when the predicate itself
+    // contains ':'.
+    let id = EntityID::Proposition(9, "a:b".to_string());
+    assert_eq!(id.to_string(), "P:9:a:b");
+    assert_eq!(EntityID::from_str("P:9:a:b").unwrap(), id);
+    assert!(EntityID::from_str("P:9:").is_err());
+
+    // Integration: a predicate named with ':' can be created, and the link
+    // id the engine returns can be matched back via `(id: "...")`.
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    let kml = r#"
+        UPSERT {
+            CONCEPT ?t { {type: "$ConceptType", name: "ColonNode"} }
+            CONCEPT ?p { {type: "$PropositionType", name: "rel:of"} }
+            CONCEPT ?a { {type: "ColonNode", name: "A"} }
+            CONCEPT ?b { {type: "ColonNode", name: "B"} }
+            PROPOSITION ?l { (?a, "rel:of", ?b) }
+        }
+        "#;
+    let result = nexus
+        .execute_kml(parse_kml(kml).unwrap(), false)
+        .await
+        .unwrap();
+    let link_id = result["upsert_proposition_links"][0].as_str().unwrap();
+    assert!(link_id.contains("rel:of"), "{link_id}");
+
+    let kql = format!(
+        r#"
+        FIND(?link.predicate)
+        WHERE {{
+            ?link (id: "{link_id}")
+        }}
+        "#
+    );
+    let (result, _) = nexus.execute_kql(parse_kql(&kql).unwrap()).await.unwrap();
+    assert_eq!(result, json!(["rel:of"]));
+}
+
+#[tokio::test]
+async fn test_kql_dangling_id_matchers_return_kip_3002() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_test_data(&nexus).await.unwrap();
+
+    // Match-only `{id:}` with a dangling concept id: KIP_3002 (spec RC8),
+    // not a silent empty result.
+    let err = nexus
+        .execute_kql(
+            parse_kql(r#"FIND(?c.name) WHERE { ?c {id: "C:999999"} }"#).unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err.code, KipErrorCode::NotFound), "{err:?}");
+
+    // Match-only `(id:)` with a dangling link id: KIP_3002.
+    let err = nexus
+        .execute_kql(
+            parse_kql(r#"FIND(?l.predicate) WHERE { ?l (id: "P:999999:none") }"#).unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err.code, KipErrorCode::NotFound), "{err:?}");
+}
+
+#[tokio::test]
+async fn test_kql_grouped_find_order_by_group_var() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_test_data(&nexus).await.unwrap();
+
+    // Group rows must actually be sorted by the group variable's field —
+    // previously ORDER BY ?symptom.name was silently ignored.
+    let kql = r#"
+        FIND(?symptom.name, COUNT(?drug))
+        WHERE {
+            ?symptom {type: "Symptom"}
+            (?drug, "treats", ?symptom)
+        }
+        ORDER BY ?symptom.name DESC
+        "#;
+    let (result, _) = nexus.execute_kql(parse_kql(kql).unwrap()).await.unwrap();
+    let arr = result.as_array().unwrap();
+    assert_eq!(
+        arr[0],
+        json!(["Headache", "Fever"]),
+        "groups must sort by ?symptom.name DESC: {result}"
+    );
+
+    let kql_asc = r#"
+        FIND(?symptom.name, COUNT(?drug))
+        WHERE {
+            ?symptom {type: "Symptom"}
+            (?drug, "treats", ?symptom)
+        }
+        ORDER BY ?symptom.name ASC
+        "#;
+    let (result, _) = nexus.execute_kql(parse_kql(kql_asc).unwrap()).await.unwrap();
+    let arr = result.as_array().unwrap();
+    assert_eq!(arr[0], json!(["Fever", "Headache"]), "{result}");
+}
+
+#[tokio::test]
+async fn test_kql_invalid_cursor_rejected_on_legacy_path() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_test_data(&nexus).await.unwrap();
+
+    // Single-variable concept projection goes through the legacy path; an
+    // unparseable cursor must be rejected (KIP_1001), not silently replayed
+    // from the start with duplicate pages.
+    let err = nexus
+        .execute_kql(
+            parse_kql(
+                r#"
+                FIND(?c.name)
+                WHERE { ?c {type: "Drug"} }
+                LIMIT 1
+                CURSOR "!!!not-a-cursor!!!"
+                "#,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err.code, KipErrorCode::InvalidSyntax), "{err:?}");
+}
+
+#[tokio::test]
+async fn test_kql_self_loop_pattern_yields_empty() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_test_data(&nexus).await.unwrap();
+
+    // `(?x, "treats", ?x)` is an equality constraint on both endpoints; the
+    // engine stores no self-loop links, so the solution set is empty —
+    // previously ?x silently bound every `treats` object.
+    let kql = r#"
+        FIND(?x.name)
+        WHERE { (?x, "treats", ?x) }
+        "#;
+    let (result, _) = nexus.execute_kql(parse_kql(kql).unwrap()).await.unwrap();
+    assert_eq!(result, json!([]), "{result}");
+}
+
+#[tokio::test]
+async fn test_kql_unaligned_filter_projection_rejected() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_test_data(&nexus).await.unwrap();
+    setup_risk_ladder(&nexus).await;
+
+    // A cross-variable FILTER over three entity variables cannot record its
+    // satisfying combinations; projecting those variables together must be
+    // rejected (KIP_4002) instead of silently re-materializing a misaligned
+    // cross product.
+    let kql = r#"
+        FIND(?d1.name, ?d2.name, ?d3.name)
+        WHERE {
+            ?d1 {type: "Drug"}
+            ?d2 {type: "Drug"}
+            ?d3 {type: "Drug"}
+            FILTER((?d1.attributes.risk_level > ?d2.attributes.risk_level) && (?d2.attributes.risk_level > ?d3.attributes.risk_level))
+        }
+        "#;
+    let err = nexus
+        .execute_kql(parse_kql(kql).unwrap())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err.code, KipErrorCode::ResourceExhausted),
+        "{err:?}"
+    );
+
+    // Single-column projection over the same narrowing stays valid
+    // (existential semantics).
+    let kql_single = r#"
+        FIND(?d2.name)
+        WHERE {
+            ?d1 {type: "Drug"}
+            ?d2 {type: "Drug"}
+            ?d3 {type: "Drug"}
+            FILTER((?d1.attributes.risk_level > ?d2.attributes.risk_level) && (?d2.attributes.risk_level > ?d3.attributes.risk_level))
+        }
+        "#;
+    let (result, _) = nexus
+        .execute_kql(parse_kql(kql_single).unwrap())
+        .await
+        .unwrap();
+    let names: Vec<&str> = result
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(!names.is_empty(), "{result}");
+    assert!(
+        !names.contains(&"HighRisk") || names.contains(&"MidRisk"),
+        "{result}"
+    );
+}
+
+#[tokio::test]
+async fn test_meta_search_uppercase_attribute_text() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_test_data(&nexus).await.unwrap();
+
+    // The per-predicate re-check lowercases the source texts; an all-caps
+    // attribute value must still match its lowercased BM25 token.
+    let kml = r#"
+        UPSERT {
+            PROPOSITION ?l {
+                ({type: "Drug", name: "Aspirin"}, "treats", {type: "Symptom", name: "Headache"})
+                SET ATTRIBUTES { "note": "SHOUTED UNIQUEMARKER TEXT" }
+            }
+        }
+        "#;
+    nexus
+        .execute_kml(parse_kml(kml).unwrap(), false)
+        .await
+        .unwrap();
+
+    let (result, _) = nexus
+        .execute_meta(parse_meta(r#"SEARCH PROPOSITION "uniquemarker""#).unwrap())
+        .await
+        .unwrap();
+    let hits = result.as_array().unwrap();
+    assert!(
+        hits.iter()
+            .any(|hit| hit["attributes"]["note"] == json!("SHOUTED UNIQUEMARKER TEXT")),
+        "all-caps attribute text must survive the re-check: {result}"
+    );
+}
+
+#[tokio::test]
+async fn test_get_or_init_concept_sets_system_metadata() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_test_data(&nexus).await.unwrap();
+
+    let created = nexus
+        .get_or_init_concept(
+            "Drug".to_string(),
+            "FreshDrug".to_string(),
+            Map::new(),
+            Map::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        created.metadata.get(METADATA_VERSION),
+        Some(&json!(1)),
+        "fresh concepts must carry engine-maintained _version"
+    );
+    assert!(
+        created.metadata.contains_key(METADATA_UPDATED_AT),
+        "fresh concepts must carry engine-maintained _updated_at"
+    );
+
+    // Idempotent: the second call returns the same row.
+    let again = nexus
+        .get_or_init_concept(
+            "Drug".to_string(),
+            "FreshDrug".to_string(),
+            Map::new(),
+            Map::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(again._id, created._id);
 }

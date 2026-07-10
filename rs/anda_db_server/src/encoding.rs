@@ -61,15 +61,31 @@ impl Encoding {
         Self::negotiate_or(headers, Encoding::Cbor)
     }
 
+    /// Parses the media types of an `Accept`/`Content-Type` value and
+    /// returns the first supported one. Parameters are ignored except for
+    /// `q=0`, which excludes the media type per RFC 9110.
     fn detect(value: &HeaderValue) -> Option<Self> {
         let value = value.to_str().ok()?;
-        if value.contains(APPLICATION_CBOR) {
-            Some(Encoding::Cbor)
-        } else if value.contains(APPLICATION_JSON) {
-            Some(Encoding::Json)
-        } else {
-            None
+        for part in value.split(',') {
+            let mut segments = part.split(';');
+            let media_type = segments.next().unwrap_or("").trim();
+            let rejected = segments.any(|param| {
+                param
+                    .trim()
+                    .strip_prefix("q=")
+                    .is_some_and(|q| q.trim().parse::<f32>().is_ok_and(|v| v == 0.0))
+            });
+            if rejected {
+                continue;
+            }
+            if media_type.eq_ignore_ascii_case(APPLICATION_CBOR) {
+                return Some(Encoding::Cbor);
+            }
+            if media_type.eq_ignore_ascii_case(APPLICATION_JSON) {
+                return Some(Encoding::Json);
+            }
         }
+        None
     }
 
     /// Returns the `Content-Type` header value for this encoding.

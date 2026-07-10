@@ -46,6 +46,16 @@ pub struct ListLogParams {
     pub limit: Option<usize>,
 }
 
+/// Error from [`Nexus::list_logs`], distinguishing client input errors from
+/// internal failures so the handler can map them to 400 vs 500.
+#[derive(Debug)]
+pub enum ListLogsError {
+    /// The supplied cursor could not be decoded.
+    InvalidCursor(String),
+    /// Engine or storage failure.
+    Internal(BoxError),
+}
+
 #[derive(Debug, Clone)]
 pub struct Nexus {
     nexus: Arc<CognitiveNexus>,
@@ -53,8 +63,10 @@ pub struct Nexus {
 }
 
 impl Nexus {
-    pub async fn connect(db: Arc<AndaDB>) -> Result<Self, BoxError> {
-        let id = "uuc56-gyb".to_string(); // Principal::from_slice(&[1])
+    /// Connects to the cognitive nexus, initializing the `$self` genesis KML
+    /// with `self_principal_id` on first start.
+    pub async fn connect(db: Arc<AndaDB>, self_principal_id: String) -> Result<Self, BoxError> {
+        let id = self_principal_id;
         let nexus = CognitiveNexus::connect(db.clone(), async |nexus| {
             if !nexus
                 .has_concept(&ConceptPK::Object {
@@ -115,17 +127,28 @@ impl Nexus {
             timestamp,
         };
 
-        let _ = self.logs.add_from(&log).await;
-        let _ = self.logs.flush(timestamp).await;
+        // Log persistence is best-effort but must not be silent; durability
+        // is handled by the periodic `AndaDB::auto_flush` task instead of a
+        // per-request flush.
+        if let Err(err) = self.logs.add_from(&log).await {
+            log::error!(
+                action = "Nexus::execute_kip";
+                "failed to record KIP log: {err:?}",
+            );
+        }
         res
     }
 
     pub async fn list_logs(
         &self,
         request: ListLogParams,
-    ) -> Result<(Vec<KIPLog>, Option<String>), BoxError> {
-        let limit = request.limit.unwrap_or(10).min(100);
-        let cursor = (BTree::from_cursor::<u64>(&request.cursor)?).unwrap_or_default();
+    ) -> Result<(Vec<KIPLog>, Option<String>), ListLogsError> {
+        // `limit == 0` combined with an empty result used to panic below;
+        // clamp to at least one document per page.
+        let limit = request.limit.unwrap_or(10).clamp(1, 100);
+        let cursor = BTree::from_cursor::<u64>(&request.cursor)
+            .map_err(|err| ListLogsError::InvalidCursor(err.to_string()))?
+            .unwrap_or_default();
         let filter = Some(Filter::Field((
             "_id".to_string(),
             RangeQuery::Gt(Fv::U64(cursor)),
@@ -138,19 +161,155 @@ impl Nexus {
                 limit: Some(limit),
                 search: None,
             })
-            .await?;
+            .await
+            .map_err(|err| ListLogsError::Internal(err.into()))?;
         let cursor = if rt.len() >= limit {
-            BTree::to_cursor(&rt.last().unwrap()._id)
+            rt.last().and_then(|log| BTree::to_cursor(&log._id))
         } else {
             None
         };
         Ok((rt, cursor))
     }
+
+    /// Deletes logs whose `period` is strictly less than `before_period`
+    /// (hours since the Unix epoch), in batches. Returns the number of
+    /// deleted documents.
+    pub async fn prune_logs(&self, before_period: u64) -> Result<usize, BoxError> {
+        let mut total = 0usize;
+        loop {
+            let ids = self
+                .logs
+                .query_ids(
+                    Filter::Field(("period".to_string(), RangeQuery::Lt(Fv::U64(before_period)))),
+                    Some(1000),
+                )
+                .await?;
+            if ids.is_empty() {
+                return Ok(total);
+            }
+            for id in ids {
+                if self.logs.remove(id).await?.is_some() {
+                    total += 1;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use anda_db::{database::DBConfig, storage::StorageConfig};
+    use object_store::memory::InMemory;
 
-    #[test]
-    fn test_conversation_status() {}
+    async fn test_nexus() -> Nexus {
+        let store = Arc::new(InMemory::new());
+        let db = AndaDB::connect(
+            store,
+            DBConfig {
+                name: "test_db".to_string(),
+                description: "test".to_string(),
+                storage: StorageConfig::default(),
+                lock: None,
+            },
+        )
+        .await
+        .unwrap();
+        Nexus::connect(Arc::new(db), "uuc56-gyb".to_string())
+            .await
+            .unwrap()
+    }
+
+    async fn add_log(nexus: &Nexus, period: u64) {
+        let log = KIPLog {
+            _id: 0,
+            command: CommandType::Meta,
+            request: Request::default(),
+            response: serde_json::json!({"result": "..."}),
+            period,
+            timestamp: period * 3600 * 1000,
+        };
+        nexus.logs.add_from(&log).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn list_logs_is_safe_on_empty_collection_and_limit_zero() {
+        let nexus = test_nexus().await;
+        // `limit: Some(0)` used to panic on `rt.last().unwrap()`.
+        for limit in [Some(0), Some(1), Some(1000), None] {
+            let (logs, cursor) = nexus
+                .list_logs(ListLogParams {
+                    cursor: None,
+                    limit,
+                })
+                .await
+                .unwrap();
+            assert!(logs.is_empty());
+            assert!(cursor.is_none());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn list_logs_paginates_and_rejects_invalid_cursor() {
+        let nexus = test_nexus().await;
+        for period in 1..=3u64 {
+            add_log(&nexus, period).await;
+        }
+
+        // limit=0 clamps to one document per page.
+        let (logs, cursor) = nexus
+            .list_logs(ListLogParams {
+                cursor: None,
+                limit: Some(0),
+            })
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 1);
+        let first_id = logs[0]._id;
+        assert!(cursor.is_some());
+
+        // The cursor continues after the previous page.
+        let (logs, _) = nexus
+            .list_logs(ListLogParams {
+                cursor,
+                limit: Some(10),
+            })
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 2);
+        assert!(logs.iter().all(|log| log._id > first_id));
+
+        // Invalid cursors are client errors, not internal ones.
+        let err = nexus
+            .list_logs(ListLogParams {
+                cursor: Some("!!! not base64 !!!".to_string()),
+                limit: None,
+            })
+            .await;
+        assert!(matches!(err, Err(ListLogsError::InvalidCursor(_))));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prune_logs_removes_expired_periods_only() {
+        let nexus = test_nexus().await;
+        for period in [1u64, 2, 10, 11] {
+            add_log(&nexus, period).await;
+        }
+
+        let pruned = nexus.prune_logs(10).await.unwrap();
+        assert_eq!(pruned, 2);
+
+        let (logs, _) = nexus
+            .list_logs(ListLogParams {
+                cursor: None,
+                limit: Some(100),
+            })
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 2);
+        assert!(logs.iter().all(|log| log.period >= 10));
+
+        // Idempotent when nothing is expired.
+        assert_eq!(nexus.prune_logs(10).await.unwrap(), 0);
+    }
 }

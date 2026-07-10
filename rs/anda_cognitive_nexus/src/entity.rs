@@ -374,18 +374,23 @@ impl FromStr for EntityID {
                 .map(EntityID::Concept)
                 .map_err(|_| format!("Invalid Concept ID, expected format 'C:<u64>', got {s:?}"))
         } else if let Some(id) = s.strip_prefix("P:") {
-            let parts: Vec<&str> = id.split(':').collect();
-            if parts.len() != 2 {
-                return Err(format!(
-                    "Invalid Proposition ID, expected format 'P:<u64>:<predicate>', got {s:?}"
-                ));
-            }
+            // The predicate is an arbitrary quoted string and may itself
+            // contain `:`, so only the first separator splits the numeric id
+            // from the predicate — `P:9:a:b` round-trips as predicate "a:b".
+            let (id, predicate) = match id.split_once(':') {
+                Some((id, predicate)) if !predicate.is_empty() => (id, predicate),
+                _ => {
+                    return Err(format!(
+                        "Invalid Proposition ID, expected format 'P:<u64>:<predicate>', got {s:?}"
+                    ));
+                }
+            };
 
-            let id = parts[0].parse::<u64>().map_err(|_| {
+            let id = id.parse::<u64>().map_err(|_| {
                 format!("Invalid Proposition ID, expected format 'P:<u64>:<predicate>', got {s:?}")
             })?;
 
-            Ok(EntityID::Proposition(id, parts[1].to_string()))
+            Ok(EntityID::Proposition(id, predicate.to_string()))
         } else {
             Err(format!("EntityID must start with 'C:' or 'P:', got {s:?}"))
         }

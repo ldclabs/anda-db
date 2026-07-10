@@ -54,9 +54,12 @@ pub struct Search {
     /// Used for full-text search operations.
     pub text: Option<String>,
 
-    /// The vector query (field, vector) to search for.
+    /// The query vector to search for.
     ///
-    /// Used for vector similarity search operations.
+    /// Used for vector similarity search operations. Every HNSW index of the
+    /// collection whose configured dimension matches the query vector length
+    /// is searched; indexes with other dimensions are skipped. The search
+    /// fails if no index matches the query dimension.
     pub vector: Option<Vec<f32>>,
 
     /// Parameters for the BM25 ranking algorithm.

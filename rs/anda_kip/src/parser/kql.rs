@@ -5,7 +5,7 @@ use nom::{
     character::complete::{char, multispace1},
     combinator::{cut, map, map_res, opt, verify},
     error::context,
-    multi::{fold, many0, many1, separated_list1},
+    multi::{many0, many1, separated_list1},
     sequence::{delimited, pair, preceded, separated_pair, terminated},
 };
 
@@ -44,7 +44,7 @@ fn parse_find_clause(input: &str) -> VResult<'_, FindClause> {
         "FIND( ... )",
         map(
             preceded(
-                ws(tag("FIND")),
+                ws(word("FIND")),
                 parenthesized_block(separated_list1(ws(char(',')), parse_find_expression)),
             ),
             |expressions| FindClause { expressions },
@@ -85,11 +85,11 @@ fn parse_aggregation_expression(input: &str) -> VResult<'_, FindExpression> {
 
 fn parse_aggregation_function(input: &str) -> VResult<'_, AggregationFunction> {
     alt((
-        map(tag("COUNT"), |_| AggregationFunction::Count),
-        map(tag("SUM"), |_| AggregationFunction::Sum),
-        map(tag("AVG"), |_| AggregationFunction::Avg),
-        map(tag("MIN"), |_| AggregationFunction::Min),
-        map(tag("MAX"), |_| AggregationFunction::Max),
+        map(word("COUNT"), |_| AggregationFunction::Count),
+        map(word("SUM"), |_| AggregationFunction::Sum),
+        map(word("AVG"), |_| AggregationFunction::Avg),
+        map(word("MIN"), |_| AggregationFunction::Min),
+        map(word("MAX"), |_| AggregationFunction::Max),
     ))
     .parse(input)
 }
@@ -99,7 +99,7 @@ fn parse_aggregation_function(input: &str) -> VResult<'_, AggregationFunction> {
 pub fn parse_where_block(input: &str) -> VResult<'_, Vec<WhereClause>> {
     context(
         "WHERE { ... }",
-        preceded(ws(tag("WHERE")), parse_where_group),
+        preceded(ws(word("WHERE")), parse_where_group),
     )
     .parse(input)
 }
@@ -240,7 +240,7 @@ pub fn parse_prop_mather(input: &str) -> VResult<'_, PropositionMatcher> {
         "KQL proposition matcher",
         parenthesized_block(cut(alt((
             map(
-                separated_pair(ws(tag("id")), ws(char(':')), ws(quoted_string)),
+                separated_pair(ws(word("id")), ws(char(':')), ws(quoted_string)),
                 |(_, id)| PropositionMatcher::ID(id),
             ),
             map(
@@ -277,7 +277,7 @@ fn parse_filter_clause(input: &str) -> VResult<'_, FilterClause> {
         "KQL FILTER clause",
         map(
             preceded(
-                ws(tag("FILTER")),
+                ws(word("FILTER")),
                 cut(parenthesized_block(parse_filter_expression)),
             ),
             |expression| FilterClause { expression },
@@ -293,35 +293,34 @@ fn parse_filter_expression(input: &str) -> VResult<'_, FilterExpression> {
 // Parses logical OR expression (lowest precedence)
 fn parse_logical_or_expression(input: &str) -> VResult<'_, FilterExpression> {
     let (input, left) = parse_logical_and_expression(input)?;
+    // Collect the right-hand sides first so `left` is moved (not cloned) into
+    // the folded tree; `many0` does not allocate when there is no `||`.
+    let (input, rest) =
+        many0(preceded(ws(tag("||")), parse_logical_and_expression)).parse(input)?;
 
-    fold(
-        0..,
-        preceded(ws(tag("||")), parse_logical_and_expression),
-        move || left.clone(),
-        |acc, right| FilterExpression::Logical {
+    let expr = rest
+        .into_iter()
+        .fold(left, |acc, right| FilterExpression::Logical {
             left: Box::new(acc),
             operator: LogicalOperator::Or,
             right: Box::new(right),
-        },
-    )
-    .parse(input)
+        });
+    Ok((input, expr))
 }
 
 // Parses logical AND expression
 fn parse_logical_and_expression(input: &str) -> VResult<'_, FilterExpression> {
     let (input, left) = parse_unary_expression(input)?;
+    let (input, rest) = many0(preceded(ws(tag("&&")), parse_unary_expression)).parse(input)?;
 
-    fold(
-        0..,
-        preceded(ws(tag("&&")), parse_unary_expression),
-        move || left.clone(),
-        |acc, right| FilterExpression::Logical {
+    let expr = rest
+        .into_iter()
+        .fold(left, |acc, right| FilterExpression::Logical {
             left: Box::new(acc),
             operator: LogicalOperator::And,
             right: Box::new(right),
-        },
-    )
-    .parse(input)
+        });
+    Ok((input, expr))
 }
 
 // Parses unary expression (NOT)
@@ -450,13 +449,13 @@ fn parse_comparison_operator(input: &str) -> VResult<'_, ComparisonOperator> {
 // Parses filter function
 fn parse_filter_function(input: &str) -> VResult<'_, FilterFunction> {
     alt((
-        map(tag("CONTAINS"), |_| FilterFunction::Contains),
-        map(tag("STARTS_WITH"), |_| FilterFunction::StartsWith),
-        map(tag("ENDS_WITH"), |_| FilterFunction::EndsWith),
-        map(tag("REGEX"), |_| FilterFunction::Regex),
-        map(tag("IS_NOT_NULL"), |_| FilterFunction::IsNotNull),
-        map(tag("IS_NULL"), |_| FilterFunction::IsNull),
-        map(tag("IN"), |_| FilterFunction::In),
+        map(word("CONTAINS"), |_| FilterFunction::Contains),
+        map(word("STARTS_WITH"), |_| FilterFunction::StartsWith),
+        map(word("ENDS_WITH"), |_| FilterFunction::EndsWith),
+        map(word("REGEX"), |_| FilterFunction::Regex),
+        map(word("IS_NOT_NULL"), |_| FilterFunction::IsNotNull),
+        map(word("IS_NULL"), |_| FilterFunction::IsNull),
+        map(word("IN"), |_| FilterFunction::In),
     ))
     .parse(input)
 }
@@ -465,7 +464,7 @@ fn parse_optional_clause(input: &str) -> VResult<'_, Vec<WhereClause>> {
     context(
         "KQL OPTIONAL clause",
         preceded(
-            ws(tag("OPTIONAL")),
+            ws(word("OPTIONAL")),
             cut(braced_block(many1(ws(parse_single_where_clause)))),
         ),
     )
@@ -476,7 +475,7 @@ fn parse_not_clause(input: &str) -> VResult<'_, Vec<WhereClause>> {
     context(
         "KQL NOT clause",
         preceded(
-            ws(tag("NOT")),
+            ws(word("NOT")),
             cut(braced_block(many1(ws(parse_single_where_clause)))),
         ),
     )
@@ -487,7 +486,7 @@ fn parse_union_expression(input: &str) -> VResult<'_, Vec<WhereClause>> {
     context(
         "KQL UNION clause",
         preceded(
-            ws(tag("UNION")),
+            ws(word("UNION")),
             cut(braced_block(many1(ws(parse_single_where_clause)))),
         ),
     )
@@ -516,8 +515,8 @@ fn parse_order_by_variable(input: &str) -> VResult<'_, OrderByCondition> {
         pair(
             dot_path_var,
             opt(alt((
-                map(ws(tag("ASC")), |_| OrderDirection::Asc),
-                map(ws(tag("DESC")), |_| OrderDirection::Desc),
+                map(ws(word("ASC")), |_| OrderDirection::Asc),
+                map(ws(word("DESC")), |_| OrderDirection::Desc),
             ))),
         ),
         |(variable, direction)| OrderByCondition {
@@ -535,8 +534,8 @@ fn parse_order_by_aggregation(input: &str) -> VResult<'_, OrderByCondition> {
             parse_aggregation_function,
             parenthesized_block(dot_path_var),
             opt(alt((
-                map(ws(tag("ASC")), |_| OrderDirection::Asc),
-                map(ws(tag("DESC")), |_| OrderDirection::Desc),
+                map(ws(word("ASC")), |_| OrderDirection::Asc),
+                map(ws(word("DESC")), |_| OrderDirection::Desc),
             ))),
         ),
         |(func, variable, direction)| OrderByCondition {
@@ -2005,5 +2004,67 @@ mod tests {
         assert_eq!(order_by.len(), 1);
         assert!(order_by[0].is_aggregation());
         assert_eq!(order_by[0].direction, OrderDirection::Asc);
+    }
+
+    #[test]
+    fn test_concept_matcher_duplicate_keys_rejected() {
+        // Duplicate identifying keys in a concept matcher are almost always
+        // an LLM generation error; last-wins would silently mask them.
+        assert!(crate::parse_kql(r#"FIND(?d) WHERE { ?d {type: "A", type: "B"} }"#).is_err());
+        assert!(crate::parse_kql(r#"FIND(?d) WHERE { ?d {id: "1", id: "2"} }"#).is_err());
+        // Distinct keys still parse.
+        assert!(crate::parse_kql(r#"FIND(?d) WHERE { ?d {type: "A", name: "B"} }"#).is_ok());
+    }
+
+    #[test]
+    fn test_filter_bare_boolean_is_rejected() {
+        // Contract: FILTER requires a comparison, function call, or logical
+        // combination thereof; a bare (boolean) operand like `FILTER(?x.flag)`
+        // is not defined by KIP spec §3.4.3 and must be a syntax error.
+        assert!(
+            crate::parse_kql(r#"FIND(?x) WHERE { ?x {type: "T"} FILTER(?x.attributes.flag) }"#)
+                .is_err()
+        );
+        // The explicit comparison form is the supported spelling.
+        assert!(
+            crate::parse_kql(
+                r#"FIND(?x) WHERE { ?x {type: "T"} FILTER(?x.attributes.flag == true) }"#
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_filter_without_logical_operator_still_parses() {
+        // Regression guard for the fold() -> many0() rewrite: single
+        // comparisons and chains of && / || must both parse.
+        let (_, single) = parse_filter_clause(r#"FILTER(?a.attributes.x < 3)"#).unwrap();
+        assert!(matches!(
+            single.expression,
+            FilterExpression::Comparison { .. }
+        ));
+
+        let (_, chained) = parse_filter_clause(
+            r#"FILTER(?a.attributes.x < 3 && ?a.attributes.y > 1 || ?a.attributes.z == 0)"#,
+        )
+        .unwrap();
+        match chained.expression {
+            FilterExpression::Logical { operator, .. } => {
+                assert_eq!(operator, LogicalOperator::Or)
+            }
+            other => panic!("expected logical expression, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_keywords_require_word_boundary() {
+        // Keyword prefixes of longer identifiers must not silently match.
+        assert!(crate::parse_kql(r#"FINDX(?x) WHERE { ?x {type: "T"} }"#).is_err());
+        assert!(crate::parse_kql(r#"FIND(?x) WHEREX { ?x {type: "T"} }"#).is_err());
+        assert!(
+            crate::parse_kql(r#"FIND(?x) WHERE { ?x {type: "T"} } ORDER BY ?x DESCX"#).is_err()
+        );
+        // The regular spellings still parse.
+        assert!(crate::parse_kql(r#"FIND(?x) WHERE { ?x {type: "T"} } ORDER BY ?x DESC"#).is_ok());
     }
 }

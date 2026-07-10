@@ -146,9 +146,21 @@ pub async fn add(db: &AndaDB, params: AddParams) -> Result<AddResult, ApiError> 
     Ok(AddResult { _id: id })
 }
 
+/// Maximum number of documents accepted by a single `doc.add_many` call.
+const MAX_ADD_MANY_DOCS: usize = 10_000;
+
 /// `doc.add_many` — inserts documents in order. Not atomic: on failure the
-/// already-inserted documents remain and the error reports the failing index.
+/// already-inserted documents remain and the error reports the failing index
+/// together with the IDs of the documents that were inserted, so clients can
+/// compensate.
 pub async fn add_many(db: &AndaDB, params: AddManyParams) -> Result<Vec<AddResult>, ApiError> {
+    if params.docs.len() > MAX_ADD_MANY_DOCS {
+        return Err(ApiError::bad_request(format!(
+            "doc.add_many accepts at most {MAX_ADD_MANY_DOCS} documents, got {}",
+            params.docs.len()
+        )));
+    }
+
     let collection = open(db, &params.collection).await?;
     let mut results = Vec::with_capacity(params.docs.len());
     for (i, mut doc) in params.docs.into_iter().enumerate() {
@@ -157,11 +169,12 @@ pub async fn add_many(db: &AndaDB, params: AddManyParams) -> Result<Vec<AddResul
         match collection.add_from(&doc).await {
             Ok(id) => results.push(AddResult { _id: id }),
             Err(err) => {
+                let inserted: Vec<DocumentId> = results.iter().map(|r| r._id).collect();
                 let mut api_err = ApiError::from(err);
                 api_err.message = format!(
-                    "doc.add_many failed at index {i} ({} documents inserted): {}",
-                    results.len(),
-                    api_err.message
+                    "doc.add_many failed at index {i}: {}; inserted document ids: {}",
+                    api_err.message,
+                    serde_json::to_string(&inserted).unwrap_or_default()
                 );
                 return Err(api_err);
             }

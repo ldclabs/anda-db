@@ -141,6 +141,10 @@ impl FaultState {
             return Err(self.injected(op, path, "power failure"));
         }
 
+        // Note: the counter tracks *attempted* mutations, so operations that
+        // a rule below fails (Error/TornWrite) are still counted. When
+        // combining rules with `crash_after_mutations`, size the crash window
+        // accordingly.
         if op.is_mutation() {
             let n = self.mutations.fetch_add(1, Ordering::AcqRel);
             if n >= self.crash_at.load(Ordering::Acquire) {
@@ -433,6 +437,12 @@ impl MultipartUpload for FaultUploader {
     }
 
     async fn abort(&mut self) -> Result<()> {
+        // Consistent with put_part/complete: nothing runs while powered off.
+        if self.state.powered_off.load(Ordering::Acquire) {
+            return Err(self
+                .state
+                .injected(FaultOp::Put, &self.location, "power failure"));
+        }
         self.inner.abort().await
     }
 }

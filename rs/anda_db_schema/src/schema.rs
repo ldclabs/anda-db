@@ -178,6 +178,15 @@ impl Schema {
         self.fields.is_empty()
     }
 
+    /// Returns `true` if the schema declares a field with this stable index.
+    ///
+    /// Useful to detect stale values written under an older schema whose
+    /// field has since been removed by [`Schema::upgrade_with`] (removed
+    /// indexes are never reused).
+    pub fn contains_idx(&self, idx: usize) -> bool {
+        self.idx.contains(&idx)
+    }
+
     /// Gets a field by name.
     ///
     /// # Arguments
@@ -872,6 +881,47 @@ mod tests {
         assert_eq!(new_schema.get_field("age").unwrap().idx(), 2);
         // email gets idx=4 (max old idx was 3, so next is 4), NOT reusing bio's 3
         assert_eq!(new_schema.get_field("email").unwrap().idx(), 4);
+    }
+
+    #[test]
+    fn test_upgrade_with_removed_field_old_documents_still_read_back() {
+        use crate::{Document, DocumentOwned};
+        use std::sync::Arc;
+
+        // old schema v1: _id(0), name(1), bio(2)
+        let mut old_builder = SchemaBuilder::new();
+        old_builder.with_version(1);
+        old_builder
+            .add_field(Fe::new("name".to_string(), Ft::Text).unwrap())
+            .unwrap();
+        old_builder
+            .add_field(Fe::new("bio".to_string(), Ft::Option(Box::new(Ft::Text))).unwrap())
+            .unwrap();
+        let old = old_builder.build().unwrap();
+
+        // new schema v2: "bio" removed.
+        let mut new_builder = SchemaBuilder::new();
+        new_builder.with_version(2);
+        new_builder
+            .add_field(Fe::new("name".to_string(), Ft::Text).unwrap())
+            .unwrap();
+        let mut new_schema = new_builder.build().unwrap();
+        new_schema.upgrade_with(&old).unwrap();
+        assert!(!new_schema.contains_idx(2));
+
+        // A document written under the old schema still carries idx 2.
+        let mut fields = IndexedFieldValues::new();
+        fields.insert(0, Fv::U64(7));
+        fields.insert(1, Fv::Text("Ada".to_string()));
+        fields.insert(2, Fv::Text("stale bio".to_string()));
+
+        // Strict validation of the raw fields still rejects the stale idx...
+        assert!(new_schema.validate(&fields).is_err());
+
+        // ...but the document read path drops it and succeeds.
+        let doc = Document::try_from_doc(Arc::new(new_schema), DocumentOwned { fields }).unwrap();
+        assert_eq!(doc.get_field("name").unwrap(), &Fv::Text("Ada".into()));
+        assert_eq!(doc.fields().len(), 2);
     }
 
     #[test]

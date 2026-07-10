@@ -451,6 +451,12 @@ impl CognitiveNexus {
     /// No type-existence check is performed here — for the protocol
     /// path use [`execute_kml`](Self::execute_kml) with an `UPSERT`
     /// statement.
+    ///
+    /// The query→insert pair runs under the exclusive KML write lock so
+    /// concurrent callers (or a concurrent KML statement) cannot race it
+    /// into duplicate `{type, name}` concepts. A freshly created concept
+    /// gets the engine-maintained `_version` / `_updated_at` system
+    /// metadata, exactly like the KML `UPSERT` path (KIP §2.11).
     pub async fn get_or_init_concept(
         &self,
         r#type: String,
@@ -458,9 +464,12 @@ impl CognitiveNexus {
         attributes: Map<String, Json>,
         metadata: Map<String, Json>,
     ) -> Result<Concept, KipError> {
+        let _guard = self.kml_lock.write().await;
         match self.query_concept_id(&r#type, &name).await {
             Ok(id) => self.concepts.get_as(id).await.map_err(db_to_kip_error),
             Err(_) => {
+                let mut metadata = metadata;
+                init_system_metadata(&mut metadata, unix_ms());
                 let mut concept = Concept {
                     _id: 0, // Will be set by the database
                     r#type,
@@ -661,11 +670,27 @@ impl CognitiveNexus {
         )))
     }
 
+    /// Resolves a KQL concept matcher to concept ids.
+    ///
+    /// Grounding semantics (intentional asymmetry): fully-identified
+    /// matchers — `{id: "…"}` (spec RC8) and `{type, name}` — refer to one
+    /// specific node, so a missing target fails the query with `KIP_3002`
+    /// to tell the agent its grounding is stale. Pattern matchers
+    /// (`{type: …}` / `{name: …}`) describe a *set* and simply bind empty.
     async fn query_concept_ids(&self, matcher: &ConceptMatcher) -> Result<Vec<u64>, KipError> {
         match matcher {
             ConceptMatcher::ID(id) => {
                 let entity_id = EntityID::from_str(id).map_err(KipError::invalid_syntax)?;
                 if let EntityID::Concept(concept_id) = entity_id {
+                    // Match-only `{id:}` target: a dangling id is a grounding
+                    // error (`KIP_3002`), not an empty match — otherwise it
+                    // would silently drain every joined pattern (spec RC8).
+                    if !self.concepts.contains(concept_id) {
+                        return Err(KipError::not_found(format!(
+                            "Concept {} not found",
+                            ConceptPK::ID(concept_id)
+                        )));
+                    }
                     Ok(vec![concept_id])
                 } else {
                     Err(KipError::invalid_syntax(format!(
@@ -722,6 +747,33 @@ impl CognitiveNexus {
         let rt = f(&concept)?;
         cache.concepts.write().insert(id, concept);
         Ok(rt)
+    }
+
+    /// Verifies that a match-only `(id: "…")` target refers to an existing
+    /// proposition link (the row exists and carries the predicate). A
+    /// dangling link id is a grounding error (`KIP_3002`, spec RC8), not an
+    /// empty match — it would otherwise silently drain joined patterns.
+    async fn ensure_proposition_link_exists(
+        &self,
+        cache: &QueryCache,
+        entity_id: &EntityID,
+    ) -> Result<(), KipError> {
+        if let EntityID::Proposition(id, predicate) = entity_id {
+            if self.propositions.contains(*id)
+                && self
+                    .try_get_proposition_with(cache, *id, |prop| {
+                        Ok(prop.predicates.contains(predicate))
+                    })
+                    .await?
+            {
+                return Ok(());
+            }
+            return Err(KipError::not_found(format!(
+                "Proposition {} not found",
+                PropositionPK::ID(*id, predicate.clone())
+            )));
+        }
+        Ok(())
     }
 
     async fn try_get_proposition_with<F, R>(

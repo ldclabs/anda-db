@@ -20,6 +20,26 @@
 //! underlying backend, so they can be layered on top of any compliant store
 //! (in-memory, local filesystem, S3, GCS, Azure Blob, …).
 //!
+//! ## Crash semantics
+//!
+//! A logical put writes two backend objects in sequence: the data object at
+//! `data/<location>` first, then the sidecar metadata at `meta/<location>`.
+//! The pair is **not atomic**. A crash (or a failed metadata write) between
+//! the two leaves the new data object with either no metadata — an "orphan"
+//! on the first write of a key — or the previous metadata on an overwrite.
+//! Until the key is written again, such an object is unreadable: `MetaStore`
+//! reports a stale size/ETag and `EncryptedStore` fails decryption or
+//! metadata authentication (indistinguishable from tampering). The previous
+//! version of the payload is already overwritten and cannot be recovered.
+//!
+//! Both wrappers self-heal on the next write of the same key:
+//! `PutMode::Overwrite` always rebuilds the pair (including when the sidecar
+//! metadata is corrupted), and `PutMode::Create` succeeds over an orphaned
+//! data object without metadata. Listings tolerate orphans (their `e_tag` is
+//! `None`) and `delete` cleans up either half. Callers must therefore be
+//! prepared to re-write objects that fail to read back after a crash, in
+//! line with AndaDB's overwrite-self-heal convention.
+//!
 //! See `docs/anda_object_store.md` in the repository for the full design
 //! document.
 
@@ -191,6 +211,12 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
         let rt = self
             .inner
             .update_meta_with(location, async |meta| {
+                // Without sidecar metadata the object does not logically
+                // exist; remember this so a conflicting orphaned data object
+                // (crash between the data and metadata writes) can be healed
+                // below instead of failing a `Create` forever.
+                let heal_create = meta.is_none() && matches!(opts.mode, PutMode::Create);
+
                 if let PutMode::Update(v) = &opts.mode {
                     match meta {
                         Some(m) => {
@@ -223,7 +249,27 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
                     original_version: None,
                 };
 
-                let rt = self.inner.store.put_opts(&full_path, payload, opts).await?;
+                let rt = if heal_create {
+                    match self
+                        .inner
+                        .store
+                        .put_opts(&full_path, payload.clone(), opts.clone())
+                        .await
+                    {
+                        Err(Error::AlreadyExists { .. }) => {
+                            // The conflicting data object is an orphan left
+                            // by a crash; overwrite it to self-heal.
+                            log::warn!(
+                                "MetaStore: healing orphaned data object at {location} on create"
+                            );
+                            opts.mode = PutMode::Overwrite;
+                            self.inner.store.put_opts(&full_path, payload, opts).await?
+                        }
+                        rt => rt?,
+                    }
+                } else {
+                    self.inner.store.put_opts(&full_path, payload, opts).await?
+                };
                 meta.original_tag = rt.e_tag;
                 meta.original_version = rt.version;
                 Ok(meta)
@@ -356,21 +402,35 @@ impl<T: ObjectStore> MultipartUpload for MetaStoreUploader<T> {
 
     async fn complete(&mut self) -> Result<PutResult> {
         let hash: [u8; 32] = self.hasher.clone().finalize().into();
-        let mut rt = self.inner.complete().await?;
-        let obj = self
-            .store
-            .store
-            .head(&self.store.full_path(&self.location))
+        let e_tag = Some(BASE64_URL_SAFE.encode(hash));
+
+        // Commit the data object and persist the metadata inside the per-key
+        // critical section of `update_meta_with`, so a concurrent multipart
+        // complete on the same location cannot interleave its data commit
+        // between our commit and our metadata write (which would leave
+        // mismatched data and metadata).
+        let store = self.store.clone();
+        let location = self.location.clone();
+        let size = self.size as u64;
+        let inner = &mut self.inner;
+        let mut result: Option<PutResult> = None;
+        let out = &mut result;
+        store
+            .update_meta_with(&location, async |_| {
+                let rt = inner.complete().await?;
+                let obj = store.store.head(&store.full_path(&location)).await?;
+                *out = Some(rt);
+                Ok(Metadata {
+                    size,
+                    e_tag: e_tag.clone(),
+                    original_tag: obj.e_tag,
+                    original_version: obj.version,
+                })
+            })
             .await?;
 
-        let meta = Metadata {
-            size: self.size as u64,
-            e_tag: Some(BASE64_URL_SAFE.encode(hash)),
-            original_tag: obj.e_tag,
-            original_version: obj.version,
-        };
-        rt.e_tag = meta.e_tag.clone();
-        self.store.put_meta(&self.location, meta).await?;
+        let mut rt = result.expect("multipart complete did not run");
+        rt.e_tag = e_tag;
         Ok(rt)
     }
 
@@ -701,7 +761,8 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(err, Error::NotFound { path, .. } if path.ends_with("meta/missing-meta")));
+        // The internal `meta/` prefix must not leak into caller-visible errors.
+        assert!(matches!(err, Error::NotFound { path, .. } if path == "missing-meta"));
     }
 
     #[tokio::test]
@@ -909,6 +970,295 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::NotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn corrupted_metadata_heals_on_overwrite() {
+        let inner = InMemory::new();
+        let storage = MetaStoreBuilder::new(inner.clone(), 100).build();
+        let location = Path::from("self-heal");
+
+        storage
+            .put(&location, Bytes::from_static(b"old").into())
+            .await
+            .unwrap();
+        // Corrupt the sidecar metadata (e.g. a torn write before a crash).
+        inner
+            .put(
+                &Path::from("meta/self-heal"),
+                Bytes::from_static(b"\xffgarbage").into(),
+            )
+            .await
+            .unwrap();
+
+        // A fresh instance (bypassing the cache) cannot read the object...
+        let reopened = MetaStoreBuilder::new(inner.clone(), 100).build();
+        assert!(reopened.get(&location).await.is_err());
+
+        // ...but a plain overwrite put must rebuild it.
+        reopened
+            .put(&location, Bytes::from_static(b"new").into())
+            .await
+            .unwrap();
+        let bytes = reopened
+            .get(&location)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"new"));
+    }
+
+    #[tokio::test]
+    async fn orphaned_data_does_not_fail_listings() {
+        use futures::TryStreamExt;
+
+        let inner = InMemory::new();
+        let storage = MetaStoreBuilder::new(inner.clone(), 100).build();
+        let healthy = Path::from("list/healthy");
+        let orphan = Path::from("list/orphan");
+
+        storage
+            .put(&healthy, Bytes::from_static(b"abc").into())
+            .await
+            .unwrap();
+        storage
+            .put(&orphan, Bytes::from_static(b"def").into())
+            .await
+            .unwrap();
+        // Simulate a crash between the data and metadata writes.
+        inner.delete(&Path::from("meta/list/orphan")).await.unwrap();
+
+        let reopened = MetaStoreBuilder::new(inner.clone(), 100).build();
+        let listed: Vec<_> = reopened
+            .list(Some(&Path::from("list")))
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 2);
+        for obj in &listed {
+            if obj.location == orphan {
+                assert_eq!(obj.e_tag, None);
+            } else {
+                assert!(obj.e_tag.is_some());
+            }
+        }
+
+        let listed: Vec<_> = reopened
+            .list_with_offset(Some(&Path::from("list")), &Path::from("list/a"))
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 2);
+
+        let rt = reopened
+            .list_with_delimiter(Some(&Path::from("list")))
+            .await
+            .unwrap();
+        assert_eq!(rt.objects.len(), 2);
+        let orphaned = rt.objects.iter().find(|o| o.location == orphan).unwrap();
+        assert_eq!(orphaned.e_tag, None);
+    }
+
+    #[tokio::test]
+    async fn create_heals_orphaned_data() {
+        let inner = InMemory::new();
+        let storage = MetaStoreBuilder::new(inner.clone(), 100).build();
+        let location = Path::from("create-heal");
+
+        storage
+            .put(&location, Bytes::from_static(b"old").into())
+            .await
+            .unwrap();
+        inner.delete(&Path::from("meta/create-heal")).await.unwrap();
+
+        // The object no longer logically exists, so `Create` must succeed
+        // over the orphaned data object.
+        let reopened = MetaStoreBuilder::new(inner.clone(), 100).build();
+        reopened
+            .put_opts(
+                &location,
+                Bytes::from_static(b"new").into(),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let bytes = reopened
+            .get(&location)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"new"));
+
+        // A `Create` over a live object still fails.
+        let err = reopened
+            .put_opts(
+                &location,
+                Bytes::from_static(b"again").into(),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::AlreadyExists { .. }));
+    }
+
+    #[tokio::test]
+    async fn rename_and_copy_to_self_preserve_object() {
+        let storage = MetaStoreBuilder::new(InMemory::new(), 100).build();
+        let location = Path::from("self-target");
+
+        storage
+            .put(&location, Bytes::from_static(b"abc").into())
+            .await
+            .unwrap();
+
+        storage.rename(&location, &location).await.unwrap();
+        let bytes = storage
+            .get(&location)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"abc"));
+
+        let err = storage
+            .rename_if_not_exists(&location, &location)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::AlreadyExists { .. }));
+
+        storage.copy(&location, &location).await.unwrap();
+        let bytes = storage
+            .get(&location)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"abc"));
+
+        // Self-rename of a missing object reports NotFound.
+        let missing = Path::from("self-missing");
+        let err = storage.rename(&missing, &missing).await.unwrap_err();
+        assert!(matches!(err, Error::NotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn crash_between_data_and_meta_write_is_recoverable() {
+        use futures::TryStreamExt;
+
+        let (fault, handle) = crate::FaultStore::wrap(InMemory::new());
+        let storage = MetaStoreBuilder::new(fault, 100).build();
+        let location = Path::from("crash/object");
+
+        // Fail the metadata write: the data object lands, the sidecar
+        // metadata does not (crash window of the two-object put).
+        handle.push_rule(crate::FaultRule::fail_once(crate::FaultOp::Put, "meta/"));
+        let err = storage
+            .put(&location, Bytes::from_static(b"v1").into())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("injected fault"));
+
+        // The orphan reads as NotFound under the logical path...
+        let err = storage.get(&location).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::NotFound { path, .. } if path == "crash/object"),
+            "unexpected error: {err:?}"
+        );
+
+        // ...does not fail listings (the recovery scan)...
+        let listed: Vec<_> = storage
+            .list(Some(&Path::from("crash")))
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].e_tag, None);
+        let rt = storage
+            .list_with_delimiter(Some(&Path::from("crash")))
+            .await
+            .unwrap();
+        assert_eq!(rt.objects.len(), 1);
+
+        // ...and both Overwrite and Create self-heal it.
+        storage
+            .put(&location, Bytes::from_static(b"v2").into())
+            .await
+            .unwrap();
+        let bytes = storage
+            .get(&location)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"v2"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_puts_to_same_key_stay_consistent() {
+        let storage = Arc::new(MetaStoreBuilder::new(InMemory::new(), 100).build());
+        let location = Path::from("put-race");
+
+        let contents: Vec<Bytes> = (0..8u8)
+            .map(|i| Bytes::from(vec![i; (i as usize + 1) * 3]))
+            .collect();
+        let mut tasks = Vec::new();
+        for content in &contents {
+            let storage = storage.clone();
+            let location = location.clone();
+            let content = content.clone();
+            tasks.push(tokio::spawn(async move {
+                storage.put(&location, content.into()).await
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+
+        // The winning put's data and metadata must agree.
+        let res = storage.get(&location).await.unwrap();
+        let e_tag = res.meta.e_tag.clone();
+        let bytes = res.bytes().await.unwrap();
+        assert!(contents.contains(&bytes));
+        let expected = BASE64_URL_SAFE.encode(sha3_256(&bytes));
+        assert_eq!(e_tag.as_deref(), Some(expected.as_str()));
+    }
+
+    #[tokio::test]
+    async fn concurrent_multipart_completes_stay_consistent() {
+        let storage = MetaStoreBuilder::new(InMemory::new(), 100).build();
+        let location = Path::from("multipart-race");
+        let content_a = Bytes::from_static(b"aaaaaaaaaaaaaaaa");
+        let content_b = Bytes::from_static(b"bbbbbbbb");
+
+        let mut up_a = storage.put_multipart(&location).await.unwrap();
+        let mut up_b = storage.put_multipart(&location).await.unwrap();
+        up_a.put_part(content_a.clone().into()).await.unwrap();
+        up_b.put_part(content_b.clone().into()).await.unwrap();
+
+        let (ra, rb) = futures::join!(up_a.complete(), up_b.complete());
+        ra.unwrap();
+        rb.unwrap();
+
+        // Whichever complete ran last, data and metadata must agree.
+        let res = storage.get(&location).await.unwrap();
+        let e_tag = res.meta.e_tag.clone();
+        let bytes = res.bytes().await.unwrap();
+        assert!(bytes == content_a || bytes == content_b);
+        let expected = BASE64_URL_SAFE.encode(sha3_256(&bytes));
+        assert_eq!(e_tag.as_deref(), Some(expected.as_str()));
     }
 
     #[tokio::test]

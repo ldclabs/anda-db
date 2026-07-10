@@ -239,7 +239,10 @@ impl CognitiveNexus {
             limit,
         } = command;
         let limit = limit.unwrap_or(100).min(100);
-        let top_k = limit.saturating_mul(10);
+        // `IN <type>` filtering happens after BM25 scoring, so widen the
+        // candidate pool when a type filter may drop most of the top hits —
+        // otherwise a rare type can starve even though matches exist.
+        let top_k = limit.saturating_mul(if in_type.is_some() { 100 } else { 10 });
         let threshold = threshold.and_then(|v| v.as_f64()).unwrap_or(0.0);
 
         match target {
@@ -322,7 +325,12 @@ impl CognitiveNexus {
                                 for (_, val) in &prop.metadata {
                                     extract_json_text(&mut texts, val);
                                 }
-                                let texts = texts.join("\n");
+                                // The tokenizer chain lowercases its tokens;
+                                // fold the source texts too, or all-caps
+                                // attribute values ("TREATS") never re-match
+                                // the BM25 hit during this per-predicate
+                                // re-check.
+                                let texts = texts.join("\n").to_lowercase();
                                 if tokens.iter().any(|t| texts.contains(t.as_str()))
                                     && let Some(val) = proposition.to_proposition_link(predicate)
                                 {

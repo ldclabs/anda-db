@@ -53,6 +53,11 @@ impl QueryType {
     /// This is the main entry point for converting a string query into a structured
     /// representation that can be used for searching.
     ///
+    /// Parsing is total and stack-safe: parenthesis nesting deeper than the
+    /// internal budget (64 levels) degrades leniently to plain terms instead
+    /// of recursing further. Use [`QueryType::try_parse`] to reject oversized
+    /// or overly complex input instead of degrading.
+    ///
     /// # Arguments
     ///
     /// * `query` - A string slice containing the query to parse
@@ -74,7 +79,7 @@ impl QueryType {
             return QueryType::Or(vec![]);
         }
 
-        Self::parse_or_expression(query)
+        Self::parse_or_expression(query, 0)
     }
 
     /// Parses a query string after applying resource-exhaustion guards.
@@ -104,16 +109,16 @@ impl QueryType {
     /// # Returns
     ///
     /// A QueryType representing the parsed OR expression
-    fn parse_or_expression(query: &str) -> Self {
+    fn parse_or_expression(query: &str, depth: usize) -> Self {
         let parts: Vec<&str> = Self::split_top_level(query, " OR ");
 
         if parts.len() == 1 {
-            return Self::parse_and_expression(parts[0]);
+            return Self::parse_and_expression(parts[0], depth);
         }
 
         let subqueries: Vec<Box<QueryType>> = parts
             .into_iter()
-            .map(|p| Box::new(Self::parse_and_expression(p)))
+            .map(|p| Box::new(Self::parse_and_expression(p, depth)))
             .collect();
 
         QueryType::Or(subqueries)
@@ -128,16 +133,16 @@ impl QueryType {
     /// # Returns
     ///
     /// A QueryType representing the parsed AND expression
-    fn parse_and_expression(query: &str) -> Self {
+    fn parse_and_expression(query: &str, depth: usize) -> Self {
         let parts: Vec<&str> = Self::split_top_level(query, " AND ");
 
         if parts.len() == 1 {
-            return Self::parse_not_expression(parts[0]);
+            return Self::parse_not_expression(parts[0], depth);
         }
 
         let subqueries: Vec<Box<QueryType>> = parts
             .into_iter()
-            .map(|p| Box::new(Self::parse_not_expression(p)))
+            .map(|p| Box::new(Self::parse_not_expression(p, depth)))
             .collect();
 
         QueryType::And(subqueries)
@@ -152,14 +157,14 @@ impl QueryType {
     /// # Returns
     ///
     /// A QueryType representing the parsed NOT expression
-    fn parse_not_expression(query: &str) -> Self {
+    fn parse_not_expression(query: &str, depth: usize) -> Self {
         let query = query.trim();
 
         if let Some(stripped) = query.strip_prefix("NOT ") {
-            return QueryType::Not(Box::new(Self::parse_term(stripped)));
+            return QueryType::Not(Box::new(Self::parse_term(stripped, depth)));
         }
 
-        Self::parse_term(query)
+        Self::parse_term(query, depth)
     }
 
     /// Parses a term or parenthesized expression, which has the highest precedence.
@@ -171,23 +176,36 @@ impl QueryType {
     /// # Returns
     ///
     /// A QueryType representing the parsed term or parenthesized expression
-    fn parse_term(query: &str) -> Self {
+    fn parse_term(query: &str, depth: usize) -> Self {
         let query = query.trim();
 
-        // Handle parenthesized expressions
-        if let Some(stripped) = query.strip_prefix('(') {
-            // 处理可能存在的非平衡括号
-            if stripped.ends_with(')') && Self::is_balanced_parentheses(query) {
-                // 完全平衡的括号表达式
-                return Self::parse_or_expression(&stripped[..stripped.len() - 1]);
-            } else {
-                // 处理不平衡的括号
-                // 1. 如果缺少右括号，尝试解析括号内的内容
-                return Self::parse_or_expression(stripped);
+        // Handle parenthesized expressions.
+        //
+        // The parenthesis handling below recurses back into
+        // `parse_or_expression`, so an adversarial run of parentheses could
+        // otherwise grow the call stack linearly with the input. The public
+        // `parse` entry point has no input-size guard (only `try_parse`
+        // validates), therefore recursion is bounded here: once the nesting
+        // budget is exhausted the rest of the input degrades to plain terms
+        // instead of overflowing the stack (an abort that cannot be caught).
+        if depth < MAX_LOGICAL_QUERY_DEPTH {
+            if let Some(stripped) = query.strip_prefix('(') {
+                // 处理可能存在的非平衡括号
+                if stripped.ends_with(')') && Self::is_balanced_parentheses(query) {
+                    // 完全平衡的括号表达式
+                    return Self::parse_or_expression(&stripped[..stripped.len() - 1], depth + 1);
+                } else {
+                    // 处理不平衡的括号
+                    // 1. 如果缺少右括号，尝试解析括号内的内容
+                    return Self::parse_or_expression(stripped, depth + 1);
+                }
+            } else if query.ends_with(')') {
+                // 处理只有右括号的情况。Strip ALL contiguous trailing ')' at
+                // once: stripping one per recursion needs O(n) stack (and
+                // O(n²) rescans) for a `")"` flood, which overflowed the
+                // stack before this guard existed.
+                return Self::parse_or_expression(query.trim_end_matches(')'), depth + 1);
             }
-        } else if let Some(stripped) = query.strip_suffix(')') {
-            // 处理只有右括号的情况
-            return Self::parse_or_expression(stripped);
         }
 
         // Handle multiple terms (default to OR relationship)
@@ -347,8 +365,13 @@ fn validate_query_input(query: &str) -> Result<(), String> {
         ));
     }
 
+    // Count both directions: a flood of ')' (or other unmatched closing
+    // parentheses) previously bypassed this guard entirely because only '('
+    // contributed to the depth, while each unmatched ')' still costs the
+    // parser a recursion step.
     let mut depth = 0usize;
     let mut max_depth = 0usize;
+    let mut unmatched_close = 0usize;
     for ch in query.chars() {
         match ch {
             '(' => {
@@ -360,7 +383,18 @@ fn validate_query_input(query: &str) -> Result<(), String> {
                     ));
                 }
             }
-            ')' => depth = depth.saturating_sub(1),
+            ')' => {
+                if depth == 0 {
+                    unmatched_close += 1;
+                    if unmatched_close > MAX_LOGICAL_QUERY_DEPTH {
+                        return Err(format!(
+                            "logical query unmatched closing parenthesis count exceeds maximum {MAX_LOGICAL_QUERY_DEPTH}"
+                        ));
+                    }
+                } else {
+                    depth -= 1;
+                }
+            }
             _ => {}
         }
     }
@@ -560,6 +594,73 @@ mod tests {
     fn try_parse_rejects_excessive_parenthesis_depth() {
         let query = format!("{}hello{}", "(".repeat(MAX_LOGICAL_QUERY_DEPTH + 1), ")");
         assert!(QueryType::try_parse(&query).is_err());
+    }
+
+    #[test]
+    fn try_parse_rejects_close_parenthesis_flood() {
+        // Regression: a ')' flood used to bypass validate_query_input (which
+        // only counted '(') and overflow the stack inside parse_term.
+        let query = format!("x{}", ")".repeat(MAX_LOGICAL_QUERY_DEPTH + 1));
+        assert!(QueryType::try_parse(&query).is_err());
+
+        // Within the guard budget the query still parses leniently.
+        let query = format!("x{}", ")".repeat(MAX_LOGICAL_QUERY_DEPTH));
+        assert_eq!(
+            QueryType::try_parse(&query).unwrap(),
+            QueryType::Term("x".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_survives_parenthesis_floods_without_stack_overflow() {
+        // Regression: the unguarded public `parse` used to recurse once per
+        // trailing ')', so `"x" + ")"*8190` aborted with a stack overflow in
+        // debug builds. Contiguous ')' runs are now stripped in one step.
+        let query = format!("x{}", ")".repeat(8190));
+        assert_eq!(QueryType::parse(&query), QueryType::Term("x".to_string()));
+
+        // Far past any length guard: still O(1) recursion.
+        let query = format!("x{}", ")".repeat(1_000_000));
+        assert_eq!(QueryType::parse(&query), QueryType::Term("x".to_string()));
+
+        // '(' floods recurse once per '(' but are cut off by the depth budget.
+        let query = format!("{}hello", "(".repeat(1_000_000));
+        let _ = QueryType::parse(&query);
+
+        // Spaced ')' floods cannot be stripped in one pass; the depth budget
+        // caps the recursion and the rest degrades to plain terms.
+        let query = format!("x{}", " )".repeat(100_000));
+        let _ = QueryType::parse(&query);
+
+        // Alternating unbalanced parentheses.
+        let query = ")(".repeat(500_000);
+        let _ = QueryType::parse(&query);
+    }
+
+    #[test]
+    fn parse_close_paren_stripping_matches_old_semantics() {
+        // Trailing ')' stripping must keep the lenient-parse results.
+        assert_eq!(
+            QueryType::parse("hello AND world))"),
+            QueryType::And(vec![
+                Box::new(QueryType::Term("hello".to_string())),
+                Box::new(QueryType::Term("world".to_string()))
+            ])
+        );
+        assert_eq!(
+            QueryType::parse("a) OR b)"),
+            QueryType::Or(vec![
+                Box::new(QueryType::Term("a".to_string())),
+                Box::new(QueryType::Term("b".to_string()))
+            ])
+        );
+        assert_eq!(
+            QueryType::parse("NOT NOT a))"),
+            QueryType::Not(Box::new(QueryType::Not(Box::new(QueryType::Term(
+                "a".to_string()
+            )))))
+        );
+        assert_eq!(QueryType::parse(")))"), QueryType::Or(vec![]));
     }
 
     #[test]
