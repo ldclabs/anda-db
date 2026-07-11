@@ -18,7 +18,11 @@ use object_store::ObjectStore;
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
@@ -103,10 +107,27 @@ struct DbEntry {
     flush_task: JoinHandle<()>,
 }
 
+impl Drop for DbEntry {
+    fn drop(&mut self) {
+        // Backstop: an entry dropped without an explicit cancel (e.g. a
+        // future code path that removes it from the registry and is then
+        // itself cancelled) must not leave the auto-flush task running
+        // forever with an open database — that task would keep writing to
+        // storage while a reopened instance of the same database also
+        // writes, i.e. two writers on one store. Cancelling here makes the
+        // flush task flush, close the database, and exit on its own.
+        self.cancel.cancel();
+    }
+}
+
 struct Inner {
     options: ServerOptions,
     object_store: Arc<dyn ObjectStore>,
     cancel: CancellationToken,
+    /// Set once [`AppState::shutdown`] begins; the RPC entry points reject
+    /// new requests with 503 so a request accepted after the graceful-drain
+    /// deadline cannot race the database close.
+    shutting_down: AtomicBool,
     databases: RwLock<BTreeMap<String, DbEntry>>,
     /// Names of non-primary databases that should be reopened on the next
     /// start. Kept separate from `databases` so a database that failed to
@@ -169,6 +190,7 @@ impl AppState {
                 options,
                 object_store,
                 cancel: CancellationToken::new(),
+                shutting_down: AtomicBool::new(false),
                 databases: RwLock::new(BTreeMap::new()),
                 registry: RwLock::new(BTreeSet::new()),
                 lifecycle: Mutex::new(()),
@@ -228,6 +250,12 @@ impl AppState {
     /// Returns the maximum accepted request body size in bytes.
     pub fn max_body_size(&self) -> usize {
         self.inner.options.max_body_size
+    }
+
+    /// Returns `true` once [`AppState::shutdown`] has begun. The RPC entry
+    /// points check this and reject new requests with 503.
+    pub fn is_shutting_down(&self) -> bool {
+        self.inner.shutting_down.load(Ordering::Acquire)
     }
 
     /// Returns server information including all open database names.
@@ -322,6 +350,19 @@ impl AppState {
         let _guard = self.inner.lifecycle.lock().await;
 
         let entry = { self.inner.databases.write().await.remove(name) };
+        // Cancel the flush task immediately — before any `.await` below.
+        // Once the entry has left `databases` it is invisible to
+        // `persist_registry`/`get_db`, so if this future were cancelled at a
+        // later await point without the token cancelled, the auto-flush task
+        // would keep running forever with an open database, and a client
+        // retrying `db.open` would create a second writer on the same
+        // storage. Cancelling the token makes `AndaDB::auto_flush` flush and
+        // close the database on its own even if we never reach the
+        // `flush_task.await` below (the `DbEntry` drop is a further
+        // backstop).
+        if let Some(entry) = &entry {
+            entry.cancel.cancel();
+        }
         // A registered database that failed to reopen has no open entry;
         // closing it just removes it from the registry.
         let registered = { self.inner.registry.write().await.remove(name) };
@@ -330,11 +371,10 @@ impl AppState {
         }
         self.persist_registry().await;
 
-        if let Some(entry) = entry {
-            // Cancelling the flush task makes `AndaDB::auto_flush` close the
-            // database (flushing all collections) before the task exits.
-            entry.cancel.cancel();
-            if let Err(err) = entry.flush_task.await {
+        if let Some(mut entry) = entry {
+            // Wait for `AndaDB::auto_flush` to close the database (flushing
+            // all collections) before reporting success.
+            if let Err(err) = (&mut entry.flush_task).await {
                 log::error!(
                     action = "AppState::close_db",
                     database = name;
@@ -346,15 +386,21 @@ impl AppState {
     }
 
     /// Flushes and closes every open database. Called on server shutdown.
+    ///
+    /// Marks the state as shutting down first, so the RPC entry points
+    /// reject new requests (503) while the databases are being closed —
+    /// connection tasks spawned before the graceful-drain deadline may
+    /// still be alive when this runs.
     pub async fn shutdown(&self) {
+        self.inner.shutting_down.store(true, Ordering::Release);
         self.inner.cancel.cancel();
         let entries: Vec<DbEntry> = {
             let mut dbs = self.inner.databases.write().await;
             std::mem::take(&mut *dbs).into_values().collect()
         };
-        for entry in entries {
+        for mut entry in entries {
             let name = entry.db.name().to_string();
-            if let Err(err) = entry.flush_task.await {
+            if let Err(err) = (&mut entry.flush_task).await {
                 log::error!(
                     action = "AppState::shutdown",
                     database = name;
@@ -402,5 +448,30 @@ impl AppState {
                 "failed to persist database registry: {err:?}",
             );
         }
+    }
+}
+
+/// Validates the API-key/listen-address combination at startup.
+///
+/// - An explicitly configured empty (or whitespace-only) API key is always
+///   rejected: it would look enabled while accepting any request.
+/// - Listening on a non-loopback address without an API key is rejected
+///   unless `insecure_no_api_key` explicitly opts in — otherwise the whole
+///   RPC API (including database creation and deletion of documents) would
+///   be open to anyone who can reach the listener.
+pub fn check_startup_api_key(
+    api_key: Option<&str>,
+    addr: &SocketAddr,
+    insecure_no_api_key: bool,
+) -> Result<(), String> {
+    match api_key {
+        Some(key) if key.trim().is_empty() => Err("API_KEY must not be empty".to_string()),
+        Some(_) => Ok(()),
+        None if addr.ip().is_loopback() || insecure_no_api_key => Ok(()),
+        None => Err(format!(
+            "refusing to listen on non-loopback address {addr} without API_KEY: \
+             the RPC API would be open to anyone; set API_KEY or pass \
+             --insecure-no-api-key to override"
+        )),
     }
 }

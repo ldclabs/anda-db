@@ -749,12 +749,16 @@ impl CognitiveNexus {
                 }
             }
             TargetTerm::Concept(concept_matcher) => {
-                let ids: Vec<EntityID> = self
-                    .query_concept_ids(&concept_matcher)
-                    .await?
-                    .into_iter()
-                    .map(EntityID::Concept)
-                    .collect();
+                let ids: Vec<EntityID> = match self.query_concept_ids(&concept_matcher).await {
+                    Ok(ids) => ids.into_iter().map(EntityID::Concept).collect(),
+                    // Dangling `{id:}` / `{type, name}` grounding inside a
+                    // NOT / OPTIONAL / UNION sub-block degrades to an empty
+                    // match (KIP §3.4.7); storage failures still propagate.
+                    Err(err) if ctx.lenient_grounding && err.code == KipErrorCode::NotFound => {
+                        Vec::new()
+                    }
+                    Err(err) => return Err(err),
+                };
                 Ok(TargetEntities::IDs(ids))
             }
             TargetTerm::Proposition(proposition_matcher) => {
@@ -768,10 +772,21 @@ impl CognitiveNexus {
                             )));
                         }
                         // Match-only `(id:)` target: KIP_3002 when dangling
-                        // (spec RC8).
-                        self.ensure_proposition_link_exists(&ctx.cache, &entity_id)
-                            .await?;
-                        TargetEntities::IDs(vec![entity_id])
+                        // (spec RC8). Inside a NOT / OPTIONAL / UNION
+                        // sub-block the dangling link degrades to an empty
+                        // match instead; storage failures still propagate.
+                        match self
+                            .ensure_proposition_link_exists(&ctx.cache, &entity_id)
+                            .await
+                        {
+                            Ok(()) => TargetEntities::IDs(vec![entity_id]),
+                            Err(err)
+                                if ctx.lenient_grounding && err.code == KipErrorCode::NotFound =>
+                            {
+                                TargetEntities::IDs(Vec::new())
+                            }
+                            Err(err) => return Err(err),
+                        }
                     }
                     PropositionMatcher::Object {
                         subject: TargetTerm::Variable(_),

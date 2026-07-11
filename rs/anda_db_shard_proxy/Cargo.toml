@@ -15,6 +15,7 @@ clap = { workspace = true }
 dashmap = { workspace = true }
 dotenv = { workspace = true }
 log = { workspace = true }
+moka = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 structured-logger = { workspace = true }

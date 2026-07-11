@@ -90,6 +90,13 @@ impl Document {
     /// stale data written under an older schema. They disappear from storage
     /// the next time the document is rewritten.
     ///
+    /// Generic (schema-less) deserialization cannot restore the declared
+    /// variant of every value: a non-negative `I64` reads back as `U64` and
+    /// an `F32` reads back as `F64`. Such read-back shapes are normalized
+    /// into the canonical variant here (see
+    /// [`FieldType::normalize`](crate::FieldType::normalize)) so that index
+    /// maintenance and field accessors always observe the declared variant.
+    ///
     /// # Arguments
     /// * `schema` - The schema to validate against
     /// * `doc` - The DocumentOwned to convert
@@ -98,12 +105,23 @@ impl Document {
     /// * `Result<Self, SchemaError>` - The validated Document or an error
     pub fn try_from_doc(schema: Arc<Schema>, mut doc: DocumentOwned) -> Result<Self, SchemaError> {
         doc.fields.retain(|idx, _| schema.contains_idx(*idx));
+        Self::normalize_fields(&schema, &mut doc.fields);
         schema.validate(&doc.fields)?;
 
         Ok(Self {
             fields: doc.fields,
             schema,
         })
+    }
+
+    /// Normalizes read-back value shapes into the schema's canonical
+    /// variants; see [`Document::try_from_doc`].
+    fn normalize_fields(schema: &Schema, fields: &mut IndexedFieldValues) {
+        for field in schema.iter() {
+            if let Some(value) = fields.get_mut(&field.idx()) {
+                field.r#type().normalize(value);
+            }
+        }
     }
 
     /// Creates a Document by serializing and validating a value against the schema.
@@ -300,14 +318,19 @@ impl Document {
 
     /// Sets a field value by name.
     ///
+    /// Read-back value shapes (e.g. a non-negative `I64` observed as `U64`)
+    /// are normalized into the field's canonical variant before being
+    /// stored, mirroring [`Document::try_from_doc`].
+    ///
     /// # Arguments
     /// * `name` - The name of the field to set
     /// * `value` - The value to store
     ///
     /// # Returns
     /// * `Result<(), SchemaError>` - Success or an error
-    pub fn set_field(&mut self, name: &str, value: Fv) -> Result<&mut Self, SchemaError> {
+    pub fn set_field(&mut self, name: &str, mut value: Fv) -> Result<&mut Self, SchemaError> {
         if let Some(field) = self.schema.get_field(name) {
+            field.r#type().normalize(&mut value);
             field.validate(&value)?;
             self.fields.insert(field.idx(), value);
             return Ok(self);
@@ -384,8 +407,9 @@ impl Document {
 
     /// Updates the document with values from a DocumentOwned.
     ///
-    /// Values stored under an index the schema does not declare are dropped,
-    /// mirroring [`Document::try_from_doc`].
+    /// Values stored under an index the schema does not declare are dropped
+    /// and read-back value shapes are normalized into their canonical
+    /// variants, mirroring [`Document::try_from_doc`].
     ///
     /// # Arguments
     /// * `doc` - The DocumentOwned containing the new values
@@ -394,6 +418,7 @@ impl Document {
     /// * `Result<(), SchemaError>` - Success or an error
     pub fn set_doc(&mut self, mut doc: DocumentOwned) -> Result<(), SchemaError> {
         doc.fields.retain(|idx, _| self.schema.contains_idx(*idx));
+        Self::normalize_fields(&self.schema, &mut doc.fields);
         self.schema.validate(&doc.fields)?;
         self.fields = doc.fields;
 
@@ -779,14 +804,16 @@ mod tests {
         cbor2::to_writer(&owned, &mut bytes).unwrap();
         let restored: DocumentOwned = cbor2::from_reader(bytes.as_slice()).unwrap();
 
-        // Read-back shapes are accepted by validation...
+        // Read-back shapes (non-negative I64 as U64, F32 as F64) are
+        // normalized back into the canonical variants...
         let doc = Document::try_from_doc(schema.clone(), restored).unwrap();
-        assert_eq!(doc.get_field("count").unwrap(), &Fv::U64(5));
-        if let Fv::F64(f) = doc.get_field("ratio").unwrap() {
-            assert_eq!(*f, 2.71f32 as f64);
-        } else {
-            panic!("expected F64 read-back shape");
-        }
+        assert_eq!(doc.get_field("count").unwrap(), &Fv::I64(5));
+        assert_eq!(doc.get_field("ratio").unwrap(), &Fv::F32(2.71));
+        assert_eq!(doc.get_field("maybe").unwrap(), &Fv::I64(7));
+        assert_eq!(
+            doc.get_field("nums").unwrap(),
+            &Fv::Array(vec![Fv::I64(0), Fv::I64(1), Fv::I64(-2), Fv::I64(i64::MAX)])
+        );
 
         // ...and decode back into the original struct losslessly.
         let round: NumDoc = doc.try_into().unwrap();
@@ -810,6 +837,50 @@ mod tests {
             .try_into()
             .unwrap();
         assert_eq!(round, negative);
+    }
+
+    #[test]
+    fn stored_documents_with_f32_fields_read_back_through_json() {
+        // Regression (#28): serde_json serializes an F32 with the f32
+        // shortest-decimal form, so the JSON read-back F64 is not the exact
+        // widening (2.71 vs 2.7100000381...). Such documents must still
+        // validate, normalize, and decode.
+        let schema = Arc::new(NumDoc::schema().unwrap());
+        let value = NumDoc {
+            _id: 1,
+            count: 5,
+            ratio: 2.71,
+            maybe: Some(7),
+            nums: vec![0, 1, -2],
+        };
+
+        let doc = Document::try_from(schema.clone(), &value).unwrap();
+        let owned: DocumentOwned = doc.into();
+
+        let json = serde_json::to_string(&owned).unwrap();
+        let restored: DocumentOwned = serde_json::from_str(&json).unwrap();
+
+        let doc = Document::try_from_doc(schema, restored).unwrap();
+        assert_eq!(doc.get_field("ratio").unwrap(), &Fv::F32(2.71));
+        assert_eq!(doc.get_field("count").unwrap(), &Fv::I64(5));
+        let round: NumDoc = doc.try_into().unwrap();
+        assert_eq!(round, value);
+    }
+
+    #[test]
+    fn set_field_normalizes_read_back_shapes() {
+        let schema = Arc::new(NumDoc::schema().unwrap());
+        let mut doc = Document::new(schema);
+        doc.set_id(1);
+        doc.set_field("count", Fv::U64(5)).unwrap();
+        assert_eq!(doc.get_field("count").unwrap(), &Fv::I64(5));
+        doc.set_field("ratio", Fv::F64(2.71)).unwrap();
+        assert_eq!(doc.get_field("ratio").unwrap(), &Fv::F32(2.71));
+        // Out-of-range U64 is still rejected, not silently truncated.
+        assert!(
+            doc.set_field("count", Fv::U64(i64::MAX as u64 + 1))
+                .is_err()
+        );
     }
 
     #[test]

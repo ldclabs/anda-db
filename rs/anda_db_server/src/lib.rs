@@ -65,11 +65,21 @@ pub use state::{AppState, OpenMode, ServerInfo, ServerOptions};
 /// from [`ServerOptions::max_body_size`] and over-limit requests receive
 /// the RPC error envelope (`payload_too_large`) instead of axum's plain
 /// text 413.
+///
+/// An outermost timeout layer ([`api::total_timeout`], 2× the request
+/// timeout) bounds the whole request including reading the body, so a
+/// slow-transmitting client cannot hold a connection open indefinitely;
+/// the per-request timeout applied to the dispatched operation itself
+/// lives in the RPC handlers.
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/", routing::get(api::get_info).post(api::rpc_root))
         .route("/{db_name}", routing::post(api::rpc_db))
         .layer(DefaultBodyLimit::max(state.max_body_size()))
         .layer(middleware::from_fn(api::normalize_rejections))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            api::total_timeout,
+        ))
         .with_state(state)
 }

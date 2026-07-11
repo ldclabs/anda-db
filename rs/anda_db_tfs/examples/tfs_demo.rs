@@ -57,10 +57,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let metadata = std::fs::File::create("debug/tfs_demo/metadata.cbor")?;
         index
-            .flush(metadata, 0, async |id, data| {
-                let mut node = std::fs::File::create(format!("debug/tfs_demo/b_{id}.cbor"))?;
-                node.write_all(data)?;
-                Ok(true)
+            .flush(metadata, 0, |id, data| {
+                let write = || {
+                    let mut node = std::fs::File::create(format!("debug/tfs_demo/b_{id}.cbor"))?;
+                    node.write_all(&data)?;
+                    Ok(true)
+                };
+                std::future::ready(write())
             })
             .await?;
     }

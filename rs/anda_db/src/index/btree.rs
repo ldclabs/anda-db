@@ -361,6 +361,15 @@ impl BTree {
                 .index
                 .insert(doc_id, *val, now_ms)
                 .map_err(DBError::from),
+            // Defense in depth: a non-negative I64 field value is observed
+            // as U64 when read back through generic CBOR (documents are
+            // normalized at materialization, but hooks or older data may
+            // still surface the read-back shape). Silently mismatching here
+            // would corrupt the index (see the same arm in `remove`).
+            (BTree::I64(btree), Fv::U64(val)) if *val <= i64::MAX as u64 => btree
+                .index
+                .insert(doc_id, *val as i64, now_ms)
+                .map_err(DBError::from),
             (BTree::U64(btree), Fv::U64(val)) => btree
                 .index
                 .insert(doc_id, *val, now_ms)
@@ -442,6 +451,12 @@ impl BTree {
 
         match (&self, field_value) {
             (BTree::I64(btree), Fv::I64(val)) => btree.index.remove(doc_id, *val, now_ms),
+            // Tolerate the U64 read-back shape of a non-negative I64 value:
+            // falling through to the `_ => false` arm would silently leak
+            // the index entry (phantom matches after update/remove).
+            (BTree::I64(btree), Fv::U64(val)) if *val <= i64::MAX as u64 => {
+                btree.index.remove(doc_id, *val as i64, now_ms)
+            }
             (BTree::U64(btree), Fv::U64(val)) => btree.index.remove(doc_id, *val, now_ms),
             (BTree::String(btree), Fv::Text(val)) => {
                 btree.index.remove(doc_id, val.clone(), now_ms)
@@ -586,6 +601,12 @@ impl BTree {
     {
         match (self, field_value) {
             (BTree::I64(btree), Fv::I64(val)) => btree.index.query_with(val, f),
+            // Tolerate the U64 read-back shape of a non-negative I64 value,
+            // mirroring `insert` / `remove` (range queries already tolerate
+            // it through `TryFrom<Fv> for i64`).
+            (BTree::I64(btree), Fv::U64(val)) if *val <= i64::MAX as u64 => {
+                btree.index.query_with(&(*val as i64), f)
+            }
             (BTree::U64(btree), Fv::U64(val)) => btree.index.query_with(val, f),
             (BTree::String(btree), Fv::Text(val)) => btree.index.query_with(val, f),
             (BTree::Bytes(btree), Fv::Bytes(val)) => btree.index.query_with(val, f),
@@ -1407,6 +1428,50 @@ mod tests {
         u64_tree.drop_data().await;
         text_tree.drop_data().await;
         bytes_tree.drop_data().await;
+    }
+
+    /// Regression (#1/#9): a non-negative I64 field value is observed as U64
+    /// when read back through generic CBOR. The scalar insert/remove/query
+    /// paths of an I64 index must tolerate that shape instead of erroring
+    /// (insert) or silently doing nothing (remove), which leaked stale index
+    /// entries on update/remove and broke backfill of existing data.
+    #[tokio::test]
+    async fn i64_index_tolerates_u64_read_back_shape() {
+        let storage = test_storage().await;
+        let now = unix_ms();
+        let tree = BTree::new(field("i64_rb", Ft::I64), storage.clone(), now)
+            .await
+            .unwrap();
+
+        // Insert with the read-back shape, query with the canonical one.
+        assert!(tree.insert(1, &Fv::U64(5), now).unwrap());
+        assert_eq!(
+            tree.query_with(&Fv::I64(5), |ids| Some(ids.clone())),
+            Some(vec![1])
+        );
+        // Query with the read-back shape too.
+        assert_eq!(
+            tree.query_with(&Fv::U64(5), |ids| Some(ids.clone())),
+            Some(vec![1])
+        );
+
+        // Update from the read-back shape to a new value must retire the old
+        // entry.
+        assert!(tree.update(1, &Fv::U64(5), &Fv::I64(7), now + 1).unwrap());
+        assert_eq!(tree.query_with(&Fv::I64(5), |ids| Some(ids.clone())), None);
+        assert_eq!(
+            tree.query_with(&Fv::I64(7), |ids| Some(ids.clone())),
+            Some(vec![1])
+        );
+
+        // Remove with the read-back shape.
+        assert!(tree.remove(1, &Fv::U64(7), now + 2));
+        assert_eq!(tree.query_with(&Fv::I64(7), |ids| Some(ids.clone())), None);
+        assert_eq!(tree.stats().num_elements, 0);
+
+        // Out-of-range U64 is still a type mismatch, not a silent wrap.
+        assert!(tree.insert(2, &Fv::U64(i64::MAX as u64 + 1), now).is_err());
+        assert!(!tree.remove(2, &Fv::U64(i64::MAX as u64 + 1), now));
     }
 
     /// Regression: `BTree::bootstrap` must accept every field type that

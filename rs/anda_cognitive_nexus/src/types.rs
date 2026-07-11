@@ -280,6 +280,17 @@ pub struct QueryContext {
     /// Variables whose field-level values participate in row-sensitive filtering.
     pub row_sensitive_vars: FxHashSet<String>,
 
+    /// When `true`, "dangling id / entity not found" grounding errors
+    /// (`KIP_3002`) degrade to an **empty match** instead of failing the
+    /// whole query. Set for `NOT` / `OPTIONAL` / `UNION` sub-block contexts
+    /// (KIP §3.4.7): a sub-pattern that cannot match makes the `NOT` clause
+    /// succeed, the `OPTIONAL` block pad with `null`, or the `UNION` branch
+    /// contribute nothing — it must not abort the query. Only the precise
+    /// `KIP_3002` grounding checks are degraded; storage-level failures
+    /// still propagate. The main (top-level) pattern keeps strict `KIP_3002`
+    /// semantics.
+    pub lenient_grounding: bool,
+
     /// Variables that passed through a cross-variable `FILTER` whose
     /// satisfying combinations could **not** be recorded as a synthetic
     /// relation (more than two entity variables or more than one predicate
@@ -322,6 +333,9 @@ impl QueryContext {
             entities: self.entities.clone(),
             predicates: self.predicates.clone(),
             cache: self.cache.clone(),
+            // A child of a lenient sub-block stays lenient (e.g. a `NOT`
+            // nested inside an `OPTIONAL`).
+            lenient_grounding: self.lenient_grounding,
             ..Default::default()
         }
     }

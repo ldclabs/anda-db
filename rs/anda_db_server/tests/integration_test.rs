@@ -5,17 +5,21 @@
 //! easy assertions. JSON round-trips and encoding negotiation are covered
 //! separately.
 
-use anda_db_server::{AppState, ServerOptions, build_router};
+use anda_db_server::{AppState, ServerOptions, build_router, state::check_startup_api_key};
 use anda_object_store::{FaultKind, FaultOp, FaultRule, FaultStore};
 use axum::{
     Router,
-    body::Body,
+    body::{Body, Bytes},
     http::{Request, StatusCode, header},
 };
 use http_body_util::BodyExt;
-use object_store::{ObjectStore, memory::InMemory};
+use object_store::{
+    ObjectStore,
+    memory::InMemory,
+    throttle::{ThrottleConfig, ThrottledStore},
+};
 use serde_json::{Value, json};
-use std::{sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tower::ServiceExt;
 
 const PRIMARY_DB: &str = "test_db";
@@ -861,6 +865,135 @@ async fn test_payload_too_large_uses_rpc_error_envelope() {
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let value: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(value["error"]["code"], "payload_too_large");
+}
+
+#[tokio::test]
+async fn test_timeout_returns_408_but_mutation_still_completes() {
+    // A store whose throttle can be turned on after startup, so connecting
+    // the primary database stays fast.
+    let throttled = Arc::new(ThrottledStore::new(
+        InMemory::new(),
+        ThrottleConfig::default(),
+    ));
+    let store: Arc<dyn ObjectStore> = throttled.clone();
+    let mut options = test_options(None);
+    options.request_timeout = Duration::from_millis(100);
+    let state = AppState::connect(store, options)
+        .await
+        .expect("failed to connect AppState");
+    let app = build_router(state.clone());
+
+    // Every storage put now takes longer than the request timeout, so
+    // `db.create` (several puts) cannot finish before the 408.
+    throttled.config_mut(|cfg| cfg.wait_put_per_call = Duration::from_millis(300));
+    let (status, resp) = rpc_cbor(&app, "/", "db.create", json!({"name": "slowdb"})).await;
+    assert_eq!(status, StatusCode::REQUEST_TIMEOUT, "resp: {resp:?}");
+    assert_eq!(resp["error"]["code"], "timeout");
+
+    // The dispatched operation lives on its own task: it must keep running
+    // after the 408 and complete, instead of being dropped halfway (which
+    // would leak the database's flush task or lose registry state).
+    throttled.config_mut(|cfg| cfg.wait_put_per_call = Duration::ZERO);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let names = rpc_ok(&app, "/", "db.list", Value::Null).await;
+        let names: Vec<String> = serde_json::from_value(names).unwrap();
+        if names.contains(&"slowdb".to_string()) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed-out db.create never completed; open databases: {names:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // The completed create left a fully consistent state: the database is
+    // usable and can be closed cleanly (flush task present and cancellable).
+    rpc_ok(&app, "/slowdb", "db.metadata", Value::Null).await;
+    rpc_ok(&app, "/", "db.close", json!({"name": "slowdb"})).await;
+    state.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_shutdown_rejects_new_requests_with_503() {
+    let state = test_state(Arc::new(InMemory::new()), None).await;
+    let app = build_router(state.clone());
+    state.shutdown().await;
+
+    // Root and database-scoped RPC endpoints refuse new work while (or
+    // after) shutting down, so late requests cannot race the database close.
+    let (status, resp) = rpc_cbor(&app, "/", "info", Value::Null).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "resp: {resp:?}");
+    assert_eq!(resp["error"]["code"], "unavailable");
+
+    let (status, resp) =
+        rpc_cbor(&app, &format!("/{PRIMARY_DB}"), "db.metadata", Value::Null).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "resp: {resp:?}");
+    assert_eq!(resp["error"]["code"], "unavailable");
+
+    // The unauthenticated health endpoint keeps answering so load balancers
+    // can still observe the instance.
+    let resp = app
+        .clone()
+        .oneshot(Request::get("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_route_timeout_covers_slow_body_read() {
+    let mut options = test_options(None);
+    options.request_timeout = Duration::from_millis(100);
+    let state = AppState::connect(Arc::new(InMemory::new()), options)
+        .await
+        .expect("failed to connect AppState");
+    let app = build_router(state);
+
+    // A body that sends a partial chunk and then stalls forever; the `Bytes`
+    // extractor never completes, so only the route-level timeout can end the
+    // request.
+    let (mut tx, channel_body) = http_body_util::channel::Channel::<Bytes>::new(4);
+    tx.send_data(Bytes::from_static(b"{\"method\":"))
+        .await
+        .unwrap();
+
+    let resp = app
+        .oneshot(
+            Request::post("/")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::new(channel_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["error"]["code"], "timeout");
+    // Keep the sender alive until the response arrived, so the stall (not a
+    // closed body) is what the server observed.
+    drop(tx);
+}
+
+#[test]
+fn test_startup_api_key_policy() {
+    let loopback: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+    let loopback_v6: SocketAddr = "[::1]:8080".parse().unwrap();
+    let public: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+
+    // A configured key allows any listen address.
+    assert!(check_startup_api_key(Some("secret"), &public, false).is_ok());
+    // An explicitly empty (or blank) key is always rejected.
+    assert!(check_startup_api_key(Some(""), &loopback, false).is_err());
+    assert!(check_startup_api_key(Some("  "), &public, true).is_err());
+    // No key is fine on loopback only.
+    assert!(check_startup_api_key(None, &loopback, false).is_ok());
+    assert!(check_startup_api_key(None, &loopback_v6, false).is_ok());
+    // No key on a non-loopback address requires the explicit escape hatch.
+    assert!(check_startup_api_key(None, &public, false).is_err());
+    assert!(check_startup_api_key(None, &public, true).is_ok());
 }
 
 #[tokio::test]

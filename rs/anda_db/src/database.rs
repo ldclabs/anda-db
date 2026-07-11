@@ -3,7 +3,7 @@ use object_store::ObjectStore;
 use parking_lot::RwLock;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -47,10 +47,43 @@ struct InnerDB {
     read_only: AtomicBool,
     /// Set of collection names being dropped
     dropping_collections: RwLock<BTreeSet<String>>,
-    /// Serializes collection creation, so concurrent
-    /// `open_or_create_collection` callers racing on the same name observe
-    /// the winner's registration instead of failing with `AlreadyExists`.
-    create_lock: tokio::sync::Mutex<()>,
+    /// Per-collection-name lifecycle locks (see
+    /// [`AndaDB::lock_collection_name`]). Creating, opening (from storage),
+    /// closing, and deleting a collection of the same name are serialized
+    /// through the same entry, so e.g. an open cannot load a second writable
+    /// instance while a close is still flushing, and concurrent creators of
+    /// the same name observe the winner's registration instead of a storage
+    /// conflict. Entries are removed again once no task holds or awaits them.
+    collection_locks: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+/// RAII guard for a per-collection-name lifecycle lock.
+///
+/// Dropping the guard releases the lock and prunes the corresponding
+/// [`InnerDB::collection_locks`] entry when no other task holds or awaits it,
+/// so the map does not grow with every collection name ever touched.
+struct CollectionNameLock {
+    inner: Arc<InnerDB>,
+    name: String,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for CollectionNameLock {
+    fn drop(&mut self) {
+        // Release the mutex first so this holder's reference to the
+        // `Arc<Mutex>` (kept alive by the owned guard) is gone before the
+        // strong-count check below.
+        self.guard = None;
+        let mut locks = self.inner.collection_locks.lock();
+        if let Some(lock) = locks.get(&self.name)
+            && Arc::strong_count(lock) == 1
+        {
+            // Only the map itself references the entry: no holder, no
+            // waiter. (Waiters clone the Arc under the map mutex before
+            // awaiting, so this check cannot race with a new waiter.)
+            locks.remove(&self.name);
+        }
+    }
 }
 
 /// Database configuration parameters.
@@ -167,7 +200,7 @@ impl AndaDB {
                 collections: RwLock::new(BTreeMap::new()),
                 read_only: AtomicBool::new(false),
                 dropping_collections: RwLock::new(BTreeSet::new()),
-                create_lock: tokio::sync::Mutex::new(()),
+                collection_locks: parking_lot::Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -234,7 +267,7 @@ impl AndaDB {
                         collections: RwLock::new(BTreeMap::new()),
                         read_only: AtomicBool::new(false),
                         dropping_collections: RwLock::new(BTreeSet::new()),
-                create_lock: tokio::sync::Mutex::new(()),
+                        collection_locks: parking_lot::Mutex::new(HashMap::new()),
                     }),
                 };
 
@@ -425,10 +458,40 @@ impl AndaDB {
         }
     }
 
+    /// Acquires the lifecycle lock for a collection name.
+    ///
+    /// Collection creation, the slow (load-from-storage) path of opening,
+    /// closing, and deletion of the same name all run under this lock, so
+    /// their storage-level effects cannot interleave. The lock is a plain
+    /// (non-reentrant) tokio mutex: a creation/open callback `f` that
+    /// creates, opens, closes, or deletes **the same collection name** it
+    /// runs for would wait on itself forever and is not supported. Nested
+    /// operations on *different* collection names are fine.
+    async fn lock_collection_name(&self, name: &str) -> CollectionNameLock {
+        let lock = {
+            let mut locks = self.inner.collection_locks.lock();
+            locks.entry(name.to_string()).or_default().clone()
+        };
+        let guard = lock.lock_owned().await;
+        CollectionNameLock {
+            inner: self.inner.clone(),
+            name: name.to_string(),
+            guard: Some(guard),
+        }
+    }
+
     /// Creates a new collection in the database.
     ///
     /// This method creates a new collection with the given schema and configuration.
     /// It also executes the provided function on the collection before finalizing creation.
+    ///
+    /// # Concurrency
+    ///
+    /// Creation runs under a per-name lifecycle lock (see
+    /// [`AndaDB::lock_collection_name`]); `f` may create or open **other**
+    /// collections, but must not create, open, close, or delete the same
+    /// collection name it runs for — the lock is not reentrant and such a
+    /// call would hang forever.
     ///
     /// # Arguments
     /// * `schema` - The schema defining the structure of documents in the collection
@@ -480,9 +543,35 @@ impl AndaDB {
             }
         }
 
-        // Serialize creation so a concurrent creator of the same name is
-        // observed through its registration rather than a storage conflict.
-        let _create_guard = self.inner.create_lock.lock().await;
+        // Serialize with other lifecycle operations on the same name, so a
+        // concurrent creator is observed through its registration rather
+        // than a storage conflict, and a concurrent delete/close cannot
+        // interleave with the files written here.
+        let _name_guard = self.lock_collection_name(&config.name).await;
+        // Re-check the states that may have changed while waiting for the
+        // lock: a concurrent delete may have started (and not finished), or
+        // a concurrent creator may have registered the name.
+        if self
+            .inner
+            .dropping_collections
+            .read()
+            .contains(&config.name)
+        {
+            return Err(DBError::AlreadyExists {
+                name: config.name,
+                path: self.inner.name.clone(),
+                source: "collection is being dropped".to_string().into(),
+                _id: 0,
+            });
+        }
+        if self.inner.collections.read().contains_key(&config.name) {
+            return Err(DBError::AlreadyExists {
+                name: config.name,
+                path: self.inner.name.clone(),
+                source: "collection already exists".into(),
+                _id: 0,
+            });
+        }
         // self.metadata.collections will check it exists again in Collection::create
         let collection = Collection::create(self.clone(), schema, config).await?;
         self.register_created_collection(collection, f).await
@@ -541,6 +630,14 @@ impl AndaDB {
     /// has a higher version, the collection's schema will be upgraded automatically
     /// before executing the callback `f`.
     ///
+    /// # Concurrency
+    ///
+    /// Creation and the load-from-storage open path run under a per-name
+    /// lifecycle lock (see [`AndaDB::lock_collection_name`]); `f` may create
+    /// or open **other** collections, but must not create, open, close, or
+    /// delete the same collection name it runs for — the lock is not
+    /// reentrant and such a call would hang forever.
+    ///
     /// # Arguments
     /// * `schema` - The schema to use for creating or upgrading the collection
     /// * `config` - The collection configuration
@@ -593,12 +690,27 @@ impl AndaDB {
             .collections
             .contains(&config.name)
         {
-            // Serialize with other creators: when a concurrent
-            // `open_or_create_collection` of the same name wins the race, we
-            // observe its registration after acquiring the lock and fall
-            // through to the open path instead of failing with
+            // Serialize with other lifecycle operations on this name: when a
+            // concurrent `open_or_create_collection` of the same name wins
+            // the race, we observe its registration after acquiring the lock
+            // and fall through to the open path instead of failing with
             // `AlreadyExists`.
-            let create_guard = self.inner.create_lock.lock().await;
+            let name_guard = self.lock_collection_name(&config.name).await;
+            // A delete of this name may have started while we were waiting
+            // for the lock; creating now would resurrect it mid-drop.
+            if self
+                .inner
+                .dropping_collections
+                .read()
+                .contains(&config.name)
+            {
+                return Err(DBError::AlreadyExists {
+                    name: config.name,
+                    path: self.inner.name.clone(),
+                    source: "collection is being dropped".to_string().into(),
+                    _id: 0,
+                });
+            }
             let exists_now = self.inner.collections.read().contains_key(&config.name)
                 || self
                     .inner
@@ -614,7 +726,9 @@ impl AndaDB {
                     Err(err @ DBError::AlreadyExists { .. }) => {
                         // Lost to a writer outside this process (or leftover
                         // files from a crashed create): fall back to opening.
-                        drop(create_guard);
+                        // Release the name lock first — the open path below
+                        // re-acquires it for the load from storage.
+                        drop(name_guard);
                         return match self
                             .open_collection_with_schema(config.name, Some(schema), f)
                             .await
@@ -640,6 +754,14 @@ impl AndaDB {
     ///
     /// This method attempts to open an existing collection with the given name.
     /// It fails if the collection doesn't exist.
+    ///
+    /// # Concurrency
+    ///
+    /// Loading from storage runs under a per-name lifecycle lock (see
+    /// [`AndaDB::lock_collection_name`]); `f` may create or open **other**
+    /// collections, but must not create, open, close, or delete the same
+    /// collection name it runs for — the lock is not reentrant and such a
+    /// call would hang forever.
     ///
     /// # Arguments
     /// * `name` - The name of the collection to open
@@ -682,6 +804,41 @@ impl AndaDB {
             }
         }
 
+        {
+            if !self.inner.metadata.read().collections.contains(&name) {
+                return Err(DBError::NotFound {
+                    name,
+                    path: self.inner.name.clone(),
+                    source: "collection not found".into(),
+                    _id: 0,
+                });
+            }
+        }
+
+        // Load from storage under the per-name lifecycle lock: a concurrent
+        // `close_collection` may still be flushing this collection's state
+        // (its index files use overwrite semantics), and loading before that
+        // finishes would create a second writable instance whose writes the
+        // close would clobber. The lock also serializes with create/delete.
+        let _name_guard = self.lock_collection_name(&name).await;
+        // Re-check the fast paths after acquiring the lock: a concurrent
+        // open may have registered the collection while we waited, or a
+        // delete may have started/completed.
+        {
+            if let Some(collection) = self.inner.collections.read().get(&name) {
+                return Ok(collection.clone());
+            }
+        }
+        {
+            if self.inner.dropping_collections.read().contains(&name) {
+                return Err(DBError::AlreadyExists {
+                    name,
+                    path: self.inner.name.clone(),
+                    source: "collection is being dropped".to_string().into(),
+                    _id: 0,
+                });
+            }
+        }
         {
             if !self.inner.metadata.read().collections.contains(&name) {
                 return Err(DBError::NotFound {
@@ -743,11 +900,30 @@ impl AndaDB {
     /// [`AndaDB::open_collection`] / [`AndaDB::open_or_create_collection`] as
     /// a permanently read-only handle.
     ///
+    /// The whole operation holds the per-name lifecycle lock (see
+    /// [`AndaDB::lock_collection_name`]), so a concurrent open of the same
+    /// name waits for the close to finish instead of loading a second
+    /// writable instance from storage while the closing flush is still
+    /// writing index files.
+    ///
+    /// When the close (flush) fails, the — now read-only — handle is put
+    /// back into the registry and the error is returned: its un-flushed
+    /// in-memory state stays reachable and a retry of `close_collection`
+    /// will flush it again, instead of silently reloading stale state from
+    /// storage.
+    ///
     /// Returns `Ok(())` when the collection is not currently open.
     pub async fn close_collection(&self, name: &str) -> Result<(), DBError> {
+        let _name_guard = self.lock_collection_name(name).await;
         let collection = { self.inner.collections.write().remove(name) };
-        if let Some(collection) = collection {
-            collection.close().await?;
+        if let Some(collection) = collection
+            && let Err(err) = collection.close().await
+        {
+            self.inner
+                .collections
+                .write()
+                .insert(name.to_string(), collection);
+            return Err(err);
         }
         Ok(())
     }
@@ -760,11 +936,15 @@ impl AndaDB {
     ///
     /// # Concurrency
     ///
-    /// Deletion should run during a write quiescence for the collection: an
-    /// `add` that already passed the read-only check when the deletion starts
-    /// can still write its document object after the prefix listing, leaving
-    /// a residual object behind. Re-running `delete_collection` for the same
-    /// name cleans such leftovers.
+    /// Deletion holds the per-name lifecycle lock (see
+    /// [`AndaDB::lock_collection_name`]) for its whole duration, so it cannot
+    /// interleave with a create, storage-loading open, or close of the same
+    /// name. It should still run during a write quiescence for the
+    /// collection: an `add` on an already-open handle that passed the
+    /// read-only check when the deletion starts can still write its document
+    /// object after the prefix listing, leaving a residual object behind.
+    /// Re-running `delete_collection` for the same name cleans such
+    /// leftovers.
     pub async fn delete_collection(&self, name: &str) -> Result<(), DBError> {
         if self.inner.read_only.load(Ordering::Relaxed) {
             return Err(DBError::Generic {
@@ -775,6 +955,8 @@ impl AndaDB {
 
         // The name is used to build the storage prefix below.
         validate_field_name(name)?;
+
+        let _name_guard = self.lock_collection_name(name).await;
 
         // 更新元数据并持久化。即使集合未注册（例如此前创建中途失败的残留），
         // 也继续执行下面的清理流程，使该名字可以重新创建。
@@ -1670,8 +1852,172 @@ mod tests {
         db.close().await.unwrap();
     }
 
+    /// Regression (#2): the creation lock is per collection name, so a
+    /// creation callback that creates *another* collection must not deadlock
+    /// (a single global lock previously hung forever here).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_open_collection_racing_delete_is_not_registered() {
+    async fn test_nested_collection_creation_in_callback_does_not_deadlock() {
+        let object_store = Arc::new(InMemory::new());
+        let db = AndaDB::create(object_store, DBConfig::default()).await.unwrap();
+        let schema = test_schema();
+
+        let outer = {
+            let db2 = db.clone();
+            let inner_schema = schema.clone();
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                db.create_collection(
+                    schema.clone(),
+                    CollectionConfig {
+                        name: "outer".to_string(),
+                        description: "".to_string(),
+                    },
+                    async move |_| {
+                        let inner = db2
+                            .open_or_create_collection(
+                                inner_schema,
+                                CollectionConfig {
+                                    name: "inner".to_string(),
+                                    description: "".to_string(),
+                                },
+                                async |_| Ok(()),
+                            )
+                            .await?;
+                        assert_eq!(inner.name(), "inner");
+                        Ok(())
+                    },
+                ),
+            )
+            .await
+            .expect("nested creation of a different collection must not deadlock")
+            .unwrap()
+        };
+        assert_eq!(outer.name(), "outer");
+        assert!(db.metadata().collections.contains("outer"));
+        assert!(db.metadata().collections.contains("inner"));
+
+        // The nested collection is fully usable afterwards.
+        let inner = db
+            .open_collection("inner".to_string(), async |_| Ok(()))
+            .await
+            .unwrap();
+        assert_eq!(inner.name(), "inner");
+        db.close().await.unwrap();
+    }
+
+    /// Regression (#3): `close_collection` holds the per-name lifecycle lock
+    /// across unregistering and closing, and a concurrent open of the same
+    /// name waits for it — so no second writable instance can be loaded
+    /// while the closing flush is still writing (overwrite-mode) index
+    /// files. The final state must be a single live, writable instance with
+    /// the data intact.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_close_and_open_collection() {
+        let object_store = Arc::new(InMemory::new());
+        let db = AndaDB::create(object_store, DBConfig::default()).await.unwrap();
+        let collection = db
+            .create_collection(
+                test_schema(),
+                CollectionConfig {
+                    name: "c".to_string(),
+                    description: "".to_string(),
+                },
+                async |_| Ok(()),
+            )
+            .await
+            .unwrap();
+        let mut doc = collection.new_document();
+        doc.set_id(0); // placeholder; `add` assigns the real id
+        doc.set_field("name", FieldValue::Text("kept".to_string()))
+            .unwrap();
+        collection.add(doc).await.unwrap();
+        drop(collection);
+
+        let close_task = {
+            let db = db.clone();
+            tokio::spawn(async move { db.close_collection("c").await })
+        };
+        let open_task = {
+            let db = db.clone();
+            tokio::spawn(async move {
+                db.open_collection("c".to_string(), async |_| Ok(())).await
+            })
+        };
+
+        tokio::time::timeout(Duration::from_secs(30), close_task)
+            .await
+            .expect("concurrent close must not deadlock")
+            .unwrap()
+            .unwrap();
+        let opened = tokio::time::timeout(Duration::from_secs(30), open_task)
+            .await
+            .expect("concurrent open must not deadlock")
+            .unwrap()
+            .unwrap();
+        assert_eq!(opened.name(), "c");
+
+        // Regardless of interleaving, a fresh open afterwards yields a
+        // single writable instance with the document intact.
+        let reopened = db
+            .open_collection("c".to_string(), async |_| Ok(()))
+            .await
+            .unwrap();
+        assert!(!reopened.metadata().stats.read_only);
+        assert_eq!(reopened.len(), 1);
+        db.close().await.unwrap();
+    }
+
+    /// Regression (#19): `open_or_create_collection` must re-check
+    /// `dropping_collections` after acquiring the per-name lock, so a delete
+    /// that started while it was waiting cannot be raced by a create.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_open_or_create_rechecks_dropping_after_lock() {
+        let object_store = Arc::new(InMemory::new());
+        let db = AndaDB::create(object_store, DBConfig::default()).await.unwrap();
+
+        // Hold the lifecycle lock for the name, then start an
+        // open_or_create_collection: it passes the pre-lock checks and
+        // blocks on the lock.
+        let guard = db.lock_collection_name("late_drop").await;
+        let create_task = {
+            let db = db.clone();
+            let schema = test_schema();
+            tokio::spawn(async move {
+                db.open_or_create_collection(
+                    schema,
+                    CollectionConfig {
+                        name: "late_drop".to_string(),
+                        description: "".to_string(),
+                    },
+                    async |_| Ok(()),
+                )
+                .await
+            })
+        };
+        // Give the task time to reach the lock wait, then mark the name as
+        // being dropped and release the lock.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        db.inner
+            .dropping_collections
+            .write()
+            .insert("late_drop".to_string());
+        drop(guard);
+
+        let result = tokio::time::timeout(Duration::from_secs(30), create_task)
+            .await
+            .expect("open_or_create must not deadlock")
+            .unwrap();
+        assert!(
+            matches!(result, Err(DBError::AlreadyExists { .. })),
+            "creating a name that started dropping while waiting for the \
+             lock must fail with AlreadyExists, got {result:?}",
+        );
+        db.inner.dropping_collections.write().remove("late_drop");
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_open_collection_racing_delete_is_serialized() {
         let object_store = Arc::new(InMemory::new());
         let db = AndaDB::create(object_store, DBConfig::default()).await.unwrap();
         let config = CollectionConfig {
@@ -1684,8 +2030,10 @@ mod tests {
         // Drop the cached handle so the open below performs a real load.
         db.close_collection("racy").await.unwrap();
 
-        // Stall the open inside its callback (fully loaded, but not yet
-        // registered) while a concurrent delete_collection completes.
+        // Stall the open inside its callback (holding the per-name lifecycle
+        // lock) while a concurrent delete_collection is issued: the delete
+        // must wait for the open to finish instead of interleaving with it,
+        // so no zombie handle over a deleted storage prefix can exist.
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
         let (resume_tx, resume_rx) = tokio::sync::oneshot::channel::<()>();
         let open_task = {
@@ -1700,16 +2048,29 @@ mod tests {
             })
         };
         entered_rx.await.unwrap();
-        db.delete_collection("racy").await.unwrap();
+        let delete_task = {
+            let db = db.clone();
+            tokio::spawn(async move { db.delete_collection("racy").await })
+        };
+        // The delete is blocked on the lifecycle lock; unblock the open.
         resume_tx.send(()).unwrap();
 
-        // The open must observe the completed delete instead of registering a
-        // zombie handle over the deleted storage prefix.
-        let result = open_task.await.unwrap();
-        assert!(
-            matches!(result, Err(DBError::NotFound { .. })),
-            "open racing a completed delete must fail with NotFound, got {result:?}",
-        );
+        // The open completes first (it holds the lock) and returns a live
+        // handle; the delete then removes the collection.
+        let opened = tokio::time::timeout(Duration::from_secs(30), open_task)
+            .await
+            .expect("open racing a delete must not deadlock")
+            .unwrap()
+            .expect("open must succeed before the delete runs");
+        assert_eq!(opened.name(), "racy");
+        tokio::time::timeout(Duration::from_secs(30), delete_task)
+            .await
+            .expect("delete racing an open must not deadlock")
+            .unwrap()
+            .unwrap();
+
+        // The taken handle was closed by the delete and the name is gone.
+        assert!(opened.metadata().stats.read_only);
         let err = db
             .open_collection("racy".to_string(), async |_| Ok(()))
             .await

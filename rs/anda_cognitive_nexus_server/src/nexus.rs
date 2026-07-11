@@ -139,13 +139,22 @@ impl Nexus {
         res
     }
 
+    /// Lists persisted KIP logs in ascending `_id` order with cursor
+    /// pagination.
+    ///
+    /// `limit` semantics: `None` defaults to 10 documents, values above 100
+    /// are capped at 100, and `limit == 0` means "no data requested" — it
+    /// returns an empty page with no cursor instead of being bumped to one
+    /// document.
     pub async fn list_logs(
         &self,
         request: ListLogParams,
     ) -> Result<(Vec<KIPLog>, Option<String>), ListLogsError> {
-        // `limit == 0` combined with an empty result used to panic below;
-        // clamp to at least one document per page.
-        let limit = request.limit.unwrap_or(10).clamp(1, 100);
+        let limit = match request.limit {
+            Some(0) => return Ok((Vec::new(), None)),
+            Some(limit) => limit.min(100),
+            None => 10,
+        };
         let cursor = BTree::from_cursor::<u64>(&request.cursor)
             .map_err(|err| ListLogsError::InvalidCursor(err.to_string()))?
             .unwrap_or_default();
@@ -174,6 +183,12 @@ impl Nexus {
     /// Deletes logs whose `period` is strictly less than `before_period`
     /// (hours since the Unix epoch), in batches. Returns the number of
     /// deleted documents.
+    ///
+    /// Defensive termination: if a whole batch of matching ids deletes
+    /// nothing (a pathological index/document mismatch would make
+    /// `query_ids` keep returning the same undeletable ids), the loop exits
+    /// instead of spinning without backoff; the next scheduled prune run
+    /// retries.
     pub async fn prune_logs(&self, before_period: u64) -> Result<usize, BoxError> {
         let mut total = 0usize;
         loop {
@@ -187,11 +202,20 @@ impl Nexus {
             if ids.is_empty() {
                 return Ok(total);
             }
+            let mut deleted_this_batch = 0usize;
             for id in ids {
                 if self.logs.remove(id).await?.is_some() {
-                    total += 1;
+                    deleted_this_batch += 1;
                 }
             }
+            if deleted_this_batch == 0 {
+                log::warn!(
+                    action = "Nexus::prune_logs";
+                    "prune batch made no progress (index returned ids with no removable documents); stopping this run",
+                );
+                return Ok(total);
+            }
+            total += deleted_this_batch;
         }
     }
 }
@@ -235,7 +259,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn list_logs_is_safe_on_empty_collection_and_limit_zero() {
         let nexus = test_nexus().await;
-        // `limit: Some(0)` used to panic on `rt.last().unwrap()`.
+        // `limit: Some(0)` returns an empty page; the others an empty
+        // collection.
         for limit in [Some(0), Some(1), Some(1000), None] {
             let (logs, cursor) = nexus
                 .list_logs(ListLogParams {
@@ -256,11 +281,23 @@ mod tests {
             add_log(&nexus, period).await;
         }
 
-        // limit=0 clamps to one document per page.
+        // limit=0 means "no data": an empty page and no cursor, even when
+        // documents exist.
         let (logs, cursor) = nexus
             .list_logs(ListLogParams {
                 cursor: None,
                 limit: Some(0),
+            })
+            .await
+            .unwrap();
+        assert!(logs.is_empty());
+        assert!(cursor.is_none());
+
+        // limit=1 pages one document at a time.
+        let (logs, cursor) = nexus
+            .list_logs(ListLogParams {
+                cursor: None,
+                limit: Some(1),
             })
             .await
             .unwrap();

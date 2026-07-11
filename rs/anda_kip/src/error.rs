@@ -496,6 +496,10 @@ fn expected_syntax_for_context(
         return Some("WITH METADATA { source: \"...\", confidence: 0.9, ... }".to_string());
     }
 
+    if context_contains(contexts, "LIMIT must be followed by") {
+        return Some("a positive integer, e.g. LIMIT 10".to_string());
+    }
+
     if context_contains(contexts, "KIP key-value map")
         || context_contains(contexts, "JSON object")
         || context_contains(contexts, "key-value pair")
@@ -624,6 +628,14 @@ fn generate_recovery_suggestion(
             "Check JSON array syntax: [value1, value2, ...]. \
              Ensure every '[' has a matching ']'. \
              Trailing commas are allowed."
+                .to_string(),
+        );
+    }
+
+    if innermost.contains("LIMIT must be followed by") {
+        return Some(
+            "LIMIT takes a positive integer, e.g. LIMIT 10. \
+             LIMIT 0 is not allowed; omit the LIMIT clause entirely to use the engine default."
                 .to_string(),
         );
     }

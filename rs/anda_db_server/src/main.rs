@@ -15,7 +15,7 @@
 //! cargo run -p anda_db_server -- --api-key my-secret local --path ./debug/db
 //! ```
 
-use anda_db_server::{AppState, ServerOptions, build_router};
+use anda_db_server::{AppState, ServerOptions, build_router, state::check_startup_api_key};
 use anda_object_store::MetaStoreBuilder;
 use axum::BoxError;
 use clap::{Parser, Subcommand};
@@ -38,9 +38,16 @@ struct Cli {
     #[clap(long, env = "ADDR", default_value = "127.0.0.1:8080")]
     addr: String,
 
-    /// API key required as `Authorization: Bearer <key>` (optional)
+    /// API key required as `Authorization: Bearer <key>`. Required when
+    /// listening on a non-loopback address unless --insecure-no-api-key is
+    /// passed.
     #[clap(long, env = "API_KEY")]
     api_key: Option<String>,
+
+    /// Allow running without API_KEY on a non-loopback address, leaving the
+    /// whole RPC API open to anyone who can reach the server (dangerous)
+    #[clap(long, env = "INSECURE_NO_API_KEY")]
+    insecure_no_api_key: bool,
 
     /// Name of the primary database (created on first start; also stores
     /// the registry of databases to reopen)
@@ -87,6 +94,11 @@ async fn main() -> Result<(), BoxError> {
     dotenv::dotenv().ok();
     let cli = Cli::parse();
 
+    // Fail fast — before touching storage — when the listener would expose
+    // an unauthenticated RPC API (or the API key is an empty string).
+    let addr: SocketAddr = cli.addr.parse()?;
+    check_startup_api_key(cli.api_key.as_deref(), &addr, cli.insecure_no_api_key)?;
+
     Builder::with_level(&get_env_level().to_string())
         .with_target_writer("*", new_writer(tokio::io::stdout()))
         .init();
@@ -119,7 +131,6 @@ async fn main() -> Result<(), BoxError> {
     .map_err(|err| err.message)?;
 
     let app = build_router(state.clone());
-    let addr: SocketAddr = cli.addr.parse()?;
     let listener = create_reuse_port_listener(addr).await?;
     log::warn!("{APP_NAME}@{APP_VERSION} listening on {addr:?}");
 
@@ -152,7 +163,10 @@ async fn main() -> Result<(), BoxError> {
     };
 
     // Flush and close every open database before exiting, even when the
-    // server loop returned an error.
+    // server loop returned an error. When the drain deadline was exceeded,
+    // connection tasks spawned by `axum::serve` may still be running;
+    // `shutdown` first marks the state as shutting down so those tasks
+    // reject new requests (503) instead of racing the database close.
     state.shutdown().await;
     result?;
     Ok(())

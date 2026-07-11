@@ -528,6 +528,30 @@ mod tests {
     }
 
     #[test]
+    fn test_limit_zero_error_message_is_actionable() {
+        // Once the LIMIT keyword matched, a bad operand must fail hard: the
+        // enclosing opt(...) must not swallow the error and degrade it to a
+        // misleading "Unexpected trailing content" report.
+        for input in [
+            r#"SEARCH CONCEPT "aspirin" LIMIT 0"#,
+            "DESCRIBE CONCEPT TYPES LIMIT 0",
+            r#"EXPORT ?x WHERE { ?x {type: "Drug"} } LIMIT 0"#,
+            r#"SEARCH CONCEPT "aspirin" LIMIT abc"#,
+        ] {
+            let err = crate::parse_meta(input).unwrap_err();
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains("positive integer"),
+                "error for {input:?} should explain the LIMIT operand: {msg}"
+            );
+            assert!(
+                !msg.contains("Unexpected trailing content"),
+                "error for {input:?} must not be reported as trailing content: {msg}"
+            );
+        }
+    }
+
+    #[test]
     fn test_keywords_accept_arbitrary_whitespace() {
         // Newlines and tabs between multi-word keywords (DESCRIBE / CONCEPT TYPES / WITH TYPE)
         // must be accepted just like a literal space.

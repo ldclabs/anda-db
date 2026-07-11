@@ -209,17 +209,51 @@ where
     /// # Returns
     ///
     /// `true` if the item was added, `false` otherwise.
+    ///
+    /// # Panic safety
+    ///
+    /// The set/vec invariant (`set` mirrors `vec` exactly) holds even if any
+    /// step unwinds:
+    ///
+    /// * `contains` / `clone` panic — nothing has been mutated yet.
+    /// * `vec.push` panics (capacity overflow) — `Vec::push` leaves the vector
+    ///   unchanged on panic and the set has not been touched.
+    /// * `set.insert` panics (a custom `Hash` impl may panic) — a drop guard
+    ///   pops the element that was just pushed onto the vector. Without the
+    ///   guard the vector would keep an element the set does not know about,
+    ///   and a later `push` of an equal element would insert a duplicate.
     pub fn push(&mut self, item: T) -> bool {
         // Membership test first: duplicates are rejected without paying for a
-        // clone. For new items, update `vec` before `set` so that if the
-        // `Vec` push panics (e.g. capacity overflow), the set has not been
-        // touched and the set/vec invariant still holds.
+        // clone.
         if self.set.contains(&item) {
             return false;
         }
+
+        struct VecRollbackGuard<'a, T> {
+            vec: &'a mut Vec<T>,
+            armed: bool,
+        }
+        impl<T> Drop for VecRollbackGuard<'_, T> {
+            fn drop(&mut self) {
+                if self.armed {
+                    self.vec.pop();
+                }
+            }
+        }
+
         self.vec.push(item.clone());
-        self.set.insert(item);
-        true
+        let mut guard = VecRollbackGuard {
+            vec: &mut self.vec,
+            armed: true,
+        };
+        let inserted = self.set.insert(item);
+        // Defuse only when the set accepted the element. `inserted == false`
+        // means an inconsistent `Hash`/`Eq` implementation disagreed with the
+        // `contains` probe above; keep set and vec in agreement by letting the
+        // guard pop the vector copy.
+        guard.armed = !inserted;
+        drop(guard);
+        inserted
     }
 
     /// Extends the vector with items from an iterator that do not already exist.
@@ -257,22 +291,33 @@ where
     ///
     /// Panics if `index` is out of bounds (same semantics as
     /// [`Vec::remove`]).
+    ///
+    /// # Panic safety
+    ///
+    /// The set entry is removed **before** the vector entry: `set.remove` may
+    /// panic (custom `Hash` impls), and doing it first leaves both containers
+    /// untouched on unwind. The subsequent `vec.remove` cannot panic because
+    /// the index was already bounds-checked.
     pub fn remove(&mut self, index: usize) -> T {
-        let item = self.vec.remove(index);
-        self.set.remove(&item);
-        item
+        // Bounds check (may panic) happens before any mutation.
+        self.set.remove(&self.vec[index]);
+        self.vec.remove(index)
     }
 
     /// Removes **an element** from the vector and returns it.
     /// The first element that satisfies the predicate will be removed.
+    ///
+    /// # Panic safety
+    ///
+    /// See [`Self::remove`]: the set entry is removed first so that a panic
+    /// in `set.remove` (custom `Hash` impls) leaves both containers untouched.
     pub fn remove_if<P>(&mut self, mut predicate: P) -> Option<T>
     where
         P: FnMut(&T) -> bool,
     {
         if let Some(index) = self.vec.iter().position(&mut predicate) {
-            let item = self.vec.remove(index);
-            self.set.remove(&item);
-            Some(item)
+            self.set.remove(&self.vec[index]);
+            Some(self.vec.remove(index))
         } else {
             None
         }
@@ -280,14 +325,18 @@ where
 
     /// Removes **an element** from the vector and returns it.
     /// The last element is swapped into its place.
+    ///
+    /// # Panic safety
+    ///
+    /// See [`Self::remove`]: the set entry is removed first so that a panic
+    /// in `set.remove` (custom `Hash` impls) leaves both containers untouched.
     pub fn swap_remove_if<P>(&mut self, mut predicate: P) -> Option<T>
     where
         P: FnMut(&T) -> bool,
     {
         if let Some(index) = self.vec.iter().position(&mut predicate) {
-            let item = self.vec.swap_remove(index);
-            self.set.remove(&item);
-            Some(item)
+            self.set.remove(&self.vec[index]);
+            Some(self.vec.swap_remove(index))
         } else {
             None
         }
@@ -897,5 +946,156 @@ mod tests {
         let c = UniqueVec::from(vec![3, 2, 1]);
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    use std::cell::Cell;
+    use std::hash::{Hash, Hasher};
+
+    thread_local! {
+        /// Remaining `Hash::hash` calls before the next one panics.
+        /// `None` disables panicking.
+        static HASH_PANIC_COUNTDOWN: Cell<Option<usize>> = const { Cell::new(None) };
+        /// When `true`, the next `Clone::clone` call panics.
+        static CLONE_PANIC: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Element type whose `Hash` / `Clone` impls can be armed to panic,
+    /// simulating adversarial or buggy user types.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Evil(u32);
+
+    impl Hash for Evil {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            HASH_PANIC_COUNTDOWN.with(|c| {
+                if let Some(n) = c.get() {
+                    if n == 0 {
+                        c.set(None);
+                        panic!("intentional Hash panic");
+                    }
+                    c.set(Some(n - 1));
+                }
+            });
+            self.0.hash(state);
+        }
+    }
+
+    impl Clone for Evil {
+        fn clone(&self) -> Self {
+            CLONE_PANIC.with(|c| {
+                if c.get() {
+                    c.set(false);
+                    panic!("intentional Clone panic");
+                }
+            });
+            Evil(self.0)
+        }
+    }
+
+    fn assert_evil_invariant(uv: &UniqueVec<Evil>, universe: std::ops::RangeInclusive<u32>) {
+        // set and vec must agree exactly, and vec must have no duplicates.
+        for value in universe {
+            let item = Evil(value);
+            assert_eq!(
+                uv.contains(&item),
+                uv.as_ref().contains(&item),
+                "set/vec diverged for {value}"
+            );
+            assert!(
+                uv.as_ref().iter().filter(|x| **x == item).count() <= 1,
+                "duplicate element {value} in vec"
+            );
+        }
+    }
+
+    #[test]
+    fn test_unique_vec_push_hash_panic_keeps_invariant() {
+        let mut uv: UniqueVec<Evil> = UniqueVec::new();
+        assert!(uv.push(Evil(1)));
+        assert!(uv.push(Evil(2)));
+
+        // `push` hashes twice: once in `contains`, once in `set.insert`.
+        // Arm the panic for the second hash so `vec.push` has already
+        // succeeded when `set.insert` unwinds — the historical window where
+        // vec ⊋ set let a later push insert a duplicate.
+        HASH_PANIC_COUNTDOWN.with(|c| c.set(Some(1)));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            uv.push(Evil(3));
+        }));
+        HASH_PANIC_COUNTDOWN.with(|c| c.set(None));
+        assert!(result.is_err());
+
+        // The drop guard must have rolled the vector back.
+        assert_eq!(uv.as_ref(), &[Evil(1), Evil(2)]);
+        assert_evil_invariant(&uv, 1..=3);
+
+        // Re-pushing the same element must add it exactly once.
+        assert!(uv.push(Evil(3)));
+        assert!(!uv.push(Evil(3)));
+        assert_eq!(uv.as_ref(), &[Evil(1), Evil(2), Evil(3)]);
+        assert_evil_invariant(&uv, 1..=3);
+    }
+
+    #[test]
+    fn test_unique_vec_push_clone_panic_keeps_invariant() {
+        let mut uv: UniqueVec<Evil> = UniqueVec::new();
+        assert!(uv.push(Evil(1)));
+
+        CLONE_PANIC.with(|c| c.set(true));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            uv.push(Evil(2));
+        }));
+        CLONE_PANIC.with(|c| c.set(false));
+        assert!(result.is_err());
+
+        assert_eq!(uv.as_ref(), &[Evil(1)]);
+        assert_evil_invariant(&uv, 1..=2);
+        assert!(uv.push(Evil(2)));
+        assert_evil_invariant(&uv, 1..=2);
+    }
+
+    #[test]
+    fn test_unique_vec_remove_hash_panic_keeps_invariant() {
+        let mut uv: UniqueVec<Evil> = UniqueVec::new();
+        for v in 1..=3 {
+            assert!(uv.push(Evil(v)));
+        }
+
+        // `remove` / `remove_if` / `swap_remove_if` hash once (`set.remove`).
+        // A panic there must leave both containers untouched instead of the
+        // historical set ⊋ vec state where the element could never be
+        // re-inserted.
+        HASH_PANIC_COUNTDOWN.with(|c| c.set(Some(0)));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            uv.remove(1);
+        }));
+        HASH_PANIC_COUNTDOWN.with(|c| c.set(None));
+        assert!(result.is_err());
+        assert_eq!(uv.as_ref(), &[Evil(1), Evil(2), Evil(3)]);
+        assert_evil_invariant(&uv, 1..=3);
+
+        HASH_PANIC_COUNTDOWN.with(|c| c.set(Some(0)));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            uv.remove_if(|x| x.0 == 2);
+        }));
+        HASH_PANIC_COUNTDOWN.with(|c| c.set(None));
+        assert!(result.is_err());
+        assert_eq!(uv.as_ref(), &[Evil(1), Evil(2), Evil(3)]);
+        assert_evil_invariant(&uv, 1..=3);
+
+        HASH_PANIC_COUNTDOWN.with(|c| c.set(Some(0)));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            uv.swap_remove_if(|x| x.0 == 2);
+        }));
+        HASH_PANIC_COUNTDOWN.with(|c| c.set(None));
+        assert!(result.is_err());
+        assert_eq!(uv.as_ref(), &[Evil(1), Evil(2), Evil(3)]);
+        assert_evil_invariant(&uv, 1..=3);
+
+        // With panics disarmed, removal still works normally.
+        assert_eq!(uv.remove_if(|x| x.0 == 2), Some(Evil(2)));
+        assert_eq!(uv.as_ref(), &[Evil(1), Evil(3)]);
+        assert_evil_invariant(&uv, 1..=3);
+        assert!(uv.push(Evil(2)));
+        assert_evil_invariant(&uv, 1..=3);
     }
 }

@@ -86,7 +86,7 @@ impl BM25 {
         let index = BM25Index::new(name.clone(), tokenizer, Some(config));
         let mut data = Vec::new();
         index
-            .flush(&mut data, now_ms, async |_, _| Ok(true))
+            .flush(&mut data, now_ms, |_, _| std::future::ready(Ok(true)))
             .await?;
         // The collection metadata is the source of truth for which indexes
         // exist, so overwrite any leftover files from a crashed creation or a
@@ -172,13 +172,16 @@ impl BM25 {
         let n = Arc::new(self.name.clone());
         let s = Arc::new(self.storage.clone());
         self.index
-            .store_dirty_buckets(async move |id, data| {
-                let path = BM25::bucket_path(n.clone().as_str(), id);
-                let _ = s
-                    .clone()
-                    .put_bytes(&path, Bytes::copy_from_slice(data), PutMode::Overwrite)
-                    .await?;
-                Ok(true)
+            .store_dirty_buckets(move |id, data| {
+                let n = n.clone();
+                let s = s.clone();
+                async move {
+                    let path = BM25::bucket_path(n.as_str(), id);
+                    let _ = s
+                        .put_bytes(&path, Bytes::from(data), PutMode::Overwrite)
+                        .await?;
+                    Ok(true)
+                }
             })
             .await?;
         Ok(())
@@ -186,27 +189,58 @@ impl BM25 {
 
     /// Persists dirty metadata and buckets.
     ///
+    /// Delegates to [`BM25Index::flush_with`], which implements the
+    /// crash-safe grow-then-shrink ordering: buckets not yet referenced by
+    /// the persisted metadata (token-migration targets) are written first,
+    /// then the metadata, then the rewrites of already-referenced buckets.
+    /// See `BM25Index::flush_with` for the crash-window analysis; keeping a
+    /// single implementation in the crate prevents this production path from
+    /// drifting out of sync with it again.
+    ///
     /// Returns `true` when any object was written.
     pub async fn flush(&self, now_ms: u64) -> Result<bool, DBError> {
-        let meta_saved = self.store_metadata(now_ms).await?;
-        let had_dirty = self.index.has_dirty_buckets();
-
-        if !meta_saved && !had_dirty {
-            return Ok(false);
-        }
-
-        self.store_dirty_buckets().await?;
-
-        Ok(meta_saved || had_dirty)
+        let metadata_path = BM25::metadata_path(&self.name);
+        let saved = self
+            .index
+            .flush_with(
+                now_ms,
+                move |data: Vec<u8>| async move {
+                    let ver = { self.metadata_version.read().clone() };
+                    let ver = self
+                        .storage
+                        .put_bytes(&metadata_path, Bytes::from(data), PutMode::Update(ver.into()))
+                        .await
+                        .map_err(BoxError::from)?;
+                    *self.metadata_version.write() = ver;
+                    Ok(())
+                },
+                |id: u32, data: Vec<u8>| async move {
+                    let path = BM25::bucket_path(&self.name, id);
+                    let _ = self
+                        .storage
+                        .put_bytes(&path, Bytes::from(data), PutMode::Overwrite)
+                        .await?;
+                    Ok(true)
+                },
+            )
+            .await?;
+        Ok(saved)
     }
 
     /// Compacts bucket layout and persists the new layout if the bucket count
     /// shrinks.
     ///
     /// Compaction persists **buckets before metadata** because it is the only
-    /// operation that shrinks `max_bucket_id`; see `BTree::compact_index` for
-    /// the crash-ordering rationale. Stale bucket files beyond the compacted
-    /// range are deleted best-effort afterwards.
+    /// operation that shrinks `max_bucket_id`: the loader only scans bucket
+    /// ids up to the persisted `max_bucket_id`, so committing the reduced
+    /// range first would hide repacked tokens if the process crashed before
+    /// the low-id bucket files were rewritten (see `BTree::compact_index` for
+    /// the same rationale). This is the inverse of the steady-state ordering
+    /// in [`Self::flush`], where *newly allocated* buckets must precede the
+    /// metadata that first references them; `BM25Index::flush_with` detects a
+    /// shrunken `max_bucket_id` and applies this buckets-first order too, so
+    /// both paths agree. Stale bucket files beyond the compacted range are
+    /// deleted best-effort afterwards.
     pub async fn compact_index(&self) -> Result<(), DBError> {
         let old_max_bucket_id = self.index.stats().max_bucket_id;
         let (old_bucket_count, new_bucket_count) = self.index.compact_buckets();

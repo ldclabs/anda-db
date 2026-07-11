@@ -423,16 +423,91 @@ pub fn validate_schema_field_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The container's generic type parameters, as seen by field-type inference.
+///
+/// Tracks which parameters carry a trait bound named `FieldTyped` (last path
+/// segment; e.g. `T: FieldTyped` or `T: my_traits::FieldTyped`, declared
+/// inline or in the `where` clause). Such a bound is assumed to provide a
+/// `field_type() -> FieldType` associated function, so a bare generic field
+/// can be resolved through `<T>::field_type()`; parameters without it get a
+/// targeted compile error instead of an inscrutable E0599.
+#[derive(Debug, Default)]
+pub struct TypeParams {
+    /// All generic type parameter names.
+    all: BTreeSet<String>,
+    /// Parameters bound by a trait named `FieldTyped`.
+    with_field_typed_bound: BTreeSet<String>,
+}
+
+impl TypeParams {
+    /// Collect the container's type parameters and their `FieldTyped` bounds
+    /// from both the inline bounds and the `where` clause.
+    pub fn from_generics(generics: &syn::Generics) -> Self {
+        let mut all = BTreeSet::new();
+        let mut with_field_typed_bound = BTreeSet::new();
+        for param in generics.type_params() {
+            let name = param.ident.to_string();
+            if param.bounds.iter().any(is_field_typed_bound) {
+                with_field_typed_bound.insert(name.clone());
+            }
+            all.insert(name);
+        }
+        if let Some(where_clause) = &generics.where_clause {
+            for predicate in &where_clause.predicates {
+                if let syn::WherePredicate::Type(predicate_type) = predicate
+                    && let Type::Path(type_path) = &predicate_type.bounded_ty
+                    && type_path.qself.is_none()
+                    && let Some(ident) = type_path.path.get_ident()
+                {
+                    let name = ident.to_string();
+                    if all.contains(&name)
+                        && predicate_type.bounds.iter().any(is_field_typed_bound)
+                    {
+                        with_field_typed_bound.insert(name);
+                    }
+                }
+            }
+        }
+        Self {
+            all,
+            with_field_typed_bound,
+        }
+    }
+
+    /// Whether `name` is one of the container's type parameters.
+    fn contains(&self, name: &str) -> bool {
+        self.all.contains(name)
+    }
+
+    /// Whether `name` carries a `FieldTyped` bound that can provide
+    /// `field_type()`.
+    fn provides_field_type(&self, name: &str) -> bool {
+        self.with_field_typed_bound.contains(name)
+    }
+}
+
+/// Returns `true` if `bound` is a trait bound whose trait is named
+/// `FieldTyped` (any path prefix).
+fn is_field_typed_bound(bound: &syn::TypeParamBound) -> bool {
+    if let syn::TypeParamBound::Trait(trait_bound) = bound
+        && let Some(segment) = trait_bound.path.segments.last()
+    {
+        return segment.ident == "FieldTyped";
+    }
+    false
+}
+
 /// Resolve a field's `FieldType` tokens: an explicit `#[field_type = "..."]`
 /// override wins; otherwise the type is inferred from the Rust type.
 ///
 /// `root` is the resolved `anda_db_schema` crate path (see
-/// [`schema_crate_path`]); `type_params` holds the names of the container's
-/// generic type parameters so that bare generic fields get a targeted error.
+/// [`schema_crate_path`]); `type_params` holds the container's generic type
+/// parameters so that bare generic fields either resolve through a
+/// `FieldTyped` bound or get a targeted error.
 pub fn resolve_field_type(
     field: &Field,
     root: &TokenStream,
-    type_params: &BTreeSet<String>,
+    type_params: &TypeParams,
 ) -> syn::Result<TokenStream> {
     match find_field_type_attr(&field.attrs, root)? {
         Some(field_type) => Ok(field_type),
@@ -609,14 +684,16 @@ pub fn parse_field_type_str(
 /// transparently. On failure, an error spanned at the offending type is
 /// returned so the compiler points at the user's code.
 ///
-/// `type_params` holds the container's generic type parameter names: a field
-/// whose type is a bare generic parameter (e.g. `T`) cannot provide a
-/// `field_type()` associated function, so it gets a targeted error pointing
-/// at the field type instead of an inscrutable E0599 on the derive.
+/// `type_params` holds the container's generic type parameters: a field
+/// whose type is a bare generic parameter (e.g. `T`) resolves through
+/// `<T>::field_type()` when the parameter carries a trait bound named
+/// `FieldTyped` (which is assumed to provide that associated function);
+/// otherwise it gets a targeted error pointing at the field type instead of
+/// an inscrutable E0599 on the derive.
 pub fn determine_field_type(
     ty: &Type,
     root: &TokenStream,
-    type_params: &BTreeSet<String>,
+    type_params: &TypeParams,
 ) -> syn::Result<TokenStream> {
     let ty = peel_type(ty);
     match ty {
@@ -626,19 +703,31 @@ pub fn determine_field_type(
             let type_name = segment.ident.unraw().to_string();
             let full_path = path_to_string(path);
 
-            // A bare generic type parameter has no inherent `field_type()`;
-            // report it here instead of emitting code that cannot compile.
+            // A bare generic type parameter has no inherent `field_type()`.
+            // When it carries a trait bound named `FieldTyped`, resolve
+            // through that bound with the pre-0.9.2 `<T>::field_type()`
+            // fallback (the bound is assumed to provide the associated
+            // function); otherwise report a targeted error instead of
+            // emitting code that cannot compile.
             if type_path.qself.is_none()
                 && path.leading_colon.is_none()
                 && path.segments.len() == 1
                 && segment.arguments.is_none()
                 && type_params.contains(&type_name)
             {
+                if type_params.provides_field_type(&type_name) {
+                    let span = ty.span();
+                    return Ok(quote_spanned! {span=>
+                        <#ty>::field_type()
+                    });
+                }
                 return Err(syn::Error::new_spanned(
                     ty,
                     format!(
                         "cannot infer a FieldType for generic type parameter `{type_name}`; \
-                         add #[field_type = \"...\"] to declare this field's schema type"
+                         add #[field_type = \"...\"] to declare this field's schema type, \
+                         or bound the parameter with a `FieldTyped` trait providing \
+                         `fn field_type() -> FieldType`"
                     ),
                 ));
             }
@@ -936,7 +1025,7 @@ mod tests {
     }
 
     fn dft(ty: &Type) -> syn::Result<TokenStream> {
-        determine_field_type(ty, &root(), &BTreeSet::new())
+        determine_field_type(ty, &root(), &TypeParams::default())
     }
 
     #[test]
@@ -1349,15 +1438,17 @@ mod tests {
 
     #[test]
     fn determine_field_type_rejects_bare_generic_parameters() {
-        let params = BTreeSet::from(["T".to_string()]);
+        let params = TypeParams::from_generics(&parse_quote!(<T>));
 
-        // A bare generic parameter cannot provide `field_type()`.
+        // A bare generic parameter without a `FieldTyped` bound cannot
+        // provide `field_type()`.
         let ty: Type = parse_quote!(T);
         let err = determine_field_type(&ty, &root(), &params)
             .unwrap_err()
             .to_string();
         assert!(err.contains("generic type parameter `T`"), "err: {err}");
         assert!(err.contains("#[field_type"), "err: {err}");
+        assert!(err.contains("FieldTyped"), "err: {err}");
 
         // ... including when nested inside a container type.
         let ty: Type = parse_quote!(Vec<T>);
@@ -1366,8 +1457,14 @@ mod tests {
             .to_string();
         assert!(err.contains("generic type parameter `T`"), "err: {err}");
 
+        // An unrelated bound does not provide `field_type()` either.
+        let params = TypeParams::from_generics(&parse_quote!(<T: Clone>));
+        let ty: Type = parse_quote!(T);
+        assert!(determine_field_type(&ty, &root(), &params).is_err());
+
         // A generic *user* type is fine: `<Wrapper<T>>::field_type()` resolves
         // through Wrapper's own generated impl.
+        let params = TypeParams::from_generics(&parse_quote!(<T>));
         let ty: Type = parse_quote!(Wrapper<T>);
         assert_eq!(
             tokens(determine_field_type(&ty, &root(), &params).unwrap()),
@@ -1381,6 +1478,46 @@ mod tests {
             tokens(determine_field_type(&ty, &root(), &params).unwrap()),
             "< module :: T > :: field_type ()"
         );
+    }
+
+    #[test]
+    fn determine_field_type_resolves_generic_parameters_with_field_typed_bound() {
+        // An inline `FieldTyped` bound restores the pre-0.9.2 fallback.
+        let params = TypeParams::from_generics(&parse_quote!(<T: FieldTyped>));
+        let ty: Type = parse_quote!(T);
+        assert_eq!(
+            tokens(determine_field_type(&ty, &root(), &params).unwrap()),
+            "< T > :: field_type ()"
+        );
+
+        // ... also when nested inside a container type.
+        let ty: Type = parse_quote!(Vec<T>);
+        let inferred = tokens(determine_field_type(&ty, &root(), &params).unwrap());
+        assert!(inferred.contains(":: anda_db_schema :: FieldType :: Array"));
+        assert!(inferred.contains("< T > :: field_type ()"));
+
+        // Path-qualified bound spellings are recognized as well.
+        let params =
+            TypeParams::from_generics(&parse_quote!(<T: anda_db_schema::FieldTyped + Clone>));
+        let ty: Type = parse_quote!(T);
+        assert_eq!(
+            tokens(determine_field_type(&ty, &root(), &params).unwrap()),
+            "< T > :: field_type ()"
+        );
+
+        // `where` clause bounds count too.
+        let generics: syn::Generics = parse_quote!(<T, U>);
+        let mut generics = generics;
+        generics.where_clause = Some(parse_quote!(where T: FieldTyped, U: Clone));
+        let params = TypeParams::from_generics(&generics);
+        let ty: Type = parse_quote!(T);
+        assert_eq!(
+            tokens(determine_field_type(&ty, &root(), &params).unwrap()),
+            "< T > :: field_type ()"
+        );
+        // `U: Clone` is not enough.
+        let ty: Type = parse_quote!(U);
+        assert!(determine_field_type(&ty, &root(), &params).is_err());
     }
 
     #[test]

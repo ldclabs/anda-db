@@ -9,7 +9,7 @@ use nom::{
 };
 
 use super::common::*;
-use super::json::{ensure_unique_keys, json_value, parse_number};
+use super::json::{SpannedKey, ensure_unique_keys, json_value, parse_number, spanned};
 use super::kql::{
     parse_concept_matcher, parse_limit_clause, parse_prop_mather, parse_target_term,
     parse_where_block,
@@ -236,15 +236,18 @@ fn parse_update_value_map(input: &str) -> VResult<'_, Vec<(String, UpdateValue)>
     .parse(input)?;
 
     let kvs = opt_kvs.unwrap_or_default();
-    ensure_unique_keys(input, &kvs)?;
-    Ok((remaining, kvs))
+    ensure_unique_keys(&kvs)?;
+    Ok((
+        remaining,
+        kvs.into_iter().map(|((_, k), v)| (k, v)).collect(),
+    ))
 }
 
-fn parse_update_key_value(input: &str) -> VResult<'_, (String, UpdateValue)> {
+fn parse_update_key_value(input: &str) -> VResult<'_, (SpannedKey<'_>, UpdateValue)> {
     context(
         "key-value pair",
         separated_pair(
-            alt((quoted_string, map(identifier, |s| s.to_string()))),
+            spanned(alt((quoted_string, map(identifier, |s| s.to_string())))),
             cut(ws(char(':'))),
             cut(parse_update_value),
         ),
@@ -1380,35 +1383,49 @@ mod tests {
     #[test]
     fn test_duplicate_keys_rejected_in_kml_maps() {
         // SET ATTRIBUTES with a duplicate key must fail instead of last-wins,
-        // and the error must point at the duplicate key.
-        let err = crate::parse_kml(
-            r#"UPSERT { CONCEPT ?c { {type: "T", name: "x"} SET ATTRIBUTES { a: 1, a: 2 } } }"#,
-        )
-        .unwrap_err();
+        // and the error location must point at the duplicate key itself (the
+        // second `a`), not at the start of the object.
+        let input =
+            r#"UPSERT { CONCEPT ?c { {type: "T", name: "x"} SET ATTRIBUTES { a: 1, a: 2 } } }"#;
+        let err = crate::parse_kml(input).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("duplicate key"), "unexpected error: {msg}");
+        let col = input.rfind("a: 2").unwrap() + 1; // 1-based column
         assert!(
-            format!("{err:?}").contains("duplicate key"),
-            "unexpected error: {err:?}"
+            msg.contains(&format!("line 1, column {col}")),
+            "error should point at the duplicate key (column {col}): {msg}"
         );
-        // WITH METADATA with a duplicate key must fail.
+        // WITH METADATA with a duplicate key must fail, pointing at the
+        // duplicated `s`.
+        let input =
+            r#"UPSERT { CONCEPT ?c { {type: "T", name: "x"} } WITH METADATA { s: "a", s: "b" } }"#;
+        let err = crate::parse_kml(input).unwrap_err();
+        let msg = format!("{err:?}");
+        let col = input.rfind(r#"s: "b""#).unwrap() + 1;
         assert!(
-            crate::parse_kml(
-                r#"UPSERT { CONCEPT ?c { {type: "T", name: "x"} } WITH METADATA { s: "a", s: "b" } }"#
-            )
-            .is_err()
+            msg.contains(&format!("line 1, column {col}")),
+            "error should point at the duplicate key (column {col}): {msg}"
         );
-        // Duplicate keys in a nested JSON object value must fail.
+        // Duplicate keys in a nested JSON object value must fail, pointing at
+        // the nested duplicate `b`.
+        let input =
+            r#"UPSERT { CONCEPT ?c { {type: "T", name: "x"} SET ATTRIBUTES { a: { b: 1, b: 2 } } } }"#;
+        let err = crate::parse_kml(input).unwrap_err();
+        let msg = format!("{err:?}");
+        let col = input.rfind("b: 2").unwrap() + 1;
         assert!(
-            crate::parse_kml(
-                r#"UPSERT { CONCEPT ?c { {type: "T", name: "x"} SET ATTRIBUTES { a: { b: 1, b: 2 } } } }"#
-            )
-            .is_err()
+            msg.contains(&format!("line 1, column {col}")),
+            "error should point at the duplicate key (column {col}): {msg}"
         );
-        // UPDATE SET map with a duplicate key must fail.
+        // UPDATE SET map with a duplicate key must fail, pointing at the
+        // duplicated `n`.
+        let input = r#"UPDATE ?t SET ATTRIBUTES { n: 1, n: ADD(?t.attributes.n, 1) } WHERE { ?t {type: "T"} }"#;
+        let err = crate::parse_kml(input).unwrap_err();
+        let msg = format!("{err:?}");
+        let col = input.find("n: ADD").unwrap() + 1;
         assert!(
-            crate::parse_kml(
-                r#"UPDATE ?t SET ATTRIBUTES { n: 1, n: ADD(?t.attributes.n, 1) } WHERE { ?t {type: "T"} }"#
-            )
-            .is_err()
+            msg.contains(&format!("line 1, column {col}")),
+            "error should point at the duplicate key (column {col}): {msg}"
         );
 
         // Unique keys still parse everywhere.

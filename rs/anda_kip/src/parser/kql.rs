@@ -551,12 +551,17 @@ pub fn parse_limit_clause(input: &str) -> VResult<'_, usize> {
     // `LIMIT 0` is rejected: the engine's internal "no limit" sentinel is 0,
     // and letting it through would make `LIMIT 0` silently mean "unlimited".
     // Omit the LIMIT clause for an unlimited query.
-    context(
-        "KQL LIMIT clause (positive integer)",
-        preceded(
-            ws(keyword("LIMIT")),
+    //
+    // Once the `LIMIT` keyword has matched, a bad operand is a hard failure
+    // (`cut`): every caller wraps this parser in `opt(...)`, which would
+    // otherwise swallow the error and let the leftover "LIMIT ..." text
+    // surface as a misleading "Unexpected trailing content" error.
+    preceded(
+        ws(keyword("LIMIT")),
+        cut(context(
+            "LIMIT must be followed by a positive integer (LIMIT 0 is not allowed; omit LIMIT for the engine default)",
             verify(nom::character::complete::usize, |n: &usize| *n > 0),
-        ),
+        )),
     )
     .parse(input)
 }
@@ -1893,6 +1898,31 @@ mod tests {
         assert!(crate::parse_kql(input).is_err());
         assert!(parse_limit_clause("LIMIT 0").is_err());
         assert!(parse_limit_clause("LIMIT 1").is_ok());
+
+        // The error must explain the LIMIT operand instead of degrading to a
+        // misleading "Unexpected trailing content" report (the old opt(...)
+        // pattern swallowed the LIMIT failure and left the text unconsumed).
+        let err = crate::parse_kql(input).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("positive integer"),
+            "error should explain the LIMIT operand: {msg}"
+        );
+        assert!(
+            !msg.contains("Unexpected trailing content"),
+            "error must not be reported as trailing content: {msg}"
+        );
+
+        // UPDATE shares the same LIMIT clause parser.
+        let err = crate::parse_kml(
+            r#"UPDATE ?t SET ATTRIBUTES { n: 1 } WHERE { ?t {type: "T"} } LIMIT 0"#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("positive integer"),
+            "UPDATE LIMIT 0 error should explain the operand: {msg}"
+        );
     }
 
     #[test]

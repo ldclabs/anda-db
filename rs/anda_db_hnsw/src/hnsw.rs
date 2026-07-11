@@ -146,6 +146,34 @@ pub struct HnswConfig {
 
     /// Neighbor selection strategy. Default [`SelectNeighborsStrategy::Heuristic`].
     pub select_neighbors_strategy: SelectNeighborsStrategy,
+
+    /// Whether [`HnswIndex::remove`] repairs the graph around a deleted node
+    /// by re-linking its former neighbors to each other. Default `true`.
+    ///
+    /// * `true` (default) — after pruning the reverse edges, the deleted
+    ///   node's remaining neighbors are merged into each affected neighbor's
+    ///   candidate set and the configured [`SelectNeighborsStrategy`]
+    ///   re-selects its edges. This keeps the local subgraph connected, so
+    ///   recall stays stable even under heavy deletion workloads — but the
+    ///   repair runs `O(M²·L)` distance computations **while holding the
+    ///   index's structural write lock**, which can slow bulk deletions by
+    ///   orders of magnitude.
+    /// * `false` — deletion only drops the reverse edges (a cheap
+    ///   `swap_remove` per affected neighbor) and returns immediately. Bulk
+    ///   deletions are much faster, but every deletion strictly reduces the
+    ///   survivors' connectivity: after many deletions recall degrades and a
+    ///   cluster reachable only through deleted nodes can become unreachable.
+    ///   Prefer this mode only when deletions are frequent and you compensate
+    ///   with periodic index rebuilds (or re-inserts of affected regions).
+    ///
+    /// Metadata persisted by older versions of this crate lacks the field and
+    /// deserializes to `true`, preserving the previous behavior.
+    #[serde(default = "default_reconnect_on_delete")]
+    pub reconnect_on_delete: bool,
+}
+
+fn default_reconnect_on_delete() -> bool {
+    true
 }
 
 impl HnswConfig {
@@ -301,6 +329,7 @@ impl Default for HnswConfig {
             distance_metric: DistanceMetric::Euclidean,
             scale_factor: None,
             select_neighbors_strategy: SelectNeighborsStrategy::Heuristic,
+            reconnect_on_delete: true,
         }
     }
 }
@@ -443,6 +472,11 @@ impl HnswIndex {
     /// being removed concurrently (each retry re-reads the repaired entry
     /// point).
     pub const SEARCH_MAX_ATTEMPTS: usize = 3;
+
+    /// Pending removed-node tombstone count at which [`Self::remove`] starts
+    /// warning (once per further multiple) that
+    /// [`Self::purge_removed_nodes`] should be called.
+    pub const REMOVED_NODES_WARN_THRESHOLD: usize = 10_000;
 
     /// Creates a new HNSW index.
     ///
@@ -1181,14 +1215,21 @@ impl HnswIndex {
     /// neighbor list (e.g. after a prior prune) are harmless: they are skipped
     /// at search time when `nodes.get()` returns `None`.
     ///
-    /// For every layer where a neighbor lost its edge to the deleted node,
-    /// the deleted node's remaining neighbors at that layer are merged into
-    /// the neighbor's candidate set and the configured
+    /// When [`HnswConfig::reconnect_on_delete`] is `true` (the default), for
+    /// every layer where a neighbor lost its edge to the deleted node, the
+    /// deleted node's remaining neighbors at that layer are merged into the
+    /// neighbor's candidate set and the configured
     /// [`SelectNeighborsStrategy`] re-selects its edges (the local repair
     /// used by hnswlib). Without this step every deletion strictly reduces
     /// the survivors' connectivity, so recall degrades monotonically over
     /// many deletions and a cluster reachable only through the deleted node
     /// can become unreachable entirely.
+    ///
+    /// The repair costs `O(M²·L)` distance computations while the structural
+    /// write lock is held. Set [`HnswConfig::reconnect_on_delete`] to `false`
+    /// to skip it (deletions then only `swap_remove` the reverse edges) when
+    /// bulk-deletion throughput matters more than recall stability; see the
+    /// config field's documentation for the trade-offs.
     ///
     /// # Returns
     /// * `true` if a node with `id` existed and was removed.
@@ -1229,7 +1270,28 @@ impl HnswIndex {
         // the tombstone instead so `purge_removed_nodes` can delete the
         // persisted blob.
         self.dirty_nodes.write().remove(&id);
-        self.removed_nodes.write().insert(id);
+        let pending_tombstones = {
+            let mut removed_nodes = self.removed_nodes.write();
+            removed_nodes.insert(id);
+            removed_nodes.len()
+        };
+        // Tombstones are only drained by `purge_removed_nodes`; remind the
+        // caller periodically so the set (and the persisted metadata that
+        // snapshots it) cannot grow without bound.
+        if pending_tombstones >= Self::REMOVED_NODES_WARN_THRESHOLD
+            && pending_tombstones.is_multiple_of(Self::REMOVED_NODES_WARN_THRESHOLD)
+        {
+            log::warn!(
+                action = "remove",
+                index = self.name.as_str(),
+                pending_tombstones = pending_tombstones;
+                "HnswIndex '{}': {} removed-node tombstones are pending purge; \
+                 call purge_removed_nodes (then flush) to delete the persisted \
+                 blobs and stop the tombstone set from growing unboundedly",
+                self.name,
+                pending_tombstones,
+            );
+        }
         let recalculated_max_layer = if entry_was_removed {
             Some(replacement_entry.map_or(0, |(_, layer)| layer))
         } else if node.layer >= previous_max_layer {
@@ -1278,6 +1340,13 @@ impl HnswIndex {
                     };
                     o.to_mut().neighbors[layer].swap_remove(pos);
                     updated = true;
+
+                    // Fast path: with reconnect_on_delete disabled, deletion
+                    // only prunes the reverse edge (see the config docs for
+                    // the recall trade-off).
+                    if !self.config.reconnect_on_delete {
+                        continue;
+                    }
 
                     // Re-link: merge the deleted node's other neighbors at
                     // this layer into this node's candidate set and re-select
@@ -1851,7 +1920,16 @@ impl HnswIndex {
     /// unprocessed ids (and, on `Err`, the failing id) are put back and
     /// retried on the next call. Treat "blob not found" as success in the
     /// callback: a crash between a purge and the next flush simply retries
-    /// deletions that already happened.
+    /// deletions that already happened, and reloaded metadata may re-queue
+    /// tombstones whose blobs were already deleted.
+    ///
+    /// When at least one tombstone is consumed (deleted or skipped as
+    /// re-inserted), the metadata version is bumped so the **next flush
+    /// persists the shrunken tombstone set**. Without the bump, the persisted
+    /// metadata would keep the stale tombstones forever and every reload
+    /// would replay the same deletions. Flush after purging (flush → purge →
+    /// flush, or simply purge before the next periodic flush) to make the
+    /// purge durable.
     pub async fn purge_removed_nodes<F>(&self, mut f: F) -> Result<(), HnswError>
     where
         F: AsyncFnMut(u64) -> Result<bool, BoxError>,
@@ -1861,25 +1939,42 @@ impl HnswIndex {
             std::mem::take(&mut *guard)
         };
 
+        // Number of tombstones consumed (blob deleted, or skipped because the
+        // id was re-inserted). Any consumption shrinks the tombstone set, so
+        // the metadata snapshot that carries it must be re-persisted.
+        let mut consumed = 0usize;
+        let commit_progress = |consumed: usize| {
+            if consumed > 0 {
+                self.update_metadata(|m| {
+                    m.stats.version += 1;
+                });
+            }
+        };
+
         while let Some(id) = removed.pop_first() {
             // Skip ids that were re-inserted after the tombstone snapshot;
             // deleting their blob would drop a live node's persisted state.
             {
                 let nodes = self.nodes.pin();
                 if nodes.contains_key(&id) {
+                    consumed += 1;
                     continue;
                 }
             }
 
             match f(id).await {
-                Ok(true) => {}
+                Ok(true) => {
+                    consumed += 1;
+                }
                 Ok(false) => {
                     self.removed_nodes.write().append(&mut removed);
+                    commit_progress(consumed);
                     return Ok(());
                 }
                 Err(err) => {
                     removed.insert(id);
                     self.removed_nodes.write().append(&mut removed);
+                    commit_progress(consumed);
                     return Err(HnswError::Generic {
                         name: self.name.clone(),
                         source: err,
@@ -1888,6 +1983,7 @@ impl HnswIndex {
             }
         }
 
+        commit_progress(consumed);
         Ok(())
     }
 
@@ -2564,6 +2660,226 @@ mod tests {
         assert!(index.has_removed_nodes());
         index.purge_removed_nodes(async |_| Ok(true)).await.unwrap();
         assert!(!index.has_removed_nodes());
+    }
+
+    #[tokio::test]
+    async fn test_purge_bumps_metadata_version_so_flush_persists_cleared_tombstones() {
+        let index = HnswIndex::new("purge_flush".to_string(), Some(test_config()));
+        index.insert_f32(1, vec![1.0, 1.0], 0).unwrap();
+        index.insert_f32(2, vec![2.0, 2.0], 0).unwrap();
+        assert!(index.remove(2, 1));
+
+        // Flush #1: the tombstone for node 2 is persisted with the metadata.
+        let mut metadata = Vec::new();
+        let mut ids = Vec::new();
+        let mut blobs: HashMap<u64, Vec<u8>> = HashMap::new();
+        index
+            .flush(&mut metadata, &mut ids, 2, async |id, data| {
+                blobs.insert(id, data.to_vec());
+                Ok(true)
+            })
+            .await
+            .unwrap();
+        assert!(!index.has_pending_metadata_flush());
+
+        // Purge deletes the blob and must mark the metadata dirty again so
+        // the cleared tombstone set reaches disk on the next flush.
+        let mut purged = Vec::new();
+        index
+            .purge_removed_nodes(async |id| {
+                purged.push(id);
+                blobs.remove(&id);
+                Ok(true)
+            })
+            .await
+            .unwrap();
+        assert_eq!(purged, vec![2]);
+        assert!(!index.has_removed_nodes());
+        assert!(
+            index.has_pending_metadata_flush(),
+            "purge must bump the metadata version so the next flush persists \
+             the cleared tombstone set"
+        );
+
+        // Flush #2 persists the post-purge state.
+        let mut metadata = Vec::new();
+        let mut ids = Vec::new();
+        assert!(
+            index
+                .flush(&mut metadata, &mut ids, 3, async |id, data| {
+                    blobs.insert(id, data.to_vec());
+                    Ok(true)
+                })
+                .await
+                .unwrap()
+        );
+        assert!(!index.has_pending_metadata_flush());
+
+        // Reload: the purged tombstone must NOT be replayed.
+        let reloaded = HnswIndex::load_all(metadata.as_slice(), ids.as_slice(), async |id| {
+            Ok(blobs.get(&id).cloned())
+        })
+        .await
+        .unwrap();
+        assert!(
+            !reloaded.has_removed_nodes(),
+            "purged tombstones must not be re-queued after reload"
+        );
+        let mut replayed = Vec::new();
+        reloaded
+            .purge_removed_nodes(async |id| {
+                replayed.push(id);
+                Ok(true)
+            })
+            .await
+            .unwrap();
+        assert!(replayed.is_empty(), "no deletions should be replayed");
+
+        // An empty purge is a no-op and must not force metadata churn.
+        assert!(!reloaded.has_pending_metadata_flush());
+    }
+
+    /// Builds a deterministic single-layer line graph (`max_layers == 1`
+    /// removes the layer randomness) so removals can be compared
+    /// structurally between the two `reconnect_on_delete` modes.
+    fn build_line_index(reconnect_on_delete: bool, n: u64) -> HnswIndex {
+        let config = HnswConfig {
+            dimension: 2,
+            max_layers: 1,
+            max_connections: 2,
+            ef_construction: 8,
+            ef_search: 8,
+            reconnect_on_delete,
+            ..Default::default()
+        };
+        let index = HnswIndex::new("reconnect_toggle".to_string(), Some(config));
+        for id in 1..=n {
+            index.insert_f32(id, vec![id as f32, 0.0], id).unwrap();
+        }
+        index
+    }
+
+    fn layer0_adjacency(index: &HnswIndex, n: u64) -> HashMap<u64, BTreeSet<u64>> {
+        let mut adjacency = HashMap::new();
+        for id in 1..=n {
+            if let Ok(neighbors) = index.get_node_with(id, |node| {
+                node.neighbors[0]
+                    .iter()
+                    .map(|&(nid, _)| nid)
+                    .collect::<BTreeSet<u64>>()
+            }) {
+                adjacency.insert(id, neighbors);
+            }
+        }
+        adjacency
+    }
+
+    #[test]
+    fn test_remove_reconnect_on_delete_toggle() {
+        const N: u64 = 30;
+        const VICTIM: u64 = 15;
+
+        let fast = build_line_index(false, N);
+        let repairing = build_line_index(true, N);
+
+        // The flag does not affect construction: both graphs are identical.
+        let before = layer0_adjacency(&fast, N);
+        assert_eq!(
+            before,
+            layer0_adjacency(&repairing, N),
+            "construction must not depend on reconnect_on_delete"
+        );
+
+        assert!(fast.remove(VICTIM, 100));
+        assert!(repairing.remove(VICTIM, 100));
+
+        let after_fast = layer0_adjacency(&fast, N);
+        let after_repairing = layer0_adjacency(&repairing, N);
+
+        for (id, neighbors) in &after_fast {
+            assert!(
+                !neighbors.contains(&VICTIM),
+                "node {id} still links to the removed node"
+            );
+            // reconnect_on_delete == false: edges can only be pruned, never
+            // added, so every surviving list is a subset of its old list.
+            assert!(
+                neighbors.is_subset(&before[id]),
+                "fast-path removal must not add edges: node {id} had {:?}, now {:?}",
+                before[id],
+                neighbors
+            );
+        }
+
+        // reconnect_on_delete == true: the removed node's former neighbors
+        // are re-linked through its remaining neighbors, so at least one
+        // survivor gains an edge it did not have before.
+        let mut gained = false;
+        for (id, neighbors) in &after_repairing {
+            assert!(
+                !neighbors.contains(&VICTIM),
+                "node {id} still links to the removed node"
+            );
+            if !neighbors.is_subset(&before[id]) {
+                gained = true;
+            }
+        }
+        assert!(
+            gained,
+            "reconnect mode must re-link at least one survivor to a new neighbor"
+        );
+
+        // Both modes keep the index searchable.
+        assert_eq!(fast.search_f32(&[VICTIM as f32, 0.0], 3).unwrap().len(), 3);
+        assert_eq!(
+            repairing
+                .search_f32(&[VICTIM as f32, 0.0], 3)
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn test_config_reconnect_on_delete_defaults_to_true_for_legacy_metadata() {
+        // Metadata persisted before the field existed must deserialize with
+        // the repair enabled (the previous behavior).
+        #[derive(Serialize)]
+        struct LegacyConfig {
+            dimension: usize,
+            max_layers: u8,
+            max_connections: u8,
+            ef_construction: usize,
+            ef_search: usize,
+            distance_metric: DistanceMetric,
+            scale_factor: Option<f64>,
+            select_neighbors_strategy: SelectNeighborsStrategy,
+        }
+
+        let legacy = LegacyConfig {
+            dimension: 2,
+            max_layers: 3,
+            max_connections: 4,
+            ef_construction: 8,
+            ef_search: 8,
+            distance_metric: DistanceMetric::Euclidean,
+            scale_factor: None,
+            select_neighbors_strategy: SelectNeighborsStrategy::Heuristic,
+        };
+        let mut buf = Vec::new();
+        cbor2::to_writer(&legacy, &mut buf).unwrap();
+        let config: HnswConfig = cbor2::from_reader(&buf[..]).unwrap();
+        assert!(config.reconnect_on_delete);
+
+        // And a round-trip of the current config preserves an explicit false.
+        let current = HnswConfig {
+            reconnect_on_delete: false,
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        cbor2::to_writer(&current, &mut buf).unwrap();
+        let config: HnswConfig = cbor2::from_reader(&buf[..]).unwrap();
+        assert!(!config.reconnect_on_delete);
     }
 
     #[tokio::test]

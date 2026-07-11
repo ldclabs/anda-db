@@ -13,6 +13,7 @@ license.workspace = true
 anda_db_utils = { version = "0.9", path = "../anda_db_utils" }
 cbor2 = { workspace = true }
 dashmap = { workspace = true, features = ["serde"] }
+log = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

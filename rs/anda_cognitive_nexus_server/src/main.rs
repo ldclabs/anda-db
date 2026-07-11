@@ -36,8 +36,16 @@ struct Cli {
     #[clap(long, env = "ADDR", default_value = "127.0.0.1:8080")]
     addr: String,
 
+    /// API key protecting the `/kip` endpoint. Required when listening on
+    /// a non-loopback address unless --insecure-no-api-key is passed.
     #[clap(long, env = "API_KEY")]
     api_key: Option<String>,
+
+    /// Allow running without API_KEY on a non-loopback address, leaving the
+    /// KIP endpoint (arbitrary graph mutations) open to anyone who can
+    /// reach the server (dangerous)
+    #[clap(long, env = "INSECURE_NO_API_KEY")]
+    insecure_no_api_key: bool,
 
     /// Reserved principal id injected into the `$self` genesis KML on
     /// first start
@@ -86,9 +94,8 @@ pub enum Commands {
 async fn main() -> Result<(), BoxError> {
     dotenv::dotenv().ok();
     let cli = Cli::parse();
-    if matches!(cli.api_key.as_deref(), Some(key) if key.trim().is_empty()) {
-        return Err("API_KEY must not be empty".into());
-    }
+    let addr: SocketAddr = cli.addr.parse()?;
+    validate_api_key_policy(cli.api_key.as_deref(), &addr, cli.insecure_no_api_key)?;
     // Initialize structured logging with JSON format
     Builder::with_level(&get_env_level().to_string())
         .with_target_writer("*", new_writer(tokio::io::stdout()))
@@ -108,6 +115,7 @@ async fn main() -> Result<(), BoxError> {
             object_chunk_size: 256 * 1024,
             bucket_overload_size: 1024 * 1024,
             max_small_object_size: 1024 * 1024 * 10,
+            ..Default::default()
         },
         lock: None,
     };
@@ -161,7 +169,6 @@ async fn main() -> Result<(), BoxError> {
         });
     }
 
-    let addr: SocketAddr = cli.addr.parse()?;
     let listener = create_reuse_port_listener(addr).await?;
     log::warn!("{}@{} listening on {:?}", APP_NAME, APP_VERSION, addr);
 
@@ -176,6 +183,29 @@ async fn main() -> Result<(), BoxError> {
         log::error!("flush task failed: {err:?}");
     }
     result?;
+    Ok(())
+}
+
+/// Refuses insecure listener configurations: `/kip` executes arbitrary KML
+/// graph mutations, so a non-loopback listener without an API key must be
+/// an explicit opt-in (`--insecure-no-api-key` / `INSECURE_NO_API_KEY`).
+/// An empty API key is always rejected.
+fn validate_api_key_policy(
+    api_key: Option<&str>,
+    addr: &SocketAddr,
+    insecure_no_api_key: bool,
+) -> Result<(), BoxError> {
+    if matches!(api_key, Some(key) if key.trim().is_empty()) {
+        return Err("API_KEY must not be empty".into());
+    }
+    if api_key.is_none() && !addr.ip().is_loopback() && !insecure_no_api_key {
+        return Err(format!(
+            "refusing to listen on non-loopback address {addr} without API_KEY: \
+             the KIP endpoint would be open to anyone; set API_KEY or pass \
+             --insecure-no-api-key to override"
+        )
+        .into());
+    }
     Ok(())
 }
 
@@ -229,6 +259,43 @@ fn build_object_store(ty: String) -> Result<Arc<dyn ObjectStore>, BoxError> {
             let os = LocalFileSystem::new_with_prefix(path)?;
             let os = MetaStoreBuilder::new(os, 100000).build();
             Ok(Arc::new(os))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn api_key_policy_rejects_empty_key_everywhere() {
+        for listen in ["127.0.0.1:8080", "0.0.0.0:8080"] {
+            assert!(validate_api_key_policy(Some(""), &addr(listen), false).is_err());
+            assert!(validate_api_key_policy(Some("  "), &addr(listen), true).is_err());
+        }
+    }
+
+    #[test]
+    fn api_key_policy_refuses_non_loopback_without_key() {
+        for listen in ["0.0.0.0:8080", "192.168.1.10:8080", "[::]:8080"] {
+            let err = validate_api_key_policy(None, &addr(listen), false)
+                .expect_err("non-loopback without API_KEY must be refused");
+            assert!(err.to_string().contains("--insecure-no-api-key"));
+            // The explicit escape hatch allows it.
+            assert!(validate_api_key_policy(None, &addr(listen), true).is_ok());
+            // A real API key allows it.
+            assert!(validate_api_key_policy(Some("secret"), &addr(listen), false).is_ok());
+        }
+    }
+
+    #[test]
+    fn api_key_policy_allows_loopback_without_key() {
+        for listen in ["127.0.0.1:8080", "[::1]:8080"] {
+            assert!(validate_api_key_policy(None, &addr(listen), false).is_ok());
         }
     }
 }

@@ -1478,9 +1478,14 @@ async fn index_wrappers_public_api() -> Result<(), DBError> {
     assert!(hnsw.try_search(&[0.1, 0.2], 1).is_err());
     assert!(hnsw.remove(1, now + 1));
     assert!(hnsw.has_pending_flush());
+    // The flush persists the tombstone and then purges the removed node's
+    // blob; the cleared tombstone set itself becomes a new pending metadata
+    // version that the next flush persists.
     assert!(hnsw.flush(now + 2).await?);
+    assert!(hnsw.has_pending_flush());
+    assert!(hnsw.flush(now + 3).await?);
     assert!(!hnsw.has_pending_flush());
-    assert!(!hnsw.flush(now + 3).await?);
+    assert!(!hnsw.flush(now + 4).await?);
     let hnsw_reloaded = Hnsw::bootstrap("embedding".into(), storage.clone()).await?;
     assert_eq!(hnsw_reloaded.metadata().name, "embedding");
     assert_eq!(hnsw_reloaded.stats().num_elements, 0);

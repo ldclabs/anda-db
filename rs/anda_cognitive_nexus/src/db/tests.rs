@@ -6061,3 +6061,300 @@ async fn test_get_or_init_concept_sets_system_metadata() {
         .unwrap();
     assert_eq!(again._id, created._id);
 }
+
+/// #5: the per-solution NOT anti-join and the `ctx.groups` cleanup must
+/// agree — a group whose members were only *partially* excluded must keep
+/// its surviving members in the grouped COUNT instead of being deleted
+/// wholesale (which returned COUNT = 0).
+#[tokio::test]
+async fn test_kql_grouped_count_not_anti_join_keeps_surviving_members() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+
+    // belongs: (N1,D1), (N2,D1), (N1,D2); excl: (N1,D1).
+    let kml = r#"
+        UPSERT {
+            CONCEPT ?node_t { {type: "$ConceptType", name: "GNode"} }
+            CONCEPT ?domain_t { {type: "$ConceptType", name: "GDomain"} }
+            CONCEPT ?belongs { {type: "$PropositionType", name: "belongs"} }
+            CONCEPT ?excl { {type: "$PropositionType", name: "excl"} }
+            CONCEPT ?n1 { {type: "GNode", name: "N1"} }
+            CONCEPT ?n2 { {type: "GNode", name: "N2"} }
+            CONCEPT ?d1 { {type: "GDomain", name: "D1"} }
+            CONCEPT ?d2 { {type: "GDomain", name: "D2"} }
+            PROPOSITION ?b1 { (?n1, "belongs", ?d1) }
+            PROPOSITION ?b2 { (?n2, "belongs", ?d1) }
+            PROPOSITION ?b3 { (?n1, "belongs", ?d2) }
+            PROPOSITION ?e1 { (?n1, "excl", ?d1) }
+        }
+        "#;
+    nexus
+        .execute_kml(parse_kml(kml).unwrap(), false)
+        .await
+        .unwrap();
+
+    // The NOT anti-join removes only the (N1,D1) solution: D1 keeps N2
+    // (COUNT 1, not 0), and N1 stays a member of D2 (COUNT 1).
+    let kql = r#"
+        FIND(?d.name, COUNT(?n))
+        WHERE {
+            (?n, "belongs", ?d)
+            NOT { (?n, "excl", ?d) }
+        }
+        "#;
+    let (result, _) = nexus.execute_kql(parse_kql(kql).unwrap()).await.unwrap();
+    let arr = result.as_array().unwrap();
+    let names = arr[0].as_array().unwrap();
+    let counts = arr[1].as_array().unwrap();
+    assert_eq!(names.len(), counts.len(), "columns aligned: {result}");
+    assert_eq!(
+        names.len(),
+        2,
+        "both domains keep surviving members: {result}"
+    );
+    for (i, name) in names.iter().enumerate() {
+        match name.as_str().unwrap() {
+            "D1" => assert_eq!(counts[i], json!(1), "D1 keeps N2: {result}"),
+            "D2" => assert_eq!(counts[i], json!(1), "D2 keeps N1: {result}"),
+            other => panic!("Unexpected domain: {other}"),
+        }
+    }
+}
+
+/// #10: a dangling id inside OPTIONAL degrades to "no optional match"
+/// (outer solutions kept, block variables project null) instead of failing
+/// the whole query with KIP_3002.
+#[tokio::test]
+async fn test_kql_dangling_id_in_optional_keeps_outer_solution() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_pair_graph(&nexus).await;
+
+    let kql = r#"
+        FIND(?a.name)
+        WHERE {
+            ?a {type: "PairNode", name: "A1"}
+            OPTIONAL { (?a, "p1", ?x) ?x {id: "C:999999"} }
+        }
+        "#;
+    let (result, _) = nexus
+        .execute_kql(parse_kql(kql).unwrap())
+        .await
+        .expect("dangling id inside OPTIONAL must not fail the query");
+    assert_eq!(result, json!(["A1"]), "outer solution survives");
+
+    // The OPTIONAL variable stays visible and projects null (§3.4.7.2).
+    let kql = r#"
+        FIND(?a.name, ?x.name)
+        WHERE {
+            ?a {type: "PairNode", name: "A1"}
+            OPTIONAL { (?a, "p1", ?x) ?x {id: "C:999999"} }
+        }
+        "#;
+    let (result, _) = nexus.execute_kql(parse_kql(kql).unwrap()).await.unwrap();
+    assert_eq!(
+        collect_pairs(&result),
+        vec![("A1".to_string(), "null".to_string())],
+        "unmatched OPTIONAL projects null: {result}"
+    );
+}
+
+/// #10: a dangling id inside NOT means the NOT pattern cannot match — the
+/// clause succeeds and excludes nothing (§3.4.7.1) instead of failing the
+/// query. A resolvable matcher in the same position still excludes.
+#[tokio::test]
+async fn test_kql_dangling_id_in_not_makes_clause_succeed() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_pair_graph(&nexus).await;
+
+    let kql = r#"
+        FIND(?a.name)
+        WHERE {
+            ?a {type: "PairNode", name: "A1"}
+            NOT { (?a, "p1", ?x) ?x {id: "C:999999"} }
+        }
+        "#;
+    let (result, _) = nexus
+        .execute_kql(parse_kql(kql).unwrap())
+        .await
+        .expect("dangling id inside NOT must not fail the query");
+    assert_eq!(
+        result,
+        json!(["A1"]),
+        "NOT with unmatchable pattern keeps the solution"
+    );
+
+    // Control: the same NOT with a resolvable target still excludes A1.
+    let kql = r#"
+        FIND(?a.name)
+        WHERE {
+            ?a {type: "PairNode", name: "A1"}
+            NOT { (?a, "p1", ?x) ?x {type: "PairNode", name: "B1"} }
+        }
+        "#;
+    let (result, _) = nexus.execute_kql(parse_kql(kql).unwrap()).await.unwrap();
+    assert_eq!(result, json!([]), "matching NOT still excludes: {result}");
+}
+
+/// #10: a dangling id inside a UNION branch makes that branch contribute
+/// an empty set (§3.4.7.3) instead of failing the query. The main pattern
+/// keeps strict KIP_3002 semantics (covered by
+/// `test_kql_dangling_id_matchers_return_kip_3002`).
+#[tokio::test]
+async fn test_kql_dangling_id_in_union_branch_contributes_empty() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_pair_graph(&nexus).await;
+
+    let kql = r#"
+        FIND(?a.name)
+        WHERE {
+            ?a {type: "PairNode", name: "A1"}
+            UNION { ?a {id: "C:999999"} }
+        }
+        "#;
+    let (result, _) = nexus
+        .execute_kql(parse_kql(kql).unwrap())
+        .await
+        .expect("dangling id inside UNION must not fail the query");
+    assert_eq!(
+        result,
+        json!(["A1"]),
+        "main branch survives, union adds nothing"
+    );
+
+    // A dangling proposition link id in a UNION branch behaves the same.
+    let kql = r#"
+        FIND(?a.name)
+        WHERE {
+            ?a {type: "PairNode", name: "A1"}
+            UNION { ?link (id: "P:999999:p1") }
+        }
+        "#;
+    let (result, _) = nexus
+        .execute_kql(parse_kql(kql).unwrap())
+        .await
+        .expect("dangling link id inside UNION must not fail the query");
+    assert_eq!(result, json!(["A1"]), "{result}");
+}
+
+/// #11: the row-wise UNION merge must survive a semantically redundant
+/// sibling pattern that binds one extra variable (`?link`): the branch's
+/// solutions were dropped by the conjunctive FIND equi-join because the
+/// branch rows were only merged into the exact-signature relation.
+#[tokio::test]
+async fn test_kql_union_row_union_with_hetero_signature_sibling() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_pair_graph(&nexus).await;
+
+    let kql = r#"
+        FIND(?a.name, ?b.name)
+        WHERE {
+            (?a, "p1", ?b)
+            ?link (?a, "p1", ?b)
+            UNION { (?a, "p2", ?b) }
+        }
+        "#;
+    let (result, _) = nexus.execute_kql(parse_kql(kql).unwrap()).await.unwrap();
+    assert_eq!(
+        collect_pairs(&result),
+        vec![
+            ("A1".to_string(), "B1".to_string()), // p1
+            ("A1".to_string(), "B2".to_string()), // p2 (UNION branch)
+            ("A2".to_string(), "B2".to_string()), // p1 and p2, deduplicated
+        ],
+        "a redundant ?link pattern must not drop UNION branch solutions: {result}"
+    );
+}
+
+/// #16: a multi-clause NOT block only excludes solutions its *whole*
+/// pattern matches: `NOT { (?a,"blocked",?b) ?b {type:"Bot"} }` must not
+/// exclude (a, b) pairs where b is blocked but not a Bot.
+#[tokio::test]
+async fn test_kql_not_block_narrows_excluded_tuples_by_later_clauses() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+
+    let kml = r#"
+        UPSERT {
+            CONCEPT ?user_t { {type: "$ConceptType", name: "GUser"} }
+            CONCEPT ?bot_t { {type: "$ConceptType", name: "GBot"} }
+            CONCEPT ?human_t { {type: "$ConceptType", name: "GHuman"} }
+            CONCEPT ?linked { {type: "$PropositionType", name: "linked"} }
+            CONCEPT ?blocked { {type: "$PropositionType", name: "blocked"} }
+            CONCEPT ?a1 { {type: "GUser", name: "UA1"} }
+            CONCEPT ?a2 { {type: "GUser", name: "UA2"} }
+            CONCEPT ?b1 { {type: "GBot", name: "TB1"} }
+            CONCEPT ?b2 { {type: "GHuman", name: "TB2"} }
+            PROPOSITION ?l1 { (?a1, "linked", ?b1) }
+            PROPOSITION ?l2 { (?a2, "linked", ?b2) }
+            PROPOSITION ?k1 { (?a1, "blocked", ?b1) }
+            PROPOSITION ?k2 { (?a2, "blocked", ?b2) }
+        }
+        "#;
+    nexus
+        .execute_kml(parse_kml(kml).unwrap(), false)
+        .await
+        .unwrap();
+
+    // UA1→TB1 is blocked AND TB1 is a bot: excluded. UA2→TB2 is blocked
+    // but TB2 is human: it must survive.
+    let kql = r#"
+        FIND(?a.name, ?b.name)
+        WHERE {
+            (?a, "linked", ?b)
+            NOT {
+                (?a, "blocked", ?b)
+                ?b {type: "GBot"}
+            }
+        }
+        "#;
+    let (result, _) = nexus.execute_kql(parse_kql(kql).unwrap()).await.unwrap();
+    assert_eq!(
+        collect_pairs(&result),
+        vec![("UA2".to_string(), "TB2".to_string())],
+        "NOT must only exclude tuples matching the whole block: {result}"
+    );
+}
+
+/// #32: solution dedup keys must not be `|`-joined strings — predicates may
+/// contain `|`, so ("|q", null) and (null, "q|") collided into one key and
+/// a distinct solution row was silently dropped.
+#[tokio::test]
+async fn test_kql_dedup_key_not_ambiguous_for_pipe_predicates() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_pair_graph(&nexus).await;
+
+    let kml = r#"
+        UPSERT {
+            CONCEPT ?pt1 { {type: "$PropositionType", name: "|q"} }
+            CONCEPT ?pt2 { {type: "$PropositionType", name: "q|"} }
+            CONCEPT ?x1 { {type: "PairNode", name: "X1"} }
+            CONCEPT ?y1 { {type: "PairNode", name: "Y1"} }
+            CONCEPT ?x2 { {type: "PairNode", name: "X2"} }
+            CONCEPT ?y2 { {type: "PairNode", name: "Y2"} }
+            PROPOSITION ?e1 { (?x1, "|q", ?y1) }
+            PROPOSITION ?e2 { (?x2, "q|", ?y2) }
+        }
+        "#;
+    nexus
+        .execute_kml(parse_kml(kml).unwrap(), false)
+        .await
+        .unwrap();
+
+    // Two disjoint UNION partitions, each contributing one solution:
+    // ("|q", null) from the main block and (null, "q|") from the branch.
+    // The old string keys were both "||q|", collapsing them to one row.
+    let kql = r#"
+        FIND(?p1, ?p2)
+        WHERE {
+            (?s1, ?p1, {type: "PairNode", name: "Y1"})
+            UNION { (?s2, ?p2, {type: "PairNode", name: "Y2"}) }
+        }
+        "#;
+    let (result, _) = nexus.execute_kql(parse_kql(kql).unwrap()).await.unwrap();
+    assert_eq!(
+        collect_pairs(&result),
+        vec![
+            ("null".to_string(), "q|".to_string()),
+            ("|q".to_string(), "null".to_string()),
+        ],
+        "both pipe-predicate solutions must survive dedup: {result}"
+    );
+}

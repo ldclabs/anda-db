@@ -115,9 +115,9 @@ fn assert_search_matches_model(index: &BM25Index<TokenizerChain>, model: &Model,
 fn flush_and_reload(index: &BM25Index<TokenizerChain>) -> BM25Index<TokenizerChain> {
     let mut metadata = Vec::new();
     let mut buckets: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
-    futures::executor::block_on(index.flush(&mut metadata, 1_000, async |bucket_id, data| {
+    futures::executor::block_on(index.flush(&mut metadata, 1_000, |bucket_id, data| {
         buckets.insert(bucket_id, data.to_vec());
-        Ok(true)
+        std::future::ready(Ok(true))
     }))
     .expect("flush failed");
 

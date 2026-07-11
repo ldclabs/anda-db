@@ -1010,29 +1010,46 @@ impl Collection {
         Ok(Some(meta.stats.max_document_id))
     }
 
-    async fn flush_metadata(&self) -> Result<(), DBError> {
-        let meta = self.metadata();
-        let ver = { self.metadata_version.read().clone() };
-        let ver = match self
-            .storage
-            .put(Self::METADATA_PATH, &meta, Some(ver))
-            .await
-        {
-            Ok(ver) => ver,
-            Err(err) => {
-                if matches!(err, DBError::Precondition { .. }) {
-                    // If precondition failed, it means another concurrent writer has already saved a newer version.
+    /// Persists the current collection metadata object once, **without**
+    /// claiming the flush version watermark: `last_saved_version` is
+    /// deliberately not advanced, so the next periodic flush still observes
+    /// `version > last_saved_version` and runs the full path
+    /// (`store_metadata` + `store_ids`) — a metadata-only write must never
+    /// make a later flush skip persisting the ids bitmap.
+    ///
+    /// Unlike `store_metadata`, a version-precondition conflict is retried
+    /// with a fresh snapshot instead of being treated as success: the
+    /// concurrent winner claimed the version with a snapshot that may
+    /// predate the change this call was asked to persist (and its write may
+    /// still fail). `Ok(())` therefore means the current in-memory metadata
+    /// — including that change — has been durably written.
+    async fn store_metadata_unclaimed(&self) -> Result<(), DBError> {
+        // A handful of retries is plenty: every conflict means a concurrent
+        // writer just succeeded and published a fresh `metadata_version`.
+        const MAX_RETRIES: usize = 8;
+        let mut attempt = 0;
+        loop {
+            let meta = self.metadata();
+            let ver = { self.metadata_version.read().clone() };
+            match self
+                .storage
+                .put(Self::METADATA_PATH, &meta, Some(ver))
+                .await
+            {
+                Ok(ver) => {
+                    *self.metadata_version.write() = ver;
                     return Ok(());
                 }
-                return Err(err);
+                Err(DBError::Precondition { .. }) if attempt < MAX_RETRIES => {
+                    // A concurrent `store_metadata` won the version race; let
+                    // it publish the fresh object version, then retry with a
+                    // new snapshot (which contains our change).
+                    attempt += 1;
+                    tokio::task::yield_now().await;
+                }
+                Err(err) => return Err(err),
             }
-        };
-        *self.metadata_version.write() = ver;
-        // Note: deliberately do NOT advance `last_saved_version` here. The next
-        // periodic flush must still observe version > last_saved_version so it
-        // runs the full path (`store_metadata` + `store_ids`), since this
-        // method persists only the metadata object and not the ids bitmap.
-        Ok(())
+        }
     }
 
     /// Stores document IDs bitmap to storage.
@@ -1328,13 +1345,17 @@ impl Collection {
             meta.extensions.insert(key, value);
             meta.stats.version += 1;
         });
-        // Run a full flush instead of `flush_metadata`: bumping the version and
-        // going through the regular flush path keeps the change durable even
-        // when a concurrent flush wins the version race (the loser's write is
-        // skipped, but the winner's metadata snapshot already contains the
-        // extension), and preserves the invariant that persisting metadata
-        // always persists the ids bitmap alongside it.
-        self.flush(unix_ms()).await?;
+        // Persist the metadata object directly (a single small put) instead
+        // of running a full flush: extensions live only in the metadata
+        // object, and the full flush caused write amplification plus an
+        // unpersisted window — a concurrent flusher could claim the version
+        // first, making this call take the fast path and return Ok while the
+        // winner's snapshot (possibly without this extension) was still in
+        // flight or failed. The unclaimed write keeps the "returning Ok
+        // means persisted" contract and does not advance
+        // `last_saved_version`, so the next full flush still persists the
+        // ids bitmap alongside the metadata.
+        self.store_metadata_unclaimed().await?;
         Ok(())
     }
 
@@ -1365,8 +1386,9 @@ impl Collection {
             old
         });
         if old.is_some() {
-            // See `save_extension` for why this is a full flush.
-            self.flush(unix_ms()).await?;
+            // See `save_extension` for why this is a direct, unclaimed
+            // metadata write instead of a full flush.
+            self.store_metadata_unclaimed().await?;
         }
         Ok(old)
     }
@@ -1689,7 +1711,7 @@ impl Collection {
     /// would fail to bootstrap the index. Leftover files from a failed deletion
     /// are harmless and will be overwritten if the index is re-created.
     async fn cleanup_removed_index(&self, dir_path: &str) -> Result<(), DBError> {
-        self.flush_metadata().await?;
+        self.store_metadata_unclaimed().await?;
         if let Err(err) = self.storage.drop_prefix(dir_path).await {
             log::warn!(
                 action = "Collection::cleanup_removed_index",
@@ -2477,14 +2499,28 @@ impl Collection {
                     results.push(rt.into_iter().map(|r| r.0).collect());
                 }
                 if !searched {
-                    return Err(DBError::Index {
-                        name: self.name.clone(),
-                        source: format!(
-                            "no HNSW index matches the query vector dimension {}",
-                            vector.len()
-                        )
-                        .into(),
-                    });
+                    // A pure vector query with no usable HNSW index is a
+                    // caller bug and must surface as an error. A hybrid
+                    // text+vector query whose text part already ran degrades
+                    // to text-only results instead (best effort), so one
+                    // mismatched vector dimension does not fail an otherwise
+                    // valid full-text search.
+                    if params.text.is_none() {
+                        return Err(DBError::Index {
+                            name: self.name.clone(),
+                            source: format!(
+                                "no HNSW index matches the query vector dimension {}",
+                                vector.len()
+                            )
+                            .into(),
+                        });
+                    }
+                    log::warn!(
+                        action = "Collection::search_ids",
+                        collection = self.name,
+                        dimension = vector.len();
+                        "no HNSW index matches the query vector dimension; degrading to text-only results",
+                    );
                 }
             }
 
@@ -5311,6 +5347,260 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, DBError::Index { .. }));
+
+        db.close().await?;
+        Ok(())
+    }
+
+    /// Regression (#20): a hybrid text+vector query whose vector dimension
+    /// matches no HNSW index degrades to text-only results instead of
+    /// failing the whole query; a pure vector query still errors.
+    #[tokio::test]
+    async fn test_hybrid_search_degrades_when_vector_matches_no_index() -> Result<(), DBError> {
+        let db = setup_test_db().await?;
+        let collection = create_test_collection(&db, async |collection| {
+            collection.create_bm25_index_nx(&["name"]).await?;
+            collection
+                .create_hnsw_index_nx(
+                    "vector",
+                    HnswConfig {
+                        dimension: 10,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            Ok(())
+        })
+        .await?;
+        let id = collection
+            .add_from(&create_test_doc(0, "alpha beta", 30, vec!["x"]))
+            .await?;
+
+        // Hybrid: the BM25 hit is kept, the mismatched vector part is
+        // dropped with a warning.
+        let ids = collection
+            .search_ids(Query {
+                search: Some(Search {
+                    text: Some("alpha".to_string()),
+                    vector: Some(vec![0.1; 5]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!(ids, vec![id]);
+
+        // Pure vector misuse still surfaces as an error.
+        let err = collection
+            .search_ids(Query {
+                search: Some(Search {
+                    vector: Some(vec![0.1; 5]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DBError::Index { .. }));
+
+        db.close().await?;
+        Ok(())
+    }
+
+    // Document with a signed counter, for the I64/U64 read-back regressions.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, AndaDBSchema)]
+    struct CounterDoc {
+        pub _id: u64,
+        pub name: String,
+        pub count: i64,
+    }
+
+    fn counter_config() -> CollectionConfig {
+        CollectionConfig {
+            name: "counters".to_string(),
+            description: "signed counters".to_string(),
+        }
+    }
+
+    /// Regression (#1/#9, cases a+b): a non-negative i64 field reads back
+    /// from storage as U64. `update` must retire the old B-tree entry (no
+    /// phantom match on the old value) and `remove` must not leak entries.
+    #[tokio::test]
+    async fn test_i64_btree_index_update_and_remove_after_read_back() -> Result<(), DBError> {
+        let db = setup_test_db().await?;
+        let collection = db
+            .open_or_create_collection(CounterDoc::schema()?, counter_config(), async |c| {
+                c.create_btree_index_nx(&["count"]).await?;
+                Ok(())
+            })
+            .await?;
+
+        let id = collection
+            .add_from(&CounterDoc {
+                _id: 0,
+                name: "a".to_string(),
+                count: 5,
+            })
+            .await?;
+
+        // (a) update: the old document is materialized from storage where
+        // `count: 5` reads back as U64(5); the old index entry must still be
+        // retired.
+        collection
+            .update(id, BTreeMap::from([("count".to_string(), Fv::I64(7))]))
+            .await?;
+        let stale = collection
+            .query_ids(
+                Filter::Field(("count".to_string(), RangeQuery::Eq(Fv::I64(5)))),
+                Some(10),
+            )
+            .await?;
+        assert!(
+            stale.is_empty(),
+            "stale index entry for the old value must be removed, got {stale:?}",
+        );
+        let current = collection
+            .query_ids(
+                Filter::Field(("count".to_string(), RangeQuery::Eq(Fv::I64(7)))),
+                Some(10),
+            )
+            .await?;
+        assert_eq!(current, vec![id]);
+
+        // (b) remove: the index entry must be dropped, not leaked.
+        assert!(collection.remove(id).await?.is_some());
+        let leaked = collection
+            .query_ids(
+                Filter::Field(("count".to_string(), RangeQuery::Eq(Fv::I64(7)))),
+                Some(10),
+            )
+            .await?;
+        assert!(leaked.is_empty(), "removed document must leave no entries");
+        assert_eq!(
+            collection.get_btree_index(&["count"])?.stats().num_elements,
+            0,
+        );
+
+        db.close().await?;
+        Ok(())
+    }
+
+    /// Regression (#1/#9, case c): creating a B-tree index over existing
+    /// non-negative i64 data backfills from storage, where the values read
+    /// back as U64 — index creation must succeed and the index must be
+    /// queryable.
+    #[tokio::test]
+    async fn test_i64_btree_index_backfill_over_existing_data() -> Result<(), DBError> {
+        let db = setup_test_db().await?;
+        let collection = db
+            .open_or_create_collection(CounterDoc::schema()?, counter_config(), async |_| Ok(()))
+            .await?;
+        let mut ids = Vec::new();
+        for (i, count) in [5i64, -2, 0].into_iter().enumerate() {
+            ids.push(
+                collection
+                    .add_from(&CounterDoc {
+                        _id: 0,
+                        name: format!("doc{i}"),
+                        count,
+                    })
+                    .await?,
+            );
+        }
+        collection.flush(unix_ms()).await?;
+        drop(collection);
+        db.close_collection("counters").await?;
+
+        // Reopen from storage and build the index over the existing data.
+        let collection = db
+            .open_collection("counters".to_string(), async |c| {
+                c.create_btree_index(&["count"]).await?;
+                Ok(())
+            })
+            .await?;
+        let found = collection
+            .query_ids(
+                Filter::Field(("count".to_string(), RangeQuery::Eq(Fv::I64(5)))),
+                Some(10),
+            )
+            .await?;
+        assert_eq!(found, vec![ids[0]]);
+        let found = collection
+            .query_ids(
+                Filter::Field(("count".to_string(), RangeQuery::Eq(Fv::I64(-2)))),
+                Some(10),
+            )
+            .await?;
+        assert_eq!(found, vec![ids[1]]);
+
+        db.close().await?;
+        Ok(())
+    }
+
+    /// Regression (#18): `save_extension` / `remove_extension` persist with
+    /// a single metadata put ("Ok means persisted") and must not advance the
+    /// flush watermark — the next full flush still runs its complete path.
+    #[tokio::test]
+    async fn test_save_extension_single_put_without_claiming_flush() -> Result<(), DBError> {
+        let object_store = Arc::new(InMemory::new());
+        let db_config = DBConfig {
+            name: "ext_db".to_string(),
+            description: "extension persistence".to_string(),
+            storage: StorageConfig {
+                compress_level: 0,
+                ..Default::default()
+            },
+            lock: None,
+        };
+        let db = AndaDB::connect(object_store.clone(), db_config.clone()).await?;
+        let collection = db
+            .open_or_create_collection(
+                CounterDoc::schema()?,
+                counter_config(),
+                async |_| Ok(()),
+            )
+            .await?;
+
+        let puts_before = collection.storage_stats().total_put_count;
+        collection
+            .save_extension("k".to_string(), Fv::Text("v".to_string()))
+            .await?;
+        assert_eq!(
+            collection.storage_stats().total_put_count,
+            puts_before + 1,
+            "save_extension must perform exactly one metadata put",
+        );
+
+        // Persisted immediately: a second database instance reads it back
+        // without any flush on the first one.
+        {
+            let db2 = AndaDB::connect(object_store.clone(), db_config.clone()).await?;
+            let c2 = db2
+                .open_collection("counters".to_string(), async |_| Ok(()))
+                .await?;
+            assert_eq!(c2.get_extension("k"), Some(Fv::Text("v".to_string())));
+        }
+
+        // The unclaimed write did not advance `last_saved_version`: the next
+        // full flush still persists metadata + ids, and only then does the
+        // fast path apply.
+        assert!(collection.flush(unix_ms()).await?);
+        assert!(!collection.flush(unix_ms()).await?);
+
+        // remove_extension mirrors the single-put behaviour.
+        let puts_before = collection.storage_stats().total_put_count;
+        let old = collection.remove_extension("k").await?;
+        assert_eq!(old, Some(Fv::Text("v".to_string())));
+        assert_eq!(
+            collection.storage_stats().total_put_count,
+            puts_before + 1,
+            "remove_extension must perform exactly one metadata put",
+        );
+        assert!(collection.get_extension("k").is_none());
+        // Removing a missing key writes nothing.
+        let puts_before = collection.storage_stats().total_put_count;
+        assert!(collection.remove_extension("missing").await?.is_none());
+        assert_eq!(collection.storage_stats().total_put_count, puts_before);
 
         db.close().await?;
         Ok(())

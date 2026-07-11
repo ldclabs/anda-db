@@ -297,8 +297,9 @@ async fn crash_at_every_mutation_point_is_recoverable() {
 }
 
 /// Guards the flush invariant: `save_extension` persists collection metadata
-/// immediately (`flush_metadata`), but must NOT advance `last_saved_version`,
-/// otherwise the next `flush` would skip persisting the document id bitmap.
+/// immediately (`store_metadata_unclaimed`), but must NOT advance
+/// `last_saved_version`, otherwise the next `flush` would skip persisting the
+/// document id bitmap.
 #[tokio::test]
 async fn flush_after_save_extension_still_persists_ids() {
     let (store, handle) = FaultStore::wrap(InMemory::new());

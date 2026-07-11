@@ -499,6 +499,15 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
                         Err(Error::AlreadyExists { .. }) => {
                             // The conflicting data object is an orphan left
                             // by a crash; overwrite it to self-heal.
+                            //
+                            // NOTE: this weakens `PutMode::Create` across
+                            // processes. Another process racing `Create` on
+                            // the same key before our sidecar metadata is
+                            // visible can also classify our data object as
+                            // an orphan and overwrite it. Acceptable under
+                            // AndaDB's single-writer-per-store deployment
+                            // assumption; see the crate-level docs
+                            // ("Single-writer assumption").
                             log::warn!(
                                 "EncryptedStore: healing orphaned data object at {location} on create"
                             );

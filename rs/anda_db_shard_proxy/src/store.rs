@@ -4,11 +4,13 @@
 //! - database-to-shard assignments, which are effectively stable identifiers
 //! - shard-to-backend assignments, which can change during upgrades or moves
 //!
-//! A local [`DashMap`] cache is used for fast request-time lookups, while
-//! PostgreSQL remains the source of truth and distributes incremental updates
-//! through `LISTEN/NOTIFY`.
+//! Local in-memory caches (a bounded [`moka`] cache for db→shard lookups, a
+//! [`DashMap`] for the small shard→backend table) are used for fast
+//! request-time lookups, while PostgreSQL remains the source of truth and
+//! distributes incremental updates through `LISTEN/NOTIFY`.
 
 use dashmap::DashMap;
+use moka::{Expiry, future::Cache};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use sqlx::postgres::PgListener;
@@ -25,6 +27,12 @@ const DB_CACHE_POSITIVE_TTL: Duration = Duration::from_secs(60);
 /// PostgreSQL lookups. Short, so a fresh assignment becomes visible quickly
 /// even if its NOTIFY event was missed.
 const DB_CACHE_NEGATIVE_TTL: Duration = Duration::from_secs(5);
+
+/// Maximum number of db→shard cache entries (positive or negative). The
+/// cache must be bounded: every unauthenticated request with an unknown
+/// database name inserts a negative entry, so an unbounded map would let an
+/// attacker grow proxy memory without limit by probing random names.
+const DB_CACHE_CAPACITY: u64 = 100_000;
 
 /// Mapping from database name to its assigned shard ID.
 /// This binding can be updated by administrators when needed.
@@ -90,6 +98,52 @@ impl DbCacheEntry {
             _ => None,
         }
     }
+
+    /// Physical lifetime of this entry in the bounded cache; matches the
+    /// logical TTL that [`DbCacheEntry::get`] enforces on hits.
+    fn ttl(&self) -> Duration {
+        match self {
+            Self::Found { .. } => DB_CACHE_POSITIVE_TTL,
+            Self::NotFound { .. } => DB_CACHE_NEGATIVE_TTL,
+        }
+    }
+}
+
+/// Per-variant expiration for the bounded db→shard cache: positive entries
+/// live [`DB_CACHE_POSITIVE_TTL`], negative entries only
+/// [`DB_CACHE_NEGATIVE_TTL`], so a flood of unknown database names is
+/// physically evicted quickly instead of merely expiring logically while
+/// still occupying memory.
+struct DbCacheExpiry;
+
+impl Expiry<String, DbCacheEntry> for DbCacheExpiry {
+    fn expire_after_create(
+        &self,
+        _key: &String,
+        value: &DbCacheEntry,
+        _created_at: Instant,
+    ) -> Option<Duration> {
+        Some(value.ttl())
+    }
+
+    fn expire_after_update(
+        &self,
+        _key: &String,
+        value: &DbCacheEntry,
+        _updated_at: Instant,
+        _duration_until_expiry: Option<Duration>,
+    ) -> Option<Duration> {
+        Some(value.ttl())
+    }
+}
+
+/// Builds the bounded db→shard cache: capacity-limited and expired per entry
+/// variant, so memory stays bounded even under random-name probing.
+fn new_db_cache() -> Cache<String, DbCacheEntry> {
+    Cache::builder()
+        .max_capacity(DB_CACHE_CAPACITY)
+        .expire_after(DbCacheExpiry)
+        .build()
 }
 
 /// Fully resolved routing information returned to the proxy layer.
@@ -128,7 +182,7 @@ enum BackendEvent {
     Delete { shard_id: u32 },
 }
 
-/// Persistent shard routing store backed by PostgreSQL with in-memory DashMap caches.
+/// Persistent shard routing store backed by PostgreSQL with in-memory caches.
 ///
 /// Two-table design:
 /// - `db_shards`: db_name → shard_id (large, mostly stable; can be updated)
@@ -138,8 +192,11 @@ enum BackendEvent {
 #[derive(Clone)]
 pub struct ShardStore {
     pool: PgPool,
-    /// db_name → cached lookup result (positive or negative, with TTL)
-    db_cache: Arc<DashMap<String, DbCacheEntry>>,
+    /// db_name → cached lookup result (positive or negative). Bounded
+    /// ([`DB_CACHE_CAPACITY`]) and physically expired per entry variant, so
+    /// unauthenticated requests probing random names cannot grow memory
+    /// without limit.
+    db_cache: Cache<String, DbCacheEntry>,
     /// shard_id → ShardBackend
     backend_cache: Arc<DashMap<u32, ShardBackend>>,
 }
@@ -174,7 +231,7 @@ impl ShardStore {
 
         let store = Self {
             pool,
-            db_cache: Arc::new(DashMap::new()),
+            db_cache: new_db_cache(),
             backend_cache: Arc::new(DashMap::new()),
         };
         store.reload_all().await?;
@@ -220,7 +277,7 @@ impl ShardStore {
     /// PostgreSQL errors are propagated instead of being folded into
     /// "not found".
     async fn lookup_db_shard(&self, db_name: &str) -> Result<Option<u32>, sqlx::Error> {
-        if let Some(entry) = self.db_cache.get(db_name)
+        if let Some(entry) = self.db_cache.get(db_name).await
             && let Some(cached) = entry.get()
         {
             return Ok(cached);
@@ -235,12 +292,14 @@ impl ShardStore {
             Some((sid,)) => {
                 let shard_id = sid as u32;
                 self.db_cache
-                    .insert(db_name.to_string(), DbCacheEntry::found(shard_id));
+                    .insert(db_name.to_string(), DbCacheEntry::found(shard_id))
+                    .await;
                 Ok(Some(shard_id))
             }
             None => {
                 self.db_cache
-                    .insert(db_name.to_string(), DbCacheEntry::not_found());
+                    .insert(db_name.to_string(), DbCacheEntry::not_found())
+                    .await;
                 Ok(None)
             }
         }
@@ -336,7 +395,8 @@ impl ShardStore {
         tx.commit().await?;
 
         self.db_cache
-            .insert(db_name.to_string(), DbCacheEntry::found(shard_id));
+            .insert(db_name.to_string(), DbCacheEntry::found(shard_id))
+            .await;
         Ok(())
     }
 
@@ -360,7 +420,7 @@ impl ShardStore {
         .await?;
         tx.commit().await?;
 
-        self.db_cache.remove(db_name);
+        self.db_cache.invalidate(db_name).await;
         Ok(result.rows_affected() > 0)
     }
 
@@ -446,13 +506,15 @@ impl ShardStore {
     }
 
     /// Apply a database-assignment event received from PostgreSQL.
-    fn apply_db_event(&self, payload: &str) {
+    async fn apply_db_event(&self, payload: &str) {
         match serde_json::from_str::<DbShardEvent>(payload) {
             Ok(DbShardEvent::Assign { db_name, shard_id }) => {
-                self.db_cache.insert(db_name, DbCacheEntry::found(shard_id));
+                self.db_cache
+                    .insert(db_name, DbCacheEntry::found(shard_id))
+                    .await;
             }
             Ok(DbShardEvent::Unassign { db_name }) => {
-                self.db_cache.remove(&db_name);
+                self.db_cache.invalidate(&db_name).await;
             }
             Err(e) => {
                 log::warn!("failed to parse db_shards_changed payload: {}", e);
@@ -521,21 +583,37 @@ impl ShardStore {
         if let Err(e) = self.reload_backend_cache().await {
             log::error!("failed to reload backend cache on connect: {}", e);
         }
-        self.db_cache.clear();
+        self.db_cache.invalidate_all();
 
         loop {
             tokio::select! {
-                notification = listener.recv() => {
+                // `try_recv`, not `recv`: `recv()` transparently reconnects
+                // after a dropped connection and never reports it, silently
+                // discarding every NOTIFY delivered during the gap — so this
+                // cache resync would only ever run for errors that tear the
+                // whole loop down, not for common network blips.
+                notification = listener.try_recv() => {
                     match notification {
-                        Ok(n) => {
+                        Ok(Some(n)) => {
                             let channel = n.channel();
                             let payload = n.payload();
                             log::info!("received notify on {}", channel);
                             match channel {
-                                "db_shards_changed" => self.apply_db_event(payload),
+                                "db_shards_changed" => self.apply_db_event(payload).await,
                                 "shard_backends_changed" => self.apply_backend_event(payload),
                                 _ => {}
                             }
+                        }
+                        // The listener lost its connection (and, with sqlx's
+                        // default eager reconnect, already re-established
+                        // it). Events during the gap are gone: drop every
+                        // db→shard entry and reload the backend table. A
+                        // reload failure propagates to the outer rebuild
+                        // path, which reconnects and resyncs again.
+                        Ok(None) => {
+                            log::warn!("pg listener reconnected, resyncing routing caches");
+                            self.db_cache.invalidate_all();
+                            self.reload_backend_cache().await?;
                         }
                         Err(e) => return Err(e),
                     }
@@ -558,24 +636,32 @@ mod tests {
             .expect("connect_lazy should parse URL");
         ShardStore {
             pool,
-            db_cache: Arc::new(DashMap::new()),
+            db_cache: new_db_cache(),
             backend_cache: Arc::new(DashMap::new()),
         }
     }
 
-    fn cached_shard(store: &ShardStore, db_name: &str) -> Option<Option<u32>> {
-        store.db_cache.get(db_name).and_then(|entry| entry.get())
+    async fn cached_shard(store: &ShardStore, db_name: &str) -> Option<Option<u32>> {
+        store
+            .db_cache
+            .get(db_name)
+            .await
+            .and_then(|entry| entry.get())
     }
 
     #[tokio::test]
     async fn apply_db_event_assign_and_unassign_updates_cache() {
         let store = test_store();
 
-        store.apply_db_event(r#"{"op":"assign","db_name":"db_a","shard_id":3}"#);
-        assert_eq!(cached_shard(&store, "db_a"), Some(Some(3)));
+        store
+            .apply_db_event(r#"{"op":"assign","db_name":"db_a","shard_id":3}"#)
+            .await;
+        assert_eq!(cached_shard(&store, "db_a").await, Some(Some(3)));
 
-        store.apply_db_event(r#"{"op":"unassign","db_name":"db_a"}"#);
-        assert!(store.db_cache.get("db_a").is_none());
+        store
+            .apply_db_event(r#"{"op":"unassign","db_name":"db_a"}"#)
+            .await;
+        assert!(store.db_cache.get("db_a").await.is_none());
     }
 
     #[tokio::test]
@@ -583,12 +669,14 @@ mod tests {
         let store = test_store();
         store
             .db_cache
-            .insert("db_keep".to_string(), DbCacheEntry::found(9));
+            .insert("db_keep".to_string(), DbCacheEntry::found(9))
+            .await;
 
-        store.apply_db_event("not-json");
+        store.apply_db_event("not-json").await;
 
-        assert_eq!(cached_shard(&store, "db_keep"), Some(Some(9)));
-        assert_eq!(store.db_cache.len(), 1);
+        assert_eq!(cached_shard(&store, "db_keep").await, Some(Some(9)));
+        store.db_cache.run_pending_tasks().await;
+        assert_eq!(store.db_cache.entry_count(), 1);
     }
 
     #[test]
@@ -608,6 +696,64 @@ mod tests {
             cached_at: Instant::now() - DB_CACHE_NEGATIVE_TTL,
         };
         assert_eq!(stale_miss.get(), None);
+    }
+
+    #[test]
+    fn db_cache_expiry_uses_variant_ttl() {
+        let expiry = DbCacheExpiry;
+        let key = "db".to_string();
+        let now = Instant::now();
+
+        assert_eq!(
+            expiry.expire_after_create(&key, &DbCacheEntry::found(1), now),
+            Some(DB_CACHE_POSITIVE_TTL)
+        );
+        assert_eq!(
+            expiry.expire_after_create(&key, &DbCacheEntry::not_found(), now),
+            Some(DB_CACHE_NEGATIVE_TTL)
+        );
+        // A re-insert (e.g. an assign event replacing a negative entry) must
+        // reset the expiration according to the *new* variant.
+        assert_eq!(
+            expiry.expire_after_update(
+                &key,
+                &DbCacheEntry::found(1),
+                now,
+                Some(DB_CACHE_NEGATIVE_TTL)
+            ),
+            Some(DB_CACHE_POSITIVE_TTL)
+        );
+        assert_eq!(
+            expiry.expire_after_update(
+                &key,
+                &DbCacheEntry::not_found(),
+                now,
+                Some(DB_CACHE_POSITIVE_TTL)
+            ),
+            Some(DB_CACHE_NEGATIVE_TTL)
+        );
+    }
+
+    #[tokio::test]
+    async fn db_cache_is_bounded_under_random_name_flood() {
+        // Same shape as `new_db_cache`, but with a small capacity so the
+        // test stays fast; the production cache only differs in the bound.
+        let cache: Cache<String, DbCacheEntry> = Cache::builder()
+            .max_capacity(64)
+            .expire_after(DbCacheExpiry)
+            .build();
+
+        for i in 0..10_000u32 {
+            cache
+                .insert(format!("missing_{i}"), DbCacheEntry::not_found())
+                .await;
+        }
+        cache.run_pending_tasks().await;
+        assert!(
+            cache.entry_count() <= 64,
+            "cache must stay bounded, got {}",
+            cache.entry_count()
+        );
     }
 
     #[tokio::test]

@@ -4,8 +4,8 @@ use quote::quote;
 use syn::{DeriveInput, ext::IdentExt, parse_macro_input};
 
 use crate::common::{
-    effective_field_name, named_fields, parse_container_serde_attrs, parse_field_cbor_attrs,
-    parse_field_serde_attrs, resolve_field_type, schema_crate_path,
+    TypeParams, effective_field_name, named_fields, parse_container_serde_attrs,
+    parse_field_cbor_attrs, parse_field_serde_attrs, resolve_field_type, schema_crate_path,
 };
 
 /// Implementation of `#[derive(FieldTyped)]`.
@@ -28,11 +28,7 @@ pub(crate) fn expand_field_typed_derive(input: DeriveInput) -> TokenStream2 {
     let name = &input.ident;
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
     let root = schema_crate_path();
-    let type_params: std::collections::BTreeSet<String> = input
-        .generics
-        .type_params()
-        .map(|p| p.ident.to_string())
-        .collect();
+    let type_params = TypeParams::from_generics(&input.generics);
 
     // Only structs with named fields are supported.
     let fields = match named_fields(&input, "FieldTyped") {
@@ -184,9 +180,10 @@ mod tests {
 
     #[test]
     fn expand_field_typed_rejects_bare_generic_fields_with_clear_error() {
-        // A bare `T` has no `field_type()`; the old fallback emitted
-        // `<T>::field_type()`, which failed with a misleading E0599 pointing
-        // at the derive. Now it is a targeted compile error.
+        // A bare `T` without a `FieldTyped` bound has no `field_type()`; the
+        // old fallback emitted `<T>::field_type()`, which failed with a
+        // misleading E0599 pointing at the derive. Now it is a targeted
+        // compile error.
         let input: DeriveInput = parse_quote! {
             struct Wrapper<T> {
                 inner: T,
@@ -197,6 +194,42 @@ mod tests {
         assert!(expanded.contains("compile_error"));
         assert!(expanded.contains("generic type parameter `T`"));
         assert!(expanded.contains("field_type"));
+
+        // An unrelated bound does not help.
+        let input: DeriveInput = parse_quote! {
+            struct Wrapper<T: Clone> {
+                inner: T,
+            }
+        };
+        assert!(tokens(expand_field_typed_derive(input)).contains("compile_error"));
+    }
+
+    #[test]
+    fn expand_field_typed_resolves_bare_generic_fields_with_field_typed_bound() {
+        // A `FieldTyped`-bounded parameter resolves through the bound with
+        // the pre-0.9.2 `<T>::field_type()` fallback (compile-compatibility
+        // for monomorphized generic fields).
+        let input: DeriveInput = parse_quote! {
+            struct Wrapper<T: FieldTyped> {
+                inner: T,
+            }
+        };
+        let expanded = tokens(expand_field_typed_derive(input));
+        assert!(expanded.contains("< T > :: field_type ()"), "{expanded}");
+        assert!(!expanded.contains("compile_error"), "{expanded}");
+
+        // The `where` clause spelling works the same way.
+        let input: DeriveInput = parse_quote! {
+            struct Wrapper<T>
+            where
+                T: my_traits::FieldTyped,
+            {
+                inner: T,
+            }
+        };
+        let expanded = tokens(expand_field_typed_derive(input));
+        assert!(expanded.contains("< T > :: field_type ()"), "{expanded}");
+        assert!(!expanded.contains("compile_error"), "{expanded}");
     }
 
     #[test]

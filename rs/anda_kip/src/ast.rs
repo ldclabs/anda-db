@@ -755,18 +755,24 @@ pub enum ComparisonOperator {
 impl ComparisonOperator {
     /// Compares two JSON values according to this operator.
     ///
-    /// All six operators share [`compare_json`]'s loose comparison semantics
-    /// so that equality and ordering never contradict each other: numbers
-    /// compare numerically (`3.0 == 3` is `true`), and strings first try
-    /// numeric, then RFC 3339 / RFC 2822 datetime, then lexical comparison
-    /// (two spellings of the same instant, e.g. `...Z` vs `...+00:00`, are
-    /// equal). Value pairs without a defined ordering (mixed types, arrays,
-    /// objects; see KIP spec §2.7) are never `Equal` and never ordered, so
-    /// only `NotEqual` returns `true` for them.
+    /// `==` / `!=` use [`loose_equal`] and are exact negations of each other:
+    /// numbers compare exactly (`3.0 == 3` is `true`, and integers keep full
+    /// precision beyond 2^53), strings are equal when identical or when both
+    /// denote the same datetime instant (RFC 3339 / RFC 2822, per side), a
+    /// number equals a string that spells the same numeric value, and
+    /// arrays/objects compare by structural equality.
+    ///
+    /// The ordering operators use [`compare_json`] and return `false` for
+    /// value pairs without a defined ordering (arrays, objects, and mixed
+    /// types other than number/numeric-string; see KIP spec §2.7). For every
+    /// ordered pair, `a == b` implies `a <= b` and `a >= b`. The ordering is
+    /// deliberately looser than equality for numeric strings: `"1.10"` and
+    /// `"1.1"` order as numerically equal (`<=` and `>=` both hold) but are
+    /// not `==`.
     pub fn compare(&self, left: &Json, right: &Json) -> bool {
         match self {
-            ComparisonOperator::Equal => compare_json(left, right) == Some(Ordering::Equal),
-            ComparisonOperator::NotEqual => compare_json(left, right) != Some(Ordering::Equal),
+            ComparisonOperator::Equal => loose_equal(left, right),
+            ComparisonOperator::NotEqual => !loose_equal(left, right),
             ComparisonOperator::LessThan => compare_json(left, right)
                 .map(|o| o == Ordering::Less)
                 .unwrap_or(false),
@@ -1089,14 +1095,16 @@ impl UpdateFunction {
 
 fn as_i128(value: &Json) -> Option<i128> {
     match value {
-        Json::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Some(i as i128)
-            } else {
-                n.as_u64().map(|u| u as i128)
-            }
-        }
+        Json::Number(n) => number_as_i128(n),
         _ => None,
+    }
+}
+
+fn number_as_i128(n: &Number) -> Option<i128> {
+    if let Some(i) = n.as_i64() {
+        Some(i as i128)
+    } else {
+        n.as_u64().map(|u| u as i128)
     }
 }
 
@@ -1322,43 +1330,157 @@ pub struct ExportCommand {
 
 /// Compares JSON scalar values using KIP filter ordering rules.
 ///
-/// Numbers compare numerically, booleans compare by boolean order, `null`
-/// compares only to `null`, and strings first try numeric then RFC 3339
-/// datetime comparison before falling back to lexical ordering.
+/// - Numbers compare numerically and exactly: integer/integer pairs compare
+///   in `i128` (no `f64` collapse above 2^53) and integer/float pairs
+///   compare without rounding the integer side.
+/// - Booleans compare by boolean order; `null` compares only to `null`.
+/// - Two strings first try numeric comparison, then datetime comparison
+///   (each side parsed independently as RFC 3339 or RFC 2822, so the same
+///   instant written in the two formats compares `Equal`), then fall back
+///   to lexical ordering.
+/// - A number and a string compare numerically when the string parses as a
+///   JSON number, mirroring [`loose_equal`]'s numeric coercion.
+/// - Every other pair (arrays, objects, remaining mixed types) has no
+///   defined ordering and yields `None`.
+///
+/// Note this ordering is deliberately looser than [`loose_equal`] for
+/// numeric strings: different spellings of the same numeric value (e.g.
+/// `"1.10"` vs `"1.1"`) are `Ordering::Equal` here but not loosely equal.
 pub fn compare_json(left: &Json, right: &Json) -> Option<Ordering> {
     match (left, right) {
-        (Json::Number(a), Json::Number(b)) => a
-            .as_f64()
-            .unwrap_or(0.0)
-            .partial_cmp(&b.as_f64().unwrap_or(0.0)),
+        (Json::Number(a), Json::Number(b)) => compare_numbers(a, b),
         (Json::Bool(a), Json::Bool(b)) => Some(a.cmp(b)),
         (Json::Null, Json::Null) => Some(Ordering::Equal),
         (Json::String(a), Json::String(b)) => {
-            // try to compare as number
+            // try to compare as numbers
             if let Ok(a) = Number::from_str(a)
                 && let Ok(b) = Number::from_str(b)
             {
-                return a
-                    .as_f64()
-                    .unwrap_or(0.0)
-                    .partial_cmp(&b.as_f64().unwrap_or(0.0));
+                return compare_numbers(&a, &b);
             }
-            // try to compare as datetime
-            if let Ok(a) = DateTime::parse_from_rfc3339(a)
-                && let Ok(b) = DateTime::parse_from_rfc3339(b)
-            {
-                return Some(a.cmp(&b));
-            }
-            if let Ok(a) = DateTime::parse_from_rfc2822(a)
-                && let Ok(b) = DateTime::parse_from_rfc2822(b)
+            // try to compare as datetimes; each side is parsed independently
+            // (RFC 3339 first, then RFC 2822) so the two formats compare
+            // against each other by instant
+            if let Some(a) = parse_datetime(a)
+                && let Some(b) = parse_datetime(b)
             {
                 return Some(a.cmp(&b));
             }
 
             Some(a.cmp(b))
         }
+        (Json::Number(a), Json::String(b)) => {
+            let b = Number::from_str(b).ok()?;
+            compare_numbers(a, &b)
+        }
+        (Json::String(a), Json::Number(b)) => {
+            let a = Number::from_str(a).ok()?;
+            compare_numbers(&a, b)
+        }
         _ => None,
     }
+}
+
+/// KIP loose equality: the semantics of the `==` / `!=` filter operators and
+/// of list-membership tests such as the `IN` filter function.
+///
+/// Rules:
+/// - **Number vs Number** — exact numeric equality. Integer/integer pairs
+///   compare in `i128`, so `9007199254740993 == 9007199254740992` is `false`
+///   even though both collapse to the same `f64`; integer/float pairs
+///   compare without rounding the integer side (`3 == 3.0` is `true`).
+/// - **String vs String** — equal when the strings are identical, or when
+///   both parse as datetimes (RFC 3339 or RFC 2822, independently per side)
+///   denoting the same instant. Numeric-looking strings are *not* loosely
+///   equal (`"1.10" == "1.1"` and `"1e3" == "1000"` are `false`), though
+///   they still *order* numerically via [`compare_json`].
+/// - **Number vs String** — equal when the string parses as a JSON number
+///   with the same exact numeric value (`3 == "3.0"` is `true`).
+/// - **Bool vs Bool / Null vs Null** — standard equality; `null` equals only
+///   `null`.
+/// - **Array/Object vs Array/Object** — structural (`serde_json`) equality.
+///   Non-scalars still have no ordering (KIP spec §2.7), so `[1] == [1]`
+///   holds while `[1] <= [1]` does not.
+/// - Any other mixed pair is not equal.
+///
+/// `ComparisonOperator::NotEqual` is always the exact negation of this
+/// function.
+pub fn loose_equal(left: &Json, right: &Json) -> bool {
+    match (left, right) {
+        (Json::Number(a), Json::Number(b)) => compare_numbers(a, b) == Some(Ordering::Equal),
+        (Json::Bool(a), Json::Bool(b)) => a == b,
+        (Json::Null, Json::Null) => true,
+        (Json::String(a), Json::String(b)) => {
+            if a == b {
+                return true;
+            }
+            // Different spellings of the same instant are equal.
+            if let Some(a) = parse_datetime(a)
+                && let Some(b) = parse_datetime(b)
+            {
+                return a == b;
+            }
+            false
+        }
+        (Json::Number(a), Json::String(b)) => Number::from_str(b)
+            .ok()
+            .is_some_and(|b| compare_numbers(a, &b) == Some(Ordering::Equal)),
+        (Json::String(a), Json::Number(b)) => Number::from_str(a)
+            .ok()
+            .is_some_and(|a| compare_numbers(&a, b) == Some(Ordering::Equal)),
+        (Json::Array(_) | Json::Object(_), Json::Array(_) | Json::Object(_)) => left == right,
+        _ => false,
+    }
+}
+
+/// Compares two JSON numbers exactly.
+///
+/// Integer/integer pairs (any mix of `i64` / `u64` representations) compare
+/// in `i128`; integer/float pairs compare via [`compare_i128_f64`] without
+/// rounding the integer side; float/float pairs compare as `f64`.
+fn compare_numbers(a: &Number, b: &Number) -> Option<Ordering> {
+    match (number_as_i128(a), number_as_i128(b)) {
+        (Some(x), Some(y)) => Some(x.cmp(&y)),
+        (Some(x), None) => compare_i128_f64(x, b.as_f64()?),
+        (None, Some(y)) => compare_i128_f64(y, a.as_f64()?).map(Ordering::reverse),
+        (None, None) => a.as_f64()?.partial_cmp(&b.as_f64()?),
+    }
+}
+
+/// Compares an integer with an `f64` without converting the integer to `f64`
+/// (which would collapse distinct integers above 2^53).
+fn compare_i128_f64(x: i128, y: f64) -> Option<Ordering> {
+    if y.is_nan() {
+        return None;
+    }
+    // 2^127 as f64. Finite doubles at or beyond ±2^127 lie outside the i128
+    // range (and a fortiori outside the i64/u64 range `x` comes from), so
+    // the sign decides; this also covers ±infinity.
+    const I128_LIMIT: f64 = 170141183460469231731687303715884105728.0;
+    if y >= I128_LIMIT {
+        return Some(Ordering::Less);
+    }
+    if y < -I128_LIMIT {
+        return Some(Ordering::Greater);
+    }
+    // `y` is finite with |y| <= 2^127, so `floor(y)` converts to i128 exactly.
+    let floor = y.floor();
+    match x.cmp(&(floor as i128)) {
+        // x == floor(y): x < y iff y has a fractional part.
+        Ordering::Equal if y > floor => Some(Ordering::Less),
+        ord => Some(ord),
+    }
+}
+
+/// Parses a datetime string as RFC 3339, falling back to RFC 2822.
+///
+/// Both formats are accepted on either side of a comparison, so the same
+/// instant written as `"2025-01-01T00:00:00Z"` and
+/// `"Wed, 01 Jan 2025 00:00:00 +0000"` compares equal.
+fn parse_datetime(s: &str) -> Option<DateTime<FixedOffset>> {
+    DateTime::parse_from_rfc3339(s)
+        .or_else(|_| DateTime::parse_from_rfc2822(s))
+        .ok()
 }
 
 #[cfg(test)]
@@ -1799,9 +1921,20 @@ mod tests {
         assert!(Equal.compare(&json!(1), &json!(1)));
         assert!(NotEqual.compare(&json!(1), &json!(2)));
 
-        // Numeric strings compare numerically on both sides.
-        assert!(Equal.compare(&json!("3"), &json!("3.0")));
-        assert!(!NotEqual.compare(&json!("3"), &json!("3.0")));
+        // String-string equality is exact: different spellings of the same
+        // numeric value are NOT equal (no numeric loose equality), but they
+        // still *order* as numerically equal via compare_json.
+        assert!(!Equal.compare(&json!("3"), &json!("3.0")));
+        assert!(NotEqual.compare(&json!("3"), &json!("3.0")));
+        assert!(LessEqual.compare(&json!("3"), &json!("3.0")));
+        assert!(GreaterEqual.compare(&json!("3"), &json!("3.0")));
+        assert!(!Equal.compare(&json!("1.10"), &json!("1.1")));
+        assert!(NotEqual.compare(&json!("1.10"), &json!("1.1")));
+        assert!(!Equal.compare(&json!("1e3"), &json!("1000")));
+        assert!(NotEqual.compare(&json!("1e3"), &json!("1000")));
+        // Identical strings are equal, of course.
+        assert!(Equal.compare(&json!("3.0"), &json!("3.0")));
+        assert!(!NotEqual.compare(&json!("3.0"), &json!("3.0")));
 
         // Different spellings of the same instant are equal, like `<=`/`>=`.
         let z = json!("2025-01-01T00:00:00Z");
@@ -1811,23 +1944,163 @@ mod tests {
         assert!(LessEqual.compare(&z, &offset));
         assert!(!LessThan.compare(&z, &offset));
 
-        // Mixed types have no defined ordering: never Equal, never ordered,
-        // only NotEqual is true.
-        assert!(!Equal.compare(&json!("3"), &json!(3)));
-        assert!(NotEqual.compare(&json!("3"), &json!(3)));
-        assert!(!LessEqual.compare(&json!("3"), &json!(3)));
-        assert!(!GreaterEqual.compare(&json!("3"), &json!(3)));
+        // Number vs numeric string coerces numerically for both equality and
+        // ordering (a == b implies a <= b and a >= b).
+        assert!(Equal.compare(&json!("3"), &json!(3)));
+        assert!(!NotEqual.compare(&json!("3"), &json!(3)));
+        assert!(LessEqual.compare(&json!("3"), &json!(3)));
+        assert!(GreaterEqual.compare(&json!("3"), &json!(3)));
+        assert!(Equal.compare(&json!(3), &json!("3.0")));
+        assert!(LessThan.compare(&json!(2), &json!("3")));
+        assert!(GreaterThan.compare(&json!("10"), &json!(9)));
+        // A non-numeric string never coerces.
+        assert!(!Equal.compare(&json!("abc"), &json!(3)));
+        assert!(NotEqual.compare(&json!("abc"), &json!(3)));
+        assert!(!LessEqual.compare(&json!("abc"), &json!(3)));
+
+        // Other mixed types have no defined ordering: never Equal, never
+        // ordered, only NotEqual is true.
         assert!(!Equal.compare(&json!(true), &json!(1)));
         assert!(NotEqual.compare(&json!(true), &json!(1)));
+        assert!(!LessEqual.compare(&json!(true), &json!(1)));
 
-        // Arrays/objects are not comparable in FILTER (KIP spec §2.7).
-        assert!(!Equal.compare(&json!([1]), &json!([1])));
-        assert!(NotEqual.compare(&json!([1]), &json!([1])));
-        assert!(!Equal.compare(&json!({"a": 1}), &json!({"a": 1})));
+        // Arrays/objects compare by structural equality for `==`/`!=` but
+        // stay unordered in FILTER (KIP spec §2.7).
+        assert!(Equal.compare(&json!([1]), &json!([1])));
+        assert!(!NotEqual.compare(&json!([1]), &json!([1])));
+        assert!(!Equal.compare(&json!([1]), &json!([2])));
+        assert!(NotEqual.compare(&json!([1]), &json!([2])));
+        assert!(Equal.compare(&json!({"a": 1}), &json!({"a": 1})));
+        assert!(!NotEqual.compare(&json!({"a": 1}), &json!({"a": 1})));
+        assert!(!Equal.compare(&json!({"a": 1}), &json!({"a": 2})));
+        assert!(!LessEqual.compare(&json!([1]), &json!([1])));
+        assert!(!GreaterEqual.compare(&json!([1]), &json!([1])));
+        assert!(!LessThan.compare(&json!([1]), &json!([2])));
+        // A scalar never equals a non-scalar.
+        assert!(!Equal.compare(&json!([1]), &json!(1)));
+        assert!(NotEqual.compare(&json!([1]), &json!(1)));
 
         // Null equals only null.
         assert!(Equal.compare(&Json::Null, &Json::Null));
         assert!(NotEqual.compare(&Json::Null, &json!(0)));
+    }
+
+    #[test]
+    fn number_comparison_is_exact_beyond_f64_precision() {
+        use ComparisonOperator::*;
+
+        // 2^53 and 2^53 + 1 collapse to the same f64; they must not compare
+        // equal (regression for the as_f64-based comparison).
+        let a = json!(9_007_199_254_740_993i64); // 2^53 + 1
+        let b = json!(9_007_199_254_740_992i64); // 2^53
+        assert!(!Equal.compare(&a, &b));
+        assert!(NotEqual.compare(&a, &b));
+        assert!(GreaterThan.compare(&a, &b));
+        assert!(!LessEqual.compare(&a, &b));
+        assert_eq!(compare_json(&a, &b), Some(Ordering::Greater));
+
+        // u64 boundary: distinct values near u64::MAX stay distinct.
+        let hi = json!(u64::MAX);
+        let lo = json!(u64::MAX - 1);
+        assert!(!Equal.compare(&hi, &lo));
+        assert!(GreaterThan.compare(&hi, &lo));
+        assert!(Equal.compare(&hi, &json!(u64::MAX)));
+        // Cross-signedness: i64::MIN < u64::MAX (compared in i128).
+        assert_eq!(
+            compare_json(&json!(i64::MIN), &json!(u64::MAX)),
+            Some(Ordering::Less)
+        );
+
+        // Integer vs float compares without rounding the integer side:
+        // 2^53 + 1 (int) > 2^53 (f64), even though (2^53 + 1) as f64 == 2^53.
+        let f = json!(9_007_199_254_740_992.0f64);
+        assert!(GreaterThan.compare(&a, &f));
+        assert!(!Equal.compare(&a, &f));
+        assert!(Equal.compare(&b, &f));
+        // Small values keep the intuitive behavior.
+        assert!(Equal.compare(&json!(3), &json!(3.0)));
+        assert!(LessThan.compare(&json!(3), &json!(3.5)));
+        assert!(GreaterThan.compare(&json!(4), &json!(3.5)));
+        assert!(LessThan.compare(&json!(-4), &json!(-3.5)));
+        // Huge floats order by sign against any integer.
+        assert!(LessThan.compare(&json!(u64::MAX), &json!(1e300)));
+        assert!(GreaterThan.compare(&json!(i64::MIN), &json!(-1e300)));
+
+        // MIN/MAX pick the true extremum (regression: the f64-collapsing
+        // comparator reported Equal and returned the wrong element).
+        let values = vec![b.clone(), a.clone(), json!(1)];
+        assert_eq!(AggregationFunction::Min.calculate(&values, false), json!(1));
+        assert_eq!(AggregationFunction::Max.calculate(&values, false), a);
+        let values = vec![a.clone(), b.clone()];
+        assert_eq!(AggregationFunction::Min.calculate(&values, false), b);
+        assert_eq!(AggregationFunction::Max.calculate(&values, false), a);
+    }
+
+    #[test]
+    fn loose_equal_covers_strings_numbers_and_non_scalars() {
+        // Number/number: exact.
+        assert!(loose_equal(&json!(3), &json!(3.0)));
+        assert!(!loose_equal(
+            &json!(9_007_199_254_740_993i64),
+            &json!(9_007_199_254_740_992i64)
+        ));
+
+        // String/string: exact, except datetime instants.
+        assert!(loose_equal(&json!("abc"), &json!("abc")));
+        assert!(!loose_equal(&json!("1.10"), &json!("1.1")));
+        assert!(!loose_equal(&json!("1e3"), &json!("1000")));
+        assert!(loose_equal(
+            &json!("2025-01-01T00:00:00Z"),
+            &json!("2025-01-01T00:00:00+00:00")
+        ));
+
+        // Number/string numeric coercion.
+        assert!(loose_equal(&json!(1000), &json!("1e3")));
+        assert!(loose_equal(&json!("3.0"), &json!(3)));
+        assert!(!loose_equal(&json!("3.5"), &json!(3)));
+        assert!(!loose_equal(&json!("abc"), &json!(3)));
+
+        // Non-scalars: structural equality, in both nesting shapes.
+        assert!(loose_equal(&json!([1, {"a": 2}]), &json!([1, {"a": 2}])));
+        assert!(!loose_equal(&json!([1, 2]), &json!([2, 1])));
+        assert!(loose_equal(&json!({"a": [1]}), &json!({"a": [1]})));
+        assert!(!loose_equal(&json!([1]), &json!({"a": 1})));
+
+        // Mixed scalar kinds are never equal.
+        assert!(!loose_equal(&json!(true), &json!(1)));
+        assert!(!loose_equal(&json!(true), &json!("true")));
+        assert!(!loose_equal(&Json::Null, &json!("null")));
+        assert!(!loose_equal(&json!([1]), &json!(1)));
+    }
+
+    #[test]
+    fn datetime_comparison_works_across_rfc_formats() {
+        use ComparisonOperator::*;
+
+        // The same instant written as RFC 3339 and RFC 2822 is equal.
+        let rfc3339 = json!("2025-01-01T00:00:00Z");
+        let rfc2822 = json!("Wed, 01 Jan 2025 00:00:00 +0000");
+        assert!(Equal.compare(&rfc3339, &rfc2822));
+        assert!(!NotEqual.compare(&rfc3339, &rfc2822));
+        assert!(LessEqual.compare(&rfc3339, &rfc2822));
+        assert!(GreaterEqual.compare(&rfc3339, &rfc2822));
+        assert!(!LessThan.compare(&rfc3339, &rfc2822));
+        assert_eq!(compare_json(&rfc3339, &rfc2822), Some(Ordering::Equal));
+
+        // Distinct instants order correctly across formats, both directions.
+        let later_3339 = json!("2025-01-02T00:00:00Z");
+        let later_2822 = json!("Thu, 02 Jan 2025 00:00:00 +0000");
+        assert!(LessThan.compare(&rfc2822, &later_3339));
+        assert!(LessThan.compare(&rfc3339, &later_2822));
+        assert!(GreaterThan.compare(&later_2822, &rfc3339));
+        assert_eq!(
+            compare_json(&rfc2822, &later_3339),
+            Some(Ordering::Less)
+        );
+
+        // Offsets are honoured: 01:00+01:00 is the same instant as 00:00Z.
+        let offset_2822 = json!("Wed, 01 Jan 2025 01:00:00 +0100");
+        assert!(Equal.compare(&rfc3339, &offset_2822));
     }
 
     #[test]

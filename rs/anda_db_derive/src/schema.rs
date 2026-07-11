@@ -4,7 +4,7 @@ use quote::quote;
 use syn::{Attribute, DeriveInput, Expr, Lit, ext::IdentExt, parse_macro_input};
 
 use crate::common::{
-    effective_field_name, is_u64_type, named_fields, parse_container_serde_attrs,
+    TypeParams, effective_field_name, is_u64_type, named_fields, parse_container_serde_attrs,
     parse_field_cbor_attrs, parse_field_serde_attrs, resolve_field_type, schema_crate_path,
     validate_schema_field_name,
 };
@@ -31,11 +31,7 @@ pub(crate) fn expand_anda_db_schema_derive(input: DeriveInput) -> TokenStream2 {
     let name = &input.ident;
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
     let root = schema_crate_path();
-    let type_params: std::collections::BTreeSet<String> = input
-        .generics
-        .type_params()
-        .map(|p| p.ident.to_string())
-        .collect();
+    let type_params = TypeParams::from_generics(&input.generics);
 
     // Only structs with named fields are supported.
     let fields = match named_fields(&input, "AndaDBSchema") {

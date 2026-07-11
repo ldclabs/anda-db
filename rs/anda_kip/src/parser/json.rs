@@ -117,21 +117,40 @@ pub(super) fn identifier<'a>()
     ))
 }
 
+/// An object key paired with the input position where it starts, so that
+/// duplicate-key errors can point at the offending key instead of at the
+/// start of the enclosing object.
+pub(super) type SpannedKey<'a> = (&'a str, String);
+
+/// Wraps a key parser so that it also captures the input slice at which the
+/// key starts. Used with [`ensure_unique_keys`] to anchor duplicate-key
+/// errors at the duplicated key itself.
+pub(super) fn spanned<'a, O, F>(
+    mut f: F,
+) -> impl Parser<&'a str, Output = (&'a str, O), Error = VerboseError<&'a str>>
+where
+    F: Parser<&'a str, Output = O, Error = VerboseError<&'a str>>,
+{
+    move |input: &'a str| {
+        let (rest, value) = f.parse(input)?;
+        Ok((rest, (input, value)))
+    }
+}
+
 /// Rejects duplicate keys in an object literal.
 ///
 /// In an LLM-facing protocol, a duplicate key is almost always a generation
 /// error; silently keeping the last value would mask it, so parsing fails
-/// (`nom::Err::Failure` anchored at `input`, the start of the object).
+/// (`nom::Err::Failure` anchored at the first duplicated key occurrence).
 pub(super) fn ensure_unique_keys<'a, V>(
-    input: &'a str,
-    entries: &[(String, V)],
+    entries: &[(SpannedKey<'a>, V)],
 ) -> Result<(), nom::Err<VerboseError<&'a str>>> {
     let mut seen: HashSet<&str> = HashSet::with_capacity(entries.len());
-    for (key, _) in entries {
+    for ((position, key), _) in entries {
         if !seen.insert(key.as_str()) {
             return Err(nom::Err::Failure(VerboseError {
                 errors: vec![(
-                    input,
+                    *position,
                     VerboseErrorKind::Context("duplicate key in object (keys must be unique)"),
                 )],
             }));
@@ -150,7 +169,7 @@ fn object<'a>() -> impl Parser<&'a str, Output = Map<String, Json>, Error = Verb
                     context(
                         "JSON key-value pair: key: value",
                         separated_pair(
-                            alt((string(), map(identifier(), |s| s.to_string()))),
+                            spanned(alt((string(), map(identifier(), |s| s.to_string())))),
                             cut(ws(char(':'))),
                             cut(json_value()),
                         ),
@@ -161,8 +180,11 @@ fn object<'a>() -> impl Parser<&'a str, Output = Map<String, Json>, Error = Verb
             cut(char('}')),
         )
         .parse(input)?;
-        ensure_unique_keys(input, &key_values)?;
-        Ok((remaining, key_values.into_iter().collect()))
+        ensure_unique_keys(&key_values)?;
+        Ok((
+            remaining,
+            key_values.into_iter().map(|((_, k), v)| (k, v)).collect(),
+        ))
     })
 }
 
@@ -301,5 +323,44 @@ mod tests {
                 .parse(r#"{ a: { a: 1 }, b: { a: 2 } }"#)
                 .is_ok()
         );
+    }
+
+    /// Extracts the deepest duplicate-key error position from a parse error.
+    fn duplicate_key_position(err: nom::Err<VerboseError<&str>>) -> &str {
+        match err {
+            nom::Err::Failure(ve) => {
+                let (position, kind) = ve.errors.into_iter().next().expect("non-empty errors");
+                assert!(
+                    matches!(&kind, VerboseErrorKind::Context(ctx) if ctx.contains("duplicate key")),
+                    "expected a duplicate-key context, got {kind:?}"
+                );
+                position
+            }
+            other => panic!("expected Failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_duplicate_object_key_error_points_at_the_duplicate_key() {
+        // The error is anchored at the first *duplicated* occurrence of the
+        // key, not at the start of the object.
+        let err = json_value().parse(r#"{ a: 1, a: 2 }"#).unwrap_err();
+        assert!(duplicate_key_position(err).starts_with("a: 2"));
+
+        // Quoted and identifier spellings of the same key collide; the
+        // position covers the duplicate's own spelling.
+        let err = json_value().parse(r#"{ "a": 1, a: 2 }"#).unwrap_err();
+        assert!(duplicate_key_position(err).starts_with("a: 2"));
+
+        // Nested objects anchor at the nested duplicate.
+        let err = json_value()
+            .parse(r#"{ a: { b: 1, b: 2 } }"#)
+            .unwrap_err();
+        assert!(duplicate_key_position(err).starts_with("b: 2"));
+
+        // With three occurrences, the second one (the first duplicate) is
+        // reported.
+        let err = json_value().parse(r#"{ k: 1, k: 2, k: 3 }"#).unwrap_err();
+        assert!(duplicate_key_position(err).starts_with("k: 2,"));
     }
 }

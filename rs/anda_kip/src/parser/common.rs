@@ -10,7 +10,7 @@ use nom::{
 };
 use nom_language::error::VerboseError;
 
-use super::json::{ensure_unique_keys, json_value, parse_number};
+use super::json::{SpannedKey, ensure_unique_keys, json_value, parse_number, spanned};
 use crate::ast::{DotPathVar, Json, KeyValue, Map, Value};
 
 pub use super::json::{quoted_string, ws};
@@ -173,15 +173,18 @@ pub fn json_value_map(input: &str) -> VResult<'_, Map<String, Json>> {
     .parse(input)?;
 
     let kvs = opt_kvs.unwrap_or_default();
-    ensure_unique_keys(input, &kvs)?;
-    Ok((remaining, kvs.into_iter().collect()))
+    ensure_unique_keys(&kvs)?;
+    Ok((
+        remaining,
+        kvs.into_iter().map(|((_, k), v)| (k, v)).collect(),
+    ))
 }
 
-fn key_json_pair(input: &str) -> VResult<'_, (String, Json)> {
+fn key_json_pair(input: &str) -> VResult<'_, (SpannedKey<'_>, Json)> {
     context(
         "key-value pair",
         separated_pair(
-            alt((quoted_string, map(identifier, |s| s.to_string()))),
+            spanned(alt((quoted_string, map(identifier, |s| s.to_string())))),
             cut(ws(char(':'))),
             cut(json_value()),
         ),

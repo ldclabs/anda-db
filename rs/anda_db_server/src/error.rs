@@ -85,6 +85,16 @@ impl ApiError {
         )
     }
 
+    /// `503 Service Unavailable` — the server is shutting down and no longer
+    /// accepts new requests.
+    pub fn unavailable() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            "server is shutting down",
+        )
+    }
+
     /// `500 Internal Server Error` — storage or index failure.
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", message)

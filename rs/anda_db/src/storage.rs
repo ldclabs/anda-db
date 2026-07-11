@@ -63,12 +63,22 @@ struct InnerStorage {
 /// mismatch is logged as a warning).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct StorageConfig {
-    /// Maximum cache capacity in weighted units. An entry weighs
-    /// `max(1, object_size_in_bytes / 1024)`: small objects (≤ 1 KiB) weigh 1,
-    /// so this behaves like an entry count for small objects while bounding
-    /// total cache memory to roughly `cache_max_capacity` KiB for large ones.
-    /// 0 disables the cache.
+    /// Maximum cache capacity as an **entry count**. 0 disables the cache.
+    ///
+    /// This is the historical semantics of the field and what existing
+    /// persisted configurations rely on. It is ignored when
+    /// [`StorageConfig::cache_max_bytes`] is set.
     pub cache_max_capacity: u64,
+    /// Optional maximum cache capacity in **bytes** of cached object data.
+    ///
+    /// When set to `Some(n > 0)`, cache entries are weighed by their object
+    /// size and the total is bounded to roughly `n` bytes;
+    /// `cache_max_capacity` is ignored. `Some(0)` disables the cache.
+    /// When `None` (the default, and the value read back from configurations
+    /// persisted before this field existed), `cache_max_capacity` applies
+    /// with its entry-count semantics.
+    #[serde(default)]
+    pub cache_max_bytes: Option<u64>,
     /// Zstd compression level. 0 disables compression, 1-22 represent compression levels.
     /// Default is 3. 22 indicates the highest compression ratio.
     pub compress_level: i32,
@@ -86,7 +96,8 @@ pub struct StorageConfig {
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
-            cache_max_capacity: 10000,          // Default cache capacity
+            cache_max_capacity: 10000,          // Default cache capacity (entries)
+            cache_max_bytes: None,              // Entry-count semantics by default
             compress_level: 3,                  // Default compression level
             object_chunk_size: 256 * 1024,      // Default chunk size (256 KiB)
             max_small_object_size: 2000 * 1024, // Default max small object size (2 MiB)
@@ -364,22 +375,29 @@ impl Storage {
         object_store: Arc<dyn ObjectStore>,
         metadata: StorageMetadata,
     ) -> Result<Storage, DBError> {
-        // Create a cache with a size limit. Entries are weighed by size
-        // (`max(1, bytes / 1024)`) instead of counted, so a workload of large
-        // objects cannot blow up memory to `capacity * max_small_object_size`;
-        // for small objects the weight is 1 and the capacity still behaves
-        // like an entry count.
-        let cache = if metadata.config.cache_max_capacity > 0 {
-            Some(
+        // The cache capacity semantics follow the configuration (see
+        // `StorageConfig`): `cache_max_bytes`, when set, bounds the total
+        // cached bytes with a size weigher; otherwise `cache_max_capacity`
+        // keeps its historical entry-count semantics. `cache_max_capacity`
+        // is persisted at first initialization, so re-interpreting the same
+        // number under a different unit would silently shrink or grow the
+        // cache of existing deployments.
+        let cache = match metadata.config.cache_max_bytes {
+            Some(max_bytes) if max_bytes > 0 => Some(
                 Cache::builder()
-                    .max_capacity(metadata.config.cache_max_capacity)
+                    .max_capacity(max_bytes)
                     .weigher(|_key: &Path, value: &Arc<(Bytes, ObjectVersion)>| {
-                        (value.0.len() / 1024).max(1).min(u32::MAX as usize) as u32
+                        value.0.len().clamp(1, u32::MAX as usize) as u32
                     })
                     .build(),
-            )
-        } else {
-            None
+            ),
+            Some(_) => None,
+            None if metadata.config.cache_max_capacity > 0 => Some(
+                Cache::builder()
+                    .max_capacity(metadata.config.cache_max_capacity)
+                    .build(),
+            ),
+            None => None,
         };
 
         Ok(Storage {
@@ -1296,6 +1314,94 @@ mod tests {
         assert_eq!(stats.total_fetch_count, 2);
         assert_eq!(stats.total_put_count, 2);
         assert_eq!(stats.total_cache_get_count, 0);
+    }
+
+    /// Regression (#15): `cache_max_capacity` keeps its persisted
+    /// entry-count semantics. A `storage_meta.cbor` written before
+    /// `cache_max_bytes` existed must deserialize with `cache_max_bytes:
+    /// None`, and the byte-weighted cache only activates when the new field
+    /// is set explicitly.
+    #[tokio::test]
+    async fn test_storage_config_cache_semantics_are_backward_compatible() {
+        // A config shape as persisted before the `cache_max_bytes` field.
+        #[derive(Serialize)]
+        struct OldStorageConfig {
+            cache_max_capacity: u64,
+            compress_level: i32,
+            object_chunk_size: usize,
+            max_small_object_size: usize,
+            bucket_overload_size: usize,
+        }
+
+        let old = OldStorageConfig {
+            cache_max_capacity: 10000,
+            compress_level: 3,
+            object_chunk_size: 256 * 1024,
+            max_small_object_size: 2000 * 1024,
+            bucket_overload_size: 1024 * 1024,
+        };
+        let mut buf = Vec::new();
+        to_writer(&old, &mut buf).unwrap();
+        let decoded: StorageConfig = from_reader(&buf[..]).unwrap();
+        assert_eq!(decoded.cache_max_capacity, 10000);
+        assert_eq!(decoded.cache_max_bytes, None);
+        // The decoded legacy config equals the current default, so
+        // `Storage::connect` does not log a spurious config mismatch.
+        assert_eq!(decoded, StorageConfig::default());
+
+        // Entry-count mode: an object far larger than 1 KiB still counts as
+        // one entry, so it stays cached even with a tiny capacity.
+        let store = Arc::new(InMemory::new());
+        let storage = Storage::connect(
+            "entry_mode".to_string(),
+            store.clone(),
+            StorageConfig {
+                cache_max_capacity: 4,
+                compress_level: 0,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let big = vec![7u8; 64 * 1024];
+        storage.create("big", &big).await.unwrap();
+        let _ = storage.get::<Vec<u8>>("big").await.unwrap();
+        let hits_before = storage.stats().total_cache_get_count;
+        let _ = storage.get::<Vec<u8>>("big").await.unwrap();
+        assert_eq!(storage.stats().total_cache_get_count, hits_before + 1);
+
+        // Byte mode: setting `cache_max_bytes` enables the size weigher; the
+        // cache still serves small objects.
+        let storage = Storage::connect(
+            "byte_mode".to_string(),
+            store.clone(),
+            StorageConfig {
+                cache_max_bytes: Some(1024 * 1024),
+                compress_level: 0,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        storage.create("small", &vec![1u8, 2, 3]).await.unwrap();
+        let _ = storage.get::<Vec<u8>>("small").await.unwrap();
+        let hits_before = storage.stats().total_cache_get_count;
+        let _ = storage.get::<Vec<u8>>("small").await.unwrap();
+        assert_eq!(storage.stats().total_cache_get_count, hits_before + 1);
+
+        // `Some(0)` disables the cache entirely.
+        let storage = Storage::connect(
+            "disabled_mode".to_string(),
+            store,
+            StorageConfig {
+                cache_max_bytes: Some(0),
+                compress_level: 0,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(storage.inner.cache.is_none());
     }
 
     #[tokio::test]

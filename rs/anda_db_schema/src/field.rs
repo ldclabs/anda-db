@@ -232,15 +232,19 @@ impl FieldType {
     /// Validate that `value` is acceptable for this type.
     ///
     /// Some declared types accept a *read-back* shape in addition to their
-    /// canonical variant, because generic CBOR deserialization (without type
+    /// canonical variant, because generic deserialization (without type
     /// information) cannot restore the original variant:
     ///
     /// - `Vector` accepts an [`Array`](FieldValue::Array) of `U64 <= u16::MAX`
     ///   (bf16 bit patterns),
     /// - `I64` accepts a non-negative [`U64`](FieldValue::U64) within `i64`
     ///   range,
-    /// - `F32` accepts an [`F64`](FieldValue::F64) that converts to `f32`
-    ///   losslessly (exactly the values an `F32` produces when read back).
+    /// - `F32` accepts an [`F64`](FieldValue::F64) that a stored `f32` can
+    ///   produce when read back through CBOR (exact widening) or JSON
+    ///   (shortest-decimal round trip); see `is_f32_read_back`.
+    ///
+    /// Use [`FieldType::normalize`] to fold accepted read-back shapes into
+    /// the canonical variant.
     ///
     /// `Json` accepts any value because JSON is itself dynamically typed.
     ///
@@ -276,12 +280,10 @@ impl FieldType {
                 "expected non-NaN F32, got {v:?}"
             ))),
             // An F32 value is observed as F64 when read back through generic
-            // CBOR without type information; only values that convert to f32
-            // losslessly (exactly the values such a read-back can produce)
-            // are accepted.
-            (FieldType::F32, FieldValue::F64(v)) if !v.is_nan() && (*v as f32) as f64 == *v => {
-                Ok(())
-            }
+            // CBOR (exact widening) or JSON (shortest-decimal round trip)
+            // without type information; only the values such read-backs can
+            // produce are accepted (see `is_f32_read_back`).
+            (FieldType::F32, FieldValue::F64(v)) if is_f32_read_back(*v) => Ok(()),
             (FieldType::Bytes, FieldValue::Bytes(_)) => Ok(()),
             (FieldType::Text, FieldValue::Text(_)) => Ok(()),
             (FieldType::Json, _) => Ok(()),
@@ -341,6 +343,120 @@ impl FieldType {
             ))),
         }
     }
+
+    /// Normalizes generic *read-back* shapes into this type's canonical
+    /// variant, recursing into `Array` / `Map` / `Option` composites:
+    ///
+    /// - an `I64` field observed as a non-negative [`FieldValue::U64`] within
+    ///   `i64` range becomes [`FieldValue::I64`],
+    /// - an `F32` field observed as an [`FieldValue::F64`] read-back shape
+    ///   (see `is_f32_read_back`) becomes [`FieldValue::F32`].
+    ///
+    /// Values that are not a read-back shape of this type are left unchanged
+    /// (a following [`FieldType::validate`] reports them). Normalization is
+    /// applied at every document materialization boundary
+    /// (`Document::try_from_doc`, `Document::set_field`, ...) so downstream
+    /// consumers such as index maintenance and equality checks always observe
+    /// the declared variant.
+    pub fn normalize(&self, value: &mut FieldValue) {
+        self.normalize_at(value, 0)
+    }
+
+    /// Depth-tracked body of [`FieldType::normalize`]: stops recursing (and
+    /// leaves the value unchanged) beyond [`MAX_CONVERSION_DEPTH`], where
+    /// validation rejects the value anyway.
+    fn normalize_at(&self, value: &mut FieldValue, depth: usize) {
+        if check_conversion_depth(depth).is_err() {
+            return;
+        }
+
+        match self {
+            FieldType::I64 => {
+                if let FieldValue::U64(v) = value
+                    && *v <= i64::MAX as u64
+                {
+                    *value = FieldValue::I64(*v as i64);
+                }
+            }
+            FieldType::F32 => {
+                if let FieldValue::F64(v) = value
+                    && is_f32_read_back(*v)
+                {
+                    *value = FieldValue::F32(*v as f32);
+                }
+            }
+            FieldType::Array(types) => {
+                if let FieldValue::Array(values) = value {
+                    match types.len() {
+                        0 => {}
+                        1 => {
+                            for v in values.iter_mut() {
+                                types[0].normalize_at(v, depth + 1);
+                            }
+                        }
+                        _ => {
+                            for (ft, v) in types.iter().zip(values.iter_mut()) {
+                                ft.normalize_at(v, depth + 1);
+                            }
+                        }
+                    }
+                }
+            }
+            FieldType::Map(types) => {
+                if let FieldValue::Map(values) = value {
+                    if let Some(ft) = as_wildcard_map(types) {
+                        for v in values.values_mut() {
+                            ft.normalize_at(v, depth + 1);
+                        }
+                    } else {
+                        for (k, v) in values.iter_mut() {
+                            if let Some(ft) = types.get(k) {
+                                ft.normalize_at(v, depth + 1);
+                            }
+                        }
+                    }
+                }
+            }
+            // `Option` wrapping is type-level nesting only; the value itself
+            // is not a container level.
+            FieldType::Option(ft) if value != &FieldValue::Null => {
+                ft.normalize_at(value, depth);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Returns `true` when `v` is a possible read-back shape of a stored `f32`
+/// observed as `f64` through generic (schema-less) deserialization:
+///
+/// - **CBOR**: an `f32` is widened exactly, so `v` equals `f64::from(f)` for
+///   some finite or infinite `f32` `f`;
+/// - **JSON**: an `f32` is serialized as its shortest round-trip decimal
+///   (e.g. `2.71`), which parses back into an `f64` that is generally *not*
+///   the exact widening. `v` is accepted when it equals the `f64` parse of
+///   the shortest decimal form of `v as f32`.
+///
+/// Any other `f64` — NaN, finite values beyond the `f32` range, or values
+/// with precision no `f32` read-back can produce (e.g. `2.7100000000001`) —
+/// is rejected.
+fn is_f32_read_back(v: f64) -> bool {
+    if v.is_nan() {
+        return false;
+    }
+    let f = v as f32;
+    if f.is_infinite() && v.is_finite() {
+        // Finite f64 beyond the f32 range: not a possible read-back.
+        return false;
+    }
+    // CBOR read-back: exact widening of the f32.
+    if f64::from(f) == v {
+        return true;
+    }
+    // JSON read-back: Rust's shortest-round-trip float formatting denotes
+    // the same decimal value as serde_json's (ryu) formatting of the f32,
+    // so parsing it as f64 reproduces exactly the JSON read-back value.
+    matches!(format!("{f}").parse::<f64>(), Ok(parsed) if parsed == v)
 }
 
 /// A key in a [`FieldType::Map`] / [`FieldValue::Map`].
@@ -837,9 +953,9 @@ impl TryFrom<FieldValue> for f32 {
     fn try_from(value: FieldValue) -> Result<Self, Self::Error> {
         match value {
             FieldValue::F32(v) => Ok(v),
-            // Read-back shape: an F32 comes back as a losslessly convertible
-            // F64 through generic CBOR (see `FieldType::validate`).
-            FieldValue::F64(v) if !v.is_nan() && (v as f32) as f64 == v => Ok(v as f32),
+            // Read-back shape: an F32 comes back as an F64 through generic
+            // CBOR or JSON (see `FieldType::validate` / `is_f32_read_back`).
+            FieldValue::F64(v) if is_f32_read_back(v) => Ok(v as f32),
             _ => Err(SchemaError::FieldValue(format!("expected F32, got {value:?}")).into()),
         }
     }
@@ -851,9 +967,9 @@ impl<'a> TryFrom<&'a FieldValue> for f32 {
     fn try_from(value: &'a FieldValue) -> Result<Self, Self::Error> {
         match value {
             FieldValue::F32(v) => Ok(*v),
-            // Read-back shape: an F32 comes back as a losslessly convertible
-            // F64 through generic CBOR (see `FieldType::validate`).
-            FieldValue::F64(v) if !v.is_nan() && (*v as f32) as f64 == *v => Ok(*v as f32),
+            // Read-back shape: an F32 comes back as an F64 through generic
+            // CBOR or JSON (see `FieldType::validate` / `is_f32_read_back`).
+            FieldValue::F64(v) if is_f32_read_back(*v) => Ok(*v as f32),
             _ => Err(SchemaError::FieldValue(format!("expected F32, got {value:?}")).into()),
         }
     }
@@ -2152,8 +2268,10 @@ mod tests {
         assert!(FieldType::F64.validate(&FieldValue::F64(f64::NAN)).is_err());
         assert!(FieldType::F64.validate(&FieldValue::F32(3.15)).is_err());
 
-        // F32: the canonical variant, plus the F64 read-back shape (which is
-        // always losslessly convertible back to f32).
+        // F32: the canonical variant, plus the two F64 read-back shapes:
+        // the exact CBOR widening, and the JSON shortest-decimal round trip
+        // (serde_json serializes F32(2.71) as "2.71", which parses back as
+        // F64(2.71), not the exact widening).
         assert!(FieldType::F32.validate(&FieldValue::F32(2.71)).is_ok());
         assert!(FieldType::F32.validate(&FieldValue::F32(f32::NAN)).is_err());
         assert!(
@@ -2166,9 +2284,17 @@ mod tests {
                 .validate(&FieldValue::F64(f64::INFINITY))
                 .is_ok()
         );
-        // Not a possible F32 read-back: precision beyond f32.
-        assert!(FieldType::F32.validate(&FieldValue::F64(2.71)).is_err());
+        // JSON read-back of F32(2.71).
+        assert!(FieldType::F32.validate(&FieldValue::F64(2.71)).is_ok());
+        // Not possible F32 read-backs: excess precision, out of range, or
+        // values whose f32 rounding loses far more than a decimal digit.
+        assert!(
+            FieldType::F32
+                .validate(&FieldValue::F64(2.7100000000001))
+                .is_err()
+        );
         assert!(FieldType::F32.validate(&FieldValue::F64(1e308)).is_err());
+        assert!(FieldType::F32.validate(&FieldValue::F64(1e-300)).is_err());
         assert!(FieldType::F32.validate(&FieldValue::F64(f64::NAN)).is_err());
 
         // Bytes
@@ -2282,6 +2408,124 @@ mod tests {
         assert!(option_type.validate(&FieldValue::Bool(true)).is_ok());
         assert!(option_type.validate(&FieldValue::Null).is_ok());
         assert!(option_type.validate(&FieldValue::U64(42)).is_err());
+    }
+
+    #[test]
+    fn f32_json_read_back_round_trips() {
+        // Regression (#28): serde_json serializes an F32 with the f32
+        // shortest-decimal form; parsing it back yields an F64 that is NOT
+        // the exact widening (2.71f64 != f64::from(2.71f32)). Such values
+        // must still validate and convert as F32 read-back shapes.
+        let json = serde_json::to_string(&FieldValue::F32(2.71)).unwrap();
+        let read_back: FieldValue = serde_json::from_str(&json).unwrap();
+        assert!(
+            FieldType::F32.validate(&read_back).is_ok(),
+            "JSON read-back {read_back:?} of F32(2.71) must validate"
+        );
+        let f: f32 = read_back.try_into().unwrap();
+        assert_eq!(f, 2.71f32);
+
+        // Any stored f32 must survive both read-back channels.
+        for f in [
+            0f32,
+            -0.0,
+            1.25,
+            2.71,
+            -3.15,
+            1e-45, // smallest positive f32 subnormal
+            1.0e-40,
+            f32::MIN,
+            f32::MAX,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ] {
+            // CBOR read-back: exact widening.
+            assert!(
+                FieldType::F32
+                    .validate(&FieldValue::F64(f64::from(f)))
+                    .is_ok(),
+                "CBOR read-back of {f}"
+            );
+            // JSON read-back: shortest-decimal round trip.
+            let v: f64 = format!("{f}").parse().unwrap();
+            assert!(
+                FieldType::F32.validate(&FieldValue::F64(v)).is_ok(),
+                "JSON read-back of {f}"
+            );
+            let converted: f32 = (&FieldValue::F64(v)).try_into().unwrap();
+            assert_eq!(converted, f, "conversion of JSON read-back of {f}");
+        }
+    }
+
+    #[test]
+    fn normalize_folds_read_back_shapes_into_canonical_variants() {
+        // I64 <- U64 within range.
+        let mut v = FieldValue::U64(5);
+        FieldType::I64.normalize(&mut v);
+        assert_eq!(v, FieldValue::I64(5));
+
+        // Out-of-range U64 stays put (validation rejects it later).
+        let mut v = FieldValue::U64(i64::MAX as u64 + 1);
+        FieldType::I64.normalize(&mut v);
+        assert_eq!(v, FieldValue::U64(i64::MAX as u64 + 1));
+
+        // F32 <- F64 read-back shapes (both channels).
+        let mut v = FieldValue::F64(f64::from(2.71f32));
+        FieldType::F32.normalize(&mut v);
+        assert_eq!(v, FieldValue::F32(2.71));
+        let mut v = FieldValue::F64(2.71);
+        FieldType::F32.normalize(&mut v);
+        assert_eq!(v, FieldValue::F32(2.71));
+
+        // A non-read-back F64 stays put.
+        let mut v = FieldValue::F64(2.7100000000001);
+        FieldType::F32.normalize(&mut v);
+        assert_eq!(v, FieldValue::F64(2.7100000000001));
+
+        // Composites recurse.
+        let mut v = FieldValue::Array(vec![FieldValue::U64(1), FieldValue::I64(-2)]);
+        FieldType::Array(vec![FieldType::I64]).normalize(&mut v);
+        assert_eq!(
+            v,
+            FieldValue::Array(vec![FieldValue::I64(1), FieldValue::I64(-2)])
+        );
+
+        let mut v = FieldValue::Array(vec![FieldValue::U64(1), FieldValue::Text("x".into())]);
+        FieldType::Array(vec![FieldType::I64, FieldType::Text]).normalize(&mut v);
+        assert_eq!(
+            v,
+            FieldValue::Array(vec![FieldValue::I64(1), FieldValue::Text("x".into())])
+        );
+
+        let mut v = FieldValue::Map(BTreeMap::from([("a".into(), FieldValue::U64(3))]));
+        FieldType::Map(BTreeMap::from([("*".into(), FieldType::I64)])).normalize(&mut v);
+        assert_eq!(
+            v,
+            FieldValue::Map(BTreeMap::from([("a".into(), FieldValue::I64(3))]))
+        );
+
+        let mut v = FieldValue::Map(BTreeMap::from([("a".into(), FieldValue::U64(3))]));
+        FieldType::Map(BTreeMap::from([("a".into(), FieldType::I64)])).normalize(&mut v);
+        assert_eq!(
+            v,
+            FieldValue::Map(BTreeMap::from([("a".into(), FieldValue::I64(3))]))
+        );
+
+        // Option unwraps; Null stays.
+        let mut v = FieldValue::U64(7);
+        FieldType::Option(Box::new(FieldType::I64)).normalize(&mut v);
+        assert_eq!(v, FieldValue::I64(7));
+        let mut v = FieldValue::Null;
+        FieldType::Option(Box::new(FieldType::I64)).normalize(&mut v);
+        assert_eq!(v, FieldValue::Null);
+
+        // Unrelated declared types leave values untouched.
+        let mut v = FieldValue::U64(9);
+        FieldType::U64.normalize(&mut v);
+        assert_eq!(v, FieldValue::U64(9));
+        let mut v = FieldValue::F64(1.5);
+        FieldType::F64.normalize(&mut v);
+        assert_eq!(v, FieldValue::F64(1.5));
     }
 
     #[test]
@@ -2789,11 +3033,15 @@ mod tests {
 
         assert_eq!(f32::try_from(FieldValue::F32(1.25)).unwrap(), 1.25);
         assert_eq!(f32::try_from(&FieldValue::F32(1.25)).unwrap(), 1.25);
-        // The F64 read-back shape converts when it is lossless as f32.
+        // The F64 read-back shapes convert: exact CBOR widening and the
+        // JSON shortest-decimal round trip (see `is_f32_read_back`).
         assert_eq!(f32::try_from(FieldValue::F64(1.25)).unwrap(), 1.25);
         assert_eq!(f32::try_from(&FieldValue::F64(1.25)).unwrap(), 1.25);
-        assert!(f32::try_from(FieldValue::F64(2.71)).is_err());
-        assert!(f32::try_from(&FieldValue::F64(2.71)).is_err());
+        assert_eq!(f32::try_from(FieldValue::F64(2.71)).unwrap(), 2.71);
+        assert_eq!(f32::try_from(&FieldValue::F64(2.71)).unwrap(), 2.71);
+        // Not a possible F32 read-back: excess precision.
+        assert!(f32::try_from(FieldValue::F64(2.7100000000001)).is_err());
+        assert!(f32::try_from(&FieldValue::F64(2.7100000000001)).is_err());
 
         let bytes = FieldValue::Bytes(vec![1, 2, 3]);
         assert_eq!(Vec::<u8>::try_from(bytes.clone()).unwrap(), vec![1, 2, 3]);

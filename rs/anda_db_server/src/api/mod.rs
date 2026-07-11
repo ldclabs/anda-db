@@ -13,6 +13,7 @@ use axum::{
     response::Response,
 };
 use serde::Serialize;
+use std::future::Future;
 
 use crate::{
     encoding::{Encoding, RpcRequest},
@@ -55,13 +56,10 @@ pub async fn get_info(State(state): State<AppState>, headers: HeaderMap) -> Resp
 /// `POST /` — root-scope RPC endpoint.
 pub async fn rpc_root(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     let enc = Encoding::negotiate(&headers);
-    let result = tokio::time::timeout(state.request_timeout(), async {
-        authorize(&state, &headers)?;
-        let req = RpcRequest::parse(&headers, &body)?;
+    let result = execute_rpc(&state, enc, &headers, &body, |state, enc, req| async move {
         dispatch_root(&state, enc, req).await
     })
-    .await
-    .unwrap_or_else(|_| Err(ApiError::timeout()));
+    .await;
     result.unwrap_or_else(|err| err.respond(enc))
 }
 
@@ -73,14 +71,76 @@ pub async fn rpc_db(
     body: Bytes,
 ) -> Response {
     let enc = Encoding::negotiate(&headers);
-    let result = tokio::time::timeout(state.request_timeout(), async {
-        authorize(&state, &headers)?;
-        let req = RpcRequest::parse(&headers, &body)?;
+    let result = execute_rpc(&state, enc, &headers, &body, |state, enc, req| async move {
         dispatch_db(&state, &db_name, enc, req).await
     })
-    .await
-    .unwrap_or_else(|_| Err(ApiError::timeout()));
+    .await;
     result.unwrap_or_else(|err| err.respond(enc))
+}
+
+/// Authorizes and parses the request inline (cheap and side-effect free),
+/// then runs `dispatch` on its own spawned task with the configured request
+/// timeout applied to the [`tokio::task::JoinHandle`].
+///
+/// Mutating RPC methods (`db.close`, `db.create`, `doc.add`, ...) are not
+/// cancel-safe: dropping them at an arbitrary await point — which is exactly
+/// what wrapping the whole future in `tokio::time::timeout` used to do —
+/// can break invariants such as "a database removed from the registry always
+/// has its flush task cancelled". Spawning decouples the operation from the
+/// response: on timeout the client receives 408, the `JoinHandle` is dropped
+/// (which *detaches* the task rather than aborting it), and the operation
+/// runs to completion in the background, so a retry observes a consistent
+/// state instead of racing a half-executed predecessor. The same reasoning
+/// protects the operation from a client disconnect or the route-level
+/// [`total_timeout`], both of which only drop this handler's future.
+async fn execute_rpc<F, Fut>(
+    state: &AppState,
+    enc: Encoding,
+    headers: &HeaderMap,
+    body: &Bytes,
+    dispatch: F,
+) -> Result<Response, ApiError>
+where
+    F: FnOnce(AppState, Encoding, RpcRequest) -> Fut,
+    Fut: Future<Output = Result<Response, ApiError>> + Send + 'static,
+{
+    if state.is_shutting_down() {
+        return Err(ApiError::unavailable());
+    }
+    authorize(state, headers)?;
+    let req = RpcRequest::parse(headers, body)?;
+    let task = tokio::spawn(dispatch(state.clone(), enc, req));
+    match tokio::time::timeout(state.request_timeout(), task).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(err)) => {
+            // The dispatch task panicked (nothing aborts these tasks).
+            log::error!(action = "execute_rpc"; "rpc dispatch task failed: {err:?}");
+            Err(ApiError::internal("internal server error"))
+        }
+        Err(_elapsed) => Err(ApiError::timeout()),
+    }
+}
+
+/// Route-level timeout covering the *entire* request, including reading the
+/// body — the per-request timeout in [`execute_rpc`] only starts after the
+/// `Bytes` extractor has buffered the body, so without this layer a client
+/// trickling a request body could hold the connection (and its task) open
+/// forever.
+///
+/// The deadline is twice the configured request timeout so that once
+/// dispatch has started, the inner timeout (which produces the precise 408
+/// for the operation) always fires first; this layer only triggers when the
+/// transport itself stalls. Cancelling here is safe: during body reading no
+/// state has been touched yet, and once dispatch has started the operation
+/// lives on its own spawned task ([`execute_rpc`]) that dropping this future
+/// cannot cancel.
+pub async fn total_timeout(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let enc = Encoding::negotiate(req.headers());
+    let deadline = state.request_timeout().saturating_mul(2);
+    match tokio::time::timeout(deadline, next.run(req)).await {
+        Ok(resp) => resp,
+        Err(_elapsed) => ApiError::timeout().respond(enc),
+    }
 }
 
 /// Rewrites extractor-level rejections (e.g. the body-limit 413, which axum

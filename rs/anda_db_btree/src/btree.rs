@@ -1689,12 +1689,15 @@ where
     ///
     /// # Depth limit
     ///
-    /// Queries nested deeper than [`RangeQuery::MAX_DEPTH`] are rejected and
-    /// return an empty result (query evaluation is recursive; the cap
-    /// prevents a stack overflow on maliciously deep queries). Validate the
-    /// depth up-front (e.g. via [`RangeQuery::depth`] or
-    /// [`RangeQuery::try_convert_from`]) if you need to distinguish this from
-    /// a genuinely empty result.
+    /// Queries nested deeper than [`RangeQuery::MAX_DEPTH`] are rejected
+    /// (query evaluation is recursive; the cap prevents a stack overflow on
+    /// maliciously deep queries). **This non-`try` method cannot report the
+    /// rejection through its return type**: it returns an empty result — which
+    /// is indistinguishable from "no matches" — and emits a `log::warn!` with
+    /// the index name and the offending depth. If you need a hard error
+    /// instead, validate the depth up-front: [`RangeQuery::try_convert_from`]
+    /// returns an `Err` for over-deep queries, and [`RangeQuery::depth`] lets
+    /// you check the cap explicitly before calling this method.
     pub fn range_query_with<F, R>(&self, query: RangeQuery<FV>, mut f: F) -> Vec<R>
     where
         F: FnMut(&FV, &Vec<PK>) -> (bool, Vec<R>),
@@ -1703,7 +1706,19 @@ where
         if self.postings.is_empty() {
             return results;
         }
-        if query.depth() > RangeQuery::<FV>::MAX_DEPTH {
+        let depth = query.depth();
+        if depth > RangeQuery::<FV>::MAX_DEPTH {
+            log::warn!(
+                action = "range_query_with",
+                index = self.name.as_str(),
+                depth = depth,
+                max_depth = RangeQuery::<FV>::MAX_DEPTH;
+                "BTreeIndex '{}': range query nesting depth {} exceeds the maximum of {}; \
+                 returning an empty result",
+                self.name,
+                depth,
+                RangeQuery::<FV>::MAX_DEPTH,
+            );
             return results;
         }
 
@@ -5412,6 +5427,47 @@ mod tests {
 
         let shallow = RangeQuery::Not(Box::new(RangeQuery::Eq("ok".to_string())));
         assert!(RangeQuery::<TestKey>::try_convert_from(shallow).is_ok());
+    }
+
+    #[test]
+    fn test_range_query_depth_cap_logs_warning() {
+        struct CaptureLogger;
+        static CAPTURED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        impl log::Log for CaptureLogger {
+            fn enabled(&self, metadata: &log::Metadata) -> bool {
+                metadata.level() <= log::Level::Warn
+            }
+            fn log(&self, record: &log::Record) {
+                if self.enabled(record.metadata()) {
+                    CAPTURED.lock().unwrap().push(record.args().to_string());
+                }
+            }
+            fn flush(&self) {}
+        }
+        static LOGGER: CaptureLogger = CaptureLogger;
+        // No other test in this binary installs a logger; ignore the error
+        // anyway so this test cannot fail on logger-installation racing.
+        let _ = log::set_logger(&LOGGER);
+        log::set_max_level(log::LevelFilter::Warn);
+
+        let index = create_populated_index();
+        let over_depth = RangeQuery::<String>::MAX_DEPTH + 1;
+        let mut over = RangeQuery::Eq("apple".to_string());
+        for _ in 0..over_depth {
+            over = RangeQuery::Not(Box::new(over));
+        }
+        let keys: Vec<String> = index.range_query_with(over, |k, _| (true, vec![k.clone()]));
+        assert!(keys.is_empty(), "over-deep query must be rejected");
+
+        let captured = CAPTURED.lock().unwrap();
+        assert!(
+            captured.iter().any(|msg| {
+                msg.contains("exceeds the maximum")
+                    && msg.contains(index.name())
+                    && msg.contains(&(over_depth + 1).to_string())
+            }),
+            "expected a depth-cap warning containing the index name and depth, got: {captured:?}"
+        );
     }
 
     #[test]

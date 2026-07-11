@@ -25,7 +25,7 @@ tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true }
 
 [dev-dependencies]
-http-body-util = "0.1"
+http-body-util = { version = "0.1", features = ["channel"] }
 tower = { version = "0.5", features = ["util"] }
 
 [lib]

@@ -35,10 +35,24 @@
 //! Both wrappers self-heal on the next write of the same key:
 //! `PutMode::Overwrite` always rebuilds the pair (including when the sidecar
 //! metadata is corrupted), and `PutMode::Create` succeeds over an orphaned
-//! data object without metadata. Listings tolerate orphans (their `e_tag` is
-//! `None`) and `delete` cleans up either half. Callers must therefore be
+//! data object without metadata. Listings tolerate orphans — whether the
+//! sidecar metadata is missing or fails to decode, the entry's `e_tag` is
+//! `None` — and `delete` cleans up either half. Callers must therefore be
 //! prepared to re-write objects that fail to read back after a crash, in
 //! line with AndaDB's overwrite-self-heal convention.
+//!
+//! ## Single-writer assumption
+//!
+//! The `PutMode::Create` self-heal path assumes AndaDB's single-writer
+//! deployment model: a data object without readable sidecar metadata is
+//! treated as logically absent, so `Create` overwrites it. Within one
+//! process the per-key metadata critical section serializes writers, but
+//! **across processes this weakens `PutMode::Create`'s "exactly one winner"
+//! guarantee**: two processes racing `Create` on the same key while a
+//! sidecar metadata write has not yet become visible can each classify the
+//! other's data object as an orphan and overwrite it. Do not rely on
+//! `PutMode::Create` through these wrappers for cross-process mutual
+//! exclusion; multi-writer deployments are not protected.
 //!
 //! See `docs/anda_object_store.md` in the repository for the full design
 //! document.
@@ -259,6 +273,15 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
                         Err(Error::AlreadyExists { .. }) => {
                             // The conflicting data object is an orphan left
                             // by a crash; overwrite it to self-heal.
+                            //
+                            // NOTE: this weakens `PutMode::Create` across
+                            // processes. Another process racing `Create` on
+                            // the same key before our sidecar metadata is
+                            // visible can also classify our data object as
+                            // an orphan and overwrite it. Acceptable under
+                            // AndaDB's single-writer-per-store deployment
+                            // assumption; see the crate-level docs
+                            // ("Single-writer assumption").
                             log::warn!(
                                 "MetaStore: healing orphaned data object at {location} on create"
                             );
@@ -1059,6 +1082,81 @@ mod tests {
         assert_eq!(rt.objects.len(), 2);
         let orphaned = rt.objects.iter().find(|o| o.location == orphan).unwrap();
         assert_eq!(orphaned.e_tag, None);
+    }
+
+    #[tokio::test]
+    async fn corrupted_metadata_does_not_fail_listings() {
+        use futures::TryStreamExt;
+
+        let inner = InMemory::new();
+        let storage = MetaStoreBuilder::new(inner.clone(), 100).build();
+        let healthy = Path::from("clist/healthy");
+        let corrupt = Path::from("clist/corrupt");
+
+        storage
+            .put(&healthy, Bytes::from_static(b"abc").into())
+            .await
+            .unwrap();
+        storage
+            .put(&corrupt, Bytes::from_static(b"def").into())
+            .await
+            .unwrap();
+        // Simulate a torn sidecar write before a crash: the document exists
+        // but no longer decodes.
+        inner
+            .put(
+                &Path::from("meta/clist/corrupt"),
+                Bytes::from_static(b"\xffgarbage").into(),
+            )
+            .await
+            .unwrap();
+
+        // A fresh instance (bypassing the cache) must list both objects; the
+        // corrupted one is reported as an orphan (no logical e_tag), matching
+        // the write path that treats it as absent and self-heals it.
+        let reopened = MetaStoreBuilder::new(inner.clone(), 100).build();
+        let listed: Vec<_> = reopened
+            .list(Some(&Path::from("clist")))
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 2);
+        for obj in &listed {
+            if obj.location == corrupt {
+                assert_eq!(obj.e_tag, None);
+            } else {
+                assert!(obj.e_tag.is_some());
+            }
+        }
+
+        let listed: Vec<_> = reopened
+            .list_with_offset(Some(&Path::from("clist")), &Path::from("clist/a"))
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 2);
+
+        let rt = reopened
+            .list_with_delimiter(Some(&Path::from("clist")))
+            .await
+            .unwrap();
+        assert_eq!(rt.objects.len(), 2);
+        let orphaned = rt.objects.iter().find(|o| o.location == corrupt).unwrap();
+        assert_eq!(orphaned.e_tag, None);
+
+        // Reads still fail loudly (the listing tolerance must not mask the
+        // corruption from readers), and an overwrite heals the object.
+        assert!(reopened.get(&corrupt).await.is_err());
+        reopened
+            .put(&corrupt, Bytes::from_static(b"new").into())
+            .await
+            .unwrap();
+        let listed: Vec<_> = reopened
+            .list(Some(&Path::from("clist")))
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(listed.iter().all(|o| o.e_tag.is_some()));
     }
 
     #[tokio::test]

@@ -18,8 +18,44 @@ pub struct AppState {
     pub version: String,
     pub nexus: Nexus,
     pub api_key: Option<String>,
-    /// Per-request processing deadline for `/kip`.
+    /// Per-request **response** deadline for `/kip`. A KIP execution that
+    /// exceeds it gets a 408 response, but the already-started execution
+    /// finishes in the background (see [`run_detached_with_timeout`]).
     pub request_timeout: Duration,
+}
+
+/// How a detached execution failed to produce a value before the deadline.
+#[derive(Debug)]
+pub enum DetachedError {
+    /// The deadline elapsed; the detached task keeps running to completion.
+    Timeout,
+    /// The detached task itself failed (panicked or was aborted).
+    Join(tokio::task::JoinError),
+}
+
+/// Runs `fut` on a detached task with a response deadline.
+///
+/// KML execution mutates the graph in multiple steps and has no rollback
+/// log: cancelling it mid-flight — which is exactly what dropping the
+/// future inside `tokio::time::timeout` does — can leave half-written
+/// graph state (e.g. an `UPSERT` with only a prefix of its blocks
+/// applied). Spawning first means a timeout only abandons the *response*;
+/// the execution itself runs to completion in the background.
+pub(crate) async fn run_detached_with_timeout<T, F>(
+    deadline: Duration,
+    fut: F,
+) -> Result<T, DetachedError>
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let task = tokio::spawn(fut);
+    match tokio::time::timeout(deadline, task).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(join_error)) => Err(DetachedError::Join(join_error)),
+        // Dropping the JoinHandle detaches the task: it keeps running.
+        Err(_) => Err(DetachedError::Timeout),
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -61,16 +97,45 @@ pub async fn post_kip(
                 )
             })?;
 
-            let response = tokio::time::timeout(app.request_timeout, app.nexus.execute_kip(params))
-                .await
-                .map_err(|_| {
+            // Detached execution: on timeout the client gets a 408, but the
+            // started KIP execution (possibly a mid-write KML mutation)
+            // continues to completion instead of being cancelled halfway.
+            let nexus = app.nexus.clone();
+            let response = run_detached_with_timeout(app.request_timeout, async move {
+                nexus.execute_kip(params).await
+            })
+            .await
+            .map_err(|err| match err {
+                DetachedError::Timeout => {
+                    log::warn!(
+                        action = "post_kip",
+                        method = "execute_kip",
+                        timeout_secs = app.request_timeout.as_secs();
+                        "response deadline exceeded; KIP execution continues in the background",
+                    );
                     (
                         StatusCode::REQUEST_TIMEOUT,
                         Json(Response::err(
-                            "request processing exceeded the configured timeout".to_string(),
+                            "request processing exceeded the configured timeout; \
+                             the started KIP execution continues on the server"
+                                .to_string(),
                         )),
                     )
-                })?;
+                }
+                DetachedError::Join(join_error) => {
+                    log::error!(
+                        action = "post_kip",
+                        method = "execute_kip";
+                        "KIP execution task failed: {join_error:?}",
+                    );
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(Response::err(
+                            "KIP execution failed unexpectedly".to_string(),
+                        )),
+                    )
+                }
+            })?;
             Ok(Json(response))
         }
         "list_logs" => {
@@ -198,5 +263,59 @@ mod tests {
 
         headers.insert("authorization", HeaderValue::from_static("Bearer secret"));
         assert!(authorize_api_key(Some("secret"), &headers));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn detached_timeout_returns_early_but_lets_execution_finish() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let completed = Arc::new(AtomicBool::new(false));
+        let flag = completed.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let result = run_detached_with_timeout(Duration::from_millis(20), async move {
+            started_tx.send(()).unwrap();
+            // Held open well past the deadline until the test releases it.
+            let _ = release_rx.await;
+            flag.store(true, Ordering::SeqCst);
+            42u32
+        })
+        .await;
+
+        // The caller observes the timeout, not the value.
+        assert!(matches!(result, Err(DetachedError::Timeout)));
+        // The detached execution was started and, once unblocked, still
+        // runs to completion instead of being cancelled by the timeout.
+        started_rx.await.unwrap();
+        assert!(!completed.load(Ordering::SeqCst));
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !completed.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("detached execution must finish after the timeout response");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn detached_timeout_returns_value_and_maps_panics() {
+        let ok = run_detached_with_timeout(Duration::from_secs(5), async { 7u32 }).await;
+        assert!(matches!(ok, Ok(7)));
+
+        let panicked = run_detached_with_timeout(Duration::from_secs(5), async {
+            panic!("boom");
+            #[allow(unreachable_code)]
+            0u32
+        })
+        .await;
+        match panicked {
+            Err(DetachedError::Join(err)) => assert!(err.is_panic()),
+            other => panic!("expected a join error, got {other:?}"),
+        }
     }
 }

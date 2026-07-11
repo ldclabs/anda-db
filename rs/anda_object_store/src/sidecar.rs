@@ -328,18 +328,42 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
     /// data object (metadata lost, e.g. after a crash between the data and
     /// metadata writes) must not fail the whole listing — typically the very
     /// recovery scan that would heal it — so a missing sidecar document maps
-    /// to `Ok(None)` instead of an error.
+    /// to `Ok(None)` instead of an error. A sidecar document that exists but
+    /// fails to decode (e.g. a torn metadata write) is treated the same way:
+    /// the write path ([`SidecarStore::update_meta_with`]) already considers
+    /// such an object logically absent and self-heals it on the next put, so
+    /// listings must not fail on it either. Only real backend errors
+    /// propagate.
     async fn logical_e_tag(&self, location: &Path) -> Result<Option<String>> {
-        match self.get_meta(location).await {
-            Ok(meta) => Ok(meta.e_tag().map(String::from)),
+        if let Some(meta) = self.meta_cache.get(location).await {
+            return Ok(meta.e_tag().map(String::from));
+        }
+        let data = match self.fetch_meta_bytes(location).await {
+            Ok(data) => data,
             Err(Error::NotFound { .. }) => {
                 log::warn!(
                     "{}: listing orphaned data object without metadata: {location}",
                     M::STORE_NAME
                 );
+                return Ok(None);
+            }
+            Err(err) => return Err(err),
+        };
+        match self.decode_meta(location, &data) {
+            Ok(meta) => {
+                let meta = Arc::new(meta);
+                self.meta_cache.insert(location.clone(), meta.clone()).await;
+                Ok(meta.e_tag().map(String::from))
+            }
+            Err(err) => {
+                // Do not cache anything for the corrupted document: reads
+                // must keep failing loudly and the next overwrite heals it.
+                log::warn!(
+                    "{}: listing data object with corrupted metadata as orphan: {location}: {err}",
+                    M::STORE_NAME
+                );
                 Ok(None)
             }
-            Err(err) => Err(err),
         }
     }
 
