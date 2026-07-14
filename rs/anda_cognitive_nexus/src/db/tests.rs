@@ -5495,7 +5495,11 @@ fn collect_pairs(result: &Json) -> Vec<(String, String)> {
     assert_eq!(cols.len(), 2, "expected two columns: {result}");
     let c1 = cols[0].as_array().unwrap();
     let c2 = cols[1].as_array().unwrap();
-    assert_eq!(c1.len(), c2.len(), "columns must be index-aligned: {result}");
+    assert_eq!(
+        c1.len(),
+        c2.len(),
+        "columns must be index-aligned: {result}"
+    );
     let mut pairs: Vec<(String, String)> = c1
         .iter()
         .zip(c2.iter())
@@ -5533,6 +5537,80 @@ async fn test_kql_union_multi_var_row_union() {
             ("A2".to_string(), "B2".to_string()), // p1 and p2, deduplicated
         ],
         "row-wise union must keep both branches' solutions: {result}"
+    );
+}
+
+/// P1-01: a concept-only UNION branch is still a solution branch.  It must
+/// contribute one row with the variables absent from that branch padded with
+/// null instead of being collapsed into the global binding columns.
+#[tokio::test]
+async fn test_kql_union_concept_branch_preserves_solution_row() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_pair_graph(&nexus).await;
+
+    let kql = r#"
+        FIND(?a.name, ?b.name)
+        WHERE {
+            (?a, "p1", ?b)
+            UNION { ?a {type: "PairNode", name: "A1"} }
+        }
+        "#;
+    let (result, _) = nexus.execute_kql(parse_kql(kql).unwrap()).await.unwrap();
+    assert_eq!(
+        result,
+        json!([["A1", "A2", "A1"], ["B1", "B2", null]]),
+        "concept UNION branch must remain an independent padded row: {result}"
+    );
+}
+
+/// P1-01: mandatory patterns form one conjunctive main branch; a UNION
+/// relation is an independent disjunct and must not be irreversibly appended
+/// to one of the mandatory pattern relations.
+#[tokio::test]
+async fn test_kql_union_survives_empty_multi_pattern_main_branch() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_pair_graph(&nexus).await;
+
+    let kql = r#"
+        FIND(?a.name, ?b.name)
+        WHERE {
+            (?a, "p1", ?b)
+            (?b, "p1", ?a)
+            UNION { (?a, "p2", ?b) }
+        }
+        "#;
+    let (result, _) = nexus.execute_kql(parse_kql(kql).unwrap()).await.unwrap();
+    assert_eq!(
+        collect_pairs(&result),
+        vec![
+            ("A1".to_string(), "B2".to_string()),
+            ("A2".to_string(), "B2".to_string()),
+        ],
+        "UNION rows must survive an empty conjunctive main branch: {result}"
+    );
+}
+
+/// P1-02: NOT removes matching solution rows from the UNION branch only.
+/// Shared bindings and grouped pairs that are still used by the mandatory
+/// branch must remain live.
+#[tokio::test]
+async fn test_kql_not_anti_join_preserves_other_union_branch_group_count() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_pair_graph(&nexus).await;
+
+    let kql = r#"
+        FIND(?b.name, COUNT(?a))
+        WHERE {
+            (?a, "p1", ?b)
+            UNION { ?link (?a, "p2", ?b) }
+            NOT { ?link (?a, "p2", ?b) }
+        }
+        "#;
+    let (result, _) = nexus.execute_kql(parse_kql(kql).unwrap()).await.unwrap();
+    assert_eq!(
+        result,
+        json!([["B1", "B2"], [1, 1]]),
+        "NOT must not erase bindings/groups still used by the p1 branch: {result}"
     );
 }
 
@@ -5843,18 +5921,14 @@ async fn test_kql_dangling_id_matchers_return_kip_3002() {
     // Match-only `{id:}` with a dangling concept id: KIP_3002 (spec RC8),
     // not a silent empty result.
     let err = nexus
-        .execute_kql(
-            parse_kql(r#"FIND(?c.name) WHERE { ?c {id: "C:999999"} }"#).unwrap(),
-        )
+        .execute_kql(parse_kql(r#"FIND(?c.name) WHERE { ?c {id: "C:999999"} }"#).unwrap())
         .await
         .unwrap_err();
     assert!(matches!(err.code, KipErrorCode::NotFound), "{err:?}");
 
     // Match-only `(id:)` with a dangling link id: KIP_3002.
     let err = nexus
-        .execute_kql(
-            parse_kql(r#"FIND(?l.predicate) WHERE { ?l (id: "P:999999:none") }"#).unwrap(),
-        )
+        .execute_kql(parse_kql(r#"FIND(?l.predicate) WHERE { ?l (id: "P:999999:none") }"#).unwrap())
         .await
         .unwrap_err();
     assert!(matches!(err.code, KipErrorCode::NotFound), "{err:?}");
@@ -5891,7 +5965,10 @@ async fn test_kql_grouped_find_order_by_group_var() {
         }
         ORDER BY ?symptom.name ASC
         "#;
-    let (result, _) = nexus.execute_kql(parse_kql(kql_asc).unwrap()).await.unwrap();
+    let (result, _) = nexus
+        .execute_kql(parse_kql(kql_asc).unwrap())
+        .await
+        .unwrap();
     let arr = result.as_array().unwrap();
     assert_eq!(arr[0], json!(["Fever", "Headache"]), "{result}");
 }

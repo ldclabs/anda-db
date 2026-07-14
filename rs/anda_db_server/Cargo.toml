@@ -10,6 +10,7 @@ license.workspace = true
 
 [dependencies]
 anda_db = { version = "0.9", path = "../anda_db", features = ["full"] }
+anda_db_tfs = { version = "0.9", path = "../anda_db_tfs" }
 anda_object_store = { version = "0.9", path = "../anda_object_store" }
 axum = { workspace = true }
 cbor2 = { workspace = true }
@@ -22,9 +23,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 structured-logger = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
-tokio-util = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
+async-trait = { workspace = true }
+futures = { workspace = true }
 http-body-util = { version = "0.1", features = ["channel"] }
 tower = { version = "0.5", features = ["util"] }
 

@@ -7,22 +7,163 @@
 
 use anda_db_server::{AppState, ServerOptions, build_router, state::check_startup_api_key};
 use anda_object_store::{FaultKind, FaultOp, FaultRule, FaultStore};
+use async_trait::async_trait;
 use axum::{
     Router,
     body::{Body, Bytes},
     http::{Request, StatusCode, header},
 };
+use futures::stream::BoxStream;
 use http_body_util::BodyExt;
 use object_store::{
-    ObjectStore,
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
     memory::InMemory,
+    path::Path,
     throttle::{ThrottleConfig, ThrottledStore},
 };
 use serde_json::{Value, json};
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    fmt,
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
+use tokio::sync::Semaphore;
 use tower::ServiceExt;
 
 const PRIMARY_DB: &str = "test_db";
+
+#[derive(Debug)]
+struct PutGate {
+    armed: AtomicBool,
+    blocked: Semaphore,
+    release: Semaphore,
+}
+
+#[derive(Clone, Debug)]
+struct PutGateHandle {
+    gate: Arc<PutGate>,
+}
+
+impl PutGateHandle {
+    fn arm(&self) {
+        assert!(
+            !self.gate.armed.swap(true, Ordering::AcqRel),
+            "put gate was already armed"
+        );
+    }
+
+    async fn wait_until_blocked(&self) {
+        self.gate
+            .blocked
+            .acquire()
+            .await
+            .expect("put gate blocked semaphore closed")
+            .forget();
+    }
+
+    fn release(&self) {
+        self.gate.release.add_permits(1);
+    }
+}
+
+#[derive(Debug)]
+struct GatedStore {
+    inner: Arc<InMemory>,
+    gate: Arc<PutGate>,
+}
+
+impl GatedStore {
+    fn new() -> (Self, PutGateHandle) {
+        let gate = Arc::new(PutGate {
+            armed: AtomicBool::new(false),
+            blocked: Semaphore::new(0),
+            release: Semaphore::new(0),
+        });
+        (
+            Self {
+                inner: Arc::new(InMemory::new()),
+                gate: gate.clone(),
+            },
+            PutGateHandle { gate },
+        )
+    }
+}
+
+impl fmt::Display for GatedStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("GatedStore")
+    }
+}
+
+#[async_trait]
+impl ObjectStore for GatedStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> ObjectStoreResult<PutResult> {
+        if self.gate.armed.swap(false, Ordering::AcqRel) {
+            self.gate.blocked.add_permits(1);
+            self.gate
+                .release
+                .acquire()
+                .await
+                .expect("put gate release semaphore closed")
+                .forget();
+        }
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, ObjectStoreResult<Path>>,
+    ) -> BoxStream<'static, ObjectStoreResult<Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> ObjectStoreResult<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> ObjectStoreResult<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
 
 fn test_options(api_key: Option<String>) -> ServerOptions {
     ServerOptions {
@@ -222,7 +363,7 @@ async fn test_root_info_and_database_lifecycle() {
         StatusCode::BAD_REQUEST,
     )
     .await;
-    assert_eq!(err["code"], "bad_request");
+    assert_eq!(err["code"], "invalid_input");
 
     // Invalid database names are rejected before touching storage.
     let err = rpc_err(
@@ -233,7 +374,7 @@ async fn test_root_info_and_database_lifecycle() {
         StatusCode::BAD_REQUEST,
     )
     .await;
-    assert_eq!(err["code"], "bad_request");
+    assert_eq!(err["code"], "invalid_input");
 }
 
 #[tokio::test]
@@ -594,10 +735,11 @@ async fn test_db_metadata_stats_and_read_only() {
         &path,
         "doc.add",
         json!({"collection": "articles", "doc": {"title": "x", "body": "y", "score": 0}}),
-        StatusCode::BAD_REQUEST,
+        StatusCode::CONFLICT,
     )
     .await;
-    assert!(err["message"].as_str().unwrap().contains("read-only"));
+    assert_eq!(err["code"], "conflict");
+    assert_eq!(err["message"], "collection \"articles\" is read-only");
 
     rpc_ok(&app, &path, "db.set_read_only", json!({"read_only": false})).await;
     add_article(&app, PRIMARY_DB, "x", "y", 0).await;
@@ -756,7 +898,7 @@ async fn test_rpc_errors() {
         StatusCode::BAD_REQUEST,
     )
     .await;
-    assert_eq!(err["code"], "bad_request");
+    assert_eq!(err["code"], "invalid_input");
 
     // Unknown collection.
     let err = rpc_err(
@@ -768,6 +910,40 @@ async fn test_rpc_errors() {
     )
     .await;
     assert_eq!(err["code"], "not_found");
+
+    setup_articles(&app, PRIMARY_DB).await;
+
+    // Query misuse is classified at the HTTP boundary without exposing an
+    // engine/index error string.
+    let err = rpc_err(
+        &app,
+        &format!("/{PRIMARY_DB}"),
+        "doc.query_ids",
+        json!({
+            "collection": "articles",
+            "filter": {"Field": ["missing_index", {"Eq": 1}]}
+        }),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert_eq!(err["code"], "invalid_query");
+    assert_eq!(
+        err["message"],
+        "query requires B-Tree index \"missing_index\", but it does not exist"
+    );
+
+    let err = rpc_err(
+        &app,
+        &format!("/{PRIMARY_DB}"),
+        "doc.search",
+        json!({
+            "collection": "articles",
+            "query": {"search": {"vector": [1.0, 2.0]}}
+        }),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert_eq!(err["code"], "invalid_query");
 }
 
 #[tokio::test]
@@ -913,6 +1089,146 @@ async fn test_timeout_returns_408_but_mutation_still_completes() {
     rpc_ok(&app, "/slowdb", "db.metadata", Value::Null).await;
     rpc_ok(&app, "/", "db.close", json!({"name": "slowdb"})).await;
     state.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_slow_create_cannot_register_after_shutdown_closes_admission() {
+    let (store, gate) = GatedStore::new();
+    let state = test_state(Arc::new(store), None).await;
+    let app = build_router(state.clone());
+
+    gate.arm();
+    let create = tokio::spawn({
+        let app = app.clone();
+        async move { rpc_cbor(&app, "/", "db.create", json!({"name": "slowdb"})).await }
+    });
+    gate.wait_until_blocked().await;
+
+    // The create has passed RPC admission but is still inside object-store
+    // I/O. Closing admission before releasing it must prevent its final
+    // registry commit.
+    state.begin_shutdown();
+    gate.release();
+
+    let (status, resp) = tokio::time::timeout(Duration::from_secs(5), create)
+        .await
+        .expect("slow create did not exit")
+        .expect("slow create task panicked");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "resp: {resp:?}");
+    assert_eq!(resp["error"]["code"], "unavailable");
+    assert_eq!(state.db_names().await, vec![PRIMARY_DB.to_string()]);
+
+    state.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_shutdown_drains_slow_mutation_before_database_close() {
+    let (store, gate) = GatedStore::new();
+    let mut options = test_options(None);
+    options.request_timeout = Duration::from_millis(100);
+    let state = AppState::connect(Arc::new(store), options)
+        .await
+        .expect("failed to connect AppState");
+    let app = build_router(state.clone());
+    setup_articles(&app, PRIMARY_DB).await;
+
+    let db = state.get_db(PRIMARY_DB).await.unwrap();
+    let collection = db
+        .open_collection("articles".to_string(), async |_| Ok(()))
+        .await
+        .unwrap();
+    assert!(!collection.metadata().stats.read_only);
+
+    gate.arm();
+    let mutation = tokio::spawn({
+        let app = app.clone();
+        async move {
+            rpc_cbor(
+                &app,
+                &format!("/{PRIMARY_DB}"),
+                "doc.add",
+                json!({"collection": "articles", "doc": {"title": "slow", "body": "write"}}),
+            )
+            .await
+        }
+    });
+    gate.wait_until_blocked().await;
+
+    // Let the HTTP response time out and drop its JoinHandle. The mutation is
+    // now genuinely detached from the request; shutdown must still find it
+    // through the state-owned tracker.
+    let (status, resp) = mutation.await.expect("slow mutation task panicked");
+    assert_eq!(status, StatusCode::REQUEST_TIMEOUT, "resp: {resp:?}");
+
+    let shutdown = tokio::spawn({
+        let state = state.clone();
+        async move { state.shutdown().await }
+    });
+    while !state.is_shutting_down() {
+        tokio::task::yield_now().await;
+    }
+
+    // `AndaDB::close` sets every collection read-only before flushing. The
+    // collection remaining writable here proves shutdown is waiting in the
+    // mutation tracker instead of closing concurrently with the blocked add.
+    assert!(!collection.metadata().stats.read_only);
+    assert!(!shutdown.is_finished());
+
+    gate.release();
+    tokio::time::timeout(Duration::from_secs(5), shutdown)
+        .await
+        .expect("shutdown did not finish after mutation drained")
+        .expect("shutdown task panicked");
+    assert!(collection.metadata().stats.read_only);
+}
+
+#[tokio::test]
+async fn test_shutdown_deadline_uses_crash_style_abort_without_database_close() {
+    let (store, gate) = GatedStore::new();
+    let mut options = test_options(None);
+    options.shutdown_timeout = Duration::from_millis(20);
+    let state = AppState::connect(Arc::new(store), options)
+        .await
+        .expect("failed to connect AppState");
+    let app = build_router(state.clone());
+    setup_articles(&app, PRIMARY_DB).await;
+
+    let db = state.get_db(PRIMARY_DB).await.unwrap();
+    let collection = db
+        .open_collection("articles".to_string(), async |_| Ok(()))
+        .await
+        .unwrap();
+
+    gate.arm();
+    let mutation = tokio::spawn({
+        let app = app.clone();
+        async move {
+            rpc_cbor(
+                &app,
+                &format!("/{PRIMARY_DB}"),
+                "doc.add",
+                json!({"collection": "articles", "doc": {"title": "stuck", "body": "write"}}),
+            )
+            .await
+        }
+    });
+    gate.wait_until_blocked().await;
+
+    tokio::time::timeout(Duration::from_secs(5), state.shutdown())
+        .await
+        .expect("hard-deadline shutdown did not finish");
+    let (status, resp) = tokio::time::timeout(Duration::from_secs(5), mutation)
+        .await
+        .expect("aborted mutation response did not finish")
+        .expect("mutation request task panicked");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "resp: {resp:?}");
+
+    // The forced path joins the aborted mutation and auto-flush owners, but
+    // deliberately does not call AndaDB::close: publishing in-memory state
+    // after arbitrary cancellation would be less safe than crash recovery.
+    assert!(!collection.metadata().stats.read_only);
+    assert!(state.db_names().await.is_empty());
+    gate.release();
 }
 
 #[tokio::test]

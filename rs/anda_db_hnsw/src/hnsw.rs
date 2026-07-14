@@ -27,8 +27,13 @@ use std::{
     borrow::Cow,
     cmp::{self, Reverse},
     collections::{BTreeMap, BTreeSet, BinaryHeap, hash_map::Entry},
+    future::Future,
     io::{Read, Write},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    task::{Context, Poll, Waker},
 };
 
 pub use half;
@@ -68,6 +73,14 @@ pub struct HnswIndex {
     /// and rewrite adjacency lists. Without this mutex, concurrent writers can
     /// overwrite each other's neighbor-list updates.
     structural_lock: Mutex<()>,
+
+    /// Serializes complete persistence passes.
+    ///
+    /// A flush snapshots the graph under [`Self::structural_lock`], releases
+    /// that synchronous lock before doing I/O, and then persists the immutable
+    /// snapshot. Serializing those passes prevents an older snapshot from
+    /// overwriting node or id objects after a newer snapshot has committed.
+    persistence_lock: Arc<PersistenceGate>,
 
     /// Lock-free id → node map backing the graph.
     ///
@@ -116,7 +129,7 @@ pub struct HnswIndex {
 
 /// Tunable HNSW parameters. Defaults are suitable for 384–768-dim sentence
 /// embeddings; see the crate-level docs for guidance on tuning.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HnswConfig {
     /// Required vector dimensionality. Every `insert` / `search` validates this.
     pub dimension: usize,
@@ -398,7 +411,7 @@ pub fn serialize_node(node: &HnswNode) -> Vec<u8> {
 }
 
 /// Index metadata.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HnswMetadata {
     /// Index name
     pub name: String,
@@ -411,7 +424,7 @@ pub struct HnswMetadata {
 }
 
 /// Runtime statistics exported alongside the metadata.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct HnswStats {
     /// Timestamp (unix ms) of the most recent `insert`.
     pub last_inserted: u64,
@@ -443,7 +456,7 @@ pub struct HnswStats {
 }
 
 /// Serializable HNSW index structure (owned version).
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 struct HnswIndexOwned {
     pub entry_point: (u64, u8),
     pub metadata: HnswMetadata,
@@ -464,6 +477,74 @@ struct HnswIndexRef<'a> {
     removed_nodes: Vec<u64>,
 }
 
+/// Immutable, single-generation persistence image captured while structural
+/// mutations are excluded.
+struct HnswFlushSnapshot {
+    version: u64,
+    last_saved: u64,
+    dirty_ids: Vec<u64>,
+    nodes: Vec<(u64, Vec<u8>)>,
+    ids: Vec<u8>,
+    metadata: Vec<u8>,
+}
+
+/// Minimal runtime-independent async mutex used to serialize persistence I/O.
+///
+/// `anda_db_hnsw` intentionally has no runtime dependency. Waiters are parked
+/// as standard task wakers behind a short-lived synchronous mutex; the guard
+/// itself is `Send`, so a database auto-flush can still run in `tokio::spawn`.
+#[derive(Default)]
+struct PersistenceGate {
+    locked: AtomicBool,
+    waiters: Mutex<Vec<Waker>>,
+}
+
+impl PersistenceGate {
+    async fn lock(self: Arc<Self>) -> PersistenceGuard {
+        std::future::poll_fn(|cx| self.poll_lock(cx)).await
+    }
+
+    fn poll_lock(self: &Arc<Self>, cx: &mut Context<'_>) -> Poll<PersistenceGuard> {
+        if self
+            .locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Poll::Ready(PersistenceGuard { gate: self.clone() });
+        }
+
+        // Hold the waiter mutex across the second acquire attempt. This closes
+        // the lost-wakeup window with `PersistenceGuard::drop`, which releases
+        // `locked` before taking the same mutex to drain waiters.
+        let mut waiters = self.waiters.lock();
+        if self
+            .locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Poll::Ready(PersistenceGuard { gate: self.clone() });
+        }
+        if !waiters.iter().any(|waker| waker.will_wake(cx.waker())) {
+            waiters.push(cx.waker().clone());
+        }
+        Poll::Pending
+    }
+}
+
+struct PersistenceGuard {
+    gate: Arc<PersistenceGate>,
+}
+
+impl Drop for PersistenceGuard {
+    fn drop(&mut self) {
+        self.gate.locked.store(false, Ordering::Release);
+        let waiters = std::mem::take(&mut *self.gate.waiters.lock());
+        for waker in waiters {
+            waker.wake();
+        }
+    }
+}
+
 impl HnswIndex {
     /// Maximum number of in-flight node loads used by [`Self::load_nodes`].
     pub const LOAD_NODES_CONCURRENCY: usize = 32;
@@ -472,6 +553,33 @@ impl HnswIndex {
     /// being removed concurrently (each retry re-reads the repaired entry
     /// point).
     pub const SEARCH_MAX_ATTEMPTS: usize = 3;
+
+    /// Compares two persisted metadata payloads while ignoring only the
+    /// observational `last_saved` timestamp.
+    ///
+    /// Object-store wrappers use this after a conditional PUT reports a stale
+    /// version: a previous attempt may have committed durably and then been
+    /// cancelled before its returned object version was observed. Accepting a
+    /// read-back is safe only when the complete logical commit record
+    /// (entry-point, tombstones, configuration, and graph version) matches.
+    pub fn metadata_payloads_logically_equal(left: &[u8], right: &[u8]) -> Result<bool, HnswError> {
+        let decode = |data: &[u8]| -> Result<HnswIndexOwned, HnswError> {
+            cbor2::from_reader(data).map_err(|err| HnswError::Serialization {
+                name: "unknown".to_string(),
+                source: err.into(),
+            })
+        };
+
+        let mut left = decode(left)?;
+        let mut right = decode(right)?;
+        left.metadata.config = left.metadata.config.normalized();
+        right.metadata.config = right.metadata.config.normalized();
+        left.metadata.stats.last_saved = 0;
+        right.metadata.stats.last_saved = 0;
+        left.metadata.stats.search_count = 0;
+        right.metadata.stats.search_count = 0;
+        Ok(left == right)
+    }
 
     /// Pending removed-node tombstone count at which [`Self::remove`] starts
     /// warning (once per further multiple) that
@@ -511,6 +619,7 @@ impl HnswIndex {
             config: config.clone(),
             layer_gen,
             structural_lock: Mutex::new(()),
+            persistence_lock: Arc::new(PersistenceGate::default()),
             nodes: CoHashMap::new(),
             entry_point: RwLock::new((0, 0)),
             metadata: RwLock::new(HnswMetadata {
@@ -582,6 +691,7 @@ impl HnswIndex {
             config: index.metadata.config.clone(),
             layer_gen,
             structural_lock: Mutex::new(()),
+            persistence_lock: Arc::new(PersistenceGate::default()),
             nodes: CoHashMap::new(),
             entry_point: RwLock::new(entry_point),
             metadata: RwLock::new(index.metadata),
@@ -1295,9 +1405,10 @@ impl HnswIndex {
         let recalculated_max_layer = if entry_was_removed {
             Some(replacement_entry.map_or(0, |(_, layer)| layer))
         } else if node.layer >= previous_max_layer {
-            Some(self.max_tracked_layer().unwrap_or_else(|| {
-                nodes.iter().map(|(_, node)| node.layer).max().unwrap_or(0)
-            }))
+            Some(
+                self.max_tracked_layer()
+                    .unwrap_or_else(|| nodes.iter().map(|(_, node)| node.layer).max().unwrap_or(0)),
+            )
         } else {
             None
         };
@@ -1851,51 +1962,207 @@ impl HnswIndex {
         }
     }
 
+    /// Captures metadata, ids, and dirty nodes from one structural generation.
+    ///
+    /// The synchronous structural lock is intentionally released before any
+    /// object-store callback is awaited. Mutations can therefore continue
+    /// while I/O is in flight, but they cannot leak into this immutable image.
+    fn capture_flush_snapshot(&self, now_ms: u64) -> Result<Option<HnswFlushSnapshot>, HnswError> {
+        let _structural_guard = self.structural_lock.lock();
+        let current_version = self.metadata.read().stats.version;
+        let dirty_ids: Vec<u64> = self.dirty_nodes.read().iter().copied().collect();
+        if self.last_saved_version.load(Ordering::Acquire) >= current_version
+            && dirty_ids.is_empty()
+        {
+            return Ok(None);
+        }
+
+        let mut metadata = self.metadata();
+        metadata.stats.last_saved = now_ms.max(metadata.stats.last_saved);
+        let version = metadata.stats.version;
+        let last_saved = metadata.stats.last_saved;
+
+        let mut metadata_buf = Vec::with_capacity(256);
+        cbor2::to_writer(
+            &HnswIndexRef {
+                entry_point: *self.entry_point.read(),
+                metadata: &metadata,
+                removed_nodes: self.removed_nodes.read().iter().copied().collect(),
+            },
+            &mut metadata_buf,
+        )
+        .map_err(|err| HnswError::Serialization {
+            name: self.name.clone(),
+            source: err.into(),
+        })?;
+
+        let ids_data = {
+            let mut ids = self.ids.read().clone();
+            ids.run_optimize();
+            ids.serialize::<Portable>()
+        };
+        let mut ids_buf = Vec::with_capacity(ids_data.len().saturating_add(16));
+        cbor2::to_writer(&cbor2::Value::Bytes(ids_data), &mut ids_buf).map_err(|err| {
+            HnswError::Serialization {
+                name: self.name.clone(),
+                source: err.into(),
+            }
+        })?;
+
+        let nodes = self.nodes.pin();
+        let mut node_bufs = Vec::with_capacity(dirty_ids.len());
+        for id in &dirty_ids {
+            let Some(node) = nodes.get(id) else {
+                // A stale dirty mark has no live blob to persist. It is still
+                // part of `dirty_ids` so a successful commit can retire it.
+                continue;
+            };
+            let mut buf = Vec::with_capacity(4096);
+            cbor2::to_writer(node, &mut buf).map_err(|err| HnswError::Serialization {
+                name: self.name.clone(),
+                source: err.into(),
+            })?;
+            node_bufs.push((*id, buf));
+        }
+
+        Ok(Some(HnswFlushSnapshot {
+            version,
+            last_saved,
+            dirty_ids,
+            nodes: node_bufs,
+            ids: ids_buf,
+            metadata: metadata_buf,
+        }))
+    }
+
+    /// Commits the in-memory persistence watermark for a durable snapshot.
+    fn commit_flush_snapshot(&self, snapshot: &HnswFlushSnapshot) {
+        let _structural_guard = self.structural_lock.lock();
+
+        // If a mutation crossed the I/O window, leave every snapshotted dirty
+        // id pending. Rewriting a few unchanged nodes on the next pass is
+        // preferable to accidentally clearing a remove+reinsert whose node
+        // version happened to wrap or restart at the same value.
+        if self.metadata.read().stats.version == snapshot.version {
+            let mut dirty = self.dirty_nodes.write();
+            for id in &snapshot.dirty_ids {
+                dirty.remove(id);
+            }
+        }
+
+        self.last_saved_version
+            .fetch_max(snapshot.version, Ordering::Release);
+        self.update_metadata(|metadata| {
+            metadata.stats.last_saved = snapshot.last_saved.max(metadata.stats.last_saved);
+        });
+    }
+
+    /// Persists one coherent graph generation through async callbacks.
+    ///
+    /// The durable order is **nodes → ids → metadata**. Metadata is the commit
+    /// record: its callback must use compare-and-swap (or an equivalent atomic
+    /// conditional update) in production. A failure or cooperative stop before
+    /// that callback leaves both the saved-version watermark and every dirty
+    /// node pending for retry. Concurrent mutations are captured by the next
+    /// generation, and concurrent flushes are serialized so an older snapshot
+    /// cannot overwrite objects from a newer one.
+    ///
+    /// Removed-node blobs are not deleted here. Call
+    /// [`Self::purge_removed_nodes`] only after this method returns success.
+    pub async fn flush_with<N, NFut, I, IFut, M, MFut>(
+        &self,
+        now_ms: u64,
+        mut node_f: N,
+        ids_f: I,
+        metadata_f: M,
+    ) -> Result<bool, HnswError>
+    where
+        N: FnMut(u64, Vec<u8>) -> NFut,
+        NFut: Future<Output = Result<bool, BoxError>>,
+        I: FnOnce(Vec<u8>) -> IFut,
+        IFut: Future<Output = Result<(), BoxError>>,
+        M: FnOnce(Vec<u8>) -> MFut,
+        MFut: Future<Output = Result<(), BoxError>>,
+    {
+        let _persistence_guard = self.persistence_lock.clone().lock().await;
+        let Some(snapshot) = self.capture_flush_snapshot(now_ms)? else {
+            return Ok(false);
+        };
+
+        for (id, data) in &snapshot.nodes {
+            let keep_going = node_f(*id, data.clone())
+                .await
+                .map_err(|err| HnswError::Generic {
+                    name: self.name.clone(),
+                    source: err,
+                })?;
+            if !keep_going {
+                return Ok(true);
+            }
+        }
+
+        ids_f(snapshot.ids.clone())
+            .await
+            .map_err(|err| HnswError::Generic {
+                name: self.name.clone(),
+                source: err,
+            })?;
+        metadata_f(snapshot.metadata.clone())
+            .await
+            .map_err(|err| HnswError::Generic {
+                name: self.name.clone(),
+                source: err,
+            })?;
+
+        self.commit_flush_snapshot(&snapshot);
+        Ok(true)
+    }
+
     /// Persists metadata, ids and dirty nodes in one coordinated pass.
     ///
-    /// The sequence is:
-    /// 1. If neither the metadata version advanced nor dirty nodes are
-    ///    pending, return `Ok(false)` without writing anything.
-    /// 2. [`Self::store_ids`] and [`Self::store_dirty_nodes`].
-    /// 3. [`Self::store_metadata_with`] — the metadata version watermark is
-    ///    only committed after the ids and nodes it describes were written,
-    ///    so a node-write failure leaves the whole flush pending for retry
-    ///    instead of committed metadata pointing at missing node blobs.
-    ///
-    /// `f` receives `(id, &cbor_bytes)` and returns:
-    /// * `Ok(true)` — continue with the next dirty node.
-    /// * `Ok(false)` — stop; unprocessed ids are placed back on the dirty set.
-    /// * `Err(_)` — stop with an error; the failing id is also requeued.
-    ///
-    /// Removed-node blobs are NOT deleted here (this method only has a write
-    /// callback); call [`Self::purge_removed_nodes`] afterwards with a delete
-    /// callback.
-    ///
-    /// Returns `true` iff any work was actually committed.
+    /// This writer-oriented compatibility API uses the same coherent snapshot
+    /// and nodes → ids → metadata commit order as [`Self::flush_with`].
+    /// `f` receives `(id, &cbor_bytes)` and may return `Ok(false)` to stop
+    /// cooperatively before ids or metadata are committed.
     pub async fn flush<W: Write, F>(
         &self,
         mut metadata: W,
-        ids: W,
+        mut ids: W,
         now_ms: u64,
-        f: F,
+        mut f: F,
     ) -> Result<bool, HnswError>
     where
         F: AsyncFnMut(u64, &[u8]) -> Result<bool, BoxError>,
     {
-        let had_dirty = self.has_dirty_nodes();
-        if !self.has_pending_metadata_flush() && !had_dirty {
+        let _persistence_guard = self.persistence_lock.clone().lock().await;
+        let Some(snapshot) = self.capture_flush_snapshot(now_ms)? else {
             return Ok(false);
+        };
+
+        for (id, data) in &snapshot.nodes {
+            let keep_going = f(*id, data).await.map_err(|err| HnswError::Generic {
+                name: self.name.clone(),
+                source: err,
+            })?;
+            if !keep_going {
+                return Ok(true);
+            }
         }
 
-        self.store_ids(ids)?;
-        self.store_dirty_nodes(f).await?;
-        let meta_saved = self
-            .store_metadata_with(now_ms, async |data| {
-                metadata.write_all(data)?;
-                Ok(())
-            })
-            .await?;
-        Ok(meta_saved || had_dirty)
+        ids.write_all(&snapshot.ids)
+            .map_err(|err| HnswError::Serialization {
+                name: self.name.clone(),
+                source: err.into(),
+            })?;
+        metadata
+            .write_all(&snapshot.metadata)
+            .map_err(|err| HnswError::Serialization {
+                name: self.name.clone(),
+                source: err.into(),
+            })?;
+
+        self.commit_flush_snapshot(&snapshot);
+        Ok(true)
     }
 
     /// Returns whether there are dirty nodes pending persistence.
@@ -1916,9 +2183,10 @@ impl HnswIndex {
     /// forever. Call this after [`Self::store_dirty_nodes`] on each flush.
     ///
     /// Ids whose node has been re-inserted in the meantime are skipped. The
-    /// callback returns `Ok(true)` to continue, `Ok(false)` to stop early;
-    /// unprocessed ids (and, on `Err`, the failing id) are put back and
-    /// retried on the next call. Treat "blob not found" as success in the
+    /// callback returns `Ok(true)` to acknowledge the current deletion and
+    /// continue. `Ok(false)` stops early without consuming the current id, so
+    /// it and all later unprocessed ids remain retryable; on `Err`, the failing
+    /// id likewise remains retryable. Treat "blob not found" as success in the
     /// callback: a crash between a purge and the next flush simply retries
     /// deletions that already happened, and reloaded metadata may re-queue
     /// tombstones whose blobs were already deleted.
@@ -1934,56 +2202,63 @@ impl HnswIndex {
     where
         F: AsyncFnMut(u64) -> Result<bool, BoxError>,
     {
-        let mut removed = {
-            let mut guard = self.removed_nodes.write();
-            std::mem::take(&mut *guard)
-        };
+        let _persistence_guard = self.persistence_lock.clone().lock().await;
+        // Never move tombstones out of the authoritative set before an await:
+        // dropping this future at any callback boundary must leave the current
+        // and remaining ids retryable. Each successful callback retires its id
+        // synchronously in the same poll that observes success.
+        let removed: Vec<u64> = self.removed_nodes.read().iter().copied().collect();
 
-        // Number of tombstones consumed (blob deleted, or skipped because the
-        // id was re-inserted). Any consumption shrinks the tombstone set, so
-        // the metadata snapshot that carries it must be re-persisted.
-        let mut consumed = 0usize;
-        let commit_progress = |consumed: usize| {
-            if consumed > 0 {
-                self.update_metadata(|m| {
-                    m.stats.version += 1;
-                });
-            }
-        };
-
-        while let Some(id) = removed.pop_first() {
-            // Skip ids that were re-inserted after the tombstone snapshot;
-            // deleting their blob would drop a live node's persisted state.
-            {
+        for id in removed {
+            // Re-check under the structural gate. An id re-inserted after the
+            // snapshot owns a new live blob and its old tombstone is obsolete.
+            let reinserted = {
+                let _structural_guard = self.structural_lock.lock();
                 let nodes = self.nodes.pin();
                 if nodes.contains_key(&id) {
-                    consumed += 1;
-                    continue;
+                    let retired = self.removed_nodes.write().remove(&id);
+                    drop(nodes);
+                    if retired {
+                        self.update_metadata(|m| m.stats.version += 1);
+                    }
+                    true
+                } else {
+                    false
                 }
+            };
+            if reinserted {
+                continue;
             }
 
-            match f(id).await {
-                Ok(true) => {
-                    consumed += 1;
-                }
-                Ok(false) => {
-                    self.removed_nodes.write().append(&mut removed);
-                    commit_progress(consumed);
-                    return Ok(());
-                }
-                Err(err) => {
-                    removed.insert(id);
-                    self.removed_nodes.write().append(&mut removed);
-                    commit_progress(consumed);
-                    return Err(HnswError::Generic {
-                        name: self.name.clone(),
-                        source: err,
-                    });
+            let keep_going = f(id).await.map_err(|source| HnswError::Generic {
+                name: self.name.clone(),
+                source,
+            })?;
+
+            // `Ok(false)` is cooperative stop, not acknowledgement that this
+            // id's persisted blob was deleted. Leave the current tombstone in
+            // the authoritative set so the next purge retries it.
+            if !keep_going {
+                return Ok(());
+            }
+
+            // The delete is durable. Retire the tombstone only if the id is
+            // still absent; a concurrent re-insert already removed it and
+            // marked the new node dirty. Bump metadata immediately so future
+            // cancellation cannot lose evidence that the tombstone set shrank.
+            {
+                let _structural_guard = self.structural_lock.lock();
+                let nodes = self.nodes.pin();
+                if !nodes.contains_key(&id) {
+                    let retired = self.removed_nodes.write().remove(&id);
+                    drop(nodes);
+                    if retired {
+                        self.update_metadata(|m| m.stats.version += 1);
+                    }
                 }
             }
         }
 
-        commit_progress(consumed);
         Ok(())
     }
 
@@ -2070,59 +2345,49 @@ impl HnswIndex {
     where
         F: AsyncFnOnce(&[u8]) -> Result<(), BoxError>,
     {
-        // Fast path: if the version is already saved, avoid cloning metadata.
-        let current_version = { self.metadata.read().stats.version };
-        if self.last_saved_version.load(Ordering::Relaxed) >= current_version {
-            return Ok(false);
-        }
+        let _persistence_guard = self.persistence_lock.clone().lock().await;
+        let (version, last_saved, buf) = {
+            // Keep entry-point, tombstones and metadata in one structural
+            // generation while building the immutable payload. The guard is
+            // released before the async callback.
+            let _structural_guard = self.structural_lock.lock();
+            let mut meta = self.metadata();
+            if self.last_saved_version.load(Ordering::Acquire) >= meta.stats.version {
+                return Ok(false);
+            }
 
-        let mut meta = self.metadata();
-        // Atomically claim the right to serialize this version.
-        let prev_saved_version = self
-            .last_saved_version
-            .fetch_max(meta.stats.version, Ordering::Relaxed);
-        if prev_saved_version >= meta.stats.version {
-            return Ok(false);
-        }
-
-        meta.stats.last_saved = now_ms.max(meta.stats.last_saved);
-        let revert_claim = || {
-            // Revert only if no other writer has already advanced this atomic
-            // to a newer version.
-            let _ = self.last_saved_version.compare_exchange(
-                meta.stats.version,
-                prev_saved_version,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            );
-        };
-
-        let mut buf = Vec::with_capacity(256);
-        if let Err(err) = cbor2::to_writer(
-            &HnswIndexRef {
-                entry_point: *self.entry_point.read(),
-                metadata: &meta,
-                removed_nodes: self.removed_nodes.read().iter().copied().collect(),
-            },
-            &mut buf,
-        ) {
-            revert_claim();
-            return Err(HnswError::Serialization {
+            meta.stats.last_saved = now_ms.max(meta.stats.last_saved);
+            let version = meta.stats.version;
+            let last_saved = meta.stats.last_saved;
+            let mut buf = Vec::with_capacity(256);
+            cbor2::to_writer(
+                &HnswIndexRef {
+                    entry_point: *self.entry_point.read(),
+                    metadata: &meta,
+                    removed_nodes: self.removed_nodes.read().iter().copied().collect(),
+                },
+                &mut buf,
+            )
+            .map_err(|err| HnswError::Serialization {
                 name: self.name.clone(),
                 source: err.into(),
-            });
-        }
+            })?;
+            (version, last_saved, buf)
+        };
 
         if let Err(err) = f(&buf).await {
-            revert_claim();
             return Err(HnswError::Generic {
                 name: self.name.clone(),
                 source: err,
             });
         }
 
+        // Publish only after the callback confirms durability. Cancellation
+        // at any earlier await leaves this generation pending for retry.
+        self.last_saved_version
+            .fetch_max(version, Ordering::Release);
         self.update_metadata(|m| {
-            m.stats.last_saved = meta.stats.last_saved.max(m.stats.last_saved);
+            m.stats.last_saved = last_saved.max(m.stats.last_saved);
         });
 
         Ok(true)
@@ -2166,51 +2431,61 @@ impl HnswIndex {
     where
         F: AsyncFnMut(u64, &[u8]) -> Result<bool, BoxError>,
     {
-        let mut dirty_nodes = {
-            // move the dirty nodes into a temporary variable
-            // and release the lock
-            let mut guard = self.dirty_nodes.write();
-            std::mem::take(&mut *guard)
-        };
+        let _persistence_guard = self.persistence_lock.clone().lock().await;
+        // Iterate an immutable id snapshot. Dirty evidence remains in the
+        // authoritative set until the corresponding callback succeeds, so
+        // dropping this future at an await boundary is inherently retryable.
+        let dirty_ids: Vec<u64> = self.dirty_nodes.read().iter().copied().collect();
 
-        let mut buf = Vec::with_capacity(4096);
-        while let Some(id) = dirty_nodes.pop_first() {
-            // Hold the `papaya` pin guard only while serializing; it is `!Send`
-            // and must be dropped before the `.await` below.
-            let has_node = {
-                let nodes = self.nodes.pin();
-                if let Some(node) = nodes.get(&id) {
-                    buf.clear();
-                    cbor2::to_writer(&node, &mut buf).map_err(|err| HnswError::Serialization {
-                        name: self.name.clone(),
-                        source: err.into(),
-                    })?;
-                    true
+        for id in dirty_ids {
+            let snapshot = {
+                // Mutations increment the global metadata version while
+                // holding this gate. If that generation changes during I/O,
+                // conservatively leave the id dirty even when this particular
+                // node's serialized bytes happen to look unchanged.
+                let _structural_guard = self.structural_lock.lock();
+                if !self.dirty_nodes.read().contains(&id) {
+                    None
                 } else {
-                    false
+                    let generation = self.metadata.read().stats.version;
+                    let nodes = self.nodes.pin();
+                    if let Some(node) = nodes.get(&id) {
+                        let mut data = Vec::with_capacity(4096);
+                        cbor2::to_writer(node, &mut data).map_err(|err| {
+                            HnswError::Serialization {
+                                name: self.name.clone(),
+                                source: err.into(),
+                            }
+                        })?;
+                        Some((generation, data))
+                    } else {
+                        // A stale mark without a live node needs no external
+                        // write. Retire it synchronously while mutations are
+                        // excluded.
+                        drop(nodes);
+                        self.dirty_nodes.write().remove(&id);
+                        None
+                    }
                 }
             };
 
-            if has_node {
-                match f(id, &buf).await {
-                    Ok(true) => {
-                        // continue
-                    }
-                    Ok(false) => {
-                        // stop and refund the unprocessed dirty nodes
-                        self.dirty_nodes.write().append(&mut dirty_nodes);
-                        return Ok(());
-                    }
-                    Err(err) => {
-                        // refund the unprocessed dirty nodes
-                        dirty_nodes.insert(id);
-                        self.dirty_nodes.write().append(&mut dirty_nodes);
-                        return Err(HnswError::Generic {
-                            name: self.name.clone(),
-                            source: err,
-                        });
-                    }
+            let Some((generation, data)) = snapshot else {
+                continue;
+            };
+            let keep_going = f(id, &data).await.map_err(|source| HnswError::Generic {
+                name: self.name.clone(),
+                source,
+            })?;
+
+            {
+                let _structural_guard = self.structural_lock.lock();
+                if self.metadata.read().stats.version == generation {
+                    self.dirty_nodes.write().remove(&id);
                 }
+            }
+
+            if !keep_going {
+                return Ok(());
             }
         }
 
@@ -2663,6 +2938,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_purge_removed_nodes_stop_keeps_current_tombstone_retryable() {
+        let index = HnswIndex::new(
+            "purge_stop".to_string(),
+            Some(HnswConfig {
+                dimension: 2,
+                ..Default::default()
+            }),
+        );
+        index.insert_f32(1, vec![1.0, 1.0], 0).unwrap();
+        assert!(index.remove(1, 1));
+
+        let mut attempted = Vec::new();
+        index
+            .purge_removed_nodes(async |id| {
+                attempted.push(id);
+                Ok(false)
+            })
+            .await
+            .unwrap();
+        assert_eq!(attempted, vec![1]);
+        assert!(index.has_removed_nodes());
+
+        let mut retried = Vec::new();
+        index
+            .purge_removed_nodes(async |id| {
+                retried.push(id);
+                Ok(true)
+            })
+            .await
+            .unwrap();
+        assert_eq!(retried, vec![1]);
+        assert!(!index.has_removed_nodes());
+    }
+
+    #[tokio::test]
     async fn test_purge_bumps_metadata_version_so_flush_persists_cleared_tombstones() {
         let index = HnswIndex::new("purge_flush".to_string(), Some(test_config()));
         index.insert_f32(1, vec![1.0, 1.0], 0).unwrap();
@@ -2956,8 +3266,8 @@ mod tests {
         let index = HnswIndex::new("flush_order".to_string(), Some(test_config()));
         index.insert_f32(1, vec![1.0, 1.0], 0).unwrap();
 
-        // Node persistence fails: the metadata version watermark must NOT
-        // have been committed (ids and nodes are written first).
+        // Node persistence fails: neither ids nor the metadata commit record
+        // may be published, and the version watermark must remain pending.
         let mut metadata = Vec::new();
         let mut ids = Vec::new();
         let err = index
@@ -2968,6 +3278,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, HnswError::Generic { .. }));
         assert!(metadata.is_empty());
+        assert!(ids.is_empty());
         assert!(index.has_pending_metadata_flush());
         assert!(index.has_dirty_nodes());
 
@@ -2995,6 +3306,95 @@ mod tests {
         .unwrap();
         assert_eq!(reloaded.len(), 1);
         assert_eq!(reloaded.search_f32(&[1.0, 1.0], 1).unwrap()[0].0, 1);
+    }
+
+    #[tokio::test]
+    async fn test_flush_snapshot_excludes_mutation_crossing_node_put() {
+        let index = HnswIndex::new("flush_snapshot".to_string(), Some(test_config()));
+        index.insert_f32(1, vec![1.0, 1.0], 0).unwrap();
+
+        let persisted_nodes = Arc::new(Mutex::new(HashMap::<u64, Vec<u8>>::new()));
+        let persisted_ids = Arc::new(Mutex::new(Vec::new()));
+        let persisted_metadata = Arc::new(Mutex::new(Vec::new()));
+        let inserted_during_io = Arc::new(AtomicBool::new(false));
+
+        assert!(
+            index
+                .flush_with(
+                    1,
+                    |id, data| {
+                        persisted_nodes.lock().insert(id, data);
+                        if !inserted_during_io.swap(true, Ordering::AcqRel) {
+                            // The immutable snapshot was already captured. This
+                            // mutation must stay wholly in the next generation,
+                            // even though it crosses the node-write callback.
+                            index.insert_f32(2, vec![2.0, 2.0], 2).unwrap();
+                        }
+                        std::future::ready(Ok::<bool, BoxError>(true))
+                    },
+                    |data| {
+                        *persisted_ids.lock() = data;
+                        std::future::ready(Ok::<(), BoxError>(()))
+                    },
+                    |data| {
+                        *persisted_metadata.lock() = data;
+                        std::future::ready(Ok::<(), BoxError>(()))
+                    },
+                )
+                .await
+                .unwrap()
+        );
+
+        // The committed image is generation 1 only; generation 2 remains
+        // pending rather than leaking into ids or metadata.
+        let first_metadata = persisted_metadata.lock().clone();
+        let first_ids = persisted_ids.lock().clone();
+        let first_nodes = persisted_nodes.clone();
+        let first = HnswIndex::load_all(
+            first_metadata.as_slice(),
+            first_ids.as_slice(),
+            async move |id| Ok(first_nodes.lock().get(&id).cloned()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.node_ids(), vec![1]);
+        assert!(index.has_pending_metadata_flush());
+        assert!(index.has_dirty_nodes());
+
+        // A retry snapshots and commits the later mutation, including the
+        // neighbor rewrite of node 1 that happened during the first I/O pass.
+        index
+            .flush_with(
+                3,
+                |id, data| {
+                    persisted_nodes.lock().insert(id, data);
+                    std::future::ready(Ok::<bool, BoxError>(true))
+                },
+                |data| {
+                    *persisted_ids.lock() = data;
+                    std::future::ready(Ok::<(), BoxError>(()))
+                },
+                |data| {
+                    *persisted_metadata.lock() = data;
+                    std::future::ready(Ok::<(), BoxError>(()))
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!index.has_pending_metadata_flush());
+        assert!(!index.has_dirty_nodes());
+
+        let final_metadata = persisted_metadata.lock().clone();
+        let final_ids = persisted_ids.lock().clone();
+        let final_nodes = persisted_nodes.clone();
+        let final_index = HnswIndex::load_all(
+            final_metadata.as_slice(),
+            final_ids.as_slice(),
+            async move |id| Ok(final_nodes.lock().get(&id).cloned()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(final_index.node_ids(), vec![1, 2]);
     }
 
     #[tokio::test]
@@ -3032,6 +3432,115 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn test_store_metadata_with_cancellation_keeps_generation_pending() {
+        let index = Arc::new(HnswIndex::new(
+            "metadata_cancel".to_string(),
+            Some(test_config()),
+        ));
+        index.insert_f32(1, vec![1.0, 1.0], 0).unwrap();
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let task_index = index.clone();
+        let task_entered = entered.clone();
+        let task = tokio::spawn(async move {
+            task_index
+                .store_metadata_with(1, async move |_| {
+                    task_entered.notify_one();
+                    std::future::pending::<Result<(), BoxError>>().await
+                })
+                .await
+        });
+        entered.notified().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        assert!(index.has_pending_metadata_flush());
+        assert!(
+            index
+                .store_metadata_with(2, async |_| Ok(()))
+                .await
+                .unwrap()
+        );
+        assert!(!index.has_pending_metadata_flush());
+    }
+
+    #[tokio::test]
+    async fn test_store_dirty_nodes_cancellation_keeps_current_node_dirty() {
+        let index = Arc::new(HnswIndex::new(
+            "dirty_cancel".to_string(),
+            Some(test_config()),
+        ));
+        index.insert_f32(1, vec![1.0, 1.0], 0).unwrap();
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let task_index = index.clone();
+        let task_entered = entered.clone();
+        let task = tokio::spawn(async move {
+            task_index
+                .store_dirty_nodes(async move |_, _| {
+                    task_entered.notify_one();
+                    std::future::pending::<Result<bool, BoxError>>().await
+                })
+                .await
+        });
+        entered.notified().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        assert!(index.has_dirty_nodes());
+        let persisted = Arc::new(Mutex::new(Vec::new()));
+        let output = persisted.clone();
+        index
+            .store_dirty_nodes(async move |id, _| {
+                output.lock().push(id);
+                Ok(true)
+            })
+            .await
+            .unwrap();
+        assert_eq!(*persisted.lock(), vec![1]);
+        assert!(!index.has_dirty_nodes());
+    }
+
+    #[tokio::test]
+    async fn test_purge_removed_nodes_cancellation_keeps_tombstone_retryable() {
+        let index = Arc::new(HnswIndex::new(
+            "purge_cancel".to_string(),
+            Some(test_config()),
+        ));
+        index.insert_f32(1, vec![1.0, 1.0], 0).unwrap();
+        index
+            .store_dirty_nodes(async |_, _| Ok(true))
+            .await
+            .unwrap();
+        assert!(index.remove(1, 1));
+        index
+            .store_metadata_with(2, async |_| Ok(()))
+            .await
+            .unwrap();
+        assert!(!index.has_pending_metadata_flush());
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let task_index = index.clone();
+        let task_entered = entered.clone();
+        let task = tokio::spawn(async move {
+            task_index
+                .purge_removed_nodes(async move |_| {
+                    task_entered.notify_one();
+                    std::future::pending::<Result<bool, BoxError>>().await
+                })
+                .await
+        });
+        entered.notified().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        assert!(index.has_removed_nodes());
+        index.purge_removed_nodes(async |_| Ok(true)).await.unwrap();
+        assert!(!index.has_removed_nodes());
+        assert!(index.has_pending_metadata_flush());
     }
 
     #[test]

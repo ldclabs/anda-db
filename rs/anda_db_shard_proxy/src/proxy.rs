@@ -14,7 +14,13 @@ use axum::{
     response::IntoResponse,
 };
 use hyper_util::client::legacy::Client;
-use std::{net::SocketAddr, sync::Arc};
+use ipnet::IpNet;
+use std::{
+    future::Future,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+};
+use tokio::sync::Semaphore;
 use tokio::time::{Duration, timeout};
 
 use crate::store::{ResolvedRoute, ShardStore};
@@ -50,6 +56,17 @@ pub struct AppState {
     /// Custom extractor to read the database name or shard ID from requests.
     /// Defaults to [`crate::router::PrefixExtractor`].
     pub db_name_extractor: Arc<dyn DbShardExtractor>,
+    /// Networks whose directly connected peers may supply an existing
+    /// `X-Forwarded-*` chain. With an empty list (the default), all incoming
+    /// forwarding headers are discarded and rebuilt from the socket peer,
+    /// original `Host`, and this proxy's HTTP scheme.
+    pub trusted_proxy_cidrs: Arc<[IpNet]>,
+    /// Upper bound covering both waiting for a route-resolution permit and
+    /// querying PostgreSQL on a cache miss.
+    pub route_resolve_timeout: Duration,
+    /// Limits concurrent database-name route resolutions so random cold
+    /// misses cannot exhaust the PostgreSQL pool or create unbounded queues.
+    pub route_resolve_semaphore: Arc<Semaphore>,
     /// Upper bound for a proxied backend request **up to the response
     /// headers**: it covers connecting, sending the request, and waiting for
     /// the backend to start responding. Streaming the response body is not
@@ -91,11 +108,25 @@ pub async fn proxy_handler(
     let original_uri = req.uri().clone();
     let route = match state.db_name_extractor.extract(req.uri(), req.headers()) {
         (Some(id), _) => state.store.resolve_by_shard(id).await,
-        (_, Some(name)) => match state.store.resolve(&name).await {
+        (_, Some(name)) => match resolve_with_limits(
+            &state.route_resolve_semaphore,
+            state.route_resolve_timeout,
+            || state.store.resolve(&name),
+        )
+        .await
+        {
             Ok(route) => route,
+            Err(RouteResolveError::Timeout) => {
+                log::warn!("route resolution timed out for {name:?}");
+                return Err((StatusCode::GATEWAY_TIMEOUT, "route resolution timed out"));
+            }
+            Err(RouteResolveError::AdmissionClosed) => {
+                log::error!("route resolution admission is closed");
+                return Err((StatusCode::SERVICE_UNAVAILABLE, "routing store unavailable"));
+            }
             // A routing-store failure is not "database not found": answer 503
             // so clients retry instead of assuming the database is gone.
-            Err(err) => {
+            Err(RouteResolveError::Store(err)) => {
                 log::error!("failed to resolve route for {name:?}: {err}");
                 return Err((StatusCode::SERVICE_UNAVAILABLE, "routing store unavailable"));
             }
@@ -113,12 +144,18 @@ pub async fn proxy_handler(
         .get::<ConnectInfo<SocketAddr>>()
         .map(|info| info.0.ip());
     let original_host = req.headers().get(header::HOST).cloned();
+    let trust_forwarded_chain = is_trusted_proxy(client_ip, &state.trusted_proxy_cidrs);
 
     remove_hop_by_hop_headers(req.headers_mut());
     // add the shard ID header so backends can know which shard the request is for (required)
     req.headers_mut()
         .insert(SHARD_ID_HEADER, route.shard_id.into());
-    add_forwarded_headers(req.headers_mut(), client_ip, original_host);
+    add_forwarded_headers(
+        req.headers_mut(),
+        client_ip,
+        original_host,
+        trust_forwarded_chain,
+    );
 
     let mut resp = timeout(state.proxy_request_timeout, state.client.request(req))
         .await
@@ -133,6 +170,44 @@ pub async fn proxy_handler(
     Ok::<_, (StatusCode, &str)>(resp.map(Body::new))
 }
 
+fn is_trusted_proxy(peer_ip: Option<IpAddr>, trusted_proxy_cidrs: &[IpNet]) -> bool {
+    peer_ip.is_some_and(|ip| {
+        trusted_proxy_cidrs
+            .iter()
+            .any(|network| network.contains(&ip))
+    })
+}
+
+#[derive(Debug)]
+enum RouteResolveError<E> {
+    Timeout,
+    AdmissionClosed,
+    Store(E),
+}
+
+/// Run a potentially blocking route resolution behind a shared concurrency
+/// limit. The timeout starts before semaphore acquisition so both queueing
+/// and PostgreSQL work have a fixed upper bound.
+async fn resolve_with_limits<T, E, F, Fut>(
+    semaphore: &Semaphore,
+    deadline: Duration,
+    resolve: F,
+) -> Result<T, RouteResolveError<E>>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+{
+    timeout(deadline, async {
+        let _permit = semaphore
+            .acquire()
+            .await
+            .map_err(|_| RouteResolveError::AdmissionClosed)?;
+        resolve().await.map_err(RouteResolveError::Store)
+    })
+    .await
+    .map_err(|_| RouteResolveError::Timeout)?
+}
+
 /// Build the backend URI by preserving the original path and query string.
 fn build_target_uri(backend_addr: &str, request_uri: &Uri) -> Result<Uri, ()> {
     let path_and_query = request_uri
@@ -145,16 +220,22 @@ fn build_target_uri(backend_addr: &str, request_uri: &Uri) -> Result<Uri, ()> {
         .map_err(|_| ())
 }
 
-/// Append the standard `X-Forwarded-*` headers so backends keep the client
-/// IP, original Host, and scheme for auditing and rate limiting. Existing
-/// values from an upstream load balancer are preserved: the client IP is
-/// appended to `X-Forwarded-For`, while `X-Forwarded-Host`/`-Proto` are only
-/// set when absent.
+/// Set the standard `X-Forwarded-*` headers so backends keep the client IP,
+/// original Host, and scheme for auditing and rate limiting. Existing values
+/// are accepted only from an explicitly trusted immediate peer. Direct or
+/// otherwise untrusted clients have all three headers discarded and rebuilt.
 fn add_forwarded_headers(
     headers: &mut HeaderMap,
-    client_ip: Option<std::net::IpAddr>,
+    client_ip: Option<IpAddr>,
     original_host: Option<HeaderValue>,
+    trust_existing: bool,
 ) {
+    if !trust_existing {
+        headers.remove(X_FORWARDED_FOR);
+        headers.remove(X_FORWARDED_HOST);
+        headers.remove(X_FORWARDED_PROTO);
+    }
+
     if let Some(ip) = client_ip {
         let xff = match headers.get(X_FORWARDED_FOR).and_then(|v| v.to_str().ok()) {
             Some(existing) => format!("{existing}, {ip}"),
@@ -261,6 +342,7 @@ mod tests {
             &mut headers,
             Some("10.1.2.3".parse().unwrap()),
             Some(HeaderValue::from_static("proxy.example.com")),
+            false,
         );
         assert_eq!(
             headers.get(X_FORWARDED_FOR).and_then(|v| v.to_str().ok()),
@@ -277,7 +359,7 @@ mod tests {
     }
 
     #[test]
-    fn add_forwarded_headers_preserves_upstream_values() {
+    fn add_forwarded_headers_preserves_values_from_trusted_peer() {
         let mut headers = HeaderMap::new();
         headers.insert(X_FORWARDED_FOR, HeaderValue::from_static("192.0.2.9"));
         headers.insert(X_FORWARDED_HOST, HeaderValue::from_static("lb.example.com"));
@@ -287,6 +369,7 @@ mod tests {
             &mut headers,
             Some("10.1.2.3".parse().unwrap()),
             Some(HeaderValue::from_static("proxy.example.com")),
+            true,
         );
 
         assert_eq!(
@@ -301,6 +384,71 @@ mod tests {
             headers.get(X_FORWARDED_PROTO).and_then(|v| v.to_str().ok()),
             Some("https")
         );
+    }
+
+    #[test]
+    fn add_forwarded_headers_replaces_spoofed_values_from_untrusted_peer() {
+        let mut headers = HeaderMap::new();
+        headers.insert(X_FORWARDED_FOR, HeaderValue::from_static("192.0.2.9"));
+        headers.insert(X_FORWARDED_HOST, HeaderValue::from_static("spoof.example"));
+        headers.insert(X_FORWARDED_PROTO, HeaderValue::from_static("https"));
+
+        add_forwarded_headers(
+            &mut headers,
+            Some("203.0.113.7".parse().unwrap()),
+            Some(HeaderValue::from_static("api.example.com")),
+            false,
+        );
+
+        assert_eq!(headers.get(X_FORWARDED_FOR).unwrap(), "203.0.113.7");
+        assert_eq!(headers.get(X_FORWARDED_HOST).unwrap(), "api.example.com");
+        assert_eq!(headers.get(X_FORWARDED_PROTO).unwrap(), "http");
+    }
+
+    #[test]
+    fn trusted_proxy_requires_immediate_peer_inside_configured_cidr() {
+        let networks: Vec<IpNet> = vec!["10.0.0.0/8".parse().unwrap(), "fd00::/8".parse().unwrap()];
+
+        assert!(is_trusted_proxy(
+            Some("10.42.0.9".parse().unwrap()),
+            &networks
+        ));
+        assert!(is_trusted_proxy(
+            Some("fd12::1".parse().unwrap()),
+            &networks
+        ));
+        assert!(!is_trusted_proxy(
+            Some("192.0.2.9".parse().unwrap()),
+            &networks
+        ));
+        assert!(!is_trusted_proxy(None, &networks));
+        assert!(!is_trusted_proxy(Some("10.42.0.9".parse().unwrap()), &[]));
+    }
+
+    #[tokio::test]
+    async fn route_resolution_timeout_covers_semaphore_queueing() {
+        let semaphore = Semaphore::new(1);
+        let _held = semaphore.acquire().await.unwrap();
+
+        let result = resolve_with_limits(&semaphore, Duration::from_millis(20), || async {
+            Ok::<_, ()>(())
+        })
+        .await;
+
+        assert!(matches!(result, Err(RouteResolveError::Timeout)));
+    }
+
+    #[tokio::test]
+    async fn route_resolution_timeout_covers_resolver_work() {
+        let semaphore = Semaphore::new(1);
+
+        let result = resolve_with_limits(&semaphore, Duration::from_millis(20), || async {
+            std::future::pending::<Result<(), ()>>().await
+        })
+        .await;
+
+        assert!(matches!(result, Err(RouteResolveError::Timeout)));
+        assert_eq!(semaphore.available_permits(), 1);
     }
 
     #[test]

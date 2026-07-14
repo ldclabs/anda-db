@@ -6,12 +6,17 @@
 
 use anda_db_utils::UniqueVec;
 use dashmap::DashMap;
-use parking_lot::RwLock;
+use parking_lot::{Mutex as ParkingMutex, RwLock};
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use std::{
+    future::Future,
     io::{Read, Write},
-    sync::atomic::{AtomicU32, AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    },
+    task::{Context, Poll, Waker},
 };
 
 use crate::error::*;
@@ -51,16 +56,76 @@ fn cbor_serialized_size<T: ?Sized + Serialize>(value: &T) -> usize {
 ///
 /// [`flush`]: Self::flush
 /// [`store_metadata`]: Self::store_metadata
-/// A claimed, serialized metadata snapshot pending persistence.
-///
-/// Produced by `BM25Index::claim_metadata_snapshot`; must be resolved with
-/// either `commit_metadata_claim` or `revert_metadata_claim`.
+/// A serialized metadata snapshot pending persistence.
 struct MetadataSnapshot {
     version: u64,
-    prev_saved_version: u64,
     max_bucket_id: u32,
     last_saved: u64,
     buf: Vec<u8>,
+}
+
+/// A serialized bucket captured at one mutation-consistent flush boundary.
+struct BucketSnapshot {
+    bucket_id: u32,
+    version: u64,
+    buf: Vec<u8>,
+}
+
+/// Minimal runtime-independent async mutex used to serialize persistence I/O.
+///
+/// `anda_db_tfs` intentionally has no async-runtime dependency. Waiters are
+/// parked as standard task wakers behind a short-lived synchronous mutex; the
+/// guard is `Send`, so database auto-flush tasks may hold it across awaits.
+#[derive(Default)]
+struct PersistenceGate {
+    locked: AtomicBool,
+    waiters: ParkingMutex<Vec<Waker>>,
+}
+
+impl PersistenceGate {
+    async fn lock(self: Arc<Self>) -> PersistenceGuard {
+        std::future::poll_fn(|cx| self.poll_lock(cx)).await
+    }
+
+    fn poll_lock(self: &Arc<Self>, cx: &mut Context<'_>) -> Poll<PersistenceGuard> {
+        if self
+            .locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Poll::Ready(PersistenceGuard { gate: self.clone() });
+        }
+
+        // Hold the waiter mutex across the second acquire attempt. This closes
+        // the lost-wakeup window with `PersistenceGuard::drop`, which releases
+        // `locked` before taking the same mutex to drain waiters.
+        let mut waiters = self.waiters.lock();
+        if self
+            .locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Poll::Ready(PersistenceGuard { gate: self.clone() });
+        }
+        if !waiters.iter().any(|waker| waker.will_wake(cx.waker())) {
+            waiters.push(cx.waker().clone());
+        }
+        Poll::Pending
+    }
+}
+
+struct PersistenceGuard {
+    gate: Arc<PersistenceGate>,
+}
+
+impl Drop for PersistenceGuard {
+    fn drop(&mut self) {
+        self.gate.locked.store(false, Ordering::Release);
+        let waiters = std::mem::take(&mut *self.gate.waiters.lock());
+        for waker in waiters {
+            waker.wake();
+        }
+    }
 }
 
 pub struct BM25Index<T: Tokenizer + Clone> {
@@ -110,6 +175,21 @@ pub struct BM25Index<T: Tokenizer + Clone> {
     /// `0..=max_bucket_id`), so [`flush`](Self::flush) must write them
     /// **before** the metadata that first references them.
     saved_bucket_watermark: AtomicU64,
+
+    /// Coordinates mutations with the synchronous snapshot phase of a flush.
+    ///
+    /// Mutations hold a shared guard while changing postings, buckets, and
+    /// metadata. A flush briefly takes the exclusive guard to freeze owned
+    /// bucket blobs and their matching metadata snapshot, then releases it
+    /// before invoking any async persistence callback. This preserves
+    /// concurrent mutations during object-store I/O without ever allowing
+    /// metadata to describe a bucket allocated after the bucket snapshot.
+    mutation_gate: RwLock<()>,
+
+    /// Serializes complete async persistence transactions so an older frozen
+    /// generation cannot overwrite bucket or metadata objects after a newer
+    /// generation has committed.
+    persistence_lock: Arc<PersistenceGate>,
 }
 
 #[derive(Default)]
@@ -333,6 +413,8 @@ where
             search_count: AtomicU64::new(0),
             last_saved_version: AtomicU64::new(0),
             saved_bucket_watermark: AtomicU64::new(0),
+            mutation_gate: RwLock::new(()),
+            persistence_lock: Arc::new(PersistenceGate::default()),
         }
     }
 
@@ -399,6 +481,8 @@ where
             last_saved_version,
             saved_bucket_watermark,
             total_tokens: AtomicU64::new(0),
+            mutation_gate: RwLock::new(()),
+            persistence_lock: Arc::new(PersistenceGate::default()),
         })
     }
 
@@ -650,6 +734,10 @@ where
             });
         }
 
+        // Freeze complete mutations against the synchronous snapshot phase
+        // of flush. The shared guard preserves insert/remove concurrency.
+        let _mutation_guard = self.mutation_gate.read();
+
         // Phase 1: Update the postings collection
         let bucket_id = self.max_bucket_id.load(Ordering::Acquire);
         let tokens: usize = token_freqs.values().sum();
@@ -810,7 +898,10 @@ where
     /// may retain stale entries — searches still skip them because scoring
     /// filters by `doc_tokens` membership, and the stale entries are pruned
     /// the next time the index is loaded via
-    /// [`load_buckets`](Self::load_buckets).
+    /// [`load_buckets`](Self::load_buckets). For idempotent recovery, cleanup
+    /// by `text` still runs when `id` is already absent from `doc_tokens`; in
+    /// that case the method returns `false` and deletion statistics are not
+    /// incremented again.
     ///
     /// # Arguments
     ///
@@ -823,12 +914,15 @@ where
     /// * `true` if a document with the given id was found and removed.
     /// * `false` otherwise.
     pub fn remove(&self, id: u64, text: &str, now_ms: u64) -> bool {
-        let removed_tokens = match self.doc_tokens.remove(&id) {
-            Some((_k, v)) => v,
-            None => return false,
-        };
+        // Even when `doc_tokens` was already removed, continue through the
+        // supplied text and bucket bookkeeping. Crash-replay may encounter a
+        // prefix of an earlier remove, and the retry must still purge stale
+        // postings without double-counting the logical deletion.
+        let _mutation_guard = self.mutation_gate.read();
+        let removed_tokens = self.doc_tokens.remove(&id).map(|(_k, v)| v);
+        let was_present = removed_tokens.is_some();
 
-        {
+        if let Some(removed_tokens) = removed_tokens {
             // Recalculate the average document length under the
             // `avg_doc_tokens` write lock; see the matching block in
             // `insert` for why this makes the cached average converge to
@@ -930,13 +1024,15 @@ where
             }
         }
 
-        self.update_metadata(|m| {
-            m.stats.version += 1;
-            m.stats.last_deleted = now_ms;
-            m.stats.delete_count += 1;
-        });
+        if was_present {
+            self.update_metadata(|m| {
+                m.stats.version += 1;
+                m.stats.last_deleted = now_ms;
+                m.stats.delete_count += 1;
+            });
+        }
 
-        true
+        was_present
     }
 
     /// Searches the index and returns the highest-scoring documents.
@@ -1348,11 +1444,14 @@ where
     ///
     /// # Concurrency
     ///
-    /// The crash-ordering guarantee assumes no concurrent writes during the
-    /// flush (the workspace-wide single-writer convention). Concurrent
-    /// `insert`/`remove` calls do not corrupt in-memory state, but a bucket
-    /// allocated between step 1 and step 2 could be referenced by the
-    /// serialized metadata before it is written in step 3.
+    /// The bucket blobs and metadata are frozen together under an internal
+    /// mutation gate before any callback is awaited. Inserts and removes may
+    /// proceed while those owned blobs are uploaded; their higher bucket and
+    /// metadata versions remain dirty for the next flush. Consequently the
+    /// metadata written by this flush can never reference a bucket allocated
+    /// after its bucket snapshot. Overlapping `flush_with` calls are
+    /// serialized internally so an older generation cannot finish uploading
+    /// after a newer one.
     ///
     /// # Arguments
     ///
@@ -1381,24 +1480,54 @@ where
         F: FnMut(u32, Vec<u8>) -> FFut,
         FFut: Future<Output = Result<bool, BoxError>>,
     {
-        let has_dirty = self.has_dirty_buckets();
-        if !self.has_pending_metadata_flush() && !has_dirty {
-            return Ok(false);
-        }
+        let _persistence_guard = self.persistence_lock.clone().lock().await;
 
-        let watermark = self.saved_bucket_watermark.load(Ordering::Acquire);
-        let current_max = u64::from(self.max_bucket_id.load(Ordering::Acquire));
+        // Freeze both sides of the persistence boundary synchronously. The
+        // exclusive guard waits for complete in-flight mutations, prevents
+        // new ones while bucket data and metadata are serialized, and is
+        // deliberately dropped before the first await so this future remains
+        // Send and object-store latency never blocks index mutations.
+        let (has_dirty, pre_metadata, metadata_snapshot, post_metadata) = {
+            let _snapshot_guard = self.mutation_gate.write();
+            let has_dirty = self.has_dirty_buckets();
+            if !self.has_pending_metadata_flush() && !has_dirty {
+                return Ok(false);
+            }
 
-        // Shrink (bucket compaction) is the only way `max_bucket_id` can drop
-        // below the persisted watermark: the new metadata will stop the
-        // loader from scanning ids beyond the reduced max_bucket_id, so every
-        // repacked bucket file must be rewritten before the metadata. In the
-        // steady state (grow), only buckets the persisted metadata does not
-        // cover yet go first.
-        let pre_metadata_min = if current_max + 1 < watermark {
-            0
-        } else {
-            watermark
+            let watermark = self.saved_bucket_watermark.load(Ordering::Acquire);
+            let current_max = u64::from(self.max_bucket_id.load(Ordering::Acquire));
+
+            // Shrink (bucket compaction) is the only way `max_bucket_id` can
+            // drop below the persisted watermark: the new metadata will stop
+            // the loader from scanning ids beyond the reduced max_bucket_id,
+            // so every repacked bucket file must be rewritten before the
+            // metadata. In the steady state (grow), only buckets the persisted
+            // metadata does not cover yet go first.
+            let pre_metadata_min = if current_max + 1 < watermark {
+                0
+            } else {
+                watermark
+            };
+
+            let mut dirty = Vec::new();
+            for (bucket_id, version) in self.collect_dirty_buckets(0) {
+                if let Some(buf) = self.serialize_bucket(bucket_id)? {
+                    dirty.push(BucketSnapshot {
+                        bucket_id,
+                        version,
+                        buf,
+                    });
+                }
+            }
+            // Determinism makes fault injection and operational traces easier
+            // to reason about; correctness only depends on the phase split.
+            dirty.sort_unstable_by_key(|snapshot| snapshot.bucket_id);
+
+            let split: (Vec<_>, Vec<_>) = dirty
+                .into_iter()
+                .partition(|snapshot| u64::from(snapshot.bucket_id) >= pre_metadata_min);
+            let metadata_snapshot = self.metadata_snapshot_locked(now_ms)?;
+            (has_dirty, split.0, metadata_snapshot, split.1)
         };
 
         // NOTE: the callbacks are plain `FnMut`/`FnOnce` closures returning a
@@ -1411,15 +1540,17 @@ where
 
         // Step 1 (grow): buckets the persisted metadata does not cover yet
         // (or, after a compaction shrink, every dirty bucket).
-        for (bucket_id, snapshot_version) in self.collect_dirty_buckets(pre_metadata_min) {
-            let Some(data) = self.serialize_bucket(bucket_id)? else {
-                continue;
+        for snapshot in pre_metadata {
+            let conti = match f(snapshot.bucket_id, snapshot.buf).await {
+                Ok(conti) => conti,
+                Err(err) => {
+                    return Err(BM25Error::Generic {
+                        name: self.name.clone(),
+                        source: err,
+                    });
+                }
             };
-            let conti = f(bucket_id, data).await.map_err(|err| BM25Error::Generic {
-                name: self.name.clone(),
-                source: err,
-            })?;
-            self.mark_bucket_saved(bucket_id, snapshot_version);
+            self.mark_bucket_saved(snapshot.bucket_id, snapshot.version);
             if !conti {
                 // Co-operative stop before the metadata write: nothing is
                 // committed and the remaining work is retried next flush.
@@ -1429,38 +1560,38 @@ where
 
         // Step 2: metadata, extending (or committing the shrink of) the
         // loader's bucket scan range.
-        let meta_saved = match self.claim_metadata_snapshot(now_ms)? {
+        let meta_saved = match metadata_snapshot {
             None => false,
-            Some(snapshot) => {
-                let (version, prev_saved_version) = (snapshot.version, snapshot.prev_saved_version);
-                match metadata_f(snapshot.buf).await {
-                    Ok(()) => {
-                        self.commit_metadata_claim(snapshot.max_bucket_id, snapshot.last_saved);
-                        true
-                    }
-                    Err(err) => {
-                        self.revert_metadata_claim(version, prev_saved_version);
-                        return Err(BM25Error::Generic {
-                            name: self.name.clone(),
-                            source: err,
-                        });
-                    }
+            Some(snapshot) => match metadata_f(snapshot.buf).await {
+                Ok(()) => {
+                    self.commit_metadata_snapshot(
+                        snapshot.version,
+                        snapshot.max_bucket_id,
+                        snapshot.last_saved,
+                    );
+                    true
                 }
-            }
+                Err(err) => {
+                    return Err(BM25Error::Generic {
+                        name: self.name.clone(),
+                        source: err,
+                    });
+                }
+            },
         };
 
         // Step 3 (shrink): rewrites of old, already-referenced buckets. After
         // a compaction shrink, step 1 already covered every dirty bucket and
         // this loop finds nothing left to do.
-        for (bucket_id, snapshot_version) in self.collect_dirty_buckets(0) {
-            let Some(data) = self.serialize_bucket(bucket_id)? else {
-                continue;
-            };
-            let conti = f(bucket_id, data).await.map_err(|err| BM25Error::Generic {
-                name: self.name.clone(),
-                source: err,
-            })?;
-            self.mark_bucket_saved(bucket_id, snapshot_version);
+        for snapshot in post_metadata {
+            let conti =
+                f(snapshot.bucket_id, snapshot.buf)
+                    .await
+                    .map_err(|err| BM25Error::Generic {
+                        name: self.name.clone(),
+                        source: err,
+                    })?;
+            self.mark_bucket_saved(snapshot.bucket_id, snapshot.version);
             if !conti {
                 break;
             }
@@ -1502,6 +1633,10 @@ where
     ///
     /// `(old_bucket_count, new_bucket_count)`.
     pub fn compact_buckets(&self) -> (usize, usize) {
+        // Compaction rewrites every bucket and posting owner. Treat it as an
+        // exclusive mutation so a flush can only capture the complete old or
+        // complete new layout.
+        let _mutation_guard = self.mutation_gate.write();
         let old_count = self.buckets.len();
         if old_count <= 1 {
             return (old_count, old_count);
@@ -1624,49 +1759,23 @@ where
     /// # Returns
     ///
     /// * `Result<bool, BM25Error>` - true if the metadata was saved, false if the version was not updated
-    pub fn store_metadata<W: Write>(&self, w: W, now_ms: u64) -> Result<bool, BM25Error> {
-        let current_version = { self.metadata.read().stats.version };
-        if self.last_saved_version.load(Ordering::Relaxed) >= current_version {
+    pub fn store_metadata<W: Write>(&self, mut w: W, now_ms: u64) -> Result<bool, BM25Error> {
+        let Some(snapshot) = self.metadata_snapshot(now_ms)? else {
             return Ok(false);
-        }
+        };
 
-        let mut meta = self.metadata();
-        let prev_saved_version = self
-            .last_saved_version
-            .fetch_max(meta.stats.version, Ordering::Relaxed);
-        if prev_saved_version >= meta.stats.version {
-            // No need to save if the version is not updated
-            return Ok(false);
-        }
-
-        meta.stats.last_saved = now_ms.max(meta.stats.last_saved);
-
-        if let Err(err) = cbor2::to_writer(&BM25IndexRef { metadata: &meta }, w) {
-            // Serialization failed: revert only if this call still owns the claimed version.
-            let _ = self.last_saved_version.compare_exchange(
-                meta.stats.version,
-                prev_saved_version,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            );
+        if let Err(err) = w.write_all(&snapshot.buf) {
             return Err(BM25Error::Serialization {
                 name: self.name.clone(),
                 source: err.into(),
             });
         }
 
-        // The serialized snapshot references buckets `0..=max_bucket_id`;
-        // record the watermark so `flush_with` knows which bucket ids the
-        // persisted metadata covers.
-        self.saved_bucket_watermark.store(
-            u64::from(meta.stats.max_bucket_id) + 1,
-            Ordering::Release,
+        self.commit_metadata_snapshot(
+            snapshot.version,
+            snapshot.max_bucket_id,
+            snapshot.last_saved,
         );
-
-        self.update_metadata(|m| {
-            m.stats.last_saved = meta.stats.last_saved.max(m.stats.last_saved);
-        });
-
         Ok(true)
     }
 
@@ -1689,84 +1798,76 @@ where
     where
         F: AsyncFnOnce(&[u8]) -> Result<(), BoxError>,
     {
-        let Some(snapshot) = self.claim_metadata_snapshot(now_ms)? else {
+        let _persistence_guard = self.persistence_lock.clone().lock().await;
+        let Some(snapshot) = self.metadata_snapshot(now_ms)? else {
             return Ok(false);
         };
 
         if let Err(err) = f(&snapshot.buf).await {
-            self.revert_metadata_claim(snapshot.version, snapshot.prev_saved_version);
             return Err(BM25Error::Generic {
                 name: self.name.clone(),
                 source: err,
             });
         }
 
-        self.commit_metadata_claim(snapshot.max_bucket_id, snapshot.last_saved);
+        self.commit_metadata_snapshot(
+            snapshot.version,
+            snapshot.max_bucket_id,
+            snapshot.last_saved,
+        );
         Ok(true)
     }
 
-    /// Claims the current metadata version for persistence and serializes a
-    /// snapshot of it. Returns `None` when the last saved version is already
-    /// current. A returned claim must be resolved with either
-    /// [`commit_metadata_claim`](Self::commit_metadata_claim) (after the
-    /// snapshot was persisted) or
-    /// [`revert_metadata_claim`](Self::revert_metadata_claim) (after a failed
-    /// persistence attempt), otherwise this metadata version is never
-    /// retried.
-    fn claim_metadata_snapshot(&self, now_ms: u64) -> Result<Option<MetadataSnapshot>, BM25Error> {
+    /// Serializes the current metadata version without publishing any saved
+    /// watermark. The caller commits the snapshot only after durable success;
+    /// dropping an async persistence future therefore leaves it retryable.
+    fn metadata_snapshot(&self, now_ms: u64) -> Result<Option<MetadataSnapshot>, BM25Error> {
+        let _snapshot_guard = self.mutation_gate.write();
+        self.metadata_snapshot_locked(now_ms)
+    }
+
+    /// Serializes metadata while the caller holds `mutation_gate` exclusively.
+    fn metadata_snapshot_locked(&self, now_ms: u64) -> Result<Option<MetadataSnapshot>, BM25Error> {
         let current_version = { self.metadata.read().stats.version };
         if self.last_saved_version.load(Ordering::Relaxed) >= current_version {
             return Ok(None);
         }
 
         let mut meta = self.metadata();
-        let prev_saved_version = self
-            .last_saved_version
-            .fetch_max(meta.stats.version, Ordering::Relaxed);
-        if prev_saved_version >= meta.stats.version {
+        if self.last_saved_version.load(Ordering::Acquire) >= meta.stats.version {
             return Ok(None);
         }
 
         meta.stats.last_saved = now_ms.max(meta.stats.last_saved);
 
         let mut buf = Vec::with_capacity(256);
-        if let Err(err) = cbor2::to_writer(&BM25IndexRef { metadata: &meta }, &mut buf) {
-            self.revert_metadata_claim(meta.stats.version, prev_saved_version);
-            return Err(BM25Error::Serialization {
+        cbor2::to_writer(&BM25IndexRef { metadata: &meta }, &mut buf).map_err(|err| {
+            BM25Error::Serialization {
                 name: self.name.clone(),
                 source: err.into(),
-            });
-        }
+            }
+        })?;
 
         Ok(Some(MetadataSnapshot {
             version: meta.stats.version,
-            prev_saved_version,
             max_bucket_id: meta.stats.max_bucket_id,
             last_saved: meta.stats.last_saved,
             buf,
         }))
     }
 
-    /// Reverts a metadata claim after a failed persistence attempt, but only
-    /// if this call still owns the claimed version.
-    fn revert_metadata_claim(&self, version: u64, prev_saved_version: u64) {
-        let _ = self.last_saved_version.compare_exchange(
-            version,
-            prev_saved_version,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
-    }
-
-    /// Commits a persisted metadata claim.
+    /// Publishes a durably persisted metadata snapshot.
     ///
     /// The persisted snapshot references buckets `0..=max_bucket_id`; the
     /// watermark records which bucket ids the persisted metadata covers so
     /// [`flush_with`](Self::flush_with) can order bucket writes around the
     /// metadata write.
-    fn commit_metadata_claim(&self, max_bucket_id: u32, last_saved: u64) {
+    fn commit_metadata_snapshot(&self, version: u64, max_bucket_id: u32, last_saved: u64) {
         self.saved_bucket_watermark
             .store(u64::from(max_bucket_id) + 1, Ordering::Release);
+
+        self.last_saved_version
+            .fetch_max(version, Ordering::Release);
 
         self.update_metadata(|m| {
             m.stats.last_saved = last_saved.max(m.stats.last_saved);
@@ -1788,15 +1889,32 @@ where
         F: FnMut(u32, Vec<u8>) -> Fut,
         Fut: Future<Output = Result<bool, BoxError>>,
     {
-        for (bucket_id, snapshot_version) in self.collect_dirty_buckets(0) {
-            let Some(data) = self.serialize_bucket(bucket_id)? else {
-                continue;
-            };
-            let conti = f(bucket_id, data).await.map_err(|err| BM25Error::Generic {
-                name: self.name.clone(),
-                source: err,
-            })?;
-            self.mark_bucket_saved(bucket_id, snapshot_version);
+        let _persistence_guard = self.persistence_lock.clone().lock().await;
+        let snapshots = {
+            let _snapshot_guard = self.mutation_gate.write();
+            let mut snapshots = Vec::new();
+            for (bucket_id, version) in self.collect_dirty_buckets(0) {
+                if let Some(buf) = self.serialize_bucket(bucket_id)? {
+                    snapshots.push(BucketSnapshot {
+                        bucket_id,
+                        version,
+                        buf,
+                    });
+                }
+            }
+            snapshots.sort_unstable_by_key(|snapshot| snapshot.bucket_id);
+            snapshots
+        };
+
+        for snapshot in snapshots {
+            let conti =
+                f(snapshot.bucket_id, snapshot.buf)
+                    .await
+                    .map_err(|err| BM25Error::Generic {
+                        name: self.name.clone(),
+                        source: err,
+                    })?;
+            self.mark_bucket_saved(snapshot.bucket_id, snapshot.version);
             if !conti {
                 break;
             }
@@ -1872,7 +1990,6 @@ where
         }
     }
 
-
     /// Gets the number of tokens for a document by its ID
     pub fn get_doc_tokens(&self, id: u64) -> Option<usize> {
         self.doc_tokens.get(&id).map(|v| *v)
@@ -1897,8 +2014,11 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::io::{self, Write};
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering},
+    };
+    use tokio::sync::{Barrier, Mutex};
 
     struct FailingWriter;
 
@@ -2537,10 +2657,7 @@ mod tests {
         .unwrap();
         for term in ["alpha", "bravo"] {
             assert!(
-                loaded
-                    .search(term, 10, None)
-                    .iter()
-                    .any(|(id, _)| *id == 1),
+                loaded.search(term, 10, None).iter().any(|(id, _)| *id == 1),
                 "doc 1 must still be found via '{term}' after the crash"
             );
         }
@@ -2569,6 +2686,211 @@ mod tests {
                     .iter()
                     .any(|(id, _)| *id == doc),
                 "doc {doc} must be found via '{term}' after recovery"
+            );
+        }
+    }
+
+    /// Regression (P0): cancellation is not an error return, so a metadata
+    /// version must not be claimed before its async callback succeeds. Hold
+    /// the flush after every migration-target bucket is durable but before
+    /// metadata is written, abort it, then retry and reopen the index.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cancelled_flush_before_metadata_retries_and_reopens_migrated_postings() {
+        let (index, metadata0, buckets0, old_max) = build_migration_scenario().await;
+        let index = Arc::new(index);
+        let persisted_metadata = Arc::new(std::sync::Mutex::new(metadata0));
+        let persisted_buckets = Arc::new(std::sync::Mutex::new(buckets0));
+        let metadata_entered = Arc::new(tokio::sync::Notify::new());
+
+        let flushing = {
+            let index = index.clone();
+            let persisted_buckets = persisted_buckets.clone();
+            let metadata_entered = metadata_entered.clone();
+            tokio::spawn(async move {
+                index
+                    .flush_with(
+                        3,
+                        move |_data| {
+                            let metadata_entered = metadata_entered.clone();
+                            async move {
+                                metadata_entered.notify_one();
+                                std::future::pending::<Result<(), BoxError>>().await
+                            }
+                        },
+                        move |id, data| {
+                            assert!(id > old_max, "only migration targets precede metadata");
+                            persisted_buckets.lock().unwrap().insert(id, data);
+                            std::future::ready(Ok(true))
+                        },
+                    )
+                    .await
+            })
+        };
+
+        metadata_entered.notified().await;
+        flushing.abort();
+        assert!(
+            flushing
+                .await
+                .expect_err("flush should be cancelled")
+                .is_cancelled()
+        );
+        assert!(
+            index.has_pending_metadata_flush(),
+            "cancellation before metadata success must not consume its version"
+        );
+
+        // Migration targets were already acknowledged and marked clean. The
+        // retry must nevertheless persist metadata and then rewrite the dirty
+        // source buckets, producing one loadable generation.
+        let metadata_for_retry = persisted_metadata.clone();
+        let buckets_for_retry = persisted_buckets.clone();
+        assert!(
+            index
+                .flush_with(
+                    4,
+                    move |data| {
+                        *metadata_for_retry.lock().unwrap() = data;
+                        std::future::ready(Ok(()))
+                    },
+                    move |id, data| {
+                        buckets_for_retry.lock().unwrap().insert(id, data);
+                        std::future::ready(Ok(true))
+                    },
+                )
+                .await
+                .unwrap()
+        );
+
+        let metadata = persisted_metadata.lock().unwrap().clone();
+        let buckets = persisted_buckets.lock().unwrap().clone();
+        let reopened = BM25Index::load_all(default_tokenizer(), &metadata[..], async |id| {
+            Ok(buckets.get(&id).cloned())
+        })
+        .await
+        .unwrap();
+        for (doc, term) in [(1, "alpha"), (1, "bravo"), (2, "alpha"), (2, "zulu")] {
+            assert!(
+                reopened
+                    .search(term, 10, None)
+                    .iter()
+                    .any(|(id, _)| *id == doc),
+                "doc {doc} must be found via '{term}' after abort and retry"
+            );
+        }
+    }
+
+    /// An older frozen generation must never resume after a newer flush and
+    /// overwrite its metadata or bucket blobs. Hold F1 at its metadata
+    /// callback, mutate, and prove F2 cannot enter any persistence callback
+    /// until F1's complete transaction releases the internal gate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_overlapping_flush_transactions_are_serialized() {
+        let index = Arc::new(BM25Index::new(
+            "serialized_flushes".to_string(),
+            default_tokenizer(),
+            None,
+        ));
+        index.insert(1, "alpha", 1).unwrap();
+
+        let mut metadata = Vec::new();
+        let mut buckets = HashMap::new();
+        index
+            .flush(&mut metadata, 2, |id, data| {
+                buckets.insert(id, data);
+                std::future::ready(Ok(true))
+            })
+            .await
+            .unwrap();
+        let persisted_metadata = Arc::new(std::sync::Mutex::new(metadata));
+        let persisted_buckets = Arc::new(std::sync::Mutex::new(buckets));
+
+        index.insert(2, "beta", 3).unwrap();
+        let first_metadata_phase = Arc::new(Barrier::new(2));
+        let first_flush = {
+            let index = index.clone();
+            let persisted_metadata = persisted_metadata.clone();
+            let persisted_buckets = persisted_buckets.clone();
+            let first_metadata_phase = first_metadata_phase.clone();
+            tokio::spawn(async move {
+                index
+                    .flush_with(
+                        4,
+                        move |data| {
+                            let persisted_metadata = persisted_metadata.clone();
+                            let first_metadata_phase = first_metadata_phase.clone();
+                            async move {
+                                first_metadata_phase.wait().await;
+                                first_metadata_phase.wait().await;
+                                *persisted_metadata.lock().unwrap() = data;
+                                Ok(())
+                            }
+                        },
+                        move |id, data| {
+                            persisted_buckets.lock().unwrap().insert(id, data);
+                            std::future::ready(Ok(true))
+                        },
+                    )
+                    .await
+            })
+        };
+
+        first_metadata_phase.wait().await;
+        index.insert(3, "gamma", 5).unwrap();
+
+        let second_callback_entered = Arc::new(AtomicBool::new(false));
+        let second_flush = {
+            let index = index.clone();
+            let persisted_metadata = persisted_metadata.clone();
+            let persisted_buckets = persisted_buckets.clone();
+            let entered_for_metadata = second_callback_entered.clone();
+            let entered_for_bucket = second_callback_entered.clone();
+            tokio::spawn(async move {
+                index
+                    .flush_with(
+                        6,
+                        move |data| {
+                            entered_for_metadata.store(true, AtomicOrdering::Release);
+                            *persisted_metadata.lock().unwrap() = data;
+                            std::future::ready(Ok(()))
+                        },
+                        move |id, data| {
+                            entered_for_bucket.store(true, AtomicOrdering::Release);
+                            persisted_buckets.lock().unwrap().insert(id, data);
+                            std::future::ready(Ok(true))
+                        },
+                    )
+                    .await
+            })
+        };
+
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !second_callback_entered.load(AtomicOrdering::Acquire),
+            "F2 must wait for F1's complete persistence transaction"
+        );
+
+        first_metadata_phase.wait().await;
+        assert!(first_flush.await.unwrap().unwrap());
+        assert!(second_flush.await.unwrap().unwrap());
+        assert!(second_callback_entered.load(AtomicOrdering::Acquire));
+
+        let metadata = persisted_metadata.lock().unwrap().clone();
+        let buckets = persisted_buckets.lock().unwrap().clone();
+        let reopened = BM25Index::load_all(default_tokenizer(), &metadata[..], async |id| {
+            Ok(buckets.get(&id).cloned())
+        })
+        .await
+        .unwrap();
+        for (doc, term) in [(1, "alpha"), (2, "beta"), (3, "gamma")] {
+            assert!(
+                reopened
+                    .search(term, 10, None)
+                    .iter()
+                    .any(|(id, _)| *id == doc),
+                "newest flush generation must retain doc {doc} via '{term}'"
             );
         }
     }
@@ -2628,10 +2950,7 @@ mod tests {
         .unwrap();
         for term in ["alpha", "bravo"] {
             assert!(
-                loaded
-                    .search(term, 10, None)
-                    .iter()
-                    .any(|(id, _)| *id == 1),
+                loaded.search(term, 10, None).iter().any(|(id, _)| *id == 1),
                 "doc 1 must still be found via '{term}' after the crash"
             );
         }
@@ -2651,6 +2970,168 @@ mod tests {
             loaded.get_doc_tokens(2),
             index.get_doc_tokens(2),
             "doc 2's token count must be carried by the new bucket files"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_bucket_allocation_after_step_one_is_not_in_metadata_snapshot() {
+        let (index, _metadata0, buckets0, old_max) = build_migration_scenario().await;
+        let frozen_max = index.stats().max_bucket_id;
+        let watermark = index.saved_bucket_watermark.load(Ordering::Acquire);
+        let pre_metadata_count = index.collect_dirty_buckets(watermark).len();
+        assert!(pre_metadata_count > 0);
+
+        let migrated_tokens: Vec<String> = index
+            .postings
+            .iter()
+            .filter(|posting| {
+                posting.0 > old_max && posting.1.iter().any(|(doc_id, _)| *doc_id == 2)
+            })
+            .map(|posting| posting.key().clone())
+            .collect();
+        assert!(!migrated_tokens.is_empty());
+
+        let index = Arc::new(index);
+        let persisted_buckets = Arc::new(std::sync::Mutex::new(buckets0));
+        let persisted_metadata = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let metadata_written = Arc::new(AtomicBool::new(false));
+        let pre_writes = Arc::new(AtomicUsize::new(0));
+        let between_steps = Arc::new(Barrier::new(2));
+
+        let flush_task = {
+            let index = index.clone();
+            let persisted_buckets = persisted_buckets.clone();
+            let persisted_metadata = persisted_metadata.clone();
+            let metadata_written_for_meta = metadata_written.clone();
+            let metadata_written_for_bucket = metadata_written.clone();
+            let pre_writes = pre_writes.clone();
+            let between_steps_for_bucket = between_steps.clone();
+            tokio::spawn(async move {
+                index
+                    .flush_with(
+                        3,
+                        move |data| {
+                            let persisted_metadata = persisted_metadata.clone();
+                            let metadata_written = metadata_written_for_meta.clone();
+                            async move {
+                                *persisted_metadata.lock().unwrap() = data;
+                                metadata_written.store(true, AtomicOrdering::Release);
+                                Ok(())
+                            }
+                        },
+                        move |id, data| {
+                            let persisted_buckets = persisted_buckets.clone();
+                            let metadata_written = metadata_written_for_bucket.clone();
+                            let pre_writes = pre_writes.clone();
+                            let between_steps = between_steps_for_bucket.clone();
+                            async move {
+                                if metadata_written.load(AtomicOrdering::Acquire) {
+                                    // Simulated process death immediately after
+                                    // the metadata PUT: no shrink-phase write
+                                    // is allowed to reach the durable map.
+                                    return Ok(false);
+                                }
+
+                                persisted_buckets.lock().unwrap().insert(id, data);
+                                let completed = pre_writes.fetch_add(1, AtomicOrdering::AcqRel) + 1;
+                                if completed == pre_metadata_count {
+                                    // Exact P0-02 window: all grow buckets from
+                                    // step 1 are durable, step 2 has not run.
+                                    between_steps.wait().await;
+                                    between_steps.wait().await;
+                                }
+                                Ok(true)
+                            }
+                        },
+                    )
+                    .await
+            })
+        };
+
+        between_steps.wait().await;
+        let concurrent_text = (0..80)
+            .map(|n| format!("concurrent_token_{n}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        index.insert(3, &concurrent_text, 4).unwrap();
+        assert!(
+            index.stats().max_bucket_id > frozen_max,
+            "barrier mutation must allocate a bucket beyond the frozen generation"
+        );
+        between_steps.wait().await;
+
+        assert!(flush_task.await.unwrap().unwrap());
+        assert!(index.has_pending_metadata_flush());
+        assert!(index.has_dirty_buckets());
+
+        // Reopen only what reached the simulated durable store. Metadata must
+        // describe the frozen generation, never the bucket allocated at the
+        // barrier, and every bucket it does reference must exist.
+        let metadata = persisted_metadata.lock().unwrap().clone();
+        let durable = persisted_buckets.lock().unwrap().clone();
+        let loaded = BM25Index::load_all(default_tokenizer(), &metadata[..], async |id| {
+            Ok(durable.get(&id).cloned())
+        })
+        .await
+        .unwrap();
+        assert_eq!(loaded.stats().max_bucket_id, frozen_max);
+        for id in 0..=frozen_max {
+            assert!(
+                durable.contains_key(&id),
+                "metadata references missing durable bucket {id}"
+            );
+        }
+        assert!(
+            loaded
+                .search("bravo", 10, None)
+                .iter()
+                .any(|(id, _)| *id == 1)
+        );
+        for token in migrated_tokens {
+            let posting = loaded
+                .postings
+                .get(&token)
+                .unwrap_or_else(|| panic!("frozen migrated token '{token}' must reload"));
+            assert!(posting.1.iter().any(|(id, _)| *id == 2));
+        }
+    }
+
+    #[test]
+    fn test_remove_replay_cleans_postings_after_doc_tokens_are_already_gone() {
+        let index = BM25Index::new("idempotent_remove".to_string(), default_tokenizer(), None);
+        let text = "alpha bravo charlie";
+        index.insert(42, text, 1).unwrap();
+
+        // Model a crash after the logical document membership was removed but
+        // before the original-text postings were all cleaned.
+        assert!(index.remove(42, "unrelated text", 2));
+        assert!(
+            index
+                .postings
+                .iter()
+                .any(|posting| { posting.1.iter().any(|(doc_id, _)| *doc_id == 42) })
+        );
+        let after_first = index.stats();
+
+        // Recovery replays the correct historical text. The logical removal
+        // reports false and does not advance statistics twice, but it still
+        // purges every stale posting and bucket doc-id reference.
+        assert!(!index.remove(42, text, 3));
+        let after_replay = index.stats();
+        assert_eq!(after_replay.version, after_first.version);
+        assert_eq!(after_replay.delete_count, after_first.delete_count);
+        assert_eq!(after_replay.last_deleted, after_first.last_deleted);
+        assert!(
+            index
+                .postings
+                .iter()
+                .all(|posting| { posting.1.iter().all(|(doc_id, _)| *doc_id != 42) })
+        );
+        assert!(
+            index
+                .buckets
+                .iter()
+                .all(|bucket| !bucket.doc_ids.contains(&42))
         );
     }
 
@@ -2763,7 +3244,12 @@ mod tests {
 
         // top_k == 0 short-circuits and is not counted.
         assert!(index.search("fox", 0, None).is_empty());
-        assert!(index.try_search_advanced("fox", 0, None).unwrap().is_empty());
+        assert!(
+            index
+                .try_search_advanced("fox", 0, None)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(index.stats().search_count, 0);
 
         // Parse failures are not counted.
@@ -2787,7 +3273,9 @@ mod tests {
             None,
         ));
         // A stable base corpus so the index is never empty.
-        index.insert(1, "base document alpha bravo charlie", 0).unwrap();
+        index
+            .insert(1, "base document alpha bravo charlie", 0)
+            .unwrap();
         index.insert(2, "base document delta echo", 0).unwrap();
 
         const ITERS: usize = 300;

@@ -1,6 +1,6 @@
 use anda_db_hnsw::HnswIndex;
 use bytes::Bytes;
-use parking_lot::RwLock;
+use parking_lot::{Mutex as ParkingMutex, RwLock};
 use std::{fmt::Debug, hash::Hash, sync::Arc};
 
 pub use anda_db_hnsw::{HnswConfig, HnswMetadata, HnswStats};
@@ -11,6 +11,18 @@ use crate::{
     storage::{ObjectVersion, PutMode, Storage},
 };
 
+#[derive(Clone)]
+struct PendingVersionedWrite {
+    payload: Vec<u8>,
+    expected_version: ObjectVersion,
+}
+
+#[derive(Clone, Copy)]
+enum PayloadMatch {
+    Exact,
+    Metadata,
+}
+
 /// Collection-level wrapper around an HNSW vector index.
 ///
 /// The wrapper owns persistence paths and object versions for index metadata,
@@ -20,8 +32,10 @@ pub struct Hnsw {
     name: String,
     index: HnswIndex,
     storage: Storage, // 与 Collection 共享同一个 Storage 实例
-    metadata_version: RwLock<ObjectVersion>,
-    ids_version: RwLock<ObjectVersion>,
+    metadata_version: Arc<RwLock<ObjectVersion>>,
+    ids_version: Arc<RwLock<ObjectVersion>>,
+    pending_metadata_write: Arc<ParkingMutex<Option<PendingVersionedWrite>>>,
+    pending_ids_write: Arc<ParkingMutex<Option<PendingVersionedWrite>>>,
 }
 
 impl Debug for Hnsw {
@@ -77,6 +91,11 @@ impl Hnsw {
         // The collection metadata is the source of truth for which indexes
         // exist, so overwrite any leftover files from a crashed creation or a
         // previously removed index instead of failing with AlreadyExists.
+        // Publish the id set before the metadata commit record, matching the
+        // steady-state crash contract used by `flush` below.
+        let ids_version = storage
+            .put_bytes(&Hnsw::ids_path(&name), ids.into(), PutMode::Overwrite)
+            .await?;
         let metadata_version = storage
             .put_bytes(
                 &Hnsw::metadata_path(&name),
@@ -84,15 +103,14 @@ impl Hnsw {
                 PutMode::Overwrite,
             )
             .await?;
-        let ids_version = storage
-            .put_bytes(&Hnsw::ids_path(&name), ids.into(), PutMode::Overwrite)
-            .await?;
         Ok(Self {
             name,
             index,
             storage,
-            metadata_version: RwLock::new(metadata_version),
-            ids_version: RwLock::new(ids_version),
+            metadata_version: Arc::new(RwLock::new(metadata_version)),
+            ids_version: Arc::new(RwLock::new(ids_version)),
+            pending_metadata_write: Arc::new(ParkingMutex::new(None)),
+            pending_ids_write: Arc::new(ParkingMutex::new(None)),
         })
     }
 
@@ -127,72 +145,133 @@ impl Hnsw {
             name,
             index,
             storage,
-            metadata_version: RwLock::new(metadata_version),
-            ids_version: RwLock::new(ids_version),
+            metadata_version: Arc::new(RwLock::new(metadata_version)),
+            ids_version: Arc::new(RwLock::new(ids_version)),
+            pending_metadata_write: Arc::new(ParkingMutex::new(None)),
+            pending_ids_write: Arc::new(ParkingMutex::new(None)),
         })
     }
 
-    /// Persists dirty metadata, id lists, and graph nodes, then deletes the
-    /// blobs of removed nodes.
+    fn payloads_match(kind: PayloadMatch, left: &[u8], right: &[u8]) -> Result<bool, BoxError> {
+        match kind {
+            PayloadMatch::Exact => Ok(left == right),
+            PayloadMatch::Metadata => {
+                Ok(HnswIndex::metadata_payloads_logically_equal(left, right)?)
+            }
+        }
+    }
+
+    /// Persists a versioned artifact while retaining the exact in-flight
+    /// generation before every await. If an older PUT committed but was
+    /// cancelled, a retry first reconciles that payload to recover its object
+    /// version, then writes the callback's newer mutation generation.
+    async fn persist_retained_snapshot(
+        storage: Storage,
+        path: String,
+        object_version: Arc<RwLock<ObjectVersion>>,
+        pending_write: Arc<ParkingMutex<Option<PendingVersionedWrite>>>,
+        data: Vec<u8>,
+        kind: PayloadMatch,
+    ) -> Result<(), BoxError> {
+        loop {
+            let pending = {
+                let mut slot = pending_write.lock();
+                slot.get_or_insert_with(|| PendingVersionedWrite {
+                    payload: data.clone(),
+                    expected_version: object_version.read().clone(),
+                })
+                .clone()
+            };
+
+            let version = match storage
+                .put_bytes(
+                    &path,
+                    Bytes::from(pending.payload.clone()),
+                    PutMode::Update(pending.expected_version.clone().into()),
+                )
+                .await
+            {
+                Ok(version) => version,
+                Err(err @ DBError::Precondition { .. }) => {
+                    let (persisted, version) = storage.fetch_bytes(&path).await?;
+                    if !Self::payloads_match(kind, &pending.payload, &persisted)? {
+                        return Err(BoxError::from(err));
+                    }
+                    version
+                }
+                Err(err) => return Err(BoxError::from(err)),
+            };
+
+            *object_version.write() = version;
+            *pending_write.lock() = None;
+            if Self::payloads_match(kind, &pending.payload, &data)? {
+                return Ok(());
+            }
+
+            // `data` belongs to a newer structural generation. The next loop
+            // registers it with the token recovered above before awaiting its
+            // own conditional PUT.
+        }
+    }
+
+    /// Persists one coherent graph snapshot, then deletes removed-node blobs.
     ///
-    /// Node-blob deletion runs last: the ids bitmap persisted in this same
-    /// flush already excludes removed ids, so a crash right before the purge
-    /// only leaves orphaned blobs that are never loaded again, while a crash
-    /// right after is fully clean.
+    /// [`HnswIndex::flush_with`] owns the crash contract and generation gate:
+    /// dirty nodes are durable first, then the ids bitmap, and finally the
+    /// metadata is compare-and-swap updated as the commit record. Mutations
+    /// crossing the I/O window remain pending as the next snapshot rather than
+    /// being mixed into the metadata or ids of this one.
     ///
     /// Returns `true` when any object was written or deleted.
     pub async fn flush(&self, now_ms: u64) -> Result<bool, DBError> {
-        let meta_saved = {
-            let path = Hnsw::metadata_path(&self.name);
-            self.index
-                .store_metadata_with(now_ms, async |data| {
-                    let metadata_version = { self.metadata_version.read().clone() };
-                    let metadata_version = self
-                        .storage
-                        .put_bytes(
-                            &path,
-                            Bytes::copy_from_slice(data),
-                            PutMode::Update(metadata_version.into()),
-                        )
-                        .await
-                        .map_err(BoxError::from)?;
-                    *self.metadata_version.write() = metadata_version;
-                    Ok(())
-                })
-                .await?
-        };
-        let had_dirty = self.index.has_dirty_nodes();
         let had_removed = self.index.has_removed_nodes();
-
-        if !meta_saved && !had_dirty && !had_removed {
-            return Ok(false);
-        }
-
-        if meta_saved {
-            let mut buf = Vec::with_capacity(256);
-            self.index.store_ids(&mut buf)?;
-            let path = Hnsw::ids_path(&self.name);
-            let ids_version = { self.ids_version.read().clone() };
-            let ids_version = self
-                .storage
-                .put_bytes(&path, buf.into(), PutMode::Update(ids_version.into()))
-                .await?;
-            {
-                *self.ids_version.write() = ids_version;
-            }
-        }
-
-        let n = Arc::new(self.name.clone());
-        let s = Arc::new(self.storage.clone());
-        self.index
-            .store_dirty_nodes(async move |id, data| {
-                let path = Hnsw::node_path(n.clone().as_str(), id);
-                let _ = s
-                    .clone()
-                    .put_bytes(&path, Bytes::copy_from_slice(data), PutMode::Overwrite)
-                    .await?;
-                Ok(true)
-            })
+        let node_name = Arc::new(self.name.clone());
+        let node_storage = Arc::new(self.storage.clone());
+        let ids_path = Hnsw::ids_path(&self.name);
+        let ids_storage = self.storage.clone();
+        let ids_version = self.ids_version.clone();
+        let pending_ids_write = self.pending_ids_write.clone();
+        let metadata_path = Hnsw::metadata_path(&self.name);
+        let metadata_storage = self.storage.clone();
+        let metadata_version = self.metadata_version.clone();
+        let pending_metadata_write = self.pending_metadata_write.clone();
+        let saved = self
+            .index
+            .flush_with(
+                now_ms,
+                move |id, data| {
+                    let name = node_name.clone();
+                    let storage = node_storage.clone();
+                    async move {
+                        let path = Hnsw::node_path(name.as_str(), id);
+                        storage
+                            .put_bytes(&path, Bytes::from(data), PutMode::Overwrite)
+                            .await
+                            .map_err(BoxError::from)?;
+                        Ok(true)
+                    }
+                },
+                move |data| {
+                    Self::persist_retained_snapshot(
+                        ids_storage,
+                        ids_path,
+                        ids_version,
+                        pending_ids_write,
+                        data,
+                        PayloadMatch::Exact,
+                    )
+                },
+                move |data| {
+                    Self::persist_retained_snapshot(
+                        metadata_storage,
+                        metadata_path,
+                        metadata_version,
+                        pending_metadata_write,
+                        data,
+                        PayloadMatch::Metadata,
+                    )
+                },
+            )
             .await?;
 
         // Delete the persisted blobs of removed nodes; without this they
@@ -209,7 +288,7 @@ impl Hnsw {
             })
             .await?;
 
-        Ok(meta_saved || had_dirty || had_removed)
+        Ok(saved || had_removed)
     }
 
     /// Returns whether metadata, nodes, or removed-node tombstones have
@@ -266,5 +345,367 @@ impl Hnsw {
     /// Searches for nearest vectors, returning an empty result on search errors.
     pub fn search(&self, query: &[f32], top_k: usize) -> Vec<(u64, f32)> {
         self.try_search(query, top_k).unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        schema::{Ft, bf16},
+        storage::StorageConfig,
+    };
+    use async_trait::async_trait;
+    use futures::stream::BoxStream;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
+        memory::InMemory, path::Path,
+    };
+    use parking_lot::Mutex;
+    use std::fmt;
+
+    /// In-memory object store with a one-shot path-targeted PUT failure and a
+    /// write log, used to assert both failure retryability and durable order.
+    #[derive(Debug, Default)]
+    struct FailPutStore {
+        inner: Arc<InMemory>,
+        fault: Mutex<Option<(String, bool)>>,
+        puts: Mutex<Vec<String>>,
+    }
+
+    impl FailPutStore {
+        fn fail_next_put(&self, suffix: impl Into<String>) {
+            *self.fault.lock() = Some((suffix.into(), false));
+        }
+
+        /// Persists the target object and then reports an injected error. The
+        /// caller is dropped after the error, modeling a crash immediately
+        /// after that atomic PUT became durable.
+        fn crash_after_next_put(&self, suffix: impl Into<String>) {
+            *self.fault.lock() = Some((suffix.into(), true));
+        }
+
+        fn clear_puts(&self) {
+            self.puts.lock().clear();
+        }
+
+        fn put_suffixes(&self) -> Vec<String> {
+            self.puts.lock().clone()
+        }
+    }
+
+    impl fmt::Display for FailPutStore {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("FailPutStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for FailPutStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> ObjectStoreResult<PutResult> {
+            let path = location.to_string();
+            self.puts.lock().push(path.clone());
+            let fault = {
+                let mut fault = self.fault.lock();
+                if fault
+                    .as_ref()
+                    .is_some_and(|(suffix, _)| path.ends_with(suffix))
+                {
+                    fault.take()
+                } else {
+                    None
+                }
+            };
+            if matches!(fault.as_ref(), Some((_, false))) {
+                return Err(object_store::Error::Generic {
+                    store: "fail_put",
+                    source: "injected put failure".into(),
+                });
+            }
+            let result = self.inner.put_opts(location, payload, opts).await?;
+            if matches!(fault.as_ref(), Some((_, true))) {
+                return Err(object_store::Error::Generic {
+                    store: "fail_put",
+                    source: "injected crash after durable put".into(),
+                });
+            }
+            Ok(result)
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> ObjectStoreResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, ObjectStoreResult<Path>>,
+        ) -> BoxStream<'static, ObjectStoreResult<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> ObjectStoreResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> ObjectStoreResult<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    async fn fault_index() -> (Hnsw, Storage, Arc<FailPutStore>) {
+        let object_store = Arc::new(FailPutStore::default());
+        let storage = Storage::connect(
+            "hnsw_fault_tests".to_string(),
+            object_store.clone(),
+            StorageConfig {
+                compress_level: 0,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let field = Fe::new("embedding".to_string(), Ft::Vector).unwrap();
+        let index = Hnsw::new(
+            &field,
+            HnswConfig {
+                dimension: 2,
+                ..Default::default()
+            },
+            storage.clone(),
+            1,
+        )
+        .await
+        .unwrap();
+        object_store.clear_puts();
+        index
+            .insert(1, vec![bf16::from_f32(1.0), bf16::from_f32(1.0)], 2)
+            .unwrap();
+        (index, storage, object_store)
+    }
+
+    async fn assert_retry_recovers(index: &Hnsw, storage: &Storage) {
+        assert!(index.has_pending_flush());
+        assert!(index.flush(4).await.unwrap());
+        assert!(!index.has_pending_flush());
+        let reloaded = Hnsw::bootstrap("embedding".to_string(), storage.clone())
+            .await
+            .unwrap();
+        assert_eq!(reloaded.search(&[1.0, 1.0], 1), vec![(1, 0.0)]);
+    }
+
+    async fn assert_crash_after_put(suffix: &str, expected_puts: &[&str], visible: bool) {
+        let (index, storage, object_store) = fault_index().await;
+        object_store.crash_after_next_put(suffix);
+        assert!(index.flush(3).await.is_err());
+
+        let puts = object_store.put_suffixes();
+        assert_eq!(puts.len(), expected_puts.len());
+        for (actual, expected) in puts.iter().zip(expected_puts) {
+            assert!(actual.ends_with(expected), "unexpected PUT path: {actual}");
+        }
+
+        // Drop the writer state conceptually and bootstrap only from the
+        // durable object-store image left at the selected crash boundary.
+        let reopened = Hnsw::bootstrap("embedding".to_string(), storage.clone())
+            .await
+            .unwrap();
+        assert_eq!(!reopened.search(&[1.0, 1.0], 1).is_empty(), visible);
+
+        // The structural version does not change for searches. A live query
+        // between cancellation and retry must therefore be ignored by
+        // metadata read-back reconciliation just like `last_saved`.
+        let _ = index.search(&[1.0, 1.0], 1);
+
+        // Advance both ids and metadata before retrying the stale writer.
+        // Any committed-but-unobserved generation must be reconciled first,
+        // then this newer generation must use the recovered object token.
+        index
+            .insert(2, vec![bf16::from_f32(2.0), bf16::from_f32(2.0)], 4)
+            .unwrap();
+
+        // The original writer did not observe the durable PUT result and thus
+        // still holds the old CAS token. It must be able to read back an
+        // identical artifact, repair that token, and finish the same logical
+        // generation without requiring a process restart.
+        assert_retry_recovers(&index, &storage).await;
+        let recovered = Hnsw::bootstrap("embedding".to_string(), storage)
+            .await
+            .unwrap();
+        assert_eq!(recovered.search(&[2.0, 2.0], 1), vec![(2, 0.0)]);
+    }
+
+    #[tokio::test]
+    async fn node_put_failure_does_not_publish_ids_or_metadata() {
+        let (index, storage, object_store) = fault_index().await;
+        let old_ids = storage
+            .fetch_bytes(&Hnsw::ids_path("embedding"))
+            .await
+            .unwrap()
+            .0;
+        let old_metadata = storage
+            .fetch_bytes(&Hnsw::metadata_path("embedding"))
+            .await
+            .unwrap()
+            .0;
+
+        object_store.fail_next_put("n_1.cbor");
+        assert!(index.flush(3).await.is_err());
+        assert_eq!(object_store.put_suffixes().len(), 1);
+        assert!(object_store.put_suffixes()[0].ends_with("n_1.cbor"));
+        assert_eq!(
+            storage
+                .fetch_bytes(&Hnsw::ids_path("embedding"))
+                .await
+                .unwrap()
+                .0,
+            old_ids
+        );
+        assert_eq!(
+            storage
+                .fetch_bytes(&Hnsw::metadata_path("embedding"))
+                .await
+                .unwrap()
+                .0,
+            old_metadata
+        );
+        let crashed = Hnsw::bootstrap("embedding".to_string(), storage.clone())
+            .await
+            .unwrap();
+        assert!(crashed.search(&[1.0, 1.0], 1).is_empty());
+
+        assert_retry_recovers(&index, &storage).await;
+    }
+
+    #[tokio::test]
+    async fn ids_put_failure_leaves_metadata_at_previous_commit() {
+        let (index, storage, object_store) = fault_index().await;
+        let old_ids = storage
+            .fetch_bytes(&Hnsw::ids_path("embedding"))
+            .await
+            .unwrap()
+            .0;
+        let old_metadata = storage
+            .fetch_bytes(&Hnsw::metadata_path("embedding"))
+            .await
+            .unwrap()
+            .0;
+
+        object_store.fail_next_put("ids.cbor");
+        assert!(index.flush(3).await.is_err());
+        let puts = object_store.put_suffixes();
+        assert_eq!(puts.len(), 2);
+        assert!(puts[0].ends_with("n_1.cbor"));
+        assert!(puts[1].ends_with("ids.cbor"));
+        assert_eq!(
+            storage
+                .fetch_bytes(&Hnsw::ids_path("embedding"))
+                .await
+                .unwrap()
+                .0,
+            old_ids
+        );
+        assert_eq!(
+            storage
+                .fetch_bytes(&Hnsw::metadata_path("embedding"))
+                .await
+                .unwrap()
+                .0,
+            old_metadata
+        );
+        let crashed = Hnsw::bootstrap("embedding".to_string(), storage.clone())
+            .await
+            .unwrap();
+        assert!(crashed.search(&[1.0, 1.0], 1).is_empty());
+
+        assert_retry_recovers(&index, &storage).await;
+    }
+
+    #[tokio::test]
+    async fn metadata_put_failure_is_last_and_retryable() {
+        let (index, storage, object_store) = fault_index().await;
+        let old_metadata = storage
+            .fetch_bytes(&Hnsw::metadata_path("embedding"))
+            .await
+            .unwrap()
+            .0;
+
+        object_store.fail_next_put("meta.cbor");
+        assert!(index.flush(3).await.is_err());
+        let puts = object_store.put_suffixes();
+        assert_eq!(puts.len(), 3);
+        assert!(puts[0].ends_with("n_1.cbor"));
+        assert!(puts[1].ends_with("ids.cbor"));
+        assert!(puts[2].ends_with("meta.cbor"));
+        assert_eq!(
+            storage
+                .fetch_bytes(&Hnsw::metadata_path("embedding"))
+                .await
+                .unwrap()
+                .0,
+            old_metadata
+        );
+
+        // Nodes and ids are already durable. Loading with the previous empty
+        // metadata self-repairs its stale entry point instead of pruning the
+        // live node, and the original writer can still retry the metadata CAS.
+        let crashed = Hnsw::bootstrap("embedding".to_string(), storage.clone())
+            .await
+            .unwrap();
+        assert_eq!(crashed.search(&[1.0, 1.0], 1), vec![(1, 0.0)]);
+
+        assert_retry_recovers(&index, &storage).await;
+    }
+
+    #[tokio::test]
+    async fn crash_after_node_put_reopens_previous_commit() {
+        assert_crash_after_put("n_1.cbor", &["n_1.cbor"], false).await;
+    }
+
+    #[tokio::test]
+    async fn crash_after_ids_put_reopens_recoverable_snapshot() {
+        assert_crash_after_put("ids.cbor", &["n_1.cbor", "ids.cbor"], true).await;
+    }
+
+    #[tokio::test]
+    async fn crash_after_metadata_put_reopens_committed_snapshot() {
+        assert_crash_after_put("meta.cbor", &["n_1.cbor", "ids.cbor", "meta.cbor"], true).await;
     }
 }

@@ -92,8 +92,9 @@ impl Document {
     ///
     /// Generic (schema-less) deserialization cannot restore the declared
     /// variant of every value: a non-negative `I64` reads back as `U64` and
-    /// an `F32` reads back as `F64`. Such read-back shapes are normalized
-    /// into the canonical variant here (see
+    /// an `F32` reads back as `F64`, and a `Vector` reads back as an array of
+    /// U64 bf16 bit patterns. Such read-back shapes are normalized into the
+    /// canonical variant here (see
     /// [`FieldType::normalize`](crate::FieldType::normalize)) so that index
     /// maintenance and field accessors always observe the declared variant.
     ///
@@ -441,7 +442,7 @@ impl Serialize for Document {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AndaDBSchema, Fv, Resource};
+    use crate::{AndaDBSchema, Fv, Resource, Vector, vector_from_f32};
     use serde::{Deserialize, Serialize};
     use std::collections::BTreeMap;
 
@@ -864,6 +865,36 @@ mod tests {
         assert_eq!(doc.get_field("ratio").unwrap(), &Fv::F32(2.71));
         assert_eq!(doc.get_field("count").unwrap(), &Fv::I64(5));
         let round: NumDoc = doc.try_into().unwrap();
+        assert_eq!(round, value);
+    }
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq, AndaDBSchema)]
+    struct VectorDoc {
+        _id: u64,
+        embedding: Vector,
+    }
+
+    #[test]
+    fn stored_vector_read_back_is_canonical_for_get_field() {
+        let schema = Arc::new(VectorDoc::schema().unwrap());
+        let value = VectorDoc {
+            _id: 1,
+            embedding: vector_from_f32(vec![1.5, -2.0, 0.25]),
+        };
+
+        let doc = Document::try_from(schema.clone(), &value).unwrap();
+        let owned: DocumentOwned = doc.into();
+        let mut bytes = Vec::new();
+        cbor2::to_writer(&owned, &mut bytes).unwrap();
+        let restored: DocumentOwned = cbor2::from_reader(bytes.as_slice()).unwrap();
+
+        assert!(matches!(restored.fields.get(&1), Some(Fv::Array(_))));
+        let doc = Document::try_from_doc(schema, restored).unwrap();
+        assert_eq!(
+            doc.get_field("embedding"),
+            Some(&Fv::Vector(value.embedding.clone()))
+        );
+        let round: VectorDoc = doc.try_into().unwrap();
         assert_eq!(round, value);
     }
 

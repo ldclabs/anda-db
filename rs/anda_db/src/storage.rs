@@ -14,6 +14,8 @@ use object_store::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
     io,
     pin::Pin,
     sync::{
@@ -26,6 +28,19 @@ use std::{
 pub use object_store::PutMode;
 
 use crate::error::DBError;
+
+/// Number of write-generation stripes used to validate cache entries.
+///
+/// A fixed-size table avoids an unbounded per-path generation map. Hash
+/// collisions only cause an extra cache miss; they cannot serve stale data.
+const CACHE_WRITE_SEQ_STRIPES: usize = 256;
+
+/// Cached object bytes bound to the write generation observed by their fetch.
+struct CachedObject {
+    bytes: Bytes,
+    version: ObjectVersion,
+    write_seq: u64,
+}
 
 /// Anda DB storage layer implementation based on `object_store`.
 #[derive(Clone)]
@@ -41,17 +56,19 @@ struct InnerStorage {
     base_path: Path,
     /// Atomic storage statistics.
     stats: StorageStatsAtomic,
+    /// Serializes metadata snapshots and their durable publication.
+    metadata_save_lock: tokio::sync::Mutex<()>,
     /// Storage metadata (configuration and non-atomic stats).
     metadata: StorageMetadata,
     /// Optional cache for frequently accessed small objects.
-    cache: Option<Cache<Path, Arc<(Bytes, ObjectVersion)>>>,
+    cache: Option<Cache<Path, Arc<CachedObject>>>,
+    /// Per-path-hash generations stored alongside cache values.
+    cache_write_seqs: [AtomicU64; CACHE_WRITE_SEQ_STRIPES],
     /// Monotonic counter bumped on every `put` / `delete`.
     ///
-    /// `inner_get` snapshots it before fetching and only inserts the fetched
-    /// bytes into the cache when no write happened in between. Without this
-    /// guard, a concurrent read could re-populate the cache with pre-write
-    /// bytes *after* the writer's invalidation, serving a stale object until
-    /// the next write to that path. Coarse (any path) but cheap and safe.
+    /// Retained as a storage-wide write counter for diagnostics and tests;
+    /// cache coherency uses the path-hash generations above so an unrelated
+    /// write does not invalidate every cached object.
     write_seq: AtomicU64,
 }
 
@@ -298,7 +315,10 @@ impl Storage {
         };
 
         let storage = Storage::new(object_store.clone(), metadata)?;
-        match storage.fetch::<StorageMetadata>(Storage::METADATA_PATH).await {
+        match storage
+            .fetch::<StorageMetadata>(Storage::METADATA_PATH)
+            .await
+        {
             Ok((metadata, _)) => {
                 // The persisted configuration is authoritative; the
                 // caller-supplied config is only used at first initialization.
@@ -332,23 +352,16 @@ impl Storage {
     ///
     /// Returns `DBError` if writing the metadata fails.
     pub async fn store_metadata(&self, check_point: u64, now_ms: u64) -> Result<(), DBError> {
-        let prev_last_saved = self
-            .inner
-            .stats
-            .last_saved
-            .fetch_max(now_ms, Ordering::Acquire);
-        let check_point_advanced = if check_point > 0 {
-            let prev_check_point = self
-                .inner
-                .stats
-                .check_point
-                .fetch_max(check_point, Ordering::AcqRel);
-            check_point > prev_check_point
+        let _guard = self.inner.metadata_save_lock.lock().await;
+        let current = self.stats();
+        let next_check_point = if check_point > 0 {
+            current.check_point.max(check_point)
         } else {
-            false
+            current.check_point
         };
+        let next_last_saved = current.last_saved.max(now_ms);
 
-        if prev_last_saved >= now_ms && !check_point_advanced {
+        if next_last_saved == current.last_saved && next_check_point == current.check_point {
             // Skip only when both timestamp and checkpoint are unchanged.
             //
             // Known limitations (accepted, low risk):
@@ -356,15 +369,38 @@ impl Storage {
             //   keep this branch skipping writes until the clock catches up
             //   with the previously persisted timestamp (a forward-advancing
             //   checkpoint still forces a write).
-            // - `version` below is incremented before the write and not rolled
-            //   back on failure, so it may drift ahead; it is only used for
-            //   statistics, never for preconditions.
             return Ok(());
         }
 
-        self.inner.stats.version.fetch_add(1, Ordering::Release);
-        let metadata = self.metadata();
+        let next_version = current.version.saturating_add(1);
+        let metadata = StorageMetadata {
+            path: self.inner.metadata.path.clone(),
+            config: self.inner.metadata.config.clone(),
+            stats: StorageStats {
+                check_point: next_check_point,
+                version: next_version,
+                last_saved: next_last_saved,
+                ..current
+            },
+        };
         self.put(Storage::METADATA_PATH, &metadata, None).await?;
+
+        // Do not let a failed PUT advance the in-memory rate limiter or
+        // checkpoint. Publishing only after the object is durable keeps an
+        // identical retry eligible and binds these values to the snapshot
+        // that was actually written.
+        self.inner
+            .stats
+            .check_point
+            .store(next_check_point, Ordering::Release);
+        self.inner
+            .stats
+            .last_saved
+            .store(next_last_saved, Ordering::Release);
+        self.inner
+            .stats
+            .version
+            .store(next_version, Ordering::Release);
 
         Ok(())
     }
@@ -386,8 +422,8 @@ impl Storage {
             Some(max_bytes) if max_bytes > 0 => Some(
                 Cache::builder()
                     .max_capacity(max_bytes)
-                    .weigher(|_key: &Path, value: &Arc<(Bytes, ObjectVersion)>| {
-                        value.0.len().clamp(1, u32::MAX as usize) as u32
+                    .weigher(|_key: &Path, value: &Arc<CachedObject>| {
+                        value.bytes.len().clamp(1, u32::MAX as usize) as u32
                     })
                     .build(),
             ),
@@ -405,8 +441,10 @@ impl Storage {
                 object_store,
                 base_path: Path::from(metadata.path.as_str()),
                 stats: (&metadata.stats).into(),
+                metadata_save_lock: tokio::sync::Mutex::new(()),
                 metadata,
                 cache,
+                cache_write_seqs: std::array::from_fn(|_| AtomicU64::new(0)),
                 write_seq: AtomicU64::new(0),
             }),
         })
@@ -542,8 +580,9 @@ impl Storage {
     {
         if let Some(cache) = &self.inner.cache
             && let Some(arc) = cache.get(path).await
+            && arc.write_seq == self.inner.cache_write_seq(path)
         {
-            let doc: T = from_reader(&arc.0[..]).map_err(|err| DBError::Serialization {
+            let doc: T = from_reader(&arc.bytes[..]).map_err(|err| DBError::Serialization {
                 name: self.inner.base_path.to_string(),
                 source: err.into(),
             })?;
@@ -551,10 +590,10 @@ impl Storage {
                 .stats
                 .total_cache_get_count
                 .fetch_add(1, Ordering::Relaxed);
-            return Ok((doc, arc.1.clone()));
+            return Ok((doc, arc.version.clone()));
         }
 
-        let write_seq = self.inner.write_seq.load(Ordering::Acquire);
+        let cache_write_seq = self.inner.cache_write_seq(path);
         let (bytes, version) = self.inner_fetch(path).await?;
         let doc: T = from_reader(&bytes[..]).map_err(|err| DBError::Serialization {
             name: self.inner.base_path.to_string(),
@@ -563,13 +602,20 @@ impl Storage {
 
         if let Some(cache) = &self.inner.cache
             && bytes.len() <= self.inner.metadata.config.max_small_object_size
-            // Skip caching when any write raced with this fetch; see
-            // `InnerStorage::write_seq`.
-            && self.inner.write_seq.load(Ordering::Acquire) == write_seq
+            // Skip caching when a write to this path (or its hash stripe)
+            // raced with this fetch.
+            && self.inner.cache_write_seq(path) == cache_write_seq
         {
             // Cache the document if it is small enough
             cache
-                .insert(path.clone(), Arc::new((bytes, version.clone())))
+                .insert(
+                    path.clone(),
+                    Arc::new(CachedObject {
+                        bytes,
+                        version: version.clone(),
+                        write_seq: cache_write_seq,
+                    }),
+                )
                 .await;
         }
 
@@ -787,6 +833,7 @@ impl Storage {
             .map_err(DBError::from)?;
 
         self.inner.write_seq.fetch_add(1, Ordering::AcqRel);
+        self.inner.bump_cache_write_seq(&path);
         if let Some(cache) = &self.inner.cache {
             cache.remove(&path).await;
         }
@@ -815,7 +862,7 @@ impl Storage {
         &self,
         prefix: Option<&str>,
         offset: Option<&str>,
-    ) -> BoxStream<'_, Result<(T, ObjectVersion), DBError>>
+    ) -> BoxStream<'static, Result<(T, ObjectVersion), DBError>>
     where
         T: DeserializeOwned + Send,
     {
@@ -837,10 +884,11 @@ impl Storage {
 
         // Use inner_fetch (bypassing cache) to avoid polluting the cache
         // with every listed object during large scans.
+        let storage = Storage::clone(self);
         (stream
             .map_err(DBError::from)
-            .try_filter_map(|meta| {
-                let this = self.clone();
+            .try_filter_map(move |meta| {
+                let this = storage.clone();
                 async move {
                     let (bytes, version) = this.inner_fetch(&meta.location).await?;
                     let doc: T = from_reader(&bytes[..]).map_err(|err| DBError::Serialization {
@@ -858,7 +906,7 @@ impl Storage {
         &self,
         prefix: Option<&str>,
         offset: Option<&str>,
-    ) -> BoxStream<'_, Result<ObjectMeta, DBError>> {
+    ) -> BoxStream<'static, Result<ObjectMeta, DBError>> {
         let path_prefix = if let Some(p) = prefix {
             self.full_path(p)
         } else {
@@ -908,6 +956,7 @@ impl Storage {
                     // the cache after our removal, or the deleted object would
                     // keep being served from the cache.
                     inner.write_seq.fetch_add(1, Ordering::AcqRel);
+                    inner.bump_cache_write_seq(&meta.location);
                     if let Some(cache) = &inner.cache {
                         cache.remove(&meta.location).await;
                     }
@@ -924,6 +973,20 @@ impl Storage {
 }
 
 impl InnerStorage {
+    fn cache_write_seq_index(path: &Path) -> usize {
+        let mut hasher = DefaultHasher::new();
+        path.hash(&mut hasher);
+        hasher.finish() as usize % CACHE_WRITE_SEQ_STRIPES
+    }
+
+    fn cache_write_seq(&self, path: &Path) -> u64 {
+        self.cache_write_seqs[Self::cache_write_seq_index(path)].load(Ordering::Acquire)
+    }
+
+    fn bump_cache_write_seq(&self, path: &Path) {
+        self.cache_write_seqs[Self::cache_write_seq_index(path)].fetch_add(1, Ordering::AcqRel);
+    }
+
     /// Internal helper to put bytes, handling compression, size checks, cache invalidation, and stats updates.
     async fn put(&self, path: Path, data: Bytes, mode: PutMode) -> Result<ObjectVersion, DBError> {
         // Check original (pre-compression) size to ensure the decompression path
@@ -957,6 +1020,7 @@ impl InnerStorage {
             .map_err(DBError::from)?;
 
         self.write_seq.fetch_add(1, Ordering::AcqRel);
+        self.bump_cache_write_seq(&path);
         if let Some(cache) = &self.cache {
             cache.remove(&path).await;
         }
@@ -1203,8 +1267,113 @@ fn zstd_compressed(data: &[u8]) -> bool {
 mod tests {
     use super::*;
     use crate::unix_ms;
-    use object_store::memory::InMemory;
+    use async_trait::async_trait;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, PutMultipartOptions,
+        PutOptions, PutPayload, PutResult, Result as ObjectStoreResult, memory::InMemory,
+    };
+    use std::{
+        fmt,
+        sync::atomic::{AtomicBool, Ordering as AtomicOrdering},
+    };
     use tokio::io::AsyncReadExt;
+
+    #[derive(Debug)]
+    struct FailMetadataPutStore {
+        inner: Arc<InMemory>,
+        metadata_path: Path,
+        fail_next: AtomicBool,
+    }
+
+    impl FailMetadataPutStore {
+        fn new(metadata_path: Path) -> Self {
+            Self {
+                inner: Arc::new(InMemory::new()),
+                metadata_path,
+                fail_next: AtomicBool::new(false),
+            }
+        }
+
+        fn fail_next_metadata_put(&self) {
+            self.fail_next.store(true, AtomicOrdering::Release);
+        }
+    }
+
+    impl fmt::Display for FailMetadataPutStore {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("FailMetadataPutStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for FailMetadataPutStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> ObjectStoreResult<PutResult> {
+            if location == &self.metadata_path && self.fail_next.swap(false, AtomicOrdering::AcqRel)
+            {
+                return Err(object_store::Error::Generic {
+                    store: "fail_metadata_put",
+                    source: "injected metadata put failure".into(),
+                });
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> ObjectStoreResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, ObjectStoreResult<Path>>,
+        ) -> BoxStream<'static, ObjectStoreResult<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> ObjectStoreResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> ObjectStoreResult<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
 
     // 创建一个测试用的存储实例
     async fn create_test_storage() -> Storage {
@@ -1253,6 +1422,47 @@ mod tests {
             .expect("Failed to store metadata");
         let metadata2 = storage.metadata();
         assert_eq!(metadata.stats.version, metadata2.stats.version);
+    }
+
+    #[tokio::test]
+    async fn test_storage_metadata_failed_put_can_retry_same_checkpoint_and_timestamp() {
+        let path = "metadata_retry";
+        let object_store = Arc::new(FailMetadataPutStore::new(Path::from(format!(
+            "{path}/{}",
+            Storage::METADATA_PATH
+        ))));
+        let config = StorageConfig {
+            compress_level: 0,
+            ..Default::default()
+        };
+        let storage = Storage::connect(path.to_string(), object_store.clone(), config.clone())
+            .await
+            .unwrap();
+
+        object_store.fail_next_metadata_put();
+        assert!(storage.store_metadata(42, 123_456).await.is_err());
+        let failed_stats = storage.stats();
+        assert_eq!(failed_stats.check_point, 0);
+        assert_eq!(failed_stats.last_saved, 0);
+        assert_eq!(failed_stats.version, 0);
+
+        // An identical retry must not be suppressed by the rate limiter.
+        storage.store_metadata(42, 123_456).await.unwrap();
+        let saved_stats = storage.stats();
+        assert_eq!(saved_stats.check_point, 42);
+        assert_eq!(saved_stats.last_saved, 123_456);
+        assert_eq!(saved_stats.version, 1);
+
+        // Reopen from the same object store to verify those exact target
+        // values were part of the durable metadata snapshot.
+        drop(storage);
+        let reopened = Storage::connect(path.to_string(), object_store, config)
+            .await
+            .unwrap();
+        let reopened_stats = reopened.stats();
+        assert_eq!(reopened_stats.check_point, 42);
+        assert_eq!(reopened_stats.last_saved, 123_456);
+        assert_eq!(reopened_stats.version, 1);
     }
 
     #[tokio::test]
@@ -1715,6 +1925,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cache_insert_after_write_invalidation_cannot_serve_stale() {
+        let storage = create_test_storage().await;
+        storage.create("cache_race", &1_u64).await.unwrap();
+
+        // Model a reader that fetched the old object and passed the first
+        // write-sequence check, but whose asynchronous cache insertion has not
+        // completed yet.
+        let path = storage.full_path("cache_race");
+        let (stale_bytes, stale_version) = storage.inner_fetch(&path).await.unwrap();
+        let reader_write_seq = storage.inner.cache_write_seq(&path);
+
+        // The writer publishes the new object and finishes its cache removal
+        // before the reader's delayed insertion completes.
+        storage.put("cache_race", &2_u64, None).await.unwrap();
+        let cache = storage.inner.cache.as_ref().unwrap();
+        cache
+            .insert(
+                path.clone(),
+                Arc::new(CachedObject {
+                    bytes: stale_bytes,
+                    version: stale_version,
+                    write_seq: reader_write_seq,
+                }),
+            )
+            .await;
+
+        // The next read must fetch the writer's value, not the stale bytes
+        // that completed insertion after invalidation.
+        assert_eq!(storage.get::<u64>("cache_race").await.unwrap().0, 2);
+    }
+
+    #[tokio::test]
     async fn test_private_cache_list_and_compression_edges() {
         let storage = create_test_storage().await;
 
@@ -1726,13 +1968,16 @@ mod tests {
             .unwrap()
             .insert(
                 cached_path,
-                Arc::new((
-                    Bytes::from_static(b"bad cached cbor"),
-                    ObjectVersion {
+                Arc::new(CachedObject {
+                    bytes: Bytes::from_static(b"bad cached cbor"),
+                    version: ObjectVersion {
                         e_tag: None,
                         version: None,
                     },
-                )),
+                    write_seq: storage
+                        .inner
+                        .cache_write_seq(&storage.full_path("bad_cached")),
+                }),
             )
             .await;
         assert!(matches!(
@@ -1762,7 +2007,10 @@ mod tests {
         let original = Bytes::from(vec![b'a'; 8192]);
         let compressed = try_compress(original.clone(), 3);
         assert!(zstd_compressed(compressed.as_ref()));
-        assert_eq!(try_decompress(compressed.clone(), u64::MAX).unwrap(), original);
+        assert_eq!(
+            try_decompress(compressed.clone(), u64::MAX).unwrap(),
+            original
+        );
         // Oversized or corrupt frames error out instead of silently returning
         // the compressed bytes (which would surface as an unrelated
         // deserialization error downstream).

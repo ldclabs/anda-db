@@ -14,7 +14,7 @@ async-trait = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
 cbor2 = { workspace = true }
-futures = { workspace = true }
+futures = { workspace = true, features = ["std"] }
 log = { workspace = true }
 serde = { workspace = true }
 serde_bytes = { workspace = true }

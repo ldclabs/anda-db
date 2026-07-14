@@ -78,21 +78,17 @@ pub async fn rpc_db(
     result.unwrap_or_else(|err| err.respond(enc))
 }
 
-/// Authorizes and parses the request inline (cheap and side-effect free),
-/// then runs `dispatch` on its own spawned task with the configured request
-/// timeout applied to the [`tokio::task::JoinHandle`].
+/// Authorizes and parses the request inline, then applies cancellation policy
+/// according to the method's side effects.
 ///
-/// Mutating RPC methods (`db.close`, `db.create`, `doc.add`, ...) are not
-/// cancel-safe: dropping them at an arbitrary await point — which is exactly
-/// what wrapping the whole future in `tokio::time::timeout` used to do —
-/// can break invariants such as "a database removed from the registry always
-/// has its flush task cancelled". Spawning decouples the operation from the
-/// response: on timeout the client receives 408, the `JoinHandle` is dropped
-/// (which *detaches* the task rather than aborting it), and the operation
-/// runs to completion in the background, so a retry observes a consistent
-/// state instead of racing a half-executed predecessor. The same reasoning
-/// protects the operation from a client disconnect or the route-level
-/// [`total_timeout`], both of which only drop this handler's future.
+/// Read-only methods run directly in the HTTP handler. Their future is
+/// cancelled on timeout, disconnect, or shutdown, preventing abandoned
+/// searches from consuming resources after their response is gone.
+///
+/// Mutating methods are not generally cancel-safe, so they acquire a bounded
+/// semaphore slot and run in the state's mutation tracker. A timed-out or
+/// disconnected response drops only its `JoinHandle`; shutdown closes
+/// admission and drains the tracked task before closing databases.
 async fn execute_rpc<F, Fut>(
     state: &AppState,
     enc: Encoding,
@@ -104,21 +100,63 @@ where
     F: FnOnce(AppState, Encoding, RpcRequest) -> Fut,
     Fut: Future<Output = Result<Response, ApiError>> + Send + 'static,
 {
-    if state.is_shutting_down() {
-        return Err(ApiError::unavailable());
-    }
     authorize(state, headers)?;
     let req = RpcRequest::parse(headers, body)?;
-    let task = tokio::spawn(dispatch(state.clone(), enc, req));
-    match tokio::time::timeout(state.request_timeout(), task).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(err)) => {
-            // The dispatch task panicked (nothing aborts these tasks).
-            log::error!(action = "execute_rpc"; "rpc dispatch task failed: {err:?}");
-            Err(ApiError::internal("internal server error"))
+    let deadline = tokio::time::Instant::now() + state.request_timeout();
+
+    if is_mutating_method(&req.method) {
+        let mutation = dispatch(state.clone(), enc, req);
+        let task = tokio::time::timeout_at(deadline, state.spawn_mutation(mutation))
+            .await
+            .map_err(|_| ApiError::timeout())??;
+        match tokio::time::timeout_at(deadline, task).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(err)) if err.is_cancelled() && state.is_shutting_down() => {
+                Err(ApiError::unavailable())
+            }
+            Ok(Err(err)) => {
+                log::error!(action = "execute_rpc"; "rpc mutation task failed: {err:?}");
+                Err(ApiError::internal("internal server error"))
+            }
+            Err(_elapsed) => Err(ApiError::timeout()),
         }
-        Err(_elapsed) => Err(ApiError::timeout()),
+    } else {
+        let cancel = state.admit_read()?;
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(ApiError::unavailable()),
+            result = tokio::time::timeout_at(deadline, dispatch(state.clone(), enc, req)) => {
+                result.map_err(|_| ApiError::timeout())?
+            }
+        }
     }
+}
+
+/// Methods whose futures may modify server, database, collection, index, or
+/// document state and therefore must not be dropped at an arbitrary await.
+fn is_mutating_method(method: &str) -> bool {
+    matches!(
+        method,
+        "db.create"
+            | "db.open"
+            | "db.connect"
+            | "db.close"
+            | "db.flush"
+            | "db.set_read_only"
+            | "db.save_extension"
+            | "db.remove_extension"
+            | "collection.create"
+            | "collection.ensure"
+            | "collection.delete"
+            | "collection.flush"
+            | "collection.set_read_only"
+            | "collection.save_extension"
+            | "collection.remove_extension"
+            | "doc.add"
+            | "doc.add_many"
+            | "doc.update"
+            | "doc.remove"
+    )
 }
 
 /// Route-level timeout covering the *entire* request, including reading the
@@ -130,10 +168,9 @@ where
 /// The deadline is twice the configured request timeout so that once
 /// dispatch has started, the inner timeout (which produces the precise 408
 /// for the operation) always fires first; this layer only triggers when the
-/// transport itself stalls. Cancelling here is safe: during body reading no
-/// state has been touched yet, and once dispatch has started the operation
-/// lives on its own spawned task ([`execute_rpc`]) that dropping this future
-/// cannot cancel.
+/// transport itself stalls. Cancelling this middleware cancels read-only
+/// dispatch directly. A mutation that has already acquired admission lives
+/// in the state tracker and is drained during shutdown.
 pub async fn total_timeout(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let enc = Encoding::negotiate(req.headers());
     let deadline = state.request_timeout().saturating_mul(2);
@@ -274,4 +311,141 @@ async fn dispatch_db(
         _ => return Err(ApiError::method_not_found(&method)),
     };
     Ok(resp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::ServerOptions;
+    use axum::http::HeaderValue;
+    use object_store::memory::InMemory;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use tokio::sync::Semaphore;
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    fn json_request(method: &str) -> (HeaderMap, Bytes) {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        (headers, Bytes::from(format!(r#"{{"method":"{method}"}}"#)))
+    }
+
+    async fn test_state(mut options: ServerOptions) -> AppState {
+        options.primary_db = "rpc_admission_test".to_string();
+        AppState::connect(Arc::new(InMemory::new()), options)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn begin_shutdown_cancels_an_admitted_read_future() {
+        let state = test_state(ServerOptions::default()).await;
+        let (headers, body) = json_request("info");
+        let entered = Arc::new(Semaphore::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+
+        let request = tokio::spawn({
+            let state = state.clone();
+            let entered = entered.clone();
+            let dropped = dropped.clone();
+            async move {
+                execute_rpc(
+                    &state,
+                    Encoding::Json,
+                    &headers,
+                    &body,
+                    move |_state, enc, _req| async move {
+                        let _drop_flag = DropFlag(dropped);
+                        entered.add_permits(1);
+                        std::future::pending::<()>().await;
+                        Ok(enc.reply(&()))
+                    },
+                )
+                .await
+            }
+        });
+        entered.acquire().await.unwrap().forget();
+
+        state.begin_shutdown();
+        let err = request.await.unwrap().unwrap_err();
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(dropped.load(Ordering::Acquire));
+        state.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_rejects_a_mutation_waiting_for_the_bounded_slot() {
+        let options = ServerOptions {
+            max_concurrent_mutations: 1,
+            ..Default::default()
+        };
+        let state = test_state(options).await;
+        let first_entered = Arc::new(Semaphore::new(0));
+        let first_release = Arc::new(Semaphore::new(0));
+
+        let first = tokio::spawn({
+            let state = state.clone();
+            let entered = first_entered.clone();
+            let release = first_release.clone();
+            let (headers, body) = json_request("db.flush");
+            async move {
+                execute_rpc(
+                    &state,
+                    Encoding::Json,
+                    &headers,
+                    &body,
+                    move |_state, enc, _req| async move {
+                        entered.add_permits(1);
+                        release.acquire().await.unwrap().forget();
+                        Ok(enc.reply(&()))
+                    },
+                )
+                .await
+            }
+        });
+        first_entered.acquire().await.unwrap().forget();
+
+        let second_polled = Arc::new(AtomicBool::new(false));
+        let second = tokio::spawn({
+            let state = state.clone();
+            let second_polled = second_polled.clone();
+            let (headers, body) = json_request("db.flush");
+            async move {
+                execute_rpc(
+                    &state,
+                    Encoding::Json,
+                    &headers,
+                    &body,
+                    move |_state, enc, _req| async move {
+                        second_polled.store(true, Ordering::Release);
+                        Ok(enc.reply(&()))
+                    },
+                )
+                .await
+            }
+        });
+        // Let the second request reach the semaphore wait before closing it.
+        tokio::task::yield_now().await;
+        state.begin_shutdown();
+
+        let err = second.await.unwrap().unwrap_err();
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!second_polled.load(Ordering::Acquire));
+
+        first_release.add_permits(1);
+        assert!(first.await.unwrap().is_ok());
+        state.shutdown().await;
+    }
 }

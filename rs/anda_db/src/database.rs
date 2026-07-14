@@ -41,10 +41,18 @@ struct InnerDB {
     storage: Storage,
     /// Database metadata protected by a read-write lock
     metadata: RwLock<DBMetadata>,
+    /// Serializes the complete database-metadata persistence transaction.
+    ///
+    /// Collection lifecycle locks are intentionally per name, so operations
+    /// on different collections may update `metadata` concurrently.  The
+    /// persistence lock must therefore cover both taking the full metadata
+    /// snapshot and writing it; otherwise an older snapshot can overwrite a
+    /// newer one after both lifecycle operations have returned successfully.
+    metadata_flush_lock: Arc<tokio::sync::Mutex<()>>,
     /// Map of collection names to collection instances
     collections: RwLock<BTreeMap<String, Arc<Collection>>>,
     /// Flag indicating whether the database is in read-only mode
-    read_only: AtomicBool,
+    read_only: Arc<AtomicBool>,
     /// Set of collection names being dropped
     dropping_collections: RwLock<BTreeSet<String>>,
     /// Per-collection-name lifecycle locks (see
@@ -197,8 +205,9 @@ impl AndaDB {
                 object_store,
                 storage,
                 metadata: RwLock::new(metadata),
+                metadata_flush_lock: Arc::new(tokio::sync::Mutex::new(())),
                 collections: RwLock::new(BTreeMap::new()),
-                read_only: AtomicBool::new(false),
+                read_only: Arc::new(AtomicBool::new(false)),
                 dropping_collections: RwLock::new(BTreeSet::new()),
                 collection_locks: parking_lot::Mutex::new(HashMap::new()),
             }),
@@ -264,8 +273,9 @@ impl AndaDB {
                         object_store,
                         storage,
                         metadata: RwLock::new(metadata),
+                        metadata_flush_lock: Arc::new(tokio::sync::Mutex::new(())),
                         collections: RwLock::new(BTreeMap::new()),
-                        read_only: AtomicBool::new(false),
+                        read_only: Arc::new(AtomicBool::new(false)),
                         dropping_collections: RwLock::new(BTreeSet::new()),
                         collection_locks: parking_lot::Mutex::new(HashMap::new()),
                     }),
@@ -289,6 +299,20 @@ impl AndaDB {
     /// Returns a clone of the database metadata.
     pub fn metadata(&self) -> DBMetadata {
         self.inner.metadata.read().clone()
+    }
+
+    /// Returns whether the database currently rejects mutations.
+    ///
+    /// This is a point-in-time observation intended for API boundaries that
+    /// want to classify a read-only request before entering the storage
+    /// engine. Callers must still treat a later engine error conservatively,
+    /// because the mode can change concurrently after this check.
+    pub fn is_read_only(&self) -> bool {
+        self.inner.read_only.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn read_only_flag(&self) -> Arc<AtomicBool> {
+        self.inner.read_only.clone()
     }
 
     /// Sets the database to read-only mode.
@@ -661,12 +685,10 @@ impl AndaDB {
             });
         }
 
-        {
-            if let Some(collection) = self.inner.collections.read().get(&config.name) {
-                return Ok(collection.clone());
-            }
-        }
-
+        // A delete tombstone always wins over a cached handle: a cancelled
+        // delete deliberately keeps both until a retry finishes the prefix
+        // removal. Returning the handle first would resurrect an object that
+        // has already entered its irreversible deleting state.
         {
             if self
                 .inner
@@ -680,6 +702,14 @@ impl AndaDB {
                     source: "collection is being dropped".to_string().into(),
                     _id: 0,
                 });
+            }
+        }
+
+        {
+            if let Some(collection) = self.inner.collections.read().get(&config.name)
+                && collection.is_active_handle()
+            {
+                return Ok(collection.clone());
             }
         }
 
@@ -788,19 +818,21 @@ impl AndaDB {
         F: AsyncFnOnce(&mut Collection) -> Result<(), DBError>,
     {
         {
-            if let Some(collection) = self.inner.collections.read().get(&name) {
-                return Ok(collection.clone());
-            }
-        }
-
-        {
             if self.inner.dropping_collections.read().contains(&name) {
                 return Err(DBError::AlreadyExists {
-                    name,
+                    name: name.clone(),
                     path: self.inner.name.clone(),
                     source: "collection is being dropped".to_string().into(),
                     _id: 0,
                 });
+            }
+        }
+
+        {
+            if let Some(collection) = self.inner.collections.read().get(&name)
+                && collection.is_active_handle()
+            {
+                return Ok(collection.clone());
             }
         }
 
@@ -825,18 +857,31 @@ impl AndaDB {
         // open may have registered the collection while we waited, or a
         // delete may have started/completed.
         {
-            if let Some(collection) = self.inner.collections.read().get(&name) {
-                return Ok(collection.clone());
-            }
-        }
-        {
             if self.inner.dropping_collections.read().contains(&name) {
                 return Err(DBError::AlreadyExists {
-                    name,
+                    name: name.clone(),
                     path: self.inner.name.clone(),
                     source: "collection is being dropped".to_string().into(),
                     _id: 0,
                 });
+            }
+        }
+
+        // A cancelled close deliberately leaves its retiring handle in the
+        // registry. Finish its drain/flush under the same per-name lock before
+        // loading a fresh generation, then remove only that exact Arc.
+        let retiring = { self.inner.collections.read().get(&name).cloned() };
+        if let Some(collection) = retiring {
+            if collection.is_active_handle() {
+                return Ok(collection);
+            }
+            collection.close().await?;
+            let mut collections = self.inner.collections.write();
+            if collections
+                .get(&name)
+                .is_some_and(|current| Arc::ptr_eq(current, &collection))
+            {
+                collections.remove(&name);
             }
         }
         {
@@ -888,7 +933,11 @@ impl AndaDB {
             collections.insert(collection.name().to_string(), collection.clone());
         }
         let now = unix_ms();
-        collection.flush(now).await?;
+        // A read-only open may replay recovery state in memory for correct
+        // reads, but must not persist it or let the callback mutate storage.
+        if !self.inner.read_only.load(Ordering::Acquire) {
+            collection.flush(now).await?;
+        }
         Ok(collection)
     }
 
@@ -904,26 +953,30 @@ impl AndaDB {
     /// [`AndaDB::lock_collection_name`]), so a concurrent open of the same
     /// name waits for the close to finish instead of loading a second
     /// writable instance from storage while the closing flush is still
-    /// writing index files.
+    /// writing index files. The collection also closes mutation admission and
+    /// drains operations that already entered before flushing. Any external
+    /// `Arc<Collection>` retained by the caller is permanently retired and
+    /// cannot be made writable again with `set_read_only(false)`.
     ///
-    /// When the close (flush) fails, the — now read-only — handle is put
-    /// back into the registry and the error is returned: its un-flushed
-    /// in-memory state stays reachable and a retry of `close_collection`
-    /// will flush it again, instead of silently reloading stale state from
-    /// storage.
+    /// The handle remains registered until its close succeeds. This makes the
+    /// transition cancellation-safe: aborting the close future cannot expose
+    /// an empty registry slot where a second instance could open and consume
+    /// the first instance's mutation journal. A retry (or an open) finishes
+    /// retiring the same handle before loading a fresh generation.
     ///
     /// Returns `Ok(())` when the collection is not currently open.
     pub async fn close_collection(&self, name: &str) -> Result<(), DBError> {
         let _name_guard = self.lock_collection_name(name).await;
-        let collection = { self.inner.collections.write().remove(name) };
-        if let Some(collection) = collection
-            && let Err(err) = collection.close().await
-        {
-            self.inner
-                .collections
-                .write()
-                .insert(name.to_string(), collection);
-            return Err(err);
+        let collection = { self.inner.collections.read().get(name).cloned() };
+        if let Some(collection) = collection {
+            collection.close().await?;
+            let mut collections = self.inner.collections.write();
+            if collections
+                .get(name)
+                .is_some_and(|current| Arc::ptr_eq(current, &collection))
+            {
+                collections.remove(name);
+            }
         }
         Ok(())
     }
@@ -939,12 +992,10 @@ impl AndaDB {
     /// Deletion holds the per-name lifecycle lock (see
     /// [`AndaDB::lock_collection_name`]) for its whole duration, so it cannot
     /// interleave with a create, storage-loading open, or close of the same
-    /// name. It should still run during a write quiescence for the
-    /// collection: an `add` on an already-open handle that passed the
-    /// read-only check when the deletion starts can still write its document
-    /// object after the prefix listing, leaving a residual object behind.
-    /// Re-running `delete_collection` for the same name cleans such
-    /// leftovers.
+    /// name. An open handle is moved to its irreversible deleting state before
+    /// the prefix is listed: new mutations are rejected and operations that
+    /// already passed admission are drained, so an old `Arc<Collection>`
+    /// cannot recreate residual objects after deletion returns.
     pub async fn delete_collection(&self, name: &str) -> Result<(), DBError> {
         if self.inner.read_only.load(Ordering::Relaxed) {
             return Err(DBError::Generic {
@@ -958,37 +1009,29 @@ impl AndaDB {
 
         let _name_guard = self.lock_collection_name(name).await;
 
-        // 更新元数据并持久化。即使集合未注册（例如此前创建中途失败的残留），
-        // 也继续执行下面的清理流程，使该名字可以重新创建。
-        let registered = {
-            let registered = self.inner.metadata.write().collections.remove(name);
-            self.inner
-                .dropping_collections
-                .write()
-                .insert(name.to_string());
-            registered
-        };
-
-        if registered && let Err(err) = self.flush_metadata(unix_ms()).await {
-            // Roll back the in-memory state so it matches the persisted
-            // metadata; otherwise the name stays in `dropping_collections`
-            // forever and can no longer be opened or created.
-            self.inner
-                .metadata
-                .write()
-                .collections
-                .insert(name.to_string());
-            self.inner.dropping_collections.write().remove(name);
-            return Err(err);
+        // Publish the tombstone before touching durable metadata. Open/create
+        // fast paths consult it before the registry, and a cancelled future
+        // leaves it in place for a later retry to take over.
+        self.inner
+            .dropping_collections
+            .write()
+            .insert(name.to_string());
+        let collection = { self.inner.collections.read().get(name).cloned() };
+        if let Some(collection) = &collection {
+            collection.begin_delete()?;
         }
 
-        // Take any in-memory handle to stop further writes, then delete every
-        // object under the collection's storage prefix. Deleting by prefix does
-        // not require opening the collection (which would load all indexes and
-        // run repair scans) and also cleans up partially created leftovers.
-        let col = { self.inner.collections.write().remove(name) };
-        let drop_result = match col {
-            Some(col) => col.drop_data().await,
+        // Always persist the current no-name snapshot, including on a retry
+        // where an earlier cancelled call already removed it from memory but
+        // may not have completed the object-store PUT.
+        self.inner.metadata.write().collections.remove(name);
+        self.flush_metadata(unix_ms()).await?;
+
+        // Keep a registered handle reachable until its drain and prefix drop
+        // succeed. If this await is cancelled, both handle and tombstone stay
+        // available and no fresh writer can open over the same prefix.
+        let drop_result = match &collection {
+            Some(collection) => collection.drop_data().await,
             None => {
                 let base_path = object_store::path::Path::from(self.name()).join(name);
                 let storage_config = { self.inner.metadata.read().config.storage.clone() };
@@ -1001,7 +1044,6 @@ impl AndaDB {
             }
         };
 
-        self.inner.dropping_collections.write().remove(name);
         if let Err(err) = drop_result {
             log::error!(
                 action = "AndaDB::delete_collection",
@@ -1011,6 +1053,17 @@ impl AndaDB {
             );
             return Err(err);
         }
+
+        if let Some(collection) = collection {
+            let mut collections = self.inner.collections.write();
+            if collections
+                .get(name)
+                .is_some_and(|current| Arc::ptr_eq(current, &collection))
+            {
+                collections.remove(name);
+            }
+        }
+        self.inner.dropping_collections.write().remove(name);
         Ok(())
     }
 
@@ -1018,13 +1071,7 @@ impl AndaDB {
         {
             self.inner.metadata.write().config.lock = Some(lock);
         }
-
-        let metadata = self.metadata();
-        self.inner
-            .storage
-            .put(Self::METADATA_PATH, &metadata, None)
-            .await?;
-        Ok(())
+        self.flush_metadata(unix_ms()).await
     }
 
     /// Flushes database metadata to storage.
@@ -1038,6 +1085,11 @@ impl AndaDB {
     /// # Returns
     /// A Result indicating success or an error
     pub async fn flush_metadata(&self, now_ms: u64) -> Result<(), DBError> {
+        // Keep the lock across snapshot creation and both durable writes.  In
+        // particular, do not clone `metadata` before awaiting this guard: an
+        // older waiter must observe changes made while it was queued instead
+        // of writing its stale clone after the newer operation.
+        let _flush_guard = self.inner.metadata_flush_lock.clone().lock_owned().await;
         let metadata = self.metadata();
 
         self.inner
@@ -1217,7 +1269,152 @@ impl AndaDB {
 mod tests {
     use super::*;
     use crate::schema::{ByteBufB64, Fe, FieldValue, Ft, Schema};
-    use object_store::memory::InMemory;
+    use async_trait::async_trait;
+    use futures::stream::BoxStream;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
+        memory::InMemory, path::Path,
+    };
+    use std::{
+        fmt,
+        sync::{
+            Mutex as StdMutex,
+            atomic::{AtomicBool as TestAtomicBool, Ordering as TestOrdering},
+        },
+        task::Poll,
+    };
+
+    /// An object store that holds the first armed database-metadata PUT before
+    /// it reaches the backing store. A second PUT is allowed through, so an
+    /// implementation without a metadata serialization gate deterministically
+    /// produces the harmful order "new snapshot, then old snapshot".
+    #[derive(Debug)]
+    struct ReverseMetadataPutStore {
+        inner: Arc<InMemory>,
+        metadata_path: Path,
+        armed: TestAtomicBool,
+        release_first: tokio::sync::watch::Receiver<bool>,
+        snapshots: StdMutex<Vec<BTreeSet<String>>>,
+    }
+
+    impl ReverseMetadataPutStore {
+        fn new(metadata_path: Path, release_first: tokio::sync::watch::Receiver<bool>) -> Self {
+            Self {
+                inner: Arc::new(InMemory::new()),
+                metadata_path,
+                armed: TestAtomicBool::new(false),
+                release_first,
+                snapshots: StdMutex::new(Vec::new()),
+            }
+        }
+
+        fn arm(&self) {
+            assert!(self.snapshots.lock().unwrap().is_empty());
+            self.armed.store(true, TestOrdering::Release);
+        }
+
+        fn snapshots(&self) -> Vec<BTreeSet<String>> {
+            self.snapshots.lock().unwrap().clone()
+        }
+    }
+
+    impl fmt::Display for ReverseMetadataPutStore {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("ReverseMetadataPutStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for ReverseMetadataPutStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> ObjectStoreResult<PutResult> {
+            if self.armed.load(TestOrdering::Acquire) && location == &self.metadata_path {
+                let bytes: bytes::Bytes = payload.clone().into();
+                let metadata: DBMetadata =
+                    cbor2::from_reader(&bytes[..]).map_err(|err| object_store::Error::Generic {
+                        store: "reverse_metadata_put",
+                        source: err.into(),
+                    })?;
+                let put_index = {
+                    let mut snapshots = self.snapshots.lock().unwrap();
+                    let put_index = snapshots.len();
+                    snapshots.push(metadata.collections);
+                    put_index
+                };
+
+                if put_index == 0 {
+                    let mut release = self.release_first.clone();
+                    while !*release.borrow() {
+                        release
+                            .changed()
+                            .await
+                            .map_err(|_| object_store::Error::Generic {
+                                store: "reverse_metadata_put",
+                                source: "release sender dropped".into(),
+                            })?;
+                    }
+                }
+            }
+
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> ObjectStoreResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, ObjectStoreResult<Path>>,
+        ) -> BoxStream<'static, ObjectStoreResult<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> ObjectStoreResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> ObjectStoreResult<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
 
     #[tokio::test]
     async fn test_database_creation() {
@@ -1481,6 +1678,30 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, DBError::AlreadyExists { .. }));
+
+        // The tombstone must also win when an old handle is still cached.
+        // A cancelled delete intentionally retains both; checking the
+        // registry first would hand the deleting handle back to the caller.
+        let live_config = CollectionConfig {
+            name: "live_drop".to_string(),
+            description: "Live Dropping Collection".to_string(),
+        };
+        db.create_collection(schema.clone(), live_config.clone(), async |_| Ok(()))
+            .await
+            .unwrap();
+        db.inner
+            .dropping_collections
+            .write()
+            .insert(live_config.name.clone());
+        let err = db
+            .open_or_create_collection(schema, live_config.clone(), async |_| Ok(()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DBError::AlreadyExists { .. }));
+        db.inner
+            .dropping_collections
+            .write()
+            .remove(&live_config.name);
     }
 
     #[tokio::test]
@@ -1500,13 +1721,30 @@ mod tests {
             name: "test_collection".to_string(),
             description: "Test Collection".to_string(),
         };
-        let _collection = db
+        let collection = db
             .create_collection(schema.clone(), collection_config.clone(), async |_| Ok(()))
             .await
             .unwrap();
+        db.close_collection(collection.name()).await.unwrap();
 
-        // Set database to read-only
+        // Set database to read-only after unregistering the collection. A
+        // storage-loaded handle must inherit this state; otherwise it becomes
+        // a fresh writer that escaped the propagation loop above.
         db.set_read_only(true);
+        let reopened = db
+            .open_collection("test_collection".to_string(), async |collection| {
+                assert!(collection.create_btree_index(&["name"]).await.is_err());
+                Ok(())
+            })
+            .await
+            .unwrap();
+        reopened.set_read_only(false);
+        let mut document = reopened.new_document();
+        document
+            .set_field("name", FieldValue::Text("blocked".to_string()))
+            .unwrap();
+        assert!(reopened.add(document).await.is_err());
+        assert!(reopened.flush(unix_ms()).await.is_err());
 
         let err = db
             .save_extension("blocked".to_string(), FieldValue::Text("value".to_string()))
@@ -1785,10 +2023,122 @@ mod tests {
         schema.build().unwrap()
     }
 
+    /// Regression (P0-05): different collection names use independent
+    /// lifecycle locks, but their full-database metadata snapshots must still
+    /// be persisted in one global order. The backing store below holds x's old
+    /// `{x}` PUT while y is registered in memory. Without the flush gate, y's
+    /// `{x,y}` PUT overtakes it and the released `{x}` PUT wins last.
+    #[tokio::test]
+    async fn test_different_collection_registrations_serialize_db_metadata_puts() {
+        const DB_NAME: &str = "metadata_race_db";
+
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+        let store = Arc::new(ReverseMetadataPutStore::new(
+            Path::from(format!("{DB_NAME}/{}", AndaDB::METADATA_PATH)),
+            release_rx,
+        ));
+        let object_store: Arc<dyn ObjectStore> = store.clone();
+        let config = DBConfig {
+            name: DB_NAME.to_string(),
+            description: "metadata race regression".to_string(),
+            storage: StorageConfig {
+                // Let the test store decode and record each CBOR snapshot.
+                compress_level: 0,
+                ..Default::default()
+            },
+            lock: None,
+        };
+        let db = AndaDB::create(object_store.clone(), config.clone())
+            .await
+            .unwrap();
+
+        // Prepare and fully flush both collection objects before registration.
+        // This leaves register_created_collection's collection flush on its
+        // no-I/O fast path, so one manual future poll deterministically reaches
+        // the database metadata gate.
+        let x = Collection::create(
+            db.clone(),
+            test_schema(),
+            CollectionConfig {
+                name: "x".to_string(),
+                description: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+        x.flush(unix_ms()).await.unwrap();
+        let y = Collection::create(
+            db.clone(),
+            test_schema(),
+            CollectionConfig {
+                name: "y".to_string(),
+                description: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+        y.flush(unix_ms()).await.unwrap();
+
+        store.arm();
+
+        // Register x and poll through to its blocked db_meta PUT. The payload
+        // has already been serialized here, so it is permanently the old
+        // `{x}` snapshot even though y will be registered before release.
+        let mut x_registration = Box::pin(db.register_created_collection(x, async |_| Ok(())));
+        assert!(matches!(
+            futures::poll!(x_registration.as_mut()),
+            Poll::Pending
+        ));
+        let x_only = BTreeSet::from(["x".to_string()]);
+        assert_eq!(store.snapshots(), vec![x_only.clone()]);
+
+        // Registration of another name reaches flush_metadata in the same
+        // poll, but must wait on x's gate instead of issuing an overtaking PUT.
+        let mut y_registration = Box::pin(db.register_created_collection(y, async |_| Ok(())));
+        assert!(matches!(
+            futures::poll!(y_registration.as_mut()),
+            Poll::Pending
+        ));
+        let both = BTreeSet::from(["x".to_string(), "y".to_string()]);
+        assert_eq!(db.metadata().collections, both);
+        assert_eq!(
+            store.snapshots(),
+            vec![x_only],
+            "y must wait for the metadata lock before taking or PUTting its snapshot",
+        );
+
+        release_tx.send(true).unwrap();
+        let x = x_registration.await.unwrap();
+        let y = y_registration.await.unwrap();
+        assert_eq!(
+            store.snapshots(),
+            vec![BTreeSet::from(["x".into()]), both.clone()]
+        );
+
+        // Simulate a crash: do not call close/flush on the original instance.
+        // A fresh instance must recover both registered collection names from
+        // the durable db_meta object, not merely from the old in-memory map.
+        drop(x);
+        drop(y);
+        drop(db);
+        let reopened = AndaDB::open(object_store, config).await.unwrap();
+        assert_eq!(reopened.metadata().collections, both);
+        reopened
+            .open_collection("x".to_string(), async |_| Ok(()))
+            .await
+            .unwrap();
+        reopened
+            .open_collection("y".to_string(), async |_| Ok(()))
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn test_close_collection_unregisters_handle() {
         let object_store = Arc::new(InMemory::new());
-        let db = AndaDB::create(object_store, DBConfig::default()).await.unwrap();
+        let db = AndaDB::create(object_store, DBConfig::default())
+            .await
+            .unwrap();
 
         let config = CollectionConfig {
             name: "c1".to_string(),
@@ -1820,7 +2170,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_concurrent_open_or_create_collection() {
         let object_store = Arc::new(InMemory::new());
-        let db = AndaDB::create(object_store, DBConfig::default()).await.unwrap();
+        let db = AndaDB::create(object_store, DBConfig::default())
+            .await
+            .unwrap();
         let schema = test_schema();
 
         // All concurrent callers must succeed: the losers of the create race
@@ -1858,7 +2210,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_nested_collection_creation_in_callback_does_not_deadlock() {
         let object_store = Arc::new(InMemory::new());
-        let db = AndaDB::create(object_store, DBConfig::default()).await.unwrap();
+        let db = AndaDB::create(object_store, DBConfig::default())
+            .await
+            .unwrap();
         let schema = test_schema();
 
         let outer = {
@@ -1914,7 +2268,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_concurrent_close_and_open_collection() {
         let object_store = Arc::new(InMemory::new());
-        let db = AndaDB::create(object_store, DBConfig::default()).await.unwrap();
+        let db = AndaDB::create(object_store, DBConfig::default())
+            .await
+            .unwrap();
         let collection = db
             .create_collection(
                 test_schema(),
@@ -1939,9 +2295,7 @@ mod tests {
         };
         let open_task = {
             let db = db.clone();
-            tokio::spawn(async move {
-                db.open_collection("c".to_string(), async |_| Ok(())).await
-            })
+            tokio::spawn(async move { db.open_collection("c".to_string(), async |_| Ok(())).await })
         };
 
         tokio::time::timeout(Duration::from_secs(30), close_task)
@@ -1973,7 +2327,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_open_or_create_rechecks_dropping_after_lock() {
         let object_store = Arc::new(InMemory::new());
-        let db = AndaDB::create(object_store, DBConfig::default()).await.unwrap();
+        let db = AndaDB::create(object_store, DBConfig::default())
+            .await
+            .unwrap();
 
         // Hold the lifecycle lock for the name, then start an
         // open_or_create_collection: it passes the pre-lock checks and
@@ -2019,7 +2375,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_open_collection_racing_delete_is_serialized() {
         let object_store = Arc::new(InMemory::new());
-        let db = AndaDB::create(object_store, DBConfig::default()).await.unwrap();
+        let db = AndaDB::create(object_store, DBConfig::default())
+            .await
+            .unwrap();
         let config = CollectionConfig {
             name: "racy".to_string(),
             description: "".to_string(),

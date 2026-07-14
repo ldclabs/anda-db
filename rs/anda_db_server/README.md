@@ -12,7 +12,8 @@ format for debugging and non-CBOR clients.
 - One server process serving multiple databases; databases created at
   runtime are registered and reopened automatically after a restart
 - Per-database background flush tasks plus graceful flush-and-close on
-  shutdown
+  shutdown; tracked mutations drain before database close
+- Cancel-safe read RPCs and bounded concurrency for non-cancel-safe mutations
 - Structured errors with meaningful HTTP status codes and stable error codes
 - Optional bearer-token authentication
 - Compatible with [`anda_db_shard_proxy`](../anda_db_shard_proxy): the first
@@ -35,9 +36,19 @@ cargo run -p anda_db_server -- --api-key my-secret local --path ./debug/db
 ```
 
 Options: `--addr` (default `127.0.0.1:8080`), `--api-key`, `--primary-db`
-(default `anda_db`), `--flush-interval-secs` (default `30`). All options can
-also be set through environment variables (`ADDR`, `API_KEY`, `PRIMARY_DB`,
-`FLUSH_INTERVAL_SECS`).
+(default `anda_db`), `--flush-interval-secs` (default `30`),
+`--request-timeout-secs` (default `300`), `--max-concurrent-mutations`
+(default `32`), and `--shutdown-timeout-secs` (default `30`). All options can
+also be set through their uppercase environment variables.
+
+On shutdown, new RPC admission closes immediately, active reads are
+cancelled, and admitted mutations drain before databases close. If the
+shutdown timeout (measured from admission close, including HTTP drain time)
+expires, the server explicitly aborts remaining work and skips the final
+database flush, treating the exit as a crash so the normal recovery path can
+repair durable state on the next open. The timeout bounds RPC drain; after a
+successful drain, the final durable database close is allowed to finish rather
+than being cancelled halfway through its flush.
 
 ## Wire Protocol
 
@@ -65,8 +76,14 @@ Error response (HTTP 4xx/5xx):
 {"error": {"code": "not_found", "message": "database \"demo\" not found"}}
 ```
 
-Error codes: `bad_request`, `method_not_found`, `unauthorized`, `not_found`,
-`already_exists`, `precondition_failed`, `payload_too_large`, `internal`.
+Error codes: `bad_request`, `invalid_input`, `invalid_query`,
+`method_not_found`, `unauthorized`, `not_found`, `already_exists`, `conflict`,
+`timeout`, `payload_too_large`, `unavailable`, `internal`.
+
+Only failures positively classified at the HTTP boundary are returned with
+client-facing details. Database, storage, serialization, and index failures
+are logged server-side and use a generic `internal` response so physical
+object paths and nested error sources never cross the API boundary.
 
 ### Encoding negotiation
 

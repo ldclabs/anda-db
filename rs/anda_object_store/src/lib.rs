@@ -76,7 +76,7 @@ mod sidecar;
 pub use encryption::{EncryptedStore, EncryptedStoreBuilder, EncryptedStoreUploader};
 pub use fault::{FaultHandle, FaultKind, FaultOp, FaultRule, FaultStore};
 
-use sidecar::{SidecarMeta, SidecarStore};
+use sidecar::{ListingMetaPolicy, SidecarMeta, SidecarStore};
 
 /// `MetaStore` is a wrapper around an `ObjectStore` implementation that adds metadata capabilities.
 ///
@@ -364,7 +364,9 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
-        self.inner.clone().list(prefix, true)
+        self.inner
+            .clone()
+            .list(prefix, ListingMetaPolicy::unchecked(true))
     }
 
     fn list_with_offset(
@@ -372,11 +374,15 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
         prefix: Option<&Path>,
         offset: &Path,
     ) -> BoxStream<'static, Result<ObjectMeta>> {
-        self.inner.clone().list_with_offset(prefix, offset, true)
+        self.inner
+            .clone()
+            .list_with_offset(prefix, offset, ListingMetaPolicy::unchecked(true))
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
-        self.inner.list_with_delimiter(prefix, true).await
+        self.inner
+            .list_with_delimiter(prefix, ListingMetaPolicy::unchecked(true))
+            .await
     }
 
     async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
@@ -607,6 +613,237 @@ fn map_arc_error(store: &'static str, err: Arc<Error>) -> Error {
             store,
             source: err.to_string().into(),
         },
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use async_trait::async_trait;
+    use futures::stream::BoxStream;
+    use object_store::memory::InMemory;
+    use std::{
+        fmt,
+        sync::atomic::{AtomicBool, Ordering},
+    };
+    use tokio::sync::Notify;
+
+    #[derive(Debug)]
+    pub(crate) enum GateOperation {
+        Put(Path),
+        Get(Path),
+        Copy { from: Path, to: Path },
+        Rename { from: Path, to: Path },
+        MultipartComplete(Path),
+    }
+
+    #[derive(Debug)]
+    pub(crate) struct OperationGate {
+        operation: GateOperation,
+        triggered: AtomicBool,
+        entered: Notify,
+        release: Notify,
+    }
+
+    impl OperationGate {
+        fn new(operation: GateOperation) -> Self {
+            Self {
+                operation,
+                triggered: AtomicBool::new(false),
+                entered: Notify::new(),
+                release: Notify::new(),
+            }
+        }
+
+        fn matches(&self, operation: &GateOperation) -> bool {
+            match (&self.operation, operation) {
+                (GateOperation::Put(expected), GateOperation::Put(actual))
+                | (GateOperation::Get(expected), GateOperation::Get(actual))
+                | (
+                    GateOperation::MultipartComplete(expected),
+                    GateOperation::MultipartComplete(actual),
+                ) => expected == actual,
+                (
+                    GateOperation::Copy {
+                        from: expected_from,
+                        to: expected_to,
+                    },
+                    GateOperation::Copy {
+                        from: actual_from,
+                        to: actual_to,
+                    },
+                )
+                | (
+                    GateOperation::Rename {
+                        from: expected_from,
+                        to: expected_to,
+                    },
+                    GateOperation::Rename {
+                        from: actual_from,
+                        to: actual_to,
+                    },
+                ) => expected_from == actual_from && expected_to == actual_to,
+                _ => false,
+            }
+        }
+
+        async fn pause(&self, operation: GateOperation) {
+            if self.matches(&operation) && !self.triggered.swap(true, Ordering::AcqRel) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+        }
+
+        pub(crate) async fn wait_until_entered(&self) {
+            self.entered.notified().await;
+        }
+
+        pub(crate) fn release(&self) {
+            self.release.notify_one();
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    pub(crate) struct GatedStore {
+        inner: InMemory,
+        gate: Arc<OperationGate>,
+    }
+
+    impl GatedStore {
+        pub(crate) fn new(operation: GateOperation) -> (Self, Arc<OperationGate>) {
+            let gate = Arc::new(OperationGate::new(operation));
+            (
+                Self {
+                    inner: InMemory::new(),
+                    gate: gate.clone(),
+                },
+                gate,
+            )
+        }
+    }
+
+    impl fmt::Display for GatedStore {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "GatedStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for GatedStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> Result<PutResult> {
+            let result = self.inner.put_opts(location, payload, opts).await;
+            if result.is_ok() {
+                self.gate.pause(GateOperation::Put(location.clone())).await;
+            }
+            result
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> Result<Box<dyn MultipartUpload>> {
+            let inner = self.inner.put_multipart_opts(location, opts).await?;
+            Ok(Box::new(GatedUpload {
+                inner,
+                location: location.clone(),
+                gate: self.gate.clone(),
+            }))
+        }
+
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+            let result = self.inner.get_opts(location, options).await;
+            if result.is_ok() {
+                self.gate.pause(GateOperation::Get(location.clone())).await;
+            }
+            result
+        }
+
+        async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+            self.inner.get_ranges(location, ranges).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, Result<Path>>,
+        ) -> BoxStream<'static, Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, Result<ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
+            let result = self.inner.copy_opts(from, to, options).await;
+            if result.is_ok() {
+                self.gate
+                    .pause(GateOperation::Copy {
+                        from: from.clone(),
+                        to: to.clone(),
+                    })
+                    .await;
+            }
+            result
+        }
+
+        async fn rename_opts(&self, from: &Path, to: &Path, options: RenameOptions) -> Result<()> {
+            let result = self.inner.rename_opts(from, to, options).await;
+            if result.is_ok() {
+                self.gate
+                    .pause(GateOperation::Rename {
+                        from: from.clone(),
+                        to: to.clone(),
+                    })
+                    .await;
+            }
+            result
+        }
+    }
+
+    #[derive(Debug)]
+    struct GatedUpload {
+        inner: Box<dyn MultipartUpload>,
+        location: Path,
+        gate: Arc<OperationGate>,
+    }
+
+    #[async_trait]
+    impl MultipartUpload for GatedUpload {
+        fn put_part(&mut self, payload: PutPayload) -> UploadPart {
+            self.inner.put_part(payload)
+        }
+
+        async fn complete(&mut self) -> Result<PutResult> {
+            let result = self.inner.complete().await;
+            if result.is_ok() {
+                self.gate
+                    .pause(GateOperation::MultipartComplete(self.location.clone()))
+                    .await;
+            }
+            result
+        }
+
+        async fn abort(&mut self) -> Result<()> {
+            self.inner.abort().await
+        }
     }
 }
 
@@ -1220,13 +1457,7 @@ mod tests {
             .unwrap();
 
         storage.rename(&location, &location).await.unwrap();
-        let bytes = storage
-            .get(&location)
-            .await
-            .unwrap()
-            .bytes()
-            .await
-            .unwrap();
+        let bytes = storage.get(&location).await.unwrap().bytes().await.unwrap();
         assert_eq!(bytes, Bytes::from_static(b"abc"));
 
         let err = storage
@@ -1236,13 +1467,7 @@ mod tests {
         assert!(matches!(err, Error::AlreadyExists { .. }));
 
         storage.copy(&location, &location).await.unwrap();
-        let bytes = storage
-            .get(&location)
-            .await
-            .unwrap()
-            .bytes()
-            .await
-            .unwrap();
+        let bytes = storage.get(&location).await.unwrap().bytes().await.unwrap();
         assert_eq!(bytes, Bytes::from_static(b"abc"));
 
         // Self-rename of a missing object reports NotFound.
@@ -1294,13 +1519,7 @@ mod tests {
             .put(&location, Bytes::from_static(b"v2").into())
             .await
             .unwrap();
-        let bytes = storage
-            .get(&location)
-            .await
-            .unwrap()
-            .bytes()
-            .await
-            .unwrap();
+        let bytes = storage.get(&location).await.unwrap().bytes().await.unwrap();
         assert_eq!(bytes, Bytes::from_static(b"v2"));
     }
 
@@ -1357,6 +1576,135 @@ mod tests {
         assert!(bytes == content_a || bytes == content_b);
         let expected = BASE64_URL_SAFE.encode(sha3_256(&bytes));
         assert_eq!(e_tag.as_deref(), Some(expected.as_str()));
+    }
+
+    #[tokio::test]
+    async fn delete_waits_for_in_flight_put_on_the_same_key() {
+        use crate::test_support::{GateOperation, GatedStore};
+
+        let location = Path::from("delete-put-race");
+        let (inner, gate) = GatedStore::new(GateOperation::Put(Path::from("data/delete-put-race")));
+        let storage = Arc::new(MetaStoreBuilder::new(inner, 100).build());
+
+        let put_storage = storage.clone();
+        let put_location = location.clone();
+        let put = tokio::spawn(async move {
+            put_storage
+                .put(&put_location, Bytes::from_static(b"new-value").into())
+                .await
+        });
+        gate.wait_until_entered().await;
+
+        let delete_storage = storage.clone();
+        let delete_location = location.clone();
+        let mut delete = tokio::spawn(async move { delete_storage.delete(&delete_location).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut delete)
+                .await
+                .is_err(),
+            "delete bypassed the put's per-key mutation lease"
+        );
+
+        gate.release();
+        put.await.unwrap().unwrap();
+        delete.await.unwrap().unwrap();
+        assert!(matches!(
+            storage.get(&location).await,
+            Err(Error::NotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn target_put_waits_for_copy_and_preserves_data_metadata_pair() {
+        use crate::test_support::{GateOperation, GatedStore};
+
+        let source = Path::from("copy-put-source");
+        let target = Path::from("copy-put-target");
+        let (inner, gate) = GatedStore::new(GateOperation::Copy {
+            from: Path::from("data/copy-put-source"),
+            to: Path::from("data/copy-put-target"),
+        });
+        let storage = Arc::new(MetaStoreBuilder::new(inner, 100).build());
+        storage
+            .put(&source, Bytes::from_static(b"source-value").into())
+            .await
+            .unwrap();
+
+        let copy_storage = storage.clone();
+        let copy_source = source.clone();
+        let copy_target = target.clone();
+        let copy = tokio::spawn(async move { copy_storage.copy(&copy_source, &copy_target).await });
+        gate.wait_until_entered().await;
+
+        let put_storage = storage.clone();
+        let put_target = target.clone();
+        let mut put = tokio::spawn(async move {
+            put_storage
+                .put(&put_target, Bytes::from_static(b"put-value").into())
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut put)
+                .await
+                .is_err(),
+            "target put bypassed the copy's two-key mutation lease"
+        );
+
+        gate.release();
+        copy.await.unwrap().unwrap();
+        put.await.unwrap().unwrap();
+        let result = storage.get(&target).await.unwrap();
+        let e_tag = result.meta.e_tag.clone();
+        let bytes = result.bytes().await.unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"put-value"));
+        assert_eq!(e_tag, Some(BASE64_URL_SAFE.encode(sha3_256(&bytes))));
+    }
+
+    #[tokio::test]
+    async fn rename_waits_for_target_multipart_complete() {
+        use crate::test_support::{GateOperation, GatedStore};
+
+        let source = Path::from("rename-multipart-source");
+        let target = Path::from("rename-multipart-target");
+        let (inner, gate) = GatedStore::new(GateOperation::MultipartComplete(Path::from(
+            "data/rename-multipart-target",
+        )));
+        let storage = Arc::new(MetaStoreBuilder::new(inner, 100).build());
+        storage
+            .put(&source, Bytes::from_static(b"source-value").into())
+            .await
+            .unwrap();
+        let mut upload = storage.put_multipart(&target).await.unwrap();
+        upload
+            .put_part(Bytes::from_static(b"multipart-value").into())
+            .await
+            .unwrap();
+        let complete = tokio::spawn(async move { upload.complete().await });
+        gate.wait_until_entered().await;
+
+        let rename_storage = storage.clone();
+        let rename_source = source.clone();
+        let rename_target = target.clone();
+        let mut rename =
+            tokio::spawn(
+                async move { rename_storage.rename(&rename_source, &rename_target).await },
+            );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut rename)
+                .await
+                .is_err(),
+            "rename bypassed the multipart completion's target lease"
+        );
+
+        gate.release();
+        complete.await.unwrap().unwrap();
+        rename.await.unwrap().unwrap();
+        let bytes = storage.get(&target).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"source-value"));
+        assert!(matches!(
+            storage.get(&source).await,
+            Err(Error::NotFound { .. })
+        ));
     }
 
     #[tokio::test]

@@ -62,11 +62,15 @@ struct Cli {
     #[clap(long, env = "REQUEST_TIMEOUT_SECS", default_value = "300")]
     request_timeout_secs: u64,
 
+    /// Maximum number of non-cancel-safe mutating RPCs executed concurrently
+    #[clap(long, env = "MAX_CONCURRENT_MUTATIONS", default_value = "32")]
+    max_concurrent_mutations: usize,
+
     /// Maximum accepted request body size in bytes
     #[clap(long, env = "MAX_BODY_SIZE", default_value = "2097152")]
     max_body_size: usize,
 
-    /// Grace period in seconds to drain in-flight requests on shutdown
+    /// Grace period for in-flight RPC drain; a final durable DB close may take longer
     #[clap(long, env = "SHUTDOWN_TIMEOUT_SECS", default_value = "30")]
     shutdown_timeout_secs: u64,
 
@@ -123,6 +127,8 @@ async fn main() -> Result<(), BoxError> {
             api_key: cli.api_key,
             flush_interval: Duration::from_secs(cli.flush_interval_secs.max(1)),
             request_timeout: Duration::from_secs(cli.request_timeout_secs.max(1)),
+            max_concurrent_mutations: cli.max_concurrent_mutations.max(1),
+            shutdown_timeout: Duration::from_secs(cli.shutdown_timeout_secs.max(1)),
             max_body_size: cli.max_body_size.max(1024),
             ..Default::default()
         },
@@ -140,8 +146,13 @@ async fn main() -> Result<(), BoxError> {
     let shutdown = CancellationToken::new();
     tokio::spawn({
         let shutdown = shutdown.clone();
+        let state = state.clone();
         async move {
             shutdown_signal().await;
+            // Close RPC admission before notifying axum. Requests that were
+            // already admitted are either cancel-safe reads (cancelled here)
+            // or tracked mutations drained by `AppState::shutdown`.
+            state.begin_shutdown();
             shutdown.cancel();
         }
     });
@@ -162,11 +173,10 @@ async fn main() -> Result<(), BoxError> {
         }
     };
 
-    // Flush and close every open database before exiting, even when the
-    // server loop returned an error. When the drain deadline was exceeded,
-    // connection tasks spawned by `axum::serve` may still be running;
-    // `shutdown` first marks the state as shutting down so those tasks
-    // reject new requests (503) instead of racing the database close.
+    // Drain tracked mutations, then flush and close every open database even
+    // when the server loop returned an error. `shutdown` enforces its own
+    // mutation-drain deadline. If it expires, shutdown uses an explicit
+    // crash-style task abort and skips the final database flush.
     state.shutdown().await;
     result?;
     Ok(())

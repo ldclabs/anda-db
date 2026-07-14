@@ -8,7 +8,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
 use std::{borrow::Cow, time::Instant};
 use std::{
@@ -63,6 +63,19 @@ pub struct Collection {
     doc_ids: RwLock<Treemap>,
     /// Whether the collection is in read-only mode
     read_only: AtomicBool,
+    /// Database-level read-only state shared with every collection handle.
+    /// This prevents a newly opened or retained collection from locally
+    /// overriding `AndaDB::set_read_only(true)`.
+    database_read_only: Arc<AtomicBool>,
+    /// Irreversible handle lifecycle, separate from user-controlled
+    /// `read_only`.  A handle that has started closing can never become a
+    /// writer again, even if a caller later invokes `set_read_only(false)`.
+    lifecycle: AtomicU8,
+    /// Shared by every asynchronous mutation and taken exclusively by
+    /// flush/close/delete.  Closing first shuts admission through
+    /// `lifecycle`, then waits for this gate to drain operations that already
+    /// passed admission.
+    operation_gate: Arc<tokio::sync::RwLock<()>>,
     /// Last saved version of the collection
     last_saved_version: AtomicU64,
 
@@ -91,6 +104,70 @@ pub struct Collection {
     /// crash-recovery scan (`auto_repair_indexes` starts at checkpoint + 1)
     /// can never find.
     in_flight_adds: parking_lot::Mutex<BTreeSet<DocumentId>>,
+
+    /// Durable document-mutation intents that have not yet been covered by a
+    /// successful index/ids checkpoint.  See [`MutationIntent`].
+    pending_mutations: parking_lot::Mutex<BTreeMap<u64, MutationIntent>>,
+    /// A collection-metadata generation whose ids bitmap and storage
+    /// checkpoint have not both been confirmed durable yet.  Metadata is
+    /// intentionally written first, so failures in the later phases must keep
+    /// this value pending across a retry; cancellation can happen either
+    /// before or after `last_saved_version` is safely advanced.
+    pending_checkpoint: parking_lot::Mutex<Option<DocumentId>>,
+    /// Exact collection-metadata payload whose conditional PUT has not yet
+    /// been observed as successful. Object stores may commit a PUT before the
+    /// awaiting task is cancelled, so a retry must retain both the payload and
+    /// its expected object version. A precondition failure can then be
+    /// reconciled by reading the durable object back and accepting it only
+    /// when the payload is identical.
+    pending_metadata_write: parking_lot::Mutex<Option<PendingMetadataWrite>>,
+    /// Serializes every collection metadata writer, including full checkpoint
+    /// flushes and the immediate unclaimed writes used by extensions/index
+    /// removal. Both paths must reconcile the same retained generation before
+    /// a later payload can advance the object-store version.
+    metadata_write_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Monotonic path component for mutation-intent objects.
+    next_mutation_sequence: AtomicU64,
+}
+
+const LIFECYCLE_ACTIVE: u8 = 0;
+const LIFECYCLE_CLOSING: u8 = 1;
+const LIFECYCLE_CLOSED: u8 = 2;
+const LIFECYCLE_DELETING: u8 = 3;
+const LIFECYCLE_DELETED: u8 = 4;
+
+/// A write-ahead record for an update/remove of an existing document.
+///
+/// Document objects and derived indexes live in different object-store
+/// objects, so no ordering alone can make an update atomic across a crash.
+/// The before/after documents are recorded before either side changes. On
+/// open, every retained intent removes both possible indexed states and then
+/// re-indexes the document currently present in storage (or completes its
+/// removal). Recording the proposed state is required for cancellation
+/// safety: a cancelled future can leave its in-memory index mutation applied
+/// even when the document PUT did not complete. One record is kept per
+/// mutation rather than overwriting a per-document record so repeated updates
+/// remain recoverable even after a partially successful flush.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MutationIntent {
+    sequence: u64,
+    document_id: DocumentId,
+    previous: Option<DocumentOwned>,
+    proposed: Option<DocumentOwned>,
+}
+
+/// A collection metadata PUT that may be in flight or committed-but-unobserved.
+#[derive(Debug, Clone)]
+struct PendingMetadataWrite {
+    metadata: CollectionMetadata,
+    payload: Vec<u8>,
+    expected_version: ObjectVersion,
+    /// `Some` only for metadata written as the first phase of a complete
+    /// collection checkpoint. Immediate extension/index metadata writes use
+    /// `None`: reconciling one of those generations must refresh the object
+    /// version without advancing `last_saved_version` or manufacturing a
+    /// pending ids/storage checkpoint.
+    check_point: Option<DocumentId>,
 }
 
 /// Collection configuration parameters.
@@ -172,6 +249,154 @@ pub struct CollectionStats {
     pub read_only: bool,
 }
 
+/// Read-only access to a collection-owned B-tree index.
+///
+/// Collection-owned indexes are deliberately exposed through a query-only
+/// view: mutating or flushing the raw wrapper would bypass the collection's
+/// lifecycle lease and document/index recovery journal.
+#[derive(Debug, Clone, Copy)]
+pub struct BTreeIndexView<'a> {
+    inner: &'a BTree,
+}
+
+impl BTreeIndexView<'_> {
+    pub fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    pub fn virtual_field(&self) -> &[String] {
+        self.inner.virtual_field()
+    }
+
+    pub fn allow_duplicates(&self) -> bool {
+        self.inner.allow_duplicates()
+    }
+
+    pub fn stats(&self) -> BTreeStats {
+        self.inner.stats()
+    }
+
+    pub fn metadata(&self) -> BTreeMetadata {
+        self.inner.metadata()
+    }
+
+    pub fn query_with<F, R>(&self, field_value: &Fv, f: F) -> Option<R>
+    where
+        F: FnOnce(&Vec<DocumentId>) -> Option<R>,
+    {
+        self.inner.query_with(field_value, f)
+    }
+
+    pub fn try_range_query_ids<F>(&self, query: RangeQuery<Fv>, f: F) -> Result<(), DBError>
+    where
+        F: FnMut(&[DocumentId]) -> bool,
+    {
+        self.inner.try_range_query_ids(query, f)
+    }
+
+    pub fn range_query_with<F, R>(&self, query: RangeQuery<Fv>, f: F) -> Vec<R>
+    where
+        F: FnMut(Fv, &Vec<DocumentId>) -> (bool, Vec<R>),
+    {
+        self.inner.range_query_with(query, f)
+    }
+
+    pub fn keys(&self, cursor: Option<String>, limit: Option<usize>) -> Vec<Fv> {
+        self.inner.keys(cursor, limit)
+    }
+}
+
+/// Read-only access to a collection-owned BM25 index.
+#[derive(Debug, Clone, Copy)]
+pub struct BM25IndexView<'a> {
+    inner: &'a BM25,
+}
+
+impl BM25IndexView<'_> {
+    pub fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    pub fn virtual_field(&self) -> &[String] {
+        self.inner.virtual_field()
+    }
+
+    pub fn stats(&self) -> BM25Stats {
+        self.inner.stats()
+    }
+
+    pub fn metadata(&self) -> BM25Metadata {
+        self.inner.metadata()
+    }
+
+    pub fn search(
+        &self,
+        query: &str,
+        top_k: usize,
+        params: Option<BM25Params>,
+    ) -> Vec<(DocumentId, f32)> {
+        self.inner.search(query, top_k, params)
+    }
+
+    pub fn search_advanced(
+        &self,
+        query: &str,
+        top_k: usize,
+        params: Option<BM25Params>,
+    ) -> Vec<(DocumentId, f32)> {
+        self.inner.search_advanced(query, top_k, params)
+    }
+
+    pub fn try_search_advanced(
+        &self,
+        query: &str,
+        top_k: usize,
+        params: Option<BM25Params>,
+    ) -> Result<Vec<(DocumentId, f32)>, DBError> {
+        self.inner.try_search_advanced(query, top_k, params)
+    }
+}
+
+/// Read-only access to a collection-owned HNSW index.
+#[derive(Debug, Clone, Copy)]
+pub struct HnswIndexView<'a> {
+    inner: &'a Hnsw,
+}
+
+impl HnswIndexView<'_> {
+    pub fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    pub fn field_name(&self) -> &str {
+        self.inner.field_name()
+    }
+
+    pub fn dimension(&self) -> usize {
+        self.inner.dimension()
+    }
+
+    pub fn stats(&self) -> HnswStats {
+        self.inner.stats()
+    }
+
+    pub fn metadata(&self) -> HnswMetadata {
+        self.inner.metadata()
+    }
+
+    pub fn try_search(
+        &self,
+        query: &[f32],
+        top_k: usize,
+    ) -> Result<Vec<(DocumentId, f32)>, DBError> {
+        self.inner.try_search(query, top_k)
+    }
+
+    pub fn search(&self, query: &[f32], top_k: usize) -> Vec<(DocumentId, f32)> {
+        self.inner.search(query, top_k)
+    }
+}
+
 impl Debug for Collection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Collection({})", self.name)
@@ -184,6 +409,9 @@ impl Collection {
 
     /// Path to the document IDs bitmap file
     const IDS_PATH: &'static str = "ids.cbor";
+
+    /// Prefix for durable update/remove intents.
+    const MUTATION_INTENT_PREFIX: &'static str = "mutation_intents/";
 
     /// Upper bound for limit-driven speculative pre-allocations, so a huge
     /// caller-supplied limit (e.g. via `query_ids`) cannot allocate excessive
@@ -213,6 +441,53 @@ impl Collection {
     /// Returns the stripe lock guarding mutations of document `id`.
     fn doc_lock(&self, id: DocumentId) -> &tokio::sync::Mutex<()> {
         &self.doc_locks[(id as usize) % Self::DOC_LOCK_STRIPES]
+    }
+
+    fn mutation_intent_path(sequence: u64) -> String {
+        format!("{}{sequence:020}.cbor", Self::MUTATION_INTENT_PREFIX)
+    }
+
+    fn lifecycle_error(&self) -> DBError {
+        let state = match self.lifecycle.load(Ordering::Acquire) {
+            LIFECYCLE_CLOSING => "closing",
+            LIFECYCLE_CLOSED => "closed",
+            LIFECYCLE_DELETING => "being deleted",
+            LIFECYCLE_DELETED => "deleted",
+            _ => "not writable",
+        };
+        DBError::Generic {
+            name: self.name.clone(),
+            source: format!("Collection handle is {state}").into(),
+        }
+    }
+
+    fn ensure_mutable(&self) -> Result<(), DBError> {
+        if self.lifecycle.load(Ordering::Acquire) != LIFECYCLE_ACTIVE {
+            return Err(self.lifecycle_error());
+        }
+        if self.database_read_only.load(Ordering::Acquire) || self.read_only.load(Ordering::Acquire)
+        {
+            return Err(DBError::Generic {
+                name: self.name.clone(),
+                source: "Collection is read-only".into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Returns whether this registered handle still admits new operations.
+    pub(crate) fn is_active_handle(&self) -> bool {
+        self.lifecycle.load(Ordering::Acquire) == LIFECYCLE_ACTIVE
+    }
+
+    /// Acquires an active-operation lease.  The state is deliberately checked
+    /// after the shared gate is acquired: close/delete publish their terminal
+    /// state before waiting for the exclusive gate, so queued operations are
+    /// rejected instead of slipping in behind the drain boundary.
+    async fn mutation_lease(&self) -> Result<tokio::sync::OwnedRwLockReadGuard<()>, DBError> {
+        let guard = self.operation_gate.clone().read_owned().await;
+        self.ensure_mutable()?;
+        Ok(guard)
     }
 
     /// Generates the storage path for a document with the given ID
@@ -302,12 +577,20 @@ impl Collection {
             doc_ids: RwLock::new(Treemap::new()),
             metadata: RwLock::new(metadata),
             read_only: AtomicBool::new(false),
+            database_read_only: db.read_only_flag(),
+            lifecycle: AtomicU8::new(LIFECYCLE_ACTIVE),
+            operation_gate: Arc::new(tokio::sync::RwLock::new(())),
             last_saved_version: AtomicU64::new(0),
             metadata_version: RwLock::new(metadata_version),
             ids_version: RwLock::new(ids_version),
             index_hooks: Arc::new(DefaultIndexHooks),
             doc_locks: Self::new_doc_locks(),
             in_flight_adds: parking_lot::Mutex::new(BTreeSet::new()),
+            pending_mutations: parking_lot::Mutex::new(BTreeMap::new()),
+            pending_checkpoint: parking_lot::Mutex::new(None),
+            pending_metadata_write: parking_lot::Mutex::new(None),
+            metadata_write_gate: Arc::new(tokio::sync::Mutex::new(())),
+            next_mutation_sequence: AtomicU64::new(unix_ms()),
         })
     }
 
@@ -367,13 +650,41 @@ impl Collection {
             doc_ids: RwLock::new(doc_ids),
             metadata: RwLock::new(metadata),
             read_only: AtomicBool::new(false),
+            database_read_only: db.read_only_flag(),
+            lifecycle: AtomicU8::new(LIFECYCLE_ACTIVE),
+            operation_gate: Arc::new(tokio::sync::RwLock::new(())),
             metadata_version: RwLock::new(metadata_version),
             ids_version: RwLock::new(ids_version),
             index_hooks: Arc::new(DefaultIndexHooks),
             doc_locks: Self::new_doc_locks(),
             in_flight_adds: parking_lot::Mutex::new(BTreeSet::new()),
+            pending_mutations: parking_lot::Mutex::new(BTreeMap::new()),
+            pending_checkpoint: parking_lot::Mutex::new(None),
+            pending_metadata_write: parking_lot::Mutex::new(None),
+            metadata_write_gate: Arc::new(tokio::sync::Mutex::new(())),
+            next_mutation_sequence: AtomicU64::new(unix_ms()),
         };
         collection.load_indexes().await?;
+
+        if let Some(schema) = schema {
+            collection.try_upgrade_schema(schema).await?;
+        }
+
+        // The callback installs custom index hooks and may add indexes. Run it
+        // before replay/repair so recovery derives values with the same
+        // application semantics as normal CRUD. Replaying once with default
+        // hooks would leave B-tree/BM25 phantom entries that a later replay
+        // with custom hooks cannot identify and remove.
+        f(&mut collection).await?;
+
+        let replayed = collection.replay_mutation_intents().await?;
+        if replayed > 0 {
+            log::warn!(
+                action = "Collection::replay_mutation_intents",
+                collection = collection.name;
+                "Replayed {replayed} uncheckpointed document mutations",
+            );
+        }
         let fixed = collection.auto_repair_indexes().await?;
         if fixed > 0 {
             log::warn!(
@@ -383,11 +694,6 @@ impl Collection {
             );
         }
 
-        if let Some(schema) = schema {
-            collection.try_upgrade_schema(schema).await?;
-        }
-
-        f(&mut collection).await?;
         Ok(collection)
     }
 
@@ -440,6 +746,179 @@ impl Collection {
         Ok(())
     }
 
+    fn remove_document_from_indexes(&self, id: DocumentId, doc: &Document, now_ms: u64) {
+        for index in &self.btree_indexes {
+            if let Some(value) = self.index_hooks.btree_index_value(index, doc)
+                && value.as_ref() != &FieldValue::Null
+            {
+                index.remove(id, &value, now_ms);
+            }
+        }
+        for index in &self.bm25_indexes {
+            if let Some(text) = self.index_hooks.bm25_index_value(index, doc) {
+                // BM25::remove is intentionally idempotent for replay: even
+                // after doc_tokens was removed by an earlier historical
+                // value, it still purges postings derived from `text`.
+                index.remove(id, &text, now_ms);
+            }
+        }
+        for index in &self.hnsw_indexes {
+            index.remove(id, now_ms);
+        }
+    }
+
+    fn insert_document_into_indexes(
+        &self,
+        id: DocumentId,
+        doc: &Document,
+        now_ms: u64,
+    ) -> Result<(), DBError> {
+        for index in &self.btree_indexes {
+            if let Some(value) = self.index_hooks.btree_index_value(index, doc)
+                && value.as_ref() != &FieldValue::Null
+            {
+                index.insert(id, &value, now_ms)?;
+            }
+        }
+        for index in &self.bm25_indexes {
+            if let Some(text) = self.index_hooks.bm25_index_value(index, doc) {
+                index.insert(id, &text, now_ms)?;
+            }
+        }
+        for index in &self.hnsw_indexes {
+            if let Some(vector) = self.index_hooks.hnsw_index_value(index, doc) {
+                index.insert(id, vector.into_owned(), now_ms)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes an add/update/remove intent before either the in-memory indexes
+    /// or the durable document object are changed.
+    async fn record_mutation_intent(
+        &self,
+        id: DocumentId,
+        previous: Option<&Document>,
+        proposed: Option<&Document>,
+    ) -> Result<(), DBError> {
+        loop {
+            let sequence = self.next_mutation_sequence.fetch_add(1, Ordering::AcqRel);
+            let intent = MutationIntent {
+                sequence,
+                document_id: id,
+                previous: previous.map(|document| document.clone().into()),
+                proposed: proposed.map(|document| document.clone().into()),
+            };
+            let path = Self::mutation_intent_path(sequence);
+            match self.storage.create(&path, &intent).await {
+                Ok(_) => {
+                    self.pending_mutations.lock().insert(sequence, intent);
+                    return Ok(());
+                }
+                // A retained intent from an earlier process may use the same
+                // wall-clock-derived sequence. Advance until a free path is
+                // found instead of overwriting recovery evidence.
+                Err(DBError::AlreadyExists { .. }) => continue,
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    /// Replays intents left by a crash or failed flush. Historical values are
+    /// removed first; the document currently present in storage is then the
+    /// sole source of truth for both the bitmap and every derived index.
+    async fn replay_mutation_intents(&self) -> Result<usize, DBError> {
+        let mut stream = self
+            .storage
+            .list::<MutationIntent>(Some(Self::MUTATION_INTENT_PREFIX), None);
+        let mut intents = BTreeMap::<u64, MutationIntent>::new();
+        while let Some(intent) = stream.next().await {
+            let intent = intent?.0;
+            if intent.document_id == 0 {
+                return Err(DBError::Serialization {
+                    name: self.name.clone(),
+                    source: "mutation intent contains reserved document id 0".into(),
+                });
+            }
+            intents.insert(intent.sequence, intent);
+        }
+        if intents.is_empty() {
+            return Ok(0);
+        }
+
+        if let Some(last) = intents.last_key_value().map(|(sequence, _)| *sequence) {
+            self.next_mutation_sequence
+                .fetch_max(last.saturating_add(1), Ordering::AcqRel);
+        }
+        *self.pending_mutations.lock() = intents.clone();
+
+        self.reconcile_mutation_intents(&intents).await?;
+        Ok(intents.len())
+    }
+
+    async fn reconcile_mutation_intents(
+        &self,
+        intents: &BTreeMap<u64, MutationIntent>,
+    ) -> Result<(), DBError> {
+        let now_ms = unix_ms();
+        let mut affected_ids = BTreeSet::new();
+        for intent in intents.values() {
+            affected_ids.insert(intent.document_id);
+            for candidate in [&intent.previous, &intent.proposed].into_iter().flatten() {
+                let document = Document::try_from_doc(self.schema(), candidate.clone())?;
+                self.remove_document_from_indexes(intent.document_id, &document, now_ms);
+            }
+        }
+
+        for id in affected_ids {
+            match self
+                .storage
+                .fetch::<DocumentOwned>(&Self::doc_path(id))
+                .await
+            {
+                Ok((current, _)) => {
+                    let current = Document::try_from_doc(self.schema(), current)?;
+                    // The final state may already have reached some index
+                    // objects during a partial flush. Remove it before the
+                    // idempotent insert so unique indexes cannot reject their
+                    // own surviving posting.
+                    self.remove_document_from_indexes(id, &current, now_ms);
+                    self.insert_document_into_indexes(id, &current, now_ms)?;
+                    self.max_document_id.fetch_max(id, Ordering::AcqRel);
+                    self.doc_ids.write().add(id);
+                    self.doc_ids_index.write().insert(id);
+                }
+                Err(DBError::NotFound { .. }) => {
+                    // Complete a crashed remove. HNSW can be purged by id even
+                    // when no historical vector could be decoded.
+                    for index in &self.hnsw_indexes {
+                        index.remove(id, now_ms);
+                    }
+                    self.doc_ids.write().remove(id);
+                    self.doc_ids_index.write().remove(&id);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        self.update_metadata(|meta| meta.stats.version += 1);
+        Ok(())
+    }
+
+    async fn clear_mutation_intents(&self) -> Result<(), DBError> {
+        let sequences: Vec<u64> = self.pending_mutations.lock().keys().copied().collect();
+        for sequence in sequences {
+            let path = Self::mutation_intent_path(sequence);
+            match self.storage.delete(&path).await {
+                Ok(()) | Err(DBError::NotFound { .. }) => {
+                    self.pending_mutations.lock().remove(&sequence);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(())
+    }
+
     /// Reconciles the in-memory state with the document objects actually
     /// present in storage, in both directions:
     ///
@@ -464,12 +943,8 @@ impl Collection {
     /// and dead ids removed from it. Changes are persisted by the next
     /// `flush()`.
     pub async fn reconcile_storage(&self) -> Result<(usize, usize), DBError> {
-        if self.read_only.load(Ordering::Relaxed) {
-            return Err(DBError::Generic {
-                name: self.name.clone(),
-                source: "Collection is read-only".into(),
-            });
-        }
+        let _operation_lease = self.operation_gate.clone().write_owned().await;
+        self.ensure_mutable()?;
 
         let now_ms = unix_ms();
         // Ids allocated after this point belong to in-flight `add` calls
@@ -749,7 +1224,12 @@ impl Collection {
         let mut stream = futures::stream::iter(ids)
             .map(|id| {
                 let storage = self.storage.clone();
-                async move { (id, storage.fetch::<DocumentOwned>(&Self::doc_path(id)).await) }
+                async move {
+                    (
+                        id,
+                        storage.fetch::<DocumentOwned>(&Self::doc_path(id)).await,
+                    )
+                }
             })
             .buffered(8);
 
@@ -838,6 +1318,17 @@ impl Collection {
     /// # Arguments
     /// * `read_only` - Whether to enable read-only mode
     pub fn set_read_only(&self, read_only: bool) {
+        if !read_only
+            && (self.lifecycle.load(Ordering::Acquire) != LIFECYCLE_ACTIVE
+                || self.database_read_only.load(Ordering::Acquire))
+        {
+            log::warn!(
+                action = "Collection::set_read_only",
+                collection = self.name;
+                "Ignoring attempt to re-enable a closed collection handle",
+            );
+            return;
+        }
         self.read_only.store(read_only, Ordering::Release);
         log::info!(
             action = "Collection::set_read_only",
@@ -851,14 +1342,46 @@ impl Collection {
     /// # Returns
     /// Ok(()) if successful, or an error if closing fails
     pub async fn close(&self) -> Result<(), DBError> {
-        self.set_read_only(true);
+        loop {
+            match self.lifecycle.load(Ordering::Acquire) {
+                LIFECYCLE_ACTIVE => {
+                    if self
+                        .lifecycle
+                        .compare_exchange(
+                            LIFECYCLE_ACTIVE,
+                            LIFECYCLE_CLOSING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        break;
+                    }
+                }
+                LIFECYCLE_CLOSING => break,
+                LIFECYCLE_CLOSED | LIFECYCLE_DELETED => return Ok(()),
+                LIFECYCLE_DELETING => return Err(self.lifecycle_error()),
+                _ => return Err(self.lifecycle_error()),
+            }
+        }
+        // Publish the user-visible read-only state as soon as admission
+        // closes. Existing operations are drained by the exclusive gate.
+        self.read_only.store(true, Ordering::Release);
+        let _operation_guard = self.operation_gate.clone().write_owned().await;
+        match self.lifecycle.load(Ordering::Acquire) {
+            LIFECYCLE_CLOSED | LIFECYCLE_DELETED => return Ok(()),
+            LIFECYCLE_DELETING => return Err(self.lifecycle_error()),
+            LIFECYCLE_CLOSING => {}
+            _ => return Err(self.lifecycle_error()),
+        }
 
         let start = Instant::now();
         let now_ms = unix_ms();
-        let rt = self.flush(now_ms).await;
+        let rt = self.flush_inner(now_ms).await;
         let elapsed = start.elapsed();
         match rt {
             Ok(_) => {
+                self.lifecycle.store(LIFECYCLE_CLOSED, Ordering::Release);
                 log::warn!(
                     action = "Collection::close",
                     collection = self.name,
@@ -887,11 +1410,37 @@ impl Collection {
     /// # Returns
     /// `true` if changes were flushed, `false` if no changes needed to be flushed
     pub async fn flush(&self, now_ms: u64) -> Result<bool, DBError> {
-        let check_point = self.store_metadata(now_ms).await?;
+        // The write guard both serializes complete flushes and freezes all
+        // document/index mutations for the checkpoint transaction.
+        let _operation_guard = self.operation_gate.clone().write_owned().await;
+        self.ensure_mutable()?;
+        self.flush_inner(now_ms).await
+    }
+
+    async fn flush_inner(&self, now_ms: u64) -> Result<bool, DBError> {
+        let pending_mutations = self.pending_mutations.lock().clone();
+        if !pending_mutations.is_empty() {
+            // A failed mutation may have needed a best-effort rollback. Make
+            // the current document authoritative again before persisting and
+            // retiring its recovery evidence; this is the same idempotent
+            // convergence performed after a process crash.
+            self.reconcile_mutation_intents(&pending_mutations).await?;
+        }
+        let stored_check_point = self.store_metadata(now_ms).await?;
+        if let Some(check_point) = stored_check_point {
+            // Publishing collection metadata is only the first phase of the
+            // complete checkpoint. Keep the generation pending until both
+            // ids.cbor and storage_meta.cbor are durable; otherwise a failure
+            // in either later write would be skipped on retry because the
+            // metadata version watermark has already advanced.
+            *self.pending_checkpoint.lock() = Some(check_point);
+        }
+        let pending_check_point = *self.pending_checkpoint.lock();
 
         // Fast path: no collection metadata update and no index has pending data.
         let has_pending_indexes = self.has_pending_index_flush();
-        if check_point.is_none() && !has_pending_indexes {
+        let has_pending_mutations = !pending_mutations.is_empty();
+        if pending_check_point.is_none() && !has_pending_indexes && !has_pending_mutations {
             return Ok(false);
         }
 
@@ -901,7 +1450,7 @@ impl Collection {
             false
         };
 
-        if let Some(check_point) = check_point {
+        if let Some(check_point) = pending_check_point {
             // Clamp the checkpoint below any in-flight `add` BEFORE taking the
             // ids snapshot: an add that completed before this point is already
             // visible to the bitmap snapshot below, and one still in flight is
@@ -911,10 +1460,17 @@ impl Collection {
             self.store_ids().await?;
             // check_point is the last persisted document ID
             self.storage.store_metadata(check_point, now_ms).await?;
-            return Ok(true);
+            *self.pending_checkpoint.lock() = None;
         }
 
-        Ok(indexes_saved)
+        // The intent log is the commit record for document/index atomicity and
+        // is removed last. A crash before this point replays the mutation; a
+        // crash after it observes durable indexes, ids and checkpoint.
+        if has_pending_mutations {
+            self.clear_mutation_intents().await?;
+        }
+
+        Ok(pending_check_point.is_some() || indexes_saved || has_pending_mutations)
     }
 
     /// Returns the highest checkpoint that is safe to persist: every document
@@ -931,16 +1487,50 @@ impl Collection {
         }
     }
 
+    /// Irreversibly closes mutation admission before database metadata is
+    /// unregistered. The database holds the per-name lifecycle lock when
+    /// calling this; a cancelled delete leaves the tombstoned handle in the
+    /// registry so a retry can finish draining and deleting it.
+    pub(crate) fn begin_delete(&self) -> Result<(), DBError> {
+        loop {
+            let state = self.lifecycle.load(Ordering::Acquire);
+            match state {
+                LIFECYCLE_DELETED | LIFECYCLE_DELETING => break,
+                LIFECYCLE_ACTIVE | LIFECYCLE_CLOSING | LIFECYCLE_CLOSED => {
+                    if self
+                        .lifecycle
+                        .compare_exchange(
+                            state,
+                            LIFECYCLE_DELETING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        break;
+                    }
+                }
+                _ => return Err(self.lifecycle_error()),
+            }
+        }
+        self.read_only.store(true, Ordering::Release);
+        Ok(())
+    }
+
     /// Drops the collection, deleting all associated data from storage.
-    pub async fn drop_data(&self) -> Result<(), DBError> {
-        // 禁止进一步写入
-        self.set_read_only(true);
+    pub(crate) async fn drop_data(&self) -> Result<(), DBError> {
+        self.begin_delete()?;
+        let _operation_guard = self.operation_gate.clone().write_owned().await;
+        if self.lifecycle.load(Ordering::Acquire) == LIFECYCLE_DELETED {
+            return Ok(());
+        }
 
         let start = Instant::now();
         let total = self.len();
 
         // 并发删除集合存储下的全部对象（文档、元数据、ids 和索引）
         self.storage.drop_data().await?;
+        self.lifecycle.store(LIFECYCLE_DELETED, Ordering::Release);
         let elapsed = start.elapsed();
         log::warn!(
             action = "Collection::drop_data",
@@ -961,53 +1551,133 @@ impl Collection {
     /// # Returns
     /// `Some(max_document_id)` if metadata was stored, `None` if no changes needed to be stored
     async fn store_metadata(&self, now_ms: u64) -> Result<Option<DocumentId>, DBError> {
-        // Fast path: if version is already saved, avoid cloning metadata.
-        let current_version = { self.metadata.read().stats.version };
-        if self.last_saved_version.load(Ordering::Relaxed) >= current_version {
-            return Ok(None);
-        }
+        let _metadata_guard = self.metadata_write_gate.clone().lock_owned().await;
+        self.store_metadata_inner(now_ms).await
+    }
 
-        // Re-acquire metadata with lock to get consistent snapshot for saving.
-        let mut meta = self.metadata();
-        // Atomically claim the right to save this version.
-        // Only one concurrent caller will see prev < meta.stats.version and proceed.
-        let prev_saved_version = self
-            .last_saved_version
-            .fetch_max(meta.stats.version, Ordering::Relaxed);
-        if prev_saved_version >= meta.stats.version {
-            return Ok(None);
-        }
-
-        meta.stats.last_saved = now_ms.max(meta.stats.last_saved);
-        let ver = { self.metadata_version.read().clone() };
-        let ver = match self
+    /// Persists an exact metadata generation that was registered before its
+    /// first await. Callers must hold `metadata_write_gate` so the retained
+    /// slot and the local object version form one serial transaction.
+    async fn persist_pending_metadata_write(
+        &self,
+        pending: PendingMetadataWrite,
+    ) -> Result<Option<DocumentId>, DBError> {
+        let version = match self
             .storage
-            .put(Self::METADATA_PATH, &meta, Some(ver))
+            .put_bytes(
+                Self::METADATA_PATH,
+                pending.payload.clone().into(),
+                crate::storage::PutMode::Update(pending.expected_version.clone().into()),
+            )
             .await
         {
-            Ok(ver) => ver,
-            Err(err) => {
-                // Write failed: revert only if no other writer has already
-                // advanced this atomic to a newer version.
-                let _ = self.last_saved_version.compare_exchange(
-                    meta.stats.version,
-                    prev_saved_version,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                );
-                if matches!(err, DBError::Precondition { .. }) {
-                    // If precondition failed, it means another concurrent writer has already saved a newer version.
-                    return Ok(None);
+            Ok(version) => version,
+            Err(err @ DBError::Precondition { .. }) => {
+                // A cancelled PUT may have committed before its result was
+                // delivered. Accept read-back only for the exact retained
+                // payload; a different object is a real stale-writer conflict.
+                let (durable, version) = self.storage.fetch_bytes(Self::METADATA_PATH).await?;
+                if durable.as_ref() != pending.payload.as_slice() {
+                    log::error!(
+                        action = "Collection::persist_pending_metadata_write",
+                        collection = self.name,
+                        pending_version = pending.metadata.stats.version;
+                        "Conditional metadata PUT conflicted with a different durable payload",
+                    );
+                    return Err(err);
                 }
-                return Err(err);
+                version
             }
+            Err(err) => return Err(err),
         };
-        *self.metadata_version.write() = ver;
-        self.update_metadata(|m| {
-            m.stats.last_saved = meta.stats.last_saved.max(m.stats.last_saved);
-        });
 
-        Ok(Some(meta.stats.max_document_id))
+        // No await follows successful reconciliation. Only metadata written as
+        // the first phase of a full checkpoint publishes the flush watermark;
+        // an unclaimed metadata-only generation deliberately remains pending
+        // for the next complete metadata + ids + storage checkpoint.
+        *self.metadata_version.write() = version;
+        if pending.check_point.is_some() {
+            self.last_saved_version
+                .fetch_max(pending.metadata.stats.version, Ordering::Release);
+            self.update_metadata(|m| {
+                m.stats.last_saved = pending.metadata.stats.last_saved.max(m.stats.last_saved);
+            });
+        }
+        *self.pending_metadata_write.lock() = None;
+        Ok(pending.check_point)
+    }
+
+    /// The retained-generation metadata protocol. Callers must hold
+    /// `metadata_write_gate` across this complete async transaction.
+    async fn store_metadata_inner(&self, now_ms: u64) -> Result<Option<DocumentId>, DBError> {
+        let mut stored_check_point = None;
+        loop {
+            // A cancelled conditional PUT may already be durable even though
+            // its result was never observed. Always retry that exact payload
+            // first; rebuilding it with a newer `now_ms` would make a safe
+            // read-back comparison impossible and turn a recoverable commit
+            // into a permanent precondition conflict.
+            let pending = if let Some(pending) = self.pending_metadata_write.lock().clone() {
+                pending
+            } else {
+                // Fast path: if version is already saved, avoid cloning
+                // metadata.
+                let current_version = { self.metadata.read().stats.version };
+                if self.last_saved_version.load(Ordering::Acquire) >= current_version {
+                    break;
+                }
+
+                // Re-acquire metadata with lock to get a consistent snapshot
+                // for saving. Complete flushes are serialized by
+                // `operation_gate`, so there is no need to claim the version
+                // before awaiting the PUT.
+                let mut metadata = self.metadata();
+                if self.last_saved_version.load(Ordering::Acquire) >= metadata.stats.version {
+                    break;
+                }
+                metadata.stats.last_saved = now_ms.max(metadata.stats.last_saved);
+                let mut payload = Vec::new();
+                cbor2::to_writer(&metadata, &mut payload).map_err(|err| {
+                    DBError::Serialization {
+                        name: self.name.clone(),
+                        source: err.into(),
+                    }
+                })?;
+                // Register the complete checkpoint generation before the
+                // first await. If the task is cancelled after the backend
+                // commits, a retry still knows that ids.cbor,
+                // storage_meta.cbor and the WAL retirement phases remain
+                // outstanding.
+                let check_point = metadata.stats.max_document_id;
+                let pending = PendingMetadataWrite {
+                    metadata,
+                    payload,
+                    expected_version: self.metadata_version.read().clone(),
+                    check_point: Some(check_point),
+                };
+                let mut pending_check_point = self.pending_checkpoint.lock();
+                *pending_check_point = Some(
+                    (*pending_check_point).map_or(check_point, |current| current.max(check_point)),
+                );
+                drop(pending_check_point);
+                *self.pending_metadata_write.lock() = Some(pending.clone());
+                pending
+            };
+
+            if let Some(check_point) = self.persist_pending_metadata_write(pending).await? {
+                stored_check_point = Some(
+                    stored_check_point
+                        .map_or(check_point, |current: DocumentId| current.max(check_point)),
+                );
+            }
+
+            // Metadata can gain a newer version while an earlier failed or
+            // cancelled payload is pending (for example, mutation replay on a
+            // retry). Loop until every such generation is durable before the
+            // ids checkpoint is completed and its WAL is retired.
+        }
+
+        Ok(stored_check_point)
     }
 
     /// Persists the current collection metadata object once, **without**
@@ -1017,39 +1687,40 @@ impl Collection {
     /// (`store_metadata` + `store_ids`) — a metadata-only write must never
     /// make a later flush skip persisting the ids bitmap.
     ///
-    /// Unlike `store_metadata`, a version-precondition conflict is retried
-    /// with a fresh snapshot instead of being treated as success: the
-    /// concurrent winner claimed the version with a snapshot that may
-    /// predate the change this call was asked to persist (and its write may
-    /// still fail). `Ok(())` therefore means the current in-memory metadata
-    /// — including that change — has been durably written.
+    /// `Ok(())` means the snapshot containing this call's change was durably
+    /// written. A stale-version read-back is accepted only for an exact
+    /// retained payload from this handle; a different durable payload remains
+    /// a conflict instead of being mistaken for this write.
     async fn store_metadata_unclaimed(&self) -> Result<(), DBError> {
-        // A handful of retries is plenty: every conflict means a concurrent
-        // writer just succeeded and published a fresh `metadata_version`.
-        const MAX_RETRIES: usize = 8;
-        let mut attempt = 0;
-        loop {
-            let meta = self.metadata();
-            let ver = { self.metadata_version.read().clone() };
-            match self
-                .storage
-                .put(Self::METADATA_PATH, &meta, Some(ver))
-                .await
-            {
-                Ok(ver) => {
-                    *self.metadata_version.write() = ver;
-                    return Ok(());
-                }
-                Err(DBError::Precondition { .. }) if attempt < MAX_RETRIES => {
-                    // A concurrent `store_metadata` won the version race; let
-                    // it publish the fresh object version, then retry with a
-                    // new snapshot (which contains our change).
-                    attempt += 1;
-                    tokio::task::yield_now().await;
-                }
-                Err(err) => return Err(err),
-            }
+        let _metadata_guard = self.metadata_write_gate.clone().lock_owned().await;
+
+        // Reconcile any earlier full-checkpoint or unclaimed PUT first. The
+        // retained generation itself decides whether publishing it advances
+        // the flush watermark; an unclaimed generation never does.
+        let retained = { self.pending_metadata_write.lock().clone() };
+        if let Some(retained) = retained {
+            self.persist_pending_metadata_write(retained).await?;
         }
+
+        // Register this exact metadata-only generation before its PUT. If the
+        // backend commits and the task is then cancelled, either a later
+        // unclaimed writer or a full flush can first reconcile these bytes and
+        // recover the returned object version before writing a newer snapshot.
+        let metadata = self.metadata();
+        let mut payload = Vec::new();
+        cbor2::to_writer(&metadata, &mut payload).map_err(|err| DBError::Serialization {
+            name: self.name.clone(),
+            source: err.into(),
+        })?;
+        let pending = PendingMetadataWrite {
+            metadata,
+            payload,
+            expected_version: self.metadata_version.read().clone(),
+            check_point: None,
+        };
+        *self.pending_metadata_write.lock() = Some(pending.clone());
+        self.persist_pending_metadata_write(pending).await?;
+        Ok(())
     }
 
     /// Stores document IDs bitmap to storage.
@@ -1065,10 +1736,6 @@ impl Collection {
         let ver = { self.ids_version.read().clone() };
         let ver = match self.storage.put(Self::IDS_PATH, &data, Some(ver)).await {
             Ok(ver) => ver,
-            Err(DBError::Precondition { .. }) => {
-                // If precondition failed, it means the document IDs have been updated by another concurrent writer.
-                return Ok(());
-            }
             Err(err) => {
                 return Err(err);
             }
@@ -1148,7 +1815,8 @@ impl Collection {
         metadata.stats.num_documents = self.doc_ids_index.read().len() as u64;
         metadata.stats.search_count = self.search_count.load(Ordering::Relaxed);
         metadata.stats.get_count = self.get_count.load(Ordering::Relaxed);
-        metadata.stats.read_only = self.read_only.load(Ordering::Relaxed);
+        metadata.stats.read_only = self.read_only.load(Ordering::Relaxed)
+            || self.database_read_only.load(Ordering::Relaxed);
         metadata
     }
 
@@ -1159,7 +1827,8 @@ impl Collection {
         stats.num_documents = self.doc_ids_index.read().len() as u64;
         stats.search_count = self.search_count.load(Ordering::Relaxed);
         stats.get_count = self.get_count.load(Ordering::Relaxed);
-        stats.read_only = self.read_only.load(Ordering::Relaxed);
+        stats.read_only = self.read_only.load(Ordering::Relaxed)
+            || self.database_read_only.load(Ordering::Relaxed);
 
         stats
     }
@@ -1243,13 +1912,19 @@ impl Collection {
             );
             return;
         }
-
-        self.update_metadata(|meta| {
-            meta.extensions.insert(key, value);
-            // Bump the version so the next `flush()` persists the change;
-            // `store_metadata` skips the write when the version is unchanged.
-            meta.stats.version += 1;
-        });
+        let mut meta = self.metadata.write();
+        if let Err(err) = self.ensure_mutable() {
+            log::warn!(
+                action = "Collection::set_extension",
+                collection = self.name;
+                "Ignoring extension mutation on inactive handle: {err:?}",
+            );
+            return;
+        }
+        meta.extensions.insert(key, value);
+        // Bump the version so the next `flush()` persists the change;
+        // `store_metadata` skips the write when the version is unchanged.
+        meta.stats.version += 1;
     }
 
     /// Sets a user-defined extension key-value pair with a serializable value.
@@ -1283,6 +1958,9 @@ impl Collection {
         F: FnOnce(Option<&FieldValue>) -> Option<FieldValue>,
     {
         let mut meta = self.metadata.write();
+        if self.ensure_mutable().is_err() {
+            return None;
+        }
         let old_value = meta.extensions.get(&key);
         let new_value = f(old_value);
         if let Some(value) = new_value {
@@ -1309,6 +1987,9 @@ impl Collection {
         T: Serialize + DeserializeOwned,
     {
         let mut meta = self.metadata.write();
+        if self.ensure_mutable().is_err() {
+            return None;
+        }
         let old_value = meta.extensions.get(&key);
         let new_value = f(old_value.and_then(|v| v.clone().deserialized().ok()));
         if let Some(value) = new_value
@@ -1333,12 +2014,7 @@ impl Collection {
     /// Sets a user-defined extension key-value pair and immediately persists the change.
     /// The extensions should not be large, as they are stored in the same object as collection metadata which size is expected to be small (<= 1MB) and loaded frequently.
     pub async fn save_extension(&self, key: String, value: FieldValue) -> Result<(), DBError> {
-        if self.read_only.load(Ordering::Relaxed) {
-            return Err(DBError::Generic {
-                name: self.name.clone(),
-                source: "Collection is read-only".into(),
-            });
-        }
+        let _operation_lease = self.mutation_lease().await?;
         value.validate_complexity()?;
 
         self.update_metadata(|meta| {
@@ -1371,12 +2047,7 @@ impl Collection {
     /// Removes a user-defined extension key and immediately persists the change.
     /// Returns the previous value if the key existed.
     pub async fn remove_extension(&self, key: &str) -> Result<Option<FieldValue>, DBError> {
-        if self.read_only.load(Ordering::Relaxed) {
-            return Err(DBError::Generic {
-                name: self.name.clone(),
-                source: "Collection is read-only".into(),
-            });
-        }
+        let _operation_lease = self.mutation_lease().await?;
 
         let old = self.update_metadata(|meta| {
             let old = meta.extensions.remove(key);
@@ -1424,6 +2095,7 @@ impl Collection {
     /// # Returns
     /// Ok(()) if successful, or an error if creation fails
     pub async fn create_btree_index(&mut self, fields: &[&str]) -> Result<(), DBError> {
+        self.ensure_mutable()?;
         if fields.is_empty() {
             return Err(DBError::Schema {
                 name: self.name.clone(),
@@ -1514,6 +2186,7 @@ impl Collection {
     /// # Returns
     /// Ok(()) if successful, or an error if creation fails
     pub async fn create_bm25_index(&mut self, fields: &[&str]) -> Result<(), DBError> {
+        self.ensure_mutable()?;
         if fields.is_empty() {
             return Err(DBError::Schema {
                 name: self.name.clone(),
@@ -1595,6 +2268,7 @@ impl Collection {
         field: &str,
         config: HnswConfig,
     ) -> Result<(), DBError> {
+        self.ensure_mutable()?;
         validate_field_name(field)?;
 
         let name = field.to_string();
@@ -1671,6 +2345,7 @@ impl Collection {
     /// Returns `true` when either metadata or an in-memory index entry was
     /// removed. Returns `false` if the requested index did not exist.
     pub async fn remove_btree_index(&mut self, fields: &[&str]) -> Result<bool, DBError> {
+        self.ensure_mutable()?;
         if fields.is_empty() {
             return Err(DBError::Schema {
                 name: self.name.clone(),
@@ -1728,6 +2403,7 @@ impl Collection {
     /// Returns `true` when either metadata or an in-memory index entry was
     /// removed. Returns `false` if the requested index did not exist.
     pub async fn remove_bm25_index(&mut self, fields: &[&str]) -> Result<bool, DBError> {
+        self.ensure_mutable()?;
         if fields.is_empty() {
             return Err(DBError::Schema {
                 name: self.name.clone(),
@@ -1765,6 +2441,7 @@ impl Collection {
     /// Returns `true` when either metadata or an in-memory index entry was
     /// removed. Returns `false` if the requested field has no HNSW index.
     pub async fn remove_hnsw_index(&mut self, field: &str) -> Result<bool, DBError> {
+        self.ensure_mutable()?;
         if field.is_empty() {
             return Err(DBError::Schema {
                 name: self.name.clone(),
@@ -1802,7 +2479,12 @@ impl Collection {
     ///
     /// Multi-field indexes are addressed by the same virtual field name used
     /// during index creation.
-    pub fn get_btree_index(&self, fields: &[&str]) -> Result<&BTree, DBError> {
+    pub fn get_btree_index(&self, fields: &[&str]) -> Result<BTreeIndexView<'_>, DBError> {
+        self.find_btree_index(fields)
+            .map(|inner| BTreeIndexView { inner })
+    }
+
+    fn find_btree_index(&self, fields: &[&str]) -> Result<&BTree, DBError> {
         let name = virtual_field_name(fields);
         if let Some(index) = self.btree_indexes.iter().find(|i| i.name() == name) {
             return Ok(index);
@@ -1818,7 +2500,12 @@ impl Collection {
     ///
     /// Multi-field indexes are addressed by the same virtual field name used
     /// during index creation.
-    pub fn get_bm25_index(&self, fields: &[&str]) -> Result<&BM25, DBError> {
+    pub fn get_bm25_index(&self, fields: &[&str]) -> Result<BM25IndexView<'_>, DBError> {
+        self.find_bm25_index(fields)
+            .map(|inner| BM25IndexView { inner })
+    }
+
+    fn find_bm25_index(&self, fields: &[&str]) -> Result<&BM25, DBError> {
         let name = virtual_field_name(fields);
         if let Some(index) = self.bm25_indexes.iter().find(|i| i.name() == name) {
             return Ok(index);
@@ -1831,7 +2518,12 @@ impl Collection {
     }
 
     /// Returns the HNSW vector index for `field`.
-    pub fn get_hnsw_index(&self, field: &str) -> Result<&Hnsw, DBError> {
+    pub fn get_hnsw_index(&self, field: &str) -> Result<HnswIndexView<'_>, DBError> {
+        self.find_hnsw_index(field)
+            .map(|inner| HnswIndexView { inner })
+    }
+
+    fn find_hnsw_index(&self, field: &str) -> Result<&Hnsw, DBError> {
         if let Some(index) = self.hnsw_indexes.iter().find(|i| i.field_name() == field) {
             return Ok(index);
         }
@@ -1844,13 +2536,15 @@ impl Collection {
 
     /// Compacts the specified BM25 index to optimize storage and performance.
     pub async fn compact_bm25_index(&self, fields: &[&str]) -> Result<(), DBError> {
-        let index = self.get_bm25_index(fields)?;
+        let _operation_lease = self.mutation_lease().await?;
+        let index = self.find_bm25_index(fields)?;
         index.compact_index().await
     }
 
     /// Compacts the specified BTree index to optimize storage and performance.
     pub async fn compact_btree_index(&self, fields: &[&str]) -> Result<(), DBError> {
-        let index = self.get_btree_index(fields)?;
+        let _operation_lease = self.mutation_lease().await?;
+        let index = self.find_btree_index(fields)?;
         index.compact_index().await
     }
 
@@ -1875,12 +2569,7 @@ impl Collection {
     /// - Any index update fails
     /// - Storage operations fail
     pub async fn add(&self, mut doc: Document) -> Result<DocumentId, DBError> {
-        if self.read_only.load(Ordering::Relaxed) {
-            return Err(DBError::Generic {
-                name: self.name.clone(),
-                source: "Collection is read-only".into(),
-            });
-        }
+        let _operation_lease = self.mutation_lease().await?;
 
         self.schema.validate(doc.fields())?;
         // Allocate the id and register it as in-flight atomically, so a
@@ -1909,6 +2598,12 @@ impl Collection {
             id,
         };
         doc.set_id(id);
+
+        // An add can be cancelled after its object-store PUT has committed
+        // but before the id bitmap is updated. Persist the intended document
+        // first so a later flush/reopen can either finish the add or remove
+        // any partially applied index entries.
+        self.record_mutation_intent(id, None, Some(&doc)).await?;
 
         let now_ms = unix_ms();
         #[allow(clippy::mutable_key_type)]
@@ -2011,6 +2706,15 @@ impl Collection {
     /// version precondition on the storage write additionally guards against
     /// writers outside this process.
     ///
+    /// # Durability
+    ///
+    /// Before changing either the document or any derived index, `update`
+    /// durably records the document's previous indexed values. A successful
+    /// call means the document object itself is durable; the next `flush`
+    /// commits the corresponding index/ids generation and removes the intent.
+    /// If the process stops first, collection open replays the intent and
+    /// makes the stored document authoritative for every index.
+    ///
     /// # Arguments
     /// * `id` - The ID of the document to update
     /// * `fields` - The new field values to apply
@@ -2031,12 +2735,7 @@ impl Collection {
         id: DocumentId,
         fields: BTreeMap<String, Fv>,
     ) -> Result<Document, DBError> {
-        if self.read_only.load(Ordering::Relaxed) {
-            return Err(DBError::Generic {
-                name: self.name.clone(),
-                source: "Collection is read-only".into(),
-            });
-        }
+        let _operation_lease = self.mutation_lease().await?;
 
         if !self.doc_ids.read().contains(id) {
             return Err(DBError::NotFound {
@@ -2076,6 +2775,12 @@ impl Collection {
 
         // validate the updated document
         self.schema.validate(doc.fields())?;
+
+        // Persist the old indexable values before changing either side of the
+        // document/index pair. The intent is cleared only by a successful
+        // full flush after both sides are durable.
+        self.record_mutation_intent(id, Some(&old_doc), Some(&doc))
+            .await?;
 
         let now_ms = unix_ms();
 
@@ -2195,6 +2900,9 @@ impl Collection {
     /// Deleting the object before the bitmap update means a crash in between
     /// leaves a dead id that reads self-heal (see [`Self::heal_missing_doc`]),
     /// instead of an orphaned object beyond the repair scan window.
+    /// A durable mutation intent containing the old indexed values is written
+    /// before phase 1. It is retired only after a full flush, so reopening
+    /// after a crash can finish removing stale B-Tree, BM25 and HNSW entries.
     ///
     /// # Arguments
     /// * `id` - The ID of the document to remove
@@ -2208,12 +2916,7 @@ impl Collection {
     /// - Any index update fails
     /// - Storage operations fail
     pub async fn remove(&self, id: DocumentId) -> Result<Option<Document>, DBError> {
-        if self.read_only.load(Ordering::Relaxed) {
-            return Err(DBError::Generic {
-                name: self.name.clone(),
-                source: "Collection is read-only".into(),
-            });
-        }
+        let _operation_lease = self.mutation_lease().await?;
 
         // Membership check is non-authoritative; the bitmap mutation below
         // serializes concurrent removes and is the source of truth.
@@ -2243,6 +2946,10 @@ impl Collection {
                 return Err(err);
             }
         };
+
+        if let Some(doc) = &doc {
+            self.record_mutation_intent(id, Some(doc), None).await?;
+        }
 
         #[allow(clippy::mutable_key_type)]
         let mut btree_removed: FxHashMap<&BTree, Cow<FieldValue>> = FxHashMap::default();
@@ -3017,6 +3724,7 @@ mod tests {
             Arc,
             atomic::{AtomicBool as TestAtomicBool, Ordering as TestOrdering},
         },
+        time::Duration,
     };
 
     // 测试用的文档结构
@@ -3158,6 +3866,31 @@ mod tests {
             }
 
             IndexHooks::btree_index_value(&DefaultIndexHooks, index, doc)
+        }
+    }
+
+    struct RecoveryCustomHooks;
+
+    impl IndexHooks for RecoveryCustomHooks {
+        fn btree_index_value<'a>(&self, index: &BTree, doc: &'a Document) -> Option<Cow<'a, Fv>> {
+            if index.name() == "name" {
+                let name = match doc.get_field("name") {
+                    Some(Fv::Text(name)) => name,
+                    _ => return None,
+                };
+                return Some(Cow::Owned(Fv::Text(format!(
+                    "hook:{}",
+                    name.to_lowercase()
+                ))));
+            }
+            IndexHooks::btree_index_value(&DefaultIndexHooks, index, doc)
+        }
+
+        fn bm25_index_value<'a>(&self, index: &BM25, doc: &'a Document) -> Option<Cow<'a, str>> {
+            if index.name() == "name" && doc.get_field("name").is_some() {
+                return Some(Cow::Borrowed("hooktoken"));
+            }
+            IndexHooks::bm25_index_value(&DefaultIndexHooks, index, doc)
         }
     }
 
@@ -4365,6 +5098,7 @@ mod tests {
 
         let doc = create_test_doc(0, "Alice", 30, vec!["smart"]);
         let id = collection.add_from(&doc).await?;
+        collection.flush(unix_ms()).await?;
         collection
             .storage
             .put_bytes(
@@ -4639,7 +5373,7 @@ mod tests {
             assert!(collection.flush(same_ms).await?);
 
             // Mutate index-only state directly: remove the mapping from btree index.
-            let index = collection.get_btree_index(&["name"])?;
+            let index = collection.find_btree_index(&["name"])?;
             assert!(index.remove(id, &Fv::Text("Alice".to_string()), unix_ms()));
 
             // Collection metadata version is unchanged, but index is dirty and must still flush.
@@ -4886,6 +5620,27 @@ mod tests {
             },
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn test_vector_get_field_is_canonical_after_reconnect() -> Result<(), DBError> {
+        let db = setup_test_db().await?;
+        let collection = create_test_collection(&db, async |_| Ok(())).await?;
+        let source = create_test_doc(0, "vector", 1, vec![]);
+        let expected = source.vector.clone();
+        let id = collection.add_from(&source).await?;
+        collection.flush(unix_ms()).await?;
+
+        drop(collection);
+        let db = reconnect_test_db(db).await?;
+        let collection = db
+            .open_collection("test_collection".to_string(), async |_| Ok(()))
+            .await?;
+        let document = collection.get(id).await?;
+        assert_eq!(document.get_field("vector"), Some(&Fv::Vector(expected)));
+
+        db.close().await?;
+        Ok(())
     }
 
     #[tokio::test]
@@ -5554,11 +6309,7 @@ mod tests {
         };
         let db = AndaDB::connect(object_store.clone(), db_config.clone()).await?;
         let collection = db
-            .open_or_create_collection(
-                CounterDoc::schema()?,
-                counter_config(),
-                async |_| Ok(()),
-            )
+            .open_or_create_collection(CounterDoc::schema()?, counter_config(), async |_| Ok(()))
             .await?;
 
         let puts_before = collection.storage_stats().total_put_count;
@@ -5670,6 +6421,7 @@ mod tests {
         inner: Arc<InMemory>,
         gate_suffix: String,
         gate: tokio::sync::watch::Receiver<bool>,
+        blocked: Arc<TestAtomicBool>,
     }
 
     impl fmt::Display for GatedPutStore {
@@ -5689,6 +6441,7 @@ mod tests {
             if location.to_string().ends_with(&self.gate_suffix) {
                 let mut rx = self.gate.clone();
                 while !*rx.borrow() {
+                    self.blocked.store(true, TestOrdering::Release);
                     rx.changed()
                         .await
                         .map_err(|_| object_store::Error::Generic {
@@ -5752,13 +6505,777 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    enum PutFault {
+        FailOnce {
+            armed: Arc<TestAtomicBool>,
+        },
+        BlockAfterCommit {
+            gate: tokio::sync::watch::Receiver<bool>,
+            blocked: Arc<TestAtomicBool>,
+        },
+    }
+
+    /// Injects one path-specific PUT failure, or blocks after the delegated
+    /// PUT is already durable but before success is returned to the caller.
+    #[derive(Debug)]
+    struct FaultPutStore {
+        inner: Arc<InMemory>,
+        suffix: String,
+        fault: PutFault,
+    }
+
+    impl fmt::Display for FaultPutStore {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("FaultPutStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for FaultPutStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> ObjectStoreResult<PutResult> {
+            let matches = location.to_string().ends_with(&self.suffix);
+            if matches
+                && let PutFault::FailOnce { armed } = &self.fault
+                && armed.swap(false, TestOrdering::AcqRel)
+            {
+                return Err(object_store::Error::Generic {
+                    store: "fault_put",
+                    source: "injected one-shot PUT failure".into(),
+                });
+            }
+
+            let result = self.inner.put_opts(location, payload, opts).await?;
+            if matches && let PutFault::BlockAfterCommit { gate, blocked } = &self.fault {
+                let mut rx = gate.clone();
+                while !*rx.borrow() {
+                    blocked.store(true, TestOrdering::Release);
+                    rx.changed()
+                        .await
+                        .map_err(|_| object_store::Error::Generic {
+                            store: "fault_put",
+                            source: "gate sender dropped".into(),
+                        })?;
+                }
+            }
+            Ok(result)
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> ObjectStoreResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, ObjectStoreResult<Path>>,
+        ) -> BoxStream<'static, ObjectStoreResult<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> ObjectStoreResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> ObjectStoreResult<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// Regression (P0-04): F1 is held after serializing its old ids snapshot
+    /// but before the conditional ids PUT completes. An add and F2 queue
+    /// behind the collection-wide gate in that order. Once released, F1 must
+    /// publish its version, the add completes, and only then may F2 take the
+    /// new snapshot/version and advance the checkpoint.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_flush_checkpoint_excludes_in_flight_add() -> Result<(), DBError> {
+    async fn test_concurrent_flushes_bind_checkpoint_to_serialized_ids_generation()
+    -> Result<(), DBError> {
+        let (gate_tx, gate_rx) = tokio::sync::watch::channel(true);
+        let blocked = Arc::new(TestAtomicBool::new(false));
+        let object_store: Arc<dyn ObjectStore> = Arc::new(GatedPutStore {
+            inner: Arc::new(InMemory::new()),
+            gate_suffix: "test_collection/ids.cbor".to_string(),
+            gate: gate_rx,
+            blocked: blocked.clone(),
+        });
+        let db_config = || DBConfig {
+            name: "test_db".to_string(),
+            description: String::new(),
+            storage: StorageConfig {
+                compress_level: 0,
+                ..Default::default()
+            },
+            lock: None,
+        };
+        let db = AndaDB::connect(object_store.clone(), db_config()).await?;
+        let collection = create_test_collection(&db, async |_| Ok(())).await?;
+        assert_eq!(
+            collection
+                .add_from(&create_test_doc(0, "one", 20, vec!["one"]))
+                .await?,
+            1
+        );
+
+        gate_tx.send(false).expect("gate receiver dropped");
+        let first_flush = {
+            let collection = collection.clone();
+            tokio::spawn(async move { collection.flush(unix_ms()).await })
+        };
+        while !blocked.load(TestOrdering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+
+        // Queue the mutation before F2. Tokio's fair RwLock makes F2 observe
+        // the completed mutation instead of overtaking it with a stale ids
+        // snapshot and then treating a CAS conflict as success.
+        let adding = {
+            let collection = collection.clone();
+            tokio::spawn(async move {
+                collection
+                    .add_from(&create_test_doc(0, "two", 21, vec!["two"]))
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let second_flush = {
+            let collection = collection.clone();
+            tokio::spawn(async move { collection.flush(unix_ms()).await })
+        };
+        assert!(!adding.is_finished());
+        assert!(!second_flush.is_finished());
+
+        gate_tx.send(true).expect("gate receiver dropped");
+        assert!(first_flush.await.expect("first flush panicked")?);
+        assert_eq!(adding.await.expect("add task panicked")?, 2);
+        assert!(second_flush.await.expect("second flush panicked")?);
+        assert!(collection.storage.stats().check_point >= 2);
+
+        drop(collection);
+        drop(db);
+        let db = AndaDB::connect(object_store, db_config()).await?;
+        let collection = db
+            .open_collection("test_collection".to_string(), async |_| Ok(()))
+            .await?;
+        assert_eq!(collection.ids(), vec![1, 2]);
+        db.close().await?;
+        Ok(())
+    }
+
+    /// Regression (P0-04): once collection metadata is durable, a failure in
+    /// ids.cbor must leave the whole checkpoint generation pending. Retrying
+    /// with no new mutation and the same timestamp must write ids/checkpoint
+    /// instead of taking the metadata fast path.
+    #[tokio::test]
+    async fn test_failed_ids_phase_is_retried_as_complete_checkpoint() -> Result<(), DBError> {
+        let armed = Arc::new(TestAtomicBool::new(false));
+        let object_store: Arc<dyn ObjectStore> = Arc::new(FaultPutStore {
+            inner: Arc::new(InMemory::new()),
+            suffix: "test_collection/ids.cbor".to_string(),
+            fault: PutFault::FailOnce {
+                armed: armed.clone(),
+            },
+        });
+        let config = DBConfig {
+            name: "test_db".to_string(),
+            description: String::new(),
+            storage: StorageConfig {
+                compress_level: 0,
+                ..Default::default()
+            },
+            lock: None,
+        };
+        let db = AndaDB::connect(object_store.clone(), config.clone()).await?;
+        let collection = create_test_collection(&db, async |_| Ok(())).await?;
+        collection
+            .add_from(&create_test_doc(0, "one", 20, vec!["one"]))
+            .await?;
+        collection.flush(unix_ms()).await?;
+        collection
+            .add_from(&create_test_doc(0, "two", 21, vec!["two"]))
+            .await?;
+
+        let same_ms = unix_ms();
+        armed.store(true, TestOrdering::Release);
+        assert!(collection.flush(same_ms).await.is_err());
+        assert_eq!(*collection.pending_checkpoint.lock(), Some(2));
+        assert!(collection.flush(same_ms).await?);
+        assert_eq!(*collection.pending_checkpoint.lock(), None);
+
+        drop(collection);
+        drop(db);
+        let db = AndaDB::connect(object_store, config).await?;
+        let collection = db
+            .open_collection("test_collection".to_string(), async |_| Ok(()))
+            .await?;
+        assert_eq!(collection.ids(), vec![1, 2]);
+        db.close().await?;
+        Ok(())
+    }
+
+    /// A conditional metadata PUT can commit before its future reports
+    /// success. Aborting at that boundary must retain the exact payload and
+    /// checkpoint generation. The retry reads the committed payload back,
+    /// refreshes the local object version, and completes ids/checkpoint/WAL
+    /// retirement before a reopen.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cancelled_metadata_put_after_commit_retries_complete_checkpoint()
+    -> Result<(), DBError> {
+        let (gate_tx, gate_rx) = tokio::sync::watch::channel(true);
+        let blocked = Arc::new(TestAtomicBool::new(false));
+        let object_store: Arc<dyn ObjectStore> = Arc::new(FaultPutStore {
+            inner: Arc::new(InMemory::new()),
+            suffix: "test_collection/meta.cbor".to_string(),
+            fault: PutFault::BlockAfterCommit {
+                gate: gate_rx,
+                blocked: blocked.clone(),
+            },
+        });
+        let config = DBConfig {
+            name: "test_db".to_string(),
+            description: String::new(),
+            storage: StorageConfig {
+                compress_level: 0,
+                ..Default::default()
+            },
+            lock: None,
+        };
+        let db = AndaDB::connect(object_store.clone(), config.clone()).await?;
+        let collection = create_test_collection(&db, async |collection| {
+            collection.create_btree_index_nx(&["name"]).await
+        })
+        .await?;
+        let id = collection
+            .add_from(&create_test_doc(0, "one", 20, vec!["one"]))
+            .await?;
+        assert_eq!(id, 1);
+        assert!(!collection.pending_mutations.lock().is_empty());
+
+        gate_tx.send(false).expect("gate receiver dropped");
+        let first_now = unix_ms();
+        let flushing = {
+            let collection = collection.clone();
+            tokio::spawn(async move { collection.flush(first_now).await })
+        };
+        while !blocked.load(TestOrdering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+
+        flushing.abort();
+        assert!(
+            flushing
+                .await
+                .expect_err("flush should be cancelled")
+                .is_cancelled()
+        );
+        assert_eq!(*collection.pending_checkpoint.lock(), Some(id));
+        assert!(collection.pending_metadata_write.lock().is_some());
+        assert!(!collection.pending_mutations.lock().is_empty());
+
+        // Let the immediate metadata writer add a newer generation before the
+        // full flush retries. It must first reconcile the retained checkpoint
+        // payload, then persist the extension with the recovered token without
+        // stranding the older pending generation.
+        gate_tx.send(true).expect("gate receiver dropped");
+        collection
+            .save_extension("after_cancel".to_string(), Fv::Text("durable".to_string()))
+            .await?;
+        assert!(collection.pending_metadata_write.lock().is_none());
+        assert_eq!(*collection.pending_checkpoint.lock(), Some(id));
+
+        // Use a different timestamp for the checkpoint completion. Metadata
+        // is already current, but ids/storage checkpoint/WAL must still run.
+        assert!(collection.flush(first_now.saturating_add(1)).await?);
+        assert_eq!(*collection.pending_checkpoint.lock(), None);
+        assert!(collection.pending_metadata_write.lock().is_none());
+        assert!(collection.pending_mutations.lock().is_empty());
+        let mut intents = collection
+            .storage
+            .list_meta(Some(Collection::MUTATION_INTENT_PREFIX), None);
+        assert!(intents.next().await.is_none(), "WAL must retire last");
+        assert!(collection.storage.stats().check_point >= id);
+
+        drop(collection);
+        drop(db);
+        let db = AndaDB::connect(object_store, config).await?;
+        let collection = db
+            .open_collection("test_collection".to_string(), async |_| Ok(()))
+            .await?;
+        assert_eq!(collection.ids(), vec![id]);
+        let reopened: TestDoc = collection.get_as(id).await?;
+        assert_eq!(reopened.name, "one");
+        assert_eq!(
+            collection.get_extension("after_cancel"),
+            Some(Fv::Text("durable".to_string()))
+        );
+        assert!(collection.storage.stats().check_point >= id);
+        assert!(collection.pending_mutations.lock().is_empty());
+        db.close().await?;
+        Ok(())
+    }
+
+    /// An immediate metadata-only write has the same post-commit cancellation
+    /// window as a full flush. Its retained generation must repair the stale
+    /// CAS token without claiming a checkpoint; a following full flush then
+    /// persists the newer document generation and retires its WAL normally.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cancelled_unclaimed_metadata_put_is_reconciled_by_full_flush()
+    -> Result<(), DBError> {
+        let (gate_tx, gate_rx) = tokio::sync::watch::channel(true);
+        let blocked = Arc::new(TestAtomicBool::new(false));
+        let object_store: Arc<dyn ObjectStore> = Arc::new(FaultPutStore {
+            inner: Arc::new(InMemory::new()),
+            suffix: "test_collection/meta.cbor".to_string(),
+            fault: PutFault::BlockAfterCommit {
+                gate: gate_rx,
+                blocked: blocked.clone(),
+            },
+        });
+        let config = DBConfig {
+            name: "test_db".to_string(),
+            description: String::new(),
+            storage: StorageConfig {
+                compress_level: 0,
+                ..Default::default()
+            },
+            lock: None,
+        };
+        let db = AndaDB::connect(object_store.clone(), config.clone()).await?;
+        let collection = create_test_collection(&db, async |_| Ok(())).await?;
+        let saved_before = collection.last_saved_version.load(Ordering::Acquire);
+
+        gate_tx.send(false).expect("gate receiver dropped");
+        let saving = {
+            let collection = collection.clone();
+            tokio::spawn(async move {
+                collection
+                    .save_extension("before_cancel".to_string(), Fv::Text("durable".to_string()))
+                    .await
+            })
+        };
+        while !blocked.load(TestOrdering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        saving.abort();
+        assert!(
+            saving
+                .await
+                .expect_err("metadata-only writer should be cancelled after commit")
+                .is_cancelled()
+        );
+        {
+            let pending = collection.pending_metadata_write.lock();
+            assert!(pending.is_some());
+            assert_eq!(pending.as_ref().unwrap().check_point, None);
+        }
+        assert_eq!(*collection.pending_checkpoint.lock(), None);
+        assert_eq!(
+            collection.last_saved_version.load(Ordering::Acquire),
+            saved_before,
+            "an unclaimed generation must not publish the full-flush watermark",
+        );
+
+        // Advance the collection generation before retrying through the full
+        // checkpoint path. It must reconcile the exact extension payload
+        // first, then use the recovered object version for this newer snapshot.
+        gate_tx.send(true).expect("gate receiver dropped");
+        let id = collection
+            .add_from(&create_test_doc(0, "after", 21, vec!["after"]))
+            .await?;
+        assert!(collection.flush(unix_ms()).await?);
+        assert!(collection.pending_metadata_write.lock().is_none());
+        assert_eq!(*collection.pending_checkpoint.lock(), None);
+        assert!(collection.pending_mutations.lock().is_empty());
+        assert!(collection.storage.stats().check_point >= id);
+
+        drop(collection);
+        drop(db);
+        let db = AndaDB::connect(object_store, config).await?;
+        let collection = db
+            .open_collection("test_collection".to_string(), async |_| Ok(()))
+            .await?;
+        assert_eq!(collection.ids(), vec![id]);
+        assert_eq!(
+            collection.get_extension("before_cancel"),
+            Some(Fv::Text("durable".to_string()))
+        );
+        let reopened: TestDoc = collection.get_as(id).await?;
+        assert_eq!(reopened.name, "after");
+        assert!(collection.storage.stats().check_point >= id);
+        db.close().await?;
+        Ok(())
+    }
+
+    /// Read-back reconciliation is valid only for the exact payload retained
+    /// before cancellation. If another writer replaces that object, the
+    /// original precondition conflict must be returned and its CAS token must
+    /// remain unchanged.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cancelled_metadata_put_rejects_different_durable_payload() -> Result<(), DBError>
+    {
+        let (gate_tx, gate_rx) = tokio::sync::watch::channel(true);
+        let blocked = Arc::new(TestAtomicBool::new(false));
+        let object_store: Arc<dyn ObjectStore> = Arc::new(FaultPutStore {
+            inner: Arc::new(InMemory::new()),
+            suffix: "test_collection/meta.cbor".to_string(),
+            fault: PutFault::BlockAfterCommit {
+                gate: gate_rx,
+                blocked: blocked.clone(),
+            },
+        });
+        let db = AndaDB::connect(
+            object_store,
+            DBConfig {
+                name: "conflict_db".to_string(),
+                description: String::new(),
+                storage: StorageConfig {
+                    compress_level: 0,
+                    ..Default::default()
+                },
+                lock: None,
+            },
+        )
+        .await?;
+        let collection = create_test_collection(&db, async |_| Ok(())).await?;
+        collection
+            .add_from(&create_test_doc(0, "one", 20, vec!["one"]))
+            .await?;
+
+        gate_tx.send(false).expect("gate receiver dropped");
+        let flushing = {
+            let collection = collection.clone();
+            tokio::spawn(async move { collection.flush(unix_ms()).await })
+        };
+        while !blocked.load(TestOrdering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        flushing.abort();
+        assert!(
+            flushing
+                .await
+                .expect_err("flush should be cancelled")
+                .is_cancelled()
+        );
+        gate_tx.send(true).expect("gate receiver dropped");
+
+        let local_version = collection.metadata_version.read().clone();
+        let (mut foreign, _) = collection
+            .storage
+            .fetch::<CollectionMetadata>(Collection::METADATA_PATH)
+            .await?;
+        foreign.config.description = "foreign writer".to_string();
+        collection
+            .storage
+            .put(Collection::METADATA_PATH, &foreign, None)
+            .await?;
+
+        let err = collection
+            .flush(unix_ms())
+            .await
+            .expect_err("different durable payload must remain a conflict");
+        assert!(matches!(err, DBError::Precondition { .. }));
+        assert_eq!(*collection.metadata_version.read(), local_version);
+        assert!(collection.pending_metadata_write.lock().is_some());
+        assert!(collection.pending_checkpoint.lock().is_some());
+        Ok(())
+    }
+
+    /// Regression (P0-04/P0-08): an object-store PUT may commit before the
+    /// caller observes its result. Cancelling `add` in that interval must not
+    /// let a later checkpoint skip the durable document.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cancelled_add_after_document_commit_is_reconciled() -> Result<(), DBError> {
+        let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+        let blocked = Arc::new(TestAtomicBool::new(false));
+        let object_store: Arc<dyn ObjectStore> = Arc::new(FaultPutStore {
+            inner: Arc::new(InMemory::new()),
+            suffix: "data/1.cbor".to_string(),
+            fault: PutFault::BlockAfterCommit {
+                gate: gate_rx,
+                blocked: blocked.clone(),
+            },
+        });
+        let config = DBConfig {
+            name: "test_db".to_string(),
+            description: String::new(),
+            storage: StorageConfig {
+                compress_level: 0,
+                ..Default::default()
+            },
+            lock: None,
+        };
+        let db = AndaDB::connect(object_store.clone(), config.clone()).await?;
+        let collection = create_test_collection(&db, async |collection| {
+            collection.create_btree_index_nx(&["name"]).await
+        })
+        .await?;
+
+        let adding = {
+            let collection = collection.clone();
+            tokio::spawn(async move {
+                collection
+                    .add_from(&create_test_doc(0, "committed", 20, vec!["x"]))
+                    .await
+            })
+        };
+        while !blocked.load(TestOrdering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        adding.abort();
+        assert!(
+            adding
+                .await
+                .expect_err("add should be cancelled")
+                .is_cancelled()
+        );
+        gate_tx.send(true).expect("gate receiver dropped");
+
+        assert_eq!(
+            collection
+                .add_from(&create_test_doc(0, "second", 21, vec!["y"]))
+                .await?,
+            2
+        );
+        collection.flush(unix_ms()).await?;
+        assert_eq!(collection.ids(), vec![1, 2]);
+        assert_eq!(
+            collection
+                .query_ids(
+                    Filter::Field((
+                        "name".to_string(),
+                        RangeQuery::Eq(Fv::Text("committed".to_string())),
+                    )),
+                    Some(10),
+                )
+                .await?,
+            vec![1]
+        );
+
+        drop(collection);
+        drop(db);
+        let db = AndaDB::connect(object_store, config).await?;
+        let collection = db
+            .open_collection("test_collection".to_string(), async |_| Ok(()))
+            .await?;
+        assert_eq!(collection.ids(), vec![1, 2]);
+        assert_eq!(collection.get_as::<TestDoc>(1).await?.name, "committed");
+        db.close().await?;
+        Ok(())
+    }
+
+    /// A cancelled update can leave its proposed in-memory index value
+    /// applied while the document PUT is still blocked. The WAL stores both
+    /// before/after values so the next flush removes that phantom.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cancelled_update_before_document_put_removes_proposed_index()
+    -> Result<(), DBError> {
+        let (gate_tx, gate_rx) = tokio::sync::watch::channel(true);
+        let blocked = Arc::new(TestAtomicBool::new(false));
+        let object_store: Arc<dyn ObjectStore> = Arc::new(GatedPutStore {
+            inner: Arc::new(InMemory::new()),
+            gate_suffix: "data/1.cbor".to_string(),
+            gate: gate_rx,
+            blocked: blocked.clone(),
+        });
+        let db = AndaDB::connect(
+            object_store,
+            DBConfig {
+                name: "test_db".to_string(),
+                description: String::new(),
+                storage: StorageConfig {
+                    compress_level: 0,
+                    ..Default::default()
+                },
+                lock: None,
+            },
+        )
+        .await?;
+        let collection = create_test_collection(&db, async |collection| {
+            collection.create_btree_index_nx(&["name"]).await
+        })
+        .await?;
+        let id = collection
+            .add_from(&create_test_doc(0, "before", 20, vec!["x"]))
+            .await?;
+        collection.flush(unix_ms()).await?;
+
+        gate_tx.send(false).expect("gate receiver dropped");
+        let updating = {
+            let collection = collection.clone();
+            tokio::spawn(async move {
+                collection
+                    .update(
+                        id,
+                        BTreeMap::from([("name".to_string(), Fv::Text("cancelled".to_string()))]),
+                    )
+                    .await
+            })
+        };
+        while !blocked.load(TestOrdering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        updating.abort();
+        assert!(
+            updating
+                .await
+                .expect_err("update should be cancelled")
+                .is_cancelled()
+        );
+        gate_tx.send(true).expect("gate receiver dropped");
+
+        collection.flush(unix_ms()).await?;
+        let before = collection
+            .query_ids(
+                Filter::Field((
+                    "name".to_string(),
+                    RangeQuery::Eq(Fv::Text("before".to_string())),
+                )),
+                Some(10),
+            )
+            .await?;
+        let cancelled = collection
+            .query_ids(
+                Filter::Field((
+                    "name".to_string(),
+                    RangeQuery::Eq(Fv::Text("cancelled".to_string())),
+                )),
+                Some(10),
+            )
+            .await?;
+        assert_eq!(before, vec![id]);
+        assert!(cancelled.is_empty());
+        db.close().await?;
+        Ok(())
+    }
+
+    /// Recovery must wait until the open callback installs custom hooks.
+    /// Replaying once with default derivation would persist raw `After`
+    /// B-tree/BM25 entries that the custom hook cannot subsequently identify.
+    #[tokio::test]
+    async fn test_mutation_replay_uses_custom_hooks_before_clearing_intent() -> Result<(), DBError>
+    {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let config = DBConfig {
+            name: "custom_replay_db".to_string(),
+            description: String::new(),
+            storage: StorageConfig {
+                compress_level: 0,
+                ..Default::default()
+            },
+            lock: None,
+        };
+        let db = AndaDB::connect(object_store.clone(), config.clone()).await?;
+        let collection = db
+            .create_collection(
+                TestDoc::schema()?,
+                CollectionConfig {
+                    name: "documents".to_string(),
+                    description: String::new(),
+                },
+                async |collection| {
+                    collection.set_index_hooks(Arc::new(RecoveryCustomHooks));
+                    collection.create_btree_index_nx(&["name"]).await?;
+                    collection.create_bm25_index_nx(&["name"]).await?;
+                    Ok(())
+                },
+            )
+            .await?;
+        let id = collection
+            .add_from(&create_test_doc(0, "Before", 20, vec!["x"]))
+            .await?;
+        collection.flush(unix_ms()).await?;
+        collection
+            .update(
+                id,
+                BTreeMap::from([("name".to_string(), Fv::Text("After".to_string()))]),
+            )
+            .await?;
+        drop(collection);
+        drop(db);
+
+        let db = AndaDB::connect(object_store, config).await?;
+        let collection = db
+            .open_collection("documents".to_string(), async |collection| {
+                collection.set_index_hooks(Arc::new(RecoveryCustomHooks));
+                Ok(())
+            })
+            .await?;
+        let raw = collection
+            .query_ids(
+                Filter::Field((
+                    "name".to_string(),
+                    RangeQuery::Eq(Fv::Text("After".to_string())),
+                )),
+                Some(10),
+            )
+            .await?;
+        let hooked = collection
+            .query_ids(
+                Filter::Field((
+                    "name".to_string(),
+                    RangeQuery::Eq(Fv::Text("hook:after".to_string())),
+                )),
+                Some(10),
+            )
+            .await?;
+        assert!(raw.is_empty(), "default-hook B-tree value must not survive");
+        assert_eq!(hooked, vec![id]);
+
+        let raw_text = collection
+            .get_bm25_index(&["name"])?
+            .search("after", 10, None);
+        let hooked_text = collection
+            .get_bm25_index(&["name"])?
+            .search("hooktoken", 10, None);
+        assert!(raw_text.iter().all(|(found, _)| *found != id));
+        assert!(hooked_text.iter().any(|(found, _)| *found == id));
+        db.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_flush_drains_in_flight_add_before_checkpoint() -> Result<(), DBError> {
         let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
         let object_store: Arc<dyn ObjectStore> = Arc::new(GatedPutStore {
             inner: Arc::new(InMemory::new()),
             gate_suffix: "data/2.cbor".to_string(),
             gate: gate_rx,
+            blocked: Arc::new(TestAtomicBool::new(false)),
         });
         let db_config = || DBConfig {
             name: "test_db".to_string(),
@@ -5800,17 +7317,23 @@ mod tests {
             .await?;
         assert_eq!(id3, 3);
 
-        // Flush while add(2) is in flight: the persisted checkpoint must stay
-        // below id 2 even though max_document_id is already 3, otherwise the
-        // crash-recovery scan (checkpoint + 1) would skip document 2 forever.
-        collection.flush(unix_ms()).await?;
-        assert!(collection.storage.stats().check_point < 2);
+        // A complete flush now owns the collection operation gate
+        // exclusively. It must wait for add(2), rather than checkpointing a
+        // bitmap/index snapshot while that mutation is only half complete.
+        let flushing = {
+            let collection = collection.clone();
+            tokio::spawn(async move { collection.flush(unix_ms()).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!flushing.is_finished(), "flush must drain the active add");
 
-        // Unblock the in-flight add and let it complete, then simulate a
-        // crash (drop everything without close/flush) and reopen.
+        // Unblock the in-flight add, let the serialized flush checkpoint the
+        // complete state, then simulate a crash and reopen.
         gate_tx.send(true).expect("gate receiver dropped");
         let id2 = blocked.await.expect("add task panicked")?;
         assert_eq!(id2, 2);
+        assert!(flushing.await.expect("flush task panicked")?);
+        assert!(collection.storage.stats().check_point >= 3);
         drop(collection);
         drop(db);
 
@@ -5824,6 +7347,388 @@ mod tests {
             "document written by the in-flight add must be recovered by the repair scan"
         );
         assert!(collection.contains(3));
+
+        db.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_mutation_intents_replay_update_and_remove_after_crash() -> Result<(), DBError> {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db_config = || DBConfig {
+            name: "mutation_replay_db".to_string(),
+            description: String::new(),
+            storage: StorageConfig {
+                compress_level: 0,
+                ..Default::default()
+            },
+            lock: None,
+        };
+
+        let db = AndaDB::connect(object_store.clone(), db_config()).await?;
+        let collection = db
+            .create_collection(
+                TestDoc::schema()?,
+                CollectionConfig {
+                    name: "documents".to_string(),
+                    description: String::new(),
+                },
+                async |c| {
+                    c.create_btree_index_nx(&["name"]).await?;
+                    c.create_bm25_index_nx(&["name"]).await?;
+                    c.create_hnsw_index_nx(
+                        "vector",
+                        HnswConfig {
+                            dimension: 10,
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                    Ok(())
+                },
+            )
+            .await?;
+
+        let mut first = create_test_doc(0, "before", 20, vec!["old"]);
+        first.vector = vec![bf16::from_f32(0.0); 10];
+        let first_id = collection.add_from(&first).await?;
+        let mut second = create_test_doc(0, "other", 21, vec!["other"]);
+        second.vector = vec![bf16::from_f32(10.0); 10];
+        let second_id = collection.add_from(&second).await?;
+        collection.flush(unix_ms()).await?;
+
+        // The document PUT succeeds, but no index flush follows before the
+        // process disappears. The retained intent must make reopen converge
+        // every index to the new document rather than the old checkpoint.
+        collection
+            .update(
+                first_id,
+                BTreeMap::from([
+                    ("name".to_string(), Fv::Text("middle".to_string())),
+                    (
+                        "vector".to_string(),
+                        Fv::Vector(vec![bf16::from_f32(15.0); 10]),
+                    ),
+                ]),
+            )
+            .await?;
+        collection
+            .update(
+                first_id,
+                BTreeMap::from([
+                    ("name".to_string(), Fv::Text("after".to_string())),
+                    (
+                        "vector".to_string(),
+                        Fv::Vector(vec![bf16::from_f32(20.0); 10]),
+                    ),
+                ]),
+            )
+            .await?;
+        assert!(!collection.pending_mutations.lock().is_empty());
+        drop(collection);
+        drop(db);
+
+        let db = AndaDB::connect(object_store.clone(), db_config()).await?;
+        let collection = db
+            .open_collection("documents".to_string(), async |_| Ok(()))
+            .await?;
+
+        let by_name = |name: &str| Query {
+            filter: Some(Filter::Field((
+                "name".to_string(),
+                RangeQuery::Eq(Fv::Text(name.to_string())),
+            ))),
+            ..Default::default()
+        };
+        assert!(collection.search_ids(by_name("before")).await?.is_empty());
+        assert!(collection.search_ids(by_name("middle")).await?.is_empty());
+        assert_eq!(
+            collection.search_ids(by_name("after")).await?,
+            vec![first_id]
+        );
+
+        let old_text = collection
+            .search_ids(Query {
+                search: Some(Search {
+                    text: Some("before".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await?;
+        assert!(!old_text.contains(&first_id));
+        let new_text = collection
+            .search_ids(Query {
+                search: Some(Search {
+                    text: Some("after".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await?;
+        assert!(new_text.contains(&first_id));
+
+        let hnsw = collection.get_hnsw_index("vector")?;
+        assert_eq!(hnsw.try_search(&[0.0; 10], 1)?[0].0, second_id);
+        assert_eq!(hnsw.try_search(&[20.0; 10], 1)?[0].0, first_id);
+        assert!(collection.pending_mutations.lock().is_empty());
+
+        // Exercise the other terminal state: a remove whose object delete is
+        // durable while the derived indexes are not yet flushed.
+        collection.remove(first_id).await?;
+        assert!(!collection.pending_mutations.lock().is_empty());
+        drop(collection);
+        drop(db);
+
+        let db = AndaDB::connect(object_store, db_config()).await?;
+        let collection = db
+            .open_collection("documents".to_string(), async |_| Ok(()))
+            .await?;
+        assert!(!collection.contains(first_id));
+        assert!(collection.search_ids(by_name("after")).await?.is_empty());
+        let removed_text = collection
+            .search_ids(Query {
+                search: Some(Search {
+                    text: Some("after".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await?;
+        assert!(!removed_text.contains(&first_id));
+        assert!(
+            !collection
+                .get_hnsw_index("vector")?
+                .try_search(&[20.0; 10], 2)?
+                .iter()
+                .any(|(id, _)| *id == first_id)
+        );
+        assert!(collection.pending_mutations.lock().is_empty());
+
+        db.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_close_drains_update_and_old_handle_cannot_reenable() -> Result<(), DBError> {
+        let (gate_tx, gate_rx) = tokio::sync::watch::channel(true);
+        let blocked = Arc::new(TestAtomicBool::new(false));
+        let object_store: Arc<dyn ObjectStore> = Arc::new(GatedPutStore {
+            inner: Arc::new(InMemory::new()),
+            gate_suffix: "data/1.cbor".to_string(),
+            gate: gate_rx,
+            blocked: blocked.clone(),
+        });
+        let config = DBConfig {
+            name: "close_drain_db".to_string(),
+            description: String::new(),
+            storage: StorageConfig {
+                compress_level: 0,
+                ..Default::default()
+            },
+            lock: None,
+        };
+        let db = AndaDB::connect(object_store, config).await?;
+        let old = db
+            .create_collection(
+                TestDoc::schema()?,
+                CollectionConfig {
+                    name: "documents".to_string(),
+                    description: String::new(),
+                },
+                async |_| Ok(()),
+            )
+            .await?;
+
+        let id = old
+            .add_from(&create_test_doc(0, "before", 20, vec!["x"]))
+            .await?;
+        gate_tx.send(false).expect("gate receiver dropped");
+        let updating = {
+            let collection = old.clone();
+            tokio::spawn(async move {
+                collection
+                    .update(
+                        id,
+                        BTreeMap::from([("name".to_string(), Fv::Text("after".to_string()))]),
+                    )
+                    .await
+            })
+        };
+        while !blocked.load(TestOrdering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+
+        let closing = {
+            let db = db.clone();
+            tokio::spawn(async move { db.close_collection("documents").await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !closing.is_finished(),
+            "close must wait for admitted update"
+        );
+
+        // Cancelling close must not create an empty registry slot. Opening the
+        // same name takes over the retiring handle and remains blocked until
+        // its admitted update is drained and flushed.
+        closing.abort();
+        assert!(
+            closing
+                .await
+                .expect_err("close should be cancelled")
+                .is_cancelled()
+        );
+        let opening = {
+            let db = db.clone();
+            tokio::spawn(async move {
+                db.open_or_create_collection(
+                    TestDoc::schema()?,
+                    CollectionConfig {
+                        name: "documents".to_string(),
+                        description: String::new(),
+                    },
+                    async |_| Ok(()),
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !opening.is_finished(),
+            "open must finish the cancelled close before loading a fresh handle"
+        );
+
+        gate_tx.send(true).expect("gate receiver dropped");
+        let updated = updating.await.expect("update task panicked")?;
+        assert_eq!(updated.get_field("name"), Some(&Fv::Text("after".into())));
+        let fresh = opening.await.expect("open task panicked")?;
+        assert_eq!(fresh.len(), 1);
+        let persisted: TestDoc = fresh.get_as(id).await?;
+        assert_eq!(persisted.name, "after");
+        assert!(!Arc::ptr_eq(&old, &fresh));
+
+        // The user-controlled read-only flag is reversible only while the
+        // handle's lifecycle lease is active. The retired Arc must never
+        // become a second writer over the same prefix.
+        old.set_read_only(false);
+        assert!(
+            old.add_from(&create_test_doc(0, "zombie", 21, vec!["z"]))
+                .await
+                .is_err()
+        );
+        assert!(
+            old.save_extension("zombie".to_string(), Fv::Bool(true))
+                .await
+                .is_err()
+        );
+        old.set_extension("zombie".to_string(), Fv::Bool(true));
+        assert!(old.get_extension("zombie").is_none());
+        assert!(old.flush(unix_ms()).await.is_err());
+
+        db.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_delete_drains_add_before_prefix_removal() -> Result<(), DBError> {
+        let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+        let object_store: Arc<dyn ObjectStore> = Arc::new(GatedPutStore {
+            inner: Arc::new(InMemory::new()),
+            gate_suffix: "data/1.cbor".to_string(),
+            gate: gate_rx,
+            blocked: Arc::new(TestAtomicBool::new(false)),
+        });
+        let db = AndaDB::connect(
+            object_store,
+            DBConfig {
+                name: "delete_drain_db".to_string(),
+                description: String::new(),
+                storage: StorageConfig {
+                    compress_level: 0,
+                    ..Default::default()
+                },
+                lock: None,
+            },
+        )
+        .await?;
+        let old = db
+            .create_collection(
+                TestDoc::schema()?,
+                CollectionConfig {
+                    name: "documents".to_string(),
+                    description: String::new(),
+                },
+                async |_| Ok(()),
+            )
+            .await?;
+        let adding = {
+            let collection = old.clone();
+            tokio::spawn(async move {
+                collection
+                    .add_from(&create_test_doc(0, "deleted", 20, vec!["x"]))
+                    .await
+            })
+        };
+        while old.max_document_id() == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        let deleting = {
+            let db = db.clone();
+            tokio::spawn(async move { db.delete_collection("documents").await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !deleting.is_finished(),
+            "delete must drain the active add before listing the prefix"
+        );
+        deleting.abort();
+        assert!(
+            deleting
+                .await
+                .expect_err("delete should be cancelled")
+                .is_cancelled()
+        );
+        assert!(
+            db.open_collection("documents".to_string(), async |_| Ok(()))
+                .await
+                .is_err(),
+            "the deletion tombstone must block open after cancellation"
+        );
+        let deleting = {
+            let db = db.clone();
+            tokio::spawn(async move { db.delete_collection("documents").await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !deleting.is_finished(),
+            "retry must take over and continue draining the retained handle"
+        );
+        gate_tx.send(true).expect("gate receiver dropped");
+        adding.await.expect("add task panicked")?;
+        deleting.await.expect("delete task panicked")?;
+
+        let fresh = db
+            .create_collection(
+                TestDoc::schema()?,
+                CollectionConfig {
+                    name: "documents".to_string(),
+                    description: String::new(),
+                },
+                async |_| Ok(()),
+            )
+            .await?;
+        assert!(
+            fresh.is_empty(),
+            "deleted add must leave no residual object"
+        );
+        old.set_read_only(false);
+        assert!(
+            old.add_from(&create_test_doc(0, "zombie", 21, vec!["z"]))
+                .await
+                .is_err()
+        );
 
         db.close().await?;
         Ok(())

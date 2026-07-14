@@ -22,7 +22,10 @@
 //! Success response: `{"result": ...}` (HTTP 200)
 //!
 //! Error response: `{"error": {"code": "...", "message": "..."}}` with a
-//! meaningful HTTP status (400/401/404/409/412/413/500).
+//! meaningful HTTP status (400/401/404/408/409/413/500/503). Client-safe
+//! input/query/conflict errors are classified at the HTTP boundary; engine
+//! failures are logged and return a generic response without storage paths or
+//! nested source details.
 //!
 //! Encoding negotiation:
 //! - Request body format follows `Content-Type` (`application/cbor` default).
@@ -55,7 +58,7 @@ pub mod encoding;
 pub mod error;
 pub mod state;
 
-pub use error::ApiError;
+pub use error::{ApiError, ClientError};
 pub use state::{AppState, OpenMode, ServerInfo, ServerOptions};
 
 /// Builds the axum [`Router`] for the server.
@@ -70,7 +73,8 @@ pub use state::{AppState, OpenMode, ServerInfo, ServerOptions};
 /// timeout) bounds the whole request including reading the body, so a
 /// slow-transmitting client cannot hold a connection open indefinitely;
 /// the per-request timeout applied to the dispatched operation itself
-/// lives in the RPC handlers.
+/// lives in the RPC handlers. Read-only RPCs are cancellation-safe; mutating
+/// RPCs run under bounded concurrency and remain tracked through shutdown.
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/", routing::get(api::get_info).post(api::rpc_root))

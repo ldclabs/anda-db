@@ -208,9 +208,9 @@ impl RpcParams {
         match self {
             RpcParams::Cbor(value) => value
                 .deserialized()
-                .map_err(|e| ApiError::bad_request(format!("invalid params: {e}"))),
+                .map_err(|e| ApiError::invalid_input(format!("invalid params: {e}"))),
             RpcParams::Json(value) => serde_json::from_value(value)
-                .map_err(|e| ApiError::bad_request(format!("invalid params: {e}"))),
+                .map_err(|e| ApiError::invalid_input(format!("invalid params: {e}"))),
         }
     }
 }

@@ -13,10 +13,13 @@ use axum::{BoxError, Router, extract::DefaultBodyLimit, middleware, routing};
 use clap::{Parser, Subcommand};
 use mimalloc::MiMalloc;
 use object_store::{ObjectStore, local::LocalFileSystem, memory::InMemory};
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 use structured_logger::{Builder, async_json::new_writer, get_env_level};
-use tokio::signal;
-use tokio_util::sync::CancellationToken;
+use tokio::{
+    signal,
+    sync::{Mutex, Semaphore},
+};
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 mod handler;
 mod nexus;
@@ -28,6 +31,9 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 const APP_NAME: &str = env!("CARGO_PKG_NAME");
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Bounded cleanup window after the graceful deadline has already forced an
+/// abort. This is not an extension of the graceful drain contract.
+const FORCED_ABORT_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -63,6 +69,14 @@ struct Cli {
     /// Maximum accepted request body size in bytes
     #[clap(long, env = "MAX_BODY_SIZE", default_value = "2097152")]
     max_body_size: usize,
+
+    /// Maximum number of concurrently executing KIP mutations
+    #[clap(long, env = "MAX_CONCURRENT_MUTATIONS", default_value = "64")]
+    max_concurrent_mutations: usize,
+
+    /// Total graceful-shutdown drain deadline in seconds
+    #[clap(long, env = "SHUTDOWN_DRAIN_TIMEOUT_SECS", default_value = "300")]
+    shutdown_drain_timeout_secs: u64,
 
     /// Retention window for the `kip_logs` collection in days;
     /// 0 disables pruning (default)
@@ -123,37 +137,50 @@ async fn main() -> Result<(), BoxError> {
     let db = Arc::new(AndaDB::connect(object_store.clone(), db_config).await?);
     let nexus = nexus::Nexus::connect(db.clone(), cli.self_principal_id).await?;
 
+    let admission = CancellationToken::new();
+    let mutation_tasks = TaskTracker::new();
+    let mutation_aborts = Arc::new(Mutex::new(Vec::new()));
     let state = AppState {
         nexus: nexus.clone(),
         name: APP_NAME.to_string(),
         version: APP_VERSION.to_string(),
         api_key: cli.api_key,
         request_timeout: Duration::from_secs(cli.request_timeout_secs.max(1)),
+        admission: admission.clone(),
+        mutation_tasks: mutation_tasks.clone(),
+        mutation_permits: Arc::new(Semaphore::new(cli.max_concurrent_mutations.max(1))),
+        mutation_aborts: mutation_aborts.clone(),
     };
+    let request_timeout = state.request_timeout;
     let app = Router::new()
         .route("/", routing::get(get_information))
         .route("/kip", routing::post(post_kip))
         .layer(DefaultBodyLimit::max(cli.max_body_size.max(1024)))
         .layer(middleware::from_fn(normalize_rejections))
+        .layer(middleware::from_fn_with_state(
+            request_timeout,
+            total_timeout,
+        ))
         .with_state(state);
-    let cancel_token = CancellationToken::new();
+    let auto_flush_cancel = CancellationToken::new();
+    let retention_cancel = CancellationToken::new();
 
     // Periodic flush of database/collection metadata; when the token is
     // cancelled the task flushes and closes the database before exiting.
-    let flush_task = tokio::spawn({
+    let mut flush_task = tokio::spawn({
         let db = db.clone();
-        let cancel = cancel_token.child_token();
+        let cancel = auto_flush_cancel.child_token();
         let interval = Duration::from_secs(cli.flush_interval_secs.max(1));
         async move { db.auto_flush(cancel, interval).await }
     });
 
     // Optional retention cleanup for the `kip_logs` collection, driven by
     // the indexed `period` field (hours since the Unix epoch).
-    if cli.log_retention_days > 0 {
+    let retention_task = if cli.log_retention_days > 0 {
         let nexus = nexus.clone();
-        let cancel = cancel_token.child_token();
+        let cancel = retention_cancel.child_token();
         let retention_hours = cli.log_retention_days * 24;
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => return,
@@ -166,21 +193,156 @@ async fn main() -> Result<(), BoxError> {
                     Err(err) => log::error!("failed to prune KIP logs: {err:?}"),
                 }
             }
-        });
-    }
+        }))
+    } else {
+        None
+    };
 
     let listener = create_reuse_port_listener(addr).await?;
     log::warn!("{}@{} listening on {:?}", APP_NAME, APP_VERSION, addr);
 
-    let result = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(cancel_token.clone()))
-        .await;
+    let stop_accepting = CancellationToken::new();
+    let mut server_task = tokio::spawn({
+        let stop_accepting = stop_accepting.clone();
+        async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(stop_accepting.cancelled_owned())
+                .await
+        }
+    });
+    let drain_timeout = Duration::from_secs(cli.shutdown_drain_timeout_secs.max(1));
+    let shutdown_deadline;
+    let server_forced_abort;
+    let result = tokio::select! {
+        joined = &mut server_task => {
+            admission.cancel();
+            retention_cancel.cancel();
+            shutdown_deadline = tokio::time::Instant::now() + drain_timeout;
+            match joined {
+                Ok(result) => {
+                    server_forced_abort = false;
+                    result
+                }
+                Err(err) => {
+                    server_forced_abort = true;
+                    Err(io::Error::other(format!("HTTP server task failed: {err}")))
+                }
+            }
+        }
+        _ = shutdown_signal(admission.clone()) => {
+            retention_cancel.cancel();
+            stop_accepting.cancel();
+            shutdown_deadline = tokio::time::Instant::now() + drain_timeout;
+            match tokio::time::timeout_at(shutdown_deadline, &mut server_task).await {
+                Ok(joined) => {
+                    match joined {
+                        Ok(result) => {
+                            server_forced_abort = false;
+                            result
+                        }
+                        Err(err) => {
+                            server_forced_abort = true;
+                            Err(io::Error::other(format!("HTTP server task failed: {err}")))
+                        }
+                    }
+                }
+                Err(_) => {
+                    log::error!("HTTP handler drain deadline exceeded; aborting remaining handlers");
+                    server_forced_abort = true;
+                    server_task.abort();
+                    if tokio::time::timeout(FORCED_ABORT_JOIN_TIMEOUT, &mut server_task)
+                        .await
+                        .is_err()
+                    {
+                        log::error!(
+                            "aborted HTTP server task did not terminate before cleanup deadline"
+                        );
+                    }
+                    Ok(())
+                }
+            }
+        }
+    };
 
-    // Flush and close the database before exiting, even when the server
-    // loop returned an error.
-    cancel_token.cancel();
-    if let Err(err) = flush_task.await {
-        log::error!("flush task failed: {err:?}");
+    // No new handler can spawn a mutation after the HTTP server has drained.
+    // Stop retention, then drain every detached non-cancel-safe mutation
+    // before allowing auto_flush to close the database.
+    let mut forced_crash = server_forced_abort;
+    if let Some(mut task) = retention_task {
+        match tokio::time::timeout_at(shutdown_deadline, &mut task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                log::error!("retention task failed during shutdown: {err:?}");
+                forced_crash = true;
+            }
+            Err(_) => {
+                log::error!("retention drain deadline exceeded; aborting retention task");
+                forced_crash = true;
+                task.abort();
+                if tokio::time::timeout(FORCED_ABORT_JOIN_TIMEOUT, &mut task)
+                    .await
+                    .is_err()
+                {
+                    log::error!("aborted retention task did not terminate before cleanup deadline");
+                }
+            }
+        }
+    }
+    // Serialize TaskTracker::close with the handler's final admission check,
+    // spawn, and abort-handle registration. TaskTracker::close alone does not
+    // reject later spawns.
+    {
+        let _registration = mutation_aborts.lock().await;
+        mutation_tasks.close();
+    }
+    if tokio::time::timeout_at(shutdown_deadline, mutation_tasks.wait())
+        .await
+        .is_err()
+    {
+        log::error!("KIP mutation drain deadline exceeded; aborting remaining mutations");
+        forced_crash = true;
+        let handles = mutation_aborts.lock().await;
+        for handle in handles.iter().filter(|handle| !handle.is_finished()) {
+            handle.abort();
+        }
+        drop(handles);
+        if tokio::time::timeout(FORCED_ABORT_JOIN_TIMEOUT, mutation_tasks.wait())
+            .await
+            .is_err()
+        {
+            log::error!("aborted KIP mutations did not terminate before cleanup deadline");
+        }
+    }
+
+    if forced_crash {
+        // Never publish an arbitrary cancellation point through a graceful
+        // close. Abort auto-flush and leave the database for crash recovery.
+        flush_task.abort();
+        if tokio::time::timeout(FORCED_ABORT_JOIN_TIMEOUT, &mut flush_task)
+            .await
+            .is_err()
+        {
+            log::error!("aborted auto-flush task did not terminate before cleanup deadline");
+        }
+    } else {
+        // Every task that can mutate the database drained normally. Give the
+        // final flush/close only the time remaining in the same total
+        // shutdown budget; if it overruns, stop at a crash-recoverable point.
+        auto_flush_cancel.cancel();
+        match tokio::time::timeout_at(shutdown_deadline, &mut flush_task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => log::error!("flush task failed: {err:?}"),
+            Err(_) => {
+                log::error!("database close exceeded the total shutdown deadline; aborting");
+                flush_task.abort();
+                if tokio::time::timeout(FORCED_ABORT_JOIN_TIMEOUT, &mut flush_task)
+                    .await
+                    .is_err()
+                {
+                    log::error!("aborted database close did not terminate before cleanup deadline");
+                }
+            }
+        }
     }
     result?;
     Ok(())

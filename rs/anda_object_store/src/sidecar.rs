@@ -13,17 +13,84 @@
 //! Wrapper-specific behavior stays in the wrappers: `MetaStore` hashes
 //! plaintext payloads, while `EncryptedStore` encrypts/decrypts chunks and
 //! only exposes the logical (content-addressable) ETag when its
-//! `conditional_put` switch is enabled — the listing helpers surface that
-//! switch as their `with_logical_e_tag` parameter.
+//! `conditional_put` switch is enabled. Listing metadata is interpreted
+//! through a wrapper-supplied policy, so encrypted metadata is authenticated
+//! before it is cached or surfaced.
 
 use cbor2::{from_reader, to_writer};
-use futures::{StreamExt, TryStreamExt, stream::BoxStream};
+use futures::{
+    StreamExt, TryStreamExt,
+    lock::{Mutex, MutexGuard},
+    stream::BoxStream,
+};
 use moka::{future::Cache, ops::compute::Op};
 use object_store::{path::Path, *};
 use serde::{Serialize, de::DeserializeOwned};
-use std::sync::Arc;
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
 
 use crate::map_arc_error;
+
+const MUTATION_LEASE_SHARDS: usize = 256;
+type MetadataValidator<M> = dyn Fn(&Path, &M) -> Result<()> + Send + Sync;
+
+/// Wrapper-supplied policy for interpreting sidecar metadata in listings.
+///
+/// `validator` lets wrappers authenticate a decoded metadata document before
+/// it is cached or used. `reject_corrupt` distinguishes strict mode (a
+/// present but undecodable document is an error) from compatibility mode
+/// (the object is listed as an orphan so a recovery scan can heal it).
+pub(crate) struct ListingMetaPolicy<M> {
+    logical_e_tag: bool,
+    reject_corrupt: bool,
+    validator: Option<Arc<MetadataValidator<M>>>,
+}
+
+impl<M> Clone for ListingMetaPolicy<M> {
+    fn clone(&self) -> Self {
+        Self {
+            logical_e_tag: self.logical_e_tag,
+            reject_corrupt: self.reject_corrupt,
+            validator: self.validator.clone(),
+        }
+    }
+}
+
+impl<M> ListingMetaPolicy<M> {
+    pub(crate) fn unchecked(logical_e_tag: bool) -> Self {
+        Self {
+            logical_e_tag,
+            reject_corrupt: false,
+            validator: None,
+        }
+    }
+
+    pub(crate) fn verified(
+        logical_e_tag: bool,
+        reject_corrupt: bool,
+        validator: impl Fn(&Path, &M) -> Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            logical_e_tag,
+            reject_corrupt,
+            validator: Some(Arc::new(validator)),
+        }
+    }
+}
+
+/// Guards one or two logical paths for a sidecar mutation.
+///
+/// Two-path operations acquire path-derived shards in stable numeric order.
+/// The bounded lock table deliberately allows unrelated paths to collide:
+/// this may add contention, but never weakens the same-path exclusion
+/// guarantee and avoids an unbounded per-path lock registry.
+pub(crate) struct MutationLease<'a> {
+    _first: MutexGuard<'a, ()>,
+    _second: Option<MutexGuard<'a, ()>>,
+}
 
 /// Sidecar metadata document maintained by [`SidecarStore`] for every object.
 ///
@@ -59,6 +126,10 @@ pub(crate) struct SidecarStore<T: ObjectStore, M: SidecarMeta> {
     meta_prefix: Path,
     /// Cache for metadata to reduce storage operations.
     meta_cache: Cache<Path, Arc<M>>,
+    /// Bounded per-path mutation lease table. Every mutation of a logical
+    /// path (put, multipart completion, delete, copy or rename) goes through
+    /// the same shard.
+    mutation_leases: Box<[Mutex<()>]>,
 }
 
 impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
@@ -69,6 +140,42 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
             data_prefix: Path::from("data"),
             meta_prefix: Path::from("meta"),
             meta_cache,
+            mutation_leases: (0..MUTATION_LEASE_SHARDS).map(|_| Mutex::new(())).collect(),
+        }
+    }
+
+    fn mutation_lease_index(location: &Path) -> usize {
+        let mut hasher = DefaultHasher::new();
+        location.hash(&mut hasher);
+        hasher.finish() as usize % MUTATION_LEASE_SHARDS
+    }
+
+    async fn mutation_lease(&self, location: &Path) -> MutexGuard<'_, ()> {
+        self.mutation_leases[Self::mutation_lease_index(location)]
+            .lock()
+            .await
+    }
+
+    /// Acquires the path-derived mutation leases for `first` and `second` in
+    /// stable shard order. If both paths map to the same shard, it is locked
+    /// only once.
+    pub(crate) async fn mutation_leases(&self, first: &Path, second: &Path) -> MutationLease<'_> {
+        let first_idx = Self::mutation_lease_index(first);
+        let second_idx = Self::mutation_lease_index(second);
+        let (first_idx, second_idx) = if first_idx <= second_idx {
+            (first_idx, second_idx)
+        } else {
+            (second_idx, first_idx)
+        };
+        let first_guard = self.mutation_leases[first_idx].lock().await;
+        let second_guard = if first_idx == second_idx {
+            None
+        } else {
+            Some(self.mutation_leases[second_idx].lock().await)
+        };
+        MutationLease {
+            _first: first_guard,
+            _second: second_guard,
         }
     }
 
@@ -170,6 +277,7 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
     where
         F: AsyncFnOnce(Option<&M>) -> Result<M>,
     {
+        let _lease = self.mutation_lease(location).await;
         let rt = self
             .meta_cache
             .entry(location.clone())
@@ -242,6 +350,7 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
                 let inner = inner.clone();
                 async move {
                     let location = location?;
+                    let _lease = inner.mutation_lease(&location).await;
                     let data_res = inner.store.delete(&inner.full_path(&location)).await;
                     // Attempt metadata deletion even when the data object was
                     // missing, so orphaned metadata heals itself.
@@ -267,18 +376,17 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
             .boxed()
     }
 
-    /// Shared implementation of [`ObjectStore::list`]. With
-    /// `with_logical_e_tag` each entry's ETag is replaced by the logical
-    /// (content-addressable) one from the sidecar metadata; otherwise only
-    /// the locations are rewritten.
+    /// Shared implementation of [`ObjectStore::list`]. When requested by the
+    /// policy, each entry's ETag is replaced by the logical
+    /// (content-addressable) one from the sidecar metadata.
     pub(crate) fn list(
         self: Arc<Self>,
         prefix: Option<&Path>,
-        with_logical_e_tag: bool,
+        policy: ListingMetaPolicy<M>,
     ) -> BoxStream<'static, Result<ObjectMeta>> {
         let prefix = self.full_path(prefix.unwrap_or(&Path::default()));
         let stream = self.store.list(Some(&prefix));
-        self.decorate_listing(stream, with_logical_e_tag)
+        self.decorate_listing(stream, policy)
     }
 
     /// Shared implementation of [`ObjectStore::list_with_offset`]; see
@@ -287,21 +395,21 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
         self: Arc<Self>,
         prefix: Option<&Path>,
         offset: &Path,
-        with_logical_e_tag: bool,
+        policy: ListingMetaPolicy<M>,
     ) -> BoxStream<'static, Result<ObjectMeta>> {
         let offset = self.full_path(offset);
         let prefix = self.full_path(prefix.unwrap_or(&Path::default()));
         let stream = self.store.list_with_offset(Some(&prefix), &offset);
-        self.decorate_listing(stream, with_logical_e_tag)
+        self.decorate_listing(stream, policy)
     }
 
     fn decorate_listing(
         self: Arc<Self>,
         stream: BoxStream<'static, Result<ObjectMeta>>,
-        with_logical_e_tag: bool,
+        policy: ListingMetaPolicy<M>,
     ) -> BoxStream<'static, Result<ObjectMeta>> {
         let inner = self;
-        if !with_logical_e_tag {
+        if !policy.logical_e_tag && policy.validator.is_none() {
             return stream
                 .map_ok(move |mut obj| {
                     obj.location = inner.strip_prefix(obj.location);
@@ -313,9 +421,13 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
         stream
             .map_ok(move |mut obj| {
                 let store = inner.clone();
+                let policy = policy.clone();
                 async move {
                     let location = store.strip_prefix(obj.location);
-                    obj.e_tag = store.logical_e_tag(&location).await?;
+                    let logical_e_tag = store.listing_e_tag(&location, &policy).await?;
+                    if policy.logical_e_tag {
+                        obj.e_tag = logical_e_tag;
+                    }
                     obj.location = location;
                     Ok::<ObjectMeta, Error>(obj)
                 }
@@ -324,20 +436,40 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
             .boxed()
     }
 
-    /// Resolves the logical ETag of `location` for listings. An orphaned
+    /// Loads and validates metadata for `location` during a listing, and
+    /// resolves its logical ETag. An orphaned
     /// data object (metadata lost, e.g. after a crash between the data and
-    /// metadata writes) must not fail the whole listing — typically the very
-    /// recovery scan that would heal it — so a missing sidecar document maps
-    /// to `Ok(None)` instead of an error. A sidecar document that exists but
-    /// fails to decode (e.g. a torn metadata write) is treated the same way:
-    /// the write path ([`SidecarStore::update_meta_with`]) already considers
-    /// such an object logically absent and self-heals it on the next put, so
-    /// listings must not fail on it either. Only real backend errors
-    /// propagate.
-    async fn logical_e_tag(&self, location: &Path) -> Result<Option<String>> {
+    /// metadata writes) does not fail a listing because recovery scans need
+    /// to observe and heal it. Compatibility mode also treats a torn CBOR
+    /// document as an orphan; strict mode rejects every present document that
+    /// cannot be decoded and verified.
+    async fn listing_e_tag(
+        &self,
+        location: &Path,
+        policy: &ListingMetaPolicy<M>,
+    ) -> Result<Option<String>> {
         if let Some(meta) = self.meta_cache.get(location).await {
+            if let Some(validator) = &policy.validator {
+                validator(location, &meta)?;
+            }
             return Ok(meta.e_tag().map(String::from));
         }
+
+        // A listing cache miss must participate in the same per-key critical
+        // section as every mutation. Without this lease, a listing can fetch
+        // old metadata, a put can then commit new data and metadata, and the
+        // listing can finally overwrite the cache with its authenticated but
+        // stale document. Re-check after acquiring the lease because a
+        // mutation (or another listing) may have filled the cache while this
+        // task was waiting. Cache hits above remain lock-free.
+        let _lease = self.mutation_lease(location).await;
+        if let Some(meta) = self.meta_cache.get(location).await {
+            if let Some(validator) = &policy.validator {
+                validator(location, &meta)?;
+            }
+            return Ok(meta.e_tag().map(String::from));
+        }
+
         let data = match self.fetch_meta_bytes(location).await {
             Ok(data) => data,
             Err(Error::NotFound { .. }) => {
@@ -351,11 +483,19 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
         };
         match self.decode_meta(location, &data) {
             Ok(meta) => {
+                if let Some(validator) = &policy.validator {
+                    // Authenticate before caching: a failed listing must not
+                    // seed the shared cache with attacker-controlled data.
+                    validator(location, &meta)?;
+                }
                 let meta = Arc::new(meta);
                 self.meta_cache.insert(location.clone(), meta.clone()).await;
                 Ok(meta.e_tag().map(String::from))
             }
             Err(err) => {
+                if policy.reject_corrupt {
+                    return Err(err);
+                }
                 // Do not cache anything for the corrupted document: reads
                 // must keep failing loudly and the next overwrite heals it.
                 log::warn!(
@@ -368,11 +508,11 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
     }
 
     /// Shared implementation of [`ObjectStore::list_with_delimiter`]; see
-    /// [`SidecarStore::list`] for the `with_logical_e_tag` semantics.
+    /// [`SidecarStore::list`] for listing-policy semantics.
     pub(crate) async fn list_with_delimiter(
         &self,
         prefix: Option<&Path>,
-        with_logical_e_tag: bool,
+        policy: ListingMetaPolicy<M>,
     ) -> Result<ListResult> {
         let prefix = self.full_path(prefix.unwrap_or(&Path::default()));
         let rt = self.store.list_with_delimiter(Some(&prefix)).await?;
@@ -391,7 +531,7 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
             })
             .collect::<Vec<_>>();
 
-        if !with_logical_e_tag {
+        if !policy.logical_e_tag && policy.validator.is_none() {
             return Ok(ListResult {
                 common_prefixes,
                 objects,
@@ -401,15 +541,20 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
 
         // Fetch the metadata for each object concurrently while preserving
         // the original listing order.
-        let mut indexed = futures::stream::iter(objects.into_iter().enumerate().map(
-            move |(idx, mut obj)| async move {
-                obj.e_tag = self.logical_e_tag(&obj.location).await?;
-                Ok::<(usize, ObjectMeta), Error>((idx, obj))
-            },
-        ))
-        .buffer_unordered(8)
-        .try_collect::<Vec<_>>()
-        .await?;
+        let mut indexed =
+            futures::stream::iter(objects.into_iter().enumerate().map(move |(idx, mut obj)| {
+                let policy = policy.clone();
+                async move {
+                    let logical_e_tag = self.listing_e_tag(&obj.location, &policy).await?;
+                    if policy.logical_e_tag {
+                        obj.e_tag = logical_e_tag;
+                    }
+                    Ok::<(usize, ObjectMeta), Error>((idx, obj))
+                }
+            }))
+            .buffer_unordered(8)
+            .try_collect::<Vec<_>>()
+            .await?;
 
         // Restore the original order based on the captured index.
         indexed.sort_by_key(|(idx, _)| *idx);
@@ -430,6 +575,7 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
         to: &Path,
         options: CopyOptions,
     ) -> Result<()> {
+        let _leases = self.mutation_leases(from, to).await;
         let full_from = self.full_path(from);
         let full_to = self.full_path(to);
         self.store
@@ -461,6 +607,7 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
         to: &Path,
         options: RenameOptions,
     ) -> Result<()> {
+        let _leases = self.mutation_leases(from, to).await;
         if from == to {
             // A self-rename must not be forwarded: the default rename
             // implementation is copy + delete, which would destroy the

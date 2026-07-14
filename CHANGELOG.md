@@ -8,6 +8,19 @@ Follow-up hardening: a review of the 0.9.2 release itself found and fixed a
 number of defects that release introduced. All crates re-tested; the full
 workspace test suite passes.
 
+### Migration note: HNSW deletion throughput
+
+HNSW deletion repair introduced in 0.9.2 reconnects a removed node's former
+neighbors while holding the structural write lock. `HnswConfig::reconnect_on_delete`
+defaults to `true` for both new indexes and metadata written before the option
+existed. This preserves recall across repeated deletions, but each deletion can
+perform O(M²·L) work under that lock and can materially reduce throughput in
+delete-heavy workloads. Operators upgrading from an earlier 0.9 release should
+benchmark their deletion latency and write concurrency. Setting
+`reconnect_on_delete: false` skips that repair for future deletions and improves
+delete throughput, at the explicit cost of graph connectivity and recall that
+may degrade until the index is rebuilt.
+
 ### Fixed
 
 - **I64 read-back shape no longer corrupts B-Tree indexes** — Stored documents deserialize non-negative `i64` values as `U64` (and `f32` as `F64`); 0.9.2 accepted these shapes at validation but left them un-normalized, so single-field `I64` B-Tree index maintenance silently no-opped: `update` left stale keys behind (queries returned documents by their *old* values), `remove` leaked index entries forever, and creating an index over existing data failed outright. Read-back shapes are now normalized to the declared variant at every document materialization boundary (`try_from_doc`, `set_doc`, `set_field`), and the B-Tree scalar paths additionally tolerate in-range `U64` for `I64` indexes as defense in depth.

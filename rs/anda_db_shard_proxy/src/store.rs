@@ -9,13 +9,18 @@
 //! request-time lookups, while PostgreSQL remains the source of truth and
 //! distributes incremental updates through `LISTEN/NOTIFY`.
 
-use dashmap::DashMap;
+use dashmap::{DashMap, mapref::entry::Entry};
 use moka::{Expiry, future::Cache};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use sqlx::postgres::PgListener;
-use std::sync::Arc;
+use std::future::Future;
+use std::sync::{
+    Arc, Weak,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 /// How long a positive db→shard cache entry is trusted before it is
@@ -66,33 +71,50 @@ pub struct ShardBackend {
 #[derive(Debug, Clone, Copy)]
 enum DbCacheEntry {
     /// The database is assigned to this shard.
-    Found { shard_id: u32, cached_at: Instant },
+    Found {
+        shard_id: u32,
+        cached_at: Instant,
+        generation: u64,
+    },
     /// PostgreSQL had no row for this database name.
-    NotFound { cached_at: Instant },
+    NotFound { cached_at: Instant, generation: u64 },
 }
 
 impl DbCacheEntry {
-    fn found(shard_id: u32) -> Self {
+    fn found(shard_id: u32, generation: u64) -> Self {
         Self::Found {
             shard_id,
             cached_at: Instant::now(),
+            generation,
         }
     }
 
-    fn not_found() -> Self {
+    fn not_found(generation: u64) -> Self {
         Self::NotFound {
             cached_at: Instant::now(),
+            generation,
         }
     }
 
-    /// Returns the cached result if the entry is still fresh.
-    fn get(&self) -> Option<Option<u32>> {
+    /// Returns the cached result if the entry is still fresh and belongs to
+    /// the current routing generation.
+    fn get(&self, current_generation: u64) -> Option<Option<u32>> {
         match *self {
             Self::Found {
                 shard_id,
                 cached_at,
-            } if cached_at.elapsed() < DB_CACHE_POSITIVE_TTL => Some(Some(shard_id)),
-            Self::NotFound { cached_at } if cached_at.elapsed() < DB_CACHE_NEGATIVE_TTL => {
+                generation,
+            } if generation == current_generation
+                && cached_at.elapsed() < DB_CACHE_POSITIVE_TTL =>
+            {
+                Some(Some(shard_id))
+            }
+            Self::NotFound {
+                cached_at,
+                generation,
+            } if generation == current_generation
+                && cached_at.elapsed() < DB_CACHE_NEGATIVE_TTL =>
+            {
                 Some(None)
             }
             _ => None,
@@ -146,6 +168,33 @@ fn new_db_cache() -> Cache<String, DbCacheEntry> {
         .build()
 }
 
+/// RAII lease for one database's lookup gate.
+///
+/// The gate table stores only a [`Weak`] reference, while every active or
+/// waiting lookup owns one lease. On drop (including cancellation), the last
+/// lease removes its weak entry under the same DashMap entry lock used by gate
+/// acquisition. This makes an active gate continuously discoverable without
+/// retaining attacker-controlled database names after their lookups finish.
+struct LookupGateLease {
+    key: String,
+    gate: Arc<Mutex<()>>,
+    gates: Arc<DashMap<String, Weak<Mutex<()>>>>,
+}
+
+impl Drop for LookupGateLease {
+    fn drop(&mut self) {
+        if let Entry::Occupied(entry) = self.gates.entry(self.key.clone()) {
+            let same_gate = entry.get().ptr_eq(&Arc::downgrade(&self.gate));
+            // The entry lock prevents a new caller from upgrading the weak
+            // reference between this count and removal. Existing callers own
+            // their own Arc, so a count of one proves this lease is last.
+            if same_gate && Arc::strong_count(&self.gate) == 1 {
+                entry.remove();
+            }
+        }
+    }
+}
+
 /// Fully resolved routing information returned to the proxy layer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolvedRoute {
@@ -197,6 +246,16 @@ pub struct ShardStore {
     /// unauthenticated requests probing random names cannot grow memory
     /// without limit.
     db_cache: Cache<String, DbCacheEntry>,
+    /// Monotonic routing generation. Every authoritative assignment change
+    /// advances it before touching the cache. A SQL result from an older
+    /// generation is discarded instead of being allowed to overwrite a newer
+    /// event or administrative mutation.
+    route_generation: Arc<AtomicU64>,
+    /// Per-database single-flight gates for cold cache misses. Values are weak
+    /// references: active leases keep their gate alive and discoverable, while
+    /// the last lease removes the key immediately so random names cannot grow
+    /// this map without bound.
+    lookup_gates: Arc<DashMap<String, Weak<Mutex<()>>>>,
     /// shard_id → ShardBackend
     backend_cache: Arc<DashMap<u32, ShardBackend>>,
 }
@@ -232,6 +291,8 @@ impl ShardStore {
         let store = Self {
             pool,
             db_cache: new_db_cache(),
+            route_generation: Arc::new(AtomicU64::new(0)),
+            lookup_gates: Arc::new(DashMap::new()),
             backend_cache: Arc::new(DashMap::new()),
         };
         store.reload_all().await?;
@@ -277,31 +338,102 @@ impl ShardStore {
     /// PostgreSQL errors are propagated instead of being folded into
     /// "not found".
     async fn lookup_db_shard(&self, db_name: &str) -> Result<Option<u32>, sqlx::Error> {
-        if let Some(entry) = self.db_cache.get(db_name).await
-            && let Some(cached) = entry.get()
-        {
-            return Ok(cached);
-        }
-
-        let row: Option<(i32,)> =
-            sqlx::query_as("SELECT shard_id FROM db_shards WHERE db_name = $1")
+        self.lookup_db_shard_with(db_name, || async {
+            sqlx::query_as::<_, (i32,)>("SELECT shard_id FROM db_shards WHERE db_name = $1")
                 .bind(db_name)
                 .fetch_optional(&self.pool)
-                .await?;
-        match row {
-            Some((sid,)) => {
-                let shard_id = sid as u32;
-                self.db_cache
-                    .insert(db_name.to_string(), DbCacheEntry::found(shard_id))
-                    .await;
-                Ok(Some(shard_id))
+                .await
+                .map(|row| row.map(|(shard_id,)| shard_id as u32))
+        })
+        .await
+    }
+
+    /// Shared lookup implementation, separated from the PostgreSQL query so
+    /// generation changes and single-flight interleavings can be tested
+    /// deterministically without a live database.
+    async fn lookup_db_shard_with<F, Fut>(
+        &self,
+        db_name: &str,
+        load: F,
+    ) -> Result<Option<u32>, sqlx::Error>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Result<Option<u32>, sqlx::Error>>,
+    {
+        loop {
+            let generation = self.route_generation.load(Ordering::Acquire);
+            if let Some(entry) = self.db_cache.get(db_name).await
+                && let Some(cached) = entry.get(generation)
+            {
+                return Ok(cached);
             }
-            None => {
-                self.db_cache
-                    .insert(db_name.to_string(), DbCacheEntry::not_found())
-                    .await;
-                Ok(None)
+
+            let gate = self.lookup_gate(db_name);
+            let _guard = gate.gate.lock().await;
+
+            // Another waiter may have populated the cache while this request
+            // waited for the per-key gate.
+            let generation = self.route_generation.load(Ordering::Acquire);
+            if let Some(entry) = self.db_cache.get(db_name).await
+                && let Some(cached) = entry.get(generation)
+            {
+                return Ok(cached);
             }
+
+            let loaded = load().await?;
+            if self.route_generation.load(Ordering::Acquire) != generation {
+                // An assign/unassign or NOTIFY event raced the SQL query. Its
+                // cache update is authoritative; retry rather than filling
+                // the cache with the query's older snapshot.
+                continue;
+            }
+
+            let entry = match loaded {
+                Some(shard_id) => DbCacheEntry::found(shard_id, generation),
+                None => DbCacheEntry::not_found(generation),
+            };
+            self.db_cache.insert(db_name.to_string(), entry).await;
+
+            // Close the check-to-insert window: an event may have advanced the
+            // generation while the asynchronous cache insert was pending.
+            if self.route_generation.load(Ordering::Acquire) == generation {
+                return Ok(loaded);
+            }
+        }
+    }
+
+    fn advance_route_generation(&self) -> u64 {
+        self.route_generation.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Acquire the identity-stable gate for `db_name`.
+    ///
+    /// Gate lookup and replacement of an expired weak reference happen under
+    /// one DashMap entry lock. [`LookupGateLease::drop`] uses the same lock for
+    /// identity-aware cleanup, closing the remove-versus-upgrade race that
+    /// would otherwise permit two live mutexes for the same key.
+    fn lookup_gate(&self, db_name: &str) -> LookupGateLease {
+        let key = db_name.to_string();
+        let gate = match self.lookup_gates.entry(key.clone()) {
+            Entry::Occupied(mut entry) => match entry.get().upgrade() {
+                Some(gate) => gate,
+                None => {
+                    let gate = Arc::new(Mutex::new(()));
+                    entry.insert(Arc::downgrade(&gate));
+                    gate
+                }
+            },
+            Entry::Vacant(entry) => {
+                let gate = Arc::new(Mutex::new(()));
+                entry.insert(Arc::downgrade(&gate));
+                gate
+            }
+        };
+
+        LookupGateLease {
+            key,
+            gate,
+            gates: self.lookup_gates.clone(),
         }
     }
 
@@ -394,8 +526,12 @@ impl ShardStore {
         .await?;
         tx.commit().await?;
 
+        let generation = self.advance_route_generation();
         self.db_cache
-            .insert(db_name.to_string(), DbCacheEntry::found(shard_id))
+            .insert(
+                db_name.to_string(),
+                DbCacheEntry::found(shard_id, generation),
+            )
             .await;
         Ok(())
     }
@@ -420,7 +556,10 @@ impl ShardStore {
         .await?;
         tx.commit().await?;
 
-        self.db_cache.invalidate(db_name).await;
+        let generation = self.advance_route_generation();
+        self.db_cache
+            .insert(db_name.to_string(), DbCacheEntry::not_found(generation))
+            .await;
         Ok(result.rows_affected() > 0)
     }
 
@@ -509,12 +648,16 @@ impl ShardStore {
     async fn apply_db_event(&self, payload: &str) {
         match serde_json::from_str::<DbShardEvent>(payload) {
             Ok(DbShardEvent::Assign { db_name, shard_id }) => {
+                let generation = self.advance_route_generation();
                 self.db_cache
-                    .insert(db_name, DbCacheEntry::found(shard_id))
+                    .insert(db_name, DbCacheEntry::found(shard_id, generation))
                     .await;
             }
             Ok(DbShardEvent::Unassign { db_name }) => {
-                self.db_cache.invalidate(&db_name).await;
+                let generation = self.advance_route_generation();
+                self.db_cache
+                    .insert(db_name, DbCacheEntry::not_found(generation))
+                    .await;
             }
             Err(e) => {
                 log::warn!("failed to parse db_shards_changed payload: {}", e);
@@ -583,6 +726,7 @@ impl ShardStore {
         if let Err(e) = self.reload_backend_cache().await {
             log::error!("failed to reload backend cache on connect: {}", e);
         }
+        self.advance_route_generation();
         self.db_cache.invalidate_all();
 
         loop {
@@ -612,6 +756,7 @@ impl ShardStore {
                         // path, which reconnects and resyncs again.
                         Ok(None) => {
                             log::warn!("pg listener reconnected, resyncing routing caches");
+                            self.advance_route_generation();
                             self.db_cache.invalidate_all();
                             self.reload_backend_cache().await?;
                         }
@@ -629,6 +774,8 @@ mod tests {
     use super::*;
     use sqlx::postgres::PgPoolOptions;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use tokio::sync::{Barrier, Semaphore};
 
     fn test_store() -> ShardStore {
         let pool = PgPoolOptions::new()
@@ -637,6 +784,8 @@ mod tests {
         ShardStore {
             pool,
             db_cache: new_db_cache(),
+            route_generation: Arc::new(AtomicU64::new(0)),
+            lookup_gates: Arc::new(DashMap::new()),
             backend_cache: Arc::new(DashMap::new()),
         }
     }
@@ -646,7 +795,7 @@ mod tests {
             .db_cache
             .get(db_name)
             .await
-            .and_then(|entry| entry.get())
+            .and_then(|entry| entry.get(store.route_generation.load(Ordering::Acquire)))
     }
 
     #[tokio::test]
@@ -661,7 +810,7 @@ mod tests {
         store
             .apply_db_event(r#"{"op":"unassign","db_name":"db_a"}"#)
             .await;
-        assert!(store.db_cache.get("db_a").await.is_none());
+        assert_eq!(cached_shard(&store, "db_a").await, Some(None));
     }
 
     #[tokio::test]
@@ -669,7 +818,7 @@ mod tests {
         let store = test_store();
         store
             .db_cache
-            .insert("db_keep".to_string(), DbCacheEntry::found(9))
+            .insert("db_keep".to_string(), DbCacheEntry::found(9, 0))
             .await;
 
         store.apply_db_event("not-json").await;
@@ -681,21 +830,25 @@ mod tests {
 
     #[test]
     fn db_cache_entries_expire() {
-        let fresh_hit = DbCacheEntry::found(7);
-        assert_eq!(fresh_hit.get(), Some(Some(7)));
-        let fresh_miss = DbCacheEntry::not_found();
-        assert_eq!(fresh_miss.get(), Some(None));
+        let fresh_hit = DbCacheEntry::found(7, 3);
+        assert_eq!(fresh_hit.get(3), Some(Some(7)));
+        assert_eq!(fresh_hit.get(4), None);
+        let fresh_miss = DbCacheEntry::not_found(3);
+        assert_eq!(fresh_miss.get(3), Some(None));
+        assert_eq!(fresh_miss.get(4), None);
 
         let old = Instant::now() - DB_CACHE_POSITIVE_TTL;
         let stale_hit = DbCacheEntry::Found {
             shard_id: 7,
             cached_at: old,
+            generation: 3,
         };
-        assert_eq!(stale_hit.get(), None);
+        assert_eq!(stale_hit.get(3), None);
         let stale_miss = DbCacheEntry::NotFound {
             cached_at: Instant::now() - DB_CACHE_NEGATIVE_TTL,
+            generation: 3,
         };
-        assert_eq!(stale_miss.get(), None);
+        assert_eq!(stale_miss.get(3), None);
     }
 
     #[test]
@@ -705,11 +858,11 @@ mod tests {
         let now = Instant::now();
 
         assert_eq!(
-            expiry.expire_after_create(&key, &DbCacheEntry::found(1), now),
+            expiry.expire_after_create(&key, &DbCacheEntry::found(1, 0), now),
             Some(DB_CACHE_POSITIVE_TTL)
         );
         assert_eq!(
-            expiry.expire_after_create(&key, &DbCacheEntry::not_found(), now),
+            expiry.expire_after_create(&key, &DbCacheEntry::not_found(0), now),
             Some(DB_CACHE_NEGATIVE_TTL)
         );
         // A re-insert (e.g. an assign event replacing a negative entry) must
@@ -717,7 +870,7 @@ mod tests {
         assert_eq!(
             expiry.expire_after_update(
                 &key,
-                &DbCacheEntry::found(1),
+                &DbCacheEntry::found(1, 0),
                 now,
                 Some(DB_CACHE_NEGATIVE_TTL)
             ),
@@ -726,7 +879,7 @@ mod tests {
         assert_eq!(
             expiry.expire_after_update(
                 &key,
-                &DbCacheEntry::not_found(),
+                &DbCacheEntry::not_found(0),
                 now,
                 Some(DB_CACHE_POSITIVE_TTL)
             ),
@@ -745,7 +898,7 @@ mod tests {
 
         for i in 0..10_000u32 {
             cache
-                .insert(format!("missing_{i}"), DbCacheEntry::not_found())
+                .insert(format!("missing_{i}"), DbCacheEntry::not_found(0))
                 .await;
         }
         cache.run_pending_tasks().await;
@@ -753,6 +906,221 @@ mod tests {
             cache.entry_count() <= 64,
             "cache must stay bounded, got {}",
             cache.entry_count()
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_sql_result_cannot_overwrite_newer_assignment_event() {
+        let store = test_store();
+        let started = Arc::new(Barrier::new(2));
+        let release = Arc::new(Semaphore::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let task = {
+            let store = store.clone();
+            let started = started.clone();
+            let release = release.clone();
+            let calls = calls.clone();
+            tokio::spawn(async move {
+                store
+                    .lookup_db_shard_with("db_race", || {
+                        let started = started.clone();
+                        let release = release.clone();
+                        calls.fetch_add(1, AtomicOrdering::SeqCst);
+                        async move {
+                            started.wait().await;
+                            let permit = release.acquire().await.unwrap();
+                            permit.forget();
+                            Ok(Some(1))
+                        }
+                    })
+                    .await
+            })
+        };
+
+        started.wait().await;
+        store
+            .apply_db_event(r#"{"op":"assign","db_name":"db_race","shard_id":2}"#)
+            .await;
+        release.add_permits(1);
+
+        assert_eq!(task.await.unwrap().unwrap(), Some(2));
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(cached_shard(&store, "db_race").await, Some(Some(2)));
+    }
+
+    #[tokio::test]
+    async fn stale_negative_sql_result_cannot_restore_404_after_assignment_event() {
+        let store = test_store();
+        let started = Arc::new(Barrier::new(2));
+        let release = Arc::new(Semaphore::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let task = {
+            let store = store.clone();
+            let started = started.clone();
+            let release = release.clone();
+            let calls = calls.clone();
+            tokio::spawn(async move {
+                store
+                    .lookup_db_shard_with("db_new", || {
+                        let started = started.clone();
+                        let release = release.clone();
+                        calls.fetch_add(1, AtomicOrdering::SeqCst);
+                        async move {
+                            started.wait().await;
+                            let permit = release.acquire().await.unwrap();
+                            permit.forget();
+                            Ok(None)
+                        }
+                    })
+                    .await
+            })
+        };
+
+        started.wait().await;
+        store
+            .apply_db_event(r#"{"op":"assign","db_name":"db_new","shard_id":4}"#)
+            .await;
+        release.add_permits(1);
+
+        assert_eq!(task.await.unwrap().unwrap(), Some(4));
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(cached_shard(&store, "db_new").await, Some(Some(4)));
+    }
+
+    #[tokio::test]
+    async fn concurrent_cold_misses_are_single_flight_per_database() {
+        let store = test_store();
+        let started = Arc::new(Barrier::new(2));
+        let release = Arc::new(Semaphore::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut tasks = tokio::task::JoinSet::new();
+
+        for _ in 0..16 {
+            let store = store.clone();
+            let started = started.clone();
+            let release = release.clone();
+            let calls = calls.clone();
+            tasks.spawn(async move {
+                store
+                    .lookup_db_shard_with("db_cold", || {
+                        let started = started.clone();
+                        let release = release.clone();
+                        let call = calls.fetch_add(1, AtomicOrdering::SeqCst);
+                        async move {
+                            if call == 0 {
+                                started.wait().await;
+                                let permit = release.acquire().await.unwrap();
+                                permit.forget();
+                            }
+                            Ok(Some(7))
+                        }
+                    })
+                    .await
+            });
+        }
+
+        started.wait().await;
+        tokio::task::yield_now().await;
+        release.add_permits(1);
+
+        while let Some(result) = tasks.join_next().await {
+            assert_eq!(result.unwrap().unwrap(), Some(7));
+        }
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+        assert!(
+            store.lookup_gates.is_empty(),
+            "the last completed lookup must remove its gate key"
+        );
+    }
+
+    #[tokio::test]
+    async fn lookup_errors_are_not_cached() {
+        let store = test_store();
+        let calls = AtomicUsize::new(0);
+
+        let first = store
+            .lookup_db_shard_with("db_error", || {
+                let call = calls.fetch_add(1, AtomicOrdering::SeqCst);
+                async move {
+                    if call == 0 {
+                        Err(sqlx::Error::Protocol("injected lookup failure".into()))
+                    } else {
+                        Ok(Some(9))
+                    }
+                }
+            })
+            .await;
+        assert!(first.is_err());
+        assert!(store.db_cache.get("db_error").await.is_none());
+
+        let second = store
+            .lookup_db_shard_with("db_error", || {
+                calls.fetch_add(1, AtomicOrdering::SeqCst);
+                async { Ok(Some(9)) }
+            })
+            .await;
+        assert_eq!(second.unwrap(), Some(9));
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 2);
+        assert!(
+            store.lookup_gates.is_empty(),
+            "error and success paths must both release their gate keys"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_lookup_gate_survives_churn_beyond_old_cache_capacity() {
+        let store = test_store();
+        let first = store.lookup_gate("db_shared");
+
+        // The previous bounded Moka gate cache could reject or evict an active
+        // gate once random-name churn reached its admission capacity. Churn
+        // beyond that old boundary: completed transient keys must disappear,
+        // while the active key stays discoverable as the exact same mutex.
+        for i in 0..=DB_CACHE_CAPACITY {
+            drop(store.lookup_gate(&format!("db_random_{i}")));
+        }
+        assert_eq!(store.lookup_gates.len(), 1);
+
+        let second = store.lookup_gate("db_shared");
+        assert!(Arc::ptr_eq(&first.gate, &second.gate));
+
+        // Identity-aware cleanup cannot remove the key while another lease is
+        // active; the final lease removes it immediately.
+        drop(first);
+        assert_eq!(store.lookup_gates.len(), 1);
+        drop(second);
+        assert!(store.lookup_gates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_lookup_releases_gate_key() {
+        let store = test_store();
+        let started = Arc::new(Barrier::new(2));
+        let task = {
+            let store = store.clone();
+            let started = started.clone();
+            tokio::spawn(async move {
+                store
+                    .lookup_db_shard_with("db_cancelled", || {
+                        let started = started.clone();
+                        async move {
+                            started.wait().await;
+                            std::future::pending::<Result<Option<u32>, sqlx::Error>>().await
+                        }
+                    })
+                    .await
+            })
+        };
+
+        started.wait().await;
+        assert_eq!(store.lookup_gates.len(), 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(
+            store.lookup_gates.is_empty(),
+            "route timeout cancellation must not retain attacker-controlled keys"
         );
     }
 

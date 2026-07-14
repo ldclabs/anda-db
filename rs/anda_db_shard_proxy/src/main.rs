@@ -58,11 +58,12 @@
 use axum::{BoxError, body::Body};
 use clap::Parser;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+use ipnet::IpNet;
 use mimalloc::MiMalloc;
 use sqlx::postgres::PgPoolOptions;
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use structured_logger::{Builder, async_json::new_writer, get_env_level};
-use tokio::signal;
+use tokio::{signal, sync::Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use anda_db_shard_proxy::handler::build_router;
@@ -112,6 +113,20 @@ struct Cli {
     /// response body stream itself is not bounded by this timeout
     #[clap(long, env = "PROXY_REQUEST_TIMEOUT", default_value = "300")]
     proxy_request_timeout: u32,
+
+    /// Timeout in seconds for database-name route resolution. This covers
+    /// waiting for a concurrency permit and any PostgreSQL lookup.
+    #[clap(long, env = "ROUTE_RESOLVE_TIMEOUT", default_value = "5")]
+    route_resolve_timeout: u32,
+
+    /// Maximum number of concurrent database-name route resolutions.
+    #[clap(long, env = "ROUTE_RESOLVE_MAX_CONCURRENCY", default_value = "64")]
+    route_resolve_max_concurrency: usize,
+
+    /// Comma-separated CIDRs of directly connected reverse proxies whose
+    /// incoming X-Forwarded-* chain may be trusted. Empty by default.
+    #[clap(long, env = "TRUSTED_PROXY_CIDRS", value_delimiter = ',')]
+    trusted_proxy_cidrs: Vec<IpNet>,
 
     /// Default backend address to use if no shard mapping is found
     #[clap(long, env = "DEFAULT_BACKEND_ADDR")]
@@ -187,6 +202,9 @@ async fn main() -> Result<(), BoxError> {
         client: Arc::new(http_client),
         api_key: Arc::new(cli.api_key),
         db_name_extractor: Arc::new(router::PrefixExtractor::new(cli.path_prefix.clone())),
+        trusted_proxy_cidrs: Arc::from(cli.trusted_proxy_cidrs),
+        route_resolve_timeout: Duration::from_secs(cli.route_resolve_timeout.max(1) as u64),
+        route_resolve_semaphore: Arc::new(Semaphore::new(cli.route_resolve_max_concurrency.max(1))),
         proxy_request_timeout: Duration::from_secs(cli.proxy_request_timeout.max(1) as u64),
         default_backend,
     };

@@ -107,7 +107,7 @@ mod schema;
 ///     age: u32,
 /// }
 /// ```
-#[proc_macro_derive(FieldTyped, attributes(field_type, cbor))]
+#[proc_macro_derive(FieldTyped, attributes(field_type, cbor, serde))]
 pub fn field_typed_derive(input: TokenStream) -> TokenStream {
     field_typed::field_typed_derive(input)
 }
@@ -194,7 +194,7 @@ pub fn field_typed_derive(input: TokenStream) -> TokenStream {
 ///     }
 /// }
 /// ```
-#[proc_macro_derive(AndaDBSchema, attributes(field_type, unique))]
+#[proc_macro_derive(AndaDBSchema, attributes(field_type, unique, cbor, serde))]
 pub fn anda_db_schema_derive(input: TokenStream) -> TokenStream {
     schema::anda_db_schema_derive(input)
 }

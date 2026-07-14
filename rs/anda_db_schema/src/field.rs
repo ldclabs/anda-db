@@ -350,7 +350,9 @@ impl FieldType {
     /// - an `I64` field observed as a non-negative [`FieldValue::U64`] within
     ///   `i64` range becomes [`FieldValue::I64`],
     /// - an `F32` field observed as an [`FieldValue::F64`] read-back shape
-    ///   (see `is_f32_read_back`) becomes [`FieldValue::F32`].
+    ///   (see `is_f32_read_back`) becomes [`FieldValue::F32`],
+    /// - a `Vector` field observed as an array of U64 bf16 bit patterns becomes
+    ///   [`FieldValue::Vector`].
     ///
     /// Values that are not a read-back shape of this type are left unchanged
     /// (a following [`FieldType::validate`] reports them). Normalization is
@@ -383,6 +385,22 @@ impl FieldType {
                     && is_f32_read_back(*v)
                 {
                     *value = FieldValue::F32(*v as f32);
+                }
+            }
+            FieldType::Vector => {
+                if let FieldValue::Array(values) = value {
+                    let vector = values
+                        .iter()
+                        .map(|value| match value {
+                            FieldValue::U64(bits) if *bits <= u16::MAX as u64 => {
+                                Some(bf16::from_bits(*bits as u16))
+                            }
+                            _ => None,
+                        })
+                        .collect::<Option<Vec<_>>>();
+                    if let Some(vector) = vector {
+                        *value = FieldValue::Vector(vector);
+                    }
                 }
             }
             FieldType::Array(types) => {
@@ -2481,6 +2499,25 @@ mod tests {
         let mut v = FieldValue::F64(2.7100000000001);
         FieldType::F32.normalize(&mut v);
         assert_eq!(v, FieldValue::F64(2.7100000000001));
+
+        // Vector <- Array(U64 bf16 bits).
+        let expected = vec![bf16::from_f32(1.5), bf16::from_f32(-2.0)];
+        let mut v = FieldValue::Array(
+            expected
+                .iter()
+                .map(|value| FieldValue::U64(value.to_bits() as u64))
+                .collect(),
+        );
+        FieldType::Vector.normalize(&mut v);
+        assert_eq!(v, FieldValue::Vector(expected));
+
+        // Invalid bit shapes stay put so validation can report the mismatch.
+        let mut v = FieldValue::Array(vec![FieldValue::U64(u16::MAX as u64 + 1)]);
+        FieldType::Vector.normalize(&mut v);
+        assert_eq!(
+            v,
+            FieldValue::Array(vec![FieldValue::U64(u16::MAX as u64 + 1)])
+        );
 
         // Composites recurse.
         let mut v = FieldValue::Array(vec![FieldValue::U64(1), FieldValue::I64(-2)]);

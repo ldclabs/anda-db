@@ -38,6 +38,28 @@ Typical admin endpoints:
 - `PUT /_admin/db_shards`
 - `GET /_admin/db_shards/{db_name}`
 
+## Proxy Trust and Route Limits
+
+Incoming `X-Forwarded-For`, `X-Forwarded-Host`, and `X-Forwarded-Proto`
+headers are untrusted by default. The proxy discards them and rebuilds the
+values from the immediate socket peer, original `Host`, and its own HTTP
+scheme. If this service is deployed directly behind a controlled load
+balancer, configure only that balancer's directly connected networks:
+
+```bash
+--trusted-proxy-cidrs 10.0.0.0/8,fd00::/8
+```
+
+When—and only when—the immediate peer belongs to one of those CIDRs, its
+existing forwarding chain is preserved and the peer address is appended.
+Do not configure client or public address ranges as trusted proxies.
+
+Cold database-name lookups are single-flight per name. They are additionally
+bounded by `ROUTE_RESOLVE_MAX_CONCURRENCY` (default `64`) and the complete
+permit-wait plus PostgreSQL lookup is limited by `ROUTE_RESOLVE_TIMEOUT`
+(default `5` seconds). `PROXY_REQUEST_TIMEOUT` remains the separate timeout
+for the subsequent backend request up to response headers.
+
 ## Related Crates
 
 - `anda_db_server` for the backend database servers being proxied

@@ -14,7 +14,7 @@ use std::{ops::Range, sync::Arc, time::Duration};
 
 use crate::{
     apply_logical_etag_preconditions, check_update_version, sha3_256,
-    sidecar::{SidecarMeta, SidecarStore},
+    sidecar::{ListingMetaPolicy, SidecarMeta, SidecarStore},
     validate_ranges,
 };
 
@@ -347,6 +347,14 @@ impl<T: ObjectStore> EncryptedStoreBuilder<T> {
     /// via copy/rename, which reseals metadata): legacy metadata is then
     /// rejected outright, closing the downgrade window.
     ///
+    /// The policy also applies to `list`, `list_with_offset`, and
+    /// `list_with_delimiter`: authenticated-but-tampered metadata is rejected
+    /// in both modes; compatibility mode accepts genuine legacy documents and
+    /// tolerates torn CBOR (reporting no logical ETag when conditional mode is
+    /// enabled), while strict mode rejects legacy and torn documents. A
+    /// missing sidecar is tolerated in both modes so recovery tooling can
+    /// still discover data orphaned by a crash.
+    ///
     /// # Returns
     /// The builder with strict metadata authentication enabled
     pub fn with_strict_metadata_auth(self) -> Self {
@@ -387,6 +395,22 @@ impl<T: ObjectStore> EncryptedStore<T> {
 
     fn verify_metadata(&self, location: &Path, meta: &Metadata) -> Result<MetadataAuth> {
         verify_metadata(&self.cipher, location, meta, self.strict_metadata_auth)
+    }
+
+    /// Listing policy shared by all three `list*` entry points.
+    ///
+    /// Every decoded document is authenticated before it can enter the
+    /// shared cache. Compatibility mode accepts genuine legacy metadata and
+    /// tolerates torn CBOR; strict mode rejects both. Missing metadata remains
+    /// listable in either mode so crash-recovery scans can find and heal
+    /// orphaned data objects.
+    fn listing_meta_policy(&self) -> ListingMetaPolicy<Metadata> {
+        let cipher = self.cipher.clone();
+        let strict = self.strict_metadata_auth;
+        ListingMetaPolicy::verified(self.conditional_put, strict, move |location, meta| {
+            verify_metadata(&cipher, location, meta, strict)?;
+            Ok(())
+        })
     }
 
     async fn verified_metadata(&self, location: &Path) -> Result<Metadata> {
@@ -765,7 +789,7 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
-        self.inner.clone().list(prefix, self.conditional_put)
+        self.inner.clone().list(prefix, self.listing_meta_policy())
     }
 
     fn list_with_offset(
@@ -775,16 +799,17 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
     ) -> BoxStream<'static, Result<ObjectMeta>> {
         self.inner
             .clone()
-            .list_with_offset(prefix, offset, self.conditional_put)
+            .list_with_offset(prefix, offset, self.listing_meta_policy())
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
         self.inner
-            .list_with_delimiter(prefix, self.conditional_put)
+            .list_with_delimiter(prefix, self.listing_meta_policy())
             .await
     }
 
     async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
+        let _leases = self.inner.mutation_leases(from, to).await;
         let meta = self.verified_metadata(from).await?;
         self.inner
             .store
@@ -798,6 +823,7 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
     }
 
     async fn rename_opts(&self, from: &Path, to: &Path, options: RenameOptions) -> Result<()> {
+        let _leases = self.inner.mutation_leases(from, to).await;
         if from == to {
             // A self-rename must not delete the object's sidecar metadata
             // (`from` and `to` share the same document), nor be forwarded to
@@ -1196,10 +1222,8 @@ fn verify_metadata(
             if meta.chunk_aad_version.is_some() {
                 return Err(Error::Generic {
                     store: "EncryptedStore",
-                    source: format!(
-                        "stripped metadata authentication fields for path {location}"
-                    )
-                    .into(),
+                    source: format!("stripped metadata authentication fields for path {location}")
+                        .into(),
                 });
             }
             if strict {
@@ -2017,8 +2041,7 @@ mod tests {
             .build();
         let err = reopened.get(&location).await.unwrap_err();
         assert!(
-            err.to_string()
-                .contains("stripped metadata authentication"),
+            err.to_string().contains("stripped metadata authentication"),
             "unexpected error: {err:?}"
         );
     }
@@ -2057,6 +2080,137 @@ mod tests {
             .build();
         let bytes = lenient.get(&legacy).await.unwrap().bytes().await.unwrap();
         assert_eq!(bytes.as_ref(), payload);
+    }
+
+    #[tokio::test]
+    async fn strict_mode_rejects_tampered_metadata_in_all_listing_variants() {
+        use futures::TryStreamExt;
+
+        let inner = InMemory::new();
+        let location = Path::from("strict-list/tampered");
+        let writer = EncryptedStoreBuilder::with_secret(inner.clone(), 100, [0u8; 32])
+            .with_conditional_put()
+            .build();
+        writer
+            .put(&location, Bytes::from_static(b"authenticated").into())
+            .await
+            .unwrap();
+
+        // Keep the CBOR well-formed but alter an authenticated field.
+        let meta_path = Path::from("meta/strict-list/tampered");
+        let bytes = inner.get(&meta_path).await.unwrap().bytes().await.unwrap();
+        let mut meta: Metadata = cbor2::from_reader(&bytes[..]).unwrap();
+        meta.size += 1;
+        let mut tampered = Vec::new();
+        cbor2::to_writer(&meta, &mut tampered).unwrap();
+        inner.put(&meta_path, tampered.into()).await.unwrap();
+
+        // Reopen to bypass the writer's valid cached metadata. Compatibility
+        // mode accepts genuine legacy documents, not failed authentication.
+        let compatible = EncryptedStoreBuilder::with_secret(inner.clone(), 100, [0u8; 32])
+            .with_conditional_put()
+            .build();
+        let err = compatible
+            .list(Some(&Path::from("strict-list")))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("metadata authentication failed"));
+
+        // A failed listing must not cache the attacker-controlled
+        // replacement, so all three strict variants independently reach the
+        // verifier and reject it.
+        let strict = EncryptedStoreBuilder::with_secret(inner, 100, [0u8; 32])
+            .with_conditional_put()
+            .with_strict_metadata_auth()
+            .build();
+        let err = strict
+            .list(Some(&Path::from("strict-list")))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("metadata authentication failed"));
+
+        let err = strict
+            .list_with_offset(
+                Some(&Path::from("strict-list")),
+                &Path::from("strict-list/a"),
+            )
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("metadata authentication failed"));
+
+        let err = strict
+            .list_with_delimiter(Some(&Path::from("strict-list")))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("metadata authentication failed"));
+    }
+
+    #[tokio::test]
+    async fn listing_metadata_load_holds_source_lease_against_put() {
+        use crate::test_support::{GateOperation, GatedStore};
+        use futures::TryStreamExt;
+
+        let source = Path::from("listing-put/source");
+        let target = Path::from("listing-put/target");
+        let (inner, gate) =
+            GatedStore::new(GateOperation::Get(Path::from("meta/listing-put/source")));
+
+        let writer = EncryptedStoreBuilder::with_secret(inner.clone(), 100, [0u8; 32])
+            .with_chunk_size(4)
+            .with_conditional_put()
+            .with_strict_metadata_auth()
+            .build();
+        writer
+            .put(&source, Bytes::from_static(b"first-value").into())
+            .await
+            .unwrap();
+
+        // Reopen with an empty cache so listing must fetch the source sidecar.
+        let storage = Arc::new(
+            EncryptedStoreBuilder::with_secret(inner, 100, [0u8; 32])
+                .with_chunk_size(4)
+                .with_conditional_put()
+                .with_strict_metadata_auth()
+                .build(),
+        );
+        let list_storage = storage.clone();
+        let listing = tokio::spawn(async move {
+            list_storage
+                .list(Some(&Path::from("listing-put")))
+                .try_collect::<Vec<_>>()
+                .await
+        });
+        gate.wait_until_entered().await;
+
+        // The listing has already obtained the old metadata bytes. Its
+        // per-key lease must keep this put from committing newer data and
+        // metadata before the old document has been validated and cached.
+        let put_storage = storage.clone();
+        let put_source = source.clone();
+        let mut put = tokio::spawn(async move {
+            put_storage
+                .put(&put_source, Bytes::from_static(b"second-value").into())
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut put)
+                .await
+                .is_err(),
+            "put bypassed the listing metadata load's source lease"
+        );
+
+        gate.release();
+        listing.await.unwrap().unwrap();
+        put.await.unwrap().unwrap();
+
+        // A later encrypted copy must pair the current ciphertext with its
+        // current metadata, rather than resealing a stale cached document.
+        storage.copy(&source, &target).await.unwrap();
+        let bytes = storage.get(&target).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"second-value"));
     }
 
     #[tokio::test]
@@ -2207,13 +2361,7 @@ mod tests {
             .unwrap();
 
         storage.rename(&location, &location).await.unwrap();
-        let bytes = storage
-            .get(&location)
-            .await
-            .unwrap()
-            .bytes()
-            .await
-            .unwrap();
+        let bytes = storage.get(&location).await.unwrap().bytes().await.unwrap();
         assert_eq!(bytes, Bytes::from_static(b"abcdefgh"));
 
         let err = storage
@@ -2223,13 +2371,7 @@ mod tests {
         assert!(matches!(err, Error::AlreadyExists { .. }));
 
         storage.copy(&location, &location).await.unwrap();
-        let bytes = storage
-            .get(&location)
-            .await
-            .unwrap()
-            .bytes()
-            .await
-            .unwrap();
+        let bytes = storage.get(&location).await.unwrap().bytes().await.unwrap();
         assert_eq!(bytes, Bytes::from_static(b"abcdefgh"));
 
         let missing = Path::from("self-missing");
@@ -2245,7 +2387,10 @@ mod tests {
         let location = Path::from("head-object");
         let payload = Bytes::from_static(b"abcdefghij");
 
-        storage.put(&location, payload.clone().into()).await.unwrap();
+        storage
+            .put(&location, payload.clone().into())
+            .await
+            .unwrap();
 
         let res = storage
             .get_opts(
@@ -2303,14 +2448,106 @@ mod tests {
 
         // Whichever complete ran last, the object must decrypt: data and
         // metadata were written under the same per-key critical section.
-        let bytes = storage
-            .get(&location)
-            .await
-            .unwrap()
-            .bytes()
+        let bytes = storage.get(&location).await.unwrap().bytes().await.unwrap();
+        assert!(bytes == content_a || bytes == content_b);
+    }
+
+    #[tokio::test]
+    async fn encrypted_copy_holds_target_lease_against_put() {
+        use crate::test_support::{GateOperation, GatedStore};
+
+        let source = Path::from("encrypted-copy-put-source");
+        let target = Path::from("encrypted-copy-put-target");
+        let (inner, gate) = GatedStore::new(GateOperation::Copy {
+            from: Path::from("data/encrypted-copy-put-source"),
+            to: Path::from("data/encrypted-copy-put-target"),
+        });
+        let storage = Arc::new(
+            EncryptedStoreBuilder::with_secret(inner, 100, [0u8; 32])
+                .with_chunk_size(4)
+                .build(),
+        );
+        storage
+            .put(&source, Bytes::from_static(b"source-value").into())
             .await
             .unwrap();
-        assert!(bytes == content_a || bytes == content_b);
+
+        let copy_storage = storage.clone();
+        let copy_source = source.clone();
+        let copy_target = target.clone();
+        let copy = tokio::spawn(async move { copy_storage.copy(&copy_source, &copy_target).await });
+        gate.wait_until_entered().await;
+
+        let put_storage = storage.clone();
+        let put_target = target.clone();
+        let mut put = tokio::spawn(async move {
+            put_storage
+                .put(&put_target, Bytes::from_static(b"put-value").into())
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut put)
+                .await
+                .is_err(),
+            "put bypassed EncryptedStore copy's target lease"
+        );
+
+        gate.release();
+        copy.await.unwrap().unwrap();
+        put.await.unwrap().unwrap();
+        let bytes = storage.get(&target).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"put-value"));
+    }
+
+    #[tokio::test]
+    async fn encrypted_rename_waits_for_target_multipart_complete() {
+        use crate::test_support::{GateOperation, GatedStore};
+
+        let source = Path::from("encrypted-rename-source");
+        let target = Path::from("encrypted-rename-target");
+        let (inner, gate) = GatedStore::new(GateOperation::MultipartComplete(Path::from(
+            "data/encrypted-rename-target",
+        )));
+        let storage = Arc::new(
+            EncryptedStoreBuilder::with_secret(inner, 100, [0u8; 32])
+                .with_chunk_size(4)
+                .build(),
+        );
+        storage
+            .put(&source, Bytes::from_static(b"source-value").into())
+            .await
+            .unwrap();
+        let mut upload = storage.put_multipart(&target).await.unwrap();
+        upload
+            .put_part(Bytes::from_static(b"multipart-value").into())
+            .await
+            .unwrap();
+        let complete = tokio::spawn(async move { upload.complete().await });
+        gate.wait_until_entered().await;
+
+        let rename_storage = storage.clone();
+        let rename_source = source.clone();
+        let rename_target = target.clone();
+        let mut rename =
+            tokio::spawn(
+                async move { rename_storage.rename(&rename_source, &rename_target).await },
+            );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut rename)
+                .await
+                .is_err(),
+            "EncryptedStore rename bypassed multipart's target lease"
+        );
+
+        gate.release();
+        complete.await.unwrap().unwrap();
+        rename.await.unwrap().unwrap();
+        let bytes = storage.get(&target).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"source-value"));
+        assert!(matches!(
+            storage.get(&source).await,
+            Err(Error::NotFound { .. })
+        ));
     }
 
     #[test]
@@ -2323,10 +2560,7 @@ mod tests {
         // The 4-byte salt is preserved.
         assert_eq!(n0[..4], base[..4]);
         assert_eq!(n1[..4], base[..4]);
-        assert_eq!(
-            u64::from_le_bytes(n0[4..].try_into().unwrap()),
-            u64::MAX
-        );
+        assert_eq!(u64::from_le_bytes(n0[4..].try_into().unwrap()), u64::MAX);
         assert_eq!(u64::from_le_bytes(n1[4..].try_into().unwrap()), 0);
 
         // Nonces stay unique within an object across the wrap boundary.

@@ -28,6 +28,7 @@ hyper-util = { version = "0.1", features = [
   "http2",
   "tokio",
 ] }
+ipnet = "2"
 sqlx = { version = "0.9", features = [
   "runtime-tokio",
   "tls-rustls",

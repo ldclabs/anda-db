@@ -11,12 +11,15 @@ use anda_db::{
     database::AndaDB,
     error::DBError,
     index::HnswConfig,
-    schema::{Fv, Schema},
+    schema::{FieldType, Fv, Schema, validate_field_name},
 };
 use serde::Deserialize;
 use std::sync::Arc;
 
-use super::db::{ExtensionKeyParams, SaveExtensionParams, SetReadOnlyParams};
+use super::db::{
+    ExtensionKeyParams, SaveExtensionParams, SetReadOnlyParams,
+    ensure_writable as ensure_db_writable,
+};
 use crate::error::ApiError;
 
 /// Parameters identifying a collection.
@@ -86,9 +89,113 @@ pub struct CollectionSetReadOnlyParams {
 
 /// Opens a collection, loading it from storage on first access.
 pub async fn open(db: &AndaDB, name: &str) -> Result<Arc<Collection>, ApiError> {
+    // Prove the client-facing 404 from logical metadata before entering the
+    // engine. A later NotFound can mean missing/corrupt persisted collection
+    // state and must be handled by the conservative DBError fallback.
+    if !db.metadata().collections.contains(name) {
+        return Err(ApiError::not_found(format!(
+            "collection {name:?} not found"
+        )));
+    }
     Ok(db
         .open_collection(name.to_string(), async |_| Ok(()))
         .await?)
+}
+
+fn btree_type_is_supported(field_type: &FieldType) -> bool {
+    // Mirror `BTree::new`: unwrap at most one Option layer, then at most one
+    // homogeneous Array/Map layer. Deeper container shapes are unsupported by
+    // the engine and must be rejected as request input here.
+    let field_type = match field_type {
+        FieldType::Option(inner) => inner.as_ref(),
+        other => other,
+    };
+    let key_type = match field_type {
+        FieldType::Array(inner) if inner.len() == 1 => inner[0].clone(),
+        FieldType::Map(inner) if inner.len() == 1 => {
+            let Some(key) = inner.keys().next() else {
+                return false;
+            };
+            key.field_type()
+        }
+        other => other.clone(),
+    };
+    matches!(
+        key_type,
+        FieldType::I64 | FieldType::U64 | FieldType::Bytes | FieldType::Text
+    )
+}
+
+fn validate_definition(params: &CreateCollectionParams) -> Result<(), ApiError> {
+    validate_field_name(&params.config.name)
+        .map_err(|err| ApiError::invalid_input(format!("invalid collection name: {err}")))?;
+
+    for fields in &params.btree_indexes {
+        if fields.is_empty() {
+            return Err(ApiError::invalid_input(
+                "B-Tree index requires at least one field",
+            ));
+        }
+        for name in fields {
+            if params.schema.get_field(name).is_none() {
+                return Err(ApiError::invalid_input(format!(
+                    "B-Tree index field {name:?} is not declared in the schema"
+                )));
+            }
+        }
+        if fields.len() == 1 {
+            let field = params
+                .schema
+                .get_field(&fields[0])
+                .expect("field presence checked above");
+            if !btree_type_is_supported(field.r#type()) {
+                return Err(ApiError::invalid_input(format!(
+                    "field {:?} has type {:?}, which cannot be used by a B-Tree index",
+                    fields[0],
+                    field.r#type()
+                )));
+            }
+        }
+    }
+
+    for name in &params.bm25_indexes {
+        if params.schema.get_field(name).is_none() {
+            return Err(ApiError::invalid_input(format!(
+                "BM25 index field {name:?} is not declared in the schema"
+            )));
+        }
+    }
+
+    for index in &params.hnsw_indexes {
+        let field = params.schema.get_field(&index.field).ok_or_else(|| {
+            ApiError::invalid_input(format!(
+                "HNSW index field {:?} is not declared in the schema",
+                index.field
+            ))
+        })?;
+        if field.r#type() != &FieldType::Vector {
+            return Err(ApiError::invalid_input(format!(
+                "HNSW index field {:?} must have type Vector",
+                index.field
+            )));
+        }
+        index
+            .config
+            .validate(&index.field)
+            .map_err(|err| ApiError::invalid_input(err.to_string()))?;
+    }
+
+    Ok(())
+}
+
+pub(super) fn ensure_writable(collection: &Collection) -> Result<(), ApiError> {
+    if collection.stats().read_only {
+        return Err(ApiError::conflict(format!(
+            "collection {:?} is read-only",
+            collection.name()
+        )));
+    }
+    Ok(())
 }
 
 /// `collection.create` — fails if the collection already exists.
@@ -96,6 +203,14 @@ pub async fn create(
     db: &AndaDB,
     params: CreateCollectionParams,
 ) -> Result<CollectionMetadata, ApiError> {
+    validate_definition(&params)?;
+    ensure_db_writable(db)?;
+    if db.metadata().collections.contains(&params.config.name) {
+        return Err(ApiError::already_exists(format!(
+            "collection {:?} already exists",
+            params.config.name
+        )));
+    }
     let CreateCollectionParams {
         config,
         schema,
@@ -103,11 +218,32 @@ pub async fn create(
         bm25_indexes,
         hnsw_indexes,
     } = params;
-    let collection = db
+    let collection_name = config.name.clone();
+    let collection = match db
         .create_collection(schema, config, async |collection| {
             ensure_indexes(collection, &btree_indexes, &bm25_indexes, &hnsw_indexes).await
         })
-        .await?;
+        .await
+    {
+        Ok(collection) => collection,
+        Err(err @ DBError::AlreadyExists { .. })
+            if db.metadata().collections.contains(&collection_name) =>
+        {
+            // The pre-check above was clear, and the name is now registered:
+            // another request won the per-name creation race. This proves a
+            // logical conflict without trusting the engine variant or exposing
+            // its physical path/source.
+            log::warn!(
+                action = "collection::create",
+                collection = collection_name;
+                "concurrent collection creation conflict: {err:?}",
+            );
+            return Err(ApiError::already_exists(format!(
+                "collection {collection_name:?} already exists"
+            )));
+        }
+        Err(err) => return Err(err.into()),
+    };
     Ok(collection.metadata())
 }
 
@@ -116,6 +252,8 @@ pub async fn ensure(
     db: &AndaDB,
     params: CreateCollectionParams,
 ) -> Result<CollectionMetadata, ApiError> {
+    validate_definition(&params)?;
+    ensure_db_writable(db)?;
     let CreateCollectionParams {
         config,
         schema,
@@ -168,6 +306,13 @@ pub async fn stats(db: &AndaDB, params: CollectionParams) -> Result<CollectionSt
 
 /// `collection.delete` — removes the collection and all of its data.
 pub async fn delete(db: &AndaDB, params: CollectionParams) -> Result<(), ApiError> {
+    ensure_db_writable(db)?;
+    if !db.metadata().collections.contains(&params.collection) {
+        return Err(ApiError::not_found(format!(
+            "collection {:?} not found",
+            params.collection
+        )));
+    }
     db.delete_collection(&params.collection).await?;
     Ok(())
 }
@@ -175,6 +320,7 @@ pub async fn delete(db: &AndaDB, params: CollectionParams) -> Result<(), ApiErro
 /// `collection.flush` — returns `true` if pending changes were written.
 pub async fn flush(db: &AndaDB, params: CollectionParams) -> Result<bool, ApiError> {
     let collection = open(db, &params.collection).await?;
+    ensure_writable(&collection)?;
     Ok(collection.flush(anda_db::unix_ms()).await?)
 }
 
@@ -183,6 +329,12 @@ pub async fn set_read_only(
     db: &AndaDB,
     params: CollectionSetReadOnlyParams,
 ) -> Result<(), ApiError> {
+    if !params.params.read_only && db.is_read_only() {
+        return Err(ApiError::conflict(format!(
+            "database {:?} is read-only",
+            db.name()
+        )));
+    }
     let collection = open(db, &params.collection).await?;
     collection.set_read_only(params.params.read_only);
     Ok(())
@@ -203,6 +355,12 @@ pub async fn save_extension(
     params: CollectionSaveExtensionParams,
 ) -> Result<(), ApiError> {
     let collection = open(db, &params.collection).await?;
+    ensure_writable(&collection)?;
+    params
+        .params
+        .value
+        .validate_complexity()
+        .map_err(|err| ApiError::invalid_input(format!("invalid extension value: {err}")))?;
     collection
         .save_extension(params.params.key, params.params.value)
         .await?;
@@ -215,5 +373,107 @@ pub async fn remove_extension(
     params: CollectionExtensionParams,
 ) -> Result<Option<Fv>, ApiError> {
     let collection = open(db, &params.collection).await?;
+    ensure_writable(&collection)?;
     Ok(collection.remove_extension(&params.params.key).await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anda_db::{database::DBConfig, storage::StorageConfig};
+    use axum::http::StatusCode;
+    use object_store::memory::InMemory;
+
+    fn params(name: &str) -> CreateCollectionParams {
+        CreateCollectionParams {
+            config: CollectionConfig {
+                name: name.to_string(),
+                description: String::new(),
+            },
+            schema: Schema::builder().build().unwrap(),
+            btree_indexes: Vec::new(),
+            bm25_indexes: Vec::new(),
+            hnsw_indexes: Vec::new(),
+        }
+    }
+
+    async fn test_db(name: &str) -> AndaDB {
+        AndaDB::connect(
+            Arc::new(InMemory::new()),
+            DBConfig {
+                name: name.to_string(),
+                description: String::new(),
+                storage: StorageConfig::default(),
+                lock: None,
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn database_read_only_is_a_conflict_for_collection_mutations() {
+        let db = test_db("read_only_collections").await;
+        db.set_read_only(true);
+
+        let error = create(&db, params("items")).await.unwrap_err();
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.code, "conflict");
+        assert_eq!(
+            error.message,
+            "database \"read_only_collections\" is read-only"
+        );
+
+        db.set_read_only(false);
+        create(&db, params("items")).await.unwrap();
+        db.set_read_only(true);
+
+        for error in [
+            ensure(&db, params("items")).await.unwrap_err(),
+            delete(
+                &db,
+                CollectionParams {
+                    collection: "items".to_string(),
+                },
+            )
+            .await
+            .unwrap_err(),
+            flush(
+                &db,
+                CollectionParams {
+                    collection: "items".to_string(),
+                },
+            )
+            .await
+            .unwrap_err(),
+        ] {
+            assert_eq!(error.status, StatusCode::CONFLICT);
+            assert_eq!(error.code, "conflict");
+        }
+
+        db.set_read_only(false);
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_collection_create_is_a_sanitized_conflict() {
+        let db = test_db("concurrent_collection_create").await;
+        let (left, right) =
+            tokio::join!(create(&db, params("items")), create(&db, params("items")));
+
+        let error = match (left, right) {
+            (Ok(_), Err(error)) | (Err(error), Ok(_)) => error,
+            (left, right) => panic!(
+                "expected one success and one conflict, got left={:?}, right={:?}",
+                left.map(|_| ()),
+                right.map(|_| ())
+            ),
+        };
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.code, "already_exists");
+        assert_eq!(error.message, "collection \"items\" already exists");
+        assert!(!error.message.contains("meta.cbor"));
+
+        db.close().await.unwrap();
+    }
 }
