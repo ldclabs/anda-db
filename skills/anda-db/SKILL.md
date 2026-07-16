@@ -131,6 +131,15 @@ cbor2 = "1"               # direct CBOR values, readers, writers, size
   `Vec<f32>`. Convert stored vectors with `vector_from_f32`.
 - For filters, wrap values in `Fv`/`FieldValue`, for example
   `RangeQuery::Eq(Fv::Text("active".into()))`.
+- Never wrap mutating calls (`add*`, `update`, `remove`, `flush`, `close`,
+  extension writes) in `tokio::select!`/`timeout`: dropping such a future
+  mid-operation poisons the collection handle (cancellation is treated as a
+  crash). A poisoned handle rejects every further operation; reopen it via
+  `db.open_collection(...)`, which discards the poisoned handle and recovers
+  from storage. Storage failures with unknown outcomes poison the handle the
+  same way.
+- One live writer process per database: this is a deployment contract. A
+  `Precondition` error from flush means a second writer touched the storage.
 
 ## Type Mapping (Rust -> AndaDB)
 

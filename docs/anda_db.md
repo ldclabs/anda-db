@@ -385,9 +385,49 @@ On reopening a collection, the library:
 - loads collection metadata
 - loads the persisted document-id bitmap
 - loads persisted indexes
-- may auto-repair index state for documents that were written but not fully reflected in index persistence
+- replays durable mutation intents (the update/remove write-ahead records)
+- runs a repair scan over the exact id window bounded by the persisted
+  checkpoint and the allocation watermark, recovering documents that were
+  written but not fully reflected in index persistence
 
 This recovery path is one of the key reasons the crate is well suited to long-running agent memory processes.
+
+### Consistency Contract: Single Writer, Poison on Cancellation
+
+AndaDB's durability design rests on three explicit rules:
+
+1. **Single writer per database.** Only one live process may mutate a given
+   database prefix. `DBConfig::lock` is an application-level password, not an
+   OS-level fence; the last line of defense is a conditional PUT on every
+   metadata object — a `Precondition` conflict means a second writer and is
+   never reconciled in place.
+2. **Cancellation is a crash.** Mutating futures (`add`, `update`, `remove`,
+   `flush`, `close`, extension writes, compactions) must be polled to
+   completion. If one is dropped mid-operation — or a storage write fails
+   with an unknown outcome — the collection handle becomes **poisoned**:
+   every further operation returns an error naming the state. Reads on a
+   poisoned handle still serve the in-memory state, but it may lag storage.
+3. **Recovery happens only on reopen.** Re-opening the collection (for
+   example via `AndaDB::open_collection`, which transparently discards a
+   poisoned handle and loads a fresh generation) replays the write-ahead
+   intents and runs the repair scan, converging in-memory state with storage
+   as the single source of truth.
+
+In practice, poisoning is rare: the built-in drivers (`auto_flush`, the HTTP
+servers) never cancel mutating futures. Avoid wrapping AndaDB mutations in
+`tokio::select!`/`timeout` unless you are prepared to reopen the collection
+afterwards.
+
+### Allocation Watermark
+
+`add` does not write a per-mutation durable record. Instead the collection
+maintains a durable **allocation watermark** (`alloc_watermark.cbor`,
+published in strides of 64 allocations): every document id is covered by the
+watermark before its object may be written, so the reopen repair scan can
+enumerate exactly the ids that may need recovery — no probabilistic scan
+heuristics, and only one extra small PUT per 64 adds. Updates and removes
+still write durable intents, because a scan cannot cheaply detect changed or
+deleted content.
 
 ## Read-Only Mode and Safety Controls
 
