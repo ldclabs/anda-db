@@ -1,5 +1,6 @@
 use anda_db_hnsw::HnswIndex;
 use bytes::Bytes;
+use futures::StreamExt;
 use parking_lot::RwLock;
 use std::{fmt::Debug, hash::Hash, sync::Arc};
 
@@ -131,13 +132,76 @@ impl Hnsw {
         })
         .await?;
 
-        Ok(Self {
+        let this = Self {
             name,
             index,
             storage,
             metadata_version: Arc::new(RwLock::new(metadata_version)),
             ids_version: Arc::new(RwLock::new(ids_version)),
-        })
+        };
+        this.purge_orphan_node_blobs().await;
+        Ok(this)
+    }
+
+    /// Best-effort deletion of node blobs that neither the committed id set
+    /// nor the tombstone set references.
+    ///
+    /// A crash between the ids PUT (which already excluded a removed node)
+    /// and the metadata PUT (which would have carried its tombstone) leaves
+    /// a blob that no later load or purge would ever visit — a permanent
+    /// space leak, and vector data lingering longer than intended. Bootstrap
+    /// already pays O(nodes) to fetch every referenced blob, so one listing
+    /// of the index directory to sweep unreferenced ones is proportional.
+    async fn purge_orphan_node_blobs(&self) {
+        let referenced: std::collections::BTreeSet<u64> = self
+            .index
+            .node_ids()
+            .into_iter()
+            .chain(self.index.removed_node_ids())
+            .collect();
+
+        let dir = Hnsw::dir_path(&self.name);
+        let mut stream = self.storage.list_meta(Some(&dir), None);
+        let mut orphans: Vec<u64> = Vec::new();
+        while let Some(meta) = stream.next().await {
+            let Ok(meta) = meta else {
+                // Listing failures must not fail bootstrap; the sweep is
+                // retried on the next open.
+                return;
+            };
+            if let Some(id) = meta
+                .location
+                .filename()
+                .and_then(|f| f.strip_prefix("n_"))
+                .and_then(|f| f.strip_suffix(".cbor"))
+                .and_then(|id| id.parse::<u64>().ok())
+                && !referenced.contains(&id)
+            {
+                orphans.push(id);
+            }
+        }
+
+        for id in orphans {
+            let path = Hnsw::node_path(&self.name, id);
+            match self.storage.delete(&path).await {
+                Ok(()) | Err(DBError::NotFound { .. }) => {
+                    log::warn!(
+                        action = "Hnsw::purge_orphan_node_blobs",
+                        index = self.name,
+                        node_id = id;
+                        "Deleted orphan HNSW node blob left by a crash",
+                    );
+                }
+                Err(err) => {
+                    log::warn!(
+                        action = "Hnsw::purge_orphan_node_blobs",
+                        index = self.name,
+                        node_id = id;
+                        "Failed to delete orphan HNSW node blob: {err:?}",
+                    );
+                }
+            }
+        }
     }
 
     /// Persists one versioned artifact with a single conditional PUT: the
@@ -446,6 +510,43 @@ mod tests {
             .insert(1, vec![bf16::from_f32(1.0), bf16::from_f32(1.0)], 2)
             .unwrap();
         (index, storage, object_store)
+    }
+
+    /// A crash between the ids PUT (node already excluded) and the metadata
+    /// PUT (tombstone never persisted) leaves an unreferenced node blob that
+    /// no load or purge would ever visit. Bootstrap must sweep it while
+    /// keeping every referenced blob.
+    #[tokio::test]
+    async fn bootstrap_sweeps_orphan_node_blobs() {
+        let (index, storage, _object_store) = fault_index().await;
+        assert!(index.flush(3).await.unwrap());
+
+        // Simulate the crash leftover: a blob at an id that neither the ids
+        // set nor the tombstone set references.
+        storage
+            .put_bytes(
+                &Hnsw::node_path("embedding", 99),
+                Bytes::from_static(b"orphan"),
+                PutMode::Overwrite,
+            )
+            .await
+            .unwrap();
+
+        let reopened = Hnsw::bootstrap("embedding".to_string(), storage.clone())
+            .await
+            .unwrap();
+        assert_eq!(reopened.search(&[1.0, 1.0], 1), vec![(1, 0.0)]);
+        assert!(matches!(
+            storage.fetch_bytes(&Hnsw::node_path("embedding", 99)).await,
+            Err(DBError::NotFound { .. })
+        ));
+        // The referenced blob survives the sweep.
+        assert!(
+            storage
+                .fetch_bytes(&Hnsw::node_path("embedding", 1))
+                .await
+                .is_ok()
+        );
     }
 
     async fn assert_retry_recovers(index: &Hnsw, storage: &Storage) {

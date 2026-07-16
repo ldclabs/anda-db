@@ -2073,6 +2073,14 @@ impl HnswIndex {
         !self.removed_nodes.read().is_empty()
     }
 
+    /// Returns the removed-node tombstones whose persisted blobs have not
+    /// been purged yet. Callers sweeping storage for orphan blobs must treat
+    /// these ids as referenced: their deletion belongs to
+    /// [`Self::purge_removed_nodes`].
+    pub fn removed_node_ids(&self) -> Vec<u64> {
+        self.removed_nodes.read().iter().copied().collect()
+    }
+
     /// Hands every removed node id to the caller so it can delete the
     /// corresponding persisted node blob.
     ///

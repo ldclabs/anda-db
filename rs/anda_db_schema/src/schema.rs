@@ -37,6 +37,15 @@ pub struct Schema {
     /// Monotonic schema version. A higher value indicates a newer schema.
     /// Used by [`Schema::upgrade_with`] to authorize migrations.
     version: u64,
+    /// High-water mark (exclusive) of every field index this schema lineage
+    /// has ever allocated, persisted across upgrades. It serves two
+    /// purposes: [`Schema::upgrade_with`] allocates new indexes from here so
+    /// a removed top field's index can never be reused, and
+    /// [`Schema::allocated_idx_end`] lets document decoding distinguish
+    /// stale values of removed fields (silently droppable) from foreign or
+    /// corrupt indexes (an error). `0` in schemas persisted by older
+    /// versions; readers fall back to `max(idx) + 1`.
+    next_idx: usize,
 }
 
 impl Schema {
@@ -91,10 +100,12 @@ impl Schema {
             )));
         }
 
-        // Find the maximum index used in the old schema to allocate new indexes after it.
-        // The first pass only validates, so that `self` stays untouched when any
-        // field is rejected.
-        let mut next_idx = old.idx.last().copied().unwrap_or(0) + 1;
+        // Allocate new indexes from the old schema's high-water mark: this
+        // covers indexes of removed fields too (including a removed *top*
+        // field, which `max(idx) + 1` alone would reuse). The first pass
+        // only validates, so that `self` stays untouched when any field is
+        // rejected.
+        let mut next_idx = old.allocated_idx_end();
         for (name, field) in self.fields.iter() {
             if let Some(old_field) = old.fields.get(name) {
                 // Field exists in both: the type must not change.
@@ -135,7 +146,7 @@ impl Schema {
         }
 
         // Second pass: apply the index assignments (infallible).
-        let mut next_idx = old.idx.last().copied().unwrap_or(0) + 1;
+        let mut next_idx = old.allocated_idx_end();
         for (name, field) in self.fields.iter_mut() {
             if let Some(old_field) = old.fields.get(name) {
                 // Field exists in both: inherit the persisted idx.
@@ -148,8 +159,10 @@ impl Schema {
             }
         }
 
-        // Rebuild the idx set from the updated fields.
+        // Rebuild the idx set from the updated fields and carry the
+        // allocation watermark forward.
         self.idx = self.fields.values().map(|f| f.idx()).collect();
+        self.next_idx = next_idx;
         Ok(())
     }
 
@@ -185,6 +198,18 @@ impl Schema {
     /// indexes are never reused).
     pub fn contains_idx(&self, idx: usize) -> bool {
         self.idx.contains(&idx)
+    }
+
+    /// Returns the exclusive upper bound of every field index this schema
+    /// lineage has ever allocated.
+    ///
+    /// An undeclared index below this bound belonged to a since-removed
+    /// field (its stale values are droppable); an index at or above it was
+    /// never allocated and marks foreign or corrupt data. Schemas persisted
+    /// before the watermark existed fall back to `max(declared idx) + 1`.
+    pub fn allocated_idx_end(&self) -> usize {
+        self.next_idx
+            .max(self.idx.last().map_or(0, |last| last + 1))
     }
 
     /// Gets a field by name.
@@ -261,6 +286,7 @@ impl Schema {
 struct SchemaRef<'a> {
     fields: Vec<&'a FieldEntry>,
     version: u64,
+    next_idx: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -268,6 +294,10 @@ struct SchemaOwned {
     fields: Vec<FieldEntry>,
     #[serde(default)]
     version: u64,
+    /// Missing in schemas persisted by older versions; `Schema::allocated_idx_end`
+    /// falls back to `max(idx) + 1`.
+    #[serde(default)]
+    next_idx: usize,
 }
 
 impl Serialize for Schema {
@@ -278,6 +308,7 @@ impl Serialize for Schema {
         let val = SchemaRef {
             fields: self.fields.values().collect(),
             version: self.version,
+            next_idx: self.allocated_idx_end(),
         };
         val.serialize(serializer)
     }
@@ -354,6 +385,7 @@ impl<'de> Deserialize<'de> for Schema {
             idx,
             fields,
             version: val.version,
+            next_idx: val.next_idx,
         })
     }
 }
@@ -477,8 +509,10 @@ impl SchemaBuilder {
             ));
         }
 
+        let idx: BTreeSet<usize> = self.fields.values().map(|f| f.idx()).collect();
         Ok(Schema {
-            idx: self.fields.values().map(|f| f.idx()).collect(),
+            next_idx: idx.last().map_or(0, |last| last + 1),
+            idx,
             fields: self.fields,
             version: self.version,
         })

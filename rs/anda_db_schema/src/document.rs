@@ -105,7 +105,7 @@ impl Document {
     /// # Returns
     /// * `Result<Self, SchemaError>` - The validated Document or an error
     pub fn try_from_doc(schema: Arc<Schema>, mut doc: DocumentOwned) -> Result<Self, SchemaError> {
-        doc.fields.retain(|idx, _| schema.contains_idx(*idx));
+        Self::drop_retired_fields(&schema, &mut doc.fields)?;
         Self::normalize_fields(&schema, &mut doc.fields);
         schema.validate(&doc.fields)?;
 
@@ -113,6 +113,31 @@ impl Document {
             fields: doc.fields,
             schema,
         })
+    }
+
+    /// Drops values stored under indexes of since-removed fields, and
+    /// rejects values under indexes this schema lineage never allocated.
+    ///
+    /// Removed-field leftovers are the only legitimate source of undeclared
+    /// indexes *below* the allocation watermark ([`Schema::upgrade_with`]
+    /// never reuses them), so those are safe to discard silently. An index at
+    /// or above the watermark means the bytes belong to a different schema
+    /// lineage — corrupt data, the wrong collection, or a newer writer — and
+    /// silently deleting such data on the next rewrite would be destructive.
+    fn drop_retired_fields(
+        schema: &Schema,
+        fields: &mut IndexedFieldValues,
+    ) -> Result<(), SchemaError> {
+        let allocated_end = schema.allocated_idx_end();
+        if let Some(idx) = fields.keys().find(|idx| **idx >= allocated_end) {
+            return Err(SchemaError::Validation(format!(
+                "document contains field index {idx} that this schema \
+                 (allocation watermark {allocated_end}) never declared; \
+                 refusing to silently drop foreign or corrupt data"
+            )));
+        }
+        fields.retain(|idx, _| schema.contains_idx(*idx));
+        Ok(())
     }
 
     /// Normalizes read-back value shapes into the schema's canonical
@@ -408,9 +433,10 @@ impl Document {
 
     /// Updates the document with values from a DocumentOwned.
     ///
-    /// Values stored under an index the schema does not declare are dropped
-    /// and read-back value shapes are normalized into their canonical
-    /// variants, mirroring [`Document::try_from_doc`].
+    /// Values stored under indexes of since-removed fields are dropped,
+    /// values under never-allocated indexes are rejected, and read-back
+    /// value shapes are normalized into their canonical variants, mirroring
+    /// [`Document::try_from_doc`].
     ///
     /// # Arguments
     /// * `doc` - The DocumentOwned containing the new values
@@ -418,7 +444,7 @@ impl Document {
     /// # Returns
     /// * `Result<(), SchemaError>` - Success or an error
     pub fn set_doc(&mut self, mut doc: DocumentOwned) -> Result<(), SchemaError> {
-        doc.fields.retain(|idx, _| self.schema.contains_idx(*idx));
+        Self::drop_retired_fields(&self.schema, &mut doc.fields)?;
         Self::normalize_fields(&self.schema, &mut doc.fields);
         self.schema.validate(&doc.fields)?;
         self.fields = doc.fields;
@@ -916,18 +942,38 @@ mod tests {
 
     #[test]
     fn try_from_doc_drops_values_of_removed_schema_fields() {
-        // Simulate a schema upgrade that removed a field: the stored document
-        // still carries a value under the removed idx. It must be readable,
-        // with the stale value dropped.
-        let schema = Arc::new(TestUser::schema().unwrap());
-        let stale_idx = 99usize; // not declared by the schema
-        assert!(!schema.contains_idx(stale_idx));
+        // A real schema upgrade that removed a field: the stored document
+        // still carries a value under the retired idx (inside the allocation
+        // watermark). It must be readable, with the stale value dropped.
+        #[derive(Debug, Serialize, Deserialize, AndaDBSchema)]
+        struct UserV1 {
+            _id: u64,
+            name: String,
+            age: u64,
+            bio: Option<String>,
+        }
+
+        #[derive(Debug, Serialize, Deserialize, AndaDBSchema)]
+        struct UserV2 {
+            _id: u64,
+            name: String,
+            age: u64,
+        }
+
+        let v1 = UserV1::schema().unwrap();
+        let mut v2 = UserV2::schema().unwrap();
+        v2.with_version(v1.version() + 1);
+        v2.upgrade_with(&v1).unwrap();
+        let retired_idx = 3usize; // `bio` in v1, removed in v2
+        assert!(!v2.contains_idx(retired_idx));
+        assert_eq!(v2.allocated_idx_end(), 4);
+        let schema = Arc::new(v2);
 
         let mut fields = IndexedFieldValues::new();
         fields.insert(0, Fv::U64(7));
         fields.insert(1, Fv::Text("John".to_string()));
         fields.insert(2, Fv::U64(30));
-        fields.insert(stale_idx, Fv::Text("stale".to_string()));
+        fields.insert(retired_idx, Fv::Text("stale".to_string()));
 
         let doc = Document::try_from_doc(
             schema.clone(),
@@ -937,13 +983,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(doc.fields().len(), 3);
-        assert!(!doc.fields().contains_key(&stale_idx));
+        assert!(!doc.fields().contains_key(&retired_idx));
 
         // set_doc mirrors the lenient behaviour.
-        let mut doc2 = Document::new(schema);
-        doc2.set_doc(DocumentOwned { fields }).unwrap();
+        let mut doc2 = Document::new(schema.clone());
+        doc2.set_doc(DocumentOwned {
+            fields: fields.clone(),
+        })
+        .unwrap();
         assert_eq!(doc2.fields().len(), 3);
-        assert!(!doc2.fields().contains_key(&stale_idx));
+        assert!(!doc2.fields().contains_key(&retired_idx));
+
+        // An index this schema lineage never allocated marks foreign or
+        // corrupt data: it is rejected instead of being silently dropped.
+        fields.insert(99, Fv::Text("foreign".to_string()));
+        assert!(
+            Document::try_from_doc(
+                schema.clone(),
+                DocumentOwned {
+                    fields: fields.clone(),
+                },
+            )
+            .is_err()
+        );
+        let mut doc3 = Document::new(schema);
+        assert!(doc3.set_doc(DocumentOwned { fields }).is_err());
     }
 
     #[test]
