@@ -234,7 +234,8 @@ fn recall_survives_deletions() {
 fn recall_survives_heavy_deletions() {
     // A deliberately sparse graph (small M / ef) so that lost connectivity
     // actually shows up as lost recall instead of being masked by the very
-    // dense default configuration.
+    // dense default configuration. Neighbor repair is opt-in since 0.10.0;
+    // this benchmark exercises exactly that feature, so enable it.
     let mut bench = Bench::build_with(
         HnswConfig {
             dimension: 32,
@@ -242,6 +243,7 @@ fn recall_survives_heavy_deletions() {
             max_connections: 6,
             ef_construction: 40,
             ef_search: 40,
+            reconnect_on_delete: true,
             ..Default::default()
         },
         2000,
@@ -303,7 +305,10 @@ fn recall_survives_delete_reinsert_churn() {
         // Delete a third of the corpus, always including the entry point.
         let victims: Vec<u64> = (1..=600u64).filter(|id| (id + round) % 3 == 0).collect();
         for id in &victims {
-            assert!(bench.index.remove(*id, round), "remove({id}) returned false");
+            assert!(
+                bench.index.remove(*id, round),
+                "remove({id}) returned false"
+            );
             bench.data.remove(id);
         }
         // Re-insert fresh vectors under the same ids.
@@ -319,8 +324,14 @@ fn recall_survives_delete_reinsert_churn() {
 
     let (avg, min) = bench.measure(&bench.index);
     println!("after churn: avg recall@10 = {avg:.4}, min = {min:.4}");
-    assert!(avg >= 0.93, "average recall@10 after churn too low: {avg:.4}");
-    assert!(min >= 0.60, "worst-case recall@10 after churn too low: {min:.4}");
+    assert!(
+        avg >= 0.93,
+        "average recall@10 after churn too low: {avg:.4}"
+    );
+    assert!(
+        min >= 0.60,
+        "worst-case recall@10 after churn too low: {min:.4}"
+    );
 }
 
 /// A flush/load round-trip must preserve retrieval quality.

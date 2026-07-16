@@ -26,14 +26,10 @@ use smallvec::SmallVec;
 use std::{
     borrow::Cow,
     cmp::{self, Reverse},
-    collections::{BTreeMap, BTreeSet, BinaryHeap, hash_map::Entry},
+    collections::{BTreeSet, BinaryHeap, hash_map::Entry},
     future::Future,
     io::{Read, Write},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
-    task::{Context, Poll, Waker},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 pub use half;
@@ -80,7 +76,6 @@ pub struct HnswIndex {
     /// that synchronous lock before doing I/O, and then persists the immutable
     /// snapshot. Serializing those passes prevents an older snapshot from
     /// overwriting node or id objects after a newer snapshot has committed.
-    persistence_lock: Arc<PersistenceGate>,
 
     /// Lock-free id → node map backing the graph.
     ///
@@ -116,7 +111,6 @@ pub struct HnswIndex {
     /// `nodes` (all mutations happen under `structural_lock`; the loaders
     /// rebuild it) so that removing the entry point or a top-layer node can
     /// find a replacement without an O(N) scan over all nodes.
-    nodes_by_layer: Mutex<BTreeMap<u8, BTreeSet<u64>>>,
 
     /// Total number of queries served (exposed via `stats()`).
     search_count: AtomicU64,
@@ -161,32 +155,29 @@ pub struct HnswConfig {
     pub select_neighbors_strategy: SelectNeighborsStrategy,
 
     /// Whether [`HnswIndex::remove`] repairs the graph around a deleted node
-    /// by re-linking its former neighbors to each other. Default `true`.
+    /// by re-linking its former neighbors to each other. Default `false`.
     ///
-    /// * `true` (default) — after pruning the reverse edges, the deleted
-    ///   node's remaining neighbors are merged into each affected neighbor's
+    /// * `false` (default) — deletion only drops the reverse edges (a cheap
+    ///   `swap_remove` per affected neighbor) and returns immediately. Bulk
+    ///   deletions are fast, but every deletion strictly reduces the
+    ///   survivors' connectivity: under delete-heavy workloads recall can
+    ///   degrade and a cluster reachable only through deleted nodes can
+    ///   become unreachable. Compensate with periodic rebuilds (or
+    ///   re-inserts of affected regions) when deletions dominate.
+    /// * `true` — after pruning the reverse edges, the deleted node's
+    ///   remaining neighbors are merged into each affected neighbor's
     ///   candidate set and the configured [`SelectNeighborsStrategy`]
     ///   re-selects its edges. This keeps the local subgraph connected, so
     ///   recall stays stable even under heavy deletion workloads — but the
     ///   repair runs `O(M²·L)` distance computations **while holding the
     ///   index's structural write lock**, which can slow bulk deletions by
     ///   orders of magnitude.
-    /// * `false` — deletion only drops the reverse edges (a cheap
-    ///   `swap_remove` per affected neighbor) and returns immediately. Bulk
-    ///   deletions are much faster, but every deletion strictly reduces the
-    ///   survivors' connectivity: after many deletions recall degrades and a
-    ///   cluster reachable only through deleted nodes can become unreachable.
-    ///   Prefer this mode only when deletions are frequent and you compensate
-    ///   with periodic index rebuilds (or re-inserts of affected regions).
     ///
-    /// Metadata persisted by older versions of this crate lacks the field and
-    /// deserializes to `true`, preserving the previous behavior.
-    #[serde(default = "default_reconnect_on_delete")]
+    /// Metadata persisted without the field (crate versions before 0.9.2 and
+    /// from 0.10.0 defaults) deserializes to `false`, matching the behavior
+    /// those indexes were built with.
+    #[serde(default)]
     pub reconnect_on_delete: bool,
-}
-
-fn default_reconnect_on_delete() -> bool {
-    true
 }
 
 impl HnswConfig {
@@ -342,7 +333,7 @@ impl Default for HnswConfig {
             distance_metric: DistanceMetric::Euclidean,
             scale_factor: None,
             select_neighbors_strategy: SelectNeighborsStrategy::Heuristic,
-            reconnect_on_delete: true,
+            reconnect_on_delete: false,
         }
     }
 }
@@ -488,63 +479,6 @@ struct HnswFlushSnapshot {
     metadata: Vec<u8>,
 }
 
-/// Minimal runtime-independent async mutex used to serialize persistence I/O.
-///
-/// `anda_db_hnsw` intentionally has no runtime dependency. Waiters are parked
-/// as standard task wakers behind a short-lived synchronous mutex; the guard
-/// itself is `Send`, so a database auto-flush can still run in `tokio::spawn`.
-#[derive(Default)]
-struct PersistenceGate {
-    locked: AtomicBool,
-    waiters: Mutex<Vec<Waker>>,
-}
-
-impl PersistenceGate {
-    async fn lock(self: Arc<Self>) -> PersistenceGuard {
-        std::future::poll_fn(|cx| self.poll_lock(cx)).await
-    }
-
-    fn poll_lock(self: &Arc<Self>, cx: &mut Context<'_>) -> Poll<PersistenceGuard> {
-        if self
-            .locked
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-        {
-            return Poll::Ready(PersistenceGuard { gate: self.clone() });
-        }
-
-        // Hold the waiter mutex across the second acquire attempt. This closes
-        // the lost-wakeup window with `PersistenceGuard::drop`, which releases
-        // `locked` before taking the same mutex to drain waiters.
-        let mut waiters = self.waiters.lock();
-        if self
-            .locked
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-        {
-            return Poll::Ready(PersistenceGuard { gate: self.clone() });
-        }
-        if !waiters.iter().any(|waker| waker.will_wake(cx.waker())) {
-            waiters.push(cx.waker().clone());
-        }
-        Poll::Pending
-    }
-}
-
-struct PersistenceGuard {
-    gate: Arc<PersistenceGate>,
-}
-
-impl Drop for PersistenceGuard {
-    fn drop(&mut self) {
-        self.gate.locked.store(false, Ordering::Release);
-        let waiters = std::mem::take(&mut *self.gate.waiters.lock());
-        for waker in waiters {
-            waker.wake();
-        }
-    }
-}
-
 impl HnswIndex {
     /// Maximum number of in-flight node loads used by [`Self::load_nodes`].
     pub const LOAD_NODES_CONCURRENCY: usize = 32;
@@ -553,33 +487,6 @@ impl HnswIndex {
     /// being removed concurrently (each retry re-reads the repaired entry
     /// point).
     pub const SEARCH_MAX_ATTEMPTS: usize = 3;
-
-    /// Compares two persisted metadata payloads while ignoring only the
-    /// observational `last_saved` timestamp.
-    ///
-    /// Object-store wrappers use this after a conditional PUT reports a stale
-    /// version: a previous attempt may have committed durably and then been
-    /// cancelled before its returned object version was observed. Accepting a
-    /// read-back is safe only when the complete logical commit record
-    /// (entry-point, tombstones, configuration, and graph version) matches.
-    pub fn metadata_payloads_logically_equal(left: &[u8], right: &[u8]) -> Result<bool, HnswError> {
-        let decode = |data: &[u8]| -> Result<HnswIndexOwned, HnswError> {
-            cbor2::from_reader(data).map_err(|err| HnswError::Serialization {
-                name: "unknown".to_string(),
-                source: err.into(),
-            })
-        };
-
-        let mut left = decode(left)?;
-        let mut right = decode(right)?;
-        left.metadata.config = left.metadata.config.normalized();
-        right.metadata.config = right.metadata.config.normalized();
-        left.metadata.stats.last_saved = 0;
-        right.metadata.stats.last_saved = 0;
-        left.metadata.stats.search_count = 0;
-        right.metadata.stats.search_count = 0;
-        Ok(left == right)
-    }
 
     /// Pending removed-node tombstone count at which [`Self::remove`] starts
     /// warning (once per further multiple) that
@@ -619,7 +526,6 @@ impl HnswIndex {
             config: config.clone(),
             layer_gen,
             structural_lock: Mutex::new(()),
-            persistence_lock: Arc::new(PersistenceGate::default()),
             nodes: CoHashMap::new(),
             entry_point: RwLock::new((0, 0)),
             metadata: RwLock::new(HnswMetadata {
@@ -630,7 +536,6 @@ impl HnswIndex {
             dirty_nodes: RwLock::new(BTreeSet::new()),
             removed_nodes: RwLock::new(BTreeSet::new()),
             ids: RwLock::new(Treemap::new()),
-            nodes_by_layer: Mutex::new(BTreeMap::new()),
             search_count: AtomicU64::new(0),
             last_saved_version: AtomicU64::new(0),
         }
@@ -691,14 +596,12 @@ impl HnswIndex {
             config: index.metadata.config.clone(),
             layer_gen,
             structural_lock: Mutex::new(()),
-            persistence_lock: Arc::new(PersistenceGate::default()),
             nodes: CoHashMap::new(),
             entry_point: RwLock::new(entry_point),
             metadata: RwLock::new(index.metadata),
             dirty_nodes: RwLock::new(BTreeSet::new()),
             removed_nodes: RwLock::new(index.removed_nodes.into_iter().collect()),
             ids: RwLock::new(Treemap::new()),
-            nodes_by_layer: Mutex::new(BTreeMap::new()),
             search_count,
             last_saved_version,
         })
@@ -800,8 +703,6 @@ impl HnswIndex {
                 LoadedNode::Missing(id) => missing_ids.push(id),
             }
         }
-
-        self.rebuild_nodes_by_layer();
 
         if !missing_ids.is_empty() {
             {
@@ -1069,7 +970,6 @@ impl HnswIndex {
                 },
             );
             self.ids.write().add(id);
-            self.track_node_layer(id, layer);
             *self.entry_point.write() = (id, layer);
             self.dirty_nodes.write().insert(id); // Mark the node as dirty for persistence
             // A re-inserted id must not have its (new) blob purged by a
@@ -1203,7 +1103,6 @@ impl HnswIndex {
 
         nodes.insert(id, new_node);
         self.ids.write().add(id);
-        self.track_node_layer(id, layer);
         // A re-inserted id must not have its (new) blob purged by a pending
         // tombstone from an earlier remove().
         self.removed_nodes.write().remove(&id);
@@ -1352,20 +1251,16 @@ impl HnswIndex {
         };
 
         let previous_max_layer = self.metadata.read().stats.max_layer;
-        self.untrack_node_layer(id, node.layer);
         let entry_was_removed = self.entry_point.read().0 == id;
         let replacement_entry = if entry_was_removed {
-            // O(log N): pick a live node on the highest tracked layer. Fall
-            // back to a full scan if the tracker ever desynchronizes from
-            // `nodes` (e.g. state assembled without going through `insert`).
-            match self.highest_tracked_node() {
-                Some((nid, layer)) if nodes.contains_key(&nid) => Some((nid, layer)),
-                _ => nodes
-                    .iter()
-                    .filter(|(node_id, _)| **node_id != id)
-                    .max_by_key(|(_, node)| node.layer)
-                    .map(|(_, node)| (node.id, node.layer)),
-            }
+            // O(N) scan for the live node on the highest layer. Entry-point
+            // deletions are rare, and the scan avoids maintaining a mirror
+            // per-layer tracker that must stay synchronized with `nodes`.
+            nodes
+                .iter()
+                .filter(|(node_id, _)| **node_id != id)
+                .max_by_key(|(_, node)| node.layer)
+                .map(|(_, node)| (node.id, node.layer))
         } else {
             None
         };
@@ -1405,10 +1300,9 @@ impl HnswIndex {
         let recalculated_max_layer = if entry_was_removed {
             Some(replacement_entry.map_or(0, |(_, layer)| layer))
         } else if node.layer >= previous_max_layer {
-            Some(
-                self.max_tracked_layer()
-                    .unwrap_or_else(|| nodes.iter().map(|(_, node)| node.layer).max().unwrap_or(0)),
-            )
+            // Removing a node at the current max layer: recompute with a
+            // scan (`id` was already removed from `nodes` above).
+            Some(nodes.iter().map(|(_, node)| node.layer).max().unwrap_or(0))
         } else {
             None
         };
@@ -2064,8 +1958,14 @@ impl HnswIndex {
     /// conditional update) in production. A failure or cooperative stop before
     /// that callback leaves both the saved-version watermark and every dirty
     /// node pending for retry. Concurrent mutations are captured by the next
-    /// generation, and concurrent flushes are serialized so an older snapshot
-    /// cannot overwrite objects from a newer one.
+    /// generation.
+    ///
+    /// # Caller contract
+    ///
+    /// Persistence calls (`flush*`, `purge_removed_nodes`, `store_*`) must be
+    /// serialized by the caller: overlapping flushes could upload an older
+    /// snapshot over a newer one. `anda_db`'s `Collection` already guarantees
+    /// this by holding its exclusive operation gate across every flush.
     ///
     /// Removed-node blobs are not deleted here. Call
     /// [`Self::purge_removed_nodes`] only after this method returns success.
@@ -2084,7 +1984,6 @@ impl HnswIndex {
         M: FnOnce(Vec<u8>) -> MFut,
         MFut: Future<Output = Result<(), BoxError>>,
     {
-        let _persistence_guard = self.persistence_lock.clone().lock().await;
         let Some(snapshot) = self.capture_flush_snapshot(now_ms)? else {
             return Ok(false);
         };
@@ -2134,7 +2033,6 @@ impl HnswIndex {
     where
         F: AsyncFnMut(u64, &[u8]) -> Result<bool, BoxError>,
     {
-        let _persistence_guard = self.persistence_lock.clone().lock().await;
         let Some(snapshot) = self.capture_flush_snapshot(now_ms)? else {
             return Ok(false);
         };
@@ -2202,7 +2100,6 @@ impl HnswIndex {
     where
         F: AsyncFnMut(u64) -> Result<bool, BoxError>,
     {
-        let _persistence_guard = self.persistence_lock.clone().lock().await;
         // Never move tombstones out of the authoritative set before an await:
         // dropping this future at any callback boundary must leave the current
         // and remaining ids retryable. Each successful callback retires its id
@@ -2345,7 +2242,6 @@ impl HnswIndex {
     where
         F: AsyncFnOnce(&[u8]) -> Result<(), BoxError>,
     {
-        let _persistence_guard = self.persistence_lock.clone().lock().await;
         let (version, last_saved, buf) = {
             // Keep entry-point, tombstones and metadata in one structural
             // generation while building the immutable payload. The guard is
@@ -2431,7 +2327,6 @@ impl HnswIndex {
     where
         F: AsyncFnMut(u64, &[u8]) -> Result<bool, BoxError>,
     {
-        let _persistence_guard = self.persistence_lock.clone().lock().await;
         // Iterate an immutable id snapshot. Dirty evidence remains in the
         // authoritative set until the corresponding callback succeeds, so
         // dropping this future at an await boundary is inherently retryable.
@@ -2497,7 +2392,6 @@ impl HnswIndex {
     /// Also resynchronizes the per-layer id tracker from the authoritative
     /// node map, since this method is the self-heal path for corrupted state.
     fn repair_entry_point(&self) -> u8 {
-        self.rebuild_nodes_by_layer();
         let nodes = self.nodes.pin();
         let max_layer = if let Some((_, node)) = nodes.iter().max_by_key(|(_, node)| node.layer) {
             *self.entry_point.write() = (node.id, node.layer);
@@ -2517,51 +2411,6 @@ impl HnswIndex {
         }
 
         max_layer
-    }
-
-    /// Records `id` as living on `layer` in the per-layer tracker.
-    fn track_node_layer(&self, id: u64, layer: u8) {
-        self.nodes_by_layer
-            .lock()
-            .entry(layer)
-            .or_default()
-            .insert(id);
-    }
-
-    /// Removes `id` from the per-layer tracker.
-    fn untrack_node_layer(&self, id: u64, layer: u8) {
-        let mut by_layer = self.nodes_by_layer.lock();
-        if let Some(ids) = by_layer.get_mut(&layer) {
-            ids.remove(&id);
-            if ids.is_empty() {
-                by_layer.remove(&layer);
-            }
-        }
-    }
-
-    /// Rebuilds the per-layer tracker from the authoritative node map.
-    fn rebuild_nodes_by_layer(&self) {
-        let nodes = self.nodes.pin();
-        let mut by_layer: BTreeMap<u8, BTreeSet<u64>> = BTreeMap::new();
-        for (id, node) in nodes.iter() {
-            by_layer.entry(node.layer).or_default().insert(*id);
-        }
-        *self.nodes_by_layer.lock() = by_layer;
-    }
-
-    /// Returns `(id, layer)` of some node on the highest tracked layer, or
-    /// `None` when the tracker is empty.
-    fn highest_tracked_node(&self) -> Option<(u64, u8)> {
-        let by_layer = self.nodes_by_layer.lock();
-        by_layer
-            .iter()
-            .next_back()
-            .and_then(|(layer, ids)| ids.iter().next().map(|id| (*id, *layer)))
-    }
-
-    /// Returns the highest tracked layer, or `None` when the tracker is empty.
-    fn max_tracked_layer(&self) -> Option<u8> {
-        self.nodes_by_layer.lock().keys().next_back().copied()
     }
 
     /// Removes all edges that point to node blobs missing during bootstrap.
@@ -2619,6 +2468,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::io;
+    use std::sync::{Arc, atomic::AtomicBool};
 
     struct FailingWriter;
 
@@ -3151,9 +3001,10 @@ mod tests {
     }
 
     #[test]
-    fn test_config_reconnect_on_delete_defaults_to_true_for_legacy_metadata() {
+    fn test_config_reconnect_on_delete_defaults_to_false_for_legacy_metadata() {
         // Metadata persisted before the field existed must deserialize with
-        // the repair enabled (the previous behavior).
+        // the repair disabled: those indexes were built without neighbor
+        // repair, and 0.10.0 makes that the default again.
         #[derive(Serialize)]
         struct LegacyConfig {
             dimension: usize,
@@ -3179,17 +3030,17 @@ mod tests {
         let mut buf = Vec::new();
         cbor2::to_writer(&legacy, &mut buf).unwrap();
         let config: HnswConfig = cbor2::from_reader(&buf[..]).unwrap();
-        assert!(config.reconnect_on_delete);
+        assert!(!config.reconnect_on_delete);
 
-        // And a round-trip of the current config preserves an explicit false.
+        // And a round-trip of the current config preserves an explicit true.
         let current = HnswConfig {
-            reconnect_on_delete: false,
+            reconnect_on_delete: true,
             ..Default::default()
         };
         let mut buf = Vec::new();
         cbor2::to_writer(&current, &mut buf).unwrap();
         let config: HnswConfig = cbor2::from_reader(&buf[..]).unwrap();
-        assert!(!config.reconnect_on_delete);
+        assert!(config.reconnect_on_delete);
     }
 
     #[tokio::test]
