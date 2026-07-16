@@ -45,35 +45,32 @@
 //! ## Persistence Model
 //!
 //! The library never writes to disk itself — callers supply async closures to
-//! [`BTreeIndex::flush`] / [`BTreeIndex::flush_with`]. A flush captures one
-//! immutable mutation generation, then persists it in three phases:
+//! [`BTreeIndex::flush`] / [`BTreeIndex::flush_owned_with`]. Every dirty
+//! bucket is written to a **fresh** immutable object keyed by
+//! `(bucket_id, generation)`, then the metadata — whose *manifest* maps every
+//! live bucket id to its current generation — is committed last. The metadata
+//! write is the single atomic commit point:
 //!
-//! 1. newly allocated migration-target buckets not covered by the persisted
-//!    metadata;
-//! 2. the metadata that extends the loader's bucket range;
-//! 3. rewrites of old source buckets from which postings migrated.
+//! - A crash or error before the commit leaves the new objects as
+//!   unreferenced garbage; a loader still sees the previous complete
+//!   snapshot.
+//! - After the commit, the replaced objects are garbage; they are returned
+//!   as [`FlushOutcome::obsolete`] for best-effort deletion.
 //!
-//! [`BTreeIndex::store_metadata`] and [`BTreeIndex::store_dirty_buckets`] remain
-//! available as low-level building blocks, but callers that need crash safety
-//! should use the coordinated flush rather than composing them independently.
+//! Metadata persisted by pre-manifest releases (no manifest, un-suffixed
+//! bucket objects) is still loadable: the loader falls back to scanning
+//! bucket ids `0..=max_bucket_id` at generation `0` and keeps the legacy
+//! reconciliation (higher bucket id wins for duplicated postings, empty
+//! postings are tombstones). The first flush upgrades the durable layout to
+//! the manifest format.
 //!
-//! Each bucket carries a `dirty_version` counter. After the caller persists a
-//! bucket, the bucket is marked clean **only if** its `dirty_version` has not
-//! changed during the I/O — this preserves correctness when concurrent writers
-//! mutate the same bucket while it is being written out.
+//! ## Concurrency contract
 //!
-//! ## Durability Guarantees
-//!
-//! - Metadata and bucket files together form a consistent snapshot:
-//!   `max_bucket_id` in metadata bounds the valid bucket id space when
-//!   replaying via [`BTreeIndex::load_all`] / [`BTreeIndex::load_buckets`].
-//! - A posting migration across buckets marks both the source and destination
-//!   buckets dirty. The destination is made durable before metadata, and the
-//!   source is shortened only afterwards, so every crash boundary retains at
-//!   least one visible copy of the posting.
-//! - Mutations that overlap async persistence remain outside the immutable
-//!   flush snapshot and dirty for the next generation; a newly allocated
-//!   bucket can never leak into metadata before its payload is durable.
+//! Concurrent `insert*`/`remove*`/query calls are safe. Coordinating
+//! mutations against `flush`/`compact_buckets`, and flushes against each
+//! other, is the **caller's** responsibility (`anda_db`'s `Collection` holds
+//! an exclusive operation gate across every flush). A single writer per
+//! durable index is a deployment contract.
 //!
 //! ## Features
 //!
@@ -91,19 +88,16 @@
 
 use anda_db_utils::UniqueVec;
 use dashmap::DashMap;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fmt::Debug,
+    future::Future,
     hash::Hash,
     io::{Read, Write},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
-    },
-    task::{Context, Poll, Waker},
+    sync::atomic::{AtomicU32, AtomicU64, Ordering},
 };
 
 use crate::{BTreeError, BoxError};
@@ -258,28 +252,31 @@ where
     /// Version of the last successfully persisted metadata.
     /// Prevents re-serializing identical metadata.
     last_saved_version: AtomicU64,
+}
 
-    /// Number of dirty buckets pending persistence.
-    ///
-    /// Used as a fast-path guard in [`BTreeIndex::flush`] /
-    /// [`BTreeIndex::store_dirty_buckets`] to avoid scanning `buckets` when
-    /// nothing is dirty.
-    dirty_bucket_count: AtomicU32,
+/// Identifies one durable bucket object.
+///
+/// A bucket's content is stored in immutable, generation-suffixed objects.
+/// `generation == 0` refers to the legacy (pre-manifest) object that was
+/// keyed by bucket id alone; generations `>= 1` are produced by the manifest
+/// protocol and each flush writes replaced buckets to a **new** generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BucketObject {
+    /// Stable bucket id.
+    pub bucket_id: u32,
+    /// Object generation; `0` denotes the legacy un-suffixed object.
+    pub generation: u64,
+}
 
-    /// Exclusive upper bound of bucket ids covered by the last persisted
-    /// metadata snapshot. Zero means metadata has not been persisted yet.
-    saved_bucket_watermark: AtomicU64,
-
-    /// Shared by synchronous mutations and exclusively held only while flush
-    /// clones a cross-bucket snapshot. The exclusive guard is dropped before
-    /// any async persistence callback is invoked.
-    mutation_gate: RwLock<()>,
-
-    /// Serializes complete async persistence transactions. Snapshot payloads
-    /// are immutable, but allowing an older flush to resume after a newer one
-    /// can still overwrite a newer bucket with stale bytes and clear its dirty
-    /// evidence. The guard therefore spans every persistence callback.
-    persistence_lock: Arc<PersistenceGate>,
+/// Result of a [`BTreeIndex::flush`] / [`BTreeIndex::flush_owned_with`] call.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FlushOutcome {
+    /// Whether anything (metadata and possibly buckets) was persisted.
+    pub saved: bool,
+    /// Bucket objects that the newly committed manifest no longer references.
+    /// The caller should delete them best-effort; a failed deletion only
+    /// leaks storage space and never affects future loads.
+    pub obsolete: Vec<BucketObject>,
 }
 
 /// Posting list for a single field value: `(bucket_id, update_version, doc_ids)`.
@@ -344,6 +341,16 @@ pub struct BTreeMetadata {
 
     /// Index statistics
     pub stats: BTreeStats,
+
+    /// Bucket manifest: `bucket_id -> generation` of the durable object that
+    /// currently holds the bucket's content (`0` = legacy un-suffixed object).
+    ///
+    /// The manifest is the loader's single source of truth: a posting exists
+    /// only in the bucket objects it references. Metadata persisted before
+    /// the manifest protocol deserializes with an empty map, which selects
+    /// the legacy bucket-id-scan load path.
+    #[serde(default)]
+    pub buckets: BTreeMap<u32, u64>,
 }
 
 /// Index statistics for monitoring and diagnostics
@@ -397,79 +404,6 @@ struct BucketPersistenceSnapshot {
     data: Vec<u8>,
 }
 
-/// Metadata payload and the logical generation it describes.
-struct MetadataPersistenceSnapshot {
-    version: u64,
-    max_bucket_id: u32,
-    last_saved: u64,
-    data: Vec<u8>,
-}
-
-/// Immutable, cross-bucket snapshot used by the crash-safe flush protocol.
-struct FlushPersistenceSnapshot {
-    persisted_bucket_watermark: u64,
-    max_bucket_id: u32,
-    metadata: Option<MetadataPersistenceSnapshot>,
-    buckets: Vec<BucketPersistenceSnapshot>,
-}
-
-/// Minimal runtime-independent async mutex used to serialize persistence I/O.
-///
-/// The index crate intentionally has no async-runtime dependency. Waiters are
-/// parked as standard task wakers behind a short-lived synchronous mutex; the
-/// guard is `Send`, so callers may still run a flush in a spawned task.
-#[derive(Default)]
-struct PersistenceGate {
-    locked: AtomicBool,
-    waiters: Mutex<Vec<Waker>>,
-}
-
-impl PersistenceGate {
-    async fn lock(self: Arc<Self>) -> PersistenceGuard {
-        std::future::poll_fn(|cx| self.poll_lock(cx)).await
-    }
-
-    fn poll_lock(self: &Arc<Self>, cx: &mut Context<'_>) -> Poll<PersistenceGuard> {
-        if self
-            .locked
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-        {
-            return Poll::Ready(PersistenceGuard { gate: self.clone() });
-        }
-
-        // Hold the waiter mutex across the second acquire attempt. This closes
-        // the lost-wakeup window with `PersistenceGuard::drop`, which releases
-        // `locked` before taking the same mutex to drain waiters.
-        let mut waiters = self.waiters.lock();
-        if self
-            .locked
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-        {
-            return Poll::Ready(PersistenceGuard { gate: self.clone() });
-        }
-        if !waiters.iter().any(|waker| waker.will_wake(cx.waker())) {
-            waiters.push(cx.waker().clone());
-        }
-        Poll::Pending
-    }
-}
-
-struct PersistenceGuard {
-    gate: Arc<PersistenceGate>,
-}
-
-impl Drop for PersistenceGuard {
-    fn drop(&mut self) {
-        self.gate.locked.store(false, Ordering::Release);
-        let waiters = std::mem::take(&mut *self.gate.waiters.lock());
-        for waker in waiters {
-            waker.wake();
-        }
-    }
-}
-
 // Helper structure for serialization and deserialization of bucket
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(bound(
@@ -485,7 +419,9 @@ where
     postings: FxHashMap<FV, PostingValue<PK>>,
 }
 
-// Reference structure for serializing bucket
+// Reference structure for serializing bucket (test-only: the flush path
+// serializes owned snapshots via `BucketOwned`).
+#[cfg(test)]
 #[derive(Serialize)]
 struct BucketRef<'a, PK, FV>
 where
@@ -660,16 +596,12 @@ where
 {
     /// Marks a bucket as dirty and bumps its `dirty_version`.
     ///
-    /// The `dirty_version` counter is sampled by [`Self::store_dirty_buckets`]
-    /// before writing the bucket, and re-checked after the async write
-    /// completes; if it has changed, the bucket remains dirty, ensuring
-    /// concurrent mutations during persistence are not lost.
+    /// The `dirty_version` counter is sampled while a flush serializes the
+    /// bucket and re-checked after the commit; if it has changed, the bucket
+    /// remains dirty for the next flush.
     fn mark_bucket_dirty(&self, bucket: &mut (usize, bool, UniqueVec<FV>, u64)) {
         bucket.3 = bucket.3.wrapping_add(1);
-        if !bucket.1 {
-            bucket.1 = true;
-            self.dirty_bucket_count.fetch_add(1, Ordering::Release);
-        }
+        bucket.1 = true;
     }
 
     fn serialize_bucket_snapshot(
@@ -714,42 +646,9 @@ where
         }))
     }
 
-    /// Captures metadata and every dirty bucket at one completed mutation
-    /// generation. The exclusive gate waits for synchronous mutations and is
-    /// released when this method returns, before any persistence callback is
-    /// awaited.
-    fn capture_flush_snapshot(&self, now_ms: u64) -> Result<FlushPersistenceSnapshot, BTreeError> {
-        let _snapshot_guard = self.mutation_gate.write();
-        let persisted_bucket_watermark = self.saved_bucket_watermark.load(Ordering::Acquire);
-
-        let mut metadata = self.metadata();
-        metadata.stats.last_saved = now_ms.max(metadata.stats.last_saved);
-        let max_bucket_id = metadata.stats.max_bucket_id;
-        let metadata_pending = self.last_saved_version.load(Ordering::Acquire)
-            < metadata.stats.version
-            || persisted_bucket_watermark != u64::from(max_bucket_id) + 1;
-        let metadata = if metadata_pending {
-            let mut data = Vec::with_capacity(256);
-            cbor2::to_writer(
-                &BTreeIndexRef {
-                    metadata: &metadata,
-                },
-                &mut data,
-            )
-            .map_err(|err| BTreeError::Serialization {
-                name: self.name.clone(),
-                source: err.into(),
-            })?;
-            Some(MetadataPersistenceSnapshot {
-                version: metadata.stats.version,
-                max_bucket_id,
-                last_saved: metadata.stats.last_saved,
-                data,
-            })
-        } else {
-            None
-        };
-
+    /// Serializes every dirty bucket, sorted by bucket id for deterministic
+    /// write order.
+    fn serialize_dirty_buckets(&self) -> Result<Vec<BucketPersistenceSnapshot>, BTreeError> {
         let mut dirty_bucket_ids: Vec<u32> = self
             .buckets
             .iter()
@@ -763,13 +662,7 @@ where
                 buckets.push(snapshot);
             }
         }
-
-        Ok(FlushPersistenceSnapshot {
-            persisted_bucket_watermark,
-            max_bucket_id,
-            metadata,
-            buckets,
-        })
+        Ok(buckets)
     }
 
     fn mark_bucket_snapshot_saved(&self, bucket_id: u32, dirty_version: u64) {
@@ -778,22 +671,7 @@ where
             && bucket.3 == dirty_version
         {
             bucket.1 = false;
-            let _ = self.dirty_bucket_count.fetch_update(
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-                |value| Some(value.saturating_sub(1)),
-            );
         }
-    }
-
-    fn commit_metadata_snapshot(&self, version: u64, max_bucket_id: u32, last_saved: u64) {
-        self.last_saved_version
-            .fetch_max(version, Ordering::Release);
-        self.saved_bucket_watermark
-            .store(u64::from(max_bucket_id) + 1, Ordering::Release);
-        self.update_metadata(|metadata| {
-            metadata.stats.last_saved = last_saved.max(metadata.stats.last_saved);
-        });
     }
 
     fn remove_btree_key_if_posting_absent(&self, field_value: &FV) {
@@ -872,14 +750,11 @@ where
                 name,
                 config,
                 stats,
+                buckets: BTreeMap::new(),
             }),
             max_bucket_id: AtomicU32::new(0),
             query_count: AtomicU64::new(0),
             last_saved_version: AtomicU64::new(0),
-            dirty_bucket_count: AtomicU32::new(0),
-            saved_bucket_watermark: AtomicU64::new(0),
-            mutation_gate: RwLock::new(()),
-            persistence_lock: Arc::new(PersistenceGate::default()),
         }
     }
 
@@ -895,7 +770,7 @@ where
     /// * `Result<Self, BTreeError>` - Loaded index or error.
     pub async fn load_all<R: Read, F>(metadata: R, f: F) -> Result<Self, BTreeError>
     where
-        F: AsyncFnMut(u32) -> Result<Option<Vec<u8>>, BoxError>,
+        F: AsyncFnMut(BucketObject) -> Result<Option<Vec<u8>>, BoxError>,
     {
         let mut index = Self::load_metadata(metadata)?;
         index.load_buckets(f).await?;
@@ -927,8 +802,6 @@ where
         let max_bucket_id = AtomicU32::new(index.metadata.stats.max_bucket_id);
         let query_count = AtomicU64::new(index.metadata.stats.query_count);
         let last_saved_version = AtomicU64::new(index.metadata.stats.version);
-        let saved_bucket_watermark =
-            AtomicU64::new(u64::from(index.metadata.stats.max_bucket_id) + 1);
 
         // `num_elements` comes from untrusted storage; cap the pre-allocation
         // so a corrupted value cannot trigger a huge allocation (or a capacity
@@ -950,10 +823,6 @@ where
             query_count,
             max_bucket_id,
             last_saved_version,
-            dirty_bucket_count: AtomicU32::new(0),
-            saved_bucket_watermark,
-            mutation_gate: RwLock::new(()),
-            persistence_lock: Arc::new(PersistenceGate::default()),
         })
     }
 
@@ -961,27 +830,64 @@ where
     /// This function should be called during database startup to load all bucket data
     /// and form a complete index
     ///
+    /// When the loaded metadata carries a bucket manifest, `f` is invoked
+    /// once per referenced [`BucketObject`]; without a manifest (data
+    /// persisted by a pre-manifest release) every bucket id in
+    /// `0..=max_bucket_id` is probed at generation `0` (the legacy object).
+    /// Returning `Ok(None)` leaves that bucket empty, which allows read-only
+    /// partial loads; a partially loaded index must not be flushed, since a
+    /// flush persists exactly the loaded content.
+    ///
     /// # Arguments
     ///
-    /// * `f` - Async function that reads posting data from a specified bucket.
-    ///   `F: AsyncFn(u32) -> Result<Option<Vec<u8>>, BTreeError>`
-    ///   The function should take a bucket ID as input and return a vector of bytes
-    ///   containing the serialized bucket data. If the bucket does not exist,
-    ///   it should return `Ok(None)`.
+    /// * `f` - Async function that reads posting data for a bucket object.
+    ///   If the object does not exist, it should return `Ok(None)`.
     ///
     /// # Returns
     ///
     /// * `Result<(), BTreeError>` - Success or error
     pub async fn load_buckets<F>(&mut self, mut f: F) -> Result<(), BTreeError>
     where
-        F: AsyncFnMut(u32) -> Result<Option<Vec<u8>>, BoxError>,
+        F: AsyncFnMut(BucketObject) -> Result<Option<Vec<u8>>, BoxError>,
     {
-        for i in 0..=self.max_bucket_id.load(Ordering::Relaxed) {
-            let data = f(i).await.map_err(|err| BTreeError::Generic {
+        let manifest = { self.metadata.read().buckets.clone() };
+        let legacy = manifest.is_empty();
+        let objects: Vec<BucketObject> = if legacy {
+            (0..=self.max_bucket_id.load(Ordering::Relaxed))
+                .map(|bucket_id| BucketObject {
+                    bucket_id,
+                    generation: 0,
+                })
+                .collect()
+        } else {
+            manifest
+                .iter()
+                .map(|(bucket_id, generation)| BucketObject {
+                    bucket_id: *bucket_id,
+                    generation: *generation,
+                })
+                .collect()
+        };
+
+        let mut loaded_bucket_ids: Vec<u32> = Vec::new();
+        for object in objects {
+            let i = object.bucket_id;
+            let data = f(object).await.map_err(|err| BTreeError::Generic {
                 name: self.name.clone(),
                 source: err,
             })?;
+            if data.is_none() && !legacy {
+                // The manifest references this bucket but the caller skipped
+                // (or lost) its object. Keep an empty placeholder so the next
+                // flush carries the manifest entry forward instead of
+                // silently dropping the durable object.
+                self.buckets
+                    .entry(i)
+                    .or_insert_with(|| (0, false, UniqueVec::default(), 0));
+                continue;
+            }
             if let Some(data) = data {
+                loaded_bucket_ids.push(i);
                 let bucket: BucketOwned<PK, FV> =
                     cbor2::from_reader(&data[..]).map_err(|err| BTreeError::Serialization {
                         name: self.name.clone(),
@@ -1051,9 +957,6 @@ where
                 }
 
                 self.btree.write().extend(loaded_keys);
-                if needs_repair {
-                    self.dirty_bucket_count.fetch_add(1, Ordering::Release);
-                }
                 // `data.len()` (the on-disk payload length) seeds the bucket
                 // size here, while runtime mutations apply estimated deltas
                 // (`posting_entry_size` + fudge). The two baselines can drift
@@ -1062,6 +965,16 @@ where
                 self.buckets
                     .insert(i, (data.len(), needs_repair, bks, u64::from(needs_repair)));
             }
+        }
+
+        if legacy && !loaded_bucket_ids.is_empty() {
+            // Record in memory where each loaded bucket's durable object
+            // lives (generation 0 = legacy object). The next flush commits a
+            // real manifest whose clean buckets keep referencing these legacy
+            // objects until they are rewritten.
+            self.update_metadata(|m| {
+                m.buckets = loaded_bucket_ids.iter().map(|id| (*id, 0)).collect();
+            });
         }
 
         Ok(())
@@ -1119,8 +1032,6 @@ where
     /// * `Ok(bool)` if the document_id-field_value pair was successfully added
     /// * `Err(BTreeError)` if failed
     pub fn insert(&self, doc_id: PK, field_value: FV, now_ms: u64) -> Result<bool, BTreeError> {
-        let _mutation_guard = self.mutation_gate.read();
-
         // Validate `doc_id` serialization up-front, before any state is
         // mutated, so a failing `Serialize` impl surfaces as an error instead
         // of a panic (and never leaves a half-applied insert behind).
@@ -1281,7 +1192,6 @@ where
                 dashmap::Entry::Vacant(entry) => {
                     // Create a new bucket with the initial size
                     entry.insert((size_increase, true, vec![field_value].into(), 1));
-                    self.dirty_bucket_count.fetch_add(1, Ordering::Release);
                 }
                 dashmap::Entry::Occupied(mut entry) => {
                     let bucket_entry = entry.get_mut();
@@ -1315,8 +1225,6 @@ where
     ///
     /// * `bool` - `true` if the document_id-field_value pair was successfully removed, `false` otherwise
     pub fn remove(&self, doc_id: PK, field_value: FV, now_ms: u64) -> bool {
-        let _mutation_guard = self.mutation_gate.read();
-
         let mut removed = false;
         let mut doc_size_decrease = 0;
         let mut full_size_decrease = 0;
@@ -1440,8 +1348,6 @@ where
         field_values: Vec<FV>,
         now_ms: u64,
     ) -> Result<usize, BTreeError> {
-        let _mutation_guard = self.mutation_gate.read();
-
         if field_values.is_empty() {
             return Ok(0);
         }
@@ -1675,7 +1581,6 @@ where
                         dashmap::Entry::Vacant(entry) => {
                             // Create a new bucket with the initial size
                             entry.insert((size, true, vec![field_value].into(), 1));
-                            self.dirty_bucket_count.fetch_add(1, Ordering::Release);
                         }
                         dashmap::Entry::Occupied(mut entry) => {
                             let bucket_entry = entry.get_mut();
@@ -1719,8 +1624,6 @@ where
     ///
     /// * `usize` - Number of items successfully removed
     pub fn remove_array(&self, doc_id: PK, field_values: Vec<FV>, now_ms: u64) -> usize {
-        let _mutation_guard = self.mutation_gate.read();
-
         if field_values.is_empty() {
             return 0;
         }
@@ -2273,194 +2176,224 @@ where
         results
     }
 
-    /// Persists metadata and dirty buckets through the crash-safe coordinated
-    /// protocol implemented by [`Self::flush_with`].
+    /// Persists metadata and every currently-dirty bucket.
+    ///
+    /// This is a convenience wrapper around
+    /// [`flush_owned_with`](Self::flush_owned_with) that writes the metadata
+    /// blob to `metadata`; see `flush_owned_with` for the manifest commit
+    /// protocol.
     ///
     /// # Arguments
     ///
     /// * `metadata` - writer that receives the CBOR-encoded metadata blob.
     /// * `now_ms`   - current unix-ms timestamp, recorded into `stats.last_saved`.
-    /// * `f`        - async callback that receives `(bucket_id, cbor_bytes)`
-    ///   for each dirty bucket. Return `Ok(true)` to continue, `Ok(false)` to
-    ///   stop early (remaining dirty buckets stay dirty and will be retried
-    ///   on the next call).
+    /// * `f`        - async function used to persist each dirty bucket.
     ///
     /// # Returns
     ///
-    /// `true` if anything was written (metadata and/or at least one bucket),
-    /// `false` if the index was already fully persisted.
-    ///
-    /// # Durability
-    ///
-    /// `W` must be a "written means durable" target. If writing into `W` only
-    /// stages bytes for a fallible later upload, use [`Self::flush_with`] and
-    /// perform that upload inside its metadata callback so a failure leaves the
-    /// metadata generation pending.
-    pub async fn flush<W: Write, F>(
+    /// See [`flush_owned_with`](Self::flush_owned_with).
+    pub async fn flush<W: Write, F, Fut>(
         &self,
-        mut metadata: W,
+        metadata: W,
         now_ms: u64,
         f: F,
-    ) -> Result<bool, BTreeError>
+    ) -> Result<FlushOutcome, BTreeError>
     where
-        F: AsyncFnMut(u32, &[u8]) -> Result<bool, BoxError>,
+        F: FnMut(BucketObject, Vec<u8>) -> Fut,
+        Fut: Future<Output = Result<(), BoxError>>,
     {
-        self.flush_with(
+        self.flush_owned_with(
             now_ms,
-            async move |data| {
-                metadata.write_all(data).map_err(BoxError::from)?;
-                Ok(())
+            move |data: Vec<u8>| {
+                let mut metadata = metadata;
+                async move {
+                    metadata.write_all(&data).map_err(BoxError::from)?;
+                    Ok(())
+                }
             },
             f,
         )
         .await
     }
 
-    /// Captures one immutable mutation generation and persists it using the
-    /// crash-safe grow -> metadata -> shrink protocol.
+    /// Persists every dirty bucket to a new immutable object, then commits
+    /// the metadata whose manifest references them.
     ///
-    /// New high-numbered buckets are written before the metadata first refers
-    /// to them. Old source buckets are rewritten afterwards. A crash before
-    /// metadata therefore sees the old source posting; a crash after metadata
-    /// sees the new destination (and the loader's higher-bucket-wins repair
-    /// removes any stale duplicate). When compaction shrinks `max_bucket_id`,
-    /// all repacked buckets are written before the smaller metadata range.
+    /// # Manifest commit protocol
     ///
-    /// Metadata and bucket bytes are captured before any callback is awaited.
-    /// Snapshot capture briefly excludes mutations; mutations that start later
-    /// during I/O stay outside this metadata version and remain dirty for the
-    /// next flush. Thus buckets allocated during flush are never referenced
-    /// prematurely.
+    /// Every dirty bucket is serialized and written to a **fresh** object
+    /// keyed by `(bucket_id, generation)` — the generation is this flush's
+    /// metadata version, so a bucket object is never mutated in place once a
+    /// committed manifest references it. The metadata (carrying the manifest
+    /// `bucket_id -> generation`) is written last; that single write is the
+    /// atomic commit point:
+    ///
+    /// * A crash or error **before** the metadata commit leaves the new
+    ///   bucket objects as unreferenced garbage. A loader still sees the
+    ///   previous manifest — a complete, consistent snapshot. Nothing is
+    ///   lost; the next flush retries at a later generation.
+    /// * **After** the commit, the objects replaced by this flush are
+    ///   garbage. They are returned as [`FlushOutcome::obsolete`] for the
+    ///   caller to delete best-effort; a failed deletion only leaks space.
+    ///
+    /// [`compact_buckets`](Self::compact_buckets) needs no special write
+    /// ordering under this protocol: the repacked layout becomes visible
+    /// atomically with the manifest commit, and every pre-compaction object
+    /// is reported as obsolete.
+    ///
+    /// # Concurrency
+    ///
+    /// The caller must not run a flush concurrently with mutations,
+    /// compaction, or another flush (see the crate-level concurrency
+    /// contract). Bucket payloads and the metadata are serialized before the
+    /// first await, so callback latency never holds internal locks.
     ///
     /// # Arguments
     ///
     /// * `now_ms` - current unix-ms timestamp, recorded into `stats.last_saved`.
     /// * `metadata_writer` - async callback receiving the CBOR-encoded
-    ///   metadata blob; must return `Ok(())` only once it is durably stored.
-    /// * `bucket_writer` - async callback receiving `(bucket_id, cbor_bytes)`
-    ///   for each dirty bucket, as in [`Self::store_dirty_buckets`].
+    ///   metadata blob; it must return `Ok(())` only once the write is
+    ///   durable, because it is the commit point.
+    /// * `bucket_writer` - async callback invoked once per dirty bucket with
+    ///   the target [`BucketObject`] and the CBOR payload. It must
+    ///   create/overwrite the object addressed by `(bucket_id, generation)`.
     ///
     /// # Returns
     ///
-    /// `true` if anything was written (metadata and/or at least one bucket),
-    /// `false` if the index was already fully persisted.
-    pub async fn flush_with<M, F>(
-        &self,
-        now_ms: u64,
-        metadata_writer: M,
-        bucket_writer: F,
-    ) -> Result<bool, BTreeError>
-    where
-        M: AsyncFnOnce(&[u8]) -> Result<(), BoxError>,
-        F: AsyncFnMut(u32, &[u8]) -> Result<bool, BoxError>,
-    {
-        let mut bucket_writer = bucket_writer;
-        self.flush_owned_with(
-            now_ms,
-            async move |data: Vec<u8>| metadata_writer(&data).await,
-            async move |bucket_id, data: Vec<u8>| bucket_writer(bucket_id, &data).await,
-        )
-        .await
-    }
-
-    /// Owned-payload form of [`Self::flush_with`]. Production wrappers should
-    /// prefer this form: no callback future borrows a serialized buffer across
-    /// an await, so the composed flush future remains `Send` when spawned.
-    pub async fn flush_owned_with<M, F>(
+    /// * `Ok(outcome)` with [`FlushOutcome::saved`] `== false` when the index
+    ///   was already fully persisted (no callback was invoked).
+    /// * `Ok(outcome)` with `saved == true` after a successful commit;
+    ///   [`FlushOutcome::obsolete`] lists the replaced bucket objects.
+    /// * `Err` on serialization failure or when any callback fails (nothing
+    ///   was committed in that case).
+    ///
+    /// # Note on callback bounds
+    ///
+    /// The callbacks are plain `FnMut`/`FnOnce` closures returning a named
+    /// future type and take owned `Vec<u8>` blobs: `AsyncFn*` bounds here
+    /// make the resulting future's `Send`-ness non-generalizable over
+    /// lifetimes (rustc: "implementation of `Send` is not general enough"),
+    /// which would break every downstream `tokio::spawn` of a flush.
+    pub async fn flush_owned_with<M, MFut, F, FFut>(
         &self,
         now_ms: u64,
         metadata_writer: M,
         mut bucket_writer: F,
-    ) -> Result<bool, BTreeError>
+    ) -> Result<FlushOutcome, BTreeError>
     where
-        M: AsyncFnOnce(Vec<u8>) -> Result<(), BoxError>,
-        F: AsyncFnMut(u32, Vec<u8>) -> Result<bool, BoxError>,
+        M: FnOnce(Vec<u8>) -> MFut,
+        MFut: Future<Output = Result<(), BoxError>>,
+        F: FnMut(BucketObject, Vec<u8>) -> FFut,
+        FFut: Future<Output = Result<(), BoxError>>,
     {
-        let _persistence_guard = self.persistence_lock.clone().lock().await;
-        let snapshot = self.capture_flush_snapshot(now_ms)?;
-        let had_buckets = !snapshot.buckets.is_empty();
-        if snapshot.metadata.is_none() && !had_buckets {
-            return Ok(false);
+        // Synchronous snapshot phase: serialize dirty buckets and the
+        // manifest-bearing metadata before the first await.
+        let has_dirty = self.has_dirty_buckets();
+        if !has_dirty && !self.has_pending_metadata_flush() {
+            return Ok(FlushOutcome::default());
         }
 
-        let persisted_max_exclusive = snapshot.persisted_bucket_watermark;
-        let current_max_exclusive = u64::from(snapshot.max_bucket_id) + 1;
-        // Compaction is the only path that shrinks max_bucket_id. In that case
-        // every dirty, repacked bucket must precede metadata; otherwise only
-        // newly allocated ids not covered by persisted metadata go first.
-        let pre_metadata_min = if current_max_exclusive < persisted_max_exclusive {
-            0
-        } else {
-            persisted_max_exclusive
-        };
+        // A bucket object only becomes reachable through the manifest, so
+        // dirty buckets always require a metadata commit. Loading can mark
+        // buckets dirty (stale-entry repair) without bumping the stats
+        // version; force a fresh version in that case.
+        if has_dirty && !self.has_pending_metadata_flush() {
+            self.update_metadata(|m| m.stats.version += 1);
+        }
 
-        let (pre_metadata, post_metadata): (Vec<_>, Vec<_>) = snapshot
-            .buckets
-            .into_iter()
-            .partition(|bucket| u64::from(bucket.bucket_id) >= pre_metadata_min);
+        let dirty = self.serialize_dirty_buckets()?;
 
-        // Step 1 (grow): persist migration destinations before metadata can
-        // make the loader scan them. The payloads belong to one immutable
-        // generation, so a concurrent allocation remains pending for the next
-        // flush rather than leaking into this metadata snapshot.
-        for bucket in pre_metadata {
-            let conti = bucket_writer(bucket.bucket_id, bucket.data)
-                .await
-                .map_err(|source| BTreeError::Generic {
-                    name: self.name.clone(),
-                    source,
-                })?;
-            self.mark_bucket_snapshot_saved(bucket.bucket_id, bucket.dirty_version);
-            if !conti {
-                // A cooperative stop before metadata leaves the new bucket as
-                // a harmless orphan. The metadata claim stays pending.
-                return Ok(true);
+        let mut meta = self.metadata();
+        meta.stats.last_saved = now_ms.max(meta.stats.last_saved);
+        // This flush's generation: unique per committed manifest because the
+        // stats version increases monotonically and is claimed exactly once.
+        let generation = meta.stats.version;
+
+        // Build the new manifest: dirty buckets move to this generation,
+        // clean buckets keep their committed object. In-memory buckets that
+        // were never persisted (e.g. the empty initial bucket) stay out.
+        let committed = meta.buckets.clone();
+        let dirty_ids: FxHashSet<u32> = dirty.iter().map(|s| s.bucket_id).collect();
+        let mut manifest = BTreeMap::new();
+        for entry in self.buckets.iter() {
+            let id = *entry.key();
+            if dirty_ids.contains(&id) {
+                manifest.insert(id, generation);
+            } else if let Some(committed_generation) = committed.get(&id) {
+                manifest.insert(id, *committed_generation);
             }
         }
+        meta.buckets = manifest.clone();
 
-        // Step 2: commit the exact metadata version/max captured with the
-        // bucket payloads above. New mutations cannot expand this snapshot.
-        let meta_saved = if let Some(metadata) = snapshot.metadata {
-            let MetadataPersistenceSnapshot {
-                version,
-                max_bucket_id,
-                last_saved,
-                data,
-            } = metadata;
-            metadata_writer(data)
-                .await
-                .map_err(|source| BTreeError::Generic {
-                    name: self.name.clone(),
-                    source,
-                })?;
-            self.commit_metadata_snapshot(version, max_bucket_id, last_saved);
-            true
-        } else {
-            false
-        };
-
-        // Step 3 (shrink): rewrite old source buckets only after metadata can
-        // discover every destination. Use the pre-I/O payload, never a newer
-        // concurrent source state whose destination is outside this snapshot.
-        for bucket in post_metadata {
-            let conti = bucket_writer(bucket.bucket_id, bucket.data)
-                .await
-                .map_err(|source| BTreeError::Generic {
-                    name: self.name.clone(),
-                    source,
-                })?;
-            self.mark_bucket_snapshot_saved(bucket.bucket_id, bucket.dirty_version);
-            if !conti {
-                break;
+        let mut meta_buf = Vec::with_capacity(256);
+        cbor2::to_writer(&BTreeIndexRef { metadata: &meta }, &mut meta_buf).map_err(|err| {
+            BTreeError::Serialization {
+                name: self.name.clone(),
+                source: err.into(),
             }
+        })?;
+
+        // Objects the previous manifest referenced that the new one replaces
+        // or drops (bucket rewrites, compaction leftovers, legacy objects).
+        let obsolete: Vec<BucketObject> = committed
+            .iter()
+            .filter(|(id, generation)| manifest.get(id) != Some(generation))
+            .map(|(id, generation)| BucketObject {
+                bucket_id: *id,
+                generation: *generation,
+            })
+            .collect();
+
+        // Phase 1: write every dirty bucket to its new immutable object.
+        // Unreachable until the commit below, so any failure here leaves the
+        // previous durable snapshot fully intact.
+        let saved_marks: Vec<(u32, u64)> = dirty
+            .iter()
+            .map(|snapshot| (snapshot.bucket_id, snapshot.dirty_version))
+            .collect();
+        for snapshot in dirty {
+            bucket_writer(
+                BucketObject {
+                    bucket_id: snapshot.bucket_id,
+                    generation,
+                },
+                snapshot.data,
+            )
+            .await
+            .map_err(|source| BTreeError::Generic {
+                name: self.name.clone(),
+                source,
+            })?;
         }
 
-        Ok(meta_saved || had_buckets)
+        // Phase 2: the manifest commit — the single atomic point.
+        metadata_writer(meta_buf)
+            .await
+            .map_err(|source| BTreeError::Generic {
+                name: self.name.clone(),
+                source,
+            })?;
+
+        // Publish the committed state in memory.
+        self.last_saved_version
+            .fetch_max(generation, Ordering::Release);
+        self.update_metadata(|m| {
+            m.stats.last_saved = meta.stats.last_saved.max(m.stats.last_saved);
+            m.buckets = manifest;
+        });
+        for (bucket_id, dirty_version) in saved_marks {
+            self.mark_bucket_snapshot_saved(bucket_id, dirty_version);
+        }
+
+        Ok(FlushOutcome {
+            saved: true,
+            obsolete,
+        })
     }
 
     /// Returns whether there are dirty buckets pending persistence.
     pub fn has_dirty_buckets(&self) -> bool {
-        self.dirty_bucket_count.load(Ordering::Acquire) > 0
+        self.buckets.iter().any(|bucket| bucket.1)
     }
 
     /// Returns whether metadata has a newer logical version than the last
@@ -2480,43 +2413,22 @@ where
     /// # Concurrency
     ///
     /// This method rebuilds the bucket map non-atomically and must NOT run
-    /// concurrently with writers (`insert*` / `remove*`) or flushes. Call it
-    /// during startup/offline maintenance, before the index is shared.
+    /// concurrently with writers (`insert*` / `remove*`) or flushes (see the
+    /// crate-level concurrency contract). It also requires a fully loaded
+    /// index.
     ///
-    /// # Persistence contract
+    /// # Persistence
     ///
-    /// Compaction re-bins postings into low bucket ids, clears bucket entries
-    /// with higher ids, and moves `max_bucket_id` *backwards*. This
-    /// intentionally breaks two invariants that crash recovery via
-    /// [`Self::load_buckets`] otherwise relies on: the "higher bucket id is
-    /// the newer state" reconciliation and the monotonicity of
-    /// `max_bucket_id`. After calling this method the caller MUST persist in
-    /// this exact order before resuming writes:
-    ///
-    /// 1. write all dirty buckets ([`Self::store_dirty_buckets`]);
-    /// 2. then write the metadata ([`Self::store_metadata_with`] /
-    ///    [`Self::store_metadata`]), which records the shrunken
-    ///    `max_bucket_id`;
-    /// 3. then delete on-disk bucket files with ids above the new
-    ///    `max_bucket_id` (orphans). Stale high-id files must not survive:
-    ///    they are never rewritten again, so if `max_bucket_id` later grows
-    ///    back over them and a crash hits the "metadata written, bucket file
-    ///    not yet written" window, `load_buckets` would read the stale file
-    ///    and resurrect long-deleted postings. Deleting them is part of the
-    ///    contract, not an optional cleanup.
-    ///
-    /// [`Self::flush`] / [`Self::flush_with`] detect this shrink and implement
-    /// the required buckets-before-metadata order. Callers that compose
-    /// [`Self::store_dirty_buckets`] and [`Self::store_metadata_with`] manually
-    /// must preserve the same sequence. See `anda_db`'s `BTree::compact` for a
-    /// production wrapper that delegates to the coordinated implementation.
+    /// The repacked layout becomes durable atomically with the next flush's
+    /// manifest commit; every pre-compaction bucket object is reported in
+    /// that flush's [`FlushOutcome::obsolete`] for best-effort deletion. No
+    /// special write ordering is required. See `anda_db`'s `BTree::compact`
+    /// for a production wrapper.
     ///
     /// # Returns
     ///
     /// `(old_bucket_count, new_bucket_count)`
     pub fn compact_buckets(&self) -> (usize, usize) {
-        let _mutation_guard = self.mutation_gate.write();
-
         let old_count = self.buckets.len();
         if old_count <= 1 {
             return (old_count, old_count);
@@ -2536,7 +2448,6 @@ where
             self.buckets.clear();
             self.buckets.insert(0, (0, true, UniqueVec::default(), 1));
             self.max_bucket_id.store(0, Ordering::Relaxed);
-            self.dirty_bucket_count.store(1, Ordering::Release);
             self.update_metadata(|m| {
                 m.stats.version += 1;
             });
@@ -2580,251 +2491,11 @@ where
         }
 
         self.max_bucket_id.store(max_id, Ordering::Relaxed);
-        self.dirty_bucket_count
-            .store(new_count as u32, Ordering::Release);
         self.update_metadata(|m| {
             m.stats.version += 1;
         });
 
         (old_count, new_count)
-    }
-
-    /// Stores the index metadata to a writer
-    ///
-    /// # Arguments
-    ///
-    /// * `w` - Any type implementing the [`Write`] trait
-    /// * `now_ms` - Current timestamp in milliseconds
-    ///
-    /// # Returns
-    ///
-    /// * `Result<bool, Error>` - true if the metadata was saved, false if the version was not updated
-    pub fn store_metadata<W: Write>(&self, w: W, now_ms: u64) -> Result<bool, BTreeError> {
-        // Fast path: if the version is already saved, avoid cloning metadata.
-        let current_version = { self.metadata.read().stats.version };
-        if self.last_saved_version.load(Ordering::Relaxed) >= current_version {
-            return Ok(false);
-        }
-
-        let mut meta = self.metadata();
-        // Atomically claim the right to serialize this version.
-        // Only one concurrent caller will see prev < meta.stats.version and proceed.
-        let prev_saved_version = self
-            .last_saved_version
-            .fetch_max(meta.stats.version, Ordering::Relaxed);
-        if prev_saved_version >= meta.stats.version {
-            // No need to save if the version is not updated
-            return Ok(false);
-        }
-
-        meta.stats.last_saved = now_ms.max(meta.stats.last_saved);
-        if let Err(err) = cbor2::to_writer(&BTreeIndexRef { metadata: &meta }, w) {
-            // Serialization failed: try to revert only if no other writer has already
-            // advanced this atomic to a newer version.
-            let _ = self.last_saved_version.compare_exchange(
-                meta.stats.version,
-                prev_saved_version,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            );
-            return Err(BTreeError::Serialization {
-                name: self.name.clone(),
-                source: err.into(),
-            });
-        }
-
-        self.update_metadata(|m| {
-            m.stats.last_saved = meta.stats.last_saved.max(m.stats.last_saved);
-        });
-        self.saved_bucket_watermark
-            .store(u64::from(meta.stats.max_bucket_id) + 1, Ordering::Release);
-
-        Ok(true)
-    }
-
-    /// Like [`Self::store_metadata`], but hands the serialized metadata to an
-    /// async persist callback and only commits the saved-version watermark
-    /// when the callback succeeds.
-    ///
-    /// Use this instead of `store_metadata` with an in-memory buffer when the
-    /// actual persistence step can fail (e.g. an object-store write): with
-    /// the plain variant, a failed external write would leave the watermark
-    /// advanced and this metadata version would never be retried, so a later
-    /// crash could load stale metadata (e.g. an old `max_bucket_id`) that
-    /// hides buckets written afterwards.
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(true)` if metadata was serialized and persisted.
-    /// * `Ok(false)` if the version was already saved.
-    pub async fn store_metadata_with<F>(&self, now_ms: u64, f: F) -> Result<bool, BTreeError>
-    where
-        F: AsyncFnOnce(&[u8]) -> Result<(), BoxError>,
-    {
-        let _persistence_guard = self.persistence_lock.clone().lock().await;
-        // Fast path: if the version is already saved, avoid cloning metadata.
-        let current_version = { self.metadata.read().stats.version };
-        if self.last_saved_version.load(Ordering::Relaxed) >= current_version {
-            return Ok(false);
-        }
-
-        let mut meta = self.metadata();
-        if self.last_saved_version.load(Ordering::Acquire) >= meta.stats.version {
-            return Ok(false);
-        }
-
-        meta.stats.last_saved = now_ms.max(meta.stats.last_saved);
-
-        let mut buf = Vec::with_capacity(256);
-        if let Err(err) = cbor2::to_writer(&BTreeIndexRef { metadata: &meta }, &mut buf) {
-            return Err(BTreeError::Serialization {
-                name: self.name.clone(),
-                source: err.into(),
-            });
-        }
-
-        if let Err(err) = f(&buf).await {
-            return Err(BTreeError::Generic {
-                name: self.name.clone(),
-                source: err,
-            });
-        }
-
-        // Publish only after the callback has confirmed durability. If this
-        // future is cancelled before then, the version remains pending and a
-        // retry will serialize it again.
-        self.last_saved_version
-            .fetch_max(meta.stats.version, Ordering::Release);
-        self.update_metadata(|m| {
-            m.stats.last_saved = meta.stats.last_saved.max(m.stats.last_saved);
-        });
-        self.saved_bucket_watermark
-            .store(u64::from(meta.stats.max_bucket_id) + 1, Ordering::Release);
-
-        Ok(true)
-    }
-
-    /// Serializes and hands every dirty bucket to the caller-supplied async
-    /// writer.
-    ///
-    /// The method snapshots the list of dirty bucket ids up-front, then for
-    /// each bucket it:
-    ///
-    /// 1. Samples the bucket's `dirty_version` while building the CBOR payload.
-    /// 2. Releases the bucket lock **before** awaiting the caller's writer
-    ///    (so I/O does not block other shards).
-    /// 3. Re-acquires the lock and clears the dirty flag only if the bucket
-    ///    has not been mutated in the meantime (same `dirty_version`).
-    ///
-    /// If the caller returns `Ok(false)`, iteration stops; unwritten dirty
-    /// buckets remain dirty for a later call.
-    ///
-    /// # Arguments
-    ///
-    /// * `f` — async callback `(bucket_id, cbor_bytes) -> Result<bool, _>`.
-    ///   Returning `Ok(true)` continues, `Ok(false)` stops.
-    pub async fn store_dirty_buckets<F>(&self, mut f: F) -> Result<(), BTreeError>
-    where
-        F: AsyncFnMut(u32, &[u8]) -> Result<bool, BoxError>,
-    {
-        let _persistence_guard = self.persistence_lock.clone().lock().await;
-        let dirty_count_snapshot = self.dirty_bucket_count.load(Ordering::Acquire);
-        if dirty_count_snapshot == 0 {
-            return Ok(());
-        }
-
-        // Snapshot dirty bucket IDs first to avoid holding mutable bucket refs across await.
-        let dirty_bucket_ids: Vec<u32> = self
-            .buckets
-            .iter()
-            .filter_map(|b| if b.1 { Some(*b.key()) } else { None })
-            .collect();
-
-        // Self-heal: if the counter indicates dirty buckets but none are actually dirty,
-        // attempt to reset the counter only when it has not changed since snapshot.
-        // This avoids permanently reporting dirty state due to possible counter drift.
-        if dirty_bucket_ids.is_empty() {
-            let _ = self.dirty_bucket_count.compare_exchange(
-                dirty_count_snapshot,
-                0,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            );
-            return Ok(());
-        }
-
-        let mut buf = Vec::with_capacity(4096);
-        for bucket_id in dirty_bucket_ids {
-            let Some(bucket) = self.buckets.get(&bucket_id) else {
-                continue;
-            };
-            if !bucket.1 {
-                continue;
-            }
-            let dirty_version = bucket.3;
-
-            // If the bucket is dirty, it needs to be persisted.
-            // Scope the postings Ref guards so they are dropped before the
-            // potentially slow async write, reducing lock contention.
-            {
-                // Skip postings that no longer exist, and postings that are
-                // transiently empty (a concurrent `remove` emptied the posting
-                // but has not yet removed the entry): persisting an empty
-                // posting would resurrect the key as a "ghost" after a crash
-                // and reload. The concurrent remove bumps this bucket's
-                // `dirty_version` when it finishes, so the bucket stays dirty
-                // and the final state is rewritten by a later flush.
-                let postings: FxHashMap<_, _> = bucket
-                    .2
-                    .iter()
-                    .filter_map(|fv| {
-                        self.postings
-                            .get(fv)
-                            .filter(|posting| !posting.2.is_empty())
-                            .map(|p| (fv, p))
-                    })
-                    .collect();
-
-                buf.clear();
-                cbor2::to_writer(
-                    &BucketRef {
-                        postings: &postings,
-                    },
-                    &mut buf,
-                )
-                .map_err(|err| BTreeError::Serialization {
-                    name: self.name.clone(),
-                    source: err.into(),
-                })?;
-            }
-            drop(bucket);
-
-            let conti = f(bucket_id, &buf)
-                .await
-                .map_err(|err| BTreeError::Generic {
-                    name: self.name.clone(),
-                    source: err,
-                })?;
-
-            // Only mark as clean if it is still dirty after persistence.
-            if let Some(mut bucket) = self.buckets.get_mut(&bucket_id)
-                && bucket.1
-                && bucket.3 == dirty_version
-            {
-                bucket.1 = false;
-                let _ = self.dirty_bucket_count.fetch_update(
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                    |v| Some(v.saturating_sub(1)),
-                );
-            }
-
-            if !conti {
-                return Ok(());
-            }
-        }
-
-        Ok(())
     }
 
     /// Updates the index metadata
@@ -2898,10 +2569,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::io;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
-    use tokio::sync::{Barrier, Mutex};
+    use tokio::sync::Barrier;
 
     // 获取当前时间戳（毫秒）
     fn now_ms() -> u64 {
@@ -2909,6 +2581,65 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64
+    }
+
+    /// In-memory model of the durable store: one metadata object plus one
+    /// object per `(bucket_id, generation)`, mirroring the production
+    /// object-store layout.
+    #[derive(Default, Clone)]
+    struct MemStore {
+        metadata: Vec<u8>,
+        buckets: HashMap<BucketObject, Vec<u8>>,
+    }
+
+    /// Flushes `index` into `store` the way the production adapter does:
+    /// buckets first, then the manifest commit, then best-effort deletion of
+    /// the obsolete objects.
+    async fn flush_to<PK, FV>(
+        index: &BTreeIndex<PK, FV>,
+        store: &mut MemStore,
+        now_ms: u64,
+    ) -> FlushOutcome
+    where
+        PK: Ord + Eq + Hash + Debug + Clone + Serialize + DeserializeOwned,
+        FV: Eq + Ord + Hash + Debug + Clone + Serialize + DeserializeOwned,
+    {
+        let mut meta_buf: Vec<u8> = Vec::new();
+        let buckets = &mut store.buckets;
+        let outcome = index
+            .flush_owned_with(
+                now_ms,
+                |data| {
+                    meta_buf = data;
+                    std::future::ready(Ok(()))
+                },
+                |object, data| {
+                    buckets.insert(object, data);
+                    std::future::ready(Ok(()))
+                },
+            )
+            .await
+            .unwrap();
+        if outcome.saved {
+            store.metadata = meta_buf;
+            for object in &outcome.obsolete {
+                store.buckets.remove(object);
+            }
+        }
+        outcome
+    }
+
+    /// Loads a complete index from `store`.
+    async fn load_from<PK, FV>(store: &MemStore) -> BTreeIndex<PK, FV>
+    where
+        PK: Ord + Eq + Hash + Debug + Clone + Serialize + DeserializeOwned,
+        FV: Eq + Ord + Hash + Debug + Clone + Serialize + DeserializeOwned,
+    {
+        BTreeIndex::load_all(&store.metadata[..], async |object| {
+            Ok(store.buckets.get(&object).cloned())
+        })
+        .await
+        .unwrap()
     }
 
     // 辅助函数：创建一个测试用的 B-tree 索引
@@ -3812,60 +3543,18 @@ mod tests {
     async fn test_serialization() {
         let index = create_populated_index();
 
-        // 序列化元数据
-        let mut buf = Vec::new();
-        let result = index.store_metadata(&mut buf, now_ms());
-        assert!(result.is_ok());
+        // 通过 manifest flush 持久化元数据与全部脏桶
+        let mut store = MemStore::default();
+        let outcome = flush_to(&index, &mut store, now_ms()).await;
+        assert!(outcome.saved);
 
-        println!("Serialized metadata: {:?}", hex::encode(&buf));
+        println!("Serialized metadata: {:?}", hex::encode(&store.metadata));
 
-        // 反序列化元数据
-        let result = BTreeIndex::<u64, String>::load_metadata(&buf[..]);
-        let mut loaded_index = result.unwrap();
-
-        // 验证元数据
-        assert_eq!(loaded_index.name(), "test_index");
-        assert_eq!(loaded_index.len(), 0); // 注意：load_metadata 只加载元数据，不加载 postings
-
-        // 模拟 load_buckets 函数
-        let bucket_data = Arc::new(Mutex::new(Vec::new()));
-
-        // 存储 bucket 数据
-        {
-            let bucket_data_clone = bucket_data.clone();
-            let result = index
-                .store_dirty_buckets(async |bucket_id, data| {
-                    let mut guard = bucket_data_clone.lock().await;
-                    while guard.len() <= bucket_id as usize {
-                        guard.push(Vec::new());
-                    }
-                    guard[bucket_id as usize] = data.to_vec();
-                    Ok(true)
-                })
-                .await;
-            assert!(result.is_ok());
-        }
-
-        // 加载 bucket 数据
-        {
-            let bucket_data_clone = bucket_data.clone();
-            let result = loaded_index
-                .load_buckets(async |bucket_id| {
-                    let guard = bucket_data_clone.lock().await;
-                    if bucket_id as usize >= guard.len() {
-                        return Err(BTreeError::Generic {
-                            name: "test".to_string(),
-                            source: "Bucket not found".into(),
-                        }
-                        .into());
-                    }
-                    Ok(Some(guard[bucket_id as usize].clone()))
-                })
-                .await;
-            assert!(result.is_ok());
-        }
+        // 重新加载
+        let loaded_index: BTreeIndex<u64, String> = load_from(&store).await;
 
         // 验证加载后的索引
+        assert_eq!(loaded_index.name(), "test_index");
         assert_eq!(loaded_index.len(), index.len());
 
         // 测试搜索
@@ -3876,42 +3565,52 @@ mod tests {
         assert!(ids.contains(&6));
     }
 
+    /// A dirty bucket always forces a manifest commit — bucket objects are
+    /// unreachable until the metadata references them. This covers the
+    /// load-time repair path, which marks buckets dirty without bumping the
+    /// stats version.
     #[tokio::test]
-    async fn test_flush_persists_dirty_buckets_even_if_metadata_already_saved() {
+    async fn test_flush_commits_manifest_even_if_metadata_version_unchanged() {
         let index = create_test_index();
-        let _ = index.insert(1, "apple".to_string(), now_ms()).unwrap();
+        index.insert(1, "apple".to_string(), now_ms()).unwrap();
+        let mut store = MemStore::default();
+        flush_to(&index, &mut store, now_ms()).await;
+        assert!(!index.has_pending_metadata_flush());
+        assert!(!index.has_dirty_buckets());
 
-        // 先只保存元数据（模拟：元数据已落盘，但 buckets 还没落盘）
-        let mut meta_buf = Vec::new();
-        assert!(index.store_metadata(&mut meta_buf, now_ms()).unwrap());
+        // Simulate a load-time repair: dirty bucket, no version bump.
+        {
+            let mut bucket = index.buckets.get_mut(&0).expect("bucket 0 exists");
+            index.mark_bucket_dirty(&mut bucket);
+        }
+        assert!(!index.has_pending_metadata_flush());
         assert!(index.has_dirty_buckets());
 
-        // 再 flush：即使元数据版本没变化，也应继续持久化 dirty buckets
-        let writes = Arc::new(Mutex::new(0usize));
-        let writes_clone = writes.clone();
-        let mut meta_buf2 = Vec::new();
-        let saved = index
-            .flush(&mut meta_buf2, now_ms(), async move |_, _| {
-                let mut g = writes_clone.lock().await;
-                *g += 1;
-                Ok(true)
-            })
-            .await
-            .unwrap();
-
-        assert!(saved);
-        assert_eq!(*writes.lock().await, 1);
+        let before = store.clone();
+        let outcome = flush_to(&index, &mut store, now_ms()).await;
+        assert!(outcome.saved);
         assert!(!index.has_dirty_buckets());
+        assert!(!index.has_pending_metadata_flush());
+        assert_ne!(
+            before.metadata, store.metadata,
+            "the manifest commit must rewrite the metadata"
+        );
+
+        let reloaded: BTreeIndex<u64, String> = load_from(&store).await;
+        assert_eq!(reloaded.len(), index.len());
     }
 
     #[tokio::test]
-    async fn test_store_dirty_buckets_propagates_write_error() {
+    async fn test_flush_propagates_bucket_write_error_and_commits_nothing() {
         let index = create_test_index();
         index.insert(1, "apple".to_string(), now_ms()).unwrap();
         assert!(index.has_dirty_buckets());
 
+        let mut meta_buf = Vec::new();
         let err = index
-            .store_dirty_buckets(async |_, _| Err::<bool, BoxError>("write failed".into()))
+            .flush(&mut meta_buf, now_ms(), |_, _| {
+                std::future::ready(Err::<(), BoxError>("write failed".into()))
+            })
             .await
             .unwrap_err();
 
@@ -3920,59 +3619,9 @@ mod tests {
             other => panic!("Expected Generic error, got: {other:?}"),
         }
 
+        assert!(meta_buf.is_empty(), "no manifest commit on bucket failure");
         assert!(index.has_dirty_buckets());
-    }
-
-    #[tokio::test]
-    async fn test_store_dirty_buckets_keeps_dirty_when_mutated_during_persist() {
-        let index = Arc::new(create_test_index());
-        index.insert(1, "apple".to_string(), now_ms()).unwrap();
-        assert!(index.has_dirty_buckets());
-
-        let index_for_cb = index.clone();
-        index
-            .store_dirty_buckets(async move |_, _| {
-                index_for_cb
-                    .insert(2, "banana".to_string(), now_ms())
-                    .unwrap();
-                Ok(true)
-            })
-            .await
-            .unwrap();
-
-        // A concurrent mutation happened during persistence, so bucket must remain dirty.
-        assert!(index.has_dirty_buckets());
-
-        index
-            .store_dirty_buckets(async |_, _| Ok(true))
-            .await
-            .unwrap();
-        assert!(!index.has_dirty_buckets());
-    }
-
-    #[tokio::test]
-    async fn test_store_dirty_buckets_self_heals_drifted_counter() {
-        let index = create_test_index();
-        index.insert(1, "apple".to_string(), now_ms()).unwrap();
-        assert!(index.has_dirty_buckets());
-
-        index
-            .store_dirty_buckets(async |_, _| Ok(true))
-            .await
-            .unwrap();
-        assert!(!index.has_dirty_buckets());
-
-        // Simulate counter drift: no bucket is dirty but counter is stale (>0).
-        index.dirty_bucket_count.store(1, Ordering::Release);
-
-        index
-            .store_dirty_buckets(async |_, _| {
-                panic!("no dirty bucket should be written");
-            })
-            .await
-            .unwrap();
-
-        assert!(!index.has_dirty_buckets());
+        assert!(index.has_pending_metadata_flush());
     }
 
     #[tokio::test]
@@ -3982,30 +3631,11 @@ mod tests {
             allow_duplicates: true,
         };
         let index = BTreeIndex::new("resurrection_test".to_string(), Some(config));
+        let mut store = MemStore::default();
 
         // Step 1: initial data persisted in bucket 0.
         index.insert(1, "apple".to_string(), now_ms()).unwrap();
-
-        let metadata_buf = Arc::new(Mutex::new(Vec::new()));
-        let bucket_data = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
-
-        {
-            let mut meta = metadata_buf.lock().await;
-            index
-                .flush(&mut *meta, now_ms(), {
-                    let bucket_data = bucket_data.clone();
-                    async move |bucket_id, data| {
-                        let mut guard = bucket_data.lock().await;
-                        while guard.len() <= bucket_id as usize {
-                            guard.push(Vec::new());
-                        }
-                        guard[bucket_id as usize] = data.to_vec();
-                        Ok(true)
-                    }
-                })
-                .await
-                .unwrap();
-        }
+        flush_to(&index, &mut store, now_ms()).await;
 
         // Step 2: force migration of "apple" to a new bucket.
         let mut doc_id = 2u64;
@@ -4014,24 +3644,7 @@ mod tests {
             doc_id += 1;
         }
         assert!(index.stats().max_bucket_id > 0);
-
-        {
-            let mut meta = metadata_buf.lock().await;
-            index
-                .flush(&mut *meta, now_ms(), {
-                    let bucket_data = bucket_data.clone();
-                    async move |bucket_id, data| {
-                        let mut guard = bucket_data.lock().await;
-                        while guard.len() <= bucket_id as usize {
-                            guard.push(Vec::new());
-                        }
-                        guard[bucket_id as usize] = data.to_vec();
-                        Ok(true)
-                    }
-                })
-                .await
-                .unwrap();
-        }
+        flush_to(&index, &mut store, now_ms()).await;
 
         // Step 3: remove all docs for "apple", persist again.
         for id in 1..doc_id {
@@ -4042,83 +3655,43 @@ mod tests {
                 .query_with(&"apple".to_string(), |ids| Some(ids.clone()))
                 .is_none()
         );
-
-        {
-            let mut meta = metadata_buf.lock().await;
-            index
-                .flush(&mut *meta, now_ms(), {
-                    let bucket_data = bucket_data.clone();
-                    async move |bucket_id, data| {
-                        let mut guard = bucket_data.lock().await;
-                        while guard.len() <= bucket_id as usize {
-                            guard.push(Vec::new());
-                        }
-                        guard[bucket_id as usize] = data.to_vec();
-                        Ok(true)
-                    }
-                })
-                .await
-                .unwrap();
-        }
+        flush_to(&index, &mut store, now_ms()).await;
 
         // Step 4: reload and verify no resurrection.
-        let meta = { metadata_buf.lock().await.clone() };
-        let mut loaded = BTreeIndex::<u64, String>::load_metadata(&meta[..]).unwrap();
-
-        loaded
-            .load_buckets({
-                let bucket_data = bucket_data.clone();
-                async move |bucket_id| {
-                    let guard = bucket_data.lock().await;
-                    if bucket_id as usize >= guard.len() {
-                        return Ok(None);
-                    }
-                    if guard[bucket_id as usize].is_empty() {
-                        return Ok(None);
-                    }
-                    Ok(Some(guard[bucket_id as usize].clone()))
-                }
-            })
-            .await
-            .unwrap();
-
+        let loaded: BTreeIndex<u64, String> = load_from(&store).await;
         assert!(
             loaded
                 .query_with(&"apple".to_string(), |ids| Some(ids.clone()))
                 .is_none(),
-            "apple should not resurrect from stale source bucket"
+            "apple should not resurrect from a stale bucket object"
         );
     }
 
     #[tokio::test]
-    async fn test_load_reconciles_stale_source_bucket_after_partial_migration_flush() {
+    async fn test_legacy_load_reconciles_stale_source_bucket_duplicate() {
         let config = BTreeConfig {
             bucket_overload_size: 80,
             allow_duplicates: true,
         };
         let index = BTreeIndex::new("partial_migration_flush".to_string(), Some(config));
 
-        let mut metadata_buf = Vec::new();
-        let mut bucket_data = Vec::<Vec<u8>>::new();
-
+        // Persist the pre-migration state (apple lives in bucket 0).
         index.insert(1, "apple".to_string(), now_ms()).unwrap();
-        index
-            .flush(&mut metadata_buf, now_ms(), async |bucket_id, data| {
-                while bucket_data.len() <= bucket_id as usize {
-                    bucket_data.push(Vec::new());
-                }
-                bucket_data[bucket_id as usize] = data.to_vec();
-                Ok(true)
-            })
-            .await
-            .unwrap();
+        let mut store = MemStore::default();
+        flush_to(&index, &mut store, now_ms()).await;
+        let stale_bucket0 = store
+            .buckets
+            .values()
+            .next()
+            .expect("bucket 0 must be persisted")
+            .clone();
 
+        // Migrate "apple" out of bucket 0 in memory.
         let mut doc_id = 2u64;
         while index.stats().max_bucket_id == 0 && doc_id < 200 {
             index.insert(doc_id, "apple".to_string(), now_ms()).unwrap();
             doc_id += 1;
         }
-
         let apple = "apple".to_string();
         let migrated_bucket_id = index.postings.get(&apple).unwrap().0;
         assert!(
@@ -4126,402 +3699,370 @@ mod tests {
             "apple should migrate out of bucket 0"
         );
 
-        metadata_buf.clear();
-        assert!(index.store_metadata(&mut metadata_buf, now_ms()).unwrap());
+        // Craft the legacy (pre-manifest) crash layout: metadata without a
+        // manifest, the stale bucket 0 object, and the migrated destination
+        // bucket — the old protocol could crash in exactly this state.
+        let mut legacy_meta = index.metadata();
+        legacy_meta.buckets = BTreeMap::new();
+        let mut metadata_buf = Vec::new();
+        cbor2::to_writer(
+            &BTreeIndexRef {
+                metadata: &legacy_meta,
+            },
+            &mut metadata_buf,
+        )
+        .unwrap();
+        let legacy_store = MemStore {
+            metadata: metadata_buf,
+            buckets: HashMap::from_iter([
+                (
+                    BucketObject {
+                        bucket_id: 0,
+                        generation: 0,
+                    },
+                    stale_bucket0,
+                ),
+                (
+                    BucketObject {
+                        bucket_id: migrated_bucket_id,
+                        generation: 0,
+                    },
+                    encode_bucket(&index, migrated_bucket_id),
+                ),
+            ]),
+        };
 
-        // Simulate a crash after the migrated destination bucket was persisted,
-        // but before the stale source bucket rewrite reached storage.
-        while bucket_data.len() <= migrated_bucket_id as usize {
-            bucket_data.push(Vec::new());
-        }
-        bucket_data[migrated_bucket_id as usize] = encode_bucket(&index, migrated_bucket_id);
-
-        let mut loaded = BTreeIndex::<u64, String>::load_metadata(&metadata_buf[..]).unwrap();
-        loaded
-            .load_buckets(async |bucket_id| {
-                if bucket_id as usize >= bucket_data.len()
-                    || bucket_data[bucket_id as usize].is_empty()
-                {
-                    return Ok(None);
-                }
-                Ok(Some(bucket_data[bucket_id as usize].clone()))
-            })
-            .await
-            .unwrap();
-
+        let loaded: BTreeIndex<u64, String> = load_from(&legacy_store).await;
         assert!(
             loaded.has_dirty_buckets(),
             "stale source bucket needs repair"
         );
-        assert!(loaded.query_with(&apple, |ids| Some(ids.clone())).is_some());
-
-        for id in 1..doc_id {
-            loaded.remove(id, apple.clone(), now_ms());
-        }
-        assert!(loaded.query_with(&apple, |ids| Some(ids.clone())).is_none());
-
-        metadata_buf.clear();
-        loaded
-            .flush(&mut metadata_buf, now_ms(), async |bucket_id, data| {
-                while bucket_data.len() <= bucket_id as usize {
-                    bucket_data.push(Vec::new());
-                }
-                bucket_data[bucket_id as usize] = data.to_vec();
-                Ok(true)
-            })
-            .await
-            .unwrap();
-
-        let mut reloaded = BTreeIndex::<u64, String>::load_metadata(&metadata_buf[..]).unwrap();
-        reloaded
-            .load_buckets(async |bucket_id| {
-                if bucket_id as usize >= bucket_data.len()
-                    || bucket_data[bucket_id as usize].is_empty()
-                {
-                    return Ok(None);
-                }
-                Ok(Some(bucket_data[bucket_id as usize].clone()))
-            })
-            .await
-            .unwrap();
-
-        assert!(
-            reloaded
-                .query_with(&apple, |ids| Some(ids.clone()))
-                .is_none(),
-            "apple must not resurrect from a stale source bucket after repair flush"
+        assert_eq!(
+            loaded.postings.get(&apple).unwrap().0,
+            migrated_bucket_id,
+            "the higher-numbered legacy bucket must win"
         );
+
+        // The repair flush upgrades to the manifest format; a reload keeps
+        // the reconciled ownership.
+        let mut repaired = legacy_store.clone();
+        let outcome = flush_to(&loaded, &mut repaired, now_ms()).await;
+        assert!(outcome.saved);
+
+        let reloaded: BTreeIndex<u64, String> = load_from(&repaired).await;
+        assert_eq!(reloaded.postings.get(&apple).unwrap().0, migrated_bucket_id);
+        assert!(!reloaded.has_dirty_buckets());
     }
 
+    /// The manifest commit must be the last write of a flush: every dirty
+    /// bucket object precedes the metadata, and each is written to a fresh
+    /// generation-suffixed object.
     #[tokio::test]
-    async fn test_flush_orders_migration_target_before_metadata_and_source() {
+    async fn test_flush_writes_all_buckets_before_manifest_commit() {
         let config = BTreeConfig {
             bucket_overload_size: 80,
             allow_duplicates: true,
         };
         let index = BTreeIndex::new("ordered_migration_flush".to_string(), Some(config));
-        let persisted_metadata = Arc::new(Mutex::new(Vec::new()));
-        let persisted_buckets = Arc::new(Mutex::new(std::collections::HashMap::new()));
-
+        let mut store = MemStore::default();
         index.insert(1, "apple".to_string(), now_ms()).unwrap();
-        index
-            .flush_with(
-                now_ms(),
-                {
-                    let persisted_metadata = persisted_metadata.clone();
-                    async move |data| {
-                        *persisted_metadata.lock().await = data.to_vec();
-                        Ok(())
-                    }
-                },
-                {
-                    let persisted_buckets = persisted_buckets.clone();
-                    async move |id, data| {
-                        persisted_buckets.lock().await.insert(id, data.to_vec());
-                        Ok(true)
-                    }
-                },
-            )
-            .await
-            .unwrap();
+        flush_to(&index, &mut store, now_ms()).await;
 
-        let mut next_id = 2;
-        while index.stats().max_bucket_id == 0 {
-            index
-                .insert(next_id, "apple".to_string(), now_ms())
-                .unwrap();
-            next_id += 1;
+        // Dirty both the old bucket and freshly-allocated migration targets.
+        let mut doc_id = 2u64;
+        while index.stats().max_bucket_id == 0 && doc_id < 200 {
+            index.insert(doc_id, "apple".to_string(), now_ms()).unwrap();
+            doc_id += 1;
         }
-        let target_bucket = index.stats().max_bucket_id;
-        let events = Arc::new(Mutex::new(Vec::new()));
+        assert!(index.stats().max_bucket_id > 0);
 
+        #[derive(Debug, PartialEq, Eq)]
+        enum Event {
+            Bucket(u32),
+            Metadata,
+        }
+        let events = std::cell::RefCell::new(Vec::<Event>::new());
         index
-            .flush_with(
+            .flush_owned_with(
                 now_ms(),
-                {
-                    let events = events.clone();
-                    let persisted_metadata = persisted_metadata.clone();
-                    async move |data| {
-                        events.lock().await.push("metadata".to_string());
-                        *persisted_metadata.lock().await = data.to_vec();
-                        Ok(())
-                    }
+                |_data| {
+                    events.borrow_mut().push(Event::Metadata);
+                    std::future::ready(Ok(()))
                 },
-                {
-                    let events = events.clone();
-                    let persisted_buckets = persisted_buckets.clone();
-                    async move |id, data| {
-                        events.lock().await.push(format!("bucket:{id}"));
-                        persisted_buckets.lock().await.insert(id, data.to_vec());
-                        Ok(true)
-                    }
+                |object, _data| {
+                    assert!(
+                        object.generation > 0,
+                        "bucket writes must target generation-suffixed objects"
+                    );
+                    events.borrow_mut().push(Event::Bucket(object.bucket_id));
+                    std::future::ready(Ok(()))
                 },
             )
             .await
             .unwrap();
 
+        let events = events.into_inner();
+        assert!(
+            events.len() > 1,
+            "expected bucket writes and one metadata write: {events:?}"
+        );
         assert_eq!(
-            *events.lock().await,
-            vec![
-                format!("bucket:{target_bucket}"),
-                "metadata".to_string(),
-                "bucket:0".to_string(),
-            ]
+            events.last(),
+            Some(&Event::Metadata),
+            "the manifest commit must come last: {events:?}"
+        );
+        assert_eq!(
+            events.iter().filter(|e| **e == Event::Metadata).count(),
+            1,
+            "exactly one metadata write: {events:?}"
         );
     }
 
+    /// A crash after some (or all) new-generation bucket objects are written
+    /// but before the manifest commit must leave the previous snapshot fully
+    /// intact — the new objects are unreferenced garbage — and a retry must
+    /// converge.
     #[tokio::test]
-    async fn test_flush_excludes_bucket_allocated_during_async_persistence() {
+    async fn test_flush_crash_before_manifest_commit_keeps_previous_snapshot() {
         let config = BTreeConfig {
             bucket_overload_size: 80,
             allow_duplicates: true,
         };
-        let index = Arc::new(BTreeIndex::new(
-            "concurrent_allocation_flush".to_string(),
-            Some(config),
-        ));
-        let persisted_metadata = Arc::new(Mutex::new(Vec::new()));
-        let persisted_buckets = Arc::new(Mutex::new(std::collections::HashMap::new()));
-
+        let index = BTreeIndex::new("crash_before_commit".to_string(), Some(config));
+        let mut store = MemStore::default();
         index.insert(1, "apple".to_string(), now_ms()).unwrap();
+        flush_to(&index, &mut store, now_ms()).await;
+
+        // Migrate "apple" and add new keys, then crash mid-flush: the first
+        // bucket write succeeds, the second fails, the metadata is never
+        // written.
+        let mut doc_id = 2u64;
+        while index.stats().max_bucket_id == 0 && doc_id < 200 {
+            index.insert(doc_id, "apple".to_string(), now_ms()).unwrap();
+            doc_id += 1;
+        }
         index
-            .flush_with(
-                now_ms(),
-                {
-                    let persisted_metadata = persisted_metadata.clone();
-                    async move |data| {
-                        *persisted_metadata.lock().await = data.to_vec();
-                        Ok(())
-                    }
-                },
-                {
-                    let persisted_buckets = persisted_buckets.clone();
-                    async move |id, data| {
-                        persisted_buckets.lock().await.insert(id, data.to_vec());
-                        Ok(true)
-                    }
-                },
-            )
-            .await
+            .insert(doc_id, "banana".to_string(), now_ms())
             .unwrap();
 
-        let mut next_id = 2;
-        while index.stats().max_bucket_id == 0 {
-            index
-                .insert(next_id, "apple".to_string(), now_ms())
-                .unwrap();
-            next_id += 1;
-        }
-        let snapshotted_max = index.stats().max_bucket_id;
-        let last_snapshotted_id = next_id - 1;
-        let next_id = Arc::new(AtomicU64::new(next_id));
-        let allocation_injected = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-        index
-            .flush_with(
-                now_ms(),
-                {
-                    let persisted_metadata = persisted_metadata.clone();
-                    async move |data| {
-                        *persisted_metadata.lock().await = data.to_vec();
-                        Ok(())
-                    }
-                },
-                {
-                    let persisted_buckets = persisted_buckets.clone();
-                    let allocation_injected = allocation_injected.clone();
-                    let next_id = next_id.clone();
-                    let index = index.clone();
-                    async move |id, data| {
-                        persisted_buckets.lock().await.insert(id, data.to_vec());
-                        if id == snapshotted_max
-                            && !allocation_injected.swap(true, Ordering::AcqRel)
-                        {
-                            while index.stats().max_bucket_id == snapshotted_max {
-                                let id = next_id.fetch_add(1, Ordering::AcqRel);
-                                index.insert(id, "apple".to_string(), now_ms()).unwrap();
-                            }
+        let mut crashed = store.clone();
+        let mut metadata_written = false;
+        {
+            let buckets = &mut crashed.buckets;
+            let mut writes = 0usize;
+            let err = index
+                .flush_owned_with(
+                    now_ms(),
+                    |_data| {
+                        metadata_written = true;
+                        std::future::ready(Ok(()))
+                    },
+                    |object, data| {
+                        if writes >= 1 {
+                            return std::future::ready(Err::<(), BoxError>(
+                                "crash after first bucket".into(),
+                            ));
                         }
-                        Ok(true)
-                    }
-                },
-            )
-            .await
-            .unwrap();
-
-        assert!(allocation_injected.load(Ordering::Acquire));
-        assert!(index.stats().max_bucket_id > snapshotted_max);
-        assert!(index.has_pending_metadata_flush());
-        assert!(index.has_dirty_buckets());
-
-        let metadata = persisted_metadata.lock().await.clone();
-        let persisted_view = BTreeIndex::<u64, String>::load_metadata(&metadata[..]).unwrap();
-        assert_eq!(persisted_view.stats().max_bucket_id, snapshotted_max);
-
-        // A crash at this point reloads the pre-callback snapshot: the source
-        // rewrite cannot erase the posting merely because the concurrent
-        // destination lies outside the persisted metadata range.
-        let buckets = persisted_buckets.lock().await.clone();
-        let loaded = BTreeIndex::<u64, String>::load_all(&metadata[..], async |id| {
-            Ok(buckets.get(&id).cloned())
-        })
-        .await
-        .unwrap();
-        let ids = loaded
-            .query_with(&"apple".to_string(), |ids| Some(ids.clone()))
-            .unwrap();
-        assert!(ids.contains(&1));
-        assert!(ids.contains(&last_snapshotted_id));
-        assert!(!ids.contains(&(last_snapshotted_id + 1)));
-    }
-
-    #[tokio::test]
-    async fn test_overlapping_flushes_are_serialized_across_callbacks() {
-        let index = Arc::new(create_test_index());
-        let persisted_metadata = Arc::new(Mutex::new(Vec::new()));
-        let persisted_buckets = Arc::new(Mutex::new(std::collections::HashMap::new()));
-
-        index.insert(1, "apple".to_string(), now_ms()).unwrap();
-        index
-            .flush_owned_with(
-                now_ms(),
-                {
-                    let persisted_metadata = persisted_metadata.clone();
-                    async move |data| {
-                        *persisted_metadata.lock().await = data;
-                        Ok(())
-                    }
-                },
-                {
-                    let persisted_buckets = persisted_buckets.clone();
-                    async move |id, data| {
-                        persisted_buckets.lock().await.insert(id, data);
-                        Ok(true)
-                    }
-                },
-            )
-            .await
-            .unwrap();
-
-        index.insert(2, "apple".to_string(), now_ms()).unwrap();
-        let first_entered = Arc::new(tokio::sync::Notify::new());
-        let release_first = Arc::new(tokio::sync::Notify::new());
-        let first_index = index.clone();
-        let first_metadata = persisted_metadata.clone();
-        let first_buckets = persisted_buckets.clone();
-        let first_entered_task = first_entered.clone();
-        let release_first_task = release_first.clone();
-        let first = tokio::spawn(async move {
-            first_index
-                .flush_owned_with(
-                    now_ms(),
-                    async move |data| {
-                        *first_metadata.lock().await = data;
-                        Ok(())
-                    },
-                    async move |id, data| {
-                        first_entered_task.notify_one();
-                        release_first_task.notified().await;
-                        first_buckets.lock().await.insert(id, data);
-                        Ok(true)
+                        writes += 1;
+                        buckets.insert(object, data);
+                        std::future::ready(Ok(()))
                     },
                 )
                 .await
-        });
-        first_entered.notified().await;
-
-        // This mutation belongs to generation 2 while generation 1 is blocked
-        // in its bucket callback.
-        index.insert(3, "apple".to_string(), now_ms()).unwrap();
-        let second_entered = Arc::new(tokio::sync::Notify::new());
-        let second_index = index.clone();
-        let second_metadata = persisted_metadata.clone();
-        let second_buckets = persisted_buckets.clone();
-        let second_entered_task = second_entered.clone();
-        let second = tokio::spawn(async move {
-            second_index
-                .flush_owned_with(
-                    now_ms(),
-                    async move |data| {
-                        *second_metadata.lock().await = data;
-                        Ok(())
-                    },
-                    async move |id, data| {
-                        second_entered_task.notify_one();
-                        second_buckets.lock().await.insert(id, data);
-                        Ok(true)
-                    },
-                )
-                .await
-        });
-
+                .unwrap_err();
+            assert!(matches!(err, BTreeError::Generic { .. }));
+        }
         assert!(
-            tokio::time::timeout(
-                std::time::Duration::from_millis(50),
-                second_entered.notified()
-            )
-            .await
-            .is_err(),
-            "a newer flush entered persistence while an older snapshot was blocked"
+            !metadata_written,
+            "the manifest must not be committed when a bucket write fails"
         );
-        release_first.notify_one();
-        first.await.unwrap().unwrap();
-        second.await.unwrap().unwrap();
 
-        let metadata = persisted_metadata.lock().await.clone();
-        let buckets = persisted_buckets.lock().await.clone();
-        let loaded = BTreeIndex::<u64, String>::load_all(&metadata[..], async |id| {
-            Ok(buckets.get(&id).cloned())
-        })
-        .await
-        .unwrap();
-        assert_eq!(
+        // Reload from the old manifest plus orphaned objects: the previous
+        // snapshot is complete, the uncommitted mutations are invisible.
+        let loaded: BTreeIndex<u64, String> = load_from(&crashed).await;
+        let apple_ids = loaded
+            .query_with(&"apple".to_string(), |ids| Some(ids.clone()))
+            .expect("apple must survive the crash");
+        assert_eq!(apple_ids, vec![1], "only the committed posting is visible");
+        assert!(
             loaded
-                .query_with(&"apple".to_string(), |ids| Some(ids.clone()))
-                .unwrap(),
-            vec![1, 2, 3]
+                .query_with(&"banana".to_string(), |ids| Some(ids.clone()))
+                .is_none(),
+            "uncommitted key must stay invisible"
+        );
+
+        // The retry persists one complete new snapshot.
+        let mut recovered_store = crashed;
+        assert!(flush_to(&index, &mut recovered_store, now_ms()).await.saved);
+        let recovered: BTreeIndex<u64, String> = load_from(&recovered_store).await;
+        assert_eq!(recovered.len(), index.len());
+        let apple_ids = recovered
+            .query_with(&"apple".to_string(), |ids| Some(ids.clone()))
+            .expect("apple must be present after recovery");
+        assert_eq!(apple_ids.len() as u64, doc_id - 1);
+        assert!(
+            recovered
+                .query_with(&"banana".to_string(), |ids| Some(ids.clone()))
+                .is_some()
         );
     }
 
-    #[test]
-    fn test_compaction_excludes_mutations() {
-        let index = Arc::new(BTreeIndex::new(
-            "compact_exclusion".to_string(),
-            Some(BTreeConfig {
-                bucket_overload_size: BTreeConfig::MIN_BUCKET_OVERLOAD_SIZE,
-                allow_duplicates: true,
-            }),
-        ));
-        for id in 0..8_u64 {
-            index
-                .insert(id, format!("key-{id}-{}", "x".repeat(96)), now_ms())
+    /// After the manifest commit, the replaced objects are garbage. A crash
+    /// (or plain failure) before they are deleted must not affect reloads:
+    /// the manifest never references them.
+    #[tokio::test]
+    async fn test_reload_unaffected_when_obsolete_deletion_fails() {
+        let index = create_populated_index();
+        let mut store = MemStore::default();
+        flush_to(&index, &mut store, now_ms()).await;
+
+        // Mutate and flush again, but "crash" between the manifest commit
+        // and the cleanup: keep every obsolete object in the store.
+        index.insert(100, "fig".to_string(), now_ms()).unwrap();
+        let outcome;
+        let mut meta_buf: Vec<u8> = Vec::new();
+        {
+            let buckets = &mut store.buckets;
+            outcome = index
+                .flush_owned_with(
+                    now_ms(),
+                    |data| {
+                        meta_buf = data;
+                        std::future::ready(Ok(()))
+                    },
+                    |object, data| {
+                        buckets.insert(object, data);
+                        std::future::ready(Ok(()))
+                    },
+                )
+                .await
                 .unwrap();
         }
-        assert!(index.buckets.len() > 1);
-
-        let mutation_in_progress = index.mutation_gate.read();
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let compact_index = index.clone();
-        let compact = std::thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            let result = compact_index.compact_buckets();
-            done_tx.send(result).unwrap();
-        });
-
-        started_rx.recv().unwrap();
+        assert!(outcome.saved);
         assert!(
-            done_rx
-                .recv_timeout(std::time::Duration::from_millis(50))
-                .is_err(),
-            "compaction acquired a shared mutation guard"
+            !outcome.obsolete.is_empty(),
+            "the rewritten bucket's previous object must be reported obsolete"
         );
-        drop(mutation_in_progress);
-        let (old_count, new_count) = done_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .unwrap();
-        compact.join().unwrap();
-        assert!(new_count <= old_count);
+        for object in &outcome.obsolete {
+            assert!(
+                store.buckets.contains_key(object),
+                "test setup: obsolete {object:?} must still exist in the store"
+            );
+        }
+        store.metadata = meta_buf;
+
+        // Reload with the leaked garbage still present: invisible.
+        let loaded: BTreeIndex<u64, String> = load_from(&store).await;
+        assert_eq!(loaded.len(), index.len());
+        let ids = loaded
+            .query_with(&"fig".to_string(), |ids| Some(ids.clone()))
+            .expect("fig must be present");
+        assert_eq!(ids, vec![100]);
+        assert!(
+            !loaded.has_dirty_buckets(),
+            "leaked garbage must not dirty anything on load"
+        );
+    }
+
+    /// Data persisted by a pre-manifest release (metadata without a manifest,
+    /// un-suffixed bucket objects) loads correctly, and the first flush
+    /// upgrades the durable layout to the manifest format while retiring the
+    /// rewritten legacy objects.
+    #[tokio::test]
+    async fn test_legacy_format_loads_and_upgrades_on_first_flush() {
+        let config = BTreeConfig {
+            bucket_overload_size: 80,
+            allow_duplicates: true,
+        };
+        let index = BTreeIndex::new("legacy_upgrade".to_string(), Some(config));
+        for (id, key) in [
+            (1u64, "apple"),
+            (2, "banana"),
+            (3, "cherry"),
+            (4, "date"),
+            (5, "eggplant"),
+            (6, "fig"),
+            (7, "grape"),
+        ] {
+            index.insert(id, key.to_string(), now_ms()).unwrap();
+        }
+        let mut store = MemStore::default();
+        flush_to(&index, &mut store, now_ms()).await;
+        assert!(
+            store.buckets.len() > 1,
+            "scenario must span several buckets"
+        );
+
+        // Transform the store into the legacy layout: strip the manifest from
+        // the metadata and re-key every bucket object to generation 0.
+        let mut legacy_meta = index.metadata();
+        legacy_meta.buckets = BTreeMap::new();
+        let mut metadata_buf = Vec::new();
+        cbor2::to_writer(
+            &BTreeIndexRef {
+                metadata: &legacy_meta,
+            },
+            &mut metadata_buf,
+        )
+        .unwrap();
+        let legacy_store = MemStore {
+            metadata: metadata_buf,
+            buckets: store
+                .buckets
+                .iter()
+                .map(|(object, data)| {
+                    (
+                        BucketObject {
+                            bucket_id: object.bucket_id,
+                            generation: 0,
+                        },
+                        data.clone(),
+                    )
+                })
+                .collect(),
+        };
+
+        // Legacy data loads through the bucket-id-scan path.
+        let loaded: BTreeIndex<u64, String> = load_from(&legacy_store).await;
+        assert_eq!(loaded.len(), index.len());
+        for (id, key) in [(1u64, "apple"), (7, "grape")] {
+            let ids = loaded
+                .query_with(&key.to_string(), |ids| Some(ids.clone()))
+                .unwrap_or_else(|| panic!("{key} must load from the legacy layout"));
+            assert!(ids.contains(&id));
+        }
+
+        // Mutate and flush: the durable metadata upgrades to the manifest
+        // format; rewritten legacy objects are reported obsolete.
+        loaded.insert(8, "honeydew".to_string(), now_ms()).unwrap();
+        let mut upgraded = legacy_store.clone();
+        let outcome = flush_to(&loaded, &mut upgraded, now_ms()).await;
+        assert!(outcome.saved);
+        for object in &outcome.obsolete {
+            assert_eq!(
+                object.generation, 0,
+                "only replaced legacy objects may be obsolete here"
+            );
+        }
+
+        let upgraded_meta = BTreeIndex::<u64, String>::load_metadata(&upgraded.metadata[..])
+            .unwrap()
+            .metadata();
+        assert!(
+            !upgraded_meta.buckets.is_empty(),
+            "the first flush must commit a manifest"
+        );
+
+        let reloaded: BTreeIndex<u64, String> = load_from(&upgraded).await;
+        assert_eq!(reloaded.len(), 8);
+        for key in ["apple", "grape", "honeydew"] {
+            assert!(
+                reloaded
+                    .query_with(&key.to_string(), |ids| Some(ids.clone()))
+                    .is_some(),
+                "{key} must be present after the format upgrade"
+            );
+        }
     }
 
     #[test]
@@ -4537,6 +4078,7 @@ mod tests {
                 max_bucket_id: 3,
                 ..Default::default()
             },
+            buckets: BTreeMap::new(),
         };
 
         let owned = BTreeIndexOwned { metadata: meta };
@@ -5338,24 +4880,17 @@ mod tests {
         assert!(bucket_count_before > 2, "should have multiple buckets");
 
         // Serialize fragmented index
-        let mut metadata_buf = Vec::new();
-        let mut bucket_data: std::collections::HashMap<u32, Vec<u8>> =
-            std::collections::HashMap::new();
-        index
-            .flush(&mut metadata_buf, 1, async |id: u32, data: &[u8]| {
-                bucket_data.insert(id, data.to_vec());
-                Ok(true)
-            })
-            .await
-            .unwrap();
+        let mut store = MemStore::default();
+        flush_to(&index, &mut store, 1).await;
+        let objects_before: Vec<BucketObject> = store.buckets.keys().copied().collect();
 
         // Reload with a large bucket limit
         let mut loaded: BTreeIndex<u64, String> =
-            BTreeIndex::load_metadata(&metadata_buf[..]).unwrap();
+            BTreeIndex::load_metadata(&store.metadata[..]).unwrap();
         loaded.config.bucket_overload_size = 1024 * 512;
         loaded.metadata.write().config.bucket_overload_size = 1024 * 512;
         loaded
-            .load_buckets(async |id| Ok(bucket_data.get(&id).cloned()))
+            .load_buckets(async |object| Ok(store.buckets.get(&object).cloned()))
             .await
             .unwrap();
 
@@ -5389,24 +4924,23 @@ mod tests {
             );
         }
 
-        // Verify flush + reload works
-        let mut metadata_buf2 = Vec::new();
-        let mut bucket_data2: std::collections::HashMap<u32, Vec<u8>> =
-            std::collections::HashMap::new();
-        loaded
-            .flush(&mut metadata_buf2, 100, async |id: u32, data: &[u8]| {
-                bucket_data2.insert(id, data.to_vec());
-                Ok(true)
-            })
-            .await
-            .unwrap();
+        // Verify flush + reload works; every pre-compaction object is
+        // replaced or dropped, and the manifest commit retires it.
+        let mut store2 = store.clone();
+        let outcome = flush_to(&loaded, &mut store2, 100).await;
+        assert!(outcome.saved);
+        for object in &objects_before {
+            assert!(
+                outcome.obsolete.contains(object),
+                "pre-compaction {object:?} must be reported obsolete"
+            );
+            assert!(
+                !store2.buckets.contains_key(object),
+                "pre-compaction {object:?} must be deleted from the store"
+            );
+        }
 
-        let final_loaded: BTreeIndex<u64, String> =
-            BTreeIndex::load_all(&metadata_buf2[..], async |id| {
-                Ok(bucket_data2.get(&id).cloned())
-            })
-            .await
-            .unwrap();
+        let final_loaded: BTreeIndex<u64, String> = load_from(&store2).await;
 
         assert_eq!(
             final_loaded.stats().num_elements,
@@ -5436,6 +4970,7 @@ mod tests {
                 query_count: 3,
                 ..Default::default()
             },
+            buckets: BTreeMap::new(),
         };
         let mut metadata_buf = Vec::new();
         cbor2::to_writer(
@@ -5477,6 +5012,7 @@ mod tests {
                 max_bucket_id: 1,
                 ..Default::default()
             },
+            buckets: BTreeMap::new(),
         };
         let mut metadata_buf = Vec::new();
         cbor2::to_writer(
@@ -5512,8 +5048,8 @@ mod tests {
         let mut loaded: BTreeIndex<u64, String> =
             BTreeIndex::load_metadata(&metadata_buf[..]).unwrap();
         loaded
-            .load_buckets(async |bucket_id| {
-                Ok(match bucket_id {
+            .load_buckets(async |object| {
+                Ok(match object.bucket_id {
                     0 => Some(old_bucket.clone()),
                     1 => Some(new_bucket.clone()),
                     _ => None,
@@ -5534,80 +5070,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_store_metadata_and_dirty_bucket_error_and_stop_paths() {
+    async fn test_flush_error_and_noop_paths() {
+        // A failing metadata writer surfaces as an error and commits nothing.
         let index = create_test_index();
+        let err = index
+            .flush(FailingWriter, now_ms(), |_, _| std::future::ready(Ok(())))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BTreeError::Generic { .. }));
+        assert!(index.has_pending_metadata_flush());
 
-        let err = index.store_metadata(FailingWriter, now_ms()).unwrap_err();
-        assert!(matches!(err, BTreeError::Serialization { .. }));
-        assert!(index.store_metadata(Vec::new(), now_ms()).unwrap());
-        assert!(!index.store_metadata(Vec::new(), now_ms()).unwrap());
-
+        // A fresh index flushes once, then reports nothing to do.
         let fresh = create_test_index();
         assert!(
             fresh
-                .flush(Vec::new(), now_ms(), async |_, _| Ok(true))
+                .flush(Vec::new(), now_ms(), |_, _| std::future::ready(Ok(())))
                 .await
                 .unwrap()
+                .saved
         );
         assert!(
             !fresh
-                .flush(Vec::new(), now_ms(), async |_, _| Ok(true))
+                .flush(Vec::new(), now_ms(), |_, _| std::future::ready(Ok(())))
                 .await
                 .unwrap()
+                .saved
         );
 
+        // A failing bucket writer keeps everything dirty and retryable.
         let dirty = create_test_index();
         dirty.insert(1, "apple".to_string(), now_ms()).unwrap();
         let err = dirty
-            .store_dirty_buckets(async |_, _| Err::<bool, _>("write failed".into()))
+            .flush(Vec::new(), now_ms(), |_, _| {
+                std::future::ready(Err::<(), BoxError>("write failed".into()))
+            })
             .await
             .unwrap_err();
         assert!(matches!(err, BTreeError::Generic { .. }));
         assert!(dirty.has_dirty_buckets());
-
-        let stop = create_test_index();
-        stop.insert(1, "apple".to_string(), now_ms()).unwrap();
-        stop.insert(2, "banana".to_string(), now_ms()).unwrap();
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let calls_for_closure = calls.clone();
-        stop.store_dirty_buckets(async |bucket_id, _| {
-            calls_for_closure.lock().await.push(bucket_id);
-            Ok(false)
-        })
-        .await
-        .unwrap();
-        assert_eq!(calls.lock().await.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_dirty_bucket_version_change_keeps_bucket_dirty_until_retry() {
-        let index = create_test_index();
-        index.insert(1, "apple".to_string(), now_ms()).unwrap();
-
-        index
-            .store_dirty_buckets(async |bucket_id, _| {
-                index
-                    .insert(
-                        100 + u64::from(bucket_id),
-                        format!("during-{bucket_id}"),
-                        now_ms(),
-                    )
-                    .unwrap();
-                Ok(true)
-            })
-            .await
-            .unwrap();
-
-        assert!(
-            index.has_dirty_buckets(),
-            "mutation during persistence must keep at least one bucket dirty"
-        );
-
-        index
-            .store_dirty_buckets(async |_, _| Ok(true))
-            .await
-            .unwrap();
-        assert!(!index.has_dirty_buckets());
     }
 
     #[test]
@@ -5657,6 +5157,7 @@ mod tests {
                 num_elements: u64::MAX,
                 ..Default::default()
             },
+            buckets: BTreeMap::new(),
         };
         let mut buf = Vec::new();
         cbor2::to_writer(
@@ -5780,22 +5281,10 @@ mod tests {
                 "every applied posting must have a btree key"
             );
 
-            let mut metadata_buf = Vec::new();
-            let mut bucket_data: std::collections::HashMap<u32, Vec<u8>> = Default::default();
-            index
-                .flush(&mut metadata_buf, now_ms(), async |id, data| {
-                    bucket_data.insert(id, data.to_vec());
-                    Ok(true)
-                })
-                .await
-                .unwrap();
+            let mut store = MemStore::default();
+            flush_to(&index, &mut store, now_ms()).await;
 
-            let loaded: BTreeIndex<u64, String> =
-                BTreeIndex::load_all(&metadata_buf[..], async |id| {
-                    Ok(bucket_data.get(&id).cloned())
-                })
-                .await
-                .unwrap();
+            let loaded: BTreeIndex<u64, String> = load_from(&store).await;
             assert_eq!(
                 loaded.len(),
                 index.len(),
@@ -5825,6 +5314,7 @@ mod tests {
                 max_bucket_id: 0,
                 ..Default::default()
             },
+            buckets: BTreeMap::new(),
         };
         let mut metadata_buf = Vec::new();
         cbor2::to_writer(
@@ -5847,8 +5337,8 @@ mod tests {
         let mut loaded: BTreeIndex<u64, String> =
             BTreeIndex::load_metadata(&metadata_buf[..]).unwrap();
         loaded
-            .load_buckets(async |id| {
-                Ok(if id == 0 {
+            .load_buckets(async |object| {
+                Ok(if object.bucket_id == 0 {
                     Some(bucket_buf.clone())
                 } else {
                     None
@@ -5877,14 +5367,17 @@ mod tests {
         );
 
         // The self-heal flush rewrites bucket 0 without the ghost posting.
-        let mut repaired: std::collections::HashMap<u32, Vec<u8>> = Default::default();
-        loaded
-            .store_dirty_buckets(async |id, data| {
-                repaired.insert(id, data.to_vec());
-                Ok(true)
-            })
-            .await
-            .unwrap();
+        let mut repaired: HashMap<u32, Vec<u8>> = Default::default();
+        {
+            let repaired = &mut repaired;
+            loaded
+                .flush(Vec::new(), now_ms(), |object, data| {
+                    repaired.insert(object.bucket_id, data);
+                    std::future::ready(Ok(()))
+                })
+                .await
+                .unwrap();
+        }
         let bucket: BucketOwned<u64, String> =
             cbor2::from_reader(&repaired.get(&0).unwrap()[..]).unwrap();
         assert!(bucket.postings.contains_key("alive"));
@@ -5911,6 +5404,7 @@ mod tests {
                 max_bucket_id: 1,
                 ..Default::default()
             },
+            buckets: BTreeMap::new(),
         };
         let mut metadata_buf = Vec::new();
         cbor2::to_writer(
@@ -5949,8 +5443,8 @@ mod tests {
         let mut loaded: BTreeIndex<u64, String> =
             BTreeIndex::load_metadata(&metadata_buf[..]).unwrap();
         loaded
-            .load_buckets(async |bucket_id| {
-                Ok(match bucket_id {
+            .load_buckets(async |object| {
+                Ok(match object.bucket_id {
                     0 => Some(old_bucket.clone()),
                     1 => Some(new_bucket.clone()),
                     _ => None,
@@ -5973,10 +5467,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_store_dirty_buckets_filters_transiently_empty_posting() {
-        // Simulates the remove() crash window: the posting has been emptied
-        // but the entry has not been removed yet. A flush sampling this state
-        // must not persist the empty posting.
+    async fn test_flush_filters_transiently_empty_posting() {
+        // A posting that is empty at serialization time (e.g. loaded legacy
+        // data mid-repair) must not be persisted: an empty posting on disk
+        // would resurrect as a ghost key.
         let index = create_test_index();
         index.insert(1, "a".to_string(), now_ms()).unwrap();
         index.insert(2, "b".to_string(), now_ms()).unwrap();
@@ -5986,14 +5480,17 @@ mod tests {
             posting.1 += 1;
         }
 
-        let mut written: std::collections::HashMap<u32, Vec<u8>> = Default::default();
-        index
-            .store_dirty_buckets(async |id, data| {
-                written.insert(id, data.to_vec());
-                Ok(true)
-            })
-            .await
-            .unwrap();
+        let mut written: HashMap<u32, Vec<u8>> = Default::default();
+        {
+            let written = &mut written;
+            index
+                .flush(Vec::new(), now_ms(), |object, data| {
+                    written.insert(object.bucket_id, data);
+                    std::future::ready(Ok(()))
+                })
+                .await
+                .unwrap();
+        }
 
         let bucket: BucketOwned<u64, String> =
             cbor2::from_reader(&written.get(&0).unwrap()[..]).unwrap();
@@ -6191,39 +5688,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_store_metadata_with_failure_then_retry() {
+    async fn test_flush_metadata_commit_failure_then_retry() {
         let index = create_test_index();
         index.insert(1, "apple".to_string(), now_ms()).unwrap();
 
         let err = index
-            .store_metadata_with(now_ms(), async |_| Err("upload failed".into()))
+            .flush_owned_with(
+                now_ms(),
+                |_| std::future::ready(Err::<(), BoxError>("upload failed".into())),
+                |_, _| std::future::ready(Ok(())),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, BTreeError::Generic { .. }));
         assert!(
             index.has_pending_metadata_flush(),
-            "failed external write must keep the metadata version pending"
+            "failed commit must keep the metadata version pending"
+        );
+        assert!(
+            index.has_dirty_buckets(),
+            "failed commit must keep buckets dirty"
         );
 
-        let saved = index
-            .store_metadata_with(now_ms(), async |data| {
-                assert!(!data.is_empty());
-                Ok(())
-            })
+        let outcome = index
+            .flush_owned_with(
+                now_ms(),
+                |data| {
+                    assert!(!data.is_empty());
+                    std::future::ready(Ok(()))
+                },
+                |_, _| std::future::ready(Ok(())),
+            )
             .await
             .unwrap();
-        assert!(saved, "retry after failure must persist the same version");
+        assert!(
+            outcome.saved,
+            "retry after failure must persist a complete snapshot"
+        );
         assert!(!index.has_pending_metadata_flush());
+        assert!(!index.has_dirty_buckets());
 
         let again = index
-            .store_metadata_with(now_ms(), async |_| Ok(()))
+            .flush_owned_with(
+                now_ms(),
+                |_| std::future::ready(Ok(())),
+                |_, _| std::future::ready(Ok(())),
+            )
             .await
             .unwrap();
-        assert!(!again, "already-saved version must be skipped");
+        assert!(!again.saved, "already-saved state must be skipped");
     }
 
+    /// Cancellation (the flush future is dropped at an await point) before
+    /// the manifest commit must leave everything retryable.
     #[tokio::test]
-    async fn test_store_metadata_with_cancellation_keeps_generation_pending() {
+    async fn test_cancelled_flush_before_commit_stays_retryable() {
         let index = Arc::new(create_test_index());
         index.insert(1, "apple".to_string(), now_ms()).unwrap();
 
@@ -6232,10 +5751,17 @@ mod tests {
         let task_entered = entered.clone();
         let task = tokio::spawn(async move {
             task_index
-                .store_metadata_with(now_ms(), async move |_| {
-                    task_entered.notify_one();
-                    std::future::pending::<Result<(), BoxError>>().await
-                })
+                .flush_owned_with(
+                    now_ms(),
+                    move |_| {
+                        let task_entered = task_entered.clone();
+                        async move {
+                            task_entered.notify_one();
+                            std::future::pending::<Result<(), BoxError>>().await
+                        }
+                    },
+                    |_, _| std::future::ready(Ok(())),
+                )
                 .await
         });
         entered.notified().await;
@@ -6243,53 +5769,42 @@ mod tests {
         assert!(task.await.unwrap_err().is_cancelled());
 
         assert!(index.has_pending_metadata_flush());
-        assert!(
-            index
-                .store_metadata_with(now_ms(), async |_| Ok(()))
-                .await
-                .unwrap()
-        );
+        assert!(index.has_dirty_buckets());
+        let mut store = MemStore::default();
+        assert!(flush_to(index.as_ref(), &mut store, now_ms()).await.saved);
         assert!(!index.has_pending_metadata_flush());
+        assert!(!index.has_dirty_buckets());
+        let loaded: BTreeIndex<u64, String> = load_from(&store).await;
+        assert_eq!(
+            loaded.query_with(&"apple".to_string(), |ids| Some(ids.clone())),
+            Some(vec![1])
+        );
     }
 
     #[tokio::test]
-    async fn test_flush_with_round_trip() {
+    async fn test_flush_owned_with_round_trip() {
         let index = create_test_index();
         index.insert(1, "apple".to_string(), now_ms()).unwrap();
 
-        let mut metadata_buf = Vec::new();
-        let mut bucket_data: std::collections::HashMap<u32, Vec<u8>> = Default::default();
-        let wrote = index
-            .flush_with(
-                now_ms(),
-                async |data| {
-                    metadata_buf.extend_from_slice(data);
-                    Ok(())
-                },
-                async |id, data| {
-                    bucket_data.insert(id, data.to_vec());
-                    Ok(true)
-                },
-            )
-            .await
-            .unwrap();
-        assert!(wrote);
+        let mut store = MemStore::default();
+        let outcome = flush_to(&index, &mut store, now_ms()).await;
+        assert!(outcome.saved);
 
-        let loaded: BTreeIndex<u64, String> = BTreeIndex::load_all(&metadata_buf[..], async |id| {
-            Ok(bucket_data.get(&id).cloned())
-        })
-        .await
-        .unwrap();
+        let loaded: BTreeIndex<u64, String> = load_from(&store).await;
         assert_eq!(
             loaded.query_with(&"apple".to_string(), |ids| Some(ids.clone())),
             Some(vec![1])
         );
 
         let idle = index
-            .flush_with(now_ms(), async |_| Ok(()), async |_, _| Ok(true))
+            .flush_owned_with(
+                now_ms(),
+                |_| std::future::ready(Ok(())),
+                |_, _| std::future::ready(Ok(())),
+            )
             .await
             .unwrap();
-        assert!(!idle, "fully persisted index must short-circuit");
+        assert!(!idle.saved, "fully persisted index must short-circuit");
     }
 
     #[test]
@@ -6317,6 +5832,7 @@ mod tests {
                 version: 1,
                 ..Default::default()
             },
+            buckets: BTreeMap::new(),
         };
         let mut buf = Vec::new();
         cbor2::to_writer(

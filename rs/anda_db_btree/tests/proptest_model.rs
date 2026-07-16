@@ -7,7 +7,7 @@
 //! the model exactly. Buckets are kept tiny so that bucket splitting is
 //! exercised constantly.
 
-use anda_db_btree::{BTreeConfig, BTreeError, BTreeIndex, RangeQuery};
+use anda_db_btree::{BTreeConfig, BTreeError, BTreeIndex, BucketObject, RangeQuery};
 use proptest::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -168,16 +168,20 @@ fn assert_index_matches_model(index: &BTreeIndex<u64, u64>, model: &Model, conte
 /// Persists the index to in-memory buffers and loads it back.
 fn flush_and_reload(index: &BTreeIndex<u64, u64>) -> BTreeIndex<u64, u64> {
     let mut metadata = Vec::new();
-    let mut buckets: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
-    futures::executor::block_on(index.flush(&mut metadata, 1_000, async |bucket_id, data| {
-        buckets.insert(bucket_id, data.to_vec());
-        Ok(true)
+    let mut buckets: BTreeMap<BucketObject, Vec<u8>> = BTreeMap::new();
+    let outcome = futures::executor::block_on(index.flush(&mut metadata, 1_000, |object, data| {
+        buckets.insert(object, data);
+        std::future::ready(Ok(()))
     }))
     .expect("flush failed");
+    // Mirror the production adapter: retire objects the manifest replaced.
+    for object in &outcome.obsolete {
+        buckets.remove(object);
+    }
 
     futures::executor::block_on(BTreeIndex::<u64, u64>::load_all(
         metadata.as_slice(),
-        async |bucket_id| Ok(buckets.get(&bucket_id).cloned()),
+        async |object| Ok(buckets.get(&object).cloned()),
     ))
     .expect("load_all failed")
 }

@@ -1,6 +1,19 @@
 use std::io::{Read, Write};
 
-use anda_db_btree::{BTreeConfig, BTreeIndex, RangeQuery};
+use anda_db_btree::{BTreeConfig, BTreeIndex, BucketObject, RangeQuery};
+
+/// Bucket objects are addressed by `(bucket_id, generation)`; generation 0 is
+/// the legacy (un-suffixed) object, kept for read compatibility.
+fn bucket_file(object: BucketObject) -> String {
+    if object.generation == 0 {
+        format!("debug/btree_demo/bucket_{}.cbor", object.bucket_id)
+    } else {
+        format!(
+            "debug/btree_demo/bucket_{}_{}.cbor",
+            object.bucket_id, object.generation
+        )
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -51,14 +64,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         std::fs::create_dir_all("debug/btree_demo")?;
         let metadata = std::fs::File::create("debug/btree_demo/metadata.cbor")?;
-        index
-            .flush(metadata, now_ms, async |id, data| {
-                let mut bucket =
-                    std::fs::File::create(format!("debug/btree_demo/bucket_{id}.cbor"))?;
-                bucket.write_all(data)?;
-                Ok(true)
+        let outcome = index
+            .flush(metadata, now_ms, |object, data| {
+                let write = || {
+                    let mut bucket = std::fs::File::create(bucket_file(object))?;
+                    bucket.write_all(&data)?;
+                    Ok(())
+                };
+                std::future::ready(write())
             })
             .await?;
+        // Best-effort cleanup of objects the new manifest replaced.
+        for object in &outcome.obsolete {
+            let _ = std::fs::remove_file(bucket_file(*object));
+        }
     }
 
     // Load the index from metadata
@@ -71,8 +90,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Load the index data
     index2
-        .load_buckets(async |id: u32| {
-            let mut file = std::fs::File::open(format!("debug/btree_demo/bucket_{id}.cbor"))?;
+        .load_buckets(async |object| {
+            let mut file = std::fs::File::open(bucket_file(object))?;
             let mut data = Vec::new();
             file.read_to_end(&mut data)?;
             Ok(Some(data))

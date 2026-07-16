@@ -1,4 +1,4 @@
-use anda_db_btree::BTreeIndex;
+use anda_db_btree::{BTreeIndex, BucketObject};
 use bytes::Bytes;
 use cbor2::{from_reader, to_canonical_vec};
 use ic_auth_types::ByteBufB64;
@@ -95,8 +95,18 @@ impl BTree {
         format!("btree_indexes/{name}/meta.cbor")
     }
 
-    fn bucket_path(name: &str, bucket: u32) -> String {
-        format!("btree_indexes/{name}/b_{bucket}.cbor")
+    /// Object path for a bucket generation. Generation `0` is the legacy
+    /// (pre-manifest) un-suffixed object and is only ever read, never
+    /// written; the manifest protocol writes generation-suffixed objects.
+    fn bucket_path(name: &str, object: BucketObject) -> String {
+        if object.generation == 0 {
+            format!("btree_indexes/{name}/b_{}.cbor", object.bucket_id)
+        } else {
+            format!(
+                "btree_indexes/{name}/b_{}_{}.cbor",
+                object.bucket_id, object.generation
+            )
+        }
     }
 
     /// Decodes an optional pagination cursor from base64url deterministic CBOR.
@@ -773,17 +783,10 @@ impl BTree {
     /// Compacts bucket layout and persists the new layout if the bucket count
     /// shrinks.
     ///
-    /// Unlike a regular [`BTree::flush`], compaction persists **buckets
-    /// before metadata**: compaction is the only operation that shrinks
-    /// `max_bucket_id`, and writing the smaller metadata first would open a
-    /// crash window in which reload only scans the shrunk id range while the
-    /// bucket files still hold the old layout — postings that lived only in
-    /// higher-numbered buckets would silently disappear. With buckets first,
-    /// a crash in between reloads the old (larger) id range over a mix of new
-    /// and stale bucket files, which the loader already reconciles.
-    ///
-    /// Bucket files beyond the compacted range are deleted best-effort at the
-    /// end; leftovers from a failed deletion are ignored by future loads.
+    /// Under the manifest protocol compaction needs no special write
+    /// ordering: the repacked layout becomes visible atomically with the
+    /// manifest commit of the following flush, which also retires every
+    /// pre-compaction bucket object best-effort.
     pub async fn compact_index(&self) -> Result<(), DBError> {
         match self {
             BTree::I64(btree) => btree.compact().await,
@@ -847,7 +850,7 @@ where
         let index = BTreeIndex::new(name.clone(), Some(config));
         let mut data = Vec::new();
         index
-            .flush(&mut data, now_ms, async |_, _| Ok(true))
+            .flush(&mut data, now_ms, |_, _| std::future::ready(Ok(())))
             .await?;
         // The collection metadata is the source of truth for which indexes
         // exist, so overwrite any leftover files from a crashed creation or a
@@ -880,8 +883,8 @@ where
         let (metadata, ver) = storage.fetch_bytes(&path).await?;
         let n = Arc::new(name.clone());
         let s = Arc::new(storage.clone());
-        let index = BTreeIndex::<DocumentId, FV>::load_all(&metadata[..], async move |id: u32| {
-            let path = BTree::bucket_path(n.clone().as_str(), id);
+        let index = BTreeIndex::<DocumentId, FV>::load_all(&metadata[..], async move |object| {
+            let path = BTree::bucket_path(n.clone().as_str(), object);
             match s.clone().fetch_bytes(&path).await {
                 Ok((data, _)) => Ok(Some(data.into())),
                 Err(DBError::NotFound { .. }) => Ok(None),
@@ -901,10 +904,10 @@ where
     }
 
     /// Delegates the complete persistence transaction to the low-level index,
-    /// which captures one immutable mutation generation and writes migration
-    /// targets -> metadata -> source rewrites. Keeping the ordering here and
-    /// in tests behind one implementation prevents the production wrapper
-    /// from reintroducing a source-first crash window.
+    /// which writes every dirty bucket to a fresh generation-suffixed object
+    /// and then commits the manifest-bearing metadata with a single
+    /// conditional PUT. Objects the new manifest no longer references are
+    /// deleted best-effort afterwards.
     async fn flush(&self, now_ms: u64) -> Result<bool, DBError> {
         let _flush_guard = self.flush_gate.clone().lock_owned().await;
         self.flush_inner(now_ms).await
@@ -917,14 +920,15 @@ where
         let metadata_version = self.metadata_version.clone();
         let bucket_storage = self.storage.clone();
         let bucket_name = self.name.clone();
-        let saved = self
+        let outcome = self
             .index
             .flush_owned_with(
                 now_ms,
                 move |data: Vec<u8>| async move {
-                    // A single conditional PUT is the remaining second-writer
-                    // defense; a `Precondition` conflict propagates and the
-                    // collection poisons its handle (recovery is a reopen).
+                    // The manifest commit. A single conditional PUT is the
+                    // remaining second-writer defense; a `Precondition`
+                    // conflict propagates and the collection poisons its
+                    // handle (recovery is a reopen).
                     let expected = { metadata_version.read().clone() };
                     let version = metadata_storage
                         .put_bytes(
@@ -937,26 +941,46 @@ where
                     *metadata_version.write() = version;
                     Ok(())
                 },
-                move |id, data: Vec<u8>| {
+                move |object, data: Vec<u8>| {
                     let storage = bucket_storage.clone();
                     let name = bucket_name.clone();
                     async move {
-                        let path = BTree::bucket_path(&name, id);
+                        let path = BTree::bucket_path(&name, object);
                         let _ = storage
                             .put_bytes(&path, Bytes::from(data), PutMode::Overwrite)
                             .await?;
-                        Ok(true)
+                        Ok(())
                     }
                 },
             )
             .await?;
-        Ok(saved)
+
+        // Best-effort retirement of bucket objects the committed manifest no
+        // longer references. A failed deletion only leaks storage space and
+        // never affects loads: the manifest is the loader's single source of
+        // truth.
+        for object in &outcome.obsolete {
+            let path = BTree::bucket_path(&self.name, *object);
+            match self.storage.delete(&path).await {
+                Ok(()) | Err(DBError::NotFound { .. }) => {}
+                Err(err) => {
+                    log::warn!(
+                        action = "BTree::flush",
+                        index = self.name,
+                        bucket = object.bucket_id,
+                        generation = object.generation;
+                        "Failed to delete obsolete bucket object: {err:?}",
+                    );
+                }
+            }
+        }
+
+        Ok(outcome.saved)
     }
 
-    /// See [`BTree::compact_index`] for the persistence-ordering rationale.
+    /// See [`BTree::compact_index`] for the persistence rationale.
     async fn compact(&self) -> Result<(), DBError> {
         let _flush_guard = self.flush_gate.clone().lock_owned().await;
-        let old_max_bucket_id = self.index.stats().max_bucket_id;
         let (old_bucket_count, new_bucket_count) = self.index.compact_buckets();
         if new_bucket_count >= old_bucket_count {
             return Ok(());
@@ -969,25 +993,10 @@ where
             new_bucket_count
         );
 
-        // The same coordinator detects the max_bucket_id shrink and writes all
-        // repacked buckets before committing the smaller metadata range.
+        // Delegate to the same coordinated persistence path used by normal
+        // production flushes; it commits the manifest and deletes the
+        // replaced objects.
         self.flush_inner(unix_ms()).await?;
-
-        // Best-effort cleanup of bucket files beyond the compacted range.
-        for id in (new_bucket_count as u32)..=old_max_bucket_id {
-            let path = BTree::bucket_path(&self.name, id);
-            match self.storage.delete(&path).await {
-                Ok(()) | Err(DBError::NotFound { .. }) => {}
-                Err(err) => {
-                    log::warn!(
-                        action = "BTree::compact",
-                        index = self.name,
-                        bucket = id;
-                        "Failed to delete stale bucket file: {err:?}",
-                    );
-                }
-            }
-        }
 
         Ok(())
     }
@@ -1648,8 +1657,12 @@ mod tests {
         assert_eq!(tree.stats().num_elements, 2);
     }
 
+    /// Crash-window test for the manifest protocol: a bucket PUT failure in
+    /// the middle of a flush (some new-generation objects durable, some not)
+    /// must prevent the manifest commit entirely, so a reopen sees the
+    /// previous complete snapshot; a retry then converges.
     #[tokio::test]
-    async fn wrapper_fault_after_first_bucket_put_cannot_lose_migrated_posting() {
+    async fn wrapper_fault_mid_bucket_puts_keeps_previous_snapshot() {
         let object_store = Arc::new(FailNthBucketPutStore::new(2));
         let storage = Storage::connect(
             "btree_wrapper_fault".to_string(),
@@ -1676,47 +1689,64 @@ mod tests {
                 .unwrap();
             next_id += 1;
         }
-        let target_bucket = tree.stats().max_bucket_id;
 
-        // Fail the second bucket PUT. A source-first implementation would
-        // persist bucket 0's removal and then fail before the migration target,
-        // reproducing P0-01. The coordinated wrapper must instead reach this
-        // boundary as target PUT -> metadata PUT -> failed source PUT.
+        // Fail the second bucket PUT: one new-generation object becomes a
+        // durable orphan, the other is never written, the manifest commit
+        // must not happen.
         object_store.arm();
         assert!(tree.flush(now + 3).await.is_err());
 
         let events = object_store.events();
-        let target_suffix = format!("btree_indexes/fault_tree/b_{target_bucket}.cbor");
-        let target_position = events
-            .iter()
-            .position(|path| path.ends_with(&target_suffix))
-            .unwrap();
-        let metadata_position = events
-            .iter()
-            .position(|path| path.ends_with("btree_indexes/fault_tree/meta.cbor"))
-            .unwrap();
-        let source_position = events
-            .iter()
-            .position(|path| path.ends_with("btree_indexes/fault_tree/b_0.cbor"))
-            .unwrap();
-        assert!(target_position < metadata_position);
-        assert!(metadata_position < source_position);
+        assert!(
+            events.iter().filter(|path| path.contains("/b_")).count() >= 2,
+            "expected at least two bucket PUT attempts: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|path| path.ends_with("meta.cbor")),
+            "the manifest must not be committed when a bucket write fails: {events:?}"
+        );
 
-        // Simulate process loss by discarding the failed in-memory index and
-        // reconnecting with a fresh Storage/cache. The stale source still has
-        // the old posting, but the durable higher target wins during reload.
-        drop(tree);
+        // Simulate process loss: reconnect with a fresh Storage/cache. The
+        // old manifest still references only the committed snapshot; the
+        // orphaned new-generation object is invisible.
         let reopened_storage = Storage::connect(
+            "btree_wrapper_fault".to_string(),
+            object_store.clone(),
+            StorageConfig::default(),
+        )
+        .await
+        .unwrap();
+        let reloaded = BTree::bootstrap(
+            "fault_tree".to_string(),
+            &Ft::Text,
+            reopened_storage.clone(),
+        )
+        .await
+        .unwrap();
+        let ids = reloaded
+            .query_with(&Fv::Text("apple".into()), |ids| Some(ids.clone()))
+            .unwrap();
+        assert_eq!(
+            ids,
+            vec![1],
+            "only the committed snapshot may be visible after the crash"
+        );
+        drop(reloaded);
+
+        // The retried flush (fail point exhausted) commits one complete new
+        // snapshot; a reopen sees every posting.
+        tree.flush(now + 4).await.unwrap();
+        let recovered_storage = Storage::connect(
             "btree_wrapper_fault".to_string(),
             object_store,
             StorageConfig::default(),
         )
         .await
         .unwrap();
-        let reloaded = BTree::bootstrap("fault_tree".to_string(), &Ft::Text, reopened_storage)
+        let recovered = BTree::bootstrap("fault_tree".to_string(), &Ft::Text, recovered_storage)
             .await
             .unwrap();
-        let ids = reloaded
+        let ids = recovered
             .query_with(&Fv::Text("apple".into()), |ids| Some(ids.clone()))
             .unwrap();
         assert_eq!(ids.len(), (next_id - 1) as usize);

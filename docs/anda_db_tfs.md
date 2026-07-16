@@ -87,10 +87,11 @@ The return value `(old_count, new_count)` is useful for monitoring. It is best c
 
 ## 5. Concurrency Model
 
-- All shared state is stored in `DashMap`, `RwLock`, and atomic counters, so **reads and writes can freely overlap across threads** without an outer lock.
+- All shared state is stored in `DashMap`, `RwLock`, and atomic counters, so **concurrent `insert` / `remove` / `search` can freely overlap across threads** without an outer lock.
 - In `insert` and `remove`, the critical regions involving bucket sizing and splitting use fine-grained entry locks via `DashMap::entry().or_default()`, avoiding holding a lock across `.await`.
 - Consistency for `avg_doc_tokens`: after `Vacant.insert()`, the code refreshes it using `doc_tokens.len()` together with the return value from `total_tokens.fetch_add`. Under multithreading this may be temporarily approximate, but it converges quickly as subsequent writes arrive.
-- `store_dirty_buckets` first extracts all dependent data into local variables before awaiting the persistence closure. It never holds a `DashMap` `Ref` across `.await`, which avoids deadlocks.
+- **Coordinating mutations against `flush` / `compact_buckets`, and flushes against each other, is the caller's responsibility** (`anda_db`'s `Collection` holds an exclusive operation gate across every flush). A single writer per durable index is a deployment contract; the crate does not defend against a second writer.
+- `flush` serializes every dirty bucket and the metadata into owned buffers before the first `.await`. It never holds a `DashMap` `Ref` across `.await`, which avoids deadlocks.
 - `top_k_results` uses `select_nth_unstable_by` for partial sorting (`O(n + k log k)`), then performs a final `sort` on the top-k tail, making queries significantly faster on large result sets.
 
 ---
@@ -101,12 +102,17 @@ Physically, one index consists of **one metadata blob** plus **multiple bucket b
 
 ```text
 <root>/
-  metadata                # CBOR-encoded BM25Metadata
+  metadata                # CBOR-encoded BM25Metadata (carries the bucket manifest)
   buckets/
-    0                     # CBOR-encoded BucketOwned
-    1
+    b_0_7                 # CBOR-encoded BucketOwned, addressed by (bucket_id, generation)
+    b_1_9
+    b_2                   # legacy (pre-manifest) object at generation 0, read-only
     ...
 ```
+
+Bucket objects are **immutable once referenced**: every flush writes replaced
+buckets to a fresh `(bucket_id, generation)` object and the metadata's
+manifest is the loader's single source of truth.
 
 ### 6.1 `BM25Metadata`
 
@@ -115,10 +121,13 @@ pub struct BM25Metadata {
     pub name: String,
     pub config: BM25Config,
     pub stats: BM25Stats,          // version / counts / timestamps / watermarks
+    /// Bucket manifest: bucket_id -> generation of the current durable object
+    /// (0 = legacy un-suffixed object). Empty when loading pre-manifest data.
+    pub buckets: BTreeMap<u32, u64>,
 }
 ```
 
-`store_metadata` uses `last_saved_version` as an idempotency guard: when `stats.version` has not increased, it returns `Ok(false)` immediately; if serialization fails, it atomically rolls the version back so that later flushes are not skipped.
+`flush` uses `last_saved_version` as an idempotency guard: when neither `stats.version` has increased nor any bucket is dirty, it returns immediately with `saved == false`.
 
 ### 6.2 Bucket CBOR
 
@@ -134,28 +143,32 @@ The short field names (`"p"`, `"d"`) are chosen to reduce CBOR size. Note that `
 ### 6.3 Incremental Flush Flow
 
 ```rust
-index.flush(metadata_writer, now_ms, async |bucket_id, bytes| {
-    // write bytes to the storage object for this bucket_id
-    Ok(true)           // returning false stops gracefully
+let outcome = index.flush(metadata_writer, now_ms, |object, bytes| {
+    // write bytes to the storage object for (object.bucket_id, object.generation)
+    std::future::ready(Ok(()))
 }).await?;
+for object in &outcome.obsolete {
+    // best-effort: delete the objects the new manifest no longer references
+}
 ```
 
-- `flush` writes metadata first, unless `version` has not advanced.
-- It then scans `buckets`, encodes only buckets where `is_dirty()` is true, and invokes the closure for each of them.
-- During bucket encoding, only postings whose current owner is that bucket are written. The serialized `doc_tokens` table is derived from those postings, so stale bucket-side document IDs are not re-persisted.
-- After each successful write, only that bucket's `saved_version` is advanced to the version snapshot observed at the time. Concurrent modifications still leave it dirty, so the next flush will resend it.
+- `flush` first serializes every dirty bucket (only postings whose current owner is that bucket are written; the serialized `doc_tokens` table is derived from those postings, so stale bucket-side document IDs are not re-persisted).
+- Each dirty bucket is written to a **new** object keyed by `(bucket_id, generation)`; the generation is this flush's metadata version, so committed objects are never mutated in place.
+- The metadata — whose manifest maps every live bucket id to its current generation — is written **last**. That single write is the atomic commit point: a crash or error before it leaves the previous snapshot fully intact (the new objects are unreferenced garbage); after it, the replaced objects are garbage and are returned in `FlushOutcome::obsolete` for best-effort deletion.
+- `compact_buckets` needs no special ordering: the repacked layout becomes visible atomically with the next manifest commit, and every pre-compaction object is reported obsolete.
 
 ### 6.4 Startup and Partial Loading
 
 ```rust
-let idx = BM25Index::load_all(tokenizer, metadata_reader, async |id| {
-    Ok(read_bucket(id).await?)     // Ok(None) means this bucket is not loaded yet
+let idx = BM25Index::load_all(tokenizer, metadata_reader, async |object| {
+    Ok(read_bucket(object).await?) // Ok(None) means this bucket is not loaded
 }).await?;
 ```
 
 - `load_metadata` restores metadata only, which is useful for lightweight scenarios that need just statistics.
-- `load_buckets` can skip buckets on demand when the closure returns `Ok(None)`, which fits a layered strategy like lazy loading plus keeping recently active buckets resident in memory. During search, `score_term` automatically ignores documents that were not loaded.
-- If the same token appears in more than one loaded bucket, the later bucket id wins. The loader removes that token from the older bucket, rebuilds bucket document-id sets from the winning postings, and marks repaired buckets dirty so the next flush removes stale on-disk ownership.
+- With a manifest present, `load_buckets` reads exactly the referenced `(bucket_id, generation)` objects. Metadata persisted by pre-manifest releases has no manifest; the loader falls back to scanning bucket ids `0..=max_bucket_id` at generation `0` (the legacy un-suffixed objects), and the first flush upgrades the durable layout to the manifest format.
+- `load_buckets` can skip buckets (read-only partial loads) when the closure returns `Ok(None)`. During search, `score_term` automatically ignores documents that were not loaded. A partially loaded index must not be flushed: a flush persists exactly the loaded content.
+- If the same token appears in more than one loaded bucket (possible only in legacy data written by the old multi-phase flush), the later bucket id wins. The loader removes that token from the older bucket, rebuilds bucket document-id sets from the winning postings, and marks repaired buckets dirty so the next flush removes stale on-disk ownership.
 
 ---
 
@@ -288,11 +301,21 @@ Persisting to the local filesystem:
 use std::{fs, io::Write};
 
 let metadata = fs::File::create("./idx/metadata.cbor")?;
-idx.flush(metadata, now_ms, async |bucket_id, bytes| {
-    let mut f = fs::File::create(format!("./idx/b_{bucket_id}.cbor"))?;
-    f.write_all(bytes)?;
-    Ok(true)
+let outcome = idx.flush(metadata, now_ms, |object, bytes| {
+    let write = || {
+        let mut f = fs::File::create(format!(
+            "./idx/b_{}_{}.cbor", object.bucket_id, object.generation
+        ))?;
+        f.write_all(&bytes)?;
+        Ok(())
+    };
+    std::future::ready(write())
 }).await?;
+for object in &outcome.obsolete {
+    let _ = fs::remove_file(format!(
+        "./idx/b_{}_{}.cbor", object.bucket_id, object.generation
+    ));
+}
 ```
 
 Loading:
@@ -301,8 +324,14 @@ Loading:
 use std::{fs, io::Read};
 
 let metadata = fs::File::open("./idx/metadata.cbor")?;
-let idx = BM25Index::load_all(default_tokenizer(), metadata, async |id| {
-    match fs::File::open(format!("./idx/b_{id}.cbor")) {
+let idx = BM25Index::load_all(default_tokenizer(), metadata, async |object| {
+    // generation 0 denotes a legacy (pre-manifest) `b_{id}.cbor` object.
+    let path = if object.generation == 0 {
+        format!("./idx/b_{}.cbor", object.bucket_id)
+    } else {
+        format!("./idx/b_{}_{}.cbor", object.bucket_id, object.generation)
+    };
+    match fs::File::open(path) {
         Ok(mut f) => { let mut buf = Vec::new(); f.read_to_end(&mut buf)?; Ok(Some(buf)) }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
@@ -316,7 +345,7 @@ let idx = BM25Index::load_all(default_tokenizer(), metadata, async |id| {
 
 1. **Removal requires the original text**: `remove(id, text, now_ms)` relies on re-tokenizing the original text to locate postings. If the original text is unavailable, call `get_doc_tokens` first or keep your own metadata. Historical misuse does not affect search correctness, but it may leave redundant postings that can be cleaned up with `compact_buckets()`.
 2. **`top_k = 0`**: kept for API compatibility. It returns an empty set and does not trigger sorting.
-3. **Concurrent flush**: multithreaded `flush` is protected by `last_saved_version`, so metadata is not written twice, but the closure may still be called from multiple threads for different buckets. If the storage layer requires serialized writes, add mutual exclusion at the upper layer.
+3. **Flush coordination**: the crate does not serialize flushes internally. The caller must ensure a flush never overlaps mutations, compaction, or another flush (`anda_db`'s `Collection` already guarantees this); a single writer per durable index is a deployment contract.
 4. **Search semantics under partial loading**: if `load_buckets` skips a posting bucket, terms owned by that bucket are unavailable. Loaded buckets also carry the document lengths needed to score their postings, so `len()` may include every document touched by those loaded terms even when other buckets are skipped. Search results remain the natural subset of the loaded postings.
 5. **Embedded-only**: this library is intended for in-process embedding inside AndaDB and does not provide HTTP or gRPC services. For remote access, use `anda_db_server` or `anda_db_shard_proxy`.
 

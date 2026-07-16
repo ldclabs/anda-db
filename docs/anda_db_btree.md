@@ -137,7 +137,6 @@ In memory, each bucket carries packing metadata:
 │   max_bucket_id      : AtomicU32                                        │
 │   query_count        : AtomicU64                                        │
 │   last_saved_version : AtomicU64                                        │
-│   dirty_bucket_count : AtomicU32                                        │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -181,7 +180,7 @@ The index is designed to be cloned into `Arc` and shared across tasks.
 | `remove`, `remove_array`                | Same as insert; `btree` write lock only when a posting becomes empty                                                    |
 | `query_with`                            | DashMap read shard for the posting                                                                                      |
 | `range_query_with`, `prefix_query_with` | `btree` read lock for the duration of iteration; postings are fetched via DashMap read shards per key                   |
-| `flush`, `store_dirty_buckets`          | DashMap read for bucket scan; CBOR is built inside the bucket guard, then released before `await`-ing the user's writer |
+| `flush`, `flush_owned_with`             | DashMap read for bucket scan; CBOR is built inside the bucket guard, then released before `await`-ing the user's writer |
 
 ### 4.2 Race-free Guarantees
 
@@ -192,21 +191,19 @@ The index is designed to be cloned into `Arc` and shared across tasks.
   `Entry::Occupied` + empty re-check, so a concurrent `insert` that re-adds
   a doc id wins over the removal and keeps the posting alive.
 - **Crash-consistent migration.** Moving a posting from bucket A to bucket B
-  marks **both** buckets dirty. If a crash leaves a stale lower-numbered
-  bucket file alongside a newer migrated bucket, `load_buckets` treats the
-  higher bucket id as the current owner, removes the stale in-memory ownership
-  from the lower bucket, and marks that lower bucket dirty so the next flush
-  repairs the stale file.
-- **Dirty-version check on flush.** If a bucket is mutated while its CBOR
-  blob is being written, its `dirty_version` changes; the post-write clean
-  step then refuses to clear the dirty flag, guaranteeing the mutation is
-  persisted on the next flush.
+  marks **both** buckets dirty; the next flush rewrites both to fresh
+  generation-suffixed objects and commits them atomically through the
+  manifest, so no crash boundary can observe A without the posting while B is
+  unreferenced.
+- **Flush coordination is the caller's job.** The crate does not defend a
+  flush against concurrent mutations, compaction, or another flush;
+  `anda_db`'s `Collection` holds an exclusive operation gate across every
+  flush, and a single writer per durable index is a deployment contract.
 
 ### 4.3 Ordering of Ops
 
-`Ordering::Relaxed` is used for statistics counters; `Ordering::AcqRel` /
-`Ordering::Acquire` is used for `dirty_bucket_count` to synchronize the
-fast-path of `flush`.
+`Ordering::Relaxed` is used for statistics counters; `Ordering::Release` /
+`Ordering::Acquire` is used for `last_saved_version`.
 
 ---
 
@@ -219,14 +216,17 @@ async callbacks. A typical layout is:
 
 ```
 <index-dir>/
-├── metadata.cbor         ← BTreeMetadata blob
-├── bucket_0.cbor
-├── bucket_1.cbor
-└── bucket_N.cbor
+├── metadata.cbor         ← BTreeMetadata blob (carries the bucket manifest)
+├── bucket_0_7.cbor       ← immutable object addressed by (bucket_id, generation)
+├── bucket_1_9.cbor
+└── bucket_2.cbor         ← legacy (pre-manifest) object at generation 0, read-only
 ```
 
-`metadata.cbor` is written by [`store_metadata`] / [`flush`]; each
-`bucket_*.cbor` is written by [`store_dirty_buckets`] / [`flush`].
+Both are written by [`flush`] / [`flush_owned_with`]. Every flush writes the
+dirty buckets to **fresh** `(bucket_id, generation)` objects, then commits
+the metadata — whose *manifest* maps every live bucket id to its current
+generation — as the single atomic point. Objects the new manifest no longer
+references are returned as `FlushOutcome::obsolete` for best-effort deletion.
 
 ### 5.2 Lifecycle
 
@@ -241,7 +241,7 @@ async callbacks. A typical layout is:
   └──────────┬────────────────────────────┬────────────────┘
              │                            │
              ▼                            ▼
-   dirty_bucket_count += …       metadata.stats.version += 1
+   bucket marked dirty           metadata.stats.version += 1
              │                            │
              └────────────┬───────────────┘
                           ▼
@@ -249,35 +249,40 @@ async callbacks. A typical layout is:
                     │  flush   │
                     └────┬─────┘
                          │
-                 ┌───────┴─────────┐
-                 ▼                 ▼
-         store_metadata     store_dirty_buckets
+        1. write dirty buckets to new (id, generation) objects
+        2. commit metadata + manifest   ← the atomic point
+        3. caller deletes FlushOutcome::obsolete best-effort
 ```
 
 ### 5.3 Version Tracking
 
-| Counter                    | Bumped on                     | Consumed by                                                         |
-| -------------------------- | ----------------------------- | ------------------------------------------------------------------- |
-| `BTreeStats::version`      | every mutating operation      | `store_metadata` (skips write when `last_saved_version >= version`) |
-| per-bucket `dirty_version` | every mutation to that bucket | `store_dirty_buckets` (keeps bucket dirty when mutated during I/O)  |
+| Counter                    | Bumped on                     | Consumed by                                                          |
+| -------------------------- | ----------------------------- | -------------------------------------------------------------------- |
+| `BTreeStats::version`      | every mutating operation      | `flush` (skips when `last_saved_version >= version` and no bucket is dirty); doubles as the object **generation** |
+| per-bucket `dirty_version` | every mutation to that bucket | `flush` (a bucket mutated after serialization stays dirty)           |
 
 ### 5.4 Loading
 
 ```rust
 // Option A: two-phase
 let mut idx = BTreeIndex::load_metadata(meta_reader)?;
-idx.load_buckets(async |id| Ok(store.get(id).cloned())).await?;
+idx.load_buckets(async |object| Ok(store.get(&object).cloned())).await?;
 
 // Option B: one-shot
-let idx = BTreeIndex::load_all(meta_reader, async |id| …).await?;
+let idx = BTreeIndex::load_all(meta_reader, async |object| …).await?;
 ```
 
-`load_buckets` iterates `0..=max_bucket_id`; missing buckets are tolerated
-(the callback returns `Ok(None)`), so compaction or bucket deletion is safe.
-When the same field value appears in multiple bucket files, later bucket ids
-win. The loader reconciles the older bucket's in-memory `field_values` list and
-marks that bucket dirty, allowing a normal flush to remove the stale on-disk
-entry.
+With a manifest present, `load_buckets` reads exactly the referenced
+`(bucket_id, generation)` objects. Metadata persisted by pre-manifest
+releases has no manifest; the loader falls back to scanning bucket ids
+`0..=max_bucket_id` at generation `0` (the legacy un-suffixed objects), and
+the first flush upgrades the durable layout to the manifest format. Missing
+objects are tolerated (the callback returns `Ok(None)`) for read-only partial
+loads; a partially loaded index must not be flushed. When the same field
+value appears in multiple legacy bucket files (a leftover of the old
+multi-phase flush), later bucket ids win: the loader reconciles the older
+bucket's in-memory `field_values` list and marks that bucket dirty, allowing
+a normal flush to remove the stale on-disk entry.
 
 ---
 
@@ -442,13 +447,21 @@ impl<PK> BTreeIndex<PK, String> {
 ### 8.5 Persistence
 
 ```rust
-pub fn store_metadata<W: Write>(&self, w: W, now_ms: u64)
-    -> Result<bool, BTreeError>;
-pub async fn store_dirty_buckets<F>(&self, f: F) -> Result<(), BTreeError>
-    where F: AsyncFnMut(u32, &[u8]) -> Result<bool, BoxError>;
-pub async fn flush<W: Write, F>(&self, metadata: W, now_ms: u64, f: F)
-    -> Result<bool, BTreeError>
-    where F: AsyncFnMut(u32, &[u8]) -> Result<bool, BoxError>;
+pub struct BucketObject { pub bucket_id: u32, pub generation: u64 }
+pub struct FlushOutcome { pub saved: bool, pub obsolete: Vec<BucketObject> }
+
+pub async fn flush<W: Write, F, Fut>(&self, metadata: W, now_ms: u64, f: F)
+    -> Result<FlushOutcome, BTreeError>
+    where F: FnMut(BucketObject, Vec<u8>) -> Fut,
+          Fut: Future<Output = Result<(), BoxError>>;
+
+pub async fn flush_owned_with<M, MFut, F, FFut>(
+    &self, now_ms: u64, metadata_writer: M, bucket_writer: F,
+) -> Result<FlushOutcome, BTreeError>
+    where M: FnOnce(Vec<u8>) -> MFut,
+          MFut: Future<Output = Result<(), BoxError>>,
+          F: FnMut(BucketObject, Vec<u8>) -> FFut,
+          FFut: Future<Output = Result<(), BoxError>>;
 
 pub fn compact_buckets(&self) -> (usize /*old*/, usize /*new*/);
 ```
@@ -456,7 +469,10 @@ pub fn compact_buckets(&self) -> (usize /*old*/, usize /*new*/);
 ### 8.6 Types
 
 ```rust
-pub struct BTreeMetadata { pub name, pub config, pub stats }
+pub struct BTreeMetadata {
+    pub name, pub config, pub stats,
+    pub buckets: BTreeMap<u32, u64>,   // bucket manifest: id -> generation
+}
 pub struct BTreeStats {
     pub last_inserted, pub last_deleted, pub last_saved: u64,
     pub version, pub num_elements,
@@ -534,17 +550,32 @@ let hits = idx.range_query_with(q, |k, ids| (true, vec![(k.clone(), ids.clone())
 use std::fs::File;
 use std::io::{Read, Write};
 
+// generation 0 denotes a legacy (pre-manifest) `bucket_{id}.cbor` object.
+fn bucket_file(object: BucketObject) -> String {
+    if object.generation == 0 {
+        format!("bucket_{}.cbor", object.bucket_id)
+    } else {
+        format!("bucket_{}_{}.cbor", object.bucket_id, object.generation)
+    }
+}
+
 // ---- Save ----
 let meta = File::create("meta.cbor")?;
-idx.flush(meta, now_ms, async |id, data| {
-    File::create(format!("bucket_{id}.cbor"))?.write_all(data)?;
-    Ok(true)
+let outcome = idx.flush(meta, now_ms, |object, data| {
+    let write = || {
+        File::create(bucket_file(object))?.write_all(&data)?;
+        Ok(())
+    };
+    std::future::ready(write())
 }).await?;
+for object in &outcome.obsolete {
+    let _ = std::fs::remove_file(bucket_file(*object)); // best-effort GC
+}
 
 // ---- Load ----
 let mut loaded = BTreeIndex::<u64, String>::load_metadata(File::open("meta.cbor")?)?;
-loaded.load_buckets(async |id| {
-    let mut f = File::open(format!("bucket_{id}.cbor"))?;
+loaded.load_buckets(async |object| {
+    let mut f = File::open(bucket_file(object))?;
     let mut buf = Vec::new();
     f.read_to_end(&mut buf)?;
     Ok(Some(buf))
@@ -665,8 +696,8 @@ multiple `BTreeIndex` instances by key prefix.
    dominate; lower it if cold-load latency dominates.
 2. **Batch writes** — prefer `insert_array` / `batch_update` over tight
    single-row loops: they amortize `btree` write locks and statistic updates.
-3. **Flush cadence** — `flush` is cheap when nothing is dirty (fast-path on
-   `dirty_bucket_count == 0`). Call it frequently.
+3. **Flush cadence** — `flush` is cheap when nothing is dirty (it
+   short-circuits before serializing anything). Call it frequently.
 4. **Concurrent readers** — `query_with` and `range_query_with` are lock-free
    against other readers; scale readers freely.
 5. **Avoid `Not` in hot paths** — it scans the entire key set.
@@ -701,7 +732,7 @@ multiple `BTreeIndex` instances by key prefix.
 ### 13.4 Persistence
 
 - Call `flush` whenever your host commits a logical transaction. The
-  fast-path check (`dirty_bucket_count` and `last_saved_version`) makes
+  fast-path check (dirty-bucket scan and `last_saved_version`) makes
   idempotent calls essentially free.
 - Make the flush callbacks **fsync** at their own cadence. The crate
   guarantees the in-memory model is correct after `Ok(_)`; durability
@@ -709,11 +740,17 @@ multiple `BTreeIndex` instances by key prefix.
 
 ### 13.5 Recovery
 
-- After a crash, re-run `load_all(metadata, loader)`. Any bucket missing on
-  disk is treated as empty, which is safe because the metadata version is
-  only bumped after the mutation is observable.
+- After a crash, re-run `load_all(metadata, loader)`. The metadata's bucket
+  manifest is a complete, consistent snapshot: bucket objects written by an
+  uncommitted flush are unreferenced and invisible, so the load always sees
+  either the old or the new snapshot in full.
+- Unreferenced bucket objects (from a flush that crashed before its manifest
+  commit, or `FlushOutcome::obsolete` deletions that failed) only leak
+  storage space; they can be garbage-collected by comparing the store's
+  listing against the manifest.
 - If you detect fragmentation or legacy over-split buckets, run
-  `compact_buckets()` once while the index is idle, then `flush` once more.
+  `compact_buckets()` once while the index is idle, then `flush` once more —
+  the flush retires every pre-compaction object via `FlushOutcome::obsolete`.
 
 ---
 
@@ -731,9 +768,9 @@ The implementation upholds the following invariants; tests in
    `allow_duplicates = false` inside the `postings` entry lock.
 4. **Empty-posting removal is atomic.** The btree key is removed only if the
    posting is still empty at the moment of removal.
-5. **Dirty version consistency.** `store_dirty_buckets` clears the dirty
-   flag only when the bucket's `dirty_version` matches the value it sampled
-   before issuing the async write — preserving concurrent mutations.
+5. **Dirty version consistency.** `flush` clears the dirty flag only when
+   the bucket's `dirty_version` matches the value it sampled at
+   serialization time — a bucket mutated afterwards stays dirty.
 6. **Version monotonicity.** `BTreeStats::version` is strictly increasing
    across every mutating operation; idempotent inserts/removes do **not**
    bump it.

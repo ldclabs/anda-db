@@ -1,4 +1,4 @@
-use anda_db_tfs::BM25Index;
+use anda_db_tfs::{BM25Index, BucketObject};
 use bytes::Bytes;
 use parking_lot::RwLock;
 use std::{fmt::Debug, hash::Hash, sync::Arc};
@@ -68,8 +68,18 @@ impl BM25 {
         format!("bm25_indexes/{name}/meta.cbor")
     }
 
-    fn bucket_path(name: &str, bucket: u32) -> String {
-        format!("bm25_indexes/{name}/b_{bucket}.cbor")
+    /// Object path for a bucket generation. Generation `0` is the legacy
+    /// (pre-manifest) un-suffixed object and is only ever read, never
+    /// written; the manifest protocol writes generation-suffixed objects.
+    fn bucket_path(name: &str, object: BucketObject) -> String {
+        if object.generation == 0 {
+            format!("bm25_indexes/{name}/b_{}.cbor", object.bucket_id)
+        } else {
+            format!(
+                "bm25_indexes/{name}/b_{}_{}.cbor",
+                object.bucket_id, object.generation
+            )
+        }
     }
 
     /// Tokenizes `text` with `tokenizer` and returns the unique indexed terms.
@@ -98,7 +108,7 @@ impl BM25 {
         let index = BM25Index::new(name.clone(), tokenizer, Some(config));
         let mut data = Vec::new();
         index
-            .flush(&mut data, now_ms, |_, _| std::future::ready(Ok(true)))
+            .flush(&mut data, now_ms, |_, _| std::future::ready(Ok(())))
             .await?;
         // The collection metadata is the source of truth for which indexes
         // exist, so overwrite any leftover files from a crashed creation or a
@@ -137,8 +147,8 @@ impl BM25 {
         let (metadata, ver) = storage.fetch_bytes(&BM25::metadata_path(&name)).await?;
         let n = Arc::new(name.clone());
         let s = Arc::new(storage.clone());
-        let index = BM25Index::load_all(tokenizer, &metadata[..], async move |id: u32| {
-            let path = BM25::bucket_path(n.clone().as_str(), id);
+        let index = BM25Index::load_all(tokenizer, &metadata[..], async move |object| {
+            let path = BM25::bucket_path(n.clone().as_str(), object);
             match s.clone().fetch_bytes(&path).await {
                 Ok((data, _)) => Ok(Some(data.into())),
                 Err(DBError::NotFound { .. }) => Ok(None),
@@ -159,13 +169,12 @@ impl BM25 {
 
     /// Persists dirty metadata and buckets.
     ///
-    /// Delegates to [`BM25Index::flush_with`], which implements the
-    /// crash-safe grow-then-shrink ordering: buckets not yet referenced by
-    /// the persisted metadata (token-migration targets) are written first,
-    /// then the metadata, then the rewrites of already-referenced buckets.
-    /// See `BM25Index::flush_with` for the crash-window analysis; keeping a
-    /// single implementation in the crate prevents this production path from
-    /// drifting out of sync with it again.
+    /// Delegates to [`BM25Index::flush_with`], which implements the manifest
+    /// commit protocol: every dirty bucket is written to a fresh
+    /// generation-suffixed object, then the metadata (whose manifest
+    /// references them) is committed with a single conditional PUT. Objects
+    /// the new manifest no longer references are deleted best-effort
+    /// afterwards.
     ///
     /// Returns `true` when any object was written.
     pub async fn flush(&self, now_ms: u64) -> Result<bool, DBError> {
@@ -176,15 +185,16 @@ impl BM25 {
     /// The sole production persistence path. Callers must hold `flush_gate`.
     async fn flush_inner(&self, now_ms: u64) -> Result<bool, DBError> {
         let metadata_path = BM25::metadata_path(&self.name);
-        let saved = self
+        let outcome = self
             .index
             .flush_with(
                 now_ms,
                 move |data: Vec<u8>| {
-                    // A single conditional PUT is the remaining second-writer
-                    // defense. A `Precondition` conflict is not reconciled in
-                    // place: the error propagates, the collection poisons its
-                    // handle and recovery happens on reopen.
+                    // The manifest commit. A single conditional PUT is the
+                    // remaining second-writer defense: a `Precondition`
+                    // conflict is not reconciled in place — the error
+                    // propagates, the collection poisons its handle and
+                    // recovery happens on reopen.
                     let metadata_path = metadata_path.clone();
                     async move {
                         let expected = { self.metadata_version.read().clone() };
@@ -201,36 +211,49 @@ impl BM25 {
                         Ok(())
                     }
                 },
-                |id: u32, data: Vec<u8>| async move {
-                    let path = BM25::bucket_path(&self.name, id);
+                |object: BucketObject, data: Vec<u8>| async move {
+                    let path = BM25::bucket_path(&self.name, object);
                     let _ = self
                         .storage
                         .put_bytes(&path, Bytes::from(data), PutMode::Overwrite)
                         .await?;
-                    Ok(true)
+                    Ok(())
                 },
             )
             .await?;
-        Ok(saved)
+
+        // Best-effort retirement of bucket objects the committed manifest no
+        // longer references. A failed deletion only leaks storage space and
+        // never affects loads: the manifest is the loader's single source of
+        // truth.
+        for object in &outcome.obsolete {
+            let path = BM25::bucket_path(&self.name, *object);
+            match self.storage.delete(&path).await {
+                Ok(()) | Err(DBError::NotFound { .. }) => {}
+                Err(err) => {
+                    log::warn!(
+                        action = "BM25::flush",
+                        index = self.name,
+                        bucket = object.bucket_id,
+                        generation = object.generation;
+                        "Failed to delete obsolete bucket object: {err:?}",
+                    );
+                }
+            }
+        }
+
+        Ok(outcome.saved)
     }
 
     /// Compacts bucket layout and persists the new layout if the bucket count
     /// shrinks.
     ///
-    /// Compaction persists **buckets before metadata** because it is the only
-    /// operation that shrinks `max_bucket_id`: the loader only scans bucket
-    /// ids up to the persisted `max_bucket_id`, so committing the reduced
-    /// range first would hide repacked tokens if the process crashed before
-    /// the low-id bucket files were rewritten (see `BTree::compact_index` for
-    /// the same rationale). This is the inverse of the steady-state ordering
-    /// in [`Self::flush`], where *newly allocated* buckets must precede the
-    /// metadata that first references them; `BM25Index::flush_with` detects a
-    /// shrunken `max_bucket_id` and applies this buckets-first order too, so
-    /// both paths agree. Stale bucket files beyond the compacted range are
-    /// deleted best-effort afterwards.
+    /// Under the manifest protocol compaction needs no special write
+    /// ordering: the repacked layout becomes visible atomically with the
+    /// manifest commit of the following flush, which also retires every
+    /// pre-compaction bucket object best-effort.
     pub async fn compact_index(&self) -> Result<(), DBError> {
         let _flush_guard = self.flush_gate.clone().lock_owned().await;
-        let old_max_bucket_id = self.index.stats().max_bucket_id;
         let (old_bucket_count, new_bucket_count) = self.index.compact_buckets();
         if new_bucket_count >= old_bucket_count {
             return Ok(());
@@ -243,31 +266,10 @@ impl BM25 {
             new_bucket_count
         );
 
-        // Delegate to the same coordinated snapshot and ordering used by
-        // normal production flushes.
+        // Delegate to the same coordinated persistence path used by normal
+        // production flushes; it commits the manifest and deletes the
+        // replaced objects.
         self.flush_inner(unix_ms()).await?;
-
-        // Best-effort cleanup of bucket files beyond the compacted range.
-        // If a concurrent mutation allocated a bucket in the stale range,
-        // leave all files there alone; the next flush will reconcile them.
-        // A mutation beginning after this check is not referenced by the
-        // metadata just persisted, so deleting an orphan remains safe.
-        if self.index.stats().max_bucket_id < new_bucket_count as u32 {
-            for id in (new_bucket_count as u32)..=old_max_bucket_id {
-                let path = BM25::bucket_path(&self.name, id);
-                match self.storage.delete(&path).await {
-                    Ok(()) | Err(DBError::NotFound { .. }) => {}
-                    Err(err) => {
-                        log::warn!(
-                            action = "BM25::compact_index",
-                            index = self.name,
-                            bucket = id;
-                            "Failed to delete stale bucket file: {err:?}",
-                        );
-                    }
-                }
-            }
-        }
 
         Ok(())
     }

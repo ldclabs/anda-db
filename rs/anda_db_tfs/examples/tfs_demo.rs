@@ -52,25 +52,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     index.remove(docs[2].id, &docs[2].text, 0);
     println!("Total documents after removal: {}", index.len());
 
-    // 保存和加载
+    // 保存和加载。桶对象以 (bucket_id, generation) 寻址；generation 0 是
+    // 旧格式（无后缀）对象，仅用于读取兼容。
+    fn bucket_file(object: anda_db_tfs::BucketObject) -> String {
+        if object.generation == 0 {
+            format!("debug/tfs_demo/b_{}.cbor", object.bucket_id)
+        } else {
+            format!(
+                "debug/tfs_demo/b_{}_{}.cbor",
+                object.bucket_id, object.generation
+            )
+        }
+    }
+
     std::fs::create_dir_all("debug/tfs_demo")?;
-    {
+    let outcome = {
         let metadata = std::fs::File::create("debug/tfs_demo/metadata.cbor")?;
         index
-            .flush(metadata, 0, |id, data| {
+            .flush(metadata, 0, |object, data| {
                 let write = || {
-                    let mut node = std::fs::File::create(format!("debug/tfs_demo/b_{id}.cbor"))?;
+                    let mut node = std::fs::File::create(bucket_file(object))?;
                     node.write_all(&data)?;
-                    Ok(true)
+                    Ok(())
                 };
                 std::future::ready(write())
             })
-            .await?;
+            .await?
+    };
+    // 清理被新 manifest 取代的旧桶对象（尽力而为）。
+    for object in &outcome.obsolete {
+        let _ = std::fs::remove_file(bucket_file(*object));
     }
 
     let metadata = std::fs::File::open("debug/tfs_demo/metadata.cbor")?;
-    let loaded_index = BM25Index::load_all(jieba_tokenizer(), metadata, async |id| {
-        let mut node = std::fs::File::open(format!("debug/tfs_demo/b_{id}.cbor"))?;
+    let loaded_index = BM25Index::load_all(jieba_tokenizer(), metadata, async |object| {
+        let mut node = std::fs::File::open(bucket_file(object))?;
         let mut buf = Vec::new();
         node.read_to_end(&mut buf)?;
         Ok(Some(buf))
