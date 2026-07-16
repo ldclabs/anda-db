@@ -1,7 +1,6 @@
 use anda_db_tfs::BM25Index;
 use bytes::Bytes;
-use parking_lot::{Mutex as ParkingMutex, RwLock};
-use serde::{Deserialize, Serialize};
+use parking_lot::RwLock;
 use std::{fmt::Debug, hash::Hash, sync::Arc};
 use tokio::sync::Mutex;
 
@@ -18,48 +17,26 @@ use crate::{
     unix_ms,
 };
 
-/// On-disk envelope emitted by `anda_db_tfs::BM25Index` metadata writers.
-///
-/// Decode this directly instead of calling `BM25Index::metadata()` on a
-/// metadata-only shell: that accessor overlays live counters from the empty
-/// shell and would erase persisted `num_elements` during conflict comparison.
-#[derive(Deserialize, Serialize)]
-struct PersistedBM25Index {
-    metadata: BM25Metadata,
-}
-
-#[derive(Clone)]
-struct PendingMetadataWrite {
-    payload: Vec<u8>,
-    expected_version: ObjectVersion,
-}
-
-fn normalize_metadata_payload(data: &[u8]) -> Result<Vec<u8>, BoxError> {
-    let mut payload: PersistedBM25Index = cbor2::from_reader(data)?;
-    payload.metadata.stats.last_saved = 0;
-    payload.metadata.stats.search_count = 0;
-    let mut normalized = Vec::new();
-    cbor2::to_writer(&payload, &mut normalized)?;
-    Ok(normalized)
-}
-
 /// Collection-level wrapper around the full-text BM25 index.
 ///
 /// The wrapper keeps the index name, virtual field list, storage namespace, and
 /// object versions needed for optimistic metadata updates.
+///
+/// The metadata CAS token is the last defense against a second writer, which
+/// the single-writer deployment contract forbids. A `Precondition` conflict
+/// (or a cancelled flush) is never reconciled in place: the error propagates,
+/// the collection poisons its handle and reopening rebuilds this wrapper from
+/// the durable objects.
 pub struct BM25 {
     name: String,
     fields: Vec<String>,
     index: BM25Index<TokenizerChain>,
     storage: Storage, // 与 Collection 共享同一个 Storage 实例
     metadata_version: RwLock<ObjectVersion>,
-    /// Exact metadata generation registered before its conditional PUT is
-    /// awaited. A committed-but-cancelled older generation must be reconciled
-    /// before a later mutation generation can use the refreshed CAS token.
-    pending_metadata_write: ParkingMutex<Option<PendingMetadataWrite>>,
     /// Serializes complete object-store flushes for this wrapper. Mutation
     /// consistency is handled by `BM25Index::flush_with`; this gate prevents
-    /// two frozen generations from being uploaded in reverse order.
+    /// two frozen generations from being uploaded in reverse order (compact
+    /// runs under a shared collection lease, so two compacts can overlap).
     flush_gate: Arc<Mutex<()>>,
 }
 
@@ -135,7 +112,6 @@ impl BM25 {
             index,
             storage,
             metadata_version: RwLock::new(ver),
-            pending_metadata_write: ParkingMutex::new(None),
             flush_gate: Arc::new(Mutex::new(())),
         })
     }
@@ -177,7 +153,6 @@ impl BM25 {
             index,
             storage,
             metadata_version: RwLock::new(ver),
-            pending_metadata_write: ParkingMutex::new(None),
             flush_gate: Arc::new(Mutex::new(())),
         })
     }
@@ -205,8 +180,26 @@ impl BM25 {
             .index
             .flush_with(
                 now_ms,
-                move |data: Vec<u8>| async move {
-                    self.persist_metadata_snapshot(metadata_path, data).await
+                move |data: Vec<u8>| {
+                    // A single conditional PUT is the remaining second-writer
+                    // defense. A `Precondition` conflict is not reconciled in
+                    // place: the error propagates, the collection poisons its
+                    // handle and recovery happens on reopen.
+                    let metadata_path = metadata_path.clone();
+                    async move {
+                        let expected = { self.metadata_version.read().clone() };
+                        let version = self
+                            .storage
+                            .put_bytes(
+                                &metadata_path,
+                                Bytes::from(data),
+                                PutMode::Update(expected.into()),
+                            )
+                            .await
+                            .map_err(BoxError::from)?;
+                        *self.metadata_version.write() = version;
+                        Ok(())
+                    }
                 },
                 |id: u32, data: Vec<u8>| async move {
                     let path = BM25::bucket_path(&self.name, id);
@@ -219,61 +212,6 @@ impl BM25 {
             )
             .await?;
         Ok(saved)
-    }
-
-    /// Persists one metadata generation and repairs the local object-version
-    /// token when a previously cancelled PUT committed remotely but its
-    /// `PutResult` was never observed.
-    async fn persist_metadata_snapshot(&self, path: String, data: Vec<u8>) -> Result<(), BoxError> {
-        let intended = normalize_metadata_payload(&data)?;
-        loop {
-            let pending = {
-                let mut slot = self.pending_metadata_write.lock();
-                slot.get_or_insert_with(|| PendingMetadataWrite {
-                    payload: data.clone(),
-                    expected_version: self.metadata_version.read().clone(),
-                })
-                .clone()
-            };
-            let pending_logical = normalize_metadata_payload(&pending.payload)?;
-
-            let version = match self
-                .storage
-                .put_bytes(
-                    &path,
-                    Bytes::from(pending.payload.clone()),
-                    PutMode::Update(pending.expected_version.clone().into()),
-                )
-                .await
-            {
-                Ok(version) => version,
-                Err(err @ DBError::Precondition { .. }) => {
-                    // `fetch_bytes` bypasses Storage's cache. This is
-                    // essential after a post-commit cancellation because the
-                    // cache invalidation happens only after `put_bytes`
-                    // returns. Never consume a true conflicting payload.
-                    let (persisted, version) = self.storage.fetch_bytes(&path).await?;
-                    if pending_logical != normalize_metadata_payload(&persisted)? {
-                        return Err(BoxError::from(err));
-                    }
-                    version
-                }
-                Err(err) => return Err(BoxError::from(err)),
-            };
-
-            // No await follows the successful reconciliation: cancellation
-            // cannot expose a refreshed token while leaving the completed
-            // pending generation registered.
-            *self.metadata_version.write() = version;
-            *self.pending_metadata_write.lock() = None;
-            if pending_logical == intended {
-                return Ok(());
-            }
-
-            // A mutation arrived after the cancelled generation. Register the
-            // callback's newer immutable payload with the refreshed token and
-            // persist it before allowing the low-level flush to commit.
-        }
     }
 
     /// Compacts bucket layout and persists the new layout if the bucket count
@@ -411,17 +349,15 @@ mod tests {
     use crate::storage::StorageConfig;
     use object_store::memory::InMemory;
 
-    /// Regression (P0): object-store PUT futures may be cancelled after the
-    /// conditional write committed but before the returned version reached
-    /// this wrapper. A retry must read back the identical logical metadata,
-    /// refresh its local CAS token, finish the bucket phase, and remain able
-    /// to commit the following generation.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_metadata_post_commit_cancellation_repairs_version_and_reopens()
-    -> Result<(), DBError> {
+    /// The wrapper's metadata CAS token is the last defense against a second
+    /// writer: after a foreign overwrite the next flush must fail instead of
+    /// being silently reconciled in place. Recovery is a reopen, which reads
+    /// the durable objects and their fresh versions.
+    #[tokio::test]
+    async fn test_foreign_metadata_writer_fails_flush() -> Result<(), DBError> {
         let object_store = Arc::new(InMemory::new());
         let storage = Storage::connect(
-            "bm25_post_commit_cancel".to_string(),
+            "bm25_foreign_writer".to_string(),
             object_store,
             StorageConfig {
                 compress_level: 0,
@@ -429,120 +365,37 @@ mod tests {
             },
         )
         .await?;
-        let bm25 = Arc::new(
-            BM25::new(
-                vec!["body".to_string()],
-                default_tokenizer(),
-                storage.clone(),
-                1,
-            )
-            .await?,
-        );
+        let bm25 = BM25::new(
+            vec!["body".to_string()],
+            default_tokenizer(),
+            storage.clone(),
+            1,
+        )
+        .await?;
         bm25.insert(1, "alpha", 2)?;
+        assert!(bm25.flush(3).await?);
 
-        let metadata_committed = Arc::new(tokio::sync::Notify::new());
-        let interrupted = {
-            let bm25 = bm25.clone();
-            let metadata_bm25 = bm25.clone();
-            let bucket_bm25 = bm25.clone();
-            let metadata_committed = metadata_committed.clone();
-            tokio::spawn(async move {
-                let metadata_path = BM25::metadata_path(&bm25.name);
-                bm25.index
-                    .flush_with(
-                        3,
-                        move |data| {
-                            let bm25 = metadata_bm25.clone();
-                            let metadata_committed = metadata_committed.clone();
-                            async move {
-                                let expected = { bm25.metadata_version.read().clone() };
-                                *bm25.pending_metadata_write.lock() = Some(PendingMetadataWrite {
-                                    payload: data.clone(),
-                                    expected_version: expected.clone(),
-                                });
-                                let _committed_version = bm25
-                                    .storage
-                                    .put_bytes(
-                                        &metadata_path,
-                                        Bytes::from(data),
-                                        PutMode::Update(expected.into()),
-                                    )
-                                    .await
-                                    .map_err(BoxError::from)?;
-                                metadata_committed.notify_one();
-                                // Model cancellation after the backend has
-                                // committed but before the wrapper observes
-                                // and publishes `_committed_version`.
-                                std::future::pending::<Result<(), BoxError>>().await
-                            }
-                        },
-                        move |id, data| {
-                            let bm25 = bucket_bm25.clone();
-                            async move {
-                                let path = BM25::bucket_path(&bm25.name, id);
-                                bm25.storage
-                                    .put_bytes(&path, Bytes::from(data), PutMode::Overwrite)
-                                    .await
-                                    .map_err(BoxError::from)?;
-                                Ok(true)
-                            }
-                        },
-                    )
-                    .await
-            })
-        };
+        // Simulate a second writer replacing the durable metadata object.
+        let (data, _) = storage.fetch_bytes(&BM25::metadata_path("body")).await?;
+        storage
+            .put_bytes(&BM25::metadata_path("body"), data, PutMode::Overwrite)
+            .await?;
 
-        metadata_committed.notified().await;
-        interrupted.abort();
-        assert!(
-            interrupted
-                .await
-                .expect_err("flush should be cancelled after metadata commit")
-                .is_cancelled()
-        );
-        assert!(bm25.has_pending_flush());
-
-        // Search counters are observational and can advance without changing
-        // the structural metadata version. They must not block reconciliation.
-        assert!(
-            bm25.search("alpha", 10, None)
-                .iter()
-                .any(|(id, _)| *id == 1)
-        );
-
-        // Advance the structural generation before retrying. The wrapper must
-        // first reconcile the retained alpha generation with its stale token,
-        // then use the refreshed token to commit this newer beta generation.
         bm25.insert(2, "beta", 4)?;
+        assert!(
+            bm25.flush(5).await.is_err(),
+            "stale CAS token must remain a conflict",
+        );
 
-        // The retry encounters Precondition with its stale local token. It
-        // must accept only the retained equivalent payload, refresh the token,
-        // then persist the newer callback payload and finish bucket writes.
-        assert!(bm25.flush(5).await?);
-
-        // A second logical generation proves the repaired token—not merely
-        // the read-back acceptance—was published locally.
-        bm25.insert(3, "gamma", 6)?;
-        assert!(bm25.flush(7).await?);
-
+        // Reopening loads the durable state (generation "alpha"); the
+        // unflushed beta insert is recovered by the collection's WAL replay,
+        // not by this wrapper.
         let reopened = BM25::bootstrap("body".to_string(), default_tokenizer(), storage).await?;
         assert!(
             reopened
                 .search("alpha", 10, None)
                 .iter()
                 .any(|(id, _)| *id == 1)
-        );
-        assert!(
-            reopened
-                .search("beta", 10, None)
-                .iter()
-                .any(|(id, _)| *id == 2)
-        );
-        assert!(
-            reopened
-                .search("gamma", 10, None)
-                .iter()
-                .any(|(id, _)| *id == 3)
         );
         Ok(())
     }

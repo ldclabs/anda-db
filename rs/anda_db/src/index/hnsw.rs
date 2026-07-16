@@ -1,6 +1,6 @@
 use anda_db_hnsw::HnswIndex;
 use bytes::Bytes;
-use parking_lot::{Mutex as ParkingMutex, RwLock};
+use parking_lot::RwLock;
 use std::{fmt::Debug, hash::Hash, sync::Arc};
 
 pub use anda_db_hnsw::{HnswConfig, HnswMetadata, HnswStats};
@@ -11,31 +11,23 @@ use crate::{
     storage::{ObjectVersion, PutMode, Storage},
 };
 
-#[derive(Clone)]
-struct PendingVersionedWrite {
-    payload: Vec<u8>,
-    expected_version: ObjectVersion,
-}
-
-#[derive(Clone, Copy)]
-enum PayloadMatch {
-    Exact,
-    Metadata,
-}
-
 /// Collection-level wrapper around an HNSW vector index.
 ///
 /// The wrapper owns persistence paths and object versions for index metadata,
 /// id lists, and graph nodes while delegating search behavior to
 /// `anda_db_hnsw::HnswIndex`.
+///
+/// The metadata/ids CAS tokens are the last defense against a second writer,
+/// which the single-writer deployment contract forbids. A `Precondition`
+/// conflict (or a cancelled flush) is never reconciled in place: the error
+/// propagates, the collection poisons its handle and reopening rebuilds this
+/// wrapper from the durable objects.
 pub struct Hnsw {
     name: String,
     index: HnswIndex,
     storage: Storage, // 与 Collection 共享同一个 Storage 实例
     metadata_version: Arc<RwLock<ObjectVersion>>,
     ids_version: Arc<RwLock<ObjectVersion>>,
-    pending_metadata_write: Arc<ParkingMutex<Option<PendingVersionedWrite>>>,
-    pending_ids_write: Arc<ParkingMutex<Option<PendingVersionedWrite>>>,
 }
 
 impl Debug for Hnsw {
@@ -109,8 +101,6 @@ impl Hnsw {
             storage,
             metadata_version: Arc::new(RwLock::new(metadata_version)),
             ids_version: Arc::new(RwLock::new(ids_version)),
-            pending_metadata_write: Arc::new(ParkingMutex::new(None)),
-            pending_ids_write: Arc::new(ParkingMutex::new(None)),
         })
     }
 
@@ -147,71 +137,26 @@ impl Hnsw {
             storage,
             metadata_version: Arc::new(RwLock::new(metadata_version)),
             ids_version: Arc::new(RwLock::new(ids_version)),
-            pending_metadata_write: Arc::new(ParkingMutex::new(None)),
-            pending_ids_write: Arc::new(ParkingMutex::new(None)),
         })
     }
 
-    fn payloads_match(kind: PayloadMatch, left: &[u8], right: &[u8]) -> Result<bool, BoxError> {
-        match kind {
-            PayloadMatch::Exact => Ok(left == right),
-            PayloadMatch::Metadata => {
-                Ok(HnswIndex::metadata_payloads_logically_equal(left, right)?)
-            }
-        }
-    }
-
-    /// Persists a versioned artifact while retaining the exact in-flight
-    /// generation before every await. If an older PUT committed but was
-    /// cancelled, a retry first reconciles that payload to recover its object
-    /// version, then writes the callback's newer mutation generation.
-    async fn persist_retained_snapshot(
+    /// Persists one versioned artifact with a single conditional PUT: the
+    /// remaining second-writer defense. A `Precondition` conflict is not
+    /// reconciled in place — it propagates, the collection poisons its handle
+    /// and recovery happens on reopen.
+    async fn persist_versioned(
         storage: Storage,
         path: String,
         object_version: Arc<RwLock<ObjectVersion>>,
-        pending_write: Arc<ParkingMutex<Option<PendingVersionedWrite>>>,
         data: Vec<u8>,
-        kind: PayloadMatch,
     ) -> Result<(), BoxError> {
-        loop {
-            let pending = {
-                let mut slot = pending_write.lock();
-                slot.get_or_insert_with(|| PendingVersionedWrite {
-                    payload: data.clone(),
-                    expected_version: object_version.read().clone(),
-                })
-                .clone()
-            };
-
-            let version = match storage
-                .put_bytes(
-                    &path,
-                    Bytes::from(pending.payload.clone()),
-                    PutMode::Update(pending.expected_version.clone().into()),
-                )
-                .await
-            {
-                Ok(version) => version,
-                Err(err @ DBError::Precondition { .. }) => {
-                    let (persisted, version) = storage.fetch_bytes(&path).await?;
-                    if !Self::payloads_match(kind, &pending.payload, &persisted)? {
-                        return Err(BoxError::from(err));
-                    }
-                    version
-                }
-                Err(err) => return Err(BoxError::from(err)),
-            };
-
-            *object_version.write() = version;
-            *pending_write.lock() = None;
-            if Self::payloads_match(kind, &pending.payload, &data)? {
-                return Ok(());
-            }
-
-            // `data` belongs to a newer structural generation. The next loop
-            // registers it with the token recovered above before awaiting its
-            // own conditional PUT.
-        }
+        let expected = { object_version.read().clone() };
+        let version = storage
+            .put_bytes(&path, Bytes::from(data), PutMode::Update(expected.into()))
+            .await
+            .map_err(BoxError::from)?;
+        *object_version.write() = version;
+        Ok(())
     }
 
     /// Persists one coherent graph snapshot, then deletes removed-node blobs.
@@ -230,11 +175,9 @@ impl Hnsw {
         let ids_path = Hnsw::ids_path(&self.name);
         let ids_storage = self.storage.clone();
         let ids_version = self.ids_version.clone();
-        let pending_ids_write = self.pending_ids_write.clone();
         let metadata_path = Hnsw::metadata_path(&self.name);
         let metadata_storage = self.storage.clone();
         let metadata_version = self.metadata_version.clone();
-        let pending_metadata_write = self.pending_metadata_write.clone();
         let saved = self
             .index
             .flush_with(
@@ -251,25 +194,9 @@ impl Hnsw {
                         Ok(true)
                     }
                 },
+                move |data| Self::persist_versioned(ids_storage, ids_path, ids_version, data),
                 move |data| {
-                    Self::persist_retained_snapshot(
-                        ids_storage,
-                        ids_path,
-                        ids_version,
-                        pending_ids_write,
-                        data,
-                        PayloadMatch::Exact,
-                    )
-                },
-                move |data| {
-                    Self::persist_retained_snapshot(
-                        metadata_storage,
-                        metadata_path,
-                        metadata_version,
-                        pending_metadata_write,
-                        data,
-                        PayloadMatch::Metadata,
-                    )
+                    Self::persist_versioned(metadata_storage, metadata_path, metadata_version, data)
                 },
             )
             .await?;
@@ -531,7 +458,15 @@ mod tests {
         assert_eq!(reloaded.search(&[1.0, 1.0], 1), vec![(1, 0.0)]);
     }
 
-    async fn assert_crash_after_put(suffix: &str, expected_puts: &[&str], visible: bool) {
+    /// Models "PUT committed, then crash/cancellation before the result was
+    /// observed" at the given boundary, asserts the exact PUT ordering, and
+    /// verifies what a bootstrap from the durable image alone can see.
+    /// Returns the stale writer and storage for per-boundary follow-ups.
+    async fn assert_crash_after_put(
+        suffix: &str,
+        expected_puts: &[&str],
+        visible: bool,
+    ) -> (Hnsw, Storage) {
         let (index, storage, object_store) = fault_index().await;
         object_store.crash_after_next_put(suffix);
         assert!(index.flush(3).await.is_err());
@@ -548,28 +483,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(!reopened.search(&[1.0, 1.0], 1).is_empty(), visible);
-
-        // The structural version does not change for searches. A live query
-        // between cancellation and retry must therefore be ignored by
-        // metadata read-back reconciliation just like `last_saved`.
-        let _ = index.search(&[1.0, 1.0], 1);
-
-        // Advance both ids and metadata before retrying the stale writer.
-        // Any committed-but-unobserved generation must be reconciled first,
-        // then this newer generation must use the recovered object token.
-        index
-            .insert(2, vec![bf16::from_f32(2.0), bf16::from_f32(2.0)], 4)
-            .unwrap();
-
-        // The original writer did not observe the durable PUT result and thus
-        // still holds the old CAS token. It must be able to read back an
-        // identical artifact, repair that token, and finish the same logical
-        // generation without requiring a process restart.
-        assert_retry_recovers(&index, &storage).await;
-        let recovered = Hnsw::bootstrap("embedding".to_string(), storage)
-            .await
-            .unwrap();
-        assert_eq!(recovered.search(&[2.0, 2.0], 1), vec![(2, 0.0)]);
+        (index, storage)
     }
 
     #[tokio::test]
@@ -696,16 +610,56 @@ mod tests {
 
     #[tokio::test]
     async fn crash_after_node_put_reopens_previous_commit() {
-        assert_crash_after_put("n_1.cbor", &["n_1.cbor"], false).await;
+        let (index, storage) = assert_crash_after_put("n_1.cbor", &["n_1.cbor"], false).await;
+        // Node blobs use overwrite mode: no CAS token went stale, so this
+        // writer can still retry and complete the generation in place.
+        index
+            .insert(2, vec![bf16::from_f32(2.0), bf16::from_f32(2.0)], 4)
+            .unwrap();
+        assert_retry_recovers(&index, &storage).await;
+        let recovered = Hnsw::bootstrap("embedding".to_string(), storage)
+            .await
+            .unwrap();
+        assert_eq!(recovered.search(&[2.0, 2.0], 1), vec![(2, 0.0)]);
     }
 
     #[tokio::test]
-    async fn crash_after_ids_put_reopens_recoverable_snapshot() {
-        assert_crash_after_put("ids.cbor", &["n_1.cbor", "ids.cbor"], true).await;
+    async fn crash_after_ids_put_fails_stale_writer_and_reopen_recovers() {
+        let (index, storage) =
+            assert_crash_after_put("ids.cbor", &["n_1.cbor", "ids.cbor"], true).await;
+        // The committed-but-unobserved conditional ids PUT left this writer's
+        // CAS token stale. In-place retry is not supported: the conflict
+        // propagates (the owning collection poisons its handle) and a reopen
+        // recovers from the durable objects.
+        index
+            .insert(2, vec![bf16::from_f32(2.0), bf16::from_f32(2.0)], 4)
+            .unwrap();
+        assert!(
+            index.flush(4).await.is_err(),
+            "stale CAS token must remain a conflict",
+        );
+        let reopened = Hnsw::bootstrap("embedding".to_string(), storage)
+            .await
+            .unwrap();
+        assert_eq!(reopened.search(&[1.0, 1.0], 1), vec![(1, 0.0)]);
     }
 
     #[tokio::test]
-    async fn crash_after_metadata_put_reopens_committed_snapshot() {
-        assert_crash_after_put("meta.cbor", &["n_1.cbor", "ids.cbor", "meta.cbor"], true).await;
+    async fn crash_after_metadata_put_fails_stale_writer_and_reopen_recovers() {
+        let (index, storage) =
+            assert_crash_after_put("meta.cbor", &["n_1.cbor", "ids.cbor", "meta.cbor"], true).await;
+        // Same contract as the ids boundary: the stale metadata token is a
+        // hard conflict, and the durable image is already fully committed.
+        index
+            .insert(2, vec![bf16::from_f32(2.0), bf16::from_f32(2.0)], 4)
+            .unwrap();
+        assert!(
+            index.flush(4).await.is_err(),
+            "stale CAS token must remain a conflict",
+        );
+        let reopened = Hnsw::bootstrap("embedding".to_string(), storage)
+            .await
+            .unwrap();
+        assert_eq!(reopened.search(&[1.0, 1.0], 1), vec![(1, 0.0)]);
     }
 }

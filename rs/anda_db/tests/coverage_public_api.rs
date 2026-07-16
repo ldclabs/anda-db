@@ -766,6 +766,13 @@ async fn collection_auto_repair_recovers_dirty_documents_and_indexes() -> Result
     );
     let mut dirty_doc = Document::try_from(Arc::new(schema), &dirty)?;
     dirty_doc.set_id(1);
+    // A real crashed `add` always publishes the allocation watermark before
+    // its document object may exist; the reopen repair scan enumerates
+    // exactly the window the watermark bounds. Simulate the same durable
+    // state here.
+    raw_collection_storage
+        .put("alloc_watermark.cbor", &65u64, None)
+        .await?;
     raw_collection_storage
         .put("data/1.cbor", &dirty_doc, None)
         .await?;

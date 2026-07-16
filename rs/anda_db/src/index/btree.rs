@@ -2,8 +2,8 @@ use anda_db_btree::BTreeIndex;
 use bytes::Bytes;
 use cbor2::{from_reader, to_canonical_vec};
 use ic_auth_types::ByteBufB64;
-use parking_lot::{Mutex, RwLock};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use parking_lot::RwLock;
+use serde::{Serialize, de::DeserializeOwned};
 use std::{fmt::Debug, hash::Hash, str::FromStr, sync::Arc};
 
 pub use anda_db_btree::{BTreeConfig, BTreeMetadata, BTreeStats, RangeQuery};
@@ -15,31 +15,6 @@ use crate::{
     storage::{ObjectVersion, PutMode, Storage},
     unix_ms,
 };
-
-/// On-disk envelope emitted by `anda_db_btree::BTreeIndex` metadata writers.
-///
-/// Decode this directly instead of calling `BTreeIndex::metadata()` on a
-/// metadata-only shell: that accessor overlays live counters from the empty
-/// shell and would erase persisted `num_elements` during conflict comparison.
-#[derive(Deserialize, Serialize)]
-struct PersistedBTreeIndex {
-    metadata: BTreeMetadata,
-}
-
-#[derive(Clone)]
-struct PendingMetadataWrite {
-    payload: Vec<u8>,
-    expected_version: ObjectVersion,
-}
-
-fn normalize_metadata_payload(data: &[u8]) -> Result<BTreeMetadata, BoxError> {
-    let mut payload: PersistedBTreeIndex = from_reader(data)?;
-    // A retry naturally carries a later wall-clock timestamp. Every other
-    // field remains part of the logical payload, including live counters such
-    // as `num_elements` and `query_count`.
-    payload.metadata.stats.last_saved = 0;
-    Ok(payload.metadata)
-}
 
 /// Collection-level typed B-tree index wrapper.
 ///
@@ -103,11 +78,11 @@ where
     fields: Vec<String>,
     index: BTreeIndex<u64, FV>,
     storage: Storage, // 与 Collection 共享同一个 Storage 实例
+    /// CAS token of the last observed metadata object: the remaining defense
+    /// against a second writer. A `Precondition` conflict is never
+    /// reconciled in place — the error propagates, the collection poisons
+    /// its handle and recovery happens on reopen.
     metadata_version: Arc<RwLock<ObjectVersion>>,
-    /// Exact metadata generation registered before its conditional PUT is
-    /// awaited. A committed-but-cancelled older generation must be reconciled
-    /// before a later mutation generation can use the refreshed CAS token.
-    pending_metadata_write: Arc<Mutex<Option<PendingMetadataWrite>>>,
     flush_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -890,7 +865,6 @@ where
             index,
             storage,
             metadata_version: Arc::new(RwLock::new(ver)),
-            pending_metadata_write: Arc::new(Mutex::new(None)),
             flush_gate: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
@@ -922,74 +896,8 @@ where
             index,
             storage,
             metadata_version: Arc::new(RwLock::new(ver)),
-            pending_metadata_write: Arc::new(Mutex::new(None)),
             flush_gate: Arc::new(tokio::sync::Mutex::new(())),
         })
-    }
-
-    /// Persists one metadata generation and repairs the local object-version
-    /// token when a previously cancelled PUT committed remotely but its
-    /// `PutResult` was never observed.
-    async fn persist_metadata_snapshot(
-        storage: Storage,
-        path: String,
-        metadata_version: Arc<RwLock<ObjectVersion>>,
-        pending_metadata_write: Arc<Mutex<Option<PendingMetadataWrite>>>,
-        data: Vec<u8>,
-    ) -> Result<(), BoxError> {
-        let intended = normalize_metadata_payload(&data)?;
-        loop {
-            // Register the exact bytes and CAS token before the first await.
-            // If this future is cancelled after the backend commits, a later
-            // flush still has the exact old generation needed for read-back
-            // reconciliation, even when a mutation has already produced a
-            // newer callback payload.
-            let pending = {
-                let mut slot = pending_metadata_write.lock();
-                slot.get_or_insert_with(|| PendingMetadataWrite {
-                    payload: data.clone(),
-                    expected_version: metadata_version.read().clone(),
-                })
-                .clone()
-            };
-            let pending_logical = normalize_metadata_payload(&pending.payload)?;
-
-            let version = match storage
-                .put_bytes(
-                    &path,
-                    Bytes::from(pending.payload.clone()),
-                    PutMode::Update(pending.expected_version.clone().into()),
-                )
-                .await
-            {
-                Ok(version) => version,
-                Err(err @ DBError::Precondition { .. }) => {
-                    // `fetch_bytes` bypasses Storage's cache. This is
-                    // essential after a post-commit cancellation because
-                    // cache invalidation happens only after `put_bytes`
-                    // returns. Never consume a true conflicting payload.
-                    let (persisted, version) = storage.fetch_bytes(&path).await?;
-                    if pending_logical != normalize_metadata_payload(&persisted)? {
-                        return Err(BoxError::from(err));
-                    }
-                    version
-                }
-                Err(err) => return Err(BoxError::from(err)),
-            };
-
-            // No await follows the successful reconciliation: cancellation
-            // cannot expose a refreshed token while leaving the completed
-            // pending generation registered.
-            *metadata_version.write() = version;
-            *pending_metadata_write.lock() = None;
-            if pending_logical == intended {
-                return Ok(());
-            }
-
-            // A mutation arrived after the cancelled generation. Register the
-            // callback's newer immutable payload with the refreshed token and
-            // persist it before allowing the low-level flush to commit.
-        }
     }
 
     /// Delegates the complete persistence transaction to the low-level index,
@@ -1007,21 +915,27 @@ where
         let metadata_path = BTree::metadata_path(&self.name);
         let metadata_storage = self.storage.clone();
         let metadata_version = self.metadata_version.clone();
-        let pending_metadata_write = self.pending_metadata_write.clone();
         let bucket_storage = self.storage.clone();
         let bucket_name = self.name.clone();
         let saved = self
             .index
             .flush_owned_with(
                 now_ms,
-                move |data: Vec<u8>| {
-                    Self::persist_metadata_snapshot(
-                        metadata_storage,
-                        metadata_path,
-                        metadata_version,
-                        pending_metadata_write,
-                        data,
-                    )
+                move |data: Vec<u8>| async move {
+                    // A single conditional PUT is the remaining second-writer
+                    // defense; a `Precondition` conflict propagates and the
+                    // collection poisons its handle (recovery is a reopen).
+                    let expected = { metadata_version.read().clone() };
+                    let version = metadata_storage
+                        .put_bytes(
+                            &metadata_path,
+                            Bytes::from(data),
+                            PutMode::Update(expected.into()),
+                        )
+                        .await
+                        .map_err(BoxError::from)?;
+                    *metadata_version.write() = version;
+                    Ok(())
                 },
                 move |id, data: Vec<u8>| {
                     let storage = bucket_storage.clone();
@@ -1115,8 +1029,6 @@ mod tests {
         bucket_puts: AtomicUsize,
         fail_at: usize,
         events: ParkingMutex<Vec<String>>,
-        postcommit_block_suffix: ParkingMutex<Option<String>>,
-        postcommit_blocked: tokio::sync::Notify,
     }
 
     impl FailNthBucketPutStore {
@@ -1127,8 +1039,6 @@ mod tests {
                 bucket_puts: AtomicUsize::new(0),
                 fail_at,
                 events: ParkingMutex::new(Vec::new()),
-                postcommit_block_suffix: ParkingMutex::new(None),
-                postcommit_blocked: tokio::sync::Notify::new(),
             }
         }
 
@@ -1140,14 +1050,6 @@ mod tests {
 
         fn events(&self) -> Vec<String> {
             self.events.lock().clone()
-        }
-
-        fn block_after_next_put(&self, suffix: impl Into<String>) {
-            *self.postcommit_block_suffix.lock() = Some(suffix.into());
-        }
-
-        async fn wait_until_postcommit_blocked(&self) {
-            self.postcommit_blocked.notified().await;
         }
     }
 
@@ -1177,23 +1079,7 @@ mod tests {
                     });
                 }
             }
-            let postcommit_block = {
-                let mut suffix = self.postcommit_block_suffix.lock();
-                if suffix.as_ref().is_some_and(|suffix| path.ends_with(suffix)) {
-                    suffix.take()
-                } else {
-                    None
-                }
-            };
-            let result = self.inner.put_opts(location, payload, opts).await?;
-            if postcommit_block.is_some() {
-                self.postcommit_blocked.notify_one();
-                // The test aborts the task at this exact post-commit boundary.
-                // Keeping the future pending models a backend whose success
-                // response has not yet reached the wrapper.
-                return std::future::pending::<ObjectStoreResult<PutResult>>().await;
-            }
-            Ok(result)
+            self.inner.put_opts(location, payload, opts).await
         }
 
         async fn put_multipart_opts(
@@ -1839,136 +1725,44 @@ mod tests {
         }
     }
 
+    /// The wrapper's metadata CAS token is the last defense against a second
+    /// writer: after a foreign overwrite the next flush must fail instead of
+    /// being silently reconciled in place. Recovery is a reopen, which reads
+    /// the durable objects and their fresh versions.
     #[tokio::test]
-    async fn metadata_postcommit_cancellation_then_mutation_retries_both_generations() {
-        let object_store = Arc::new(FailNthBucketPutStore::new(usize::MAX));
-        let storage = Storage::connect(
-            "btree_postcommit_retry".to_string(),
-            object_store.clone(),
-            StorageConfig {
-                compress_level: 0,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+    async fn foreign_metadata_writer_fails_flush() {
+        let storage = test_storage().await;
         let now = unix_ms();
-        let tree = Arc::new(
-            BTree::new(field("postcommit_tree", Ft::Text), storage.clone(), now)
-                .await
-                .unwrap(),
-        );
+        let tree = BTree::new(field("conflict_tree", Ft::Text), storage.clone(), now)
+            .await
+            .unwrap();
         tree.insert(1, &Fv::Text("apple".into()), now + 1).unwrap();
+        assert!(tree.flush(now + 2).await.unwrap());
 
-        object_store.block_after_next_put("btree_indexes/postcommit_tree/meta.cbor");
-        let interrupted = {
-            let tree = tree.clone();
-            tokio::spawn(async move { tree.flush(now + 2).await })
-        };
-        object_store.wait_until_postcommit_blocked().await;
-        interrupted.abort();
-        assert!(
-            interrupted
-                .await
-                .expect_err("flush should be cancelled after metadata commit")
-                .is_cancelled()
-        );
-        assert!(tree.has_pending_flush());
+        // Simulate a second writer replacing the durable metadata object.
+        let path = BTree::metadata_path("conflict_tree");
+        let (data, _) = storage.fetch_bytes(&path).await.unwrap();
+        storage
+            .put_bytes(&path, data, PutMode::Overwrite)
+            .await
+            .unwrap();
 
-        // Advancing a query counter makes the retry payload distinct without
-        // changing its structural generation. It must not affect comparison
-        // with the exact retained payload from the cancelled PUT.
-        assert_eq!(
-            tree.query_with(&Fv::Text("apple".into()), |ids| Some(ids.clone())),
-            Some(vec![1])
-        );
-
-        // Advance the structural generation before retrying. The wrapper must
-        // first reconcile the retained apple generation with its stale token,
-        // then use the refreshed token to commit this newer banana generation.
         tree.insert(2, &Fv::Text("banana".into()), now + 3).unwrap();
+        assert!(
+            tree.flush(now + 4).await.is_err(),
+            "stale CAS token must remain a conflict",
+        );
 
-        assert!(tree.flush(now + 3).await.unwrap());
-        assert!(!tree.has_pending_flush());
-
-        drop(tree);
-        let reloaded = BTree::bootstrap("postcommit_tree".to_string(), &Ft::Text, storage)
+        // Reopening loads the durable "apple" generation; the unflushed
+        // banana insert is recovered by the collection's WAL replay, not by
+        // this wrapper.
+        let reloaded = BTree::bootstrap("conflict_tree".to_string(), &Ft::Text, storage)
             .await
             .unwrap();
         assert_eq!(
             reloaded.query_with(&Fv::Text("apple".into()), |ids| Some(ids.clone())),
             Some(vec![1])
         );
-        assert_eq!(
-            reloaded.query_with(&Fv::Text("banana".into()), |ids| Some(ids.clone())),
-            Some(vec![2])
-        );
-    }
-
-    #[tokio::test]
-    async fn metadata_conflict_does_not_accept_different_num_elements() {
-        let storage = test_storage().await;
-        let now = unix_ms();
-        let tree = BTree::new(field("conflict_tree", Ft::Text), storage.clone(), now)
-            .await
-            .unwrap();
-        let inner = match &tree {
-            BTree::String(inner) => inner,
-            _ => unreachable!(),
-        };
-        let path = BTree::metadata_path(inner.name.as_str());
-        let (base, expected) = storage.fetch_bytes(&path).await.unwrap();
-
-        let mut intended: PersistedBTreeIndex = from_reader(&base[..]).unwrap();
-        intended.metadata.stats.version += 1;
-        intended.metadata.stats.num_elements = 1;
-        intended.metadata.stats.last_saved = now + 1;
-        intended.metadata.stats.query_count = 7;
-        let mut intended_data = Vec::new();
-        cbor2::to_writer(&intended, &mut intended_data).unwrap();
-
-        // Keep the same structural generation but persist a genuinely
-        // different element count. A metadata-only BTree shell would report
-        // zero for both payloads and incorrectly accept this conflict; direct
-        // envelope decoding must retain and compare the durable counts.
-        let mut conflicting = intended;
-        conflicting.metadata.stats.num_elements = 2;
-        conflicting.metadata.stats.last_saved = now + 2;
-        conflicting.metadata.stats.query_count = 7;
-        let mut conflicting_data = Vec::new();
-        cbor2::to_writer(&conflicting, &mut conflicting_data).unwrap();
-        storage
-            .put_bytes(
-                &path,
-                Bytes::from(conflicting_data),
-                PutMode::Update(expected.clone().into()),
-            )
-            .await
-            .unwrap();
-
-        let err = InnerBTree::<String>::persist_metadata_snapshot(
-            storage.clone(),
-            path.clone(),
-            inner.metadata_version.clone(),
-            inner.pending_metadata_write.clone(),
-            intended_data.clone(),
-        )
-        .await
-        .unwrap_err();
-        assert!(err.to_string().contains("Precondition"));
-        assert_eq!(*inner.metadata_version.read(), expected);
-
-        {
-            let pending = inner.pending_metadata_write.lock();
-            assert_eq!(
-                pending.as_ref().map(|pending| pending.payload.as_slice()),
-                Some(intended_data.as_slice())
-            );
-        }
-
-        let (persisted, _) = storage.fetch_bytes(&path).await.unwrap();
-        let persisted: PersistedBTreeIndex = from_reader(&persisted[..]).unwrap();
-        assert_eq!(persisted.metadata.stats.num_elements, 2);
     }
 
     /// Regression: `BTree::bootstrap` must accept every field type that

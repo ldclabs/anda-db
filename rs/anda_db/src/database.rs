@@ -875,7 +875,16 @@ impl AndaDB {
             if collection.is_active_handle() {
                 return Ok(collection);
             }
-            collection.close().await?;
+            if collection.is_poisoned() {
+                // A poisoned handle is treated like a crashed process: its
+                // in-memory state must not be flushed. Wait for in-flight
+                // operations to drain, drop the handle, and let the fresh
+                // load below run the reopen recovery path (mutation-intent
+                // replay plus the repair scan).
+                let _drain = collection.drain_operations().await;
+            } else {
+                collection.close().await?;
+            }
             let mut collections = self.inner.collections.write();
             if collections
                 .get(&name)

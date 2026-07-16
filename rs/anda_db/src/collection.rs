@@ -93,41 +93,27 @@ pub struct Collection {
     /// not take a stripe: every add works on a freshly allocated unique id.
     doc_locks: Vec<tokio::sync::Mutex<()>>,
 
-    /// Document ids allocated by in-flight `add` calls that have not been
-    /// registered in the id bitmap yet.
-    ///
-    /// `flush` clamps the persisted checkpoint below the smallest in-flight id
-    /// (see [`Collection::safe_check_point`]): without this, a flush racing an
-    /// `add` could persist `check_point = max_document_id` while the ids
-    /// bitmap snapshot misses that document, and a crash right after the
-    /// document object was written would leave an orphan that the bounded
-    /// crash-recovery scan (`auto_repair_indexes` starts at checkpoint + 1)
-    /// can never find.
-    in_flight_adds: parking_lot::Mutex<BTreeSet<DocumentId>>,
-
-    /// Durable document-mutation intents that have not yet been covered by a
-    /// successful index/ids checkpoint.  See [`MutationIntent`].
+    /// Durable document-mutation intents (update/remove only) that have not
+    /// yet been covered by a successful index/ids checkpoint.  See
+    /// [`MutationIntent`].
     pending_mutations: parking_lot::Mutex<BTreeMap<u64, MutationIntent>>,
-    /// A collection-metadata generation whose ids bitmap and storage
-    /// checkpoint have not both been confirmed durable yet.  Metadata is
-    /// intentionally written first, so failures in the later phases must keep
-    /// this value pending across a retry; cancellation can happen either
-    /// before or after `last_saved_version` is safely advanced.
-    pending_checkpoint: parking_lot::Mutex<Option<DocumentId>>,
-    /// Exact collection-metadata payload whose conditional PUT has not yet
-    /// been observed as successful. Object stores may commit a PUT before the
-    /// awaiting task is cancelled, so a retry must retain both the payload and
-    /// its expected object version. A precondition failure can then be
-    /// reconciled by reading the durable object back and accepting it only
-    /// when the payload is identical.
-    pending_metadata_write: parking_lot::Mutex<Option<PendingMetadataWrite>>,
-    /// Serializes every collection metadata writer, including full checkpoint
-    /// flushes and the immediate unclaimed writes used by extensions/index
-    /// removal. Both paths must reconcile the same retained generation before
-    /// a later payload can advance the object-store version.
-    metadata_write_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes concurrent extension writers' unclaimed metadata PUTs.
+    /// They hold shared `operation_gate` leases, so without this two of them
+    /// could race the same expected object version and one would fail with a
+    /// spurious `Precondition`. Flush needs no part in this: it holds the
+    /// exclusive gate.
+    extension_write_gate: tokio::sync::Mutex<()>,
     /// Monotonic path component for mutation-intent objects.
     next_mutation_sequence: AtomicU64,
+    /// Highest durably published allocation watermark. `add` guarantees
+    /// `id <= watermark` **before** a document object may be written for the
+    /// id (persisting the watermark in strides of
+    /// [`Collection::ALLOCATION_WATERMARK_STRIDE`]), so the reopen repair
+    /// scan can enumerate `checkpoint+1 ..= max(metadata max, watermark)`
+    /// exhaustively instead of writing one durable intent per add.
+    durable_alloc_watermark: AtomicU64,
+    /// Serializes the rare watermark PUT when an allocation crosses it.
+    watermark_gate: tokio::sync::Mutex<()>,
 }
 
 const LIFECYCLE_ACTIVE: u8 = 0;
@@ -135,6 +121,37 @@ const LIFECYCLE_CLOSING: u8 = 1;
 const LIFECYCLE_CLOSED: u8 = 2;
 const LIFECYCLE_DELETING: u8 = 3;
 const LIFECYCLE_DELETED: u8 = 4;
+/// A mutating future on this handle was dropped before completion.
+///
+/// Cancellation is treated exactly like a process crash: the in-memory
+/// index/bitmap/version state may have diverged from storage in ways only the
+/// reopen recovery path (mutation-intent replay plus the repair scan) can
+/// reconcile. A poisoned handle rejects every further operation; reopening
+/// the collection loads a fresh, consistent generation from storage.
+const LIFECYCLE_POISONED: u8 = 5;
+
+/// Poisons a collection handle when a mutating future is dropped before its
+/// wrapped operation returned. Callers `disarm` the guard after the operation
+/// completes (with either result); only cancellation leaves it armed.
+struct CancelGuard<'a> {
+    collection: &'a Collection,
+    action: &'static str,
+    armed: bool,
+}
+
+impl CancelGuard<'_> {
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancelGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.collection.poison(self.action);
+        }
+    }
+}
 
 /// A write-ahead record for an update/remove of an existing document.
 ///
@@ -143,31 +160,20 @@ const LIFECYCLE_DELETED: u8 = 4;
 /// The before/after documents are recorded before either side changes. On
 /// open, every retained intent removes both possible indexed states and then
 /// re-indexes the document currently present in storage (or completes its
-/// removal). Recording the proposed state is required for cancellation
-/// safety: a cancelled future can leave its in-memory index mutation applied
-/// even when the document PUT did not complete. One record is kept per
-/// mutation rather than overwriting a per-document record so repeated updates
-/// remain recoverable even after a partially successful flush.
+/// removal). One record is kept per mutation rather than overwriting a
+/// per-document record so repeated updates remain recoverable even after a
+/// partially successful flush.
+///
+/// `add` writes no intent: the allocation watermark (see
+/// [`Collection::ensure_allocation_watermark`]) bounds the id window the
+/// reopen repair scan probes, which recovers committed-but-unregistered adds
+/// without per-add write amplification.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MutationIntent {
     sequence: u64,
     document_id: DocumentId,
     previous: Option<DocumentOwned>,
     proposed: Option<DocumentOwned>,
-}
-
-/// A collection metadata PUT that may be in flight or committed-but-unobserved.
-#[derive(Debug, Clone)]
-struct PendingMetadataWrite {
-    metadata: CollectionMetadata,
-    payload: Vec<u8>,
-    expected_version: ObjectVersion,
-    /// `Some` only for metadata written as the first phase of a complete
-    /// collection checkpoint. Immediate extension/index metadata writes use
-    /// `None`: reconciling one of those generations must refresh the object
-    /// version without advancing `last_saved_version` or manufacturing a
-    /// pending ids/storage checkpoint.
-    check_point: Option<DocumentId>,
 }
 
 /// Collection configuration parameters.
@@ -413,6 +419,15 @@ impl Collection {
     /// Prefix for durable update/remove intents.
     const MUTATION_INTENT_PREFIX: &'static str = "mutation_intents/";
 
+    /// Path of the durable allocation watermark object (a single `u64`).
+    const ALLOCATION_WATERMARK_PATH: &'static str = "alloc_watermark.cbor";
+
+    /// How far the allocation watermark is published ahead of the highest
+    /// allocated id. One small PUT per this many adds replaces the previous
+    /// one-durable-intent-per-add write amplification; the reopen repair scan
+    /// probes at most this many ids beyond the last observed allocation.
+    const ALLOCATION_WATERMARK_STRIDE: u64 = 64;
+
     /// Upper bound for limit-driven speculative pre-allocations, so a huge
     /// caller-supplied limit (e.g. via `query_ids`) cannot allocate excessive
     /// memory up front. Result vectors still grow on demand beyond this hint.
@@ -453,6 +468,9 @@ impl Collection {
             LIFECYCLE_CLOSED => "closed",
             LIFECYCLE_DELETING => "being deleted",
             LIFECYCLE_DELETED => "deleted",
+            LIFECYCLE_POISONED => {
+                "poisoned (a mutating call was cancelled mid-operation); reopen the collection to recover"
+            }
             _ => "not writable",
         };
         DBError::Generic {
@@ -478,6 +496,59 @@ impl Collection {
     /// Returns whether this registered handle still admits new operations.
     pub(crate) fn is_active_handle(&self) -> bool {
         self.lifecycle.load(Ordering::Acquire) == LIFECYCLE_ACTIVE
+    }
+
+    /// Returns whether this handle was poisoned by a cancelled mutation.
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.lifecycle.load(Ordering::Acquire) == LIFECYCLE_POISONED
+    }
+
+    /// Waits until every operation already admitted on this handle has
+    /// drained. New operations are rejected by the terminal lifecycle state,
+    /// so acquiring the exclusive gate once guarantees quiescence.
+    pub(crate) async fn drain_operations(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        self.operation_gate.clone().write_owned().await
+    }
+
+    /// Transitions the handle to [`LIFECYCLE_POISONED`] after a mutating
+    /// future was dropped mid-operation. Delete states are preserved: a
+    /// deletion in progress already rejects every operation and its partial
+    /// storage removal is not recoverable by reopening anyway.
+    fn poison(&self, action: &'static str) {
+        loop {
+            let state = self.lifecycle.load(Ordering::Acquire);
+            if !matches!(state, LIFECYCLE_ACTIVE | LIFECYCLE_CLOSING) {
+                return;
+            }
+            if self
+                .lifecycle
+                .compare_exchange(
+                    state,
+                    LIFECYCLE_POISONED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                log::error!(
+                    action = action,
+                    collection = self.name;
+                    "Mutating operation was cancelled mid-flight; the collection handle is poisoned and must be reopened",
+                );
+                return;
+            }
+        }
+    }
+
+    /// Arms a [`CancelGuard`] for `action`. Cancellation of the wrapped
+    /// future is treated as a crash: recovery happens on reopen, never
+    /// in place.
+    fn cancel_guard(&self, action: &'static str) -> CancelGuard<'_> {
+        CancelGuard {
+            collection: self,
+            action,
+            armed: true,
+        }
     }
 
     /// Acquires an active-operation lease.  The state is deliberately checked
@@ -585,12 +656,11 @@ impl Collection {
             ids_version: RwLock::new(ids_version),
             index_hooks: Arc::new(DefaultIndexHooks),
             doc_locks: Self::new_doc_locks(),
-            in_flight_adds: parking_lot::Mutex::new(BTreeSet::new()),
             pending_mutations: parking_lot::Mutex::new(BTreeMap::new()),
-            pending_checkpoint: parking_lot::Mutex::new(None),
-            pending_metadata_write: parking_lot::Mutex::new(None),
-            metadata_write_gate: Arc::new(tokio::sync::Mutex::new(())),
+            extension_write_gate: tokio::sync::Mutex::new(()),
             next_mutation_sequence: AtomicU64::new(unix_ms()),
+            durable_alloc_watermark: AtomicU64::new(0),
+            watermark_gate: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -634,6 +704,16 @@ impl Collection {
             })?;
         let doc_ids_index = BTreeSet::from_iter(doc_ids.iter());
 
+        // The durable allocation watermark bounds the id window the repair
+        // scan below must probe. Collections created before the watermark
+        // existed load as 0; the metadata max keeps their bound intact.
+        let alloc_watermark = match storage.fetch::<u64>(Self::ALLOCATION_WATERMARK_PATH).await {
+            Ok((watermark, _)) => watermark,
+            Err(DBError::NotFound { .. }) => 0,
+            Err(err) => return Err(err),
+        };
+        let metadata_max_document_id = metadata.stats.max_document_id;
+
         let mut collection = Self {
             name,
             schema: Arc::new(metadata.schema.clone()),
@@ -657,12 +737,13 @@ impl Collection {
             ids_version: RwLock::new(ids_version),
             index_hooks: Arc::new(DefaultIndexHooks),
             doc_locks: Self::new_doc_locks(),
-            in_flight_adds: parking_lot::Mutex::new(BTreeSet::new()),
             pending_mutations: parking_lot::Mutex::new(BTreeMap::new()),
-            pending_checkpoint: parking_lot::Mutex::new(None),
-            pending_metadata_write: parking_lot::Mutex::new(None),
-            metadata_write_gate: Arc::new(tokio::sync::Mutex::new(())),
+            extension_write_gate: tokio::sync::Mutex::new(()),
             next_mutation_sequence: AtomicU64::new(unix_ms()),
+            durable_alloc_watermark: AtomicU64::new(
+                alloc_watermark.max(metadata_max_document_id),
+            ),
+            watermark_gate: tokio::sync::Mutex::new(()),
         };
         collection.load_indexes().await?;
 
@@ -945,7 +1026,13 @@ impl Collection {
     pub async fn reconcile_storage(&self) -> Result<(usize, usize), DBError> {
         let _operation_lease = self.operation_gate.clone().write_owned().await;
         self.ensure_mutable()?;
+        let guard = self.cancel_guard("Collection::reconcile_storage");
+        let rt = self.reconcile_storage_impl().await;
+        guard.disarm();
+        rt
+    }
 
+    async fn reconcile_storage_impl(&self) -> Result<(usize, usize), DBError> {
         let now_ms = unix_ms();
         // Ids allocated after this point belong to in-flight `add` calls
         // whose objects may not have been visible to the listing below.
@@ -1024,67 +1111,39 @@ impl Collection {
         Ok((recovered, dropped))
     }
 
-    /// Automatically repairs indexes if needed.
-    /// This is called during collection opening to ensure index integrity.
+    /// Crash-recovery scan run on open, after mutation-intent replay.
     ///
-    /// This method scans for documents between the persisted checkpoint and the
-    /// max_document_id that may have been written but not indexed (due to crash
-    /// or incomplete flush). It also scans slightly beyond max_document_id to
-    /// recover documents written but not recorded in metadata.
-    ///
-    /// The scan is bounded (it stops after a run of consecutive missing ids),
-    /// so orphans beyond a large id gap — e.g. after many deletions or many
-    /// failed `add` calls, which also consume ids — may not be found here.
-    /// [`Self::reconcile_storage`] performs the unbounded, listing-based
-    /// reconciliation for those cases.
+    /// Every id that may have a document object lies in
+    /// `checkpoint+1 ..= max(max_document_id, allocation watermark)`: an add
+    /// publishes the durable watermark before its document object can exist
+    /// (see [`Self::ensure_allocation_watermark`]). The scan probes that
+    /// exact window — holes (failed or cancelled adds, removed documents)
+    /// read as one cheap NotFound each — so no consecutive-miss heuristics
+    /// are needed and no committed document can be skipped. The window is
+    /// bounded by the mutations since the last successful flush plus one
+    /// watermark stride.
     async fn auto_repair_indexes(&self) -> Result<usize, DBError> {
-        let persisted_max_document_id = self.storage.stats().check_point;
-        let maybe_max_document_id = self.max_document_id.load(Ordering::Relaxed);
+        let check_point = self.storage.stats().check_point;
+        let scan_max = self
+            .max_document_id
+            .load(Ordering::Acquire)
+            .max(self.durable_alloc_watermark.load(Ordering::Acquire));
 
         let now_ms = unix_ms();
-        let mut id = persisted_max_document_id;
         let mut fixed = 0;
-
-        // Limit consecutive misses to avoid unbounded scanning in case of sparse IDs
-        let mut consecutive_misses = 0;
-        const MAX_CONSECUTIVE_MISSES: u32 = 100;
-
-        loop {
-            id += 1;
+        for id in (check_point + 1)..=scan_max {
             match self
                 .storage
                 .fetch::<DocumentOwned>(&Self::doc_path(id))
                 .await
             {
-                Err(DBError::NotFound { .. }) => {
-                    consecutive_misses += 1;
-                    // If we've had too many consecutive misses, assume no more dirty docs.
-                    // If we haven't reached maybe_max_document_id, we use a larger limit.
-                    // If we have reached maybe_max_document_id, we use a smaller limit (10) for efficiency.
-                    let limit = if id < maybe_max_document_id {
-                        MAX_CONSECUTIVE_MISSES
-                    } else {
-                        10
-                    };
-
-                    if consecutive_misses >= limit {
-                        if fixed > 0 || (id < maybe_max_document_id && consecutive_misses > 1) {
-                            log::warn!(
-                                action = "Collection::auto_repair_indexes",
-                                collection = self.name,
-                                id = id;
-                                "Stopping repair scan after {consecutive_misses} consecutive misses",
-                            );
-                        }
-                        break;
-                    }
-                }
+                Err(DBError::NotFound { .. }) => {}
                 Err(err) => {
-                    // Transient storage errors or corrupt objects must not be
-                    // silently folded into the miss counter (that could
-                    // prematurely truncate the scan without any trace). Log
-                    // and skip the id; the `maybe_max_document_id + 1000`
-                    // bound below still guarantees termination.
+                    // Transient storage errors or corrupt objects are logged
+                    // and skipped; `reconcile_storage` remains the manual
+                    // backstop once the object is fixed. Burn the id so a
+                    // future add cannot collide with the existing object.
+                    self.max_document_id.fetch_max(id, Ordering::AcqRel);
                     log::warn!(
                         action = "Collection::auto_repair_indexes",
                         collection = self.name,
@@ -1093,18 +1152,18 @@ impl Collection {
                     );
                 }
                 Ok((doc, _)) => {
-                    // Reset consecutive miss counter on successful fetch
-                    consecutive_misses = 0;
                     if self.repair_document(id, doc, now_ms)? {
                         fixed += 1;
                     }
                 }
             }
+        }
 
-            // Safety limit to prevent infinite scan
-            if id > maybe_max_document_id + 1000 {
-                break;
-            }
+        if fixed > 0 {
+            // Make the recovery observable to the version watermark so the
+            // flush that follows in the open path persists the repaired
+            // bitmap instead of taking the no-change fast path.
+            self.update_metadata(|meta| meta.stats.version += 1);
         }
 
         Ok(fixed)
@@ -1377,7 +1436,9 @@ impl Collection {
 
         let start = Instant::now();
         let now_ms = unix_ms();
+        let guard = self.cancel_guard("Collection::close");
         let rt = self.flush_inner(now_ms).await;
+        guard.disarm();
         let elapsed = start.elapsed();
         match rt {
             Ok(_) => {
@@ -1391,6 +1452,11 @@ impl Collection {
                 Ok(())
             }
             Err(err) => {
+                // The failed flush may have completed some of its dependent
+                // writes; the in-memory watermarks are no longer trustworthy.
+                // Poison so a reopen loads a fresh generation from storage
+                // instead of retrying with diverged state.
+                self.poison("Collection::close");
                 log::error!(
                     action = "Collection::close",
                     collection = self.name,
@@ -1414,33 +1480,39 @@ impl Collection {
         // document/index mutations for the checkpoint transaction.
         let _operation_guard = self.operation_gate.clone().write_owned().await;
         self.ensure_mutable()?;
-        self.flush_inner(now_ms).await
+        let guard = self.cancel_guard("Collection::flush");
+        let rt = self.flush_inner(now_ms).await;
+        guard.disarm();
+        if rt.is_err() {
+            // A checkpoint is multiple dependent writes; after any failure the
+            // in-memory watermarks no longer describe what is durable. Treat
+            // it like a crash: reject further use and recover on reopen.
+            self.poison("Collection::flush");
+        }
+        rt
     }
 
+    /// A checkpoint is a sequence of dependent writes (collection metadata,
+    /// indexes, ids bitmap, storage checkpoint, WAL retirement). Any error
+    /// after the first write leaves memory and storage diverged in a way this
+    /// handle no longer tracks — the caller ([`Collection::flush`]) poisons
+    /// the handle, and reopening converges from storage. `flush` holds the
+    /// exclusive `operation_gate`, so no mutation runs concurrently.
     async fn flush_inner(&self, now_ms: u64) -> Result<bool, DBError> {
-        let pending_mutations = self.pending_mutations.lock().clone();
-        if !pending_mutations.is_empty() {
-            // A failed mutation may have needed a best-effort rollback. Make
-            // the current document authoritative again before persisting and
-            // retiring its recovery evidence; this is the same idempotent
-            // convergence performed after a process crash.
-            self.reconcile_mutation_intents(&pending_mutations).await?;
-        }
+        // On a live handle every retained intent belongs to a mutation that
+        // either completed (indexes and document agree) or failed
+        // deterministically before its storage write (memory was rolled back
+        // to the stored state). Unknown-outcome failures and cancellations
+        // poison the handle before reaching this point, so no reconciliation
+        // is needed here: the checkpoint below captures a consistent state
+        // and simply retires the intents afterwards. Reconciliation happens
+        // only on reopen (`replay_mutation_intents`).
+        let has_pending_mutations = { !self.pending_mutations.lock().is_empty() };
         let stored_check_point = self.store_metadata(now_ms).await?;
-        if let Some(check_point) = stored_check_point {
-            // Publishing collection metadata is only the first phase of the
-            // complete checkpoint. Keep the generation pending until both
-            // ids.cbor and storage_meta.cbor are durable; otherwise a failure
-            // in either later write would be skipped on retry because the
-            // metadata version watermark has already advanced.
-            *self.pending_checkpoint.lock() = Some(check_point);
-        }
-        let pending_check_point = *self.pending_checkpoint.lock();
 
         // Fast path: no collection metadata update and no index has pending data.
         let has_pending_indexes = self.has_pending_index_flush();
-        let has_pending_mutations = !pending_mutations.is_empty();
-        if pending_check_point.is_none() && !has_pending_indexes && !has_pending_mutations {
+        if stored_check_point.is_none() && !has_pending_indexes && !has_pending_mutations {
             return Ok(false);
         }
 
@@ -1450,17 +1522,13 @@ impl Collection {
             false
         };
 
-        if let Some(check_point) = pending_check_point {
-            // Clamp the checkpoint below any in-flight `add` BEFORE taking the
-            // ids snapshot: an add that completed before this point is already
-            // visible to the bitmap snapshot below, and one still in flight is
-            // covered by the clamp. Ids allocated after this point are greater
-            // than the metadata snapshot (`check_point`) and thus already safe.
-            let check_point = self.safe_check_point(check_point);
+        if let Some(check_point) = stored_check_point {
+            // The metadata snapshot was taken under the exclusive operation
+            // gate, so every id at or below `check_point` is already visible
+            // in the ids bitmap: there are no in-flight adds during a flush.
             self.store_ids().await?;
             // check_point is the last persisted document ID
             self.storage.store_metadata(check_point, now_ms).await?;
-            *self.pending_checkpoint.lock() = None;
         }
 
         // The intent log is the commit record for document/index atomicity and
@@ -1470,21 +1538,7 @@ impl Collection {
             self.clear_mutation_intents().await?;
         }
 
-        Ok(pending_check_point.is_some() || indexes_saved || has_pending_mutations)
-    }
-
-    /// Returns the highest checkpoint that is safe to persist: every document
-    /// id at or below it is either present in the current ids bitmap or was
-    /// never written (failed `add`). In-flight adds (id allocated, document
-    /// object possibly written, bitmap not updated yet) force the checkpoint
-    /// below their smallest id so `auto_repair_indexes` can still find them
-    /// after a crash.
-    fn safe_check_point(&self, check_point: u64) -> u64 {
-        let in_flight = self.in_flight_adds.lock();
-        match in_flight.first() {
-            Some(min_id) => check_point.min(min_id.saturating_sub(1)),
-            None => check_point,
-        }
+        Ok(stored_check_point.is_some() || indexes_saved || has_pending_mutations)
     }
 
     /// Irreversibly closes mutation admission before database metadata is
@@ -1496,7 +1550,9 @@ impl Collection {
             let state = self.lifecycle.load(Ordering::Acquire);
             match state {
                 LIFECYCLE_DELETED | LIFECYCLE_DELETING => break,
-                LIFECYCLE_ACTIVE | LIFECYCLE_CLOSING | LIFECYCLE_CLOSED => {
+                // A poisoned handle may be deleted: deletion does not depend
+                // on trustworthy in-memory state, it removes storage.
+                LIFECYCLE_ACTIVE | LIFECYCLE_CLOSING | LIFECYCLE_CLOSED | LIFECYCLE_POISONED => {
                     if self
                         .lifecycle
                         .compare_exchange(
@@ -1545,139 +1601,54 @@ impl Collection {
 
     /// Stores collection metadata to storage if it has changed.
     ///
+    /// A single conditional PUT against the last observed object version is
+    /// the remaining defense against a second writer, which the deployment
+    /// contract forbids. A `Precondition` conflict is not reconciled in
+    /// place: it propagates, the caller poisons the handle and recovery
+    /// happens on reopen (which re-reads the durable object version).
+    ///
     /// # Arguments
     /// * `now_ms` - Current timestamp in milliseconds
     ///
     /// # Returns
     /// `Some(max_document_id)` if metadata was stored, `None` if no changes needed to be stored
     async fn store_metadata(&self, now_ms: u64) -> Result<Option<DocumentId>, DBError> {
-        let _metadata_guard = self.metadata_write_gate.clone().lock_owned().await;
-        self.store_metadata_inner(now_ms).await
-    }
+        // Fast path: if version is already saved, avoid cloning metadata.
+        let current_version = { self.metadata.read().stats.version };
+        if self.last_saved_version.load(Ordering::Acquire) >= current_version {
+            return Ok(None);
+        }
 
-    /// Persists an exact metadata generation that was registered before its
-    /// first await. Callers must hold `metadata_write_gate` so the retained
-    /// slot and the local object version form one serial transaction.
-    async fn persist_pending_metadata_write(
-        &self,
-        pending: PendingMetadataWrite,
-    ) -> Result<Option<DocumentId>, DBError> {
-        let version = match self
+        // Re-acquire metadata with lock to get a consistent snapshot for
+        // saving. Complete flushes are serialized by `operation_gate`, so the
+        // snapshot cannot change while the PUT is in flight.
+        let mut metadata = self.metadata();
+        if self.last_saved_version.load(Ordering::Acquire) >= metadata.stats.version {
+            return Ok(None);
+        }
+        metadata.stats.last_saved = now_ms.max(metadata.stats.last_saved);
+        let mut payload = Vec::new();
+        cbor2::to_writer(&metadata, &mut payload).map_err(|err| DBError::Serialization {
+            name: self.name.clone(),
+            source: err.into(),
+        })?;
+        let expected_version = { self.metadata_version.read().clone() };
+        let version = self
             .storage
             .put_bytes(
                 Self::METADATA_PATH,
-                pending.payload.clone().into(),
-                crate::storage::PutMode::Update(pending.expected_version.clone().into()),
+                payload.into(),
+                crate::storage::PutMode::Update(expected_version.into()),
             )
-            .await
-        {
-            Ok(version) => version,
-            Err(err @ DBError::Precondition { .. }) => {
-                // A cancelled PUT may have committed before its result was
-                // delivered. Accept read-back only for the exact retained
-                // payload; a different object is a real stale-writer conflict.
-                let (durable, version) = self.storage.fetch_bytes(Self::METADATA_PATH).await?;
-                if durable.as_ref() != pending.payload.as_slice() {
-                    log::error!(
-                        action = "Collection::persist_pending_metadata_write",
-                        collection = self.name,
-                        pending_version = pending.metadata.stats.version;
-                        "Conditional metadata PUT conflicted with a different durable payload",
-                    );
-                    return Err(err);
-                }
-                version
-            }
-            Err(err) => return Err(err),
-        };
+            .await?;
 
-        // No await follows successful reconciliation. Only metadata written as
-        // the first phase of a full checkpoint publishes the flush watermark;
-        // an unclaimed metadata-only generation deliberately remains pending
-        // for the next complete metadata + ids + storage checkpoint.
         *self.metadata_version.write() = version;
-        if pending.check_point.is_some() {
-            self.last_saved_version
-                .fetch_max(pending.metadata.stats.version, Ordering::Release);
-            self.update_metadata(|m| {
-                m.stats.last_saved = pending.metadata.stats.last_saved.max(m.stats.last_saved);
-            });
-        }
-        *self.pending_metadata_write.lock() = None;
-        Ok(pending.check_point)
-    }
-
-    /// The retained-generation metadata protocol. Callers must hold
-    /// `metadata_write_gate` across this complete async transaction.
-    async fn store_metadata_inner(&self, now_ms: u64) -> Result<Option<DocumentId>, DBError> {
-        let mut stored_check_point = None;
-        loop {
-            // A cancelled conditional PUT may already be durable even though
-            // its result was never observed. Always retry that exact payload
-            // first; rebuilding it with a newer `now_ms` would make a safe
-            // read-back comparison impossible and turn a recoverable commit
-            // into a permanent precondition conflict.
-            let pending = if let Some(pending) = self.pending_metadata_write.lock().clone() {
-                pending
-            } else {
-                // Fast path: if version is already saved, avoid cloning
-                // metadata.
-                let current_version = { self.metadata.read().stats.version };
-                if self.last_saved_version.load(Ordering::Acquire) >= current_version {
-                    break;
-                }
-
-                // Re-acquire metadata with lock to get a consistent snapshot
-                // for saving. Complete flushes are serialized by
-                // `operation_gate`, so there is no need to claim the version
-                // before awaiting the PUT.
-                let mut metadata = self.metadata();
-                if self.last_saved_version.load(Ordering::Acquire) >= metadata.stats.version {
-                    break;
-                }
-                metadata.stats.last_saved = now_ms.max(metadata.stats.last_saved);
-                let mut payload = Vec::new();
-                cbor2::to_writer(&metadata, &mut payload).map_err(|err| {
-                    DBError::Serialization {
-                        name: self.name.clone(),
-                        source: err.into(),
-                    }
-                })?;
-                // Register the complete checkpoint generation before the
-                // first await. If the task is cancelled after the backend
-                // commits, a retry still knows that ids.cbor,
-                // storage_meta.cbor and the WAL retirement phases remain
-                // outstanding.
-                let check_point = metadata.stats.max_document_id;
-                let pending = PendingMetadataWrite {
-                    metadata,
-                    payload,
-                    expected_version: self.metadata_version.read().clone(),
-                    check_point: Some(check_point),
-                };
-                let mut pending_check_point = self.pending_checkpoint.lock();
-                *pending_check_point = Some(
-                    (*pending_check_point).map_or(check_point, |current| current.max(check_point)),
-                );
-                drop(pending_check_point);
-                *self.pending_metadata_write.lock() = Some(pending.clone());
-                pending
-            };
-
-            if let Some(check_point) = self.persist_pending_metadata_write(pending).await? {
-                stored_check_point = Some(
-                    stored_check_point
-                        .map_or(check_point, |current: DocumentId| current.max(check_point)),
-                );
-            }
-
-            // Metadata can gain a newer version while an earlier failed or
-            // cancelled payload is pending (for example, mutation replay on a
-            // retry). Loop until every such generation is durable before the
-            // ids checkpoint is completed and its WAL is retired.
-        }
-
-        Ok(stored_check_point)
+        self.last_saved_version
+            .fetch_max(metadata.stats.version, Ordering::Release);
+        self.update_metadata(|m| {
+            m.stats.last_saved = metadata.stats.last_saved.max(m.stats.last_saved);
+        });
+        Ok(Some(metadata.stats.max_document_id))
     }
 
     /// Persists the current collection metadata object once, **without**
@@ -1688,38 +1659,27 @@ impl Collection {
     /// make a later flush skip persisting the ids bitmap.
     ///
     /// `Ok(())` means the snapshot containing this call's change was durably
-    /// written. A stale-version read-back is accepted only for an exact
-    /// retained payload from this handle; a different durable payload remains
-    /// a conflict instead of being mistaken for this write.
+    /// written. Extension writers are serialized against flush and each other
+    /// by `operation_gate` leases plus the caller-held admission checks, so a
+    /// `Precondition` here means a second writer and is not retried.
     async fn store_metadata_unclaimed(&self) -> Result<(), DBError> {
-        let _metadata_guard = self.metadata_write_gate.clone().lock_owned().await;
-
-        // Reconcile any earlier full-checkpoint or unclaimed PUT first. The
-        // retained generation itself decides whether publishing it advances
-        // the flush watermark; an unclaimed generation never does.
-        let retained = { self.pending_metadata_write.lock().clone() };
-        if let Some(retained) = retained {
-            self.persist_pending_metadata_write(retained).await?;
-        }
-
-        // Register this exact metadata-only generation before its PUT. If the
-        // backend commits and the task is then cancelled, either a later
-        // unclaimed writer or a full flush can first reconcile these bytes and
-        // recover the returned object version before writing a newer snapshot.
+        let _gate = self.extension_write_gate.lock().await;
         let metadata = self.metadata();
         let mut payload = Vec::new();
         cbor2::to_writer(&metadata, &mut payload).map_err(|err| DBError::Serialization {
             name: self.name.clone(),
             source: err.into(),
         })?;
-        let pending = PendingMetadataWrite {
-            metadata,
-            payload,
-            expected_version: self.metadata_version.read().clone(),
-            check_point: None,
-        };
-        *self.pending_metadata_write.lock() = Some(pending.clone());
-        self.persist_pending_metadata_write(pending).await?;
+        let expected_version = { self.metadata_version.read().clone() };
+        let version = self
+            .storage
+            .put_bytes(
+                Self::METADATA_PATH,
+                payload.into(),
+                crate::storage::PutMode::Update(expected_version.into()),
+            )
+            .await?;
+        *self.metadata_version.write() = version;
         Ok(())
     }
 
@@ -2017,6 +1977,7 @@ impl Collection {
         let _operation_lease = self.mutation_lease().await?;
         value.validate_complexity()?;
 
+        let guard = self.cancel_guard("Collection::save_extension");
         self.update_metadata(|meta| {
             meta.extensions.insert(key, value);
             meta.stats.version += 1;
@@ -2031,8 +1992,9 @@ impl Collection {
         // means persisted" contract and does not advance
         // `last_saved_version`, so the next full flush still persists the
         // ids bitmap alongside the metadata.
-        self.store_metadata_unclaimed().await?;
-        Ok(())
+        let rt = self.store_metadata_unclaimed().await;
+        guard.disarm();
+        rt
     }
 
     /// Sets a user-defined extension key-value pair with a serializable value and immediately persists the change.
@@ -2049,19 +2011,25 @@ impl Collection {
     pub async fn remove_extension(&self, key: &str) -> Result<Option<FieldValue>, DBError> {
         let _operation_lease = self.mutation_lease().await?;
 
-        let old = self.update_metadata(|meta| {
-            let old = meta.extensions.remove(key);
+        let guard = self.cancel_guard("Collection::remove_extension");
+        let rt = async {
+            let old = self.update_metadata(|meta| {
+                let old = meta.extensions.remove(key);
+                if old.is_some() {
+                    meta.stats.version += 1;
+                }
+                old
+            });
             if old.is_some() {
-                meta.stats.version += 1;
+                // See `save_extension` for why this is a direct, unclaimed
+                // metadata write instead of a full flush.
+                self.store_metadata_unclaimed().await?;
             }
-            old
-        });
-        if old.is_some() {
-            // See `save_extension` for why this is a direct, unclaimed
-            // metadata write instead of a full flush.
-            self.store_metadata_unclaimed().await?;
+            Ok(old)
         }
-        Ok(old)
+        .await;
+        guard.disarm();
+        rt
     }
 
     /// Provides access to the entire extensions map for advanced use cases.
@@ -2538,14 +2506,20 @@ impl Collection {
     pub async fn compact_bm25_index(&self, fields: &[&str]) -> Result<(), DBError> {
         let _operation_lease = self.mutation_lease().await?;
         let index = self.find_bm25_index(fields)?;
-        index.compact_index().await
+        let guard = self.cancel_guard("Collection::compact_bm25_index");
+        let rt = index.compact_index().await;
+        guard.disarm();
+        rt
     }
 
     /// Compacts the specified BTree index to optimize storage and performance.
     pub async fn compact_btree_index(&self, fields: &[&str]) -> Result<(), DBError> {
         let _operation_lease = self.mutation_lease().await?;
         let index = self.find_btree_index(fields)?;
-        index.compact_index().await
+        let guard = self.cancel_guard("Collection::compact_btree_index");
+        let rt = index.compact_index().await;
+        guard.disarm();
+        rt
     }
 
     /// Adds a new document to the collection.
@@ -2568,42 +2542,59 @@ impl Collection {
     /// - The document fails schema validation
     /// - Any index update fails
     /// - Storage operations fail
-    pub async fn add(&self, mut doc: Document) -> Result<DocumentId, DBError> {
+    pub async fn add(&self, doc: Document) -> Result<DocumentId, DBError> {
         let _operation_lease = self.mutation_lease().await?;
+        // Past this point a dropped future is treated as a crash: in-memory
+        // index/bitmap state may already diverge from storage, so the guard
+        // poisons the handle and recovery happens on reopen.
+        let guard = self.cancel_guard("Collection::add");
+        let rt = self.add_impl(doc).await;
+        guard.disarm();
+        rt
+    }
 
+    /// Guarantees `id` is at or below the durable allocation watermark before
+    /// any document object may be written for it. Persisted in strides, so
+    /// this is one small PUT per [`Self::ALLOCATION_WATERMARK_STRIDE`] adds.
+    /// A failed watermark PUT fails the add before anything else was written:
+    /// the id is skipped and the handle stays healthy.
+    async fn ensure_allocation_watermark(&self, id: DocumentId) -> Result<(), DBError> {
+        if id <= self.durable_alloc_watermark.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let _gate = self.watermark_gate.lock().await;
+        if id <= self.durable_alloc_watermark.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let target = self
+            .max_document_id
+            .load(Ordering::Acquire)
+            .max(id)
+            .saturating_add(Self::ALLOCATION_WATERMARK_STRIDE);
+        self.storage
+            .put(Self::ALLOCATION_WATERMARK_PATH, &target, None)
+            .await?;
+        self.durable_alloc_watermark
+            .fetch_max(target, Ordering::AcqRel);
+        Ok(())
+    }
+
+    async fn add_impl(&self, mut doc: Document) -> Result<DocumentId, DBError> {
         self.schema.validate(doc.fields())?;
-        // Allocate the id and register it as in-flight atomically, so a
-        // concurrent flush that observed the new `max_document_id` also
-        // observes the in-flight registration (see `safe_check_point`).
-        let id = {
-            let mut in_flight = self.in_flight_adds.lock();
-            let id = self.max_document_id.fetch_add(1, Ordering::Acquire) + 1;
-            in_flight.insert(id);
-            id
-        };
-        // Deregister on every exit path. On success this drops at the end of
-        // the function, after the id was inserted into the bitmap; on failure
-        // the id is simply skipped forever (no document object remains).
-        struct InFlightGuard<'a> {
-            ids: &'a parking_lot::Mutex<BTreeSet<DocumentId>>,
-            id: DocumentId,
-        }
-        impl Drop for InFlightGuard<'_> {
-            fn drop(&mut self) {
-                self.ids.lock().remove(&self.id);
-            }
-        }
-        let _in_flight_guard = InFlightGuard {
-            ids: &self.in_flight_adds,
-            id,
-        };
+        // Flush holds the exclusive `operation_gate` while this add holds a
+        // shared lease, so a checkpoint can never observe this id before the
+        // bitmap registration below completes. A failed add simply skips the
+        // id forever; a cancelled add poisons the handle and the reopen
+        // repair scan (bounded by the allocation watermark) recovers or
+        // retires the id.
+        let id = self.max_document_id.fetch_add(1, Ordering::Acquire) + 1;
         doc.set_id(id);
 
-        // An add can be cancelled after its object-store PUT has committed
-        // but before the id bitmap is updated. Persist the intended document
-        // first so a later flush/reopen can either finish the add or remove
-        // any partially applied index entries.
-        self.record_mutation_intent(id, None, Some(&doc)).await?;
+        // Adds write no per-mutation intent. The durable allocation watermark
+        // guarantees the reopen repair scan enumerates every id that may have
+        // a document object, so a committed-but-unacknowledged add is found
+        // there instead of through a WAL record.
+        self.ensure_allocation_watermark(id).await?;
 
         let now_ms = unix_ms();
         #[allow(clippy::mutable_key_type)]
@@ -2662,6 +2653,23 @@ impl Collection {
         let path = Self::doc_path(id);
         if let Err(err) = self.storage.create(&path, &doc).await {
             rollback_indexes();
+            // The PUT outcome is unknown: it may have committed. Delete the
+            // object so the id cannot survive as an orphan below a future
+            // checkpoint. If even the delete outcome is unknown, treat it
+            // like a crash — the reopen repair scan (whose checkpoint has not
+            // advanced past this id) decides whether the document exists.
+            match self.storage.delete(&path).await {
+                Ok(()) | Err(DBError::NotFound { .. }) => {}
+                Err(delete_err) => {
+                    log::error!(
+                        action = "Collection::add",
+                        collection = self.name,
+                        doc_id = id;
+                        "Failed to clean up document after failed add: {delete_err:?}",
+                    );
+                    self.poison("Collection::add");
+                }
+            }
             return Err(err);
         }
 
@@ -2736,7 +2744,17 @@ impl Collection {
         fields: BTreeMap<String, Fv>,
     ) -> Result<Document, DBError> {
         let _operation_lease = self.mutation_lease().await?;
+        let guard = self.cancel_guard("Collection::update");
+        let rt = self.update_impl(id, fields).await;
+        guard.disarm();
+        rt
+    }
 
+    async fn update_impl(
+        &self,
+        id: DocumentId,
+        fields: BTreeMap<String, Fv>,
+    ) -> Result<Document, DBError> {
         if !self.doc_ids.read().contains(id) {
             return Err(DBError::NotFound {
                 name: "document".to_string(),
@@ -2878,6 +2896,10 @@ impl Collection {
         let path = Self::doc_path(id);
         if let Err(err) = self.storage.put(&path, &doc, Some(ver)).await {
             rollback_indexes();
+            // The PUT outcome is unknown: the new document may be durable
+            // while memory was just rolled back. The retained intent plus a
+            // reopen reconcile the divergence; this handle must not continue.
+            self.poison("Collection::update");
             return Err(err);
         }
 
@@ -2898,8 +2920,8 @@ impl Collection {
     /// 3. Removes the document ID from the bitmap
     ///
     /// Deleting the object before the bitmap update means a crash in between
-    /// leaves a dead id that reads self-heal (see [`Self::heal_missing_doc`]),
-    /// instead of an orphaned object beyond the repair scan window.
+    /// leaves a dead id that the reopen intent replay retires, instead of an
+    /// orphaned object beyond the repair scan window.
     /// A durable mutation intent containing the old indexed values is written
     /// before phase 1. It is retired only after a full flush, so reopening
     /// after a crash can finish removing stale B-Tree, BM25 and HNSW entries.
@@ -2917,7 +2939,13 @@ impl Collection {
     /// - Storage operations fail
     pub async fn remove(&self, id: DocumentId) -> Result<Option<Document>, DBError> {
         let _operation_lease = self.mutation_lease().await?;
+        let guard = self.cancel_guard("Collection::remove");
+        let rt = self.remove_impl(id).await;
+        guard.disarm();
+        rt
+    }
 
+    async fn remove_impl(&self, id: DocumentId) -> Result<Option<Document>, DBError> {
         // Membership check is non-authoritative; the bitmap mutation below
         // serializes concurrent removes and is the source of truth.
         if !self.doc_ids.read().contains(id) {
@@ -3013,6 +3041,10 @@ impl Collection {
                 doc_id = id;
                 "Failed to delete document from storage: {err:?}",
             );
+            // The DELETE outcome is unknown: the object may be gone while the
+            // bitmap and indexes were just restored. The retained intent plus
+            // a reopen complete the removal; this handle must not continue.
+            self.poison("Collection::remove");
             return Err(err);
         }
 
@@ -3063,7 +3095,16 @@ impl Collection {
                     docs.push(doc);
                 }
                 Err(DBError::NotFound { .. }) => {
-                    self.heal_missing_doc(id);
+                    // Under the poison-on-unknown-outcome contract a live
+                    // handle should never observe a dead id: crash recovery
+                    // happens on reopen. Log the anomaly; `reconcile_storage`
+                    // is the explicit repair path.
+                    log::warn!(
+                        action = "Collection::search",
+                        collection = self.name,
+                        doc_id = id;
+                        "Skipping dead document id without a backing object",
+                    );
                 }
                 Err(err) => return Err(err),
             }
@@ -3071,14 +3112,14 @@ impl Collection {
         Ok(docs)
     }
 
-    /// Self-heals a document id whose object is missing from storage.
+    /// Drops a document id whose object is missing from storage from the
+    /// in-memory id structures, so the next flush persists the repair.
     ///
-    /// A crash between deleting a document object and flushing the ids bitmap
-    /// leaves a dead id behind: it is present in the bitmap but has no
-    /// backing object, inflating `len()` forever with no cleanup path. When a
-    /// read discovers such an id, drop it from the in-memory id structures so
-    /// the next flush persists the repair. No-op in read-only mode or when
-    /// the id is not in the bitmap (e.g. a stale index entry).
+    /// Only [`Self::reconcile_storage`] calls this: under the
+    /// poison-on-unknown-outcome contract, dead ids (bitmap entry without a
+    /// backing object) can only be produced by a crash, and reopen recovery
+    /// resolves them before the handle serves reads. No-op in read-only mode
+    /// or when the id is not in the bitmap.
     fn heal_missing_doc(&self, id: DocumentId) {
         if self.read_only.load(Ordering::Relaxed) {
             return;
@@ -3340,7 +3381,14 @@ impl Collection {
                     return Ok(doc);
                 }
                 Err(DBError::NotFound { .. }) => {
-                    self.heal_missing_doc(id);
+                    // See the search path: a dead id on a live handle is an
+                    // anomaly, repaired explicitly via `reconcile_storage`.
+                    log::warn!(
+                        action = "Collection::get",
+                        collection = self.name,
+                        doc_id = id;
+                        "Document id has no backing object",
+                    );
                 }
                 Err(err) => return Err(err),
             }
@@ -4256,6 +4304,22 @@ mod tests {
             })
             .await?;
         assert!(hnsw_ids.contains(&id));
+
+        // The DELETE outcome was unknown, so the handle is poisoned: reads
+        // above still serve the rolled-back in-memory state, but mutations
+        // are rejected until the collection is reopened.
+        assert!(collection.is_poisoned());
+        assert!(collection.remove(id).await.is_err());
+
+        // Reopening replays the retained remove intent against storage: the
+        // object still exists (the injected failure happened before erasing
+        // it), so the document survives fully indexed.
+        let collection = db
+            .open_collection("test_collection".to_string(), async |_| Ok(()))
+            .await?;
+        assert!(collection.contains(id));
+        let stored: TestDoc = collection.get_as(id).await?;
+        assert_eq!(stored.name, "Alice");
 
         db.close().await?;
         Ok(())
@@ -6697,12 +6761,12 @@ mod tests {
         Ok(())
     }
 
-    /// Regression (P0-04): once collection metadata is durable, a failure in
-    /// ids.cbor must leave the whole checkpoint generation pending. Retrying
-    /// with no new mutation and the same timestamp must write ids/checkpoint
-    /// instead of taking the metadata fast path.
+    /// Once collection metadata is durable, a failure in ids.cbor poisons the
+    /// handle: the checkpoint is a sequence of dependent writes and the
+    /// in-memory watermarks no longer describe what is durable. Reopening
+    /// converges from the WAL and the repair scan; no document is lost.
     #[tokio::test]
-    async fn test_failed_ids_phase_is_retried_as_complete_checkpoint() -> Result<(), DBError> {
+    async fn test_failed_ids_phase_poisons_handle_and_reopen_converges() -> Result<(), DBError> {
         let armed = Arc::new(TestAtomicBool::new(false));
         let object_store: Arc<dyn ObjectStore> = Arc::new(FaultPutStore {
             inner: Arc::new(InMemory::new()),
@@ -6733,12 +6797,37 @@ mod tests {
         let same_ms = unix_ms();
         armed.store(true, TestOrdering::Release);
         assert!(collection.flush(same_ms).await.is_err());
-        assert_eq!(*collection.pending_checkpoint.lock(), Some(2));
-        assert!(collection.flush(same_ms).await?);
-        assert_eq!(*collection.pending_checkpoint.lock(), None);
+        assert!(collection.is_poisoned());
+        // Every further operation on the poisoned handle is rejected.
+        let err = collection
+            .flush(same_ms)
+            .await
+            .expect_err("poisoned handle must reject flush");
+        assert!(err.to_string().contains("poisoned"), "{err}");
+        assert!(
+            collection
+                .add_from(&create_test_doc(0, "three", 22, vec!["three"]))
+                .await
+                .is_err()
+        );
+
+        // Reopening through the same database discards the poisoned handle
+        // (without flushing it) and loads a fresh generation. The WAL replay
+        // recovers document 2 and the flush inside `open_collection` already
+        // persists the converged checkpoint and retires the WAL.
+        let collection = db
+            .open_collection("test_collection".to_string(), async |_| Ok(()))
+            .await?;
+        assert_eq!(collection.ids(), vec![1, 2]);
+        assert!(collection.pending_mutations.lock().is_empty());
+        let mut intents = collection
+            .storage
+            .list_meta(Some(Collection::MUTATION_INTENT_PREFIX), None);
+        assert!(intents.next().await.is_none(), "WAL retired after reopen");
+        assert!(collection.storage.stats().check_point >= 2);
 
         drop(collection);
-        drop(db);
+        db.close().await?;
         let db = AndaDB::connect(object_store, config).await?;
         let collection = db
             .open_collection("test_collection".to_string(), async |_| Ok(()))
@@ -6749,12 +6838,11 @@ mod tests {
     }
 
     /// A conditional metadata PUT can commit before its future reports
-    /// success. Aborting at that boundary must retain the exact payload and
-    /// checkpoint generation. The retry reads the committed payload back,
-    /// refreshes the local object version, and completes ids/checkpoint/WAL
-    /// retirement before a reopen.
+    /// success. Aborting at that boundary poisons the handle (cancellation is
+    /// treated as a crash); reopening loads the durable state and the
+    /// retained WAL converges ids and indexes without losing the document.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_cancelled_metadata_put_after_commit_retries_complete_checkpoint()
+    async fn test_cancelled_metadata_put_poisons_handle_and_reopen_converges()
     -> Result<(), DBError> {
         let (gate_tx, gate_rx) = tokio::sync::watch::channel(true);
         let blocked = Arc::new(TestAtomicBool::new(false));
@@ -6784,7 +6872,6 @@ mod tests {
             .add_from(&create_test_doc(0, "one", 20, vec!["one"]))
             .await?;
         assert_eq!(id, 1);
-        assert!(!collection.pending_mutations.lock().is_empty());
 
         gate_tx.send(false).expect("gate receiver dropped");
         let first_now = unix_ms();
@@ -6803,35 +6890,32 @@ mod tests {
                 .expect_err("flush should be cancelled")
                 .is_cancelled()
         );
-        assert_eq!(*collection.pending_checkpoint.lock(), Some(id));
-        assert!(collection.pending_metadata_write.lock().is_some());
-        assert!(!collection.pending_mutations.lock().is_empty());
-
-        // Let the immediate metadata writer add a newer generation before the
-        // full flush retries. It must first reconcile the retained checkpoint
-        // payload, then persist the extension with the recovered token without
-        // stranding the older pending generation.
         gate_tx.send(true).expect("gate receiver dropped");
-        collection
-            .save_extension("after_cancel".to_string(), Fv::Text("durable".to_string()))
-            .await?;
-        assert!(collection.pending_metadata_write.lock().is_none());
-        assert_eq!(*collection.pending_checkpoint.lock(), Some(id));
+        assert!(collection.is_poisoned());
 
-        // Use a different timestamp for the checkpoint completion. Metadata
-        // is already current, but ids/storage checkpoint/WAL must still run.
-        assert!(collection.flush(first_now.saturating_add(1)).await?);
-        assert_eq!(*collection.pending_checkpoint.lock(), None);
-        assert!(collection.pending_metadata_write.lock().is_none());
-        assert!(collection.pending_mutations.lock().is_empty());
+        // Every further operation on the poisoned handle is rejected.
+        let err = collection
+            .save_extension("after_cancel".to_string(), Fv::Text("durable".to_string()))
+            .await
+            .expect_err("poisoned handle must reject writes");
+        assert!(err.to_string().contains("poisoned"), "{err}");
+
+        // Reopening through the same database discards the poisoned handle
+        // without flushing it. The watermark-bounded repair scan recovers the
+        // committed document; a full flush then completes a checkpoint.
+        let collection = db
+            .open_collection("test_collection".to_string(), async |_| Ok(()))
+            .await?;
+        assert_eq!(collection.ids(), vec![id]);
+        collection.flush(unix_ms()).await?;
         let mut intents = collection
             .storage
             .list_meta(Some(Collection::MUTATION_INTENT_PREFIX), None);
-        assert!(intents.next().await.is_none(), "WAL must retire last");
+        assert!(intents.next().await.is_none(), "WAL retired after reopen");
         assert!(collection.storage.stats().check_point >= id);
 
         drop(collection);
-        drop(db);
+        db.close().await?;
         let db = AndaDB::connect(object_store, config).await?;
         let collection = db
             .open_collection("test_collection".to_string(), async |_| Ok(()))
@@ -6839,10 +6923,6 @@ mod tests {
         assert_eq!(collection.ids(), vec![id]);
         let reopened: TestDoc = collection.get_as(id).await?;
         assert_eq!(reopened.name, "one");
-        assert_eq!(
-            collection.get_extension("after_cancel"),
-            Some(Fv::Text("durable".to_string()))
-        );
         assert!(collection.storage.stats().check_point >= id);
         assert!(collection.pending_mutations.lock().is_empty());
         db.close().await?;
@@ -6850,12 +6930,11 @@ mod tests {
     }
 
     /// An immediate metadata-only write has the same post-commit cancellation
-    /// window as a full flush. Its retained generation must repair the stale
-    /// CAS token without claiming a checkpoint; a following full flush then
-    /// persists the newer document generation and retires its WAL normally.
+    /// window as a full flush: aborting it poisons the handle. The committed
+    /// extension write is durable and visible after a reopen; the unclaimed
+    /// write never publishes the full-flush watermark.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_cancelled_unclaimed_metadata_put_is_reconciled_by_full_flush()
-    -> Result<(), DBError> {
+    async fn test_cancelled_unclaimed_metadata_put_poisons_handle() -> Result<(), DBError> {
         let (gate_tx, gate_rx) = tokio::sync::watch::channel(true);
         let blocked = Arc::new(TestAtomicBool::new(false));
         let object_store: Arc<dyn ObjectStore> = Arc::new(FaultPutStore {
@@ -6898,33 +6977,39 @@ mod tests {
                 .expect_err("metadata-only writer should be cancelled after commit")
                 .is_cancelled()
         );
-        {
-            let pending = collection.pending_metadata_write.lock();
-            assert!(pending.is_some());
-            assert_eq!(pending.as_ref().unwrap().check_point, None);
-        }
-        assert_eq!(*collection.pending_checkpoint.lock(), None);
+        gate_tx.send(true).expect("gate receiver dropped");
+        assert!(collection.is_poisoned());
         assert_eq!(
             collection.last_saved_version.load(Ordering::Acquire),
             saved_before,
             "an unclaimed generation must not publish the full-flush watermark",
         );
+        assert!(
+            collection
+                .add_from(&create_test_doc(0, "after", 21, vec!["after"]))
+                .await
+                .is_err(),
+            "poisoned handle must reject mutations",
+        );
 
-        // Advance the collection generation before retrying through the full
-        // checkpoint path. It must reconcile the exact extension payload
-        // first, then use the recovered object version for this newer snapshot.
-        gate_tx.send(true).expect("gate receiver dropped");
+        // Reopen through the same database: the committed extension write is
+        // durable and visible in the fresh generation, which stays writable.
+        let collection = db
+            .open_collection("test_collection".to_string(), async |_| Ok(()))
+            .await?;
+        assert_eq!(
+            collection.get_extension("before_cancel"),
+            Some(Fv::Text("durable".to_string()))
+        );
         let id = collection
             .add_from(&create_test_doc(0, "after", 21, vec!["after"]))
             .await?;
         assert!(collection.flush(unix_ms()).await?);
-        assert!(collection.pending_metadata_write.lock().is_none());
-        assert_eq!(*collection.pending_checkpoint.lock(), None);
         assert!(collection.pending_mutations.lock().is_empty());
         assert!(collection.storage.stats().check_point >= id);
 
         drop(collection);
-        drop(db);
+        db.close().await?;
         let db = AndaDB::connect(object_store, config).await?;
         let collection = db
             .open_collection("test_collection".to_string(), async |_| Ok(()))
@@ -6941,25 +7026,13 @@ mod tests {
         Ok(())
     }
 
-    /// Read-back reconciliation is valid only for the exact payload retained
-    /// before cancellation. If another writer replaces that object, the
-    /// original precondition conflict must be returned and its CAS token must
-    /// remain unchanged.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_cancelled_metadata_put_rejects_different_durable_payload() -> Result<(), DBError>
-    {
-        let (gate_tx, gate_rx) = tokio::sync::watch::channel(true);
-        let blocked = Arc::new(TestAtomicBool::new(false));
-        let object_store: Arc<dyn ObjectStore> = Arc::new(FaultPutStore {
-            inner: Arc::new(InMemory::new()),
-            suffix: "test_collection/meta.cbor".to_string(),
-            fault: PutFault::BlockAfterCommit {
-                gate: gate_rx,
-                blocked: blocked.clone(),
-            },
-        });
+    /// A second writer replacing the metadata object makes the next flush
+    /// fail with `Precondition` and poisons the handle: single-writer
+    /// violations are never reconciled in place.
+    #[tokio::test]
+    async fn test_foreign_metadata_writer_poisons_handle() -> Result<(), DBError> {
         let db = AndaDB::connect(
-            object_store,
+            Arc::new(InMemory::new()),
             DBConfig {
                 name: "conflict_db".to_string(),
                 description: String::new(),
@@ -6975,25 +7048,9 @@ mod tests {
         collection
             .add_from(&create_test_doc(0, "one", 20, vec!["one"]))
             .await?;
+        collection.flush(unix_ms()).await?;
 
-        gate_tx.send(false).expect("gate receiver dropped");
-        let flushing = {
-            let collection = collection.clone();
-            tokio::spawn(async move { collection.flush(unix_ms()).await })
-        };
-        while !blocked.load(TestOrdering::Acquire) {
-            tokio::task::yield_now().await;
-        }
-        flushing.abort();
-        assert!(
-            flushing
-                .await
-                .expect_err("flush should be cancelled")
-                .is_cancelled()
-        );
-        gate_tx.send(true).expect("gate receiver dropped");
-
-        let local_version = collection.metadata_version.read().clone();
+        // Simulate a second writer bumping the durable metadata object.
         let (mut foreign, _) = collection
             .storage
             .fetch::<CollectionMetadata>(Collection::METADATA_PATH)
@@ -7004,22 +7061,25 @@ mod tests {
             .put(Collection::METADATA_PATH, &foreign, None)
             .await?;
 
+        collection
+            .add_from(&create_test_doc(0, "two", 21, vec!["two"]))
+            .await?;
         let err = collection
             .flush(unix_ms())
             .await
-            .expect_err("different durable payload must remain a conflict");
+            .expect_err("stale CAS token must remain a conflict");
         assert!(matches!(err, DBError::Precondition { .. }));
-        assert_eq!(*collection.metadata_version.read(), local_version);
-        assert!(collection.pending_metadata_write.lock().is_some());
-        assert!(collection.pending_checkpoint.lock().is_some());
+        assert!(collection.is_poisoned());
         Ok(())
     }
 
-    /// Regression (P0-04/P0-08): an object-store PUT may commit before the
-    /// caller observes its result. Cancelling `add` in that interval must not
-    /// let a later checkpoint skip the durable document.
+    /// An object-store PUT may commit before the caller observes its result.
+    /// Cancelling `add` in that interval poisons the handle; the durable WAL
+    /// intent makes the reopened generation recover the committed document
+    /// instead of skipping it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_cancelled_add_after_document_commit_is_reconciled() -> Result<(), DBError> {
+    async fn test_cancelled_add_poisons_handle_and_reopen_recovers_document() -> Result<(), DBError>
+    {
         let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
         let blocked = Arc::new(TestAtomicBool::new(false));
         let object_store: Arc<dyn ObjectStore> = Arc::new(FaultPutStore {
@@ -7064,7 +7124,20 @@ mod tests {
                 .is_cancelled()
         );
         gate_tx.send(true).expect("gate receiver dropped");
+        assert!(collection.is_poisoned());
+        assert!(
+            collection
+                .add_from(&create_test_doc(0, "second", 21, vec!["y"]))
+                .await
+                .is_err(),
+            "poisoned handle must reject mutations",
+        );
 
+        // Reopen through the same database: WAL replay recovers the committed
+        // document and the id allocator, so the next add gets a fresh id.
+        let collection = db
+            .open_collection("test_collection".to_string(), async |_| Ok(()))
+            .await?;
         assert_eq!(
             collection
                 .add_from(&create_test_doc(0, "second", 21, vec!["y"]))
@@ -7099,10 +7172,11 @@ mod tests {
     }
 
     /// A cancelled update can leave its proposed in-memory index value
-    /// applied while the document PUT is still blocked. The WAL stores both
-    /// before/after values so the next flush removes that phantom.
+    /// applied while the document PUT is still blocked. The handle is
+    /// poisoned; the WAL stores both before/after values so the reopened
+    /// generation removes that phantom.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_cancelled_update_before_document_put_removes_proposed_index()
+    async fn test_cancelled_update_poisons_handle_and_reopen_removes_phantom()
     -> Result<(), DBError> {
         let (gate_tx, gate_rx) = tokio::sync::watch::channel(true);
         let blocked = Arc::new(TestAtomicBool::new(false));
@@ -7157,7 +7231,17 @@ mod tests {
                 .is_cancelled()
         );
         gate_tx.send(true).expect("gate receiver dropped");
+        assert!(collection.is_poisoned());
+        assert!(
+            collection.flush(unix_ms()).await.is_err(),
+            "poisoned handle must reject flush",
+        );
 
+        // The reopened generation replays the WAL: both historical values are
+        // removed and the document still present in storage is re-indexed.
+        let collection = db
+            .open_collection("test_collection".to_string(), async |_| Ok(()))
+            .await?;
         collection.flush(unix_ms()).await?;
         let before = collection
             .query_ids(
