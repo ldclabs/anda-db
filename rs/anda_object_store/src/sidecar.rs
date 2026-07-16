@@ -1,50 +1,57 @@
 //! Crate-internal generic core shared by [`MetaStore`](crate::MetaStore) and
 //! [`EncryptedStore`](crate::EncryptedStore).
 //!
-//! Both wrappers follow the same "sidecar metadata" layout on the underlying
-//! backend: the payload of a logical object `<location>` lives at
-//! `data/<location>`, while a small CBOR-encoded metadata document describing
-//! it lives at `meta/<location>`. [`SidecarStore`] implements everything that
-//! depends only on this layout — path rewriting, the cached metadata
-//! pipeline, and the [`ObjectStore`] operations whose logic is identical for
-//! both wrappers (delete, list, copy, rename) — generically over the concrete
-//! metadata type ([`SidecarMeta`]).
+//! Both wrappers follow the same *immutable-generation* layout on the
+//! underlying backend:
 //!
-//! Wrapper-specific behavior stays in the wrappers: `MetaStore` hashes
-//! plaintext payloads, while `EncryptedStore` encrypts/decrypts chunks and
-//! only exposes the logical (content-addressable) ETag when its
-//! `conditional_put` switch is enabled. Listing metadata is interpreted
-//! through a wrapper-supplied policy, so encrypted metadata is authenticated
-//! before it is cached or surfaced.
+//! - `meta/<location>` — a small CBOR-encoded metadata document. It is the
+//!   **only commit point**: a logical object exists iff its metadata document
+//!   exists, and the document carries a pointer (the *generation*) to the
+//!   payload object.
+//! - `gen/<location>/<generation>` — the payload. Generation objects are
+//!   **immutable**: they are written exactly once (at a fresh, unique path)
+//!   and never overwritten. Replaced generations are deleted best-effort
+//!   after the pointer switch and otherwise reclaimed by
+//!   [`SidecarStore::collect_garbage`].
+//! - `data/<location>` — the *legacy* payload location used by the mutable
+//!   dual-object layout of anda_object_store < 0.10. Metadata without a
+//!   generation pointer refers to this path; the first overwrite of such a
+//!   key migrates it to the generation layout.
+//!
+//! A logical put therefore is: write the payload to a fresh immutable
+//! generation, then atomically switch the metadata pointer (one backend put).
+//! Readers resolve the pointer and read an immutable object, so torn
+//! "old metadata + new payload" reads are impossible by construction, and a
+//! crash before the pointer switch leaves the previous version fully intact
+//! and readable.
+//!
+//! [`SidecarStore`] implements everything that depends only on this layout —
+//! path mapping, the cached metadata pipeline, the commit protocol
+//! ([`SidecarStore::update_meta_with`]), delete, listing, and garbage
+//! collection — generically over the concrete metadata type
+//! ([`SidecarMeta`]). Hashing, encryption/decryption and metadata
+//! authentication stay in the wrappers.
 
 use cbor2::{from_reader, to_writer};
-use futures::{
-    StreamExt, TryStreamExt,
-    lock::{Mutex, MutexGuard},
-    stream::BoxStream,
-};
+use futures::{StreamExt, TryStreamExt, stream::BoxStream};
 use moka::{future::Cache, ops::compute::Op};
 use object_store::{path::Path, *};
+use rand::RngExt;
 use serde::{Serialize, de::DeserializeOwned};
-use std::{
-    collections::hash_map::DefaultHasher,
-    hash::{Hash, Hasher},
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
 use crate::map_arc_error;
 
-const MUTATION_LEASE_SHARDS: usize = 256;
 type MetadataValidator<M> = dyn Fn(&Path, &M) -> Result<()> + Send + Sync;
 
 /// Wrapper-supplied policy for interpreting sidecar metadata in listings.
 ///
 /// `validator` lets wrappers authenticate a decoded metadata document before
-/// it is cached or used. `reject_corrupt` distinguishes strict mode (a
-/// present but undecodable document is an error) from compatibility mode
-/// (the object is listed as an orphan so a recovery scan can heal it).
+/// it is surfaced. `reject_corrupt` distinguishes strict mode (a present but
+/// undecodable document fails the listing) from compatibility mode (the entry
+/// is skipped with a warning; reads of the key keep failing loudly and an
+/// overwrite or garbage collection resolves it).
 pub(crate) struct ListingMetaPolicy<M> {
-    logical_e_tag: bool,
     reject_corrupt: bool,
     validator: Option<Arc<MetadataValidator<M>>>,
 }
@@ -52,7 +59,6 @@ pub(crate) struct ListingMetaPolicy<M> {
 impl<M> Clone for ListingMetaPolicy<M> {
     fn clone(&self) -> Self {
         Self {
-            logical_e_tag: self.logical_e_tag,
             reject_corrupt: self.reject_corrupt,
             validator: self.validator.clone(),
         }
@@ -60,36 +66,22 @@ impl<M> Clone for ListingMetaPolicy<M> {
 }
 
 impl<M> ListingMetaPolicy<M> {
-    pub(crate) fn unchecked(logical_e_tag: bool) -> Self {
+    pub(crate) fn unchecked() -> Self {
         Self {
-            logical_e_tag,
             reject_corrupt: false,
             validator: None,
         }
     }
 
     pub(crate) fn verified(
-        logical_e_tag: bool,
         reject_corrupt: bool,
         validator: impl Fn(&Path, &M) -> Result<()> + Send + Sync + 'static,
     ) -> Self {
         Self {
-            logical_e_tag,
             reject_corrupt,
             validator: Some(Arc::new(validator)),
         }
     }
-}
-
-/// Guards one or two logical paths for a sidecar mutation.
-///
-/// Two-path operations acquire path-derived shards in stable numeric order.
-/// The bounded lock table deliberately allows unrelated paths to collide:
-/// this may add contention, but never weakens the same-path exclusion
-/// guarantee and avoids an unbounded per-path lock registry.
-pub(crate) struct MutationLease<'a> {
-    _first: MutexGuard<'a, ()>,
-    _second: Option<MutexGuard<'a, ()>>,
 }
 
 /// Sidecar metadata document maintained by [`SidecarStore`] for every object.
@@ -104,78 +96,78 @@ pub(crate) trait SidecarMeta: Serialize + DeserializeOwned + Send + Sync + 'stat
     /// The logical, content-addressable ETag exposed to callers.
     fn e_tag(&self) -> Option<&str>;
 
-    /// Records the ETag/version reported by the underlying backend for the
-    /// most recent write of the data object, so caller-provided preconditions
-    /// can later be translated into requests the backend understands.
-    fn set_original(&mut self, e_tag: Option<String>, version: Option<String>);
+    /// Size of the logical object in bytes, reported in listings.
+    fn size(&self) -> u64;
+
+    /// The generation this document points to. `None` means the legacy
+    /// (pre-0.10) layout: the payload lives directly at `data/<location>`.
+    fn generation(&self) -> Option<&str>;
 }
 
-/// Generic "data + sidecar metadata" store core.
+/// Mints a fresh generation identifier: a 16-hex-digit millisecond timestamp
+/// followed by a random 8-hex-digit salt. Timestamps make identifiers roughly
+/// monotonic (useful for the garbage collector's in-flight guard); the salt
+/// makes collisions between concurrent writers of the same key negligible.
+pub(crate) fn new_generation() -> String {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let salt: u32 = rand::rng().random();
+    format!("{ms:016x}-{salt:08x}")
+}
+
+/// Extracts the millisecond timestamp from a generation identifier minted by
+/// [`new_generation`]. Returns `None` for foreign objects.
+fn generation_timestamp_ms(generation: &str) -> Option<u64> {
+    let (ts, salt) = generation.split_once('-')?;
+    if ts.len() != 16 || salt.len() != 8 {
+        return None;
+    }
+    u64::from_str_radix(ts, 16).ok()
+}
+
+/// What a committed metadata document says about its key's payload, as
+/// gathered by the garbage collector's mark phase.
+enum PayloadRef {
+    /// Points at `gen/<location>/<generation>`.
+    Generation(String),
+    /// Legacy layout: points at `data/<location>`.
+    Legacy,
+    /// The document exists but cannot be decoded; keep every payload of the
+    /// key (conservative).
+    Unknown,
+}
+
+/// Generic immutable-generation store core.
 ///
-/// Owns the underlying [`ObjectStore`], the `data/`/`meta/` path prefixes and
-/// the metadata cache, and provides the metadata pipeline plus the
-/// structurally identical [`ObjectStore`] operations on top of them. The
-/// wrappers hold it behind an [`Arc`] so the `'static` streams returned by
+/// Owns the underlying [`ObjectStore`], the path prefixes and the metadata
+/// cache, and provides the commit protocol plus the structurally identical
+/// [`ObjectStore`] operations on top of them. The wrappers hold it behind an
+/// [`Arc`] so the `'static` streams returned by
 /// [`SidecarStore::delete_stream`] and the listing helpers can share it.
 pub(crate) struct SidecarStore<T: ObjectStore, M: SidecarMeta> {
     /// The underlying storage implementation.
     pub(crate) store: T,
-    /// Prefix for actual data objects.
+    /// Prefix for legacy (pre-0.10) payload objects.
     data_prefix: Path,
-    /// Prefix for metadata objects.
+    /// Prefix for immutable generation payload objects.
+    gen_prefix: Path,
+    /// Prefix for metadata objects (the commit points).
     meta_prefix: Path,
     /// Cache for metadata to reduce storage operations.
     meta_cache: Cache<Path, Arc<M>>,
-    /// Bounded per-path mutation lease table. Every mutation of a logical
-    /// path (put, multipart completion, delete, copy or rename) goes through
-    /// the same shard.
-    mutation_leases: Box<[Mutex<()>]>,
 }
 
 impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
-    /// Creates a core with the default `data/` and `meta/` prefixes.
+    /// Creates a core with the default `data/`, `gen/` and `meta/` prefixes.
     pub(crate) fn new(store: T, meta_cache: Cache<Path, Arc<M>>) -> Self {
         SidecarStore {
             store,
             data_prefix: Path::from("data"),
+            gen_prefix: Path::from("gen"),
             meta_prefix: Path::from("meta"),
             meta_cache,
-            mutation_leases: (0..MUTATION_LEASE_SHARDS).map(|_| Mutex::new(())).collect(),
-        }
-    }
-
-    fn mutation_lease_index(location: &Path) -> usize {
-        let mut hasher = DefaultHasher::new();
-        location.hash(&mut hasher);
-        hasher.finish() as usize % MUTATION_LEASE_SHARDS
-    }
-
-    async fn mutation_lease(&self, location: &Path) -> MutexGuard<'_, ()> {
-        self.mutation_leases[Self::mutation_lease_index(location)]
-            .lock()
-            .await
-    }
-
-    /// Acquires the path-derived mutation leases for `first` and `second` in
-    /// stable shard order. If both paths map to the same shard, it is locked
-    /// only once.
-    pub(crate) async fn mutation_leases(&self, first: &Path, second: &Path) -> MutationLease<'_> {
-        let first_idx = Self::mutation_lease_index(first);
-        let second_idx = Self::mutation_lease_index(second);
-        let (first_idx, second_idx) = if first_idx <= second_idx {
-            (first_idx, second_idx)
-        } else {
-            (second_idx, first_idx)
-        };
-        let first_guard = self.mutation_leases[first_idx].lock().await;
-        let second_guard = if first_idx == second_idx {
-            None
-        } else {
-            Some(self.mutation_leases[second_idx].lock().await)
-        };
-        MutationLease {
-            _first: first_guard,
-            _second: second_guard,
         }
     }
 
@@ -184,18 +176,46 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
         self.meta_prefix.parts().chain(location.parts()).collect()
     }
 
-    /// Maps a logical location to its data path: `loc` → `data/<loc>`.
-    pub(crate) fn full_path(&self, location: &Path) -> Path {
+    /// Maps a logical location and generation to the immutable payload path:
+    /// `loc` → `gen/<loc>/<generation>`.
+    pub(crate) fn generation_path(&self, location: &Path, generation: &str) -> Path {
+        self.gen_prefix
+            .parts()
+            .chain(location.parts())
+            .chain(Path::from(generation).parts())
+            .collect()
+    }
+
+    /// Maps a logical location to its legacy payload path: `loc` → `data/<loc>`.
+    pub(crate) fn legacy_path(&self, location: &Path) -> Path {
         self.data_prefix.parts().chain(location.parts()).collect()
     }
 
-    /// Maps a data path back to the logical location: `data/<loc>` → `<loc>`
-    /// (paths outside the data prefix pass through unchanged).
-    pub(crate) fn strip_prefix(&self, path: Path) -> Path {
-        if let Some(suffix) = path.prefix_match(&self.data_prefix) {
+    /// Resolves the payload path a metadata document points at.
+    pub(crate) fn payload_path(&self, location: &Path, generation: Option<&str>) -> Path {
+        match generation {
+            Some(generation) => self.generation_path(location, generation),
+            None => self.legacy_path(location),
+        }
+    }
+
+    /// Maps a metadata path back to the logical location:
+    /// `meta/<loc>` → `<loc>` (paths outside the prefix pass through).
+    fn strip_meta_prefix(&self, path: Path) -> Path {
+        if let Some(suffix) = path.prefix_match(&self.meta_prefix) {
             return suffix.collect();
         }
         path
+    }
+
+    /// Splits a full generation payload path into `(location, generation)`.
+    fn split_generation(&self, path: &Path) -> Option<(Path, String)> {
+        let mut parts: Vec<_> = path.prefix_match(&self.gen_prefix)?.collect();
+        if parts.len() < 2 {
+            return None;
+        }
+        let generation = parts.pop()?.as_ref().to_string();
+        Some((parts.into_iter().collect(), generation))
     }
 
     /// Fetches the raw metadata document from the underlying store,
@@ -245,64 +265,106 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
         Ok(meta)
     }
 
-    /// Serializes and persists the metadata document, then updates the cache.
-    pub(crate) async fn put_meta(&self, location: &Path, meta: M) -> Result<PutResult> {
-        let meta_path = self.meta_path(location);
-        let mut data = Vec::new();
-        to_writer(&meta, &mut data).map_err(|err| Error::Generic {
-            store: M::STORE_NAME,
-            source: format!("Failed to serialize Metadata for path {location}: {err:?}").into(),
-        })?;
-        // Persist to the underlying store first, then update cache.
-        // If we cached before the put and the put failed, readers would
-        // observe a non-persisted metadata until the cache entry expired.
-        let rt = self
-            .store
-            .put_opts(&meta_path, data.into(), PutOptions::default())
-            .await?;
-        self.meta_cache
-            .insert(location.clone(), Arc::new(meta))
-            .await;
-        Ok(rt)
-    }
-
-    /// Atomically (per key) computes and persists a new metadata document.
+    /// Re-resolves the metadata from the backend **inside the per-key
+    /// critical section** and replaces the cached document with the result.
     ///
-    /// `f` receives the current metadata (cached, or freshly loaded; `None`
-    /// when no document exists yet), typically validates preconditions and
-    /// writes the data object, and returns the new metadata. The new document
-    /// is persisted before the cache entry is replaced; on any error the
-    /// cache is left untouched.
-    pub(crate) async fn update_meta_with<F>(&self, location: &Path, f: F) -> Result<Arc<M>>
-    where
-        F: AsyncFnOnce(Option<&M>) -> Result<M>,
-    {
-        let _lease = self.mutation_lease(location).await;
+    /// Read paths call this when a resolved payload turns out to be gone
+    /// (their cached pointer was stale). A plain remove-and-reload could
+    /// race a concurrent commit and clobber the newer cached document with
+    /// the older one it just read — serializing the reload with the commits
+    /// makes that impossible.
+    pub(crate) async fn refresh_meta(&self, location: &Path) -> Result<Arc<M>> {
         let rt = self
             .meta_cache
             .entry(location.clone())
-            .and_try_compute_with(|entry| async {
-                let val = match entry {
-                    Some(meta) => f(Some(meta.value())).await?,
-                    None => match self.fetch_meta_bytes(location).await {
-                        Ok(data) => match self.decode_meta(location, &data) {
-                            Ok(meta) => f(Some(&meta)).await?,
-                            Err(err) => {
-                                // A corrupted sidecar (e.g. a torn write
-                                // followed by a crash) must not make the key
-                                // permanently unwritable: treat it as absent
-                                // so an overwriting put can rebuild both the
-                                // data object and its metadata.
-                                log::warn!(
-                                    "{}: replacing corrupted metadata for {location}: {err}",
-                                    M::STORE_NAME
-                                );
-                                f(None).await?
+            .and_try_compute_with(|_| async {
+                let meta = self.load_meta(location).await?;
+                Ok::<_, Error>(Op::Put(Arc::new(meta)))
+            })
+            .await?;
+        Ok(rt.unwrap().value().clone())
+    }
+
+    /// Atomically (per key) computes and commits a new metadata document —
+    /// the pointer switch of the immutable-generation protocol.
+    ///
+    /// `f` receives the current committed metadata, always freshly loaded
+    /// from the backend (`None` when no document exists yet) so caller
+    /// preconditions are checked against the committed truth rather than a
+    /// possibly lagging cache entry. It typically validates those
+    /// preconditions, writes the new immutable payload generation, and
+    /// returns the new metadata. The document put is the commit point: on
+    /// any error the cache is left untouched and the current version stays
+    /// fully readable (a freshly written generation is unreferenced garbage
+    /// for [`SidecarStore::collect_garbage`]).
+    ///
+    /// With `create`, the commit fails with [`Error::AlreadyExists`] when a
+    /// decodable document already exists; when no document exists at all the
+    /// metadata put is forwarded with [`PutMode::Create`], so a second writer
+    /// racing the same key **across processes** is rejected by the backend's
+    /// conditional write. A document that exists but does not decode (torn by
+    /// external corruption) is treated as absent so an overwriting or
+    /// creating put can rebuild the key; its unreachable payload is left to
+    /// garbage collection.
+    ///
+    /// After a successful commit the replaced payload (previous generation,
+    /// or the legacy `data/` object) is deleted best-effort; failures are
+    /// logged and left to [`SidecarStore::collect_garbage`].
+    pub(crate) async fn update_meta_with<F>(
+        &self,
+        location: &Path,
+        create: bool,
+        f: F,
+    ) -> Result<Arc<M>>
+    where
+        F: AsyncFnOnce(Option<&M>) -> Result<M>,
+    {
+        let already_exists = || Error::AlreadyExists {
+            path: location.to_string(),
+            source: "object already exists".into(),
+        };
+        let mut replaced: Option<Path> = None;
+        let replaced_out = &mut replaced;
+        let mut f = Some(f);
+        let rt = self
+            .meta_cache
+            .entry(location.clone())
+            .and_try_compute_with(|_entry| async move {
+                let f = f.take().expect("update_meta_with closure invoked twice");
+                let mut meta_mode = PutMode::Overwrite;
+                // Resolve the current document from the backend, not from
+                // the (possibly lagging) cache entry: conditional writes
+                // must be checked against the committed truth.
+                let val = match self.fetch_meta_bytes(location).await {
+                    Ok(data) => match self.decode_meta(location, &data) {
+                        Ok(cur) => {
+                            if create {
+                                return Err(already_exists());
                             }
-                        },
-                        Err(Error::NotFound { .. }) => f(None).await?,
-                        Err(err) => return Err(err),
+                            *replaced_out = Some(self.payload_path(location, cur.generation()));
+                            f(Some(&cur)).await?
+                        }
+                        Err(err) => {
+                            // A corrupted commit point (external corruption;
+                            // backend puts are atomic in the crash model)
+                            // must not make the key permanently unwritable:
+                            // treat it as absent so the put can rebuild the
+                            // object. Its payload is unreachable either way
+                            // and is left to garbage collection.
+                            log::warn!(
+                                "{}: replacing corrupted metadata for {location}: {err}",
+                                M::STORE_NAME
+                            );
+                            f(None).await?
+                        }
                     },
+                    Err(Error::NotFound { .. }) => {
+                        if create {
+                            meta_mode = PutMode::Create;
+                        }
+                        f(None).await?
+                    }
+                    Err(err) => return Err(err),
                 };
 
                 let meta_path = self.meta_path(location);
@@ -313,25 +375,94 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
                         .into(),
                 })?;
                 self.store
-                    .put_opts(&meta_path, data.into(), PutOptions::default())
-                    .await?;
+                    .put_opts(
+                        &meta_path,
+                        data.into(),
+                        PutOptions {
+                            mode: meta_mode,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map_err(|err| match err {
+                        Error::AlreadyExists { source, .. } => Error::AlreadyExists {
+                            path: location.to_string(),
+                            source,
+                        },
+                        err => err,
+                    })?;
                 Ok::<_, Error>(Op::Put(Arc::new(val)))
             })
             .await?;
-        Ok(rt.unwrap().value().clone())
+        let rt = rt.unwrap().value().clone();
+
+        // The pointer switch committed; the replaced payload is garbage now.
+        // Deleting it here is best-effort — an interruption leaves it to
+        // `collect_garbage`, never in the read path.
+        if let Some(old) = replaced
+            && old != self.payload_path(location, rt.generation())
+        {
+            self.best_effort_delete(&old).await;
+        }
+        Ok(rt)
     }
 
-    pub(crate) async fn remove_meta_cache(&self, location: &Path) {
-        self.meta_cache.remove(location).await;
+    async fn best_effort_delete(&self, path: &Path) {
+        match self.store.delete(path).await {
+            Ok(()) | Err(Error::NotFound { .. }) => {}
+            Err(err) => log::warn!(
+                "{}: failed to delete replaced payload {path}: {err}",
+                M::STORE_NAME
+            ),
+        }
     }
 
-    /// Re-reads the data object's backend ETag/version (after a copy or
-    /// rename produced a new one) and persists it into the metadata.
-    async fn refresh_meta_original_tag(&self, location: &Path) -> Result<()> {
-        let mut meta = self.load_meta(location).await?;
-        let obj = self.store.head(&self.full_path(location)).await?;
-        meta.set_original(obj.e_tag, obj.version);
-        self.put_meta(location, meta).await?;
+    /// Logically deletes `location`: removes the metadata document (the
+    /// commit point) and then deletes the payload best-effort. Reports
+    /// [`Error::NotFound`] when no metadata document exists.
+    pub(crate) async fn delete_object(&self, location: &Path) -> Result<()> {
+        let mut payload: Option<Path> = None;
+        let payload_out = &mut payload;
+        self.meta_cache
+            .entry(location.clone())
+            .and_try_compute_with(|_entry| async move {
+                // Resolve the payload from the backend, not from the
+                // (possibly lagging) cache entry.
+                match self.fetch_meta_bytes(location).await {
+                    Ok(data) => match self.decode_meta(location, &data) {
+                        Ok(cur) => {
+                            *payload_out = Some(self.payload_path(location, cur.generation()));
+                        }
+                        Err(err) => {
+                            // The payload cannot be resolved; delete the
+                            // commit point anyway and leave the payload
+                            // to garbage collection.
+                            log::warn!(
+                                "{}: deleting object with corrupted metadata at {location}: {err}",
+                                M::STORE_NAME
+                            );
+                        }
+                    },
+                    Err(Error::NotFound { source, .. }) => {
+                        return Err(Error::NotFound {
+                            path: location.to_string(),
+                            source,
+                        });
+                    }
+                    Err(err) => return Err(err),
+                }
+
+                match self.store.delete(&self.meta_path(location)).await {
+                    Ok(()) | Err(Error::NotFound { .. }) => {}
+                    Err(err) => return Err(err),
+                }
+                Ok::<_, Error>(Op::Remove)
+            })
+            .await?;
+
+        if let Some(path) = payload {
+            self.best_effort_delete(&path).await;
+        }
         Ok(())
     }
 
@@ -340,51 +471,31 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
         self: Arc<Self>,
         locations: BoxStream<'static, Result<Path>>,
     ) -> BoxStream<'static, Result<Path>> {
-        // Each location is handled end-to-end (data object, then metadata
-        // object) so failures always carry the caller's logical path. Error
-        // paths reported by the inner store cannot be mapped back reliably
-        // (e.g. `LocalFileSystem` reports filesystem paths).
         let inner = self;
         locations
             .map(move |location| {
                 let inner = inner.clone();
                 async move {
                     let location = location?;
-                    let _lease = inner.mutation_lease(&location).await;
-                    let data_res = inner.store.delete(&inner.full_path(&location)).await;
-                    // Attempt metadata deletion even when the data object was
-                    // missing, so orphaned metadata heals itself.
-                    let meta_res = inner.store.delete(&inner.meta_path(&location)).await;
-                    inner.remove_meta_cache(&location).await;
-
-                    match (data_res, meta_res) {
-                        // Missing metadata is tolerated: the data object is
-                        // the source of truth.
-                        (Ok(()), Ok(()) | Err(Error::NotFound { .. })) => Ok(location),
-                        (Ok(()), Err(err)) => Err(err),
-                        // Surface a missing data object under the logical
-                        // path, matching the inner store's NotFound behavior.
-                        (Err(Error::NotFound { source, .. }), _) => Err(Error::NotFound {
-                            path: location.to_string(),
-                            source,
-                        }),
-                        (Err(err), _) => Err(err),
-                    }
+                    inner.delete_object(&location).await?;
+                    Ok(location)
                 }
             })
             .buffered(10)
             .boxed()
     }
 
-    /// Shared implementation of [`ObjectStore::list`]. When requested by the
-    /// policy, each entry's ETag is replaced by the logical
-    /// (content-addressable) one from the sidecar metadata.
+    /// Shared implementation of [`ObjectStore::list`]: enumerates the
+    /// metadata documents (the commit points), so uncommitted generations and
+    /// crash leftovers are invisible by construction. Each entry reports the
+    /// logical size and the content-addressable ETag from the decoded
+    /// document.
     pub(crate) fn list(
         self: Arc<Self>,
         prefix: Option<&Path>,
         policy: ListingMetaPolicy<M>,
     ) -> BoxStream<'static, Result<ObjectMeta>> {
-        let prefix = self.full_path(prefix.unwrap_or(&Path::default()));
+        let prefix = self.meta_path(prefix.unwrap_or(&Path::default()));
         let stream = self.store.list(Some(&prefix));
         self.decorate_listing(stream, policy)
     }
@@ -397,8 +508,8 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
         offset: &Path,
         policy: ListingMetaPolicy<M>,
     ) -> BoxStream<'static, Result<ObjectMeta>> {
-        let offset = self.full_path(offset);
-        let prefix = self.full_path(prefix.unwrap_or(&Path::default()));
+        let offset = self.meta_path(offset);
+        let prefix = self.meta_path(prefix.unwrap_or(&Path::default()));
         let stream = self.store.list_with_offset(Some(&prefix), &offset);
         self.decorate_listing(stream, policy)
     }
@@ -409,147 +520,89 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
         policy: ListingMetaPolicy<M>,
     ) -> BoxStream<'static, Result<ObjectMeta>> {
         let inner = self;
-        if !policy.logical_e_tag && policy.validator.is_none() {
-            return stream
-                .map_ok(move |mut obj| {
-                    obj.location = inner.strip_prefix(obj.location);
-                    obj
-                })
-                .boxed();
-        }
-
         stream
-            .map_ok(move |mut obj| {
+            .map_ok(move |obj| {
                 let store = inner.clone();
                 let policy = policy.clone();
-                async move {
-                    let location = store.strip_prefix(obj.location);
-                    let logical_e_tag = store.listing_e_tag(&location, &policy).await?;
-                    if policy.logical_e_tag {
-                        obj.e_tag = logical_e_tag;
-                    }
-                    obj.location = location;
-                    Ok::<ObjectMeta, Error>(obj)
-                }
+                async move { store.listing_entry(obj, &policy).await }
             })
             .try_buffered(8) // fetch metadata concurrently
+            .try_filter_map(|entry| async move { Ok(entry) })
             .boxed()
     }
 
-    /// Loads and validates metadata for `location` during a listing, and
-    /// resolves its logical ETag. An orphaned
-    /// data object (metadata lost, e.g. after a crash between the data and
-    /// metadata writes) does not fail a listing because recovery scans need
-    /// to observe and heal it. Compatibility mode also treats a torn CBOR
-    /// document as an orphan; strict mode rejects every present document that
-    /// cannot be decoded and verified.
-    async fn listing_e_tag(
+    /// Builds the caller-visible [`ObjectMeta`] for one listed metadata
+    /// document. Returns `Ok(None)` for entries that must be skipped: keys
+    /// deleted while the listing was running, and (in compatibility mode)
+    /// documents that no longer decode.
+    ///
+    /// Decoded documents seen here are deliberately **not** inserted into the
+    /// metadata cache: an insert could clobber a newer document committed by
+    /// a concurrent writer between our fetch and the insert.
+    async fn listing_entry(
         &self,
-        location: &Path,
+        obj: ObjectMeta,
         policy: &ListingMetaPolicy<M>,
-    ) -> Result<Option<String>> {
-        if let Some(meta) = self.meta_cache.get(location).await {
-            if let Some(validator) = &policy.validator {
-                validator(location, &meta)?;
+    ) -> Result<Option<ObjectMeta>> {
+        let location = self.strip_meta_prefix(obj.location);
+        let meta: Arc<M> = if let Some(meta) = self.meta_cache.get(&location).await {
+            meta
+        } else {
+            match self.fetch_meta_bytes(&location).await {
+                Ok(data) => match self.decode_meta(&location, &data) {
+                    Ok(meta) => Arc::new(meta),
+                    Err(err) => {
+                        if policy.reject_corrupt {
+                            return Err(err);
+                        }
+                        log::warn!(
+                            "{}: skipping object with corrupted metadata in listing: {location}: {err}",
+                            M::STORE_NAME
+                        );
+                        return Ok(None);
+                    }
+                },
+                Err(Error::NotFound { .. }) => return Ok(None),
+                Err(err) => return Err(err),
             }
-            return Ok(meta.e_tag().map(String::from));
-        }
-
-        // A listing cache miss must participate in the same per-key critical
-        // section as every mutation. Without this lease, a listing can fetch
-        // old metadata, a put can then commit new data and metadata, and the
-        // listing can finally overwrite the cache with its authenticated but
-        // stale document. Re-check after acquiring the lease because a
-        // mutation (or another listing) may have filled the cache while this
-        // task was waiting. Cache hits above remain lock-free.
-        let _lease = self.mutation_lease(location).await;
-        if let Some(meta) = self.meta_cache.get(location).await {
-            if let Some(validator) = &policy.validator {
-                validator(location, &meta)?;
-            }
-            return Ok(meta.e_tag().map(String::from));
-        }
-
-        let data = match self.fetch_meta_bytes(location).await {
-            Ok(data) => data,
-            Err(Error::NotFound { .. }) => {
-                log::warn!(
-                    "{}: listing orphaned data object without metadata: {location}",
-                    M::STORE_NAME
-                );
-                return Ok(None);
-            }
-            Err(err) => return Err(err),
         };
-        match self.decode_meta(location, &data) {
-            Ok(meta) => {
-                if let Some(validator) = &policy.validator {
-                    // Authenticate before caching: a failed listing must not
-                    // seed the shared cache with attacker-controlled data.
-                    validator(location, &meta)?;
-                }
-                let meta = Arc::new(meta);
-                self.meta_cache.insert(location.clone(), meta.clone()).await;
-                Ok(meta.e_tag().map(String::from))
-            }
-            Err(err) => {
-                if policy.reject_corrupt {
-                    return Err(err);
-                }
-                // Do not cache anything for the corrupted document: reads
-                // must keep failing loudly and the next overwrite heals it.
-                log::warn!(
-                    "{}: listing data object with corrupted metadata as orphan: {location}: {err}",
-                    M::STORE_NAME
-                );
-                Ok(None)
-            }
+
+        if let Some(validator) = &policy.validator {
+            validator(&location, &meta)?;
         }
+        Ok(Some(ObjectMeta {
+            location,
+            last_modified: obj.last_modified,
+            size: meta.size(),
+            e_tag: meta.e_tag().map(String::from),
+            // Versions are not reported; see the crate documentation.
+            version: None,
+        }))
     }
 
     /// Shared implementation of [`ObjectStore::list_with_delimiter`]; see
-    /// [`SidecarStore::list`] for listing-policy semantics.
+    /// [`SidecarStore::list`] for listing semantics.
     pub(crate) async fn list_with_delimiter(
         &self,
         prefix: Option<&Path>,
         policy: ListingMetaPolicy<M>,
     ) -> Result<ListResult> {
-        let prefix = self.full_path(prefix.unwrap_or(&Path::default()));
+        let prefix = self.meta_path(prefix.unwrap_or(&Path::default()));
         let rt = self.store.list_with_delimiter(Some(&prefix)).await?;
         let common_prefixes = rt
             .common_prefixes
             .into_iter()
-            .map(|p| self.strip_prefix(p))
+            .map(|p| self.strip_meta_prefix(p))
             .collect::<Vec<_>>();
-
-        let objects = rt
-            .objects
-            .into_iter()
-            .map(|mut meta| {
-                meta.location = self.strip_prefix(meta.location);
-                meta
-            })
-            .collect::<Vec<_>>();
-
-        if !policy.logical_e_tag && policy.validator.is_none() {
-            return Ok(ListResult {
-                common_prefixes,
-                objects,
-                extensions: Extensions::default(),
-            });
-        }
 
         // Fetch the metadata for each object concurrently while preserving
         // the original listing order.
         let mut indexed =
-            futures::stream::iter(objects.into_iter().enumerate().map(move |(idx, mut obj)| {
+            futures::stream::iter(rt.objects.into_iter().enumerate().map(move |(idx, obj)| {
                 let policy = policy.clone();
                 async move {
-                    let logical_e_tag = self.listing_e_tag(&obj.location, &policy).await?;
-                    if policy.logical_e_tag {
-                        obj.e_tag = logical_e_tag;
-                    }
-                    Ok::<(usize, ObjectMeta), Error>((idx, obj))
+                    let entry = self.listing_entry(obj, &policy).await?;
+                    Ok::<_, Error>((idx, entry))
                 }
             }))
             .buffer_unordered(8)
@@ -558,7 +611,7 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
 
         // Restore the original order based on the captured index.
         indexed.sort_by_key(|(idx, _)| *idx);
-        let objects = indexed.into_iter().map(|(_, obj)| obj).collect();
+        let objects = indexed.into_iter().filter_map(|(_, entry)| entry).collect();
 
         Ok(ListResult {
             common_prefixes,
@@ -567,76 +620,47 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
         })
     }
 
-    /// Shared implementation of [`ObjectStore::copy_opts`]: copies the data
-    /// object honouring the requested mode, then mirrors the metadata.
-    pub(crate) async fn copy_opts(
+    /// Copies the current payload of `from` into a fresh generation of `to`,
+    /// re-resolving a stale cached pointer once (see the read paths). The
+    /// target's commit point is **not** touched: the caller builds the new
+    /// metadata around the returned generation and commits it via
+    /// [`SidecarStore::update_meta_with`], so a failure in between leaves the
+    /// target unchanged and the copied generation as collectable garbage.
+    ///
+    /// `verify` lets wrappers authenticate the source document before its
+    /// payload is copied.
+    pub(crate) async fn copy_payload<F>(
         &self,
         from: &Path,
         to: &Path,
-        options: CopyOptions,
-    ) -> Result<()> {
-        let _leases = self.mutation_leases(from, to).await;
-        let full_from = self.full_path(from);
-        let full_to = self.full_path(to);
-        self.store
-            .copy_opts(&full_from, &full_to, options.clone())
-            .await?;
-
-        // The data copy above already enforced the requested CopyMode; copy
-        // the sidecar metadata with Overwrite so stale/orphaned metadata at
-        // the target cannot fail the operation halfway.
-        let meta_from = self.meta_path(from);
-        let meta_to = self.meta_path(to);
-        let meta_options = CopyOptions {
-            mode: CopyMode::Overwrite,
-            extensions: options.extensions,
-        };
-        self.store
-            .copy_opts(&meta_from, &meta_to, meta_options)
-            .await?;
-        self.remove_meta_cache(to).await;
-        self.refresh_meta_original_tag(to).await?;
-        Ok(())
-    }
-
-    /// Shared implementation of [`ObjectStore::rename_opts`]; see
-    /// [`SidecarStore::copy_opts`].
-    pub(crate) async fn rename_opts(
-        &self,
-        from: &Path,
-        to: &Path,
-        options: RenameOptions,
-    ) -> Result<()> {
-        let _leases = self.mutation_leases(from, to).await;
-        if from == to {
-            // A self-rename must not be forwarded: the default rename
-            // implementation is copy + delete, which would destroy the
-            // object on some backends. Validate existence and target mode,
-            // then leave the object untouched.
-            return self.check_self_rename(from, &options).await;
+        verify: F,
+    ) -> Result<(Arc<M>, String)>
+    where
+        F: Fn(&Path, &M) -> Result<()>,
+    {
+        let mut retried = false;
+        loop {
+            let src = self.get_meta(from).await?;
+            verify(from, &src)?;
+            let src_path = self.payload_path(from, src.generation());
+            let generation = new_generation();
+            let dst_path = self.generation_path(to, &generation);
+            match self.store.copy(&src_path, &dst_path).await {
+                Ok(()) => return Ok((src, generation)),
+                Err(Error::NotFound { source, .. }) => {
+                    if !retried && src.generation().is_some() {
+                        retried = true;
+                        self.refresh_meta(from).await?;
+                        continue;
+                    }
+                    return Err(Error::NotFound {
+                        path: from.to_string(),
+                        source,
+                    });
+                }
+                Err(err) => return Err(err),
+            }
         }
-
-        let full_from = self.full_path(from);
-        let full_to = self.full_path(to);
-        self.store
-            .rename_opts(&full_from, &full_to, options.clone())
-            .await?;
-        self.remove_meta_cache(from).await;
-
-        // See copy_opts: the data rename already enforced the requested
-        // target mode, so always overwrite the target metadata.
-        let meta_from = self.meta_path(from);
-        let meta_to = self.meta_path(to);
-        let meta_options = RenameOptions {
-            target_mode: RenameTargetMode::Overwrite,
-            extensions: options.extensions,
-        };
-        self.store
-            .rename_opts(&meta_from, &meta_to, meta_options)
-            .await?;
-        self.remove_meta_cache(to).await;
-        self.refresh_meta_original_tag(to).await?;
-        Ok(())
     }
 
     /// Validates a rename where `from == to`: the object must exist, and a
@@ -655,5 +679,143 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
                 source: "rename target already exists".into(),
             }),
         }
+    }
+
+    /// Mark-sweep garbage collection over the payload prefixes.
+    ///
+    /// **Mark**: every metadata document (commit point) is read first, before
+    /// anything is deleted. **Sweep**: a payload object is a candidate only
+    /// when the marked state does not reference it, and immediately before
+    /// deletion the key's metadata is re-read from the backend — a payload
+    /// that is (or has become) referenced is never deleted. Generations
+    /// minted at or after the collection started are skipped, as are foreign
+    /// objects under `gen/` and every payload of a key whose metadata exists
+    /// but does not decode (conservative).
+    ///
+    /// The collector is designed to run when no other **process** writes the
+    /// store (e.g. at open), in line with the crate's single-writer contract;
+    /// the re-check keeps concurrent in-process writers safe, but a foreign
+    /// process could still commit a swept generation between the re-check and
+    /// the delete.
+    ///
+    /// Returns the number of payload objects deleted.
+    pub(crate) async fn collect_garbage(&self) -> Result<usize> {
+        let floor_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        // Mark: snapshot every commit point.
+        let mut referenced: HashMap<Path, PayloadRef> = HashMap::new();
+        let mut metas = self.store.list(Some(&self.meta_prefix));
+        while let Some(obj) = metas.try_next().await? {
+            let location = self.strip_meta_prefix(obj.location);
+            let state = match self.fetch_meta_bytes(&location).await {
+                Ok(data) => match self.decode_meta(&location, &data) {
+                    Ok(meta) => meta
+                        .generation()
+                        .map(|g| PayloadRef::Generation(g.to_string()))
+                        .unwrap_or(PayloadRef::Legacy),
+                    Err(_) => PayloadRef::Unknown,
+                },
+                Err(Error::NotFound { .. }) => continue, // deleted mid-scan
+                Err(err) => return Err(err),
+            };
+            referenced.insert(location, state);
+        }
+
+        // Sweep: collect candidates first (never mutate under a listing).
+        let mut candidates: Vec<(Path, Path, Option<String>)> = Vec::new();
+        let mut gens = self.store.list(Some(&self.gen_prefix));
+        while let Some(obj) = gens.try_next().await? {
+            let parsed = self
+                .split_generation(&obj.location)
+                .and_then(|(loc, g)| generation_timestamp_ms(&g).map(|ts| (loc, g, ts)));
+            let Some((location, generation, ts)) = parsed else {
+                log::warn!(
+                    "{}: skipping unrecognized object under generation prefix: {}",
+                    M::STORE_NAME,
+                    obj.location
+                );
+                continue;
+            };
+            if ts >= floor_ms {
+                // In-flight write (or clock skew): try again next run.
+                continue;
+            }
+            match referenced.get(&location) {
+                Some(PayloadRef::Generation(g)) if *g == generation => continue,
+                Some(PayloadRef::Unknown) => continue,
+                _ => candidates.push((obj.location, location, Some(generation))),
+            }
+        }
+        let mut legacy = self.store.list(Some(&self.data_prefix));
+        while let Some(obj) = legacy.try_next().await? {
+            let location = match obj.location.prefix_match(&self.data_prefix) {
+                Some(suffix) => suffix.collect::<Path>(),
+                None => continue,
+            };
+            match referenced.get(&location) {
+                Some(PayloadRef::Legacy) | Some(PayloadRef::Unknown) => continue,
+                _ => candidates.push((obj.location, location, None)),
+            }
+        }
+
+        let mut deleted = 0usize;
+        for (full_path, location, generation) in candidates {
+            // Re-read the commit point right before deleting: never delete a
+            // payload that is referenced now, even if the mark snapshot is
+            // stale.
+            if self.is_referenced(&location, generation.as_deref()).await? {
+                continue;
+            }
+            match self.store.delete(&full_path).await {
+                Ok(()) => deleted += 1,
+                Err(Error::NotFound { .. }) => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(deleted)
+    }
+
+    /// Whether the key's *current* on-disk metadata references the given
+    /// payload (`Some(generation)` for a generation object, `None` for the
+    /// legacy `data/` object). A document that fails to decode counts as
+    /// referencing everything (conservative).
+    async fn is_referenced(&self, location: &Path, generation: Option<&str>) -> Result<bool> {
+        match self.fetch_meta_bytes(location).await {
+            Ok(data) => match self.decode_meta(location, &data) {
+                Ok(meta) => Ok(meta.generation() == generation),
+                Err(_) => Ok(true),
+            },
+            Err(Error::NotFound { .. }) => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generation_ids_are_unique_and_carry_timestamps() {
+        let a = new_generation();
+        let b = new_generation();
+        assert_ne!(a, b);
+
+        let ts = generation_timestamp_ms(&a).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert!(
+            ts <= now && ts + 60_000 > now,
+            "timestamp {ts} vs now {now}"
+        );
+
+        assert_eq!(generation_timestamp_ms("not-a-generation"), None);
+        assert_eq!(generation_timestamp_ms("0123"), None);
+        assert_eq!(generation_timestamp_ms("zzzzzzzzzzzzzzzz-00000000"), None);
     }
 }

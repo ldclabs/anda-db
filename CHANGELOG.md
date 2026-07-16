@@ -2,24 +2,114 @@
 
 All notable changes to this workspace are documented in this file.
 
-## [Unreleased]
+## [0.10.0] — 2026-07-16
 
-Follow-up hardening: a review of the 0.9.2 release itself found and fixed a
-number of defects that release introduced. All crates re-tested; the full
-workspace test suite passes.
+De-complexity release. 0.9.2 was never published; its review-driven hardening
+(see "0.9.2 (unpublished)" below) ships here together with a follow-up review
+that fixed defects the hardening itself introduced, and a structural
+simplification pass that removes the machinery built for extreme edge cases.
+The release rests on three explicit contracts:
 
-### Migration note: HNSW deletion throughput
+1. **Single writer per database** is a deployment contract; each metadata
+   object keeps one conditional PUT as the last defense against a second
+   writer, and a `Precondition` conflict is never reconciled in place.
+2. **Cancellation is a crash (poison-on-cancel).** Dropping a mutating future
+   mid-operation — or a storage write failing with an unknown outcome —
+   poisons the collection handle; every further operation on it errors.
+3. **Recovery happens only on reopen**: write-ahead intent replay plus a
+   repair scan bounded exactly by the new allocation watermark.
 
-HNSW deletion repair introduced in 0.9.2 reconnects a removed node's former
-neighbors while holding the structural write lock. `HnswConfig::reconnect_on_delete`
-defaults to `true` for both new indexes and metadata written before the option
-existed. This preserves recall across repeated deletions, but each deletion can
-perform O(M²·L) work under that lock and can materially reduce throughput in
-delete-heavy workloads. Operators upgrading from an earlier 0.9 release should
-benchmark their deletion latency and write concurrency. Setting
-`reconnect_on_delete: false` skips that repair for future deletions and improves
-delete throughput, at the explicit cost of graph connectivity and recall that
-may degrade until the index is rebuilt.
+### Migration note: poison-on-cancel
+
+Do not wrap AndaDB mutating calls (`add*`, `update`, `remove`, `flush`,
+`close`, extension writes, compactions) in `tokio::select!`/`timeout`.
+A cancelled mutation poisons the collection handle; reopen it via
+`AndaDB::open_collection`, which discards the poisoned handle and recovers
+from storage. The built-in drivers (`auto_flush`, both HTTP servers) never
+cancel mutating futures.
+
+### Migration note: on-disk formats roll forward only
+
+Four durable formats gained fields or layouts this release. All of them read
+existing data and upgrade it lazily; **binaries older than 0.10 cannot read
+data written by 0.10** (do not roll back after writing):
+
+- object store immutable-generation layout (see the dedicated note below),
+- BM25/B-Tree bucket manifests (see Changed),
+- the collection allocation watermark object (`alloc_watermark.cbor`),
+- the schema allocation watermark (`next_idx`, serialized with each schema).
+
+### Migration note: HNSW deletion repair is now opt-in
+
+`HnswConfig::reconnect_on_delete` now defaults to **`false`** for new
+configurations *and* for persisted metadata that lacks the field (matching
+the behavior those indexes were built with; the unpublished 0.9.2 defaulted
+it to `true`). Neighbor repair keeps recall stable under delete-heavy
+workloads but runs O(M²·L) distance computations while holding the
+structural write lock; enable it explicitly when recall stability matters
+more than deletion throughput.
+
+### Migration note: object store immutable-generation layout
+
+`anda_object_store` replaced the mutable dual-object sidecar protocol with an
+immutable-generation layout. A logical put now writes the payload to a fresh,
+never-overwritten object `gen/<path>/<generation>` and commits by atomically
+switching the pointer inside the metadata document `meta/<path>` (a single
+backend put). Consequences:
+
+- **Torn states are gone by construction.** A crash before the pointer switch
+  leaves the previous version fully readable (previously the old version was
+  already overwritten and unrecoverable, and `EncryptedStore` surfaced the
+  window as an AES-GCM authentication failure); a crash after it means the
+  write took effect.
+- **Format rolls forward only.** Pre-0.10 data (payload at `data/<path>`, no
+  generation pointer) stays fully readable, and the first overwrite of a key
+  migrates it to the new layout. Metadata written by this version carries the
+  generation pointer, which older releases do not understand — **do not roll
+  back to a pre-0.10 binary after writing with this version.**
+- **Garbage collection.** Replaced payloads are deleted best-effort right
+  after each commit; crash leftovers are reclaimed by the new explicit
+  mark-sweep `MetaStore::collect_garbage` / `EncryptedStore::collect_garbage`
+  (run it at open or on a maintenance schedule). The collector reads every
+  commit point before deleting anything and re-checks each key immediately
+  before each deletion, so referenced payloads are never deleted.
+- **Versions are no longer reported.** `PutResult::version` and
+  `ObjectMeta::version` are `None` (replaced generations are reclaimed
+  eagerly, so version-addressed reads cannot be honoured); conditional
+  updates use the content-addressable ETag. Persisted
+  `ObjectVersion { version: None }` tokens from `LocalFileSystem` deployments
+  keep working unchanged.
+- **Conditional semantics unified.** `PutMode::Create` is now arbitrated
+  cross-process by a conditional write of the commit point (strictly stronger
+  than the old orphan self-heal, which weakened `Create`);
+  `PutMode::Update` / `if_match` / `if_none_match` are evaluated against the
+  logical ETag on every backend. `EncryptedStore`'s `with_conditional_put()`
+  is a retained no-op: those semantics are always on, and `EncryptedStore`
+  now always exposes the logical (ciphertext-hash) ETag.
+- **Listings enumerate commit points** (`meta/`), so uncommitted payloads and
+  crash leftovers are invisible; entries report the logical size and ETag.
+  A metadata document that no longer decodes is skipped with a warning in
+  compatibility mode (strict `EncryptedStore` mode still fails the listing),
+  reads of such a key keep failing loudly, and an overwrite rebuilds it.
+- **Removed machinery**: the per-key mutation-lease table, the
+  `heal_create` orphan self-heal branches, the conditional-GET rewrite of
+  backend ETags, and the listing orphan-tolerance dance are all gone —
+  the immutable-generation protocol makes them unnecessary.
+
+### Changed — de-complexity pass
+
+- **Poison-on-cancel recovery model** (`anda_db`; breaking behavior) — The retained-write/read-back state machines (kept payload snapshots, expected-version slots, `Precondition` read-back comparison — four copies across collection metadata, B-Tree, BM25 and HNSW adapters), the pending-checkpoint retry state and the in-flight-add checkpoint clamp are deleted. In their place: a cancelled mutating future or an unknown-outcome storage failure moves the handle to a poisoned lifecycle state, `AndaDB::open_collection` transparently discards a poisoned handle after draining it, and reopening converges from storage (intent replay + repair scan). Handles no longer attempt to "resume in place" after cancellation.
+- **`add` writes no per-mutation WAL record** (`anda_db`) — A durable **allocation watermark** (`alloc_watermark.cbor`, published one small PUT per 64 allocations) guarantees every id that may have a document object lies inside `checkpoint+1 ..= max(metadata max, watermark)`. The reopen repair scan probes exactly that window — the consecutive-miss heuristics (and their "more than N consecutive holes can hide documents" failure mode) are gone. Updates and removes keep their durable intents.
+- **Flush no longer replays mutation intents** (`anda_db`) — Under the poison contract a live handle only ever holds completed intents, so the normal flush path persists dirty state and retires the intent log without the delete-and-rebuild reconciliation the unpublished 0.9.2 follow-up ran on every flush (which re-inserted every pending document into every index, including re-randomizing HNSW placements). Reconciliation now runs only on reopen.
+- **KQL solver rewritten on a row-based solution model** (`anda_cognitive_nexus`) — The parallel representations (columnar entity/predicate bindings, fixed 3+1-slot relation rows, grouped-pair maps, alignment marker sets), the four FIND fallback projection paths and the three FILTER sub-paths are replaced by a single `SolutionTable` (header + rows, columnar layout) with relational operators: natural join, left join (OPTIONAL), padded union (UNION), row-level FILTER, tuple anti-join (NOT), group-aggregate and §3.3 projection dedup. `kql.rs` shrinks from 3,326 to 1,482 lines. Fixed by construction, each with a regression test: concept-only UNION no longer degenerates into a cartesian product; UNION branches with multi-pattern equi-joins no longer lose solutions; NOT anti-joins with 3+ shared variables remove exact tuples only; FILTER after UNION filters both branches; UNION branches are no longer limited to 3 entity / 1 predicate variables.
+- **Shard proxy routing caches are invalidate-only** (`anda_db_shard_proxy`) — Administrative writes and NOTIFY events no longer back-fill caches from request payloads (racing back-fills could re-apply an older commit); they only invalidate, and lookups re-resolve against PostgreSQL. The `route_generation` epoch machinery is deleted; the positive route TTL (now 30s) is the convergence bound for the one remaining stale-insert race, and the backend mirror is maintained solely by commit-ordered NOTIFY events.
+- **Index-crate concurrency contracts narrowed** (`anda_db_tfs`, `anda_db_btree`, `anda_db_hnsw`) — The internal mutation gates, the hand-written persistence gates (three verbatim copies of an async mutex), BM25/B-Tree empty-posting flush healing and B-Tree's dirty-bucket counter with its drift-healing CAS are deleted. Coordinating mutations against flush/compaction — and flushes against each other — is the caller's responsibility; `anda_db`'s `Collection` already holds an exclusive operation gate across every flush. HNSW additionally drops its per-layer id tracker (entry-point replacement falls back to an O(N) scan on the rare paths that need it).
+- **Schema tracks an allocation watermark** (`anda_db_schema`) — `Schema` persists `next_idx`, the exclusive upper bound of every field index the schema lineage ever allocated. This fixes a latent index-reuse bug (removing the highest-indexed field let the next upgrade reallocate its index, so stale values of the removed field could be misread as the new field) and lets `try_from_doc`/`set_doc` distinguish retired-field leftovers (still silently dropped) from indexes the lineage never allocated — which are now **rejected** instead of silently deleted on the next rewrite.
+- **`Filter::Or` is order-independent** (`anda_db`) — Every branch is evaluated (each bounded by `limit` on its own) and the union is returned in canonical order; previously evaluation stopped once the union reached `limit`, so equal boolean sets returned different results depending on operand order.
+- **Server registry persistence is part of RPC success** (`anda_db_server`) — `db.create`/`db.open` unwind their registration (and close the database) when the registry write fails, and `db.close` reports the failure and stays retryable; previously the registry write was best-effort and a "successful" lifecycle transition could silently not survive a restart.
+- **HNSW bootstrap sweeps orphan node blobs** (`anda_db`) — A crash between the ids PUT and the metadata PUT used to leak the removed node's blob forever (no load or purge would ever visit it); bootstrap now deletes node blobs that neither the id set nor the tombstone set references.
+- **`EncryptedStore` ETags are seeded with the per-commit nonce** — The logical ETag is now SHA3-256 over the random per-commit nonce followed by the ciphertext. Hashing the bare ciphertext collided for short payloads (a one-byte ciphertext has only 256 possible values), which let a stale CAS token pass a conditional update and silently lose writes once conditional updates switched to logical ETags; found by an OCC stress test that now guards the property.
+- **UPSERT self-loop preflight propagates read errors** (`anda_cognitive_nexus`) — Only a definite NotFound degrades to "new concept"; storage or index failures during the preflight now propagate instead of silently skipping the self-loop check it exists to perform.
 
 ### Fixed
 
@@ -56,14 +146,15 @@ may degrade until the index is rebuilt.
   - **API**: bucket callbacks now receive a `BucketObject { bucket_id, generation }` and return `Result<(), _>` (the cooperative `Ok(false)` stop is gone); `flush`/`flush_with`/`flush_owned_with` return `FlushOutcome { saved, obsolete }` instead of `bool`; `load_all`/`load_buckets` callbacks take `BucketObject`. The low-level `store_metadata`, `store_metadata_with` and `store_dirty_buckets` building blocks are removed — the coordinated flush is the only persistence path. `BTreeIndex::flush_with` (borrowing variant) is folded into `flush_owned_with`.
   - **Concurrency contract narrowed**: both crates no longer serialize flushes internally or defend a flush against concurrent mutations (the internal mutation gate, persistence gate, dirty-bucket counter and empty-posting flush defenses are deleted). Coordinating mutations vs. flush/compaction, and flushes against each other, is the caller's responsibility — `anda_db`'s `Collection` already holds an exclusive operation gate across every flush; a single writer per durable index is a deployment contract.
 - **BM25 flush callback signatures** — `BM25Index::flush` / `flush_with` callbacks are now plain `FnMut`/`FnOnce` closures returning a future and receive owned `Vec<u8>` blobs (previously `AsyncFn*` over `&[u8]`); the `AsyncFn*`-over-borrow pattern made every downstream `tokio::spawn` of a flush fail to prove `Send` (rustc "implementation of `Send` is not general enough").
-- **HNSW delete-time reconnection is configurable** — New `HnswConfig::reconnect_on_delete` (default `true`, backward compatible) lets delete-heavy workloads opt out of the O(M²·L) under-lock neighbor repair introduced in 0.9.2, trading recall stability for deletion throughput.
+- **HNSW delete-time reconnection is configurable** — New `HnswConfig::reconnect_on_delete` lets recall-sensitive workloads opt into the O(M²·L) under-lock neighbor repair introduced by the unpublished 0.9.2. It now defaults to `false` (see the migration note above).
 - **`anda_kip::loose_equal` is public** — The engine's `==`/`!=`/`IN` equality is exposed for downstream executors.
 
-## [0.9.2] — 2026-07-10
+### 0.9.2 (unpublished, 2026-07-10) — folded into this release
 
-Workspace-wide hardening release driven by a full per-crate code review. All 13
-crates were audited and fixed; ~60 regression tests were added and the full
-workspace test suite passes.
+Workspace-wide hardening driven by a full per-crate code review. All 13
+crates were audited and fixed; ~60 regression tests were added. This version
+was never published; entries contradicted by the follow-up review above are
+annotated.
 
 ### Added
 
@@ -80,17 +171,16 @@ workspace test suite passes.
 - **Search and filter misuse now error instead of returning empty results** — `Search.text` without a BM25 index, `Search.vector` without a dimension-matching HNSW index, and filter values whose type does not match the B-Tree index key now return `DBError::Index`; previously all three silently returned empty result sets.
 - **Hybrid search truncation keeps the most-relevant results** — With `Lt`/`Le` filters, result truncation now keeps the head of the RRF-ranked candidates; the tail-keeping strategy only applies to the pure-filter (id-ascending) path. Previously hybrid queries returned the *least* relevant `limit` documents.
 - **KQL default result order is deterministic** — Solutions without `ORDER BY` are returned in ascending `EntityID` order (previously clause-insertion order), which also fixes cursor pagination skipping pages over unordered bindings.
-- **KIP comparison semantics unified** — `==`/`!=` now use the same loose numeric/datetime comparison as the ordering operators (`3.0 == 3` is true; arrays/objects never compare equal); previously `3.0 == 3` was false while `3.0 <= 3` was true.
+- **KIP comparison semantics unified** — `==`/`!=` now use the same loose numeric/datetime comparison as the ordering operators (`3.0 == 3` is true); previously `3.0 == 3` was false while `3.0 <= 3` was true. *The "arrays/objects never compare equal" part was reverted by the follow-up review (structural equality again), and exact big-integer comparison landed there too.*
 - **KIP aggregate integer semantics** — `SUM`/`MIN`/`MAX` over all-integer inputs return integers (i128 accumulation, no precision loss above 2^53); `SUM` of an empty set is integer `0`, `AVG` of an empty set is `null`.
 - **KIP duplicate keys are parse errors** — Duplicate keys in concept matchers, `SET ATTRIBUTES`/`WITH METADATA` blocks, and nested JSON objects now fail with `KIP_1001` instead of silently keeping the last value; `SEARCH ... LIMIT 0` is likewise rejected at parse time.
 - **`UPDATE` response `matched` counts pre-truncation hits** — `updated < matched` now signals `LIMIT` truncation; dangling `{id:}`/`(id:)` references fail fast with `KIP_3002` instead of matching an empty set.
 - **Shard proxy refuses insecure exposure** — Listening on a non-loopback address without `API_KEY` now aborts startup unless `INSECURE_NO_API_KEY` is set; `backend_addr` must be an absolute `http://` URI; backend PostgreSQL failures return 503 instead of being misreported as 404, with a 5s negative cache and db-name pre-validation protecting the connection pool.
-- **Storage cache capacity is weight-based** — `cache_max_capacity` now counts approximate KiB weight instead of entry count, bounding worst-case memory for large objects.
 - **Server 500 responses are generic** — Internal error details go to logs; query-usage errors surfaced by the engine's new `DBError::Index` behavior map to 400.
 
 ### Fixed
 
-- **Collection flush checkpoint vs. concurrent adds** — `flush` clamps the crash-recovery checkpoint below the smallest in-flight `add` (ids allocated but not yet in the bitmap), so a crash between id allocation and bitmap update can no longer permanently hide the document from `auto_repair_indexes`.
+- **Collection flush checkpoint vs. concurrent adds** — `flush` clamps the crash-recovery checkpoint below the smallest in-flight `add` (ids allocated but not yet in the bitmap), so a crash between id allocation and bitmap update can no longer permanently hide the document from `auto_repair_indexes`. *Superseded in this release by the allocation watermark plus the exclusive flush gate.*
 - **`set_extension` persistence** — `set_extension`/`set_extension_with`/`set_extension_from_with` now bump the metadata version so extension data actually persists on the next flush; the prior test passed spuriously against the in-memory cache and has been rewritten to reconnect from storage.
 - **Collection lifecycle races** — `delete_collection` vs. `open_collection` can no longer resurrect a zombie collection; `open_or_create_collection` serializes creation and falls back to open on `AlreadyExists`; `inner_drop_prefix` bumps `write_seq` so deleted objects stop being served from cache.
 - **Grouped aggregation respects FILTER/NOT narrowing** — Group members are intersected with the narrowed bindings before aggregation, so `COUNT` no longer includes filtered-out members; grouped `FIND` also honors `ORDER BY ?group_var` (previously a silent no-op).
@@ -101,7 +191,7 @@ workspace test suite passes.
 - **I64/F32 stored-document read-back** — Untyped CBOR deserialization restores non-negative integers as `U64` and `f32` as `F64`; validation and typed conversion now accept these read-back forms (mirroring the existing `Vector` compatibility branch), so such documents no longer fail to load after a flush.
 - **JSON prefix escaping inside `FieldValue::Json`** — Strings embedded in `Json` values are `b64:`/`txt:`-escaped symmetrically with deserialization, so values like `"b64:AQID"` survive a human-readable round trip instead of being mangled into `Bytes`.
 - **Deep-nesting stack overflow guards** — `FieldValue` recursive conversions enforce `MAX_CONVERSION_DEPTH` (128); the BM25 logical-query parser handles trailing-`)` floods iteratively with a 64-level nesting budget (an 8K-`)` input previously aborted the process); KIP nesting/input limits are now exported as public constants.
-- **HNSW deletion repairs the graph** — Removing a node reconnects its former neighbors through neighbor-selection repair, preventing monotonic recall degradation over delete-heavy workloads (recall@10 after deleting 50% of nodes: 0.81 → 0.90 in the new regression test); tombstones persist with metadata so purge survives reload, and entry-point replacement uses a per-layer tracker instead of an O(N) scan.
+- **HNSW deletion repairs the graph** — Removing a node reconnects its former neighbors through neighbor-selection repair, preventing monotonic recall degradation over delete-heavy workloads (recall@10 after deleting 50% of nodes: 0.81 → 0.90 in the new regression test); tombstones persist with metadata so purge survives reload. *The repair now defaults to off and the per-layer tracker was removed again in this release.*
 - **BM25 statistics consistency** — `avg_doc_tokens` updates are serialized under one lock so concurrent insert/remove can no longer leave a permanently skewed average; flush persists buckets before advancing the metadata version watermark (HNSW likewise).
 - **B-Tree ghost keys after crash** — Empty postings persisted during a remove/flush crash window are treated as tombstones on load (skipped, marked dirty for self-heal), so reloaded trees no longer report keys with no documents; serialization failures during insert return errors instead of panicking.
 - **Encrypted metadata auth stripping** — Metadata carrying an auth version but missing `auth_nonce`/`auth_tag` is rejected by default (previously it silently downgraded to legacy verification, allowing cross-path object moves and chunk-boundary truncation by an attacker with storage write access).

@@ -4,10 +4,10 @@
 brain build on top of. It extends the [`object_store`][object_store] crate
 with two composable wrappers:
 
-| Wrapper          | Purpose                                                                                                                                         |
-| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| `MetaStore`      | Side-car metadata (size, content-addressable ETag, original backend tags). Provides uniform conditional-update semantics on top of any backend. |
-| `EncryptedStore` | Transparent, chunked AES-256-GCM encryption-at-rest. Random per-object nonce, per-chunk authentication tags, range-get friendly.                |
+| Wrapper          | Purpose                                                                                                                                          |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `MetaStore`      | Side-car metadata (size, content-addressable ETag). Provides uniform conditional-update semantics on top of any backend.                         |
+| `EncryptedStore` | Transparent, chunked AES-256-GCM encryption-at-rest. Random per-object nonce, per-chunk authentication tags, range-get friendly.                 |
 
 Both wrappers implement the [`object_store::ObjectStore`] trait, so any
 caller written against `object_store` (S3, GCS, Azure Blob, local filesystem,
@@ -39,49 +39,143 @@ abstraction, but two practical problems remain:
    whole object.
 
 `MetaStore` solves (1). `EncryptedStore` solves (2) and inherits the
-machinery for (1) optionally.
+machinery for (1).
 
 ---
 
-## 2. On-disk layout
+## 2. On-disk layout and write protocol
 
-Both wrappers split the underlying namespace into two prefixes. By default:
+Both wrappers split the underlying namespace into three prefixes:
 
 ```
-data/<logical-path>   — payload (plaintext for MetaStore, ciphertext for EncryptedStore)
-meta/<logical-path>   — CBOR-encoded Metadata side-car
+meta/<logical-path>              — CBOR-encoded Metadata document: the COMMIT POINT
+gen/<logical-path>/<generation>  — immutable payload (plaintext for MetaStore, ciphertext for EncryptedStore)
+data/<logical-path>              — legacy payload location (pre-0.10 layout, read-only)
 ```
 
 Callers always interact with the *logical* path (`<logical-path>`); the
 wrapper rewrites paths transparently for every read, write, list, copy and
-delete operation, and strips the prefix back when results are returned.
+delete operation.
 
-Internally, both wrappers delegate everything that depends only on this
-layout — path rewriting, the cached metadata pipeline, and the structurally
-identical `ObjectStore` operations (delete, list, copy, rename) — to a
-shared, crate-private generic core (`SidecarStore<T, M>` in `src/sidecar.rs`).
-Only hashing, encryption/decryption and the conditional-put behaviour live in
-the wrappers themselves.
+### 2.1 Immutable generations + pointer switch
 
-### 2.1 MetaStore metadata (CBOR)
+A logical object exists **iff** its metadata document exists. The document
+carries a *generation* pointer identifying the payload object. A write is:
+
+1. Write the payload to a **fresh, immutable** generation object
+   `gen/<path>/<generation>` (generations are
+   `<16-hex ms timestamp>-<8-hex random>`; a generation path is written
+   exactly once and never overwritten).
+2. Commit by writing `meta/<path>` with the new pointer — a **single backend
+   put**, which is the only atomicity the protocol needs.
+3. Best-effort delete the replaced payload (previous generation, or the
+   legacy `data/` object). Failures are logged and left to garbage
+   collection.
+
+Crash semantics follow directly:
+
+- **Crash before the pointer switch** — the previous version stays fully
+  intact and readable; the new generation is unreferenced garbage.
+- **Crash after the pointer switch** — the write took effect; the replaced
+  payload is garbage.
+- **Torn reads are impossible by construction.** A reader resolves the
+  pointer and then reads an immutable object, so it can never observe "old
+  metadata + new payload" (which, for `EncryptedStore`, used to surface as an
+  AES-GCM authentication failure indistinguishable from tampering). Even a
+  `GetResult` stream that outlives the request stays consistent, because the
+  generation it reads from is never rewritten.
+
+If a reader resolves a *cached* pointer whose generation has just been
+replaced and reclaimed by a concurrent in-process writer, the payload read
+reports `NotFound`; the wrappers then invalidate the cached document and
+re-resolve once, so the reader observes the new committed version.
+
+### 2.2 Conditional writes
+
+- `PutMode::Create` — rejected with `AlreadyExists` when a decodable
+  metadata document exists. When no document exists, the metadata put itself
+  is forwarded with `PutMode::Create`, so **cross-process** `Create` races
+  are arbitrated by the backend's conditional write: exactly one winner.
+- `PutMode::Update(v)` — `v.e_tag` is compared against the current
+  document's content-addressable ETag inside the per-key critical section.
+  This works uniformly on every backend, including `LocalFileSystem`.
+- `if_match` / `if_none_match` on reads are evaluated against the logical
+  ETag and then stripped: once the precondition holds against the current
+  commit point, the immutable payload cannot change under the reader.
+
+Versions are **not** reported (`PutResult::version`, `ObjectMeta::version`
+are `None`): replaced generations are reclaimed eagerly, so version-addressed
+reads cannot be honoured. Conditional updates rely on the ETag.
+
+### 2.3 Garbage collection
+
+`MetaStore::collect_garbage` / `EncryptedStore::collect_garbage` run an
+explicit mark-sweep pass:
+
+1. **Mark** — read *every* metadata document first; nothing is deleted
+   before the full referenced set is known.
+2. **Sweep** — a payload object (`gen/` generation or legacy `data/` object)
+   is a candidate only if the marked state does not reference it. Right
+   before each deletion the key's metadata is re-read from the backend; a
+   payload that is referenced *now* is never deleted. Generations minted at
+   or after the collection started are skipped (in-flight writes), as are
+   unrecognizable objects under `gen/` and all payloads of a key whose
+   metadata exists but does not decode (conservative).
+
+Run the collector when the store is otherwise quiescent (e.g. at open), in
+line with the single-writer contract below. The collector holds the
+referenced set in memory (one entry per logical key).
+
+### 2.4 Single-writer contract
+
+Concurrent mutations of the **same key** must be coordinated by the caller
+(AndaDB deploys one writer per store). Within one process, the per-key
+metadata critical section (the cache's compute entry) serializes writers.
+Across processes, a second `Create` writer is rejected by the conditional
+metadata write; `Overwrite`/`Update` writers and the garbage collector are
+only safe under the single-writer assumption.
+
+### 2.5 Backward compatibility (pre-0.10 layout)
+
+Deployments written by anda_object_store < 0.10 store the payload directly
+at `data/<logical-path>` and their metadata carries no generation pointer
+(`generation: None`). Such objects stay fully readable (get, range get,
+list, copy, rename), and the first overwrite migrates the key to the
+generation layout: the new generation is written, the pointer switches, and
+the legacy `data/` object is deleted best-effort. The legacy prefix is kept
+separate from `gen/` so that, on a real filesystem, the legacy *file*
+`data/<path>` and the generation *directory* `gen/<path>/` can coexist
+during migration.
+
+The format only rolls forward: metadata written by ≥ 0.10 carries the
+generation pointer, which older releases do not understand. **Do not roll
+back to a pre-0.10 binary after writing with this version.**
+
+### 2.6 MetaStore metadata (CBOR)
 
 ```text
 { "s": <u64 size>,
   "e": <Option<String> base64url(SHA3-256(payload))>,
-  "o": <Option<String> ETag from inner store>,
-  "v": <Option<String> version from inner store> }
+  "g": <Option<String> generation pointer; absent = legacy data/ layout> }
 ```
 
-### 2.2 EncryptedStore metadata (CBOR)
+(Legacy documents additionally contain `"o"`/`"v"` — the pre-0.10 backend
+ETag/version fields. They still decode; new writes omit them.)
+
+### 2.7 EncryptedStore metadata (CBOR)
 
 ```text
 { "s": <u64 ciphertext_size>,
   "e": <Option<String> base64url(SHA3-256(ciphertext))>,
-  "o": <Option<String> inner ETag>,
-  "v": <Option<String> inner version>,
+  "o": <Option<String> legacy field, None for new writes>,
+  "v": <Option<String> legacy field, None for new writes>,
   "n": <12-byte base nonce>,
   "t": [<16-byte chunk_0 tag>, <16-byte chunk_1 tag>, …],
-  "c": <Option<u64> plaintext chunk size used at write time> }
+  "c": <Option<u64> plaintext chunk size used at write time>,
+  "av": <Option<u8> chunk AAD version>,
+  "an": <Option<12-byte metadata auth nonce>>,
+  "at": <Option<16-byte metadata auth tag>>,
+  "g": <Option<String> generation pointer; absent = legacy data/ layout> }
 ```
 
 The `aes_tags` vector grows linearly with the object size; for a 1 GiB
@@ -91,6 +185,12 @@ The chunk size is recorded per object (`"c"`), so objects stay readable
 after the store is reconfigured with a different `with_chunk_size` value.
 Metadata written by older versions lacks the field; readers then fall back
 to the store's configured chunk size.
+
+The metadata document is sealed with an AES-GCM tag over the logical path
+and every field. The generation pointer participates in that AAD **only when
+present**, so documents sealed by 0.9.x (no generation) keep verifying
+byte-for-byte, while stripping or forging the pointer on a new document
+fails authentication.
 
 ---
 
@@ -109,59 +209,50 @@ let store = MetaStoreBuilder::new(
 
 ### 3.1 What it does
 
-- Tracks a per-object `Metadata { size, e_tag, original_tag, original_version }`.
+- Tracks a per-object `Metadata { size, e_tag, generation }`.
 - Computes a content-addressable ETag (`base64url(SHA3-256(payload))`) on
-  every put. This ETag is what `MetaStore` exposes to callers; the inner
-  backend's ETag is preserved as `original_tag` and used internally to
-  forward `if_match` / `if_none_match` preconditions.
-- Implements `PutMode::Update(…)` precondition checks against the cached
-  metadata, so `LocalFileSystem` (which has no native CAS) gains the same
+  every put. This ETag is what `MetaStore` exposes to callers and what
+  `PutMode::Update` / `if_match` / `if_none_match` are checked against.
+- Implements the immutable-generation write protocol of §2, so
+  `LocalFileSystem` (which has no native CAS) gains the same
   optimistic-concurrency guarantee as S3 or Azure Blob.
-- Forwards `version` from the underlying backend through `PutResult.version`
-  unchanged when the backend supports versioning.
 
 ### 3.2 Concurrency model
 
 All metadata mutations go through `update_meta_with`, which uses
 `moka::Cache::and_try_compute_with` to serialize concurrent writers on the
-same key. The closure is invoked exactly once with the current cached
+same key. The closure is invoked exactly once with the current committed
 metadata (or the freshly loaded copy if not cached) and is expected to:
 
 1. Validate caller preconditions.
-2. Write the data object to the inner store.
+2. Write the new payload generation to the inner store.
 3. Return the new `Metadata`.
 
 If the closure returns an error or the inner write fails, the cache is left
-untouched. On success, the metadata side-car is persisted **before** the
-cache is updated, so a failed metadata put never leaves a stale entry in
-front of the on-disk truth.
+untouched and the previous version remains committed. On success, the
+metadata document is persisted **before** the cache is updated, so a failed
+metadata put never leaves a stale entry in front of the on-disk truth.
 
 ### 3.3 Semantic guarantees
 
-| Operation                   | Behaviour                                                                                                                                                                               |
-| --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `put_opts`                  | Writes data, then metadata, then updates cache. Atomic from the cache's point of view.                                                                                                  |
-| `put_multipart`             | Streams parts to the inner uploader; finalises metadata in `complete()`.                                                                                                                |
-| `get_opts`                  | Forwards range/preconditions, swaps the response ETag for the content-addressable one.                                                                                                  |
-| `delete_stream`             | Per location: deletes data, then metadata. Tolerates missing metadata; a missing data object surfaces as `NotFound` under the logical path while orphaned metadata is still cleaned up. |
-| `copy_opts` / `rename_opts` | Performs the operation on both `data/` and `meta/` paths (metadata always with Overwrite — the data phase enforces the requested mode), invalidates caches.                             |
-| `list*`                     | Lists data, fetches metadata concurrently (8-way), restores ETag.                                                                                                                       |
+| Operation                   | Behaviour                                                                                                                                       |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `put_opts`                  | Writes a fresh generation, then commits the pointer, then reclaims the replaced payload best-effort. Atomic at the commit point.               |
+| `put_multipart`             | Streams parts into a fresh generation; `complete()` materializes it and switches the pointer. An unfinished upload never affects readers.       |
+| `get_opts`                  | Resolves the pointer, evaluates logical-ETag preconditions, reads the immutable payload (with one retry on a stale cached pointer).            |
+| `delete_stream`             | Per location: deletes the metadata document (the logical delete), then the payload best-effort. `NotFound` iff no commit point exists.         |
+| `copy_opts` / `rename_opts` | Copies the payload into a fresh generation of the target, then commits the target pointer; rename then deletes the source commit point.        |
+| `list*`                     | Enumerates `meta/` (commit points; 8-way concurrent decode). Uncommitted generations and crash leftovers are invisible by construction.        |
 
-> ⚠️ **Crash atomicity.** A crash between writing data and writing metadata
-> can leave the side-car missing. Subsequent reads of that key surface as
-> `Error::NotFound` for the metadata path; `delete_stream` tolerates this
-> case explicitly. On the write path, the data is the source of truth: the
-> caller can simply re-issue the put, which will rewrite both objects.
-
-### 3.4 Path rewriting helpers
+### 3.4 Path mapping helpers
 
 `MetaStore` exposes only the logical path; internally the wrapper uses:
 
-| Helper            | Maps                                      |
-| ----------------- | ----------------------------------------- |
-| `full_path(loc)`  | `loc` → `data/<loc>`                      |
-| `meta_path(loc)`  | `loc` → `meta/<loc>`                      |
-| `strip_prefix(p)` | `data/<loc>` → `<loc>` (else passthrough) |
+| Helper                       | Maps                              |
+| ---------------------------- | --------------------------------- |
+| `meta_path(loc)`             | `loc` → `meta/<loc>`              |
+| `generation_path(loc, gen)`  | `loc` → `gen/<loc>/<gen>`         |
+| `legacy_path(loc)`           | `loc` → `data/<loc>` (pre-0.10)   |
 
 ---
 
@@ -179,7 +270,6 @@ let store = EncryptedStoreBuilder::with_secret(
         secret,
     )
     .with_chunk_size(256 * 1024)        // 256 KiB plaintext chunks (default)
-    .with_conditional_put()             // enable for LocalFileSystem
     .build();
 ```
 
@@ -189,8 +279,11 @@ let store = EncryptedStoreBuilder::with_secret(
 - Key: a single 32-byte symmetric key per `EncryptedStore` instance. Inject
   through `with_secret([u8; 32])` or pass a pre-built `Arc<Aes256Gcm>` via
   `EncryptedStoreBuilder::new`.
-- AAD: empty (`&[]`) for every chunk. The chunk index (encoded into the
-  nonce) and the per-object base nonce together provide context binding.
+- Chunk AAD: new objects bind the chunk size and chunk index into every
+  chunk tag (`"av": 1`); objects written before that used an empty AAD and
+  remain readable.
+- Metadata AAD: the document is sealed against its logical path and fields
+  (see §2.7).
 
 [`aes_gcm`]: https://docs.rs/aes-gcm
 
@@ -198,16 +291,17 @@ let store = EncryptedStoreBuilder::with_secret(
 
 Each object is split into fixed-size **plaintext** chunks (default 256 KiB,
 configurable). Each chunk is encrypted independently with
-`encrypt_in_place_detached`:
+`encrypt_inout_detached`:
 
 ```text
 ciphertext_chunk_i = AES-256-GCM_Enc(key, nonce_i, plaintext_chunk_i)
 tag_i              = corresponding 16-byte authentication tag
 ```
 
-The ciphertext is written contiguously to `data/<loc>`; the per-chunk tags
-are stored in `meta.aes_tags[i]`. The ciphertext therefore has exactly the
-same length as the plaintext, which is what makes range-get inexpensive.
+The ciphertext is written contiguously to the generation object; the
+per-chunk tags are stored in `meta.aes_tags[i]`. The ciphertext therefore
+has exactly the same length as the plaintext, which is what makes range-get
+inexpensive.
 
 #### Chunk-size trade-offs
 
@@ -264,40 +358,34 @@ decryption.
 full plaintext chunk is available, then encrypts all complete chunks in
 place and forwards them to the inner uploader as a single part. This keeps
 the caller's part granularity, which matters for backends with minimum
-part sizes (e.g. S3). `complete()` flushes the remaining (possibly short)
-tail chunk, persists the encryption metadata, and returns a `PutResult`
-whose `e_tag` is the content-addressable hash over the ciphertext.
+part sizes (e.g. S3). The parts stream into a fresh immutable generation;
+`complete()` flushes the remaining (possibly short) tail chunk, materializes
+the generation, and switches the metadata pointer — a crash or failure
+before the switch leaves the previous version fully readable.
 
 Because GCM is non-streaming per chunk, abort/retry semantics are handled
 by the underlying `MultipartUpload`; the encryption layer is stateless
 across upload sessions.
 
-### 4.6 Conditional put
+### 4.6 Conditional semantics
 
-`with_conditional_put()` mirrors `MetaStore`'s behaviour:
-
-- `PutMode::Update(v)` checks `v.e_tag` against the cached metadata's
-  content-addressable e_tag and rejects with `Error::Precondition` on
-  mismatch.
-- `if_match` / `if_none_match` on `get_opts` are translated into the inner
-  backend's original ETag.
-- `list*` results have their ETag rewritten to the content-addressable
-  value (concurrent metadata fetches, 8-way buffered).
-
-When `conditional_put` is **not** enabled, `put_opts` returns the inner
-backend's ETag and version directly, and `list*` operations skip the
-metadata fan-out (they only rewrite paths). Use this mode against backends
-that already provide strong CAS semantics (S3, GCS, Azure Blob).
+`PutMode::Update`, `if_match` and `if_none_match` are always honoured (see
+§2.2); they are evaluated against the content-addressable ETag over the
+ciphertext. `EncryptedStoreBuilder::with_conditional_put()` is retained as a
+no-op for API compatibility — the semantics it used to gate are now always
+on, since the protocol never forwards preconditions to the backend.
 
 ### 4.7 Semantic guarantees (deltas vs `MetaStore`)
 
-| Aspect             | Behaviour                                                                                                                           |
-| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------- |
-| Plaintext exposure | Plaintext never crosses the inner-store boundary.                                                                                   |
-| Integrity          | Tampering with any ciphertext chunk fails decryption with `Error::Generic("AES256 decrypt failed …")`.                              |
-| Truncation attacks | A truncated object yields fewer ciphertext bytes than `meta.size` indicates and surfaces as a decrypt or explicit truncation error. |
-| Reordering         | Each chunk's nonce is bound to its index, so swapping two chunks fails authentication.                                              |
-| Random-access cost | One inner range get per request, decrypts only the touched chunks.                                                                  |
+| Aspect             | Behaviour                                                                                                                             |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
+| Plaintext exposure | Plaintext never crosses the inner-store boundary.                                                                                     |
+| Integrity          | Tampering with any ciphertext chunk fails decryption with `Error::Generic("AES256 decrypt failed …")`.                                |
+| Metadata integrity | The sidecar document is sealed (path-bound GMAC); swapping, mutating or re-pointing it fails authentication.                          |
+| Truncation attacks | A truncated object yields fewer ciphertext bytes than `meta.size` indicates and surfaces as a decrypt or explicit truncation error.   |
+| Reordering         | Each chunk's nonce (and, for new objects, its AAD) is bound to its index, so swapping two chunks fails authentication.                |
+| Random-access cost | One inner range get per request, decrypts only the touched chunks.                                                                    |
+| Copy/rename        | The ciphertext is copied verbatim (chunk AAD is not path-bound); only the metadata document is resealed for the target path.          |
 
 ---
 
@@ -312,9 +400,12 @@ Both wrappers use [`moka::future::Cache`] keyed by logical path:
   cache (e.g. with eviction listeners for telemetry).
 
 The cache is treated as an authoritative read-through layer for hot
-metadata; mutations are written through the underlying store first. Cache
-eviction simply forces a re-read on the next access — the on-disk metadata
-is always the source of truth.
+metadata; mutations are written through the underlying store first, inside
+the cache's per-key compute entry (which is also what serializes in-process
+writers). Cache eviction simply forces a re-read on the next access — the
+on-disk metadata is always the source of truth. Listings deliberately do not
+seed the cache, so a slow listing can never clobber a newer committed
+document.
 
 [`moka::future::Cache`]: https://docs.rs/moka/latest/moka/future/struct.Cache.html
 
@@ -343,13 +434,12 @@ let store = EncryptedStoreBuilder::with_secret(
         10_000,
         key,
     )
-    .with_conditional_put()   // enable CAS on top of the local FS
     .with_chunk_size(256 * 1024)
     .build();
 ```
 
-For S3-like backends, omit `with_conditional_put()` to avoid the
-metadata-fanout cost on `list*`, and rely on the backend's native ETag.
+Consider calling `collect_garbage()` at open (or on a maintenance schedule)
+to reclaim payloads abandoned by crashes.
 
 ---
 
@@ -372,10 +462,15 @@ underlying backend wherever possible. Two additions are introduced:
 
 - `Error::Generic { store: "MetaStore" | "EncryptedStore", source }` — for
   CBOR (de)serialization errors and AES-GCM cryptographic failures
-  (decryption tag mismatch, tampered ciphertext, missing per-chunk tag,
-  invalid range).
-- `Error::Precondition { … }` — emitted when `PutMode::Update(v)` is
-  rejected by the metadata-side e_tag comparison.
+  (decryption tag mismatch, tampered ciphertext or metadata, missing
+  per-chunk tag, invalid range).
+- `Error::Precondition { … }` — emitted when `PutMode::Update(v)` or an
+  `if_match` precondition is rejected by the logical-ETag comparison.
+
+A metadata document that exists but does not decode makes reads fail loudly
+(`Error::Generic`); overwriting the key rebuilds it, compatibility-mode
+listings skip it with a warning, and garbage collection keeps its payloads
+(conservative) until the key is rewritten or deleted.
 
 `map_arc_error` reconstructs path-bearing variants when `moka` returns a
 shared `Arc<Error>` from a deduplicated loader; non-path variants collapse
@@ -385,11 +480,13 @@ into `Error::Generic`.
 
 ## 9. Limitations and future work
 
-- **Crash-window between data and metadata writes.** The current ordering
-  writes data first; an interrupted put may leave a data object without
-  metadata. Reads of such an object surface as `NotFound` for the metadata
-  side-car. Background reconciliation (rehash, rebuild metadata) is the
-  caller's responsibility for now.
+- **Garbage requires collection.** Crash-abandoned generations are invisible
+  but occupy space until `collect_garbage` runs (the eager post-commit
+  cleanup handles the common case). The collector is designed for
+  quiescent/single-writer operation.
+- **No version-addressed reads.** Replaced generations are reclaimed
+  eagerly, so `GetOptions::version` cannot be honoured and versions are not
+  reported; conditional updates use the content-addressable ETag.
 - **No envelope encryption / per-object DEKs.** All chunks of all objects
   share a single 256-bit key. Workloads that need per-tenant key isolation
   should layer multiple `EncryptedStore` instances on top of namespaced
@@ -397,10 +494,10 @@ into `Error::Generic`.
 - **No content compression.** Compression-before-encryption is left to the
   caller, since blind compression interacts poorly with chunk-aligned
   range reads.
-- **`copy_opts` / `rename_opts` are not atomic across `data/` + `meta/`.**
-  A failure between the two operations can desynchronize the side-car.
-  This matches the wider `object_store` contract, which doesn't promise
-  atomic multi-object operations.
+- **`rename_opts` is not atomic.** It is copy-then-delete at the commit
+  level: a crash in between can leave both source and target committed
+  (never a torn or missing object). This matches the wider `object_store`
+  contract, which doesn't promise atomic multi-object operations.
 
 ---
 
@@ -412,30 +509,32 @@ into `Error::Generic`.
 let store = MetaStoreBuilder::new(inner, 10_000)
     .with_meta_cache_ttl(Duration::from_secs(60 * 60))
     .build();
+let reclaimed = store.collect_garbage().await?;
 ```
 
-| Method (via `ObjectStore`)                          | Notes                                                        |
-| --------------------------------------------------- | ------------------------------------------------------------ |
-| `put_opts`                                          | Computes content ETag; honours `PutMode::Update` everywhere. |
-| `put_multipart_opts`                                | Streams to inner, finalises metadata in `complete()`.        |
-| `get_opts`                                          | Range, `if_match`, `if_none_match` all supported.            |
-| `get_ranges`                                        | Forwarded as-is to the inner store.                          |
-| `delete` / `delete_stream`                          | Deletes data + metadata; tolerates missing metadata.         |
-| `list` / `list_with_offset` / `list_with_delimiter` | Concurrent metadata fan-out (8-way).                         |
-| `copy_opts` / `rename_opts`                         | Both prefixes are mirrored; cache invalidated.               |
+| Method                                              | Notes                                                             |
+| --------------------------------------------------- | ------------------------------------------------------------------ |
+| `put_opts`                                          | Computes content ETag; honours `PutMode::Create/Update` everywhere.|
+| `put_multipart_opts`                                | Streams into a generation; commits the pointer in `complete()`.   |
+| `get_opts`                                          | Range, `if_match`, `if_none_match` all supported.                 |
+| `get_ranges`                                        | Validated against the logical size, then forwarded.               |
+| `delete` / `delete_stream`                          | Deletes the commit point, then the payload best-effort.           |
+| `list` / `list_with_offset` / `list_with_delimiter` | Enumerates commit points; concurrent metadata decode (8-way).     |
+| `copy_opts` / `rename_opts`                         | Payload copied into a fresh target generation; pointer committed. |
+| `collect_garbage`                                   | Mark-sweep reclamation of unreferenced payloads.                  |
 
 ### EncryptedStore
 
 ```rust
 let store = EncryptedStoreBuilder::with_secret(inner, 10_000, key)
     .with_chunk_size(256 * 1024)
-    .with_conditional_put()
     .with_meta_cache(custom_cache)
     .build();
 ```
 
 Supports the full `ObjectStore` surface; range reads decrypt only the
-chunks that intersect the request.
+chunks that intersect the request. `with_strict_metadata_auth()` rejects
+pre-authentication legacy metadata once all objects have been resealed.
 
 ---
 
@@ -478,7 +577,6 @@ async fn main() -> object_store::Result<()> {
             key,
         )
         .with_chunk_size(64 * 1024)
-        .with_conditional_put()
         .build();
 
     let path = Path::from("vec/segments/0001.bin");
@@ -507,9 +605,8 @@ Enable whichever backend(s) you need at the application layer:
 
 ```toml
 [dependencies]
-anda_object_store = "0.9"
+anda_object_store = "0.10"
 object_store      = { version = "*", features = ["aws", "fs"] }
 ```
 
-The crate's own test suite runs against `InMemory` and `LocalFileSystem`
-(the latter under `#[ignore]` so it's opt-in via `cargo test -- --ignored`).
+The crate's own test suite runs against `InMemory` and `LocalFileSystem`.

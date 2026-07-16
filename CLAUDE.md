@@ -49,7 +49,7 @@ That skill contains the current API patterns for:
 For embedded database usage, start with:
 
 ```toml
-anda_db = { version = "0.8", features = ["full"] }
+anda_db = { version = "0.10", features = ["full"] }
 object_store = { version = "0.14", features = ["fs"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

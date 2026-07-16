@@ -13,8 +13,8 @@ use sha3::Digest;
 use std::{ops::Range, sync::Arc, time::Duration};
 
 use crate::{
-    apply_logical_etag_preconditions, check_update_version, sha3_256,
-    sidecar::{ListingMetaPolicy, SidecarMeta, SidecarStore},
+    check_get_preconditions, check_update_version,
+    sidecar::{ListingMetaPolicy, SidecarMeta, SidecarStore, new_generation},
     validate_ranges,
 };
 
@@ -33,7 +33,7 @@ const CHUNK_AAD_BOUND: u8 = 1;
 /// - Transparent encryption/decryption using AES-256-GCM
 /// - Chunked encryption for large objects
 /// - Metadata caching for improved performance
-/// - Optional conditional put operations
+/// - Conditional put operations on every backend
 ///
 /// # Security considerations
 ///
@@ -52,13 +52,13 @@ const CHUNK_AAD_BOUND: u8 = 1;
 ///
 /// # Crash semantics
 ///
-/// A put writes the ciphertext first and the sidecar metadata second; the
-/// pair is not atomic. A crash between the two writes leaves an object that
-/// fails AES-GCM authentication (new ciphertext with the previous — or no —
-/// metadata) until it is written again; such a failure after a crash is
-/// indistinguishable from tampering. Overwriting the object (or `Create`
-/// when no sidecar metadata exists) self-heals it. See the crate-level
-/// documentation for the full contract.
+/// A put writes the ciphertext to a fresh immutable generation object and
+/// then commits by switching the metadata pointer with a single backend put.
+/// A crash before the pointer switch leaves the previous version fully
+/// intact and decryptable; a crash after it means the put took effect. Torn
+/// "old metadata + new ciphertext" states — which would surface as AES-GCM
+/// authentication failures indistinguishable from tampering — are impossible
+/// by construction. See the crate-level documentation for the full contract.
 ///
 /// # Performance considerations
 ///
@@ -96,7 +96,6 @@ const CHUNK_AAD_BOUND: u8 = 1;
 /// let store = LocalFileSystem::new_with_prefix("my_store").unwrap();
 /// let encrypted_store = EncryptedStoreBuilder::with_secret(store, 1000, secret)
 ///     .with_chunk_size(1024 * 1024) // Set chunk size to 1 MB
-///     .with_conditional_put() // Should be enabled for LocalFileSystem
 ///     .build();
 /// ```
 #[derive(Clone)]
@@ -108,11 +107,6 @@ pub struct EncryptedStore<T: ObjectStore> {
     /// Plaintext chunk size in bytes. Each chunk is encrypted independently
     /// with its own derived nonce and authentication tag.
     chunk_size: u64,
-    /// When true, expose the content-addressable e_tag and honour
-    /// `PutMode::Update`/`if_match`/`if_none_match` preconditions even on
-    /// backends (such as the local filesystem) that don't support them
-    /// natively.
-    conditional_put: bool,
     /// When true, reject legacy sidecar metadata that carries no
     /// authentication fields instead of accepting it with a warning.
     strict_metadata_auth: bool,
@@ -120,9 +114,9 @@ pub struct EncryptedStore<T: ObjectStore> {
 
 /// Builder for configuring and creating an [`EncryptedStore`] instance.
 ///
-/// All optional knobs (chunk size, conditional put, custom metadata cache)
-/// have sensible defaults; only the underlying store, metadata cache
-/// capacity and AES-256-GCM key need to be supplied.
+/// All optional knobs (chunk size, custom metadata cache) have sensible
+/// defaults; only the underlying store, metadata cache capacity and
+/// AES-256-GCM key need to be supplied.
 pub struct EncryptedStoreBuilder<T: ObjectStore> {
     /// The underlying object store that holds ciphertext and metadata.
     store: T,
@@ -131,11 +125,6 @@ pub struct EncryptedStoreBuilder<T: ObjectStore> {
     /// Plaintext chunk size in bytes. Each chunk is encrypted independently
     /// with its own derived nonce and authentication tag.
     chunk_size: u64,
-    /// When true, expose the content-addressable e_tag and honour
-    /// `PutMode::Update`/`if_match`/`if_none_match` preconditions even on
-    /// backends (such as the local filesystem) that don't support them
-    /// natively.
-    conditional_put: bool,
     /// When true, reject legacy sidecar metadata without authentication.
     strict_metadata_auth: bool,
     /// In-memory metadata cache to avoid round-trips on hot paths.
@@ -145,8 +134,11 @@ pub struct EncryptedStoreBuilder<T: ObjectStore> {
 /// Per-object encryption metadata stored alongside the ciphertext.
 ///
 /// Serialized as compact CBOR (single-letter field names) and persisted at
-/// `meta/<location>`. The corresponding ciphertext lives at `data/<location>`
-/// and is laid out as `ceil(size / chunk_size)` fixed-size encrypted chunks.
+/// `meta/<location>` — the object's commit point. The ciphertext lives at the
+/// immutable generation object `gen/<location>/<generation>` (or, for
+/// pre-0.10 documents without a generation, at the legacy `data/<location>`
+/// object) and is laid out as `ceil(size / chunk_size)` fixed-size encrypted
+/// chunks.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Metadata {
     /// Size of the ciphertext in bytes (also the plaintext size, since
@@ -157,17 +149,19 @@ pub struct Metadata {
 
     /// Content-addressable ETag computed as the URL-safe Base64 encoding of
     /// SHA3-256 over the *ciphertext*. Exposed to callers as the object's
-    /// ETag whenever conditional-put mode is enabled.
+    /// ETag.
     #[serde(rename = "e")]
     e_tag: Option<String>,
 
-    /// ETag returned by the underlying storage when the ciphertext was
-    /// written. Used to translate `if_match`/`if_none_match` preconditions.
+    /// Legacy field of the pre-0.10 mutable dual-object layout (the inner
+    /// backend's ETag). Retained because it participates in the sealed AAD
+    /// of existing documents; never populated by new writes.
     #[serde(rename = "o")]
     original_tag: Option<String>,
 
-    /// Version returned by the underlying storage on the most recent put,
-    /// when the backend supports object versioning.
+    /// Legacy field of the pre-0.10 mutable dual-object layout (the inner
+    /// backend's version). Retained because it participates in the sealed
+    /// AAD of existing documents; never populated by new writes.
     #[serde(rename = "v")]
     original_version: Option<String>,
 
@@ -207,6 +201,14 @@ pub struct Metadata {
     /// Authentication tag over the logical path and metadata fields.
     #[serde(rename = "at", default, skip_serializing_if = "Option::is_none")]
     auth_tag: Option<ByteArray<16>>,
+
+    /// Generation pointer: the ciphertext lives at
+    /// `gen/<location>/<generation>`. `None` means the legacy layout
+    /// (`data/<location>`). Bound into the metadata authentication AAD when
+    /// present (absent for pre-0.10 documents, whose AAD layout is
+    /// preserved byte-for-byte).
+    #[serde(rename = "g", default, skip_serializing_if = "Option::is_none")]
+    generation: Option<String>,
 }
 
 impl SidecarMeta for Metadata {
@@ -216,9 +218,12 @@ impl SidecarMeta for Metadata {
         self.e_tag.as_deref()
     }
 
-    fn set_original(&mut self, e_tag: Option<String>, version: Option<String>) {
-        self.original_tag = e_tag;
-        self.original_version = version;
+    fn size(&self) -> u64 {
+        self.size
+    }
+
+    fn generation(&self) -> Option<&str> {
+        self.generation.as_deref()
     }
 }
 
@@ -269,7 +274,6 @@ impl<T: ObjectStore> EncryptedStoreBuilder<T> {
             store,
             cipher,
             chunk_size: DEFAULT_CHUNK_SIZE,
-            conditional_put: false,
             strict_metadata_auth: false,
             meta_cache: Cache::builder()
                 .max_capacity(meta_cache_capacity)
@@ -317,18 +321,16 @@ impl<T: ObjectStore> EncryptedStoreBuilder<T> {
         }
     }
 
-    /// Enables conditional put operations (Should enable with LocalFileSystem store).
-    ///
-    /// When enabled, put operations will check the extend e-tag of the existing object
-    /// before overwriting it, providing optimistic concurrency control.
+    /// Retained for API compatibility: conditional-put semantics (the
+    /// content-addressable ETag, `PutMode::Update` and
+    /// `if_match`/`if_none_match` preconditions) are now always enabled on
+    /// every backend, because the immutable-generation protocol evaluates
+    /// them against the metadata commit point instead of forwarding them.
     ///
     /// # Returns
-    /// The builder with conditional put enabled
+    /// The builder, unchanged
     pub fn with_conditional_put(self) -> Self {
-        Self {
-            conditional_put: true,
-            ..self
-        }
+        self
     }
 
     /// Requires every sidecar metadata document to be authenticated.
@@ -340,8 +342,9 @@ impl<T: ObjectStore> EncryptedStoreBuilder<T> {
     /// readable. An attacker with write access to the underlying store could
     /// exploit that fallback by stripping the authentication fields from a
     /// sealed document (a downgrade attack); stripped documents that still
-    /// carry other v1 fields are always rejected, but fully stripped ones
-    /// are indistinguishable from genuine legacy metadata.
+    /// carry other v1 fields (or a generation pointer) are always rejected,
+    /// but fully stripped ones are indistinguishable from genuine legacy
+    /// metadata.
     ///
     /// Enable strict mode once all legacy objects have been rewritten (e.g.
     /// via copy/rename, which reseals metadata): legacy metadata is then
@@ -350,10 +353,8 @@ impl<T: ObjectStore> EncryptedStoreBuilder<T> {
     /// The policy also applies to `list`, `list_with_offset`, and
     /// `list_with_delimiter`: authenticated-but-tampered metadata is rejected
     /// in both modes; compatibility mode accepts genuine legacy documents and
-    /// tolerates torn CBOR (reporting no logical ETag when conditional mode is
-    /// enabled), while strict mode rejects legacy and torn documents. A
-    /// missing sidecar is tolerated in both modes so recovery tooling can
-    /// still discover data orphaned by a crash.
+    /// skips documents that no longer decode, while strict mode rejects
+    /// legacy and undecodable documents.
     ///
     /// # Returns
     /// The builder with strict metadata authentication enabled
@@ -373,7 +374,6 @@ impl<T: ObjectStore> EncryptedStoreBuilder<T> {
             inner: Arc::new(SidecarStore::new(self.store, self.meta_cache)),
             cipher: self.cipher,
             chunk_size: self.chunk_size,
-            conditional_put: self.conditional_put,
             strict_metadata_auth: self.strict_metadata_auth,
         }
     }
@@ -399,15 +399,13 @@ impl<T: ObjectStore> EncryptedStore<T> {
 
     /// Listing policy shared by all three `list*` entry points.
     ///
-    /// Every decoded document is authenticated before it can enter the
-    /// shared cache. Compatibility mode accepts genuine legacy metadata and
-    /// tolerates torn CBOR; strict mode rejects both. Missing metadata remains
-    /// listable in either mode so crash-recovery scans can find and heal
-    /// orphaned data objects.
+    /// Every decoded document is authenticated before it is surfaced.
+    /// Compatibility mode accepts genuine legacy metadata and skips torn
+    /// CBOR; strict mode rejects both.
     fn listing_meta_policy(&self) -> ListingMetaPolicy<Metadata> {
         let cipher = self.cipher.clone();
         let strict = self.strict_metadata_auth;
-        ListingMetaPolicy::verified(self.conditional_put, strict, move |location, meta| {
+        ListingMetaPolicy::verified(strict, move |location, meta| {
             verify_metadata(&cipher, location, meta, strict)?;
             Ok(())
         })
@@ -419,17 +417,18 @@ impl<T: ObjectStore> EncryptedStore<T> {
         Ok((*meta).clone())
     }
 
-    async fn put_rebound_metadata(&self, location: &Path, mut meta: Metadata) -> Result<()> {
-        let obj = self
-            .inner
-            .store
-            .head(&self.inner.full_path(location))
-            .await?;
-        meta.set_original(obj.e_tag, obj.version);
-        ensure_chunk_aad_version(&mut meta)?;
-        self.seal_metadata(location, &mut meta)?;
-        self.inner.put_meta(location, meta).await?;
-        Ok(())
+    /// Runs mark-sweep garbage collection over the ciphertext objects.
+    ///
+    /// All commit points (`meta/` documents) are read first; a payload is
+    /// only deleted when no commit point references it, with a fresh re-read
+    /// of the key's metadata right before each deletion. Generations minted
+    /// after the collection started are skipped. Run this when the store is
+    /// otherwise quiescent (e.g. at open), in line with the single-writer
+    /// contract.
+    ///
+    /// Returns the number of payload objects deleted.
+    pub async fn collect_garbage(&self) -> Result<usize> {
+        self.inner.collect_garbage().await
     }
 }
 
@@ -439,24 +438,17 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
         &self,
         location: &Path,
         payload: PutPayload,
-        mut opts: PutOptions,
+        opts: PutOptions,
     ) -> Result<PutResult> {
+        let create = matches!(opts.mode, PutMode::Create);
         let rt = self
             .inner
-            .update_meta_with(location, async |meta| {
-                // Without sidecar metadata the object does not logically
-                // exist; remember this so a conflicting orphaned data object
-                // (crash between the data and metadata writes) can be healed
-                // below instead of failing a `Create` forever.
-                let heal_create = meta.is_none() && matches!(opts.mode, PutMode::Create);
-
-                if self.conditional_put
-                    && let PutMode::Update(v) = &opts.mode
-                {
+            .update_meta_with(location, create, async |meta| {
+                if let PutMode::Update(v) = &opts.mode {
                     match meta {
                         Some(m) => {
                             self.verify_metadata(location, m)?;
-                            check_update_version(location, &m.e_tag, &m.original_version, v)?;
+                            check_update_version(location, &m.e_tag, &m.generation, v)?;
                         }
                         None => {
                             return Err(Error::Precondition {
@@ -465,11 +457,7 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
                             });
                         }
                     }
-
-                    opts.mode = PutMode::Overwrite;
                 }
-
-                let full_path = self.inner.full_path(location);
 
                 // Gather the payload into a single mutable buffer for
                 // in-place chunked encryption (exactly one copy, even for
@@ -498,7 +486,20 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
                     aes_tags.push(tag.into());
                 }
 
-                let hash = sha3_256(&data);
+                // The logical ETag must be unique per commit: conditional
+                // updates compare it as the CAS token, and hashing the bare
+                // ciphertext collides for short payloads (a one-byte
+                // ciphertext has only 256 possible values, so distinct
+                // counter values can produce the same tag and a stale token
+                // can pass the precondition — a lost update). Seeding the
+                // hash with the per-commit random nonce makes collisions
+                // negligible while still revealing nothing about the
+                // plaintext.
+                let mut hasher = sha3::Sha3_256::new();
+                hasher.update(base_nonce);
+                hasher.update(&data);
+                let hash: [u8; 32] = hasher.finalize().into();
+                let generation = new_generation();
                 let mut meta = Metadata {
                     size: data.len() as u64,
                     e_tag: Some(BASE64_URL_SAFE.encode(hash)),
@@ -510,60 +511,30 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
                     chunk_aad_version: Some(CHUNK_AAD_BOUND),
                     auth_nonce: None,
                     auth_tag: None,
+                    generation: Some(generation.clone()),
                 };
 
+                // Write the ciphertext to a fresh immutable generation; the
+                // metadata put below is the commit point.
+                let gen_path = self.inner.generation_path(location, &generation);
                 let ciphertext: PutPayload = data.into();
-                let rt = if heal_create {
-                    match self
-                        .inner
-                        .store
-                        .put_opts(&full_path, ciphertext.clone(), opts.clone())
-                        .await
-                    {
-                        Err(Error::AlreadyExists { .. }) => {
-                            // The conflicting data object is an orphan left
-                            // by a crash; overwrite it to self-heal.
-                            //
-                            // NOTE: this weakens `PutMode::Create` across
-                            // processes. Another process racing `Create` on
-                            // the same key before our sidecar metadata is
-                            // visible can also classify our data object as
-                            // an orphan and overwrite it. Acceptable under
-                            // AndaDB's single-writer-per-store deployment
-                            // assumption; see the crate-level docs
-                            // ("Single-writer assumption").
-                            log::warn!(
-                                "EncryptedStore: healing orphaned data object at {location} on create"
-                            );
-                            opts.mode = PutMode::Overwrite;
-                            self.inner.store.put_opts(&full_path, ciphertext, opts).await?
-                        }
-                        rt => rt?,
-                    }
-                } else {
-                    self.inner.store.put_opts(&full_path, ciphertext, opts).await?
-                };
+                let mut data_opts = opts.clone();
+                data_opts.mode = PutMode::Overwrite;
+                self.inner
+                    .store
+                    .put_opts(&gen_path, ciphertext, data_opts)
+                    .await?;
 
-                meta.original_tag = rt.e_tag;
-                meta.original_version = rt.version;
                 self.seal_metadata(location, &mut meta)?;
                 Ok(meta)
             })
             .await?;
 
-        if self.conditional_put {
-            Ok(PutResult {
-                e_tag: rt.e_tag.clone(),
-                version: rt.original_version.clone(),
-                extensions: Extensions::default(),
-            })
-        } else {
-            Ok(PutResult {
-                e_tag: rt.original_tag.clone(),
-                version: rt.original_version.clone(),
-                extensions: Extensions::default(),
-            })
-        }
+        Ok(PutResult {
+            e_tag: rt.e_tag.clone(),
+            version: None,
+            extensions: Extensions::default(),
+        })
     }
 
     async fn put_multipart_opts(
@@ -571,120 +542,139 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
-        let full_path = self.inner.full_path(location);
-        let inner = self
-            .inner
-            .store
-            .put_multipart_opts(&full_path, opts)
-            .await?;
+        // Upload into a fresh immutable generation; `complete` switches the
+        // metadata pointer, so an unfinished upload never affects readers.
+        let generation = new_generation();
+        let gen_path = self.inner.generation_path(location, &generation);
+        let inner = self.inner.store.put_multipart_opts(&gen_path, opts).await?;
 
+        // Seed the running ciphertext hasher with the per-upload nonce so
+        // the logical ETag is unique per commit; see `put_opts`.
+        let aes_nonce: [u8; 12] = rand_bytes();
+        let mut hasher = sha3::Sha3_256::new();
+        hasher.update(aes_nonce);
         Ok(Box::new(EncryptedStoreUploader {
             buf: Vec::new(),
-            hasher: sha3::Sha3_256::new(),
+            hasher,
             size: 0,
-            aes_nonce: rand_bytes(),
+            aes_nonce,
             aes_tags: Vec::new(),
             chunk_index: 0,
             location: location.clone(),
+            generation,
             store: self.inner.clone(),
             cipher: self.cipher.clone(),
             chunk_size: self.chunk_size,
-            conditional_put: self.conditional_put,
             inner,
         }))
     }
 
-    async fn get_opts(&self, location: &Path, mut options: GetOptions) -> Result<GetResult> {
-        let full_path = self.inner.full_path(location);
-        let meta = self.inner.get_meta(location).await?;
-        self.verify_metadata(location, &meta)?;
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+        let mut retried = false;
+        loop {
+            let meta = self.inner.get_meta(location).await?;
+            self.verify_metadata(location, &meta)?;
 
-        if self.conditional_put {
-            apply_logical_etag_preconditions(
-                location,
-                &mut options,
-                meta.e_tag.as_deref(),
-                meta.original_tag.clone(),
-            )?;
-        }
+            let mut options = options.clone();
+            check_get_preconditions(location, &mut options, meta.e_tag.as_deref())?;
 
-        // Resolve the caller-supplied (plaintext) range, defaulting to the
-        // full object when no range is specified.
-        let range = if let Some(r) = &options.range {
-            r.as_range(meta.size)
-                .map_err(|source| object_store::Error::Generic {
-                    store: "EncryptedStore",
-                    source: source.into(),
-                })?
-        } else {
-            0..meta.size
-        };
+            // Resolve the caller-supplied (plaintext) range, defaulting to the
+            // full object when no range is specified.
+            let range = if let Some(r) = &options.range {
+                r.as_range(meta.size)
+                    .map_err(|source| object_store::Error::Generic {
+                        store: "EncryptedStore",
+                        source: source.into(),
+                    })?
+            } else {
+                0..meta.size
+            };
 
-        // A HEAD request must not fetch or decrypt any payload: backends
-        // that honour `head` return an empty body, which the decryption
-        // stream would otherwise report as truncated ciphertext.
-        let range = if options.head {
-            range.start..range.start
-        } else {
-            range
-        };
+            // A HEAD request must not fetch or decrypt any payload: backends
+            // that honour `head` return an empty body, which the decryption
+            // stream would otherwise report as truncated ciphertext.
+            let range = if options.head {
+                range.start..range.start
+            } else {
+                range
+            };
 
-        // Expand the request to whole-chunk boundaries: AES-GCM is not a
-        // streaming cipher, so we must read each chunk in full to verify its
-        // authentication tag before yielding the (possibly trimmed) plaintext.
-        let chunk_size = self.read_chunk_size(&meta);
-        let rr = if range.start == range.end {
-            options.range = None;
-            options.head = true;
-            range.start..range.start
-        } else {
-            let rr_start = (range.start / chunk_size) * chunk_size;
-            let rr_end = range
-                .end
-                .saturating_sub(1)
-                .checked_div(chunk_size)
-                .and_then(|idx| idx.checked_add(1))
-                .and_then(|idx| idx.checked_mul(chunk_size))
-                .unwrap_or(u64::MAX)
-                .min(meta.size);
+            // Expand the request to whole-chunk boundaries: AES-GCM is not a
+            // streaming cipher, so we must read each chunk in full to verify its
+            // authentication tag before yielding the (possibly trimmed) plaintext.
+            let chunk_size = self.read_chunk_size(&meta);
+            let rr = if range.start == range.end {
+                options.range = None;
+                options.head = true;
+                range.start..range.start
+            } else {
+                let rr_start = (range.start / chunk_size) * chunk_size;
+                let rr_end = range
+                    .end
+                    .saturating_sub(1)
+                    .checked_div(chunk_size)
+                    .and_then(|idx| idx.checked_add(1))
+                    .and_then(|idx| idx.checked_mul(chunk_size))
+                    .unwrap_or(u64::MAX)
+                    .min(meta.size);
 
-            rr_start..rr_end
-        };
+                rr_start..rr_end
+            };
 
-        if rr.end > rr.start {
-            options.range = Some(GetRange::Bounded(rr.clone()));
-        }
+            if rr.end > rr.start {
+                options.range = Some(GetRange::Bounded(rr.clone()));
+            }
 
-        let mut res = self.inner.store.get_opts(&full_path, options).await?;
-        let attributes = std::mem::take(&mut res.attributes);
-        let mut obj = res.meta.clone();
-        obj.location = self.inner.strip_prefix(obj.location);
-        if self.conditional_put {
+            let payload_path = self
+                .inner
+                .payload_path(location, meta.generation.as_deref());
+            let mut res = match self.inner.store.get_opts(&payload_path, options).await {
+                Ok(res) => res,
+                Err(Error::NotFound { source, .. }) => {
+                    // The cached pointer may be stale and its generation
+                    // already replaced and reclaimed; re-resolve once.
+                    if !retried && meta.generation.is_some() {
+                        retried = true;
+                        self.inner.refresh_meta(location).await?;
+                        continue;
+                    }
+                    return Err(Error::NotFound {
+                        path: location.to_string(),
+                        source,
+                    });
+                }
+                Err(err) => return Err(err),
+            };
+            let attributes = std::mem::take(&mut res.attributes);
+            let mut obj = res.meta.clone();
+            obj.location = location.clone();
             obj.e_tag = meta.e_tag.clone();
+            // Versions are not reported; see the crate documentation.
+            obj.version = None;
+
+            let start_idx = (rr.start / chunk_size) as usize;
+            let start_offset = (range.start - rr.start) as usize;
+            let size = range.end - range.start;
+
+            let stream = create_decryption_stream(
+                res,
+                self.cipher.clone(),
+                meta,
+                location.clone(),
+                chunk_size as usize,
+                start_idx,
+                start_offset,
+                size,
+            );
+
+            return Ok(GetResult {
+                payload: GetResultPayload::Stream(stream),
+                meta: obj,
+                range,
+                attributes,
+                extensions: Extensions::default(),
+            });
         }
-
-        let start_idx = (rr.start / chunk_size) as usize;
-        let start_offset = (range.start - rr.start) as usize;
-        let size = range.end - range.start;
-
-        let stream = create_decryption_stream(
-            res,
-            self.cipher.clone(),
-            meta,
-            location.clone(),
-            chunk_size as usize,
-            start_idx,
-            start_offset,
-            size,
-        );
-
-        Ok(GetResult {
-            payload: GetResultPayload::Stream(stream),
-            meta: obj,
-            range,
-            attributes,
-            extensions: Extensions::default(),
-        })
     }
 
     async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
@@ -692,93 +682,115 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
             return Ok(Vec::new());
         }
 
-        let meta = self.inner.get_meta(location).await?;
-        self.verify_metadata(location, &meta)?;
-        validate_ranges("EncryptedStore", ranges, meta.size)?;
+        let mut retried = false;
+        'retry: loop {
+            let meta = self.inner.get_meta(location).await?;
+            self.verify_metadata(location, &meta)?;
+            validate_ranges("EncryptedStore", ranges, meta.size)?;
 
-        let chunk_size = self.read_chunk_size(&meta);
-        let full_path = self.inner.full_path(location);
+            let chunk_size = self.read_chunk_size(&meta);
+            let payload_path = self
+                .inner
+                .payload_path(location, meta.generation.as_deref());
 
-        let mut result: Vec<Bytes> = Vec::with_capacity(ranges.len());
-        // The most recently decrypted, chunk-aligned plaintext span. It
-        // serves subsequent ranges that fall entirely within it, which is
-        // common for clustered reads.
-        let mut cached_span = 0u64..0u64;
-        let mut cached = Bytes::new();
+            let mut result: Vec<Bytes> = Vec::with_capacity(ranges.len());
+            // The most recently decrypted, chunk-aligned plaintext span. It
+            // serves subsequent ranges that fall entirely within it, which is
+            // common for clustered reads.
+            let mut cached_span = 0u64..0u64;
+            let mut cached = Bytes::new();
 
-        for &Range { start, end } in ranges {
-            if start < cached_span.start || end > cached_span.end {
-                // Fetch all chunks intersecting the range with a single
-                // request and decrypt them in place.
-                let span_start = (start / chunk_size) * chunk_size;
-                let span_end = ((end - 1) / chunk_size)
-                    .saturating_add(1)
-                    .saturating_mul(chunk_size)
-                    .min(meta.size);
-                let first_idx = start / chunk_size;
+            for &Range { start, end } in ranges {
+                if start < cached_span.start || end > cached_span.end {
+                    // Fetch all chunks intersecting the range with a single
+                    // request and decrypt them in place.
+                    let span_start = (start / chunk_size) * chunk_size;
+                    let span_end = ((end - 1) / chunk_size)
+                        .saturating_add(1)
+                        .saturating_mul(chunk_size)
+                        .min(meta.size);
+                    let first_idx = start / chunk_size;
 
-                let data = self
-                    .inner
-                    .store
-                    .get_range(&full_path, span_start..span_end)
-                    .await?;
-                if data.len() as u64 != span_end - span_start {
-                    return Err(Error::Generic {
-                        store: "EncryptedStore",
-                        source: format!(
-                            "truncated encrypted data for path {location}: expected {} bytes, got {}",
-                            span_end - span_start,
-                            data.len()
-                        )
-                        .into(),
-                    });
-                }
-
-                let mut data: Vec<u8> = data.into();
-                for (i, chunk) in data.chunks_mut(chunk_size as usize).enumerate() {
-                    let idx = first_idx + i as u64;
-                    let tag = meta
-                        .aes_tags
-                        .get(idx as usize)
-                        .ok_or_else(|| Error::Generic {
+                    let data = match self
+                        .inner
+                        .store
+                        .get_range(&payload_path, span_start..span_end)
+                        .await
+                    {
+                        Ok(data) => data,
+                        Err(Error::NotFound { source, .. }) => {
+                            if !retried && meta.generation.is_some() {
+                                retried = true;
+                                self.inner.refresh_meta(location).await?;
+                                continue 'retry;
+                            }
+                            return Err(Error::NotFound {
+                                path: location.to_string(),
+                                source,
+                            });
+                        }
+                        Err(err) => return Err(err),
+                    };
+                    if data.len() as u64 != span_end - span_start {
+                        return Err(Error::Generic {
                             store: "EncryptedStore",
                             source: format!(
-                                "missing AES256 tag for chunk {idx} for path {location}"
+                                "truncated encrypted data for path {location}: expected {} bytes, got {}",
+                                span_end - span_start,
+                                data.len()
                             )
                             .into(),
-                        })?;
-                    let nonce = derive_gcm_nonce(&meta.aes_nonce, idx);
-                    let aad = chunk_aad_for_meta(&meta, chunk_size, idx)?;
-                    self.cipher
-                        .decrypt_inout_detached(
-                            &Nonce::from(nonce),
-                            &aad,
-                            chunk.into(),
-                            &Tag::from(**tag),
-                        )
-                        .map_err(|err| Error::Generic {
-                            store: "EncryptedStore",
-                            source: format!("AES256 decrypt failed for path {location}: {err:?}")
+                        });
+                    }
+
+                    let mut data: Vec<u8> = data.into();
+                    for (i, chunk) in data.chunks_mut(chunk_size as usize).enumerate() {
+                        let idx = first_idx + i as u64;
+                        let tag =
+                            meta.aes_tags
+                                .get(idx as usize)
+                                .ok_or_else(|| Error::Generic {
+                                    store: "EncryptedStore",
+                                    source: format!(
+                                        "missing AES256 tag for chunk {idx} for path {location}"
+                                    )
+                                    .into(),
+                                })?;
+                        let nonce = derive_gcm_nonce(&meta.aes_nonce, idx);
+                        let aad = chunk_aad_for_meta(&meta, chunk_size, idx)?;
+                        self.cipher
+                            .decrypt_inout_detached(
+                                &Nonce::from(nonce),
+                                &aad,
+                                chunk.into(),
+                                &Tag::from(**tag),
+                            )
+                            .map_err(|err| Error::Generic {
+                                store: "EncryptedStore",
+                                source: format!(
+                                    "AES256 decrypt failed for path {location}: {err:?}"
+                                )
                                 .into(),
-                        })?;
+                            })?;
+                    }
+
+                    cached = Bytes::from(data);
+                    cached_span = span_start..span_end;
                 }
 
-                cached = Bytes::from(data);
-                cached_span = span_start..span_end;
+                let s = (start - cached_span.start) as usize;
+                let e = (end - cached_span.start) as usize;
+                // Share the decrypted buffer when the caller asked for most of
+                // it; copy small slices so they don't pin a whole span in memory.
+                if (e - s) * 2 >= cached.len() {
+                    result.push(cached.slice(s..e));
+                } else {
+                    result.push(Bytes::copy_from_slice(&cached[s..e]));
+                }
             }
 
-            let s = (start - cached_span.start) as usize;
-            let e = (end - cached_span.start) as usize;
-            // Share the decrypted buffer when the caller asked for most of
-            // it; copy small slices so they don't pin a whole span in memory.
-            if (e - s) * 2 >= cached.len() {
-                result.push(cached.slice(s..e));
-            } else {
-                result.push(Bytes::copy_from_slice(&cached[s..e]));
-            }
+            return Ok(result);
         }
-
-        Ok(result)
     }
 
     fn delete_stream(
@@ -809,49 +821,61 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
     }
 
     async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
-        let _leases = self.inner.mutation_leases(from, to).await;
-        let meta = self.verified_metadata(from).await?;
-        self.inner
-            .store
-            .copy_opts(
-                &self.inner.full_path(from),
-                &self.inner.full_path(to),
-                options,
-            )
+        let create = matches!(options.mode, CopyMode::Create);
+        // The ciphertext chunks are not bound to the path (their AAD carries
+        // chunk size and index only), so the payload is copied verbatim;
+        // only the metadata document is resealed below for the target path.
+        // The pointer switch is the commit point.
+        let cipher = self.cipher.clone();
+        let strict = self.strict_metadata_auth;
+        let (src, generation) = self
+            .inner
+            .copy_payload(from, to, |location, meta| {
+                verify_metadata(&cipher, location, meta, strict)?;
+                Ok(())
+            })
             .await?;
-        self.put_rebound_metadata(to, meta).await
+
+        let mut meta = (*src).clone();
+        meta.generation = Some(generation);
+        meta.original_tag = None;
+        meta.original_version = None;
+        // Pin the chunk-AAD version explicitly so legacy ciphertext stays
+        // readable under the resealed (authenticated) target document.
+        ensure_chunk_aad_version(&mut meta)?;
+        self.seal_metadata(to, &mut meta)?;
+        self.inner
+            .update_meta_with(to, create, async |_| Ok(meta))
+            .await?;
+        Ok(())
     }
 
     async fn rename_opts(&self, from: &Path, to: &Path, options: RenameOptions) -> Result<()> {
-        let _leases = self.inner.mutation_leases(from, to).await;
         if from == to {
-            // A self-rename must not delete the object's sidecar metadata
+            // A self-rename must not delete the object's commit point
             // (`from` and `to` share the same document), nor be forwarded to
             // the backend (whose rename may be implemented as copy+delete).
             self.verified_metadata(from).await?;
             return self.inner.check_self_rename(from, &options).await;
         }
 
-        let meta = self.verified_metadata(from).await?;
-        self.inner
-            .store
-            .rename_opts(
-                &self.inner.full_path(from),
-                &self.inner.full_path(to),
-                options,
-            )
-            .await?;
-        self.put_rebound_metadata(to, meta).await?;
-
-        let meta_from = self.inner.meta_path(from);
-        let meta_delete = self.inner.store.delete(&meta_from).await;
-        self.inner.remove_meta_cache(from).await;
-        match meta_delete {
-            Ok(()) | Err(Error::NotFound { .. }) => {}
-            Err(err) => return Err(err),
+        let mode = match options.target_mode {
+            RenameTargetMode::Overwrite => CopyMode::Overwrite,
+            RenameTargetMode::Create => CopyMode::Create,
+        };
+        self.copy_opts(
+            from,
+            to,
+            CopyOptions {
+                mode,
+                extensions: options.extensions,
+            },
+        )
+        .await?;
+        match self.inner.delete_object(from).await {
+            Ok(()) | Err(Error::NotFound { .. }) => Ok(()),
+            Err(err) => Err(err),
         }
-
-        Ok(())
     }
 }
 
@@ -870,14 +894,15 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
 /// minimum part size (e.g. S3's 5 MiB), supply parts of at least the
 /// backend minimum plus one chunk size.
 ///
-/// `complete` commits the data object and writes the sidecar metadata under
-/// the store's per-location metadata lock, so two in-process uploads to the
-/// same location cannot interleave their commit and metadata writes (the
-/// later `complete` wins wholesale).
+/// The parts are uploaded into a fresh immutable generation object;
+/// `complete` materializes it and then switches the metadata pointer under
+/// the store's per-location critical section, so a crash (or failure) before
+/// the switch leaves the previous version fully readable.
 pub struct EncryptedStoreUploader<T: ObjectStore> {
     /// Plaintext bytes that have not yet been packed into a full chunk.
     buf: Vec<u8>,
-    /// Running SHA3-256 hasher over the *ciphertext*. Provides the
+    /// Running SHA3-256 hasher over the per-upload nonce followed by the
+    /// *ciphertext* (unique per commit; see `put_opts`). Provides the
     /// content-addressable e_tag for the finished object.
     hasher: sha3::Sha3_256,
     /// Total number of plaintext bytes accepted so far.
@@ -891,14 +916,14 @@ pub struct EncryptedStoreUploader<T: ObjectStore> {
     chunk_index: u64,
     /// Logical (caller-visible) path of the object being uploaded.
     location: Path,
+    /// Generation the ciphertext is uploaded into.
+    generation: String,
     /// Shared sidecar core of the originating [`EncryptedStore`].
     store: Arc<SidecarStore<T, Metadata>>,
     /// Shared AES-256-GCM cipher.
     cipher: Arc<Aes256Gcm>,
     /// Plaintext chunk size (in bytes) the upload encrypts with.
     chunk_size: u64,
-    /// Whether the originating store exposes the content-addressable e_tag.
-    conditional_put: bool,
     /// Underlying multipart upload handler against the inner store.
     inner: Box<dyn MultipartUpload>,
 }
@@ -988,48 +1013,44 @@ impl<T: ObjectStore> MultipartUpload for EncryptedStoreUploader<T> {
         let hash: [u8; 32] = self.hasher.clone().finalize().into();
         let e_tag = Some(BASE64_URL_SAFE.encode(hash));
 
-        // Commit the data object and persist the metadata inside the per-key
-        // critical section of `update_meta_with`, so a concurrent multipart
-        // complete on the same location cannot interleave its data commit
-        // between our commit and our metadata write (which would leave
-        // mismatched — undecryptable — data and metadata).
+        // Materialize the generation object, then switch the metadata
+        // pointer inside the per-key critical section. A failure (or crash)
+        // before the switch leaves the previous version fully readable.
         let store = self.store.clone();
         let location = self.location.clone();
         let cipher = self.cipher.clone();
+        let generation = self.generation.clone();
         let size = self.size as u64;
         let aes_nonce = self.aes_nonce;
         let aes_tags = self.aes_tags.clone();
         let chunk_size = self.chunk_size;
         let inner = &mut self.inner;
-        let mut result: Option<PutResult> = None;
-        let out = &mut result;
         store
-            .update_meta_with(&location, async |_| {
-                let rt = inner.complete().await?;
-                let obj = store.store.head(&store.full_path(&location)).await?;
+            .update_meta_with(&location, false, async |_| {
+                inner.complete().await?;
                 let mut meta = Metadata {
                     size,
                     e_tag: e_tag.clone(),
-                    original_tag: obj.e_tag,
-                    original_version: obj.version,
+                    original_tag: None,
+                    original_version: None,
                     aes_nonce: aes_nonce.into(),
                     aes_tags,
                     chunk_size: Some(chunk_size),
                     chunk_aad_version: Some(CHUNK_AAD_BOUND),
                     auth_nonce: None,
                     auth_tag: None,
+                    generation: Some(generation.clone()),
                 };
                 seal_metadata(&cipher, &location, &mut meta)?;
-                *out = Some(rt);
                 Ok(meta)
             })
             .await?;
 
-        let mut rt = result.expect("multipart complete did not run");
-        if self.conditional_put {
-            rt.e_tag = e_tag;
-        }
-        Ok(rt)
+        Ok(PutResult {
+            e_tag,
+            version: None,
+            extensions: Extensions::default(),
+        })
     }
 
     async fn abort(&mut self) -> Result<()> {
@@ -1214,12 +1235,13 @@ fn verify_metadata(
     let (nonce, tag) = match (meta.auth_nonce.as_ref(), meta.auth_tag.as_ref()) {
         (Some(nonce), Some(tag)) => (nonce, tag),
         (None, None) => {
-            // `chunk_aad_version` was introduced together with metadata
-            // authentication: every writer that records it also seals the
-            // document. Its presence without authentication fields therefore
-            // means the fields were stripped (a downgrade attack) or the
-            // document is corrupted — never genuine legacy metadata.
-            if meta.chunk_aad_version.is_some() {
+            // `chunk_aad_version` and the generation pointer were introduced
+            // together with (or after) metadata authentication: every writer
+            // that records them also seals the document. Their presence
+            // without authentication fields therefore means the fields were
+            // stripped (a downgrade attack) or the document is corrupted —
+            // never genuine legacy metadata.
+            if meta.chunk_aad_version.is_some() || meta.generation.is_some() {
                 return Err(Error::Generic {
                     store: "EncryptedStore",
                     source: format!("stripped metadata authentication fields for path {location}")
@@ -1288,6 +1310,13 @@ fn metadata_auth_aad(location: &Path, meta: &Metadata) -> Vec<u8> {
     aad.extend_from_slice(&(meta.aes_tags.len() as u64).to_le_bytes());
     for tag in &meta.aes_tags {
         push_bytes(&mut aad, tag.as_slice());
+    }
+    // Documents sealed before the immutable-generation protocol carry no
+    // generation; append the field only when present so their AAD stays
+    // byte-identical and they keep verifying.
+    if let Some(generation) = &meta.generation {
+        aad.extend_from_slice(b".g");
+        push_bytes(&mut aad, generation.as_bytes());
     }
     aad
 }
@@ -1397,32 +1426,57 @@ fn derive_gcm_nonce(base: &[u8; 12], idx: u64) -> [u8; 12] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sha3_256;
     use aes_gcm::KeyInit;
+    use futures::TryStreamExt;
     use object_store::{integration::*, local::LocalFileSystem, memory::InMemory};
     use tempfile::TempDir;
 
     const NON_EXISTENT_NAME: &str = "nonexistentname";
 
+    fn test_cipher() -> Aes256Gcm {
+        Aes256Gcm::new(&Key::<Aes256Gcm>::from([0u8; 32]))
+    }
+
+    fn encrypt_chunks(
+        cipher: &Aes256Gcm,
+        base_nonce: &[u8; 12],
+        plaintext: &[u8],
+        chunk_size: u64,
+        bound_aad: bool,
+    ) -> (Vec<u8>, Vec<ByteArray<16>>) {
+        let mut ciphertext = plaintext.to_vec();
+        let mut aes_tags = Vec::with_capacity(ciphertext.len().div_ceil(chunk_size as usize));
+        for (idx, chunk) in ciphertext.chunks_mut(chunk_size as usize).enumerate() {
+            let nonce = derive_gcm_nonce(base_nonce, idx as u64);
+            let aad = if bound_aad {
+                chunk_aad(chunk_size, idx as u64)
+            } else {
+                Vec::new()
+            };
+            let tag = cipher
+                .encrypt_inout_detached(&Nonce::from(nonce), &aad, chunk.into())
+                .unwrap();
+            let tag: [u8; 16] = tag.into();
+            aes_tags.push(tag.into());
+        }
+        (ciphertext, aes_tags)
+    }
+
+    /// Writes an object in the pre-auth legacy layout directly into the
+    /// backend: ciphertext at `data/<location>`, metadata without any
+    /// authentication fields, chunk-AAD version or generation.
     async fn put_legacy_encrypted_object(
         inner: &InMemory,
         location: &Path,
         plaintext: &'static [u8],
         chunk_size: u64,
     ) {
-        let cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from([0u8; 32]));
+        let cipher = test_cipher();
         let base_nonce = [7u8; 12];
         let chunk_size = normalize_chunk_size(chunk_size);
-        let mut ciphertext = plaintext.to_vec();
-        let mut aes_tags = Vec::with_capacity(ciphertext.len().div_ceil(chunk_size as usize));
-
-        for (idx, chunk) in ciphertext.chunks_mut(chunk_size as usize).enumerate() {
-            let nonce = derive_gcm_nonce(&base_nonce, idx as u64);
-            let tag = cipher
-                .encrypt_inout_detached(&Nonce::from(nonce), &[], chunk.into())
-                .unwrap();
-            let tag: [u8; 16] = tag.into();
-            aes_tags.push(tag.into());
-        }
+        let (ciphertext, aes_tags) =
+            encrypt_chunks(&cipher, &base_nonce, plaintext, chunk_size, false);
 
         let hash = sha3_256(&ciphertext);
         let put = inner
@@ -1443,6 +1497,7 @@ mod tests {
             chunk_aad_version: None,
             auth_nonce: None,
             auth_tag: None,
+            generation: None,
         };
         let mut buf = Vec::new();
         cbor2::to_writer(&meta, &mut buf).unwrap();
@@ -1452,11 +1507,79 @@ mod tests {
             .unwrap();
     }
 
+    /// Writes an object exactly as anda_object_store 0.9.x did: ciphertext
+    /// at `data/<location>`, sealed (authenticated) metadata with a bound
+    /// chunk AAD but **no generation pointer**. Verifying it exercises the
+    /// AAD compatibility of the generation field.
+    async fn put_sealed_v1_object(
+        inner: &InMemory,
+        location: &Path,
+        plaintext: &'static [u8],
+        chunk_size: u64,
+    ) {
+        let cipher = test_cipher();
+        let base_nonce = [9u8; 12];
+        let chunk_size = normalize_chunk_size(chunk_size);
+        let (ciphertext, aes_tags) =
+            encrypt_chunks(&cipher, &base_nonce, plaintext, chunk_size, true);
+
+        let hash = sha3_256(&ciphertext);
+        let put = inner
+            .put(
+                &Path::from(format!("data/{location}")),
+                Bytes::from(ciphertext).into(),
+            )
+            .await
+            .unwrap();
+        let mut meta = Metadata {
+            size: plaintext.len() as u64,
+            e_tag: Some(BASE64_URL_SAFE.encode(hash)),
+            original_tag: put.e_tag,
+            original_version: put.version,
+            aes_nonce: base_nonce.into(),
+            aes_tags,
+            chunk_size: Some(chunk_size),
+            chunk_aad_version: Some(CHUNK_AAD_BOUND),
+            auth_nonce: None,
+            auth_tag: None,
+            generation: None,
+        };
+        seal_metadata(&cipher, location, &mut meta).unwrap();
+        let mut buf = Vec::new();
+        cbor2::to_writer(&meta, &mut buf).unwrap();
+        inner
+            .put(&Path::from(format!("meta/{location}")), buf.into())
+            .await
+            .unwrap();
+    }
+
+    /// Decodes the metadata document of `location` directly from the backend.
+    async fn read_meta(inner: &InMemory, location: &Path) -> Metadata {
+        let bytes = inner
+            .get(&Path::from(format!("meta/{location}")))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        cbor2::from_reader(&bytes[..]).unwrap()
+    }
+
+    /// Resolves the full backend path of `location`'s current ciphertext.
+    async fn ciphertext_path(inner: &InMemory, location: &Path) -> Path {
+        let meta = read_meta(inner, location).await;
+        match meta.generation {
+            Some(g) => Path::from(format!("gen/{location}/{g}")),
+            None => Path::from(format!("data/{location}")),
+        }
+    }
+
     #[test]
     fn builder_custom_cache_and_display_debug_are_exercised() {
         let cache = Cache::builder().max_capacity(1).build();
         let storage = EncryptedStoreBuilder::with_secret(InMemory::new(), 100, [0u8; 32])
             .with_meta_cache(cache)
+            .with_conditional_put() // retained no-op, part of the public API
             .build();
 
         assert!(format!("{storage}").contains("EncryptedStore"));
@@ -1464,26 +1587,19 @@ mod tests {
 
         let location = Path::from("nested/object");
         assert_eq!(
-            storage.inner.full_path(&location).to_string(),
-            "data/nested/object"
-        );
-        assert_eq!(
             storage.inner.meta_path(&location).to_string(),
             "meta/nested/object"
         );
         assert_eq!(
-            storage
-                .inner
-                .strip_prefix(Path::from("data/nested/object"))
-                .to_string(),
-            "nested/object"
+            storage.inner.legacy_path(&location).to_string(),
+            "data/nested/object"
         );
         assert_eq!(
             storage
                 .inner
-                .strip_prefix(Path::from("other/nested/object"))
+                .generation_path(&location, "0123-abcd")
                 .to_string(),
-            "other/nested/object"
+            "gen/nested/object/0123-abcd"
         );
     }
 
@@ -1516,42 +1632,6 @@ mod tests {
         multipart_out_of_order(&storage).await;
 
         let storage = EncryptedStoreBuilder::with_secret(InMemory::new(), 10000, [0u8; 32]).build();
-        stream_get(&storage).await;
-    }
-
-    #[tokio::test]
-    async fn test_with_memory_conditional_put() {
-        let storage = EncryptedStoreBuilder::with_secret(InMemory::new(), 10000, [0u8; 32])
-            .with_conditional_put()
-            .build();
-
-        let location = Path::from(NON_EXISTENT_NAME);
-
-        let err = get_nonexistent_object(&storage, Some(location))
-            .await
-            .unwrap_err();
-        if let crate::Error::NotFound { path, .. } = err {
-            assert!(path.ends_with(NON_EXISTENT_NAME));
-        } else {
-            panic!("unexpected error type: {err:?}");
-        }
-
-        put_get_delete_list(&storage).await;
-        put_get_attributes(&storage).await;
-        get_opts(&storage).await;
-        put_opts(&storage, true).await;
-
-        list_uses_directories_correctly(&storage).await;
-        list_with_delimiter(&storage).await;
-        rename_and_copy(&storage).await;
-        copy_if_not_exists(&storage).await;
-        copy_rename_nonexistent_object(&storage).await;
-        multipart_race_condition(&storage, true).await;
-        multipart_out_of_order(&storage).await;
-
-        let storage = EncryptedStoreBuilder::with_secret(InMemory::new(), 10000, [0u8; 32])
-            .with_conditional_put()
-            .build();
         stream_get(&storage).await;
     }
 
@@ -1666,6 +1746,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sealed_v1_layout_still_verifies_and_upgrades() {
+        let inner = InMemory::new();
+        let location = Path::from("sealed-v1");
+        let payload = b"sealed v1 payload";
+        put_sealed_v1_object(&inner, &location, payload, 4).await;
+
+        // A document sealed before the generation field existed must keep
+        // verifying: its AAD layout is preserved byte-for-byte, even under
+        // strict metadata authentication.
+        let storage = EncryptedStoreBuilder::with_secret(inner.clone(), 100, [0u8; 32])
+            .with_chunk_size(4)
+            .with_strict_metadata_auth()
+            .build();
+        let bytes = storage.get(&location).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes.as_ref(), payload);
+
+        // The first overwrite migrates to the generation layout and removes
+        // the legacy ciphertext.
+        storage
+            .put(&location, Bytes::from_static(b"upgraded").into())
+            .await
+            .unwrap();
+        let bytes = storage.get(&location).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"upgraded"));
+        let meta = read_meta(&inner, &location).await;
+        assert!(meta.generation.is_some());
+        assert!(matches!(
+            inner.get(&Path::from("data/sealed-v1")).await,
+            Err(Error::NotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
     async fn legacy_metadata_copy_and_rename_reseal_legacy_chunk_aad() {
         let inner = InMemory::new();
         let source = Path::from("legacy-copy-source");
@@ -1679,36 +1792,27 @@ mod tests {
             .build();
         storage.copy(&source, &copied).await.unwrap();
 
-        let copied_meta_bytes = inner
-            .get(&Path::from("meta/legacy-copy-target"))
-            .await
-            .unwrap()
-            .bytes()
-            .await
-            .unwrap();
-        let copied_meta: Metadata = cbor2::from_reader(&copied_meta_bytes[..]).unwrap();
+        let copied_meta = read_meta(&inner, &copied).await;
         assert_eq!(copied_meta.chunk_aad_version, Some(CHUNK_AAD_LEGACY));
         assert!(copied_meta.auth_nonce.is_some());
         assert!(copied_meta.auth_tag.is_some());
+        assert!(copied_meta.generation.is_some());
 
         let bytes = storage.get(&copied).await.unwrap().bytes().await.unwrap();
         assert_eq!(bytes.as_ref(), payload);
 
         storage.rename(&copied, &renamed).await.unwrap();
-        let renamed_meta_bytes = inner
-            .get(&Path::from("meta/legacy-rename-target"))
-            .await
-            .unwrap()
-            .bytes()
-            .await
-            .unwrap();
-        let renamed_meta: Metadata = cbor2::from_reader(&renamed_meta_bytes[..]).unwrap();
+        let renamed_meta = read_meta(&inner, &renamed).await;
         assert_eq!(renamed_meta.chunk_aad_version, Some(CHUNK_AAD_LEGACY));
         assert!(renamed_meta.auth_nonce.is_some());
         assert!(renamed_meta.auth_tag.is_some());
 
         let bytes = storage.get(&renamed).await.unwrap().bytes().await.unwrap();
         assert_eq!(bytes.as_ref(), payload);
+        assert!(matches!(
+            storage.get(&copied).await,
+            Err(Error::NotFound { .. })
+        ));
     }
 
     #[tokio::test]
@@ -1729,14 +1833,22 @@ mod tests {
             .await
             .unwrap();
 
+        // Transplant object-a's ciphertext and sidecar wholesale onto
+        // object-b's paths.
+        let a_meta = read_meta(&inner, &a).await;
+        let a_gen = a_meta.generation.clone().unwrap();
         let a_data = inner
-            .get(&Path::from("data/object-a"))
+            .get(&Path::from(format!("gen/object-a/{a_gen}")))
             .await
             .unwrap()
             .bytes()
             .await
             .unwrap();
-        let a_meta = inner
+        inner
+            .put(&Path::from(format!("gen/object-b/{a_gen}")), a_data.into())
+            .await
+            .unwrap();
+        let a_meta_bytes = inner
             .get(&Path::from("meta/object-a"))
             .await
             .unwrap()
@@ -1744,11 +1856,7 @@ mod tests {
             .await
             .unwrap();
         inner
-            .put(&Path::from("data/object-b"), a_data.into())
-            .await
-            .unwrap();
-        inner
-            .put(&Path::from("meta/object-b"), a_meta.into())
+            .put(&Path::from("meta/object-b"), a_meta_bytes.into())
             .await
             .unwrap();
 
@@ -1763,7 +1871,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metadata_authentication_rejects_sidecar_size_mutation() {
+    async fn metadata_authentication_rejects_sidecar_mutation() {
         let inner = InMemory::new();
         let storage = EncryptedStoreBuilder::with_secret(inner.clone(), 100, [0u8; 32])
             .with_chunk_size(4)
@@ -1775,10 +1883,28 @@ mod tests {
             .await
             .unwrap();
 
+        // Mutating the size fails authentication.
         let meta_path = Path::from("meta/tamper-meta");
-        let meta_bytes = inner.get(&meta_path).await.unwrap().bytes().await.unwrap();
-        let mut meta: Metadata = cbor2::from_reader(&meta_bytes[..]).unwrap();
+        let mut meta = read_meta(&inner, &location).await;
         meta.size += 1;
+        let mut tampered = Vec::new();
+        cbor2::to_writer(&meta, &mut tampered).unwrap();
+        inner.put(&meta_path, tampered.into()).await.unwrap();
+
+        let reopened = EncryptedStoreBuilder::with_secret(inner.clone(), 100, [0u8; 32])
+            .with_chunk_size(4)
+            .build();
+        let err = match reopened.get(&location).await {
+            Ok(_) => panic!("tampered sidecar should fail metadata authentication"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("metadata authentication failed"));
+
+        // Repointing the generation is equally rejected: the pointer is
+        // bound into the sealed AAD.
+        let mut meta = read_meta(&inner, &location).await;
+        meta.size -= 1; // restore
+        meta.generation = Some("0000000000000009-11111111".to_string());
         let mut tampered = Vec::new();
         cbor2::to_writer(&meta, &mut tampered).unwrap();
         inner.put(&meta_path, tampered.into()).await.unwrap();
@@ -1786,10 +1912,7 @@ mod tests {
         let reopened = EncryptedStoreBuilder::with_secret(inner, 100, [0u8; 32])
             .with_chunk_size(4)
             .build();
-        let err = match reopened.get(&location).await {
-            Ok(_) => panic!("tampered sidecar should fail metadata authentication"),
-            Err(err) => err,
-        };
+        let err = reopened.get(&location).await.unwrap_err();
         assert!(err.to_string().contains("metadata authentication failed"));
     }
 
@@ -1827,7 +1950,7 @@ mod tests {
         let err = reopened.copy(&copy_source, &copy_target).await.unwrap_err();
         assert!(err.to_string().contains("metadata authentication failed"));
         assert!(matches!(
-            inner.get(&Path::from("data/tamper-copy-target")).await,
+            reopened.get(&copy_target).await,
             Err(Error::NotFound { .. })
         ));
 
@@ -1837,7 +1960,7 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("metadata authentication failed"));
         assert!(matches!(
-            inner.get(&Path::from("data/tamper-rename-target")).await,
+            reopened.get(&rename_target).await,
             Err(Error::NotFound { .. })
         ));
     }
@@ -1863,10 +1986,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn conditional_get_opts_accepts_comma_separated_logical_etags() {
-        let storage = EncryptedStoreBuilder::with_secret(InMemory::new(), 100, [0u8; 32])
-            .with_conditional_put()
-            .build();
+    async fn get_opts_accepts_comma_separated_logical_etags() {
+        let storage = EncryptedStoreBuilder::with_secret(InMemory::new(), 100, [0u8; 32]).build();
         let location = Path::from("encrypted-etag-list");
         let put = storage
             .put(&location, Bytes::from_static(b"abc").into())
@@ -1903,10 +2024,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn conditional_copy_and_rename_refresh_original_tag_for_logical_etag_preconditions() {
-        let storage = EncryptedStoreBuilder::with_secret(InMemory::new(), 100, [0u8; 32])
-            .with_conditional_put()
-            .build();
+    async fn copy_and_rename_preserve_logical_etag_preconditions() {
+        let storage = EncryptedStoreBuilder::with_secret(InMemory::new(), 100, [0u8; 32]).build();
         let source = Path::from("encrypted-copy-source");
         let copied = Path::from("encrypted-copy-target");
         let renamed = Path::from("encrypted-rename-target");
@@ -1950,10 +2069,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn conditional_put_update_rejects_stale_version() {
-        let storage = EncryptedStoreBuilder::with_secret(InMemory::new(), 100, [0u8; 32])
-            .with_conditional_put()
-            .build();
+    async fn put_update_rejects_stale_version() {
+        let storage = EncryptedStoreBuilder::with_secret(InMemory::new(), 100, [0u8; 32]).build();
         let location = Path::from("encrypted-stale-version");
         let put = storage
             .put(&location, Bytes::from_static(b"abc").into())
@@ -1966,7 +2083,7 @@ mod tests {
                 Bytes::from_static(b"def").into(),
                 PutOptions {
                     mode: PutMode::Update(UpdateVersion {
-                        e_tag: put.e_tag,
+                        e_tag: put.e_tag.clone(),
                         version: Some("stale".to_string()),
                     }),
                     ..Default::default()
@@ -1974,8 +2091,23 @@ mod tests {
             )
             .await
             .unwrap_err();
-
         assert!(matches!(err, Error::Precondition { .. }));
+
+        // An e_tag-only Update succeeds (versions are not reported).
+        storage
+            .put_opts(
+                &location,
+                Bytes::from_static(b"def").into(),
+                PutOptions {
+                    mode: PutMode::Update(UpdateVersion {
+                        e_tag: put.e_tag,
+                        version: put.version,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1991,7 +2123,7 @@ mod tests {
             .await
             .unwrap();
 
-        let data_path = Path::from("data/truncated");
+        let data_path = ciphertext_path(&inner, &location).await;
         let ciphertext = inner.get(&data_path).await.unwrap().bytes().await.unwrap();
         inner
             .put(&data_path, ciphertext.slice(..4).into())
@@ -2025,8 +2157,7 @@ mod tests {
         // Strip the authentication fields (downgrade attack) while keeping
         // the other v1 fields intact.
         let meta_path = Path::from("meta/stripped");
-        let meta_bytes = inner.get(&meta_path).await.unwrap().bytes().await.unwrap();
-        let mut meta: Metadata = cbor2::from_reader(&meta_bytes[..]).unwrap();
+        let mut meta = read_meta(&inner, &location).await;
         assert!(meta.auth_nonce.is_some() && meta.auth_tag.is_some());
         meta.auth_nonce = None;
         meta.auth_tag = None;
@@ -2034,8 +2165,9 @@ mod tests {
         cbor2::to_writer(&meta, &mut stripped).unwrap();
         inner.put(&meta_path, stripped.into()).await.unwrap();
 
-        // Even the default (non-strict) store must reject it: v1 fields
-        // without authentication can only mean stripping or corruption.
+        // Even the default (non-strict) store must reject it: v1 fields (or
+        // a generation pointer) without authentication can only mean
+        // stripping or corruption.
         let reopened = EncryptedStoreBuilder::with_secret(inner, 100, [0u8; 32])
             .with_chunk_size(4)
             .build();
@@ -2083,14 +2215,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strict_mode_rejects_tampered_metadata_in_all_listing_variants() {
-        use futures::TryStreamExt;
-
+    async fn tampered_metadata_is_rejected_in_all_listing_variants() {
         let inner = InMemory::new();
         let location = Path::from("strict-list/tampered");
-        let writer = EncryptedStoreBuilder::with_secret(inner.clone(), 100, [0u8; 32])
-            .with_conditional_put()
-            .build();
+        let writer = EncryptedStoreBuilder::with_secret(inner.clone(), 100, [0u8; 32]).build();
         writer
             .put(&location, Bytes::from_static(b"authenticated").into())
             .await
@@ -2107,9 +2235,7 @@ mod tests {
 
         // Reopen to bypass the writer's valid cached metadata. Compatibility
         // mode accepts genuine legacy documents, not failed authentication.
-        let compatible = EncryptedStoreBuilder::with_secret(inner.clone(), 100, [0u8; 32])
-            .with_conditional_put()
-            .build();
+        let compatible = EncryptedStoreBuilder::with_secret(inner.clone(), 100, [0u8; 32]).build();
         let err = compatible
             .list(Some(&Path::from("strict-list")))
             .try_collect::<Vec<_>>()
@@ -2121,7 +2247,6 @@ mod tests {
         // replacement, so all three strict variants independently reach the
         // verifier and reject it.
         let strict = EncryptedStoreBuilder::with_secret(inner, 100, [0u8; 32])
-            .with_conditional_put()
             .with_strict_metadata_auth()
             .build();
         let err = strict
@@ -2149,71 +2274,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn listing_metadata_load_holds_source_lease_against_put() {
-        use crate::test_support::{GateOperation, GatedStore};
-        use futures::TryStreamExt;
-
-        let source = Path::from("listing-put/source");
-        let target = Path::from("listing-put/target");
-        let (inner, gate) =
-            GatedStore::new(GateOperation::Get(Path::from("meta/listing-put/source")));
-
-        let writer = EncryptedStoreBuilder::with_secret(inner.clone(), 100, [0u8; 32])
-            .with_chunk_size(4)
-            .with_conditional_put()
-            .with_strict_metadata_auth()
-            .build();
-        writer
-            .put(&source, Bytes::from_static(b"first-value").into())
-            .await
-            .unwrap();
-
-        // Reopen with an empty cache so listing must fetch the source sidecar.
-        let storage = Arc::new(
-            EncryptedStoreBuilder::with_secret(inner, 100, [0u8; 32])
-                .with_chunk_size(4)
-                .with_conditional_put()
-                .with_strict_metadata_auth()
-                .build(),
-        );
-        let list_storage = storage.clone();
-        let listing = tokio::spawn(async move {
-            list_storage
-                .list(Some(&Path::from("listing-put")))
-                .try_collect::<Vec<_>>()
-                .await
-        });
-        gate.wait_until_entered().await;
-
-        // The listing has already obtained the old metadata bytes. Its
-        // per-key lease must keep this put from committing newer data and
-        // metadata before the old document has been validated and cached.
-        let put_storage = storage.clone();
-        let put_source = source.clone();
-        let mut put = tokio::spawn(async move {
-            put_storage
-                .put(&put_source, Bytes::from_static(b"second-value").into())
-                .await
-        });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut put)
-                .await
-                .is_err(),
-            "put bypassed the listing metadata load's source lease"
-        );
-
-        gate.release();
-        listing.await.unwrap().unwrap();
-        put.await.unwrap().unwrap();
-
-        // A later encrypted copy must pair the current ciphertext with its
-        // current metadata, rather than resealing a stale cached document.
-        storage.copy(&source, &target).await.unwrap();
-        let bytes = storage.get(&target).await.unwrap().bytes().await.unwrap();
-        assert_eq!(bytes, Bytes::from_static(b"second-value"));
-    }
-
-    #[tokio::test]
     async fn corrupted_metadata_heals_on_overwrite() {
         let inner = InMemory::new();
         let storage = EncryptedStoreBuilder::with_secret(inner.clone(), 100, [0u8; 32])
@@ -2225,7 +2285,8 @@ mod tests {
             .put(&location, Bytes::from_static(b"old-data").into())
             .await
             .unwrap();
-        // Corrupt the sidecar metadata (e.g. a torn write before a crash).
+        // Corrupt the commit point (external corruption; backend puts are
+        // atomic in the crash model).
         inner
             .put(
                 &Path::from("meta/self-heal"),
@@ -2254,50 +2315,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn orphaned_data_does_not_fail_listings() {
-        use futures::TryStreamExt;
-
+    async fn uncommitted_payloads_are_invisible_and_collected() {
         let inner = InMemory::new();
-        let storage = EncryptedStoreBuilder::with_secret(inner.clone(), 100, [0u8; 32])
-            .with_conditional_put()
-            .build();
+        let storage = EncryptedStoreBuilder::with_secret(inner.clone(), 100, [0u8; 32]).build();
         let healthy = Path::from("list/healthy");
-        let orphan = Path::from("list/orphan");
 
         storage
             .put(&healthy, Bytes::from_static(b"abc").into())
             .await
             .unwrap();
-        storage
-            .put(&orphan, Bytes::from_static(b"def").into())
+        // A ciphertext generation whose pointer switch never happened (crash
+        // window) is invisible to listings and reclaimed by the collector.
+        inner
+            .put(
+                &Path::from("gen/list/orphan/0000000000000001-00000000"),
+                Bytes::from_static(b"ghost").into(),
+            )
             .await
             .unwrap();
-        // Simulate a crash between the data and metadata writes.
-        inner.delete(&Path::from("meta/list/orphan")).await.unwrap();
 
-        let reopened = EncryptedStoreBuilder::with_secret(inner, 100, [0u8; 32])
-            .with_conditional_put()
-            .build();
+        let reopened = EncryptedStoreBuilder::with_secret(inner.clone(), 100, [0u8; 32]).build();
         let listed: Vec<_> = reopened
             .list(Some(&Path::from("list")))
             .try_collect()
             .await
             .unwrap();
-        assert_eq!(listed.len(), 2);
-        let orphaned = listed.iter().find(|o| o.location == orphan).unwrap();
-        assert_eq!(orphaned.e_tag, None);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].location, healthy);
+        assert!(listed[0].e_tag.is_some());
 
-        let rt = reopened
-            .list_with_delimiter(Some(&Path::from("list")))
-            .await
-            .unwrap();
-        assert_eq!(rt.objects.len(), 2);
-        let orphaned = rt.objects.iter().find(|o| o.location == orphan).unwrap();
-        assert_eq!(orphaned.e_tag, None);
+        assert_eq!(reopened.collect_garbage().await.unwrap(), 1);
+        assert!(matches!(
+            inner
+                .get(&Path::from("gen/list/orphan/0000000000000001-00000000"))
+                .await,
+            Err(Error::NotFound { .. })
+        ));
+        let bytes = reopened.get(&healthy).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"abc"));
     }
 
     #[tokio::test]
-    async fn create_heals_orphaned_data() {
+    async fn create_succeeds_after_commit_point_loss() {
         let inner = InMemory::new();
         let storage = EncryptedStoreBuilder::with_secret(inner.clone(), 100, [0u8; 32])
             .with_chunk_size(4)
@@ -2310,6 +2369,9 @@ mod tests {
             .unwrap();
         inner.delete(&Path::from("meta/create-heal")).await.unwrap();
 
+        // Without its commit point the object does not logically exist, so
+        // `Create` succeeds; the abandoned ciphertext is left to the
+        // collector.
         let reopened = EncryptedStoreBuilder::with_secret(inner, 100, [0u8; 32])
             .with_chunk_size(4)
             .build();
@@ -2346,6 +2408,87 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::AlreadyExists { .. }));
+    }
+
+    #[tokio::test]
+    async fn crash_before_pointer_switch_keeps_old_ciphertext_decryptable() {
+        let inner = InMemory::new();
+        let (fault, handle) = crate::FaultStore::wrap(inner.clone());
+        let storage = EncryptedStoreBuilder::with_secret(fault, 100, [0u8; 32])
+            .with_chunk_size(4)
+            .build();
+        let location = Path::from("crash/encrypted");
+
+        storage
+            .put(&location, Bytes::from_static(b"version-1").into())
+            .await
+            .unwrap();
+
+        // Fail the pointer switch of the overwrite. Under the old mutable
+        // layout this crash window produced an AES-GCM authentication
+        // failure (old metadata + new ciphertext); now the old version stays
+        // fully decryptable.
+        handle.push_rule(crate::FaultRule::fail_once(crate::FaultOp::Put, "meta/"));
+        assert!(
+            storage
+                .put(&location, Bytes::from_static(b"version-2").into())
+                .await
+                .is_err()
+        );
+
+        let bytes = storage.get(&location).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"version-1"));
+
+        // Same through a fresh instance (cold cache, "after reboot").
+        let reopened = EncryptedStoreBuilder::with_secret(inner.clone(), 100, [0u8; 32])
+            .with_chunk_size(4)
+            .build();
+        let bytes = reopened
+            .get(&location)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"version-1"));
+
+        // The collector reclaims the abandoned ciphertext generation (after
+        // the same-millisecond in-flight guard has lapsed).
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        assert_eq!(reopened.collect_garbage().await.unwrap(), 1);
+        let bytes = reopened
+            .get(&location)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"version-1"));
+    }
+
+    #[tokio::test]
+    async fn multipart_crash_before_complete_preserves_old_version() {
+        let (fault, handle) = crate::FaultStore::wrap(InMemory::new());
+        let storage = EncryptedStoreBuilder::with_secret(fault, 100, [0u8; 32])
+            .with_chunk_size(4)
+            .build();
+        let location = Path::from("multipart-crash");
+
+        storage
+            .put(&location, Bytes::from_static(b"version-1").into())
+            .await
+            .unwrap();
+
+        let mut upload = storage.put_multipart(&location).await.unwrap();
+        upload
+            .put_part(Bytes::from_static(b"multipart-version-2").into())
+            .await
+            .unwrap();
+        handle.push_rule(crate::FaultRule::fail_once(crate::FaultOp::Put, "meta/"));
+        assert!(upload.complete().await.is_err());
+
+        let bytes = storage.get(&location).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"version-1"));
     }
 
     #[tokio::test]
@@ -2446,108 +2589,10 @@ mod tests {
         ra.unwrap();
         rb.unwrap();
 
-        // Whichever complete ran last, the object must decrypt: data and
-        // metadata were written under the same per-key critical section.
+        // Whichever complete committed last, the object must decrypt:
+        // ciphertext and metadata are switched atomically at the pointer.
         let bytes = storage.get(&location).await.unwrap().bytes().await.unwrap();
         assert!(bytes == content_a || bytes == content_b);
-    }
-
-    #[tokio::test]
-    async fn encrypted_copy_holds_target_lease_against_put() {
-        use crate::test_support::{GateOperation, GatedStore};
-
-        let source = Path::from("encrypted-copy-put-source");
-        let target = Path::from("encrypted-copy-put-target");
-        let (inner, gate) = GatedStore::new(GateOperation::Copy {
-            from: Path::from("data/encrypted-copy-put-source"),
-            to: Path::from("data/encrypted-copy-put-target"),
-        });
-        let storage = Arc::new(
-            EncryptedStoreBuilder::with_secret(inner, 100, [0u8; 32])
-                .with_chunk_size(4)
-                .build(),
-        );
-        storage
-            .put(&source, Bytes::from_static(b"source-value").into())
-            .await
-            .unwrap();
-
-        let copy_storage = storage.clone();
-        let copy_source = source.clone();
-        let copy_target = target.clone();
-        let copy = tokio::spawn(async move { copy_storage.copy(&copy_source, &copy_target).await });
-        gate.wait_until_entered().await;
-
-        let put_storage = storage.clone();
-        let put_target = target.clone();
-        let mut put = tokio::spawn(async move {
-            put_storage
-                .put(&put_target, Bytes::from_static(b"put-value").into())
-                .await
-        });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut put)
-                .await
-                .is_err(),
-            "put bypassed EncryptedStore copy's target lease"
-        );
-
-        gate.release();
-        copy.await.unwrap().unwrap();
-        put.await.unwrap().unwrap();
-        let bytes = storage.get(&target).await.unwrap().bytes().await.unwrap();
-        assert_eq!(bytes, Bytes::from_static(b"put-value"));
-    }
-
-    #[tokio::test]
-    async fn encrypted_rename_waits_for_target_multipart_complete() {
-        use crate::test_support::{GateOperation, GatedStore};
-
-        let source = Path::from("encrypted-rename-source");
-        let target = Path::from("encrypted-rename-target");
-        let (inner, gate) = GatedStore::new(GateOperation::MultipartComplete(Path::from(
-            "data/encrypted-rename-target",
-        )));
-        let storage = Arc::new(
-            EncryptedStoreBuilder::with_secret(inner, 100, [0u8; 32])
-                .with_chunk_size(4)
-                .build(),
-        );
-        storage
-            .put(&source, Bytes::from_static(b"source-value").into())
-            .await
-            .unwrap();
-        let mut upload = storage.put_multipart(&target).await.unwrap();
-        upload
-            .put_part(Bytes::from_static(b"multipart-value").into())
-            .await
-            .unwrap();
-        let complete = tokio::spawn(async move { upload.complete().await });
-        gate.wait_until_entered().await;
-
-        let rename_storage = storage.clone();
-        let rename_source = source.clone();
-        let rename_target = target.clone();
-        let mut rename =
-            tokio::spawn(
-                async move { rename_storage.rename(&rename_source, &rename_target).await },
-            );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut rename)
-                .await
-                .is_err(),
-            "EncryptedStore rename bypassed multipart's target lease"
-        );
-
-        gate.release();
-        complete.await.unwrap().unwrap();
-        rename.await.unwrap().unwrap();
-        let bytes = storage.get(&target).await.unwrap().bytes().await.unwrap();
-        assert_eq!(bytes, Bytes::from_static(b"source-value"));
-        assert!(matches!(
-            storage.get(&source).await,
-            Err(Error::NotFound { .. })
-        ));
     }
 
     #[test]
@@ -2578,7 +2623,6 @@ mod tests {
             10000,
             [0u8; 32],
         )
-        .with_conditional_put()
         .build();
 
         let location = Path::from(NON_EXISTENT_NAME);
@@ -2611,8 +2655,75 @@ mod tests {
             10000,
             [0u8; 32],
         )
-        .with_conditional_put()
         .build();
         stream_get(&storage).await;
+    }
+
+    /// Regression stress test for OCC lost updates over short payloads.
+    ///
+    /// One-byte counter values make bare-ciphertext ETags collide with
+    /// probability 1/256 per pair; a collision lets a stale CAS token pass
+    /// the precondition and silently rewind the counter. The logical ETag
+    /// is therefore seeded with the per-commit nonce (see `put_opts`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stress_occ_counter_local_file() {
+        const NUM_WORKERS: usize = 16;
+        const NUM_INCREMENTS: usize = 25;
+
+        let root = TempDir::new().unwrap();
+        let storage = std::sync::Arc::new(
+            EncryptedStoreBuilder::with_secret(
+                LocalFileSystem::new_with_prefix(root.path()).unwrap(),
+                10000,
+                [7u8; 32],
+            )
+            .build(),
+        );
+        let path = Path::from("RACE");
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..NUM_WORKERS {
+            let storage = storage.clone();
+            let path = path.clone();
+            tasks.spawn(async move {
+                for _ in 0..NUM_INCREMENTS {
+                    loop {
+                        match storage.get(&path).await {
+                            Ok(r) => {
+                                let mode = PutMode::Update(UpdateVersion {
+                                    e_tag: r.meta.e_tag.clone(),
+                                    version: r.meta.version.clone(),
+                                });
+                                let b = r.bytes().await.unwrap();
+                                let v: usize = std::str::from_utf8(&b).unwrap().parse().unwrap();
+                                let new = (v + 1).to_string();
+                                match storage.put_opts(&path, new.into(), mode.into()).await {
+                                    Ok(_) => break,
+                                    Err(object_store::Error::Precondition { .. }) => continue,
+                                    Err(e) => panic!("unexpected error: {e:?}"),
+                                }
+                            }
+                            Err(object_store::Error::NotFound { .. }) => {
+                                match storage
+                                    .put_opts(&path, "1".into(), PutMode::Create.into())
+                                    .await
+                                {
+                                    Ok(_) => break,
+                                    Err(object_store::Error::AlreadyExists { .. }) => continue,
+                                    Err(e) => panic!("unexpected error: {e:?}"),
+                                }
+                            }
+                            Err(e) => panic!("unexpected error: {e:?}"),
+                        }
+                    }
+                }
+            });
+        }
+        while let Some(rt) = tasks.join_next().await {
+            rt.unwrap();
+        }
+
+        let b = storage.get(&path).await.unwrap().bytes().await.unwrap();
+        let v = std::str::from_utf8(&b).unwrap().parse::<usize>().unwrap();
+        assert_eq!(v, NUM_WORKERS * NUM_INCREMENTS, "lost updates");
     }
 }

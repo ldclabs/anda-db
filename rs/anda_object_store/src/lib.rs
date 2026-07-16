@@ -5,54 +5,59 @@
 //! brain:
 //!
 //! - [`MetaStore`] — augments any [`ObjectStore`] backend with side-car
-//!   metadata (object size, content hash, original backend ETag/version).
-//!   This enables a uniform, content-addressable ETag and conditional
-//!   `PutMode::Update` semantics on top of backends that lack them natively
-//!   (notably `object_store::local::LocalFileSystem`).
+//!   metadata (object size, content hash). This enables a uniform,
+//!   content-addressable ETag and conditional `PutMode::Update` semantics on
+//!   top of backends that lack them natively (notably
+//!   `object_store::local::LocalFileSystem`).
 //! - [`EncryptedStore`] — provides transparent, chunked AES-256-GCM
 //!   encryption-at-rest. Objects are split into fixed-size chunks, each
 //!   encrypted with a per-chunk nonce derived from a random per-object base
 //!   nonce. Encryption metadata (base nonce, per-chunk authentication tags)
 //!   is stored alongside content metadata.
 //!
-//! Both wrappers implement [`ObjectStore`] and place data and metadata under
-//! two distinct path prefixes (`data/` and `meta/` by default) on the
-//! underlying backend, so they can be layered on top of any compliant store
-//! (in-memory, local filesystem, S3, GCS, Azure Blob, …).
+//! ## Immutable-generation write protocol
+//!
+//! Both wrappers store a logical object as two backend objects:
+//!
+//! - `meta/<location>` — a small metadata document, the **only commit
+//!   point**. It carries a pointer (the *generation*) to the payload.
+//! - `gen/<location>/<generation>` — the immutable payload. Every put writes
+//!   a fresh generation (a unique, never-overwritten path) and then commits
+//!   by atomically switching the metadata pointer with a single backend put.
 //!
 //! ## Crash semantics
 //!
-//! A logical put writes two backend objects in sequence: the data object at
-//! `data/<location>` first, then the sidecar metadata at `meta/<location>`.
-//! The pair is **not atomic**. A crash (or a failed metadata write) between
-//! the two leaves the new data object with either no metadata — an "orphan"
-//! on the first write of a key — or the previous metadata on an overwrite.
-//! Until the key is written again, such an object is unreadable: `MetaStore`
-//! reports a stale size/ETag and `EncryptedStore` fails decryption or
-//! metadata authentication (indistinguishable from tampering). The previous
-//! version of the payload is already overwritten and cannot be recovered.
+//! - A crash **before** the pointer switch leaves the previous version fully
+//!   intact and readable; the new generation is unreferenced garbage.
+//! - A crash **after** the pointer switch means the put took effect; the
+//!   replaced generation is garbage.
+//! - Torn reads ("old metadata + new payload") are impossible by
+//!   construction: readers resolve the pointer and then read an immutable
+//!   object.
 //!
-//! Both wrappers self-heal on the next write of the same key:
-//! `PutMode::Overwrite` always rebuilds the pair (including when the sidecar
-//! metadata is corrupted), and `PutMode::Create` succeeds over an orphaned
-//! data object without metadata. Listings tolerate orphans — whether the
-//! sidecar metadata is missing or fails to decode, the entry's `e_tag` is
-//! `None` — and `delete` cleans up either half. Callers must therefore be
-//! prepared to re-write objects that fail to read back after a crash, in
-//! line with AndaDB's overwrite-self-heal convention.
+//! Garbage is deleted best-effort right after each successful pointer switch
+//! and otherwise reclaimed by the explicit mark-sweep collector
+//! ([`MetaStore::collect_garbage`] / [`EncryptedStore::collect_garbage`]),
+//! which is designed to run when the store is otherwise quiescent (e.g. at
+//! open) and never deletes a payload that a commit point references.
 //!
-//! ## Single-writer assumption
+//! ## Backward compatibility
 //!
-//! The `PutMode::Create` self-heal path assumes AndaDB's single-writer
-//! deployment model: a data object without readable sidecar metadata is
-//! treated as logically absent, so `Create` overwrites it. Within one
-//! process the per-key metadata critical section serializes writers, but
-//! **across processes this weakens `PutMode::Create`'s "exactly one winner"
-//! guarantee**: two processes racing `Create` on the same key while a
-//! sidecar metadata write has not yet become visible can each classify the
-//! other's data object as an orphan and overwrite it. Do not rely on
-//! `PutMode::Create` through these wrappers for cross-process mutual
-//! exclusion; multi-writer deployments are not protected.
+//! Deployments written by anda_object_store < 0.10 store payloads directly at
+//! `data/<location>` ("legacy layout"); their metadata carries no generation
+//! pointer. Such objects stay fully readable, and the first overwrite
+//! migrates them to the generation layout (the old `data/` object is deleted
+//! after the pointer switch). The format only rolls forward: data written by
+//! this version cannot be read by < 0.10.
+//!
+//! ## Single-writer contract
+//!
+//! Concurrent mutations of the **same key** must be coordinated by the
+//! caller (AndaDB deploys one writer per store). Within one process the
+//! per-key metadata critical section serializes writers; across processes a
+//! second `PutMode::Create` writer is rejected by the backend's conditional
+//! write of the commit point, but `Overwrite`/`Update` writers and the
+//! garbage collector are only safe under the single-writer assumption.
 //!
 //! See `docs/anda_object_store.md` in the repository for the full design
 //! document.
@@ -76,7 +81,7 @@ mod sidecar;
 pub use encryption::{EncryptedStore, EncryptedStoreBuilder, EncryptedStoreUploader};
 pub use fault::{FaultHandle, FaultKind, FaultOp, FaultRule, FaultStore};
 
-use sidecar::{ListingMetaPolicy, SidecarMeta, SidecarStore};
+use sidecar::{ListingMetaPolicy, SidecarMeta, SidecarStore, new_generation};
 
 /// `MetaStore` is a wrapper around an `ObjectStore` implementation that adds metadata capabilities.
 ///
@@ -86,7 +91,7 @@ use sidecar::{ListingMetaPolicy, SidecarMeta, SidecarStore};
 /// The metadata includes:
 /// - Size of the object
 /// - E-Tag (SHA3-256 hash of the content)
-/// - Original tag from the underlying storage
+/// - The generation pointer to the immutable payload object
 ///
 /// # Example
 /// ```rust,no_run
@@ -121,7 +126,9 @@ pub struct MetaStoreBuilder<T: ObjectStore> {
 /// Metadata structure for objects stored in `MetaStore`.
 ///
 /// Serialized as compact CBOR (single-letter field names) and stored at
-/// `meta/<location>` alongside the data object at `data/<location>`.
+/// `meta/<location>`; it points at the immutable payload object at
+/// `gen/<location>/<generation>` (or, for pre-0.10 documents without a
+/// generation, at the legacy `data/<location>` object).
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct Metadata {
     /// Size of the (logical) object in bytes.
@@ -135,18 +142,22 @@ struct Metadata {
     #[serde(rename = "e")]
     e_tag: Option<String>,
 
-    /// ETag returned by the underlying storage when the data object was
-    /// written. Used to translate caller-provided `if_match`/`if_none_match`
-    /// preconditions on [`MetaStore::get_opts`] into a request the inner
-    /// store understands.
-    #[serde(rename = "o")]
+    /// Legacy field of the pre-0.10 mutable dual-object layout (the inner
+    /// backend's ETag). Retained so old documents decode; never written.
+    #[serde(rename = "o", default, skip_serializing_if = "Option::is_none")]
     original_tag: Option<String>,
 
-    /// Version returned by the underlying storage on the most recent put,
-    /// when the backend supports object versioning. Forwarded back to the
-    /// caller via [`PutResult::version`].
-    #[serde(rename = "v")]
+    /// Legacy field of the pre-0.10 mutable dual-object layout (the inner
+    /// backend's version). Retained so old documents decode; never written.
+    #[serde(rename = "v", default, skip_serializing_if = "Option::is_none")]
     original_version: Option<String>,
+
+    /// Generation pointer: the payload lives at
+    /// `gen/<location>/<generation>`. `None` means the legacy layout
+    /// (`data/<location>`). Internal to the protocol; never exposed as a
+    /// caller-visible version.
+    #[serde(rename = "g", default, skip_serializing_if = "Option::is_none")]
+    generation: Option<String>,
 }
 
 impl SidecarMeta for Metadata {
@@ -156,9 +167,12 @@ impl SidecarMeta for Metadata {
         self.e_tag.as_deref()
     }
 
-    fn set_original(&mut self, e_tag: Option<String>, version: Option<String>) {
-        self.original_tag = e_tag;
-        self.original_version = version;
+    fn size(&self) -> u64 {
+        self.size
+    }
+
+    fn generation(&self) -> Option<&str> {
+        self.generation.as_deref()
     }
 }
 
@@ -214,27 +228,38 @@ impl<T: ObjectStore> MetaStoreBuilder<T> {
     }
 }
 
+impl<T: ObjectStore> MetaStore<T> {
+    /// Runs mark-sweep garbage collection over the payload objects.
+    ///
+    /// All commit points (`meta/` documents) are read first; a payload is
+    /// only deleted when no commit point references it, with a fresh re-read
+    /// of the key's metadata right before each deletion. Generations minted
+    /// after the collection started are skipped. Run this when the store is
+    /// otherwise quiescent (e.g. at open), in line with the single-writer
+    /// contract.
+    ///
+    /// Returns the number of payload objects deleted.
+    pub async fn collect_garbage(&self) -> Result<usize> {
+        self.inner.collect_garbage().await
+    }
+}
+
 #[async_trait]
 impl<T: ObjectStore> ObjectStore for MetaStore<T> {
     async fn put_opts(
         &self,
         location: &Path,
         payload: PutPayload,
-        mut opts: PutOptions,
+        opts: PutOptions,
     ) -> Result<PutResult> {
+        let create = matches!(opts.mode, PutMode::Create);
         let rt = self
             .inner
-            .update_meta_with(location, async |meta| {
-                // Without sidecar metadata the object does not logically
-                // exist; remember this so a conflicting orphaned data object
-                // (crash between the data and metadata writes) can be healed
-                // below instead of failing a `Create` forever.
-                let heal_create = meta.is_none() && matches!(opts.mode, PutMode::Create);
-
+            .update_meta_with(location, create, async |meta| {
                 if let PutMode::Update(v) = &opts.mode {
                     match meta {
                         Some(m) => {
-                            check_update_version(location, &m.e_tag, &m.original_version, v)?;
+                            check_update_version(location, &m.e_tag, &m.generation, v)?;
                         }
                         None => {
                             return Err(Error::Precondition {
@@ -243,11 +268,8 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
                             });
                         }
                     }
-
-                    opts.mode = PutMode::Overwrite;
                 }
 
-                let full_path = self.inner.full_path(location);
                 // Hash segment-by-segment so multi-segment payloads are not
                 // concatenated into a temporary contiguous buffer.
                 let mut hasher = sha3::Sha3_256::new();
@@ -256,52 +278,30 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
                 }
                 let hash: [u8; 32] = hasher.finalize().into();
 
-                let mut meta = Metadata {
+                // Write the payload to a fresh immutable generation; the
+                // metadata put below is the commit point.
+                let generation = new_generation();
+                let gen_path = self.inner.generation_path(location, &generation);
+                let mut data_opts = opts.clone();
+                data_opts.mode = PutMode::Overwrite;
+                self.inner
+                    .store
+                    .put_opts(&gen_path, payload.clone(), data_opts)
+                    .await?;
+
+                Ok(Metadata {
                     size: payload.content_length() as u64,
                     e_tag: Some(BASE64_URL_SAFE.encode(hash)),
                     original_tag: None,
                     original_version: None,
-                };
-
-                let rt = if heal_create {
-                    match self
-                        .inner
-                        .store
-                        .put_opts(&full_path, payload.clone(), opts.clone())
-                        .await
-                    {
-                        Err(Error::AlreadyExists { .. }) => {
-                            // The conflicting data object is an orphan left
-                            // by a crash; overwrite it to self-heal.
-                            //
-                            // NOTE: this weakens `PutMode::Create` across
-                            // processes. Another process racing `Create` on
-                            // the same key before our sidecar metadata is
-                            // visible can also classify our data object as
-                            // an orphan and overwrite it. Acceptable under
-                            // AndaDB's single-writer-per-store deployment
-                            // assumption; see the crate-level docs
-                            // ("Single-writer assumption").
-                            log::warn!(
-                                "MetaStore: healing orphaned data object at {location} on create"
-                            );
-                            opts.mode = PutMode::Overwrite;
-                            self.inner.store.put_opts(&full_path, payload, opts).await?
-                        }
-                        rt => rt?,
-                    }
-                } else {
-                    self.inner.store.put_opts(&full_path, payload, opts).await?
-                };
-                meta.original_tag = rt.e_tag;
-                meta.original_version = rt.version;
-                Ok(meta)
+                    generation: Some(generation),
+                })
             })
             .await?;
 
         Ok(PutResult {
             e_tag: rt.e_tag.clone(),
-            version: rt.original_version.clone(),
+            version: None,
             extensions: Extensions::default(),
         })
     }
@@ -311,37 +311,58 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
-        let full_path = self.inner.full_path(location);
-        let inner = self
-            .inner
-            .store
-            .put_multipart_opts(&full_path, opts)
-            .await?;
+        // Upload into a fresh immutable generation; `complete` switches the
+        // metadata pointer, so an unfinished upload never affects readers.
+        let generation = new_generation();
+        let gen_path = self.inner.generation_path(location, &generation);
+        let inner = self.inner.store.put_multipart_opts(&gen_path, opts).await?;
 
         Ok(Box::new(MetaStoreUploader {
             hasher: sha3::Sha3_256::new(),
             size: 0,
             location: location.clone(),
+            generation,
             store: self.inner.clone(),
             inner,
         }))
     }
 
-    async fn get_opts(&self, location: &Path, mut options: GetOptions) -> Result<GetResult> {
-        let full_path = self.inner.full_path(location);
-        let meta = self.inner.get_meta(location).await?;
-        apply_logical_etag_preconditions(
-            location,
-            &mut options,
-            meta.e_tag.as_deref(),
-            meta.original_tag.clone(),
-        )?;
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+        let mut retried = false;
+        loop {
+            let meta = self.inner.get_meta(location).await?;
+            let mut options = options.clone();
+            check_get_preconditions(location, &mut options, meta.e_tag.as_deref())?;
 
-        let mut res = self.inner.store.get_opts(&full_path, options).await?;
-        res.meta.location = self.inner.strip_prefix(res.meta.location);
-        res.meta.e_tag = meta.e_tag.clone();
-
-        Ok(res)
+            let payload_path = self
+                .inner
+                .payload_path(location, meta.generation.as_deref());
+            match self.inner.store.get_opts(&payload_path, options).await {
+                Ok(mut res) => {
+                    res.meta.location = location.clone();
+                    res.meta.e_tag = meta.e_tag.clone();
+                    // Versions are not reported: replaced generations are
+                    // reclaimed eagerly, so version-addressed reads cannot be
+                    // honoured. Conditional updates use the logical e_tag.
+                    res.meta.version = None;
+                    return Ok(res);
+                }
+                Err(Error::NotFound { source, .. }) => {
+                    // The cached pointer may be stale and its generation
+                    // already replaced and reclaimed; re-resolve once.
+                    if !retried && meta.generation.is_some() {
+                        retried = true;
+                        self.inner.refresh_meta(location).await?;
+                        continue;
+                    }
+                    return Err(Error::NotFound {
+                        path: location.to_string(),
+                        source,
+                    });
+                }
+                Err(err) => return Err(err),
+            }
+        }
     }
 
     async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
@@ -349,11 +370,30 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
             return Ok(Vec::new());
         }
 
-        let meta = self.inner.get_meta(location).await?;
-        validate_ranges("MetaStore", ranges, meta.size)?;
+        let mut retried = false;
+        loop {
+            let meta = self.inner.get_meta(location).await?;
+            validate_ranges("MetaStore", ranges, meta.size)?;
 
-        let full_path = self.inner.full_path(location);
-        self.inner.store.get_ranges(&full_path, ranges).await
+            let payload_path = self
+                .inner
+                .payload_path(location, meta.generation.as_deref());
+            match self.inner.store.get_ranges(&payload_path, ranges).await {
+                Ok(rt) => return Ok(rt),
+                Err(Error::NotFound { source, .. }) => {
+                    if !retried && meta.generation.is_some() {
+                        retried = true;
+                        self.inner.refresh_meta(location).await?;
+                        continue;
+                    }
+                    return Err(Error::NotFound {
+                        path: location.to_string(),
+                        source,
+                    });
+                }
+                Err(err) => return Err(err),
+            }
+        }
     }
 
     fn delete_stream(
@@ -366,7 +406,7 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
         self.inner
             .clone()
-            .list(prefix, ListingMetaPolicy::unchecked(true))
+            .list(prefix, ListingMetaPolicy::unchecked())
     }
 
     fn list_with_offset(
@@ -376,30 +416,68 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
     ) -> BoxStream<'static, Result<ObjectMeta>> {
         self.inner
             .clone()
-            .list_with_offset(prefix, offset, ListingMetaPolicy::unchecked(true))
+            .list_with_offset(prefix, offset, ListingMetaPolicy::unchecked())
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
         self.inner
-            .list_with_delimiter(prefix, ListingMetaPolicy::unchecked(true))
+            .list_with_delimiter(prefix, ListingMetaPolicy::unchecked())
             .await
     }
 
     async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
-        self.inner.copy_opts(from, to, options).await
+        let create = matches!(options.mode, CopyMode::Create);
+        // Copy the payload into a fresh generation of the target; the
+        // pointer switch below is the commit point.
+        let (src, generation) = self.inner.copy_payload(from, to, |_, _| Ok(())).await?;
+        self.inner
+            .update_meta_with(to, create, async |_| {
+                Ok(Metadata {
+                    size: src.size,
+                    e_tag: src.e_tag.clone(),
+                    original_tag: None,
+                    original_version: None,
+                    generation: Some(generation.clone()),
+                })
+            })
+            .await?;
+        Ok(())
     }
 
     async fn rename_opts(&self, from: &Path, to: &Path, options: RenameOptions) -> Result<()> {
-        self.inner.rename_opts(from, to, options).await
+        if from == to {
+            // A self-rename must not be forwarded (copy + delete would
+            // destroy the object). Validate existence and target mode, then
+            // leave the object untouched.
+            return self.inner.check_self_rename(from, &options).await;
+        }
+
+        let mode = match options.target_mode {
+            RenameTargetMode::Overwrite => CopyMode::Overwrite,
+            RenameTargetMode::Create => CopyMode::Create,
+        };
+        self.copy_opts(
+            from,
+            to,
+            CopyOptions {
+                mode,
+                extensions: options.extensions,
+            },
+        )
+        .await?;
+        match self.inner.delete_object(from).await {
+            Ok(()) | Err(Error::NotFound { .. }) => Ok(()),
+            Err(err) => Err(err),
+        }
     }
 }
 
 /// Handler for multipart uploads to a `MetaStore`.
 ///
 /// This struct:
-/// 1. Tracks the size of the uploaded content
+/// 1. Streams parts into a fresh immutable generation object
 /// 2. Calculates a hash of the content
-/// 3. Creates metadata when the upload completes
+/// 3. Commits the metadata pointer when the upload completes
 pub struct MetaStoreUploader<T: ObjectStore> {
     /// Hasher for calculating the content hash
     hasher: sha3::Sha3_256,
@@ -407,6 +485,8 @@ pub struct MetaStoreUploader<T: ObjectStore> {
     size: usize,
     /// Logical path of the object
     location: Path,
+    /// Generation the parts are uploaded into
+    generation: String,
     /// Shared sidecar core of the originating `MetaStore`
     store: Arc<SidecarStore<T, Metadata>>,
     /// Underlying multipart upload handler
@@ -433,34 +513,32 @@ impl<T: ObjectStore> MultipartUpload for MetaStoreUploader<T> {
         let hash: [u8; 32] = self.hasher.clone().finalize().into();
         let e_tag = Some(BASE64_URL_SAFE.encode(hash));
 
-        // Commit the data object and persist the metadata inside the per-key
-        // critical section of `update_meta_with`, so a concurrent multipart
-        // complete on the same location cannot interleave its data commit
-        // between our commit and our metadata write (which would leave
-        // mismatched data and metadata).
+        // Materialize the generation object, then switch the metadata
+        // pointer inside the per-key critical section. A failure (or crash)
+        // before the switch leaves the previous version fully readable.
         let store = self.store.clone();
         let location = self.location.clone();
+        let generation = self.generation.clone();
         let size = self.size as u64;
         let inner = &mut self.inner;
-        let mut result: Option<PutResult> = None;
-        let out = &mut result;
         store
-            .update_meta_with(&location, async |_| {
-                let rt = inner.complete().await?;
-                let obj = store.store.head(&store.full_path(&location)).await?;
-                *out = Some(rt);
+            .update_meta_with(&location, false, async |_| {
+                inner.complete().await?;
                 Ok(Metadata {
                     size,
                     e_tag: e_tag.clone(),
-                    original_tag: obj.e_tag,
-                    original_version: obj.version,
+                    original_tag: None,
+                    original_version: None,
+                    generation: Some(generation.clone()),
                 })
             })
             .await?;
 
-        let mut rt = result.expect("multipart complete did not run");
-        rt.e_tag = e_tag;
-        Ok(rt)
+        Ok(PutResult {
+            e_tag,
+            version: None,
+            extensions: Extensions::default(),
+        })
     }
 
     async fn abort(&mut self) -> Result<()> {
@@ -472,7 +550,8 @@ impl<T: ObjectStore> MultipartUpload for MetaStoreUploader<T> {
 ///
 /// Used by [`MetaStore`] to derive a content-addressable ETag, and by
 /// [`crate::encryption::EncryptedStore`] to hash the produced ciphertext.
-fn sha3_256(data: &[u8]) -> [u8; 32] {
+#[cfg(test)]
+pub(crate) fn sha3_256(data: &[u8]) -> [u8; 32] {
     let mut hasher = sha3::Sha3_256::new();
     hasher.update(data);
     hasher.finalize().into()
@@ -481,7 +560,7 @@ fn sha3_256(data: &[u8]) -> [u8; 32] {
 fn check_update_version(
     location: &Path,
     current_e_tag: &Option<String>,
-    current_version: &Option<String>,
+    current_generation: &Option<String>,
     update: &UpdateVersion,
 ) -> Result<()> {
     // Mirror `object_store`'s in-memory reference behavior: an e_tag is
@@ -500,39 +579,45 @@ fn check_update_version(
         });
     }
 
+    // Versions are not reported by this store (replaced generations are
+    // reclaimed eagerly), so a caller-provided version precondition can only
+    // come from a stale or foreign source; it is checked against the
+    // internal generation and therefore never matches.
     if let Some(version) = &update.version
-        && current_version.as_ref() != Some(version)
+        && current_generation.as_ref() != Some(version)
     {
         return Err(Error::Precondition {
             path: location.to_string(),
-            source: format!("{:?} does not match {:?}", current_version, update.version).into(),
+            source: format!(
+                "{:?} does not match {:?}",
+                current_generation, update.version
+            )
+            .into(),
         });
     }
 
     Ok(())
 }
 
-fn apply_logical_etag_preconditions(
+/// Evaluates `if_match` / `if_none_match` against the logical
+/// (content-addressable) ETag and strips them from the request: the payload
+/// object is immutable, so once the precondition holds against the current
+/// metadata there is nothing further for the backend to check.
+fn check_get_preconditions(
     location: &Path,
     options: &mut GetOptions,
     logical_e_tag: Option<&str>,
-    original_tag: Option<String>,
 ) -> Result<()> {
     let e_tag = logical_e_tag.unwrap_or("*");
 
-    if let Some(if_match) = options.if_match.take() {
-        if if_match != "*" && if_match.split(',').map(str::trim).all(|tag| tag != e_tag) {
-            return Err(Error::Precondition {
-                path: location.to_string(),
-                source: format!("{e_tag} does not match {if_match}").into(),
-            });
-        }
-
-        options.if_match = if if_match == "*" {
-            Some(if_match)
-        } else {
-            original_tag
-        };
+    if let Some(if_match) = options.if_match.take()
+        && if_match != "*"
+        && if_match.split(',').map(str::trim).all(|tag| tag != e_tag)
+    {
+        return Err(Error::Precondition {
+            path: location.to_string(),
+            source: format!("{e_tag} does not match {if_match}").into(),
+        });
     }
 
     if let Some(if_none_match) = options.if_none_match.take()
@@ -617,246 +702,62 @@ fn map_arc_error(store: &'static str, err: Arc<Error>) -> Error {
 }
 
 #[cfg(test)]
-pub(crate) mod test_support {
-    use super::*;
-    use async_trait::async_trait;
-    use futures::stream::BoxStream;
-    use object_store::memory::InMemory;
-    use std::{
-        fmt,
-        sync::atomic::{AtomicBool, Ordering},
-    };
-    use tokio::sync::Notify;
-
-    #[derive(Debug)]
-    pub(crate) enum GateOperation {
-        Put(Path),
-        Get(Path),
-        Copy { from: Path, to: Path },
-        Rename { from: Path, to: Path },
-        MultipartComplete(Path),
-    }
-
-    #[derive(Debug)]
-    pub(crate) struct OperationGate {
-        operation: GateOperation,
-        triggered: AtomicBool,
-        entered: Notify,
-        release: Notify,
-    }
-
-    impl OperationGate {
-        fn new(operation: GateOperation) -> Self {
-            Self {
-                operation,
-                triggered: AtomicBool::new(false),
-                entered: Notify::new(),
-                release: Notify::new(),
-            }
-        }
-
-        fn matches(&self, operation: &GateOperation) -> bool {
-            match (&self.operation, operation) {
-                (GateOperation::Put(expected), GateOperation::Put(actual))
-                | (GateOperation::Get(expected), GateOperation::Get(actual))
-                | (
-                    GateOperation::MultipartComplete(expected),
-                    GateOperation::MultipartComplete(actual),
-                ) => expected == actual,
-                (
-                    GateOperation::Copy {
-                        from: expected_from,
-                        to: expected_to,
-                    },
-                    GateOperation::Copy {
-                        from: actual_from,
-                        to: actual_to,
-                    },
-                )
-                | (
-                    GateOperation::Rename {
-                        from: expected_from,
-                        to: expected_to,
-                    },
-                    GateOperation::Rename {
-                        from: actual_from,
-                        to: actual_to,
-                    },
-                ) => expected_from == actual_from && expected_to == actual_to,
-                _ => false,
-            }
-        }
-
-        async fn pause(&self, operation: GateOperation) {
-            if self.matches(&operation) && !self.triggered.swap(true, Ordering::AcqRel) {
-                self.entered.notify_one();
-                self.release.notified().await;
-            }
-        }
-
-        pub(crate) async fn wait_until_entered(&self) {
-            self.entered.notified().await;
-        }
-
-        pub(crate) fn release(&self) {
-            self.release.notify_one();
-        }
-    }
-
-    #[derive(Clone, Debug)]
-    pub(crate) struct GatedStore {
-        inner: InMemory,
-        gate: Arc<OperationGate>,
-    }
-
-    impl GatedStore {
-        pub(crate) fn new(operation: GateOperation) -> (Self, Arc<OperationGate>) {
-            let gate = Arc::new(OperationGate::new(operation));
-            (
-                Self {
-                    inner: InMemory::new(),
-                    gate: gate.clone(),
-                },
-                gate,
-            )
-        }
-    }
-
-    impl fmt::Display for GatedStore {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "GatedStore")
-        }
-    }
-
-    #[async_trait]
-    impl ObjectStore for GatedStore {
-        async fn put_opts(
-            &self,
-            location: &Path,
-            payload: PutPayload,
-            opts: PutOptions,
-        ) -> Result<PutResult> {
-            let result = self.inner.put_opts(location, payload, opts).await;
-            if result.is_ok() {
-                self.gate.pause(GateOperation::Put(location.clone())).await;
-            }
-            result
-        }
-
-        async fn put_multipart_opts(
-            &self,
-            location: &Path,
-            opts: PutMultipartOptions,
-        ) -> Result<Box<dyn MultipartUpload>> {
-            let inner = self.inner.put_multipart_opts(location, opts).await?;
-            Ok(Box::new(GatedUpload {
-                inner,
-                location: location.clone(),
-                gate: self.gate.clone(),
-            }))
-        }
-
-        async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
-            let result = self.inner.get_opts(location, options).await;
-            if result.is_ok() {
-                self.gate.pause(GateOperation::Get(location.clone())).await;
-            }
-            result
-        }
-
-        async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
-            self.inner.get_ranges(location, ranges).await
-        }
-
-        fn delete_stream(
-            &self,
-            locations: BoxStream<'static, Result<Path>>,
-        ) -> BoxStream<'static, Result<Path>> {
-            self.inner.delete_stream(locations)
-        }
-
-        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
-            self.inner.list(prefix)
-        }
-
-        fn list_with_offset(
-            &self,
-            prefix: Option<&Path>,
-            offset: &Path,
-        ) -> BoxStream<'static, Result<ObjectMeta>> {
-            self.inner.list_with_offset(prefix, offset)
-        }
-
-        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
-            self.inner.list_with_delimiter(prefix).await
-        }
-
-        async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
-            let result = self.inner.copy_opts(from, to, options).await;
-            if result.is_ok() {
-                self.gate
-                    .pause(GateOperation::Copy {
-                        from: from.clone(),
-                        to: to.clone(),
-                    })
-                    .await;
-            }
-            result
-        }
-
-        async fn rename_opts(&self, from: &Path, to: &Path, options: RenameOptions) -> Result<()> {
-            let result = self.inner.rename_opts(from, to, options).await;
-            if result.is_ok() {
-                self.gate
-                    .pause(GateOperation::Rename {
-                        from: from.clone(),
-                        to: to.clone(),
-                    })
-                    .await;
-            }
-            result
-        }
-    }
-
-    #[derive(Debug)]
-    struct GatedUpload {
-        inner: Box<dyn MultipartUpload>,
-        location: Path,
-        gate: Arc<OperationGate>,
-    }
-
-    #[async_trait]
-    impl MultipartUpload for GatedUpload {
-        fn put_part(&mut self, payload: PutPayload) -> UploadPart {
-            self.inner.put_part(payload)
-        }
-
-        async fn complete(&mut self) -> Result<PutResult> {
-            let result = self.inner.complete().await;
-            if result.is_ok() {
-                self.gate
-                    .pause(GateOperation::MultipartComplete(self.location.clone()))
-                    .await;
-            }
-            result
-        }
-
-        async fn abort(&mut self) -> Result<()> {
-            self.inner.abort().await
-        }
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
+    use futures::TryStreamExt;
     use object_store::{integration::*, local::LocalFileSystem, memory::InMemory};
     use tempfile::TempDir;
 
     const NON_EXISTENT_NAME: &str = "nonexistentname";
 
+    /// Serialization shape of the pre-0.10 mutable dual-object layout: the
+    /// `o`/`v` fields were always present and there was no generation.
+    #[derive(Serialize)]
+    struct LegacyMetadata {
+        #[serde(rename = "s")]
+        size: u64,
+        #[serde(rename = "e")]
+        e_tag: Option<String>,
+        #[serde(rename = "o")]
+        original_tag: Option<String>,
+        #[serde(rename = "v")]
+        original_version: Option<String>,
+    }
+
+    /// Writes an object in the legacy (pre-0.10) layout directly into the
+    /// backend: payload at `data/<location>`, metadata without a generation.
+    async fn put_legacy_object<T: ObjectStore>(inner: &T, location: &Path, payload: &'static [u8]) {
+        let put = inner
+            .put(
+                &Path::from(format!("data/{location}")),
+                Bytes::from_static(payload).into(),
+            )
+            .await
+            .unwrap();
+        let meta = LegacyMetadata {
+            size: payload.len() as u64,
+            e_tag: Some(BASE64_URL_SAFE.encode(sha3_256(payload))),
+            original_tag: put.e_tag,
+            original_version: put.version,
+        };
+        let mut buf = Vec::new();
+        cbor2::to_writer(&meta, &mut buf).unwrap();
+        inner
+            .put(&Path::from(format!("meta/{location}")), buf.into())
+            .await
+            .unwrap();
+    }
+
+    /// Resolves the full backend path of `location`'s current payload.
+    async fn payload_backend_path<T: ObjectStore>(storage: &MetaStore<T>, location: &Path) -> Path {
+        let meta = storage.inner.get_meta(location).await.unwrap();
+        storage
+            .inner
+            .payload_path(location, meta.generation.as_deref())
+    }
+
     #[test]
-    fn builder_display_debug_and_prefix_helpers_are_exercised() {
+    fn builder_display_debug_and_path_helpers_are_exercised() {
         let storage = MetaStoreBuilder::new(InMemory::new(), 100)
             .with_meta_cache_ttl(Duration::from_secs(1))
             .build();
@@ -866,26 +767,27 @@ mod tests {
 
         let location = Path::from("nested/object");
         assert_eq!(
-            storage.inner.full_path(&location).to_string(),
-            "data/nested/object"
-        );
-        assert_eq!(
             storage.inner.meta_path(&location).to_string(),
             "meta/nested/object"
         );
         assert_eq!(
-            storage
-                .inner
-                .strip_prefix(Path::from("data/nested/object"))
-                .to_string(),
-            "nested/object"
+            storage.inner.legacy_path(&location).to_string(),
+            "data/nested/object"
         );
         assert_eq!(
             storage
                 .inner
-                .strip_prefix(Path::from("other/nested/object"))
+                .generation_path(&location, "0123-abcd")
                 .to_string(),
-            "other/nested/object"
+            "gen/nested/object/0123-abcd"
+        );
+        assert_eq!(
+            storage.inner.payload_path(&location, None),
+            storage.inner.legacy_path(&location)
+        );
+        assert_eq!(
+            storage.inner.payload_path(&location, Some("0123-abcd")),
+            storage.inner.generation_path(&location, "0123-abcd")
         );
     }
 
@@ -1003,6 +905,7 @@ mod tests {
     #[tokio::test]
     async fn get_ranges_requires_metadata() {
         let inner = InMemory::new();
+        // A legacy payload without a commit point does not logically exist.
         inner
             .put(
                 &Path::from("data/missing-meta"),
@@ -1064,7 +967,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn copy_and_rename_refresh_original_tag_for_logical_etag_preconditions() {
+    async fn copy_and_rename_preserve_logical_etag_preconditions() {
         let storage = MetaStoreBuilder::new(InMemory::new(), 100).build();
         let source = Path::from("copy-source");
         let copied = Path::from("copy-target");
@@ -1162,6 +1065,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn versions_are_not_reported() {
+        let storage = MetaStoreBuilder::new(InMemory::new(), 100).build();
+        let location = Path::from("versioned");
+
+        // Replaced generations are reclaimed eagerly, so version-addressed
+        // reads cannot be honoured; no operation reports a version and
+        // conditional updates rely on the content-addressable e_tag.
+        let put = storage
+            .put(&location, Bytes::from_static(b"v1").into())
+            .await
+            .unwrap();
+        assert_eq!(put.version, None);
+
+        let res = storage.get(&location).await.unwrap();
+        assert_eq!(res.meta.version, None);
+        let listed: Vec<_> = storage.list(None).try_collect().await.unwrap();
+        assert_eq!(listed[0].version, None);
+
+        // An e_tag-only Update succeeds; any version precondition fails.
+        storage
+            .put_opts(
+                &location,
+                Bytes::from_static(b"v2").into(),
+                PutOptions {
+                    mode: PutMode::Update(UpdateVersion {
+                        e_tag: put.e_tag,
+                        version: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn delete_nonexistent_reports_logical_path() {
         let root = TempDir::new().unwrap();
         let storage =
@@ -1179,57 +1118,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_tolerates_missing_metadata_and_heals_orphans() {
-        let root = TempDir::new().unwrap();
-        let storage =
-            MetaStoreBuilder::new(LocalFileSystem::new_with_prefix(root.path()).unwrap(), 100)
-                .build();
-        let location = Path::from("orphan");
+    async fn delete_removes_commit_point_and_payload() {
+        let inner = InMemory::new();
+        let storage = MetaStoreBuilder::new(inner.clone(), 100).build();
+        let location = Path::from("delete-me");
 
-        // Orphaned data (metadata lost): delete succeeds and removes the data.
         storage
             .put(&location, Bytes::from_static(b"abc").into())
             .await
             .unwrap();
-        storage
-            .inner
-            .store
-            .delete(&Path::from("meta/orphan"))
-            .await
-            .unwrap();
+        let payload = payload_backend_path(&storage, &location).await;
+
         storage.delete(&location).await.unwrap();
+        assert!(matches!(
+            inner.get(&Path::from("meta/delete-me")).await,
+            Err(Error::NotFound { .. })
+        ));
+        assert!(matches!(
+            inner.get(&payload).await,
+            Err(Error::NotFound { .. })
+        ));
+
+        // A payload without a commit point does not logically exist, so
+        // deleting it reports NotFound; garbage collection reclaims it.
+        inner
+            .put(
+                &Path::from("data/orphan-legacy"),
+                Bytes::from_static(b"zzz").into(),
+            )
+            .await
+            .unwrap();
         let err = storage
-            .inner
-            .store
-            .get(&Path::from("data/orphan"))
+            .delete(&Path::from("orphan-legacy"))
             .await
             .unwrap_err();
-        assert!(matches!(err, Error::NotFound { .. }));
+        assert!(matches!(&err, Error::NotFound { path, .. } if path == "orphan-legacy"));
+        assert_eq!(storage.collect_garbage().await.unwrap(), 1);
+        assert!(matches!(
+            inner.get(&Path::from("data/orphan-legacy")).await,
+            Err(Error::NotFound { .. })
+        ));
 
-        // Orphaned metadata (data lost): delete reports NotFound for the data
-        // object but still cleans up the metadata.
+        // Deleting a key whose payload is already gone still succeeds: the
+        // commit point is the source of truth.
         storage
             .put(&location, Bytes::from_static(b"abc").into())
             .await
             .unwrap();
-        storage
-            .inner
-            .store
-            .delete(&Path::from("data/orphan"))
-            .await
-            .unwrap();
-        let err = storage.delete(&location).await.unwrap_err();
-        assert!(
-            matches!(&err, Error::NotFound { path, .. } if path == "orphan"),
-            "unexpected error: {err:?}"
-        );
-        let err = storage
-            .inner
-            .store
-            .get(&Path::from("meta/orphan"))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, Error::NotFound { .. }));
+        let payload = payload_backend_path(&storage, &location).await;
+        inner.delete(&payload).await.unwrap();
+        storage.delete(&location).await.unwrap();
+        assert!(matches!(
+            storage.get(&location).await,
+            Err(Error::NotFound { .. })
+        ));
     }
 
     #[tokio::test]
@@ -1242,7 +1184,8 @@ mod tests {
             .put(&location, Bytes::from_static(b"old").into())
             .await
             .unwrap();
-        // Corrupt the sidecar metadata (e.g. a torn write before a crash).
+        // Corrupt the commit point (external corruption; backend puts are
+        // atomic in the crash model).
         inner
             .put(
                 &Path::from("meta/self-heal"),
@@ -1271,133 +1214,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn orphaned_data_does_not_fail_listings() {
-        use futures::TryStreamExt;
-
-        let inner = InMemory::new();
-        let storage = MetaStoreBuilder::new(inner.clone(), 100).build();
-        let healthy = Path::from("list/healthy");
-        let orphan = Path::from("list/orphan");
-
-        storage
-            .put(&healthy, Bytes::from_static(b"abc").into())
-            .await
-            .unwrap();
-        storage
-            .put(&orphan, Bytes::from_static(b"def").into())
-            .await
-            .unwrap();
-        // Simulate a crash between the data and metadata writes.
-        inner.delete(&Path::from("meta/list/orphan")).await.unwrap();
-
-        let reopened = MetaStoreBuilder::new(inner.clone(), 100).build();
-        let listed: Vec<_> = reopened
-            .list(Some(&Path::from("list")))
-            .try_collect()
-            .await
-            .unwrap();
-        assert_eq!(listed.len(), 2);
-        for obj in &listed {
-            if obj.location == orphan {
-                assert_eq!(obj.e_tag, None);
-            } else {
-                assert!(obj.e_tag.is_some());
-            }
-        }
-
-        let listed: Vec<_> = reopened
-            .list_with_offset(Some(&Path::from("list")), &Path::from("list/a"))
-            .try_collect()
-            .await
-            .unwrap();
-        assert_eq!(listed.len(), 2);
-
-        let rt = reopened
-            .list_with_delimiter(Some(&Path::from("list")))
-            .await
-            .unwrap();
-        assert_eq!(rt.objects.len(), 2);
-        let orphaned = rt.objects.iter().find(|o| o.location == orphan).unwrap();
-        assert_eq!(orphaned.e_tag, None);
-    }
-
-    #[tokio::test]
-    async fn corrupted_metadata_does_not_fail_listings() {
-        use futures::TryStreamExt;
-
-        let inner = InMemory::new();
-        let storage = MetaStoreBuilder::new(inner.clone(), 100).build();
-        let healthy = Path::from("clist/healthy");
-        let corrupt = Path::from("clist/corrupt");
-
-        storage
-            .put(&healthy, Bytes::from_static(b"abc").into())
-            .await
-            .unwrap();
-        storage
-            .put(&corrupt, Bytes::from_static(b"def").into())
-            .await
-            .unwrap();
-        // Simulate a torn sidecar write before a crash: the document exists
-        // but no longer decodes.
-        inner
-            .put(
-                &Path::from("meta/clist/corrupt"),
-                Bytes::from_static(b"\xffgarbage").into(),
-            )
-            .await
-            .unwrap();
-
-        // A fresh instance (bypassing the cache) must list both objects; the
-        // corrupted one is reported as an orphan (no logical e_tag), matching
-        // the write path that treats it as absent and self-heals it.
-        let reopened = MetaStoreBuilder::new(inner.clone(), 100).build();
-        let listed: Vec<_> = reopened
-            .list(Some(&Path::from("clist")))
-            .try_collect()
-            .await
-            .unwrap();
-        assert_eq!(listed.len(), 2);
-        for obj in &listed {
-            if obj.location == corrupt {
-                assert_eq!(obj.e_tag, None);
-            } else {
-                assert!(obj.e_tag.is_some());
-            }
-        }
-
-        let listed: Vec<_> = reopened
-            .list_with_offset(Some(&Path::from("clist")), &Path::from("clist/a"))
-            .try_collect()
-            .await
-            .unwrap();
-        assert_eq!(listed.len(), 2);
-
-        let rt = reopened
-            .list_with_delimiter(Some(&Path::from("clist")))
-            .await
-            .unwrap();
-        assert_eq!(rt.objects.len(), 2);
-        let orphaned = rt.objects.iter().find(|o| o.location == corrupt).unwrap();
-        assert_eq!(orphaned.e_tag, None);
-
-        // Reads still fail loudly (the listing tolerance must not mask the
-        // corruption from readers), and an overwrite heals the object.
-        assert!(reopened.get(&corrupt).await.is_err());
-        reopened
-            .put(&corrupt, Bytes::from_static(b"new").into())
-            .await
-            .unwrap();
-        let listed: Vec<_> = reopened
-            .list(Some(&Path::from("clist")))
-            .try_collect()
-            .await
-            .unwrap();
-        assert!(listed.iter().all(|o| o.e_tag.is_some()));
-    }
-
-    #[tokio::test]
-    async fn create_heals_orphaned_data() {
+    async fn create_over_corrupted_metadata_heals() {
         let inner = InMemory::new();
         let storage = MetaStoreBuilder::new(inner.clone(), 100).build();
         let location = Path::from("create-heal");
@@ -1406,10 +1223,16 @@ mod tests {
             .put(&location, Bytes::from_static(b"old").into())
             .await
             .unwrap();
-        inner.delete(&Path::from("meta/create-heal")).await.unwrap();
+        inner
+            .put(
+                &Path::from("meta/create-heal"),
+                Bytes::from_static(b"\xffgarbage").into(),
+            )
+            .await
+            .unwrap();
 
-        // The object no longer logically exists, so `Create` must succeed
-        // over the orphaned data object.
+        // The object is unreadable, so `Create` treats it as absent and
+        // rebuilds it.
         let reopened = MetaStoreBuilder::new(inner.clone(), 100).build();
         reopened
             .put_opts(
@@ -1447,6 +1270,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn listing_skips_corrupt_commit_points_and_orphans() {
+        let inner = InMemory::new();
+        let storage = MetaStoreBuilder::new(inner.clone(), 100).build();
+        let healthy = Path::from("clist/healthy");
+        let corrupt = Path::from("clist/corrupt");
+
+        storage
+            .put(&healthy, Bytes::from_static(b"abc").into())
+            .await
+            .unwrap();
+        storage
+            .put(&corrupt, Bytes::from_static(b"def").into())
+            .await
+            .unwrap();
+        inner
+            .put(
+                &Path::from("meta/clist/corrupt"),
+                Bytes::from_static(b"\xffgarbage").into(),
+            )
+            .await
+            .unwrap();
+        // An uncommitted generation (e.g. from a crash before the pointer
+        // switch) is invisible to listings by construction.
+        inner
+            .put(
+                &Path::from("gen/clist/orphan/0000000000000001-00000000"),
+                Bytes::from_static(b"ghost").into(),
+            )
+            .await
+            .unwrap();
+
+        let reopened = MetaStoreBuilder::new(inner.clone(), 100).build();
+        let listed: Vec<_> = reopened
+            .list(Some(&Path::from("clist")))
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].location, healthy);
+        assert!(listed[0].e_tag.is_some());
+        assert_eq!(listed[0].size, 3);
+
+        let listed: Vec<_> = reopened
+            .list_with_offset(Some(&Path::from("clist")), &Path::from("clist/a"))
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+
+        let rt = reopened
+            .list_with_delimiter(Some(&Path::from("clist")))
+            .await
+            .unwrap();
+        assert_eq!(rt.objects.len(), 1);
+
+        // Reads of the corrupted key still fail loudly (the listing
+        // tolerance must not mask the corruption), and an overwrite heals it.
+        assert!(reopened.get(&corrupt).await.is_err());
+        reopened
+            .put(&corrupt, Bytes::from_static(b"new").into())
+            .await
+            .unwrap();
+        let listed: Vec<_> = reopened
+            .list(Some(&Path::from("clist")))
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().all(|o| o.e_tag.is_some()));
+    }
+
+    #[tokio::test]
     async fn rename_and_copy_to_self_preserve_object() {
         let storage = MetaStoreBuilder::new(InMemory::new(), 100).build();
         let location = Path::from("self-target");
@@ -1477,50 +1372,299 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn crash_between_data_and_meta_write_is_recoverable() {
-        use futures::TryStreamExt;
-
-        let (fault, handle) = crate::FaultStore::wrap(InMemory::new());
+    async fn crash_before_pointer_switch_preserves_old_version() {
+        let inner = InMemory::new();
+        let (fault, handle) = crate::FaultStore::wrap(inner.clone());
         let storage = MetaStoreBuilder::new(fault, 100).build();
         let location = Path::from("crash/object");
 
-        // Fail the metadata write: the data object lands, the sidecar
-        // metadata does not (crash window of the two-object put).
+        storage
+            .put(&location, Bytes::from_static(b"v1").into())
+            .await
+            .unwrap();
+
+        // Fail the commit point write of the overwrite: the new generation
+        // lands, the pointer switch does not (crash window of the put).
         handle.push_rule(crate::FaultRule::fail_once(crate::FaultOp::Put, "meta/"));
         let err = storage
-            .put(&location, Bytes::from_static(b"v1").into())
+            .put(&location, Bytes::from_static(b"v2").into())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("injected fault"));
 
-        // The orphan reads as NotFound under the logical path...
-        let err = storage.get(&location).await.unwrap_err();
-        assert!(
-            matches!(&err, Error::NotFound { path, .. } if path == "crash/object"),
-            "unexpected error: {err:?}"
-        );
+        // The old version stays fully readable — through the warm cache...
+        let bytes = storage.get(&location).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"v1"));
 
-        // ...does not fail listings (the recovery scan)...
-        let listed: Vec<_> = storage
+        // ...and after a "reboot" (fresh instance, cold cache).
+        let reopened = MetaStoreBuilder::new(inner.clone(), 100).build();
+        let bytes = reopened
+            .get(&location)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"v1"));
+
+        // Listings show exactly the committed object.
+        let listed: Vec<_> = reopened
             .list(Some(&Path::from("crash")))
             .try_collect()
             .await
             .unwrap();
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].e_tag, None);
-        let rt = storage
-            .list_with_delimiter(Some(&Path::from("crash")))
+        assert_eq!(
+            listed[0].e_tag.as_deref(),
+            Some(BASE64_URL_SAFE.encode(sha3_256(b"v1")).as_str())
+        );
+
+        // The abandoned generation is garbage; collection reclaims it and
+        // the object remains intact. (Generations minted in the same
+        // millisecond as the collection start are conservatively skipped,
+        // hence the sleep.)
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        assert_eq!(reopened.collect_garbage().await.unwrap(), 1);
+        let bytes = reopened
+            .get(&location)
+            .await
+            .unwrap()
+            .bytes()
             .await
             .unwrap();
-        assert_eq!(rt.objects.len(), 1);
+        assert_eq!(bytes, Bytes::from_static(b"v1"));
 
-        // ...and both Overwrite and Create self-heal it.
+        // The next write succeeds normally.
+        storage
+            .put(&location, Bytes::from_static(b"v3").into())
+            .await
+            .unwrap();
+        let bytes = storage.get(&location).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"v3"));
+    }
+
+    #[tokio::test]
+    async fn crash_after_pointer_switch_serves_new_version() {
+        let (fault, handle) = crate::FaultStore::wrap(InMemory::new());
+        let storage = MetaStoreBuilder::new(fault, 100).build();
+        let location = Path::from("crash/object");
+
+        storage
+            .put(&location, Bytes::from_static(b"v1").into())
+            .await
+            .unwrap();
+
+        // Fail the best-effort cleanup of the replaced generation: the
+        // pointer switch has already committed, so the put succeeds.
+        handle.push_rule(crate::FaultRule::fail_once(crate::FaultOp::Delete, "gen/"));
         storage
             .put(&location, Bytes::from_static(b"v2").into())
             .await
             .unwrap();
+
         let bytes = storage.get(&location).await.unwrap().bytes().await.unwrap();
         assert_eq!(bytes, Bytes::from_static(b"v2"));
+
+        // The replaced generation survived the failed cleanup; garbage
+        // collection reclaims exactly it (after the same-millisecond
+        // in-flight guard has lapsed).
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        assert_eq!(storage.collect_garbage().await.unwrap(), 1);
+        let bytes = storage.get(&location).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"v2"));
+        assert_eq!(storage.collect_garbage().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn collect_garbage_preserves_referenced_payloads() {
+        let inner = InMemory::new();
+        let storage = MetaStoreBuilder::new(inner.clone(), 100).build();
+
+        // A generation-layout object and a legacy-layout object.
+        let modern = Path::from("gc/modern");
+        let legacy = Path::from("gc/legacy");
+        storage
+            .put(&modern, Bytes::from_static(b"modern").into())
+            .await
+            .unwrap();
+        put_legacy_object(&inner, &legacy, b"legacy").await;
+
+        // Plant garbage: an unreferenced old generation and an orphaned
+        // legacy payload without a commit point.
+        inner
+            .put(
+                // Outside the managed prefixes: must never be touched.
+                &Path::from("gc-noise/modern"),
+                Bytes::from_static(b"noise").into(),
+            )
+            .await
+            .unwrap();
+        inner
+            .put(
+                &Path::from("gen/gc/modern/0000000000000001-deadbeef"),
+                Bytes::from_static(b"stale-gen").into(),
+            )
+            .await
+            .unwrap();
+        inner
+            .put(
+                &Path::from("data/gc/orphan"),
+                Bytes::from_static(b"orphan").into(),
+            )
+            .await
+            .unwrap();
+        // An in-flight generation (timestamp in the future) must survive.
+        inner
+            .put(
+                &Path::from("gen/gc/inflight/ffffffffffffffff-00000000"),
+                Bytes::from_static(b"inflight").into(),
+            )
+            .await
+            .unwrap();
+
+        let deleted = storage.collect_garbage().await.unwrap();
+        assert_eq!(deleted, 2, "stale generation + orphaned legacy payload");
+
+        // Referenced payloads and unknown/in-flight objects are untouched.
+        let bytes = storage.get(&modern).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"modern"));
+        let bytes = storage.get(&legacy).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"legacy"));
+        assert!(inner.get(&Path::from("gc-noise/modern")).await.is_ok());
+        assert!(
+            inner
+                .get(&Path::from("gen/gc/inflight/ffffffffffffffff-00000000"))
+                .await
+                .is_ok()
+        );
+        assert!(matches!(
+            inner
+                .get(&Path::from("gen/gc/modern/0000000000000001-deadbeef"))
+                .await,
+            Err(Error::NotFound { .. })
+        ));
+        assert!(matches!(
+            inner.get(&Path::from("data/gc/orphan")).await,
+            Err(Error::NotFound { .. })
+        ));
+
+        // A key whose commit point is corrupted keeps all its payloads.
+        inner
+            .put(
+                &Path::from("meta/gc/modern"),
+                Bytes::from_static(b"\xffgarbage").into(),
+            )
+            .await
+            .unwrap();
+        let reopened = MetaStoreBuilder::new(inner.clone(), 100).build();
+        assert_eq!(reopened.collect_garbage().await.unwrap(), 0);
+
+        // Idempotent once everything is clean.
+        let clean = MetaStoreBuilder::new(InMemory::new(), 100).build();
+        clean
+            .put(&modern, Bytes::from_static(b"x").into())
+            .await
+            .unwrap();
+        assert_eq!(clean.collect_garbage().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_layout_readable_and_upgraded_on_overwrite() {
+        let inner = InMemory::new();
+        let location = Path::from("compat/legacy");
+        put_legacy_object(&inner, &location, b"legacy payload").await;
+
+        let storage = MetaStoreBuilder::new(inner.clone(), 100).build();
+
+        // Reads, range reads and listings all work on the legacy layout.
+        let res = storage.get(&location).await.unwrap();
+        assert_eq!(
+            res.meta.e_tag.as_deref(),
+            Some(BASE64_URL_SAFE.encode(sha3_256(b"legacy payload")).as_str())
+        );
+        assert_eq!(res.meta.version, None); // legacy: no generation
+        let bytes = res.bytes().await.unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"legacy payload"));
+
+        let requested = 0..6;
+        let ranges = storage
+            .get_ranges(&location, std::slice::from_ref(&requested))
+            .await
+            .unwrap();
+        assert_eq!(ranges[0], Bytes::from_static(b"legacy"));
+
+        let listed: Vec<_> = storage
+            .list(Some(&Path::from("compat")))
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].size, 14);
+
+        // The first overwrite migrates the key to the generation layout and
+        // removes the legacy payload.
+        storage
+            .put(&location, Bytes::from_static(b"upgraded").into())
+            .await
+            .unwrap();
+        let meta = storage.inner.get_meta(&location).await.unwrap();
+        assert!(meta.generation.is_some());
+        let bytes = storage.get(&location).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"upgraded"));
+        assert!(matches!(
+            inner.get(&Path::from("data/compat/legacy")).await,
+            Err(Error::NotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_is_arbitrated_across_instances() {
+        let inner = InMemory::new();
+        let a = Arc::new(MetaStoreBuilder::new(inner.clone(), 100).build());
+        let b = Arc::new(MetaStoreBuilder::new(inner.clone(), 100).build());
+        let location = Path::from("create-race");
+
+        // Two independent instances (separate caches, shared backend) race
+        // `Create` on the same key: the backend's conditional write of the
+        // commit point admits exactly one winner.
+        let mut tasks = Vec::new();
+        for (i, storage) in [a.clone(), b.clone(), a.clone(), b.clone()]
+            .into_iter()
+            .enumerate()
+        {
+            let location = location.clone();
+            tasks.push(tokio::spawn(async move {
+                storage
+                    .put_opts(
+                        &location,
+                        Bytes::from(vec![i as u8; 4]).into(),
+                        PutOptions {
+                            mode: PutMode::Create,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            }));
+        }
+        let mut winners = 0;
+        for task in tasks {
+            match task.await.unwrap() {
+                Ok(_) => winners += 1,
+                Err(Error::AlreadyExists { .. }) => {}
+                Err(err) => panic!("unexpected error: {err:?}"),
+            }
+        }
+        assert_eq!(winners, 1);
+
+        // The winner's committed payload and metadata agree.
+        let fresh = MetaStoreBuilder::new(inner, 100).build();
+        let res = fresh.get(&location).await.unwrap();
+        let e_tag = res.meta.e_tag.clone();
+        let bytes = res.bytes().await.unwrap();
+        assert_eq!(
+            e_tag.as_deref(),
+            Some(BASE64_URL_SAFE.encode(sha3_256(&bytes)).as_str())
+        );
     }
 
     #[tokio::test]
@@ -1544,13 +1688,19 @@ mod tests {
             task.await.unwrap().unwrap();
         }
 
-        // The winning put's data and metadata must agree.
+        // The winning put's payload and metadata must agree.
         let res = storage.get(&location).await.unwrap();
         let e_tag = res.meta.e_tag.clone();
         let bytes = res.bytes().await.unwrap();
         assert!(contents.contains(&bytes));
         let expected = BASE64_URL_SAFE.encode(sha3_256(&bytes));
         assert_eq!(e_tag.as_deref(), Some(expected.as_str()));
+
+        // The object stays intact across garbage collection.
+        storage.collect_garbage().await.unwrap();
+        let res = storage.get(&location).await.unwrap();
+        let bytes = res.bytes().await.unwrap();
+        assert!(contents.contains(&bytes));
     }
 
     #[tokio::test]
@@ -1569,7 +1719,7 @@ mod tests {
         ra.unwrap();
         rb.unwrap();
 
-        // Whichever complete ran last, data and metadata must agree.
+        // Whichever complete committed last, payload and metadata agree.
         let res = storage.get(&location).await.unwrap();
         let e_tag = res.meta.e_tag.clone();
         let bytes = res.bytes().await.unwrap();
@@ -1579,132 +1729,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_waits_for_in_flight_put_on_the_same_key() {
-        use crate::test_support::{GateOperation, GatedStore};
+    async fn multipart_crash_before_complete_preserves_old_version() {
+        let (fault, handle) = crate::FaultStore::wrap(InMemory::new());
+        let storage = MetaStoreBuilder::new(fault, 100).build();
+        let location = Path::from("multipart-crash");
 
-        let location = Path::from("delete-put-race");
-        let (inner, gate) = GatedStore::new(GateOperation::Put(Path::from("data/delete-put-race")));
-        let storage = Arc::new(MetaStoreBuilder::new(inner, 100).build());
-
-        let put_storage = storage.clone();
-        let put_location = location.clone();
-        let put = tokio::spawn(async move {
-            put_storage
-                .put(&put_location, Bytes::from_static(b"new-value").into())
-                .await
-        });
-        gate.wait_until_entered().await;
-
-        let delete_storage = storage.clone();
-        let delete_location = location.clone();
-        let mut delete = tokio::spawn(async move { delete_storage.delete(&delete_location).await });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut delete)
-                .await
-                .is_err(),
-            "delete bypassed the put's per-key mutation lease"
-        );
-
-        gate.release();
-        put.await.unwrap().unwrap();
-        delete.await.unwrap().unwrap();
-        assert!(matches!(
-            storage.get(&location).await,
-            Err(Error::NotFound { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn target_put_waits_for_copy_and_preserves_data_metadata_pair() {
-        use crate::test_support::{GateOperation, GatedStore};
-
-        let source = Path::from("copy-put-source");
-        let target = Path::from("copy-put-target");
-        let (inner, gate) = GatedStore::new(GateOperation::Copy {
-            from: Path::from("data/copy-put-source"),
-            to: Path::from("data/copy-put-target"),
-        });
-        let storage = Arc::new(MetaStoreBuilder::new(inner, 100).build());
         storage
-            .put(&source, Bytes::from_static(b"source-value").into())
+            .put(&location, Bytes::from_static(b"v1").into())
             .await
             .unwrap();
 
-        let copy_storage = storage.clone();
-        let copy_source = source.clone();
-        let copy_target = target.clone();
-        let copy = tokio::spawn(async move { copy_storage.copy(&copy_source, &copy_target).await });
-        gate.wait_until_entered().await;
-
-        let put_storage = storage.clone();
-        let put_target = target.clone();
-        let mut put = tokio::spawn(async move {
-            put_storage
-                .put(&put_target, Bytes::from_static(b"put-value").into())
-                .await
-        });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut put)
-                .await
-                .is_err(),
-            "target put bypassed the copy's two-key mutation lease"
-        );
-
-        gate.release();
-        copy.await.unwrap().unwrap();
-        put.await.unwrap().unwrap();
-        let result = storage.get(&target).await.unwrap();
-        let e_tag = result.meta.e_tag.clone();
-        let bytes = result.bytes().await.unwrap();
-        assert_eq!(bytes, Bytes::from_static(b"put-value"));
-        assert_eq!(e_tag, Some(BASE64_URL_SAFE.encode(sha3_256(&bytes))));
-    }
-
-    #[tokio::test]
-    async fn rename_waits_for_target_multipart_complete() {
-        use crate::test_support::{GateOperation, GatedStore};
-
-        let source = Path::from("rename-multipart-source");
-        let target = Path::from("rename-multipart-target");
-        let (inner, gate) = GatedStore::new(GateOperation::MultipartComplete(Path::from(
-            "data/rename-multipart-target",
-        )));
-        let storage = Arc::new(MetaStoreBuilder::new(inner, 100).build());
-        storage
-            .put(&source, Bytes::from_static(b"source-value").into())
-            .await
-            .unwrap();
-        let mut upload = storage.put_multipart(&target).await.unwrap();
+        let mut upload = storage.put_multipart(&location).await.unwrap();
         upload
-            .put_part(Bytes::from_static(b"multipart-value").into())
+            .put_part(Bytes::from_static(b"v2-multipart").into())
             .await
             .unwrap();
-        let complete = tokio::spawn(async move { upload.complete().await });
-        gate.wait_until_entered().await;
+        // Fail the pointer switch; the upload reports failure and the old
+        // version remains committed.
+        handle.push_rule(crate::FaultRule::fail_once(crate::FaultOp::Put, "meta/"));
+        assert!(upload.complete().await.is_err());
 
-        let rename_storage = storage.clone();
-        let rename_source = source.clone();
-        let rename_target = target.clone();
-        let mut rename =
-            tokio::spawn(
-                async move { rename_storage.rename(&rename_source, &rename_target).await },
-            );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut rename)
-                .await
-                .is_err(),
-            "rename bypassed the multipart completion's target lease"
-        );
-
-        gate.release();
-        complete.await.unwrap().unwrap();
-        rename.await.unwrap().unwrap();
-        let bytes = storage.get(&target).await.unwrap().bytes().await.unwrap();
-        assert_eq!(bytes, Bytes::from_static(b"source-value"));
-        assert!(matches!(
-            storage.get(&source).await,
-            Err(Error::NotFound { .. })
-        ));
+        let bytes = storage.get(&location).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"v1"));
     }
 
     #[tokio::test]
@@ -1747,5 +1793,29 @@ mod tests {
         )
         .build();
         stream_get(&storage).await;
+    }
+
+    #[tokio::test]
+    async fn local_file_legacy_layout_upgrade() {
+        // On a real filesystem the legacy payload (`data/<key>`, a file) and
+        // the generation tree (`gen/<key>/…`, a directory) must coexist
+        // during migration — this is why generations live under their own
+        // prefix.
+        let root = TempDir::new().unwrap();
+        let inner = LocalFileSystem::new_with_prefix(root.path()).unwrap();
+        let location = Path::from("compat/legacy");
+        put_legacy_object(&inner, &location, b"legacy payload").await;
+
+        let storage = MetaStoreBuilder::new(inner, 100).build();
+        let bytes = storage.get(&location).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"legacy payload"));
+
+        storage
+            .put(&location, Bytes::from_static(b"upgraded").into())
+            .await
+            .unwrap();
+        let bytes = storage.get(&location).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"upgraded"));
+        assert_eq!(storage.collect_garbage().await.unwrap(), 0);
     }
 }
