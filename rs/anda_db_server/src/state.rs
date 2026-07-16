@@ -536,7 +536,28 @@ impl AppState {
         {
             self.inner.registry.write().await.insert(name.to_string());
         }
-        self.persist_registry().await;
+        if let Err(err) = self.persist_registry().await {
+            // Success must mean "reopened automatically after a restart".
+            // Unwind the registration completely so a client retry repeats
+            // the whole open + persist flow.
+            {
+                self.inner.registry.write().await.remove(name);
+            }
+            let entry = { self.inner.databases.write().await.remove(name) };
+            if let Some(entry) = &entry {
+                entry.cancel.cancel();
+            }
+            if let Some(mut entry) = entry
+                && let Err(close_err) = (&mut entry.flush_task).await
+            {
+                log::error!(
+                    action = "AppState::register_db",
+                    database = name;
+                    "failed to close database after registry persistence failure: {close_err:?}",
+                );
+            }
+            return Err(err);
+        }
         Ok(metadata)
     }
 
@@ -571,7 +592,13 @@ impl AppState {
         if entry.is_none() && !registered {
             return Err(ApiError::not_found(format!("database {name:?} not found")));
         }
-        self.persist_registry().await;
+        let persisted = self.persist_registry().await;
+        if persisted.is_err() && registered {
+            // The database still closes below, but the durable registry
+            // would reopen it after a restart. Keep it registered in memory
+            // so a retry of `db.close` can attempt the durable removal again.
+            self.inner.registry.write().await.insert(name.to_string());
+        }
 
         if let Some(mut entry) = entry {
             // Wait for `AndaDB::auto_flush` to close the database (flushing
@@ -584,7 +611,9 @@ impl AppState {
                 );
             }
         }
-        Ok(())
+        // Success means the close is durable: the database will not be
+        // reopened on the next start.
+        persisted
     }
 
     /// Flushes and closes every open database. Called on server shutdown.
@@ -762,10 +791,12 @@ impl AppState {
     }
 
     /// Persists the registered non-primary database names into the primary
-    /// database's extensions. Best-effort: a failure is logged and the
-    /// affected database stays usable, but it will not be reopened
-    /// automatically until the registry is written again.
-    async fn persist_registry(&self) {
+    /// database's extensions.
+    ///
+    /// Callers whose RPC success implies a durable lifecycle transition
+    /// (`db.create`/`db.open` reopening after restart, `db.close` staying
+    /// closed) must propagate this error instead of reporting success.
+    async fn persist_registry(&self) -> Result<(), ApiError> {
         let names: BTreeSet<String> = { self.inner.registry.read().await.clone() };
         let primary = {
             let dbs = self.inner.databases.read().await;
@@ -782,7 +813,9 @@ impl AppState {
                 database = self.inner.options.primary_db;
                 "failed to persist database registry: {err:?}",
             );
+            return Err(err.into());
         }
+        Ok(())
     }
 }
 

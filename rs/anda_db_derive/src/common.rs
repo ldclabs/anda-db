@@ -460,8 +460,7 @@ impl TypeParams {
                     && let Some(ident) = type_path.path.get_ident()
                 {
                     let name = ident.to_string();
-                    if all.contains(&name)
-                        && predicate_type.bounds.iter().any(is_field_typed_bound)
+                    if all.contains(&name) && predicate_type.bounds.iter().any(is_field_typed_bound)
                     {
                         with_field_typed_bound.insert(name);
                     }

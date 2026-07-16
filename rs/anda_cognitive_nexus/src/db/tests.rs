@@ -1078,12 +1078,36 @@ async fn test_kql_multi_hop_bidirectional_matching() {
             "#;
     let query = parse_kql(kql).unwrap();
     let (result, _) = nexus.execute_kql(query).await.unwrap();
-    // Unordered legacy projections iterate bindings in ascending EntityID
-    // order (deterministic pagination); Medicine was created before
-    // PainReliever in this fixture.
+    // The chained patterns equi-join per solution, so the columns stay
+    // index-aligned across the two (drug, category, parent) solutions (KIP
+    // §6.2.2). The legacy engine projected each variable independently
+    // here, yielding misaligned column lengths (1/1/2).
+    let cols = result.as_array().unwrap();
+    assert_eq!(cols.len(), 3);
+    let mut triples: Vec<(String, String, String)> = (0..cols[0].as_array().unwrap().len())
+        .map(|i| {
+            (
+                cols[0][i].as_str().unwrap().to_string(),
+                cols[1][i].as_str().unwrap().to_string(),
+                cols[2][i].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    triples.sort();
     assert_eq!(
-        result,
-        json!([["Aspirin"], ["NSAID"], ["Medicine", "PainReliever"]])
+        triples,
+        vec![
+            (
+                "Aspirin".to_string(),
+                "NSAID".to_string(),
+                "Medicine".to_string()
+            ),
+            (
+                "Aspirin".to_string(),
+                "NSAID".to_string(),
+                "PainReliever".to_string()
+            ),
+        ]
     );
 
     // 测试2: 反向多跳查询 - 从Medicine分类查找所有下级药物（1-3跳）
@@ -2768,99 +2792,31 @@ async fn test_kql_filter_not_and_invalid_function_arguments() {
 }
 
 #[tokio::test]
-async fn test_private_relation_row_helpers_and_predicate_value_loading() {
+async fn test_private_solution_table_helpers_and_binding_value_loading() {
     let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
-    let relation = QueryRelationBinding {
-        proposition_var: Some("link".to_string()),
-        subject_var: Some("subject".to_string()),
-        predicate_var: Some("pred".to_string()),
-        object_var: Some("object".to_string()),
-        rows: vec![],
-        origin: RelationOrigin::default(),
+
+    // Solution tables cover their header variables; padded (`Null`) cells
+    // project null and stay join-compatible with anything.
+    let table = SolutionTable {
+        vars: vec!["subject".to_string(), "pred".to_string()],
+        rows: vec![vec![
+            BindingValue::Entity(EntityID::Concept(1)),
+            BindingValue::Predicate("knows".to_string()),
+        ]],
     };
-    let row = QueryRelationRow {
-        proposition: Some(EntityID::Proposition(7, "knows".to_string())),
-        subject: Some(EntityID::Concept(1)),
-        predicate: Some("knows".to_string()),
-        object: Some(EntityID::Concept(2)),
-    };
+    assert!(table.covers("subject"));
+    assert!(table.covers("pred"));
+    assert!(!table.covers("missing"));
+    assert_eq!(table.column("pred"), Some(1));
+    assert_eq!(table.column("missing"), None);
 
-    assert!(CognitiveNexus::relation_covers_var(&relation, "link"));
-    assert!(CognitiveNexus::relation_covers_var(&relation, "subject"));
-    assert!(CognitiveNexus::relation_covers_var(&relation, "pred"));
-    assert!(CognitiveNexus::relation_covers_var(&relation, "object"));
-    assert!(!CognitiveNexus::relation_covers_var(&relation, "missing"));
-    assert_eq!(
-        CognitiveNexus::relation_row_entity(&relation, &row, "link"),
-        Some(row.proposition.as_ref())
-    );
-    assert_eq!(
-        CognitiveNexus::relation_row_entity(&relation, &row, "subject"),
-        Some(row.subject.as_ref())
-    );
-    assert_eq!(
-        CognitiveNexus::relation_row_entity(&relation, &row, "object"),
-        Some(row.object.as_ref())
-    );
-    assert_eq!(
-        CognitiveNexus::relation_row_entity(&relation, &row, "pred"),
-        None
-    );
-    assert_eq!(
-        CognitiveNexus::relation_row_predicate(&relation, &row, "pred"),
-        Some(Some("knows"))
-    );
-    assert_eq!(
-        CognitiveNexus::relation_row_predicate(&relation, &row, "subject"),
-        None
-    );
-
-    // OPTIONAL-padded rows: covered positions with `None` values project
-    // null and are unconstrained during context matching.
-    let padded = QueryRelationRow {
-        proposition: None,
-        subject: Some(EntityID::Concept(1)),
-        predicate: None,
-        object: None,
-    };
-    assert_eq!(
-        CognitiveNexus::relation_row_entity(&relation, &padded, "object"),
-        Some(None)
-    );
-    assert_eq!(
-        CognitiveNexus::relation_row_predicate(&relation, &padded, "pred"),
-        Some(None)
-    );
-
-    let mut ctx = QueryContext::default();
-    ctx.entities
-        .insert("subject".to_string(), vec![EntityID::Concept(1)].into());
-    ctx.entities
-        .insert("object".to_string(), vec![EntityID::Concept(2)].into());
-    ctx.predicates
-        .insert("pred".to_string(), vec!["knows".to_string()].into());
-    assert!(CognitiveNexus::relation_row_matches_context(
-        &ctx, &relation, &row
-    ));
-
-    ctx.predicates
-        .insert("pred".to_string(), vec!["likes".to_string()].into());
-    assert!(!CognitiveNexus::relation_row_matches_context(
-        &ctx, &relation, &row
-    ));
-    ctx.predicates
-        .insert("pred".to_string(), vec!["knows".to_string()].into());
-    ctx.entities
-        .insert("object".to_string(), vec![EntityID::Concept(3)].into());
-    assert!(!CognitiveNexus::relation_row_matches_context(
-        &ctx, &relation, &row
-    ));
-
+    // A predicate binding projects its name for a bare variable and null
+    // for any dot path; a padded binding always projects null.
+    let ctx = QueryContext::default();
     let value = nexus
-        .load_relation_row_value(
+        .load_binding_field(
             &ctx.cache,
-            &relation,
-            &row,
+            &BindingValue::Predicate("knows".to_string()),
             &DotPathVar {
                 var: "pred".to_string(),
                 path: vec![],
@@ -2871,10 +2827,9 @@ async fn test_private_relation_row_helpers_and_predicate_value_loading() {
     assert_eq!(value, json!("knows"));
 
     let value = nexus
-        .load_relation_row_value(
+        .load_binding_field(
             &ctx.cache,
-            &relation,
-            &row,
+            &BindingValue::Predicate("knows".to_string()),
             &DotPathVar {
                 var: "pred".to_string(),
                 path: vec!["metadata".to_string()],
@@ -2884,22 +2839,22 @@ async fn test_private_relation_row_helpers_and_predicate_value_loading() {
         .unwrap();
     assert_eq!(value, Json::Null);
 
-    let err = nexus
-        .load_relation_row_value(
+    let value = nexus
+        .load_binding_field(
             &ctx.cache,
-            &relation,
-            &row,
+            &BindingValue::Null,
             &DotPathVar {
-                var: "missing".to_string(),
-                path: vec![],
+                var: "x".to_string(),
+                path: vec!["name".to_string()],
             },
         )
         .await
-        .unwrap_err();
-    assert!(matches!(err.code, KipErrorCode::ReferenceError));
+        .unwrap();
+    assert_eq!(value, Json::Null);
 
+    // FILTER variable collection walks nested expressions.
     let mut vars = FxHashSet::default();
-    CognitiveNexus::collect_filter_row_sensitive_vars(
+    CognitiveNexus::collect_filter_vars(
         &FilterExpression::Not(Box::new(FilterExpression::Comparison {
             left: FilterOperand::Variable(DotPathVar {
                 var: "link".to_string(),
@@ -6015,15 +5970,17 @@ async fn test_kql_self_loop_pattern_yields_empty() {
 }
 
 #[tokio::test]
-async fn test_kql_unaligned_filter_projection_rejected() {
+async fn test_kql_three_variable_filter_projection_stays_aligned() {
     let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
     setup_test_data(&nexus).await.unwrap();
     setup_risk_ladder(&nexus).await;
 
-    // A cross-variable FILTER over three entity variables cannot record its
-    // satisfying combinations; projecting those variables together must be
-    // rejected (KIP_4002) instead of silently re-materializing a misaligned
-    // cross product.
+    // A cross-variable FILTER over three entity variables joins them into
+    // one solution table, so projecting all three yields exactly the
+    // satisfying triples, index-aligned (KIP §6.2.2). The legacy engine
+    // could not record >2-variable combinations and rejected this
+    // projection with KIP_4002.
+    // Risks: Aspirin 2, HighRisk 5, MidRisk 3, LowRisk 1.
     let kql = r#"
         FIND(?d1.name, ?d2.name, ?d3.name)
         WHERE {
@@ -6033,14 +5990,36 @@ async fn test_kql_unaligned_filter_projection_rejected() {
             FILTER((?d1.attributes.risk_level > ?d2.attributes.risk_level) && (?d2.attributes.risk_level > ?d3.attributes.risk_level))
         }
         "#;
-    let err = nexus
-        .execute_kql(parse_kql(kql).unwrap())
-        .await
-        .unwrap_err();
+    let (result, _) = nexus.execute_kql(parse_kql(kql).unwrap()).await.unwrap();
+    let cols = result.as_array().unwrap();
+    assert_eq!(cols.len(), 3);
+    let len = cols[0].as_array().unwrap().len();
     assert!(
-        matches!(err.code, KipErrorCode::ResourceExhausted),
-        "{err:?}"
+        cols.iter().all(|c| c.as_array().unwrap().len() == len),
+        "columns must be index-aligned: {result}"
     );
+    let mut triples: Vec<(String, String, String)> = (0..len)
+        .map(|i| {
+            (
+                cols[0][i].as_str().unwrap().to_string(),
+                cols[1][i].as_str().unwrap().to_string(),
+                cols[2][i].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    triples.sort();
+    let mut expected = vec![
+        // 5 > 2 > 1, 5 > 3 > 2, 5 > 3 > 1, 3 > 2 > 1
+        ("HighRisk", "Aspirin", "LowRisk"),
+        ("HighRisk", "MidRisk", "Aspirin"),
+        ("HighRisk", "MidRisk", "LowRisk"),
+        ("MidRisk", "Aspirin", "LowRisk"),
+    ]
+    .into_iter()
+    .map(|(a, b, c)| (a.to_string(), b.to_string(), c.to_string()))
+    .collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(triples, expected, "{result}");
 
     // Single-column projection over the same narrowing stays valid
     // (existential semantics).
@@ -6433,5 +6412,179 @@ async fn test_kql_dedup_key_not_ambiguous_for_pipe_predicates() {
             ("|q".to_string(), "null".to_string()),
         ],
         "both pipe-predicate solutions must survive dedup: {result}"
+    );
+}
+
+/// Regression (rewrite defect 1): a concept-only UNION branch is a solution
+/// branch — the merged result is the row-wise union with null padding
+/// (KIP §3.4.7.3), never the cartesian product of the two binding columns.
+#[tokio::test]
+async fn test_kql_union_concept_only_branches_pad_null_not_cartesian() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_test_data(&nexus).await.unwrap();
+
+    let kql = r#"
+        FIND(?drug.name, ?symptom.name)
+        WHERE {
+            ?drug {type: "Drug"}
+            UNION { ?symptom {type: "Symptom"} }
+        }
+        "#;
+    let (result, _) = nexus.execute_kql(parse_kql(kql).unwrap()).await.unwrap();
+    assert_eq!(
+        collect_pairs(&result),
+        vec![
+            ("Aspirin".to_string(), "null".to_string()),
+            ("null".to_string(), "Fever".to_string()),
+            ("null".to_string(), "Headache".to_string()),
+        ],
+        "concept-only branches must union with null padding, not cross-join: {result}"
+    );
+}
+
+/// Regression (rewrite defect 2, debug/REVIEW_0.10.0.md #9): a UNION branch
+/// whose patterns equi-join per solution keeps exactly the joined rows —
+/// they are neither lost nor flattened into independent binding columns.
+#[tokio::test]
+async fn test_kql_union_branch_multi_pattern_equi_join_keeps_solutions() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_pair_graph(&nexus).await;
+
+    // Branch solutions = p1 ⋈ p2 = {(A2, B2)} (see setup_pair_graph);
+    // the main block contributes one unrelated padded row.
+    let kql = r#"
+        FIND(?a.name, ?b.name)
+        WHERE {
+            ?a {type: "PairNode", name: "B1"}
+            UNION {
+                (?a, "p1", ?b)
+                (?a, "p2", ?b)
+            }
+        }
+        "#;
+    let (result, _) = nexus.execute_kql(parse_kql(kql).unwrap()).await.unwrap();
+    assert_eq!(
+        collect_pairs(&result),
+        vec![
+            ("A2".to_string(), "B2".to_string()),
+            ("B1".to_string(), "null".to_string()),
+        ],
+        "the branch's equi-joined solutions must survive the union: {result}"
+    );
+}
+
+/// Regression (rewrite defect 3, debug/REVIEW_0.10.0.md #10): a NOT block
+/// sharing three variables with the outer solutions anti-joins exactly the
+/// matching (link, a, b) tuples — it must not wipe unrelated rows.
+#[tokio::test]
+async fn test_kql_not_anti_join_three_shared_vars_removes_exact_tuples() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_pair_graph(&nexus).await;
+
+    // Outer solutions: (l1, A1, B1) and (l2, A2, B2) via p1. The NOT block
+    // re-matches the pattern and narrows it to ?b = B1, so only the
+    // (l1, A1, B1) solution is excluded.
+    let kql = r#"
+        FIND(?a.name, ?b.name)
+        WHERE {
+            ?link (?a, "p1", ?b)
+            NOT {
+                ?link (?a, "p1", ?b)
+                ?b {type: "PairNode", name: "B1"}
+            }
+        }
+        "#;
+    let (result, _) = nexus.execute_kql(parse_kql(kql).unwrap()).await.unwrap();
+    assert_eq!(
+        collect_pairs(&result),
+        vec![("A2".to_string(), "B2".to_string())],
+        "NOT must remove exactly the matching 3-variable tuples: {result}"
+    );
+}
+
+/// Regression (rewrite defect 4): a FILTER placed after a UNION applies to
+/// the merged solution set — both the main block's rows and the branch's
+/// rows — not just the most recent branch.
+#[tokio::test]
+async fn test_kql_filter_after_union_filters_both_branches() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_pair_graph(&nexus).await;
+
+    // Main (p1): (A1,B1), (A2,B2). Branch (p2): (A1,B2), (A2,B2).
+    // Filtering ?b removes the main-side (A1,B1) row.
+    let kql = r#"
+        FIND(?a.name, ?b.name)
+        WHERE {
+            (?a, "p1", ?b)
+            UNION { (?a, "p2", ?b) }
+            FILTER(?b.name != "B1")
+        }
+        "#;
+    let (result, _) = nexus.execute_kql(parse_kql(kql).unwrap()).await.unwrap();
+    assert_eq!(
+        collect_pairs(&result),
+        vec![
+            ("A1".to_string(), "B2".to_string()),
+            ("A2".to_string(), "B2".to_string()),
+        ],
+        "FILTER after UNION must drop main-branch rows too: {result}"
+    );
+
+    // Filtering ?a removes rows from *both* branches: (A1,B1) from main and
+    // (A1,B2) from the UNION branch.
+    let kql = r#"
+        FIND(?a.name, ?b.name)
+        WHERE {
+            (?a, "p1", ?b)
+            UNION { (?a, "p2", ?b) }
+            FILTER(?a.name != "A1")
+        }
+        "#;
+    let (result, _) = nexus.execute_kql(parse_kql(kql).unwrap()).await.unwrap();
+    assert_eq!(
+        collect_pairs(&result),
+        vec![("A2".to_string(), "B2".to_string())],
+        "FILTER after UNION must drop rows from every branch: {result}"
+    );
+}
+
+/// Regression (rewrite defect 5): a UNION branch may bind any number of
+/// entity and predicate variables — the old fixed 3+1 slot representation
+/// rejected more than 3 entity variables or 1 predicate variable with
+/// KIP_4002.
+#[tokio::test]
+async fn test_kql_union_branch_with_many_variables_accepted() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_pair_graph(&nexus).await;
+
+    // The branch binds 6 entity variables (?w ?x ?y ?z and the two link
+    // variables) and 2 predicate variables — far beyond the old capacity
+    // of 3 entity + 1 predicate slots.
+    let kql = r#"
+        FIND(?w.name, ?q)
+        WHERE {
+            ?m {type: "PairNode", name: "B1"}
+            UNION {
+                ?w {type: "PairNode", name: "A1"}
+                ?l1 (?w, ?p, ?x)
+                ?y {type: "PairNode", name: "A2"}
+                ?l2 (?y, ?q, ?z)
+            }
+        }
+        "#;
+    let (result, _) = nexus
+        .execute_kql(parse_kql(kql).unwrap())
+        .await
+        .expect("a wide UNION branch must not be rejected");
+    // A1 carries p1 and p2 links, A2 carries p1 and p2 links: the branch's
+    // cross product projects (A1, p1) and (A1, p2); the main block pads.
+    assert_eq!(
+        collect_pairs(&result),
+        vec![
+            ("A1".to_string(), "p1".to_string()),
+            ("A1".to_string(), "p2".to_string()),
+            ("null".to_string(), "null".to_string()),
+        ],
+        "wide branches keep solution-aligned columns: {result}"
     );
 }

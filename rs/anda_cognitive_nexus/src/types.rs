@@ -244,41 +244,301 @@ impl From<EntityID> for EntityPK {
     }
 }
 
-/// Query execution context for managing variable bindings and caching.
+/// Engine cap on the number of solution rows a single operation
+/// materializes: natural joins across disconnected variables, UNION block
+/// materialization and the unconstrained `(?s, ?p, ?o)` full scan. Beyond
+/// it the command fails with `KIP_4002` — connect the variables through
+/// graph patterns or narrow them first (the spec explicitly allows the
+/// engine to reject such queries, KIP §3.4.2).
+pub const MAX_SOLUTION_COMBINATIONS: usize = 65_536;
+
+/// One variable's binding inside a solution row.
 ///
-/// This structure maintains the state during query execution, including:
-/// - Variable bindings for entities and predicates
-/// - Shared cache for loaded entities to avoid redundant database access
+/// This is the single value representation shared by the whole KQL solver:
+/// solution tables, FILTER evaluation and FIND projection all speak
+/// `BindingValue`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum BindingValue {
+    /// The variable binds a concept node or proposition link.
+    Entity(EntityID),
+    /// The variable binds a predicate name (KIP §3.4.2 — a string).
+    Predicate(String),
+    /// Absent binding: `OPTIONAL` misses and `UNION` branches that do not
+    /// bind the variable project `null` (KIP §3.4.7.2 / §3.4.7.3).
+    Null,
+}
+
+impl BindingValue {
+    /// Returns `true` for the [`BindingValue::Null`] (absent) binding.
+    pub fn is_null(&self) -> bool {
+        matches!(self, BindingValue::Null)
+    }
+}
+
+/// A set of candidate solutions over a fixed set of variables, stored in a
+/// column-layout row table (`vars` is the header, every row has exactly
+/// `vars.len()` cells).
 ///
-/// # Usage
+/// The KQL solver keeps the `WHERE` state as a *forest* of these tables
+/// (see [`QueryContext::tables`]): each variable lives in exactly one
+/// table, and tables are pairwise disjoint. Disconnected variable groups
+/// stay in separate tables so their cross product is never materialized
+/// until a clause or projection actually needs it.
+#[derive(Clone, Debug, Default)]
+pub struct SolutionTable {
+    /// Column header: the variables this table binds.
+    pub vars: Vec<String>,
+    /// Solution rows; every row has exactly `vars.len()` cells.
+    pub rows: Vec<Vec<BindingValue>>,
+}
+
+impl SolutionTable {
+    /// A table over one variable with one row per value.
+    pub fn single_column(var: String, values: Vec<BindingValue>) -> Self {
+        SolutionTable {
+            vars: vec![var],
+            rows: values.into_iter().map(|value| vec![value]).collect(),
+        }
+    }
+
+    /// Column index of `var`, if this table binds it.
+    pub fn column(&self, var: &str) -> Option<usize> {
+        self.vars.iter().position(|v| v == var)
+    }
+
+    /// Whether this table binds `var`.
+    pub fn covers(&self, var: &str) -> bool {
+        self.vars.iter().any(|v| v == var)
+    }
+
+    /// Distinct non-null values of `var`'s column, in first-occurrence
+    /// (row) order. Empty when the variable is not covered.
+    pub fn distinct_values(&self, var: &str) -> Vec<BindingValue> {
+        let Some(col) = self.column(var) else {
+            return Vec::new();
+        };
+        let mut seen: FxHashSet<&BindingValue> = FxHashSet::default();
+        let mut out = Vec::new();
+        for row in &self.rows {
+            let value = &row[col];
+            if !value.is_null() && seen.insert(value) {
+                out.push(value.clone());
+            }
+        }
+        out
+    }
+
+    /// Natural join (KIP §3.4: `WHERE` clauses are conjunctive).
+    ///
+    /// Shared variables must agree; a [`BindingValue::Null`] cell is
+    /// compatible with anything (SPARQL-style unbound semantics — padded
+    /// `OPTIONAL` / `UNION` rows never block a later pattern) and the
+    /// merged cell takes the non-null side. With no shared variables this
+    /// is the cross product. The output is capped at
+    /// [`MAX_SOLUTION_COMBINATIONS`] (`KIP_4002`).
+    pub fn natural_join(&self, right: &SolutionTable) -> Result<SolutionTable, KipError> {
+        // (left column, right column) pairs of the shared variables.
+        let shared: Vec<(usize, usize)> = self
+            .vars
+            .iter()
+            .enumerate()
+            .filter_map(|(li, var)| right.column(var).map(|ri| (li, ri)))
+            .collect();
+        let right_extra: Vec<usize> = (0..right.vars.len())
+            .filter(|ri| !shared.iter().any(|(_, r)| r == ri))
+            .collect();
+
+        let mut vars = self.vars.clone();
+        vars.extend(right_extra.iter().map(|&ri| right.vars[ri].clone()));
+
+        // Hash the right rows on their shared-variable key; rows with a
+        // null in the key are wildcards and must be probed per left row.
+        let mut keyed: FxHashMap<Vec<&BindingValue>, Vec<usize>> = FxHashMap::default();
+        let mut wild: Vec<usize> = Vec::new();
+        for (ri, row) in right.rows.iter().enumerate() {
+            let key: Vec<&BindingValue> = shared.iter().map(|&(_, r)| &row[r]).collect();
+            if key.iter().any(|value| value.is_null()) {
+                wild.push(ri);
+            } else {
+                keyed.entry(key).or_default().push(ri);
+            }
+        }
+
+        let compatible = |left: &[BindingValue], right_row: &[BindingValue]| {
+            shared.iter().all(|&(l, r)| {
+                left[l].is_null() || right_row[r].is_null() || left[l] == right_row[r]
+            })
+        };
+        let emit = |left: &[BindingValue], right_row: &[BindingValue]| -> Vec<BindingValue> {
+            let mut row = left.to_vec();
+            for &(l, r) in &shared {
+                if row[l].is_null() {
+                    row[l] = right_row[r].clone();
+                }
+            }
+            row.extend(right_extra.iter().map(|&ri| right_row[ri].clone()));
+            row
+        };
+
+        let mut rows: Vec<Vec<BindingValue>> = Vec::new();
+        for left in &self.rows {
+            let key: Vec<&BindingValue> = shared.iter().map(|&(l, _)| &left[l]).collect();
+            if key.iter().any(|value| value.is_null()) {
+                // Wildcard on the left: probe every right row.
+                for right_row in &right.rows {
+                    if compatible(left, right_row) {
+                        rows.push(emit(left, right_row));
+                    }
+                }
+            } else {
+                if let Some(matches) = keyed.get(&key) {
+                    for &ri in matches {
+                        rows.push(emit(left, &right.rows[ri]));
+                    }
+                }
+                for &ri in &wild {
+                    if compatible(left, &right.rows[ri]) {
+                        rows.push(emit(left, &right.rows[ri]));
+                    }
+                }
+            }
+            if rows.len() > MAX_SOLUTION_COMBINATIONS {
+                return Err(KipError::resource_exhausted(format!(
+                    "joining graph patterns materializes more than {MAX_SOLUTION_COMBINATIONS} \
+                     solution rows; narrow the patterns or connect the variables before \
+                     combining them"
+                )));
+            }
+        }
+
+        Ok(SolutionTable { vars, rows })
+    }
+
+    /// Left join (KIP §3.4.7.2, `OPTIONAL`): every left row is kept; the
+    /// right table's extra variables extend matching rows and pad `null`
+    /// on misses. Shared-variable compatibility follows
+    /// [`SolutionTable::natural_join`].
+    pub fn left_join(&self, right: &SolutionTable) -> Result<SolutionTable, KipError> {
+        let shared: Vec<(usize, usize)> = self
+            .vars
+            .iter()
+            .enumerate()
+            .filter_map(|(li, var)| right.column(var).map(|ri| (li, ri)))
+            .collect();
+        let right_extra: Vec<usize> = (0..right.vars.len())
+            .filter(|ri| !shared.iter().any(|(_, r)| r == ri))
+            .collect();
+
+        let mut vars = self.vars.clone();
+        vars.extend(right_extra.iter().map(|&ri| right.vars[ri].clone()));
+
+        let compatible = |left: &[BindingValue], right_row: &[BindingValue]| {
+            shared.iter().all(|&(l, r)| {
+                left[l].is_null() || right_row[r].is_null() || left[l] == right_row[r]
+            })
+        };
+        let mut rows: Vec<Vec<BindingValue>> = Vec::new();
+        for left in &self.rows {
+            let mut matched = false;
+            for right_row in &right.rows {
+                if compatible(left, right_row) {
+                    matched = true;
+                    let mut row = left.to_vec();
+                    for &(l, r) in &shared {
+                        if row[l].is_null() {
+                            row[l] = right_row[r].clone();
+                        }
+                    }
+                    row.extend(right_extra.iter().map(|&ri| right_row[ri].clone()));
+                    rows.push(row);
+                }
+            }
+            if !matched {
+                let mut row = left.to_vec();
+                row.extend(right_extra.iter().map(|_| BindingValue::Null));
+                rows.push(row);
+            }
+            if rows.len() > MAX_SOLUTION_COMBINATIONS {
+                return Err(KipError::resource_exhausted(format!(
+                    "OPTIONAL join materializes more than {MAX_SOLUTION_COMBINATIONS} solution \
+                     rows; narrow the patterns before combining them"
+                )));
+            }
+        }
+
+        Ok(SolutionTable { vars, rows })
+    }
+
+    /// Row-wise union with null padding (KIP §3.4.7.3): the result covers
+    /// the union of both variable sets, `self`'s rows come first, each side
+    /// padded with `null` for the other's missing variables, and identical
+    /// full rows are deduplicated (§3.3 solution set semantics).
+    pub fn union_padded(&self, right: &SolutionTable) -> Result<SolutionTable, KipError> {
+        let mut vars = self.vars.clone();
+        for var in &right.vars {
+            if !self.covers(var) {
+                vars.push(var.clone());
+            }
+        }
+        if self.rows.len().saturating_add(right.rows.len()) > MAX_SOLUTION_COMBINATIONS {
+            return Err(KipError::resource_exhausted(format!(
+                "UNION materializes more than {MAX_SOLUTION_COMBINATIONS} solution rows; \
+                 narrow the branches before merging them"
+            )));
+        }
+
+        let mut rows: Vec<Vec<BindingValue>> = Vec::with_capacity(self.rows.len());
+        let mut seen: FxHashSet<Vec<BindingValue>> = FxHashSet::default();
+        for row in &self.rows {
+            let mut padded = row.clone();
+            padded.extend(vars[self.vars.len()..].iter().map(|_| BindingValue::Null));
+            if seen.insert(padded.clone()) {
+                rows.push(padded);
+            }
+        }
+        for row in &right.rows {
+            let padded: Vec<BindingValue> = vars
+                .iter()
+                .map(|var| match right.column(var) {
+                    Some(ri) => row[ri].clone(),
+                    None => BindingValue::Null,
+                })
+                .collect();
+            if seen.insert(padded.clone()) {
+                rows.push(padded);
+            }
+        }
+
+        Ok(SolutionTable { vars, rows })
+    }
+}
+
+/// Query execution context: the row-oriented solution state of a `WHERE`
+/// evaluation plus the shared entity cache.
 ///
-/// The query context is passed through query execution pipelines to maintain
-/// consistency and performance through caching.
+/// # Solution model
+///
+/// The candidate solution set is a forest of [`SolutionTable`]s with
+/// pairwise-disjoint variable sets. Every `WHERE` clause is a relational
+/// operator over this forest: graph patterns natural-join their match rows
+/// in, `FILTER` keeps satisfying rows, `NOT` anti-joins, `OPTIONAL`
+/// left-joins with null padding and `UNION` merges row-wise with null
+/// padding. `FIND` projects columns from the (joined) tables, so
+/// multi-variable results stay index-aligned across solutions by
+/// construction (KIP §6.2.2).
 #[derive(Clone, Debug, Default)]
 pub struct QueryContext {
-    /// Variable name to entity ID mappings
-    ///
-    /// Maps variable names (e.g., "?person", "?location") to lists of entity IDs
-    /// that match the variable's constraints in the current query context.
-    pub entities: FxHashMap<String, UniqueVec<EntityID>>,
+    /// The solution forest. Invariant: every variable is bound by at most
+    /// one table.
+    pub tables: Vec<SolutionTable>,
 
-    /// Variable name to predicate mappings
-    ///
-    /// Maps variable names to lists of predicate strings that match
-    /// the variable's constraints in the current query context.
-    pub predicates: FxHashMap<String, UniqueVec<String>>,
-
-    /// Group relationships between variables.
-    ///
-    /// Key: `(group_var, member_var)` — e.g., `("d", "n")` for the pattern
-    /// `(?n, "belongs_to_domain", ?d)` where each domain ?d groups its members ?n.
-    /// Value: maps each group entity ID to its related member entity IDs.
-    ///
-    /// This enables per-group aggregation in FIND clauses like `FIND(?d.name, COUNT(?n))`.
-    pub groups: FxHashMap<(String, String), FxHashMap<EntityID, UniqueVec<EntityID>>>,
-
-    /// Variables whose field-level values participate in row-sensitive filtering.
-    pub row_sensitive_vars: FxHashSet<String>,
+    /// `(group_var, member_var)` pairs eligible for grouped aggregation:
+    /// recorded for the subject/object endpoints of each matched
+    /// proposition pattern (both directions). `FIND(?g.name, COUNT(?m))`
+    /// aggregates per group only when such a pair exists — mirroring the
+    /// spec's implicit-grouping examples while keeping plain
+    /// `FIND(?x, COUNT(?y))` a global aggregate for unrelated variables.
+    pub group_pairs: FxHashSet<(String, String)>,
 
     /// When `true`, "dangling id / entity not found" grounding errors
     /// (`KIP_3002`) degrade to an **empty match** instead of failing the
@@ -290,21 +550,6 @@ pub struct QueryContext {
     /// still propagate. The main (top-level) pattern keeps strict `KIP_3002`
     /// semantics.
     pub lenient_grounding: bool,
-
-    /// Variables that passed through a cross-variable `FILTER` whose
-    /// satisfying combinations could **not** be recorded as a synthetic
-    /// relation (more than two entity variables or more than one predicate
-    /// variable). Their bindings are existentially narrowed only, so a
-    /// multi-column `FIND` over two or more of them cannot stay
-    /// solution-aligned and is rejected with `KIP_4002`.
-    pub unaligned_filter_vars: FxHashSet<String>,
-
-    /// Row-level bindings produced by proposition clauses.
-    ///
-    /// These preserve the tuple relationship between a proposition link and its
-    /// subject/object bindings for result materialization that needs row-level
-    /// ordering or filtering across variables.
-    pub relations: Vec<QueryRelationBinding>,
 
     /// Shared cache for loaded entities
     ///
@@ -320,18 +565,119 @@ pub struct QueryContext {
 }
 
 impl QueryContext {
-    /// Lightweight child context for `NOT` / `OPTIONAL` sub-blocks: shares
-    /// the entity cache and copies only the variable bindings.
-    ///
-    /// Relations, groups, row-sensitive markers and the regex cache start
-    /// empty on purpose — sub-block execution only reads/narrows the
-    /// bindings, and the parent merges back exactly the state it needs.
-    /// This avoids cloning potentially large relation row sets on every
-    /// `NOT` / `OPTIONAL` clause.
-    pub fn scoped_child(&self) -> Self {
+    /// Whether `var` is bound by some table (possibly with zero rows).
+    pub fn is_bound(&self, var: &str) -> bool {
+        self.tables.iter().any(|table| table.covers(var))
+    }
+
+    /// The table binding `var`, if any.
+    pub fn table_of(&self, var: &str) -> Option<&SolutionTable> {
+        self.tables.iter().find(|table| table.covers(var))
+    }
+
+    /// Distinct non-null values of `var` across its table, in row order.
+    /// `None` when the variable is unbound.
+    pub fn distinct_values(&self, var: &str) -> Option<Vec<BindingValue>> {
+        self.table_of(var).map(|table| table.distinct_values(var))
+    }
+
+    /// Distinct entity bindings of `var` in row order. `None` when the
+    /// variable is unbound; `Some(empty)` when it is bound with no
+    /// surviving entity value.
+    pub fn entity_values(&self, var: &str) -> Option<UniqueVec<EntityID>> {
+        let values = self.distinct_values(var)?;
+        let mut out = UniqueVec::new();
+        for value in values {
+            if let BindingValue::Entity(id) = value {
+                out.push(id);
+            }
+        }
+        Some(out)
+    }
+
+    /// Merges a clause's match table into the forest: every existing table
+    /// sharing a variable is natural-joined with it (conjunctive `WHERE`
+    /// semantics); a fully disjoint table starts a new tree.
+    pub fn merge_table(&mut self, table: SolutionTable) -> Result<(), KipError> {
+        if table.vars.is_empty() {
+            return Ok(());
+        }
+        let mut acc = table;
+        // Walk existing tables in order; joining through `acc` keeps every
+        // step keyed on at least one shared variable, so two existing
+        // tables are never cross-joined unless the new table bridges them.
+        let mut idx = 0;
+        let mut insert_at: Option<usize> = None;
+        while idx < self.tables.len() {
+            if acc.vars.iter().any(|var| self.tables[idx].covers(var)) {
+                let existing = self.tables.remove(idx);
+                // Existing table on the left: its row order (the earlier
+                // clauses' order) dominates the merged row order.
+                acc = existing.natural_join(&acc)?;
+                insert_at.get_or_insert(idx);
+            } else {
+                idx += 1;
+            }
+        }
+        let at = insert_at.unwrap_or(self.tables.len());
+        self.tables.insert(at, acc);
+        Ok(())
+    }
+
+    /// Joins every table covering any of `vars` into a single table and
+    /// returns its forest index. Disconnected tables cross-join under the
+    /// [`MAX_SOLUTION_COMBINATIONS`] cap. Returns `None` when no table
+    /// covers any of the variables.
+    pub fn join_tables_covering<S: AsRef<str>>(
+        &mut self,
+        vars: &[S],
+    ) -> Result<Option<usize>, KipError> {
+        let mut indices: Vec<usize> = self
+            .tables
+            .iter()
+            .enumerate()
+            .filter(|(_, table)| vars.iter().any(|var| table.covers(var.as_ref())))
+            .map(|(idx, _)| idx)
+            .collect();
+        let Some(&first) = indices.first() else {
+            return Ok(None);
+        };
+        // Remove back-to-front so indices stay valid, then fold in forest
+        // order (first table's row order dominates).
+        indices.reverse();
+        let mut removed: Vec<SolutionTable> = indices
+            .into_iter()
+            .map(|idx| self.tables.remove(idx))
+            .collect();
+        removed.reverse();
+        let mut iter = removed.into_iter();
+        let mut acc = iter.next().expect("at least one table");
+        for table in iter {
+            acc = acc.natural_join(&table)?;
+        }
+        self.tables.insert(first, acc);
+        Ok(Some(first))
+    }
+
+    /// Child context for `NOT` / `OPTIONAL` sub-blocks: shares the entity
+    /// cache and seeds one single-column domain table per outer-bound
+    /// variable in `seed_vars` (KIP §3.4.7.1/§3.4.7.2 — outer bindings are
+    /// visible inside the block). Row correlations are *not* copied: the
+    /// block's own patterns re-establish them, and the parent combines the
+    /// block's solutions back per its own semantics (anti-join/left join).
+    pub fn scoped_child<S: AsRef<str>>(&self, seed_vars: &[S]) -> Self {
+        let mut sorted: Vec<&str> = seed_vars.iter().map(|var| var.as_ref()).collect();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let tables = sorted
+            .into_iter()
+            .filter_map(|var| {
+                self.distinct_values(var)
+                    .map(|values| SolutionTable::single_column(var.to_string(), values))
+            })
+            .collect();
         QueryContext {
-            entities: self.entities.clone(),
-            predicates: self.predicates.clone(),
+            tables,
             cache: self.cache.clone(),
             // A child of a lenient sub-block stays lenient (e.g. a `NOT`
             // nested inside an `OPTIONAL`).
@@ -363,56 +709,6 @@ pub struct QueryCache {
     pub propositions: RwLock<FxHashMap<u64, Proposition>>,
 }
 
-/// Provenance of a relation binding. `FIND` and `NOT` use it to pick the
-/// correct combining semantics: `Pattern` relations are conjunctive
-/// (row-level equi-join, KIP §3.4), `Union` relations contribute a row-wise
-/// union (KIP §3.4.7.3), and `Optional` relations never restrict the outer
-/// solution set (KIP §3.4.7.2).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum RelationOrigin {
-    /// Produced by a top-level (mandatory) graph pattern clause.
-    #[default]
-    Pattern,
-    /// Produced inside an `OPTIONAL { … }` block.
-    Optional,
-    /// Produced inside a `UNION { … }` block.
-    Union,
-}
-
-/// Variables attached to the rows emitted by one proposition clause.
-#[derive(Clone, Debug)]
-pub struct QueryRelationBinding {
-    /// Optional variable bound to the proposition entity.
-    pub proposition_var: Option<String>,
-    /// Optional variable bound to the subject entity.
-    pub subject_var: Option<String>,
-    /// Optional variable bound to the predicate string.
-    pub predicate_var: Option<String>,
-    /// Optional variable bound to the object entity.
-    pub object_var: Option<String>,
-    /// Concrete relation rows produced by the clause.
-    pub rows: Vec<QueryRelationRow>,
-    /// Which kind of clause produced this relation (see [`RelationOrigin`]).
-    pub origin: RelationOrigin,
-}
-
-/// One concrete proposition-clause match.
-///
-/// Fields are `Option` so that `OPTIONAL` blocks can contribute
-/// **left-join padded rows**: a row whose anchor variable is bound but whose
-/// other positions are `None` projects `null` per KIP §3.4.7.2.
-#[derive(Clone, Debug)]
-pub struct QueryRelationRow {
-    /// Matched proposition id (`None` in an OPTIONAL-padded row).
-    pub proposition: Option<EntityID>,
-    /// Matched subject entity id (`None` in an OPTIONAL-padded row).
-    pub subject: Option<EntityID>,
-    /// Matched predicate name (`None` in an OPTIONAL-padded row).
-    pub predicate: Option<String>,
-    /// Matched object entity id (`None` in an OPTIONAL-padded row).
-    pub object: Option<EntityID>,
-}
-
 /// Specifies the target entities for query operations.
 ///
 /// This enum allows queries to target different subsets of entities
@@ -433,51 +729,37 @@ pub enum TargetEntities {
     IDs(Vec<EntityID>),
 }
 
-/// Result structure for proposition matching operations.
+/// One concrete proposition-pattern match row.
 ///
-/// Collects all entities and predicates that match during proposition queries,
-/// providing comprehensive information about the matching results.
-///
-/// # Usage
-///
-/// This structure is typically populated during query execution and provides
-/// access to all matched components of propositions for further processing.
+/// `proposition` is `None` for multi-hop path matches — a path is not a
+/// single link — while the `(subject, predicate, object)` triple keeps the
+/// solution row aligned (KIP §6.2.2).
+#[derive(Clone, Debug)]
+pub struct PropositionMatchRow {
+    /// Matched proposition id (`None` for a multi-hop path match).
+    pub proposition: Option<EntityID>,
+    /// Matched subject entity id.
+    pub subject: EntityID,
+    /// Matched predicate name.
+    pub predicate: String,
+    /// Matched object entity id.
+    pub object: EntityID,
+}
+
+/// Result of one proposition-pattern matching operation: the concrete
+/// solution rows plus the matched proposition link ids (the pattern's value
+/// when it is used as a nested endpoint target).
 #[derive(Default)]
 pub struct PropositionsMatchResult {
     /// List of matched proposition entity IDs
     pub matched_propositions: UniqueVec<EntityID>,
-    /// List of matched subject entity IDs
-    pub matched_subjects: UniqueVec<EntityID>,
-    /// List of matched object entity IDs
-    pub matched_objects: UniqueVec<EntityID>,
-    /// List of matched predicate strings
-    pub matched_predicates: UniqueVec<String>,
-    /// Per-subject grouping: maps each subject to its matched objects
-    pub subject_to_objects: FxHashMap<EntityID, UniqueVec<EntityID>>,
-    /// Per-object grouping: maps each object to its matched subjects
-    pub object_to_subjects: FxHashMap<EntityID, UniqueVec<EntityID>>,
     /// Concrete row matches preserving subject-predicate-object alignment.
-    pub rows: Vec<QueryRelationRow>,
+    pub rows: Vec<PropositionMatchRow>,
 }
 
 impl PropositionsMatchResult {
-    /// Adds a matching proposition and its components to the result.
-    ///
-    /// This method ensures that duplicate entries are not added to the result collections
-    /// by using the `push_nx` helper function.
-    ///
-    /// # Arguments
-    ///
-    /// * `subject` - The subject entity ID of the matched proposition
-    /// * `object` - The object entity ID of the matched proposition
-    /// * `predicates` - List of predicates for this proposition
-    /// * `proposition_id` - The numeric ID of the proposition
-    ///
-    /// # Behavior
-    ///
-    /// - Adds subject and object to their respective collections (if not already present)
-    /// - Creates proposition entity IDs for each predicate and adds them
-    /// - Adds each predicate string to the predicates collection
+    /// Adds a matching proposition: one row (and one matched link id) per
+    /// matched predicate.
     pub fn add_match(
         &mut self,
         subject: EntityID,
@@ -485,28 +767,14 @@ impl PropositionsMatchResult {
         predicates: Vec<String>,
         proposition_id: u64,
     ) {
-        self.matched_subjects.push(subject.clone());
-        self.matched_objects.push(object.clone());
-
-        // Track per-entity groupings
-        self.subject_to_objects
-            .entry(subject.clone())
-            .or_default()
-            .push(object.clone());
-        self.object_to_subjects
-            .entry(object.clone())
-            .or_default()
-            .push(subject.clone());
-
         for pred in predicates {
             let proposition = EntityID::Proposition(proposition_id, pred.clone());
             self.matched_propositions.push(proposition.clone());
-            self.matched_predicates.push(pred.clone());
-            self.rows.push(QueryRelationRow {
+            self.rows.push(PropositionMatchRow {
                 proposition: Some(proposition),
-                subject: Some(subject.clone()),
-                predicate: Some(pred),
-                object: Some(object.clone()),
+                subject: subject.clone(),
+                predicate: pred,
+                object: object.clone(),
             });
         }
     }
@@ -635,7 +903,7 @@ mod tests {
     }
 
     #[test]
-    fn proposition_match_result_deduplicates_and_keeps_rows() {
+    fn proposition_match_result_keeps_rows_and_link_ids() {
         let mut result = PropositionsMatchResult::default();
         result.add_match(
             concept_ref(1),
@@ -650,31 +918,106 @@ mod tests {
             10,
         );
 
-        assert_eq!(result.matched_subjects.len(), 1);
-        assert_eq!(result.matched_objects.len(), 1);
-        assert_eq!(result.matched_predicates.len(), 2);
+        // Link ids deduplicate; rows keep every emitted match row.
         assert_eq!(result.matched_propositions.len(), 2);
         assert_eq!(result.rows.len(), 3);
+        assert_eq!(result.rows[0].subject, concept_ref(1));
+        assert_eq!(result.rows[0].object, concept_ref(2));
+        assert_eq!(result.rows[0].predicate, "likes");
         assert_eq!(
-            result
-                .subject_to_objects
-                .get(&concept_ref(1))
-                .unwrap()
-                .to_vec(),
-            vec![concept_ref(2)]
+            result.rows[0].proposition,
+            Some(EntityID::Proposition(10, "likes".to_string()))
         );
+    }
+
+    fn table(vars: &[&str], rows: &[&[BindingValue]]) -> SolutionTable {
+        SolutionTable {
+            vars: vars.iter().map(|v| v.to_string()).collect(),
+            rows: rows.iter().map(|row| row.to_vec()).collect(),
+        }
+    }
+
+    fn ent(id: u64) -> BindingValue {
+        BindingValue::Entity(concept_ref(id))
+    }
+
+    #[test]
+    fn solution_table_natural_join_covers_shared_null_and_cross() {
+        // Shared-variable equi-join.
+        let left = table(&["a", "b"], &[&[ent(1), ent(2)], &[ent(3), ent(4)]]);
+        let right = table(&["b", "c"], &[&[ent(2), ent(5)], &[ent(9), ent(6)]]);
+        let joined = left.natural_join(&right).unwrap();
+        assert_eq!(joined.vars, vec!["a", "b", "c"]);
+        assert_eq!(joined.rows, vec![vec![ent(1), ent(2), ent(5)]]);
+
+        // Null is a wildcard and adopts the other side's value.
+        let padded = table(&["a", "b"], &[&[ent(1), BindingValue::Null]]);
+        let joined = padded.natural_join(&right).unwrap();
         assert_eq!(
-            result
-                .object_to_subjects
-                .get(&concept_ref(2))
-                .unwrap()
-                .to_vec(),
-            vec![concept_ref(1)]
+            joined.rows,
+            vec![vec![ent(1), ent(2), ent(5)], vec![ent(1), ent(9), ent(6)],]
+        );
+
+        // No shared variables: cross product.
+        let loose = table(&["x"], &[&[ent(7)], &[ent(8)]]);
+        let crossed = left.natural_join(&loose).unwrap();
+        assert_eq!(crossed.rows.len(), 4);
+    }
+
+    #[test]
+    fn solution_table_left_join_pads_misses_with_null() {
+        let left = table(&["a"], &[&[ent(1)], &[ent(2)]]);
+        let right = table(&["a", "b"], &[&[ent(1), ent(5)]]);
+        let joined = left.left_join(&right).unwrap();
+        assert_eq!(joined.vars, vec!["a", "b"]);
+        assert_eq!(
+            joined.rows,
+            vec![vec![ent(1), ent(5)], vec![ent(2), BindingValue::Null],]
         );
     }
 
     #[test]
-    fn query_context_cache_relation_and_target_structs_are_exercised() {
+    fn solution_table_union_pads_and_deduplicates() {
+        let left = table(&["a"], &[&[ent(1)]]);
+        let right = table(&["a", "b"], &[&[ent(1), ent(5)], &[ent(1), ent(5)]]);
+        let merged = left.union_padded(&right).unwrap();
+        assert_eq!(merged.vars, vec!["a", "b"]);
+        assert_eq!(
+            merged.rows,
+            vec![vec![ent(1), BindingValue::Null], vec![ent(1), ent(5)],]
+        );
+    }
+
+    #[test]
+    fn query_context_forest_merge_and_domains() {
+        let mut ctx = QueryContext::default();
+        ctx.merge_table(table(&["a"], &[&[ent(1)], &[ent(2)]]))
+            .unwrap();
+        ctx.merge_table(table(&["b"], &[&[ent(3)]])).unwrap();
+        assert_eq!(ctx.tables.len(), 2, "disjoint tables stay separate");
+
+        // A bridging table joins both trees into one.
+        ctx.merge_table(table(&["a", "b"], &[&[ent(1), ent(3)]]))
+            .unwrap();
+        assert_eq!(ctx.tables.len(), 1);
+        assert_eq!(ctx.tables[0].rows.len(), 1);
+
+        assert!(ctx.is_bound("a"));
+        assert!(!ctx.is_bound("missing"));
+        assert_eq!(
+            ctx.entity_values("a").unwrap().to_vec(),
+            vec![concept_ref(1)]
+        );
+        assert!(ctx.entity_values("missing").is_none());
+
+        // Child contexts seed single-column domain tables.
+        let child = ctx.scoped_child(&["a", "missing"]);
+        assert_eq!(child.tables.len(), 1);
+        assert_eq!(child.tables[0].vars, vec!["a"]);
+    }
+
+    #[test]
+    fn query_context_cache_and_target_structs_are_exercised() {
         let ctx = QueryContext::default();
         ctx.cache.concepts.write().insert(
             1,
@@ -702,22 +1045,6 @@ mod tests {
             ctx.cache.propositions.read().get(&2).unwrap().subject,
             concept_ref(1)
         );
-
-        let row = QueryRelationRow {
-            proposition: Some(EntityID::Proposition(2, "likes".to_string())),
-            subject: Some(concept_ref(1)),
-            predicate: Some("likes".to_string()),
-            object: Some(concept_ref(3)),
-        };
-        let binding = QueryRelationBinding {
-            proposition_var: Some("p".to_string()),
-            subject_var: Some("s".to_string()),
-            predicate_var: Some("pred".to_string()),
-            object_var: Some("o".to_string()),
-            rows: vec![row.clone()],
-            origin: RelationOrigin::default(),
-        };
-        assert_eq!(binding.rows[0].predicate, row.predicate);
 
         let targets = [
             TargetEntities::Any,

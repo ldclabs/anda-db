@@ -159,11 +159,19 @@ impl CognitiveNexus {
             // otherwise) so self-loop targets are rejected during preflight,
             // before any row is written — the execution-time check in
             // `upsert_proposition` would otherwise fire after the concept
-            // block itself was already applied.
-            let subject_id: Option<EntityID> = self
+            // block itself was already applied. Only a definite NotFound may
+            // degrade to `None` (a genuinely new concept); storage or index
+            // failures must propagate, or the preflight would silently skip
+            // the self-loop check and reintroduce the partial write it
+            // exists to prevent.
+            let subject_id: Option<EntityID> = match self
                 .resolve_entity_id(&EntityPK::Concept(concept_pk.clone()), cached_pks)
                 .await
-                .ok();
+            {
+                Ok(id) => Some(id),
+                Err(err) if err.code == KipErrorCode::NotFound => None,
+                Err(err) => return Err(err),
+            };
             for set_prop in propositions {
                 self.validate_set_proposition_for_kml(
                     subject_id.as_ref(),
@@ -341,7 +349,9 @@ impl CognitiveNexus {
     /// multi-predicate loops: stale index hits, rows removed earlier in the
     /// same statement) from real storage failures, which must abort the
     /// statement instead of being silently reported as success.
-    pub(super) fn tolerate_not_found<T>(result: Result<T, KipError>) -> Result<Option<T>, KipError> {
+    pub(super) fn tolerate_not_found<T>(
+        result: Result<T, KipError>,
+    ) -> Result<Option<T>, KipError> {
         match result {
             Ok(value) => Ok(Some(value)),
             Err(err) if err.code == KipErrorCode::NotFound => Ok(None),
@@ -452,7 +462,7 @@ impl CognitiveNexus {
             self.execute_where_clause(&mut ctx, clause).await?;
         }
 
-        let target_entities = ctx.entities.get(&target).cloned().ok_or_else(|| {
+        let target_entities = ctx.entity_values(&target).ok_or_else(|| {
             KipError::reference_error(format!("Target term '{}' not found in context", target))
         })?;
 
@@ -587,7 +597,7 @@ impl CognitiveNexus {
             self.execute_where_clause(&mut ctx, clause).await?;
         }
 
-        let target_entities = ctx.entities.get(&target).cloned().ok_or_else(|| {
+        let target_entities = ctx.entity_values(&target).ok_or_else(|| {
             KipError::reference_error(format!("Target term '{}' not found in context", target))
         })?;
 
@@ -638,10 +648,7 @@ impl CognitiveNexus {
                         self.concepts
                             .update(
                                 *id,
-                                BTreeMap::from([(
-                                    "metadata".to_string(),
-                                    concept.metadata.into(),
-                                )]),
+                                BTreeMap::from([("metadata".to_string(), concept.metadata.into())]),
                             )
                             .await
                             .map_err(db_to_kip_error)?;
@@ -704,7 +711,7 @@ impl CognitiveNexus {
             self.execute_where_clause(&mut ctx, clause).await?;
         }
 
-        let target_entities = ctx.entities.get(&target).cloned().ok_or_else(|| {
+        let target_entities = ctx.entity_values(&target).ok_or_else(|| {
             KipError::reference_error(format!("Target term '{}' not found in context", target))
         })?;
 
@@ -799,7 +806,7 @@ impl CognitiveNexus {
             self.execute_where_clause(&mut ctx, clause).await?;
         }
 
-        let target_entities = ctx.entities.get(&target).cloned().ok_or_else(|| {
+        let target_entities = ctx.entity_values(&target).ok_or_else(|| {
             KipError::reference_error(format!("Target term '{}' not found in context", target))
         })?;
 
@@ -989,7 +996,7 @@ impl CognitiveNexus {
             self.execute_where_clause(&mut ctx, clause).await?;
         }
 
-        let target_entities = ctx.entities.get(&target).cloned().ok_or_else(|| {
+        let target_entities = ctx.entity_values(&target).ok_or_else(|| {
             KipError::reference_error(format!("Target term '{target}' not found in context"))
         })?;
         let mut targets: Vec<EntityID> = target_entities.into();
@@ -1396,7 +1403,7 @@ impl CognitiveNexus {
     /// zero matches → `KIP_3002`, more than one → `KIP_3003`, a proposition
     /// binding → `KIP_2002`.
     pub(super) fn single_merge_concept(ctx: &QueryContext, var: &str) -> Result<u64, KipError> {
-        let ids = ctx.entities.get(var).ok_or_else(|| {
+        let ids = ctx.entity_values(var).ok_or_else(|| {
             KipError::reference_error(format!("Variable ?{var} not bound in WHERE clause"))
         })?;
         if ids.is_empty() {

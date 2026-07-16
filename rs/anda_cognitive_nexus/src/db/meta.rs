@@ -384,7 +384,7 @@ impl CognitiveNexus {
         for clause in where_clauses {
             self.execute_where_clause(&mut ctx, clause).await?;
         }
-        let target_entities = ctx.entities.get(&target).cloned().ok_or_else(|| {
+        let target_entities = ctx.entity_values(&target).ok_or_else(|| {
             KipError::reference_error(format!("Target term '{target}' not found in context"))
         })?;
         let mut targets: Vec<EntityID> = target_entities.into();

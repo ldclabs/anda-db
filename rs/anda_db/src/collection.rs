@@ -740,9 +740,7 @@ impl Collection {
             pending_mutations: parking_lot::Mutex::new(BTreeMap::new()),
             extension_write_gate: tokio::sync::Mutex::new(()),
             next_mutation_sequence: AtomicU64::new(unix_ms()),
-            durable_alloc_watermark: AtomicU64::new(
-                alloc_watermark.max(metadata_max_document_id),
-            ),
+            durable_alloc_watermark: AtomicU64::new(alloc_watermark.max(metadata_max_document_id)),
             watermark_gate: tokio::sync::Mutex::new(()),
         };
         collection.load_indexes().await?;
@@ -3499,19 +3497,18 @@ impl Collection {
             }
             Filter::Or(queries) => {
                 let mut rt: UniqueVec<u64> = UniqueVec::with_capacity(Self::reserve_hint(limit));
+                // Evaluate every branch (each bounded by `limit` on its own)
+                // instead of stopping once the union reaches `limit`: the
+                // early stop made the result depend on operand order.
                 for query in queries {
                     let ids = self.filter_by_field_with(*query, candidates, limit)?;
                     rt.extend(ids);
-                    if limit > 0 && rt.len() >= limit {
-                        break;
-                    }
                 }
 
                 result = rt.into();
-                // 由调用方控制结果长度
-                // if limit > 0 && result.len() > limit {
-                //     result.truncate(limit);
-                // }
+                // Canonical order, so equal boolean sets yield equal results
+                // regardless of branch order; the caller applies `limit`.
+                result.sort_unstable();
                 Ok(result)
             }
             Filter::And(queries) => {
@@ -6842,8 +6839,8 @@ mod tests {
     /// treated as a crash); reopening loads the durable state and the
     /// retained WAL converges ids and indexes without losing the document.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_cancelled_metadata_put_poisons_handle_and_reopen_converges()
-    -> Result<(), DBError> {
+    async fn test_cancelled_metadata_put_poisons_handle_and_reopen_converges() -> Result<(), DBError>
+    {
         let (gate_tx, gate_rx) = tokio::sync::watch::channel(true);
         let blocked = Arc::new(TestAtomicBool::new(false));
         let object_store: Arc<dyn ObjectStore> = Arc::new(FaultPutStore {
@@ -7176,8 +7173,8 @@ mod tests {
     /// poisoned; the WAL stores both before/after values so the reopened
     /// generation removes that phantom.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_cancelled_update_poisons_handle_and_reopen_removes_phantom()
-    -> Result<(), DBError> {
+    async fn test_cancelled_update_poisons_handle_and_reopen_removes_phantom() -> Result<(), DBError>
+    {
         let (gate_tx, gate_rx) = tokio::sync::watch::channel(true);
         let blocked = Arc::new(TestAtomicBool::new(false));
         let object_store: Arc<dyn ObjectStore> = Arc::new(GatedPutStore {

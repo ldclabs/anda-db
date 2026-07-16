@@ -1408,8 +1408,7 @@ mod tests {
         );
         // Duplicate keys in a nested JSON object value must fail, pointing at
         // the nested duplicate `b`.
-        let input =
-            r#"UPSERT { CONCEPT ?c { {type: "T", name: "x"} SET ATTRIBUTES { a: { b: 1, b: 2 } } } }"#;
+        let input = r#"UPSERT { CONCEPT ?c { {type: "T", name: "x"} SET ATTRIBUTES { a: { b: 1, b: 2 } } } }"#;
         let err = crate::parse_kml(input).unwrap_err();
         let msg = format!("{err:?}");
         let col = input.rfind("b: 2").unwrap() + 1;

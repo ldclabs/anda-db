@@ -79,17 +79,14 @@ impl CognitiveNexus {
                     .await?;
 
                 for path in paths {
-                    result.matched_subjects.push(path.start.clone());
-                    result.matched_objects.push(path.end.clone());
-                    result.matched_predicates.push(predicate.clone());
                     // A path is not a single link, so the row carries no
                     // proposition binding — but the (subject, object) pair
                     // keeps multi-variable FIND columns solution-aligned.
-                    result.rows.push(QueryRelationRow {
+                    result.rows.push(PropositionMatchRow {
                         proposition: None,
-                        subject: Some(path.start),
-                        predicate: Some(predicate.clone()),
-                        object: Some(path.end),
+                        subject: path.start,
+                        predicate: predicate.clone(),
+                        object: path.end,
                     });
                     result
                         .matched_propositions
@@ -122,16 +119,13 @@ impl CognitiveNexus {
                     .await?;
 
                 for path in paths {
-                    result.matched_subjects.push(path.end.clone());
-                    result.matched_objects.push(path.start.clone());
-                    result.matched_predicates.push(predicate.clone());
                     // See the forward branch: align (subject, object) rows
                     // even though the path itself binds no single link.
-                    result.rows.push(QueryRelationRow {
+                    result.rows.push(PropositionMatchRow {
                         proposition: None,
-                        subject: Some(path.end),
-                        predicate: Some(predicate.clone()),
-                        object: Some(path.start),
+                        subject: path.end,
+                        predicate: predicate.clone(),
+                        object: path.start,
                     });
                     result
                         .matched_propositions
@@ -330,13 +324,13 @@ impl CognitiveNexus {
             .await
             .map_err(db_to_kip_error)?;
 
-        if ids.len() > super::kql::MAX_SOLUTION_COMBINATIONS {
+        if ids.len() > MAX_SOLUTION_COMBINATIONS {
             return Err(KipError::resource_exhausted(format!(
                 "unconstrained (?s, ?p, ?o) pattern would materialize {} proposition rows, \
-                 exceeding the engine cap of {}; constrain the subject, predicate or object \
-                 (e.g. a literal predicate or a typed subject) before matching",
+                 exceeding the engine cap of {MAX_SOLUTION_COMBINATIONS}; constrain the \
+                 subject, predicate or object (e.g. a literal predicate or a typed subject) \
+                 before matching",
                 ids.len(),
-                super::kql::MAX_SOLUTION_COMBINATIONS
             )));
         }
 
@@ -585,7 +579,6 @@ impl CognitiveNexus {
             TargetTerm::Variable(var) => Some(var.clone()),
             _ => None,
         };
-        let subject_var_clone = subject_var.clone();
         // `(?x, "p", ?x)` — the same variable at both endpoints is an
         // equality constraint on the solution rows, not two independent
         // bindings (which would silently bind ?x to every object).
@@ -631,8 +624,7 @@ impl CognitiveNexus {
             (subjects, predicate, objects) => {
                 let subject_must_be_proposition =
                     matches!(subjects, TargetEntities::AnyPropositions);
-                let object_must_be_proposition =
-                    matches!(objects, TargetEntities::AnyPropositions);
+                let object_must_be_proposition = matches!(objects, TargetEntities::AnyPropositions);
                 if matches!(&predicate, PredTerm::Variable(_)) {
                     // Fully unconstrained exploration `(?s, ?p, ?o)`:
                     // enumerate every proposition so the variables actually
@@ -661,73 +653,77 @@ impl CognitiveNexus {
             // Keep only rows whose subject equals their object (single-link
             // self-loops are not storable by this engine, but multi-hop
             // zero-hop and cyclic paths legitimately satisfy the equality),
-            // then rebuild the aggregate match sets from the survivors.
-            let rows: Vec<QueryRelationRow> = result
-                .rows
-                .into_iter()
-                .filter(|row| {
-                    matches!((&row.subject, &row.object), (Some(s), Some(o)) if s == o)
-                })
-                .collect();
-            let mut filtered = PropositionsMatchResult::default();
-            for row in rows {
-                if let (Some(subject), Some(object)) = (&row.subject, &row.object) {
-                    filtered.matched_subjects.push(subject.clone());
-                    filtered.matched_objects.push(object.clone());
-                }
-                if let Some(predicate) = &row.predicate {
-                    filtered.matched_predicates.push(predicate.clone());
-                }
+            // then rebuild the matched link ids from the survivors.
+            result.rows.retain(|row| row.subject == row.object);
+            let mut matched_propositions = UniqueVec::new();
+            for row in &result.rows {
                 if let Some(proposition) = &row.proposition {
-                    filtered.matched_propositions.push(proposition.clone());
+                    matched_propositions.push(proposition.clone());
                 }
-                filtered.rows.push(row);
             }
-            result = filtered;
+            result.matched_propositions = matched_propositions;
         }
 
-        if proposition_var.is_some()
-            || subject_var.is_some()
-            || predicate_var.is_some()
-            || object_var.is_some()
-        {
-            ctx.relations.push(QueryRelationBinding {
-                proposition_var,
-                subject_var: subject_var.clone(),
-                predicate_var: predicate_var.clone(),
-                object_var: object_var.clone(),
-                rows: result.rows.clone(),
-                origin: RelationOrigin::Pattern,
-            });
-        }
-
-        if let Some(var) = subject_var {
-            ctx.entities.insert(var.clone(), result.matched_subjects);
-
-            // Store group relationships: subject_var → object_var
-            if let Some(obj_var) = &object_var
-                && !result.subject_to_objects.is_empty()
-            {
-                let group_map = ctx.groups.entry((var, obj_var.clone())).or_default();
-                for (subj, objs) in result.subject_to_objects {
-                    group_map.entry(subj).or_default().extend(objs.into_vec());
+        // Merge the pattern's solution rows into the context as one table:
+        // each named position becomes a column, and the natural join with
+        // the existing forest enforces the conjunctive WHERE semantics.
+        // A variable naming two positions (beyond the subject/object pair
+        // handled above) is an equality constraint on the row.
+        let mut vars: Vec<String> = Vec::with_capacity(4);
+        let mut slots: Vec<Vec<usize>> = Vec::with_capacity(4);
+        for (slot, var) in [
+            (0usize, &proposition_var),
+            (1, &subject_var),
+            (2, &predicate_var),
+            (3, &object_var),
+        ] {
+            if let Some(var) = var {
+                if let Some(pos) = vars.iter().position(|v| v == var) {
+                    slots[pos].push(slot);
+                } else {
+                    vars.push(var.clone());
+                    slots.push(vec![slot]);
                 }
             }
         }
-        if let Some(var) = predicate_var {
-            ctx.predicates.insert(var, result.matched_predicates);
-        }
-        if let Some(var) = object_var {
-            ctx.entities.insert(var.clone(), result.matched_objects);
-
-            // Store group relationships: object_var → subject_var
-            if let Some(subj_var) = &subject_var_clone
-                && !result.object_to_subjects.is_empty()
-            {
-                let group_map = ctx.groups.entry((var, subj_var.clone())).or_default();
-                for (obj, subjs) in result.object_to_subjects {
-                    group_map.entry(obj).or_default().extend(subjs.into_vec());
+        if !vars.is_empty() {
+            let mut rows: Vec<Vec<BindingValue>> = Vec::with_capacity(result.rows.len());
+            'row: for row in &result.rows {
+                let slot_value = |slot: usize| -> BindingValue {
+                    match slot {
+                        0 => row
+                            .proposition
+                            .clone()
+                            .map(BindingValue::Entity)
+                            .unwrap_or(BindingValue::Null),
+                        1 => BindingValue::Entity(row.subject.clone()),
+                        2 => BindingValue::Predicate(row.predicate.clone()),
+                        _ => BindingValue::Entity(row.object.clone()),
+                    }
+                };
+                let mut out = Vec::with_capacity(vars.len());
+                for positions in &slots {
+                    let value = slot_value(positions[0]);
+                    for &other in &positions[1..] {
+                        if slot_value(other) != value {
+                            continue 'row;
+                        }
+                    }
+                    out.push(value);
                 }
+                rows.push(out);
+            }
+            let has_rows = !rows.is_empty();
+            ctx.merge_table(SolutionTable { vars, rows })?;
+
+            // Record the endpoint pair for grouped aggregation
+            // (FIND(?g, COUNT(?m)), KIP §3.3 implicit grouping).
+            if has_rows
+                && let (Some(s), Some(o)) = (&subject_var, &object_var)
+                && s != o
+            {
+                ctx.group_pairs.insert((s.clone(), o.clone()));
+                ctx.group_pairs.insert((o.clone(), s.clone()));
             }
         }
 
@@ -742,8 +738,8 @@ impl CognitiveNexus {
     ) -> Result<TargetEntities, KipError> {
         match target {
             TargetTerm::Variable(var) => {
-                if let Some(ids) = ctx.entities.get(&var) {
-                    Ok(TargetEntities::IDs(ids.clone().into()))
+                if let Some(ids) = ctx.entity_values(&var) {
+                    Ok(TargetEntities::IDs(ids.into()))
                 } else {
                     Ok(TargetEntities::Any)
                 }

@@ -2093,10 +2093,7 @@ mod tests {
         assert!(LessThan.compare(&rfc2822, &later_3339));
         assert!(LessThan.compare(&rfc3339, &later_2822));
         assert!(GreaterThan.compare(&later_2822, &rfc3339));
-        assert_eq!(
-            compare_json(&rfc2822, &later_3339),
-            Some(Ordering::Less)
-        );
+        assert_eq!(compare_json(&rfc2822, &later_3339), Some(Ordering::Less));
 
         // Offsets are honoured: 01:00+01:00 is the same instant as 00:00Z.
         let offset_2822 = json!("Wed, 01 Jan 2025 01:00:00 +0100");

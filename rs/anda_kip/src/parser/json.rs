@@ -353,9 +353,7 @@ mod tests {
         assert!(duplicate_key_position(err).starts_with("a: 2"));
 
         // Nested objects anchor at the nested duplicate.
-        let err = json_value()
-            .parse(r#"{ a: { b: 1, b: 2 } }"#)
-            .unwrap_err();
+        let err = json_value().parse(r#"{ a: { b: 1, b: 2 } }"#).unwrap_err();
         assert!(duplicate_key_position(err).starts_with("b: 2"));
 
         // With three occurrences, the second one (the first duplicate) is
