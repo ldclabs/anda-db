@@ -252,16 +252,11 @@ impl CognitiveNexus {
                     .get_bm25_index(&["name", "attributes", "metadata"])
                     .map_err(db_to_kip_error)?;
                 let scored = index.search_advanced(&term, top_k, None);
-                let max_score = scored
-                    .first()
-                    .map(|(_, score)| *score)
-                    .filter(|score| *score > 0.0)
-                    .unwrap_or(1.0);
 
                 let cache = QueryCache::default();
                 let mut result: Vec<Json> = Vec::new();
                 for (id, score) in scored {
-                    let score = normalize_search_score(score, max_score);
+                    let score = normalize_search_score(score);
                     if score < threshold {
                         continue;
                     }
@@ -294,17 +289,12 @@ impl CognitiveNexus {
                     .get_bm25_index(&["predicates", "properties"])
                     .map_err(db_to_kip_error)?;
                 let scored = index.search_advanced(&term, top_k, None);
-                let max_score = scored
-                    .first()
-                    .map(|(_, score)| *score)
-                    .filter(|score| *score > 0.0)
-                    .unwrap_or(1.0);
 
                 let tokens = self.propositions.tokenize(&term);
                 let cache = QueryCache::default();
                 let mut result: Vec<Json> = Vec::new();
                 'scored: for (id, score) in scored {
-                    let score = normalize_search_score(score, max_score);
+                    let score = normalize_search_score(score);
                     if score < threshold {
                         continue;
                     }

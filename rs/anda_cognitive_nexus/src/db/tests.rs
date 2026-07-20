@@ -4505,6 +4505,8 @@ async fn test_meta_search_modes_threshold_and_score() {
     setup_test_data(&nexus).await.unwrap();
 
     // Keyword search returns hits ordered by descending transient _score.
+    // Scores are absolute (saturation-normalized), not relative to the best
+    // hit — the top hit does NOT automatically score 1.0.
     let (result, _) = nexus
         .execute_meta(parse_meta(r#"SEARCH CONCEPT "Aspirin" LIMIT 5"#).unwrap())
         .await
@@ -4516,9 +4518,10 @@ async fn test_meta_search_modes_threshold_and_score() {
         .iter()
         .map(|h| h["metadata"]["_score"].as_f64().unwrap())
         .collect();
-    assert_eq!(scores[0], 1.0);
+    assert!(scores[0] > 0.0 && scores[0] < 1.0, "absolute: {scores:?}");
     assert!(scores.windows(2).all(|w| w[0] >= w[1]));
-    assert!(scores.iter().all(|s| (0.0..=1.0).contains(s)));
+    assert!(scores.iter().all(|s| (0.0..1.0).contains(s)));
+    let top_score = scores[0];
 
     // `_score` is transient: it is not persisted on the element.
     let aspirin = nexus
@@ -4545,14 +4548,41 @@ async fn test_meta_search_modes_threshold_and_score() {
         assert_eq!(result[0]["name"], json!("Aspirin"), "mode {mode}");
     }
 
-    // THRESHOLD 1.0 keeps only the best hit(s).
+    // THRESHOLD is an honest-miss gate (KIP §5.2.2): a threshold above the
+    // best achievable score returns an empty result instead of relabeling
+    // the least-bad hit as a perfect one.
+    let (result, _) = nexus
+        .execute_meta(
+            parse_meta(&format!(
+                r#"SEARCH CONCEPT "Aspirin" THRESHOLD {:.6} LIMIT 10"#,
+                (top_score + 0.05).min(1.0)
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result, json!([]), "honest miss above the top score");
+
+    // ... while a threshold just below the top score keeps the hit.
+    let (result, _) = nexus
+        .execute_meta(
+            parse_meta(&format!(
+                r#"SEARCH CONCEPT "Aspirin" THRESHOLD {:.6} LIMIT 10"#,
+                (top_score - 0.05).max(0.0)
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result[0]["name"], json!("Aspirin"));
+
+    // THRESHOLD 1.0 can never be satisfied by the saturating normalization —
+    // the strictest gate is always an honest miss.
     let (result, _) = nexus
         .execute_meta(parse_meta(r#"SEARCH CONCEPT "Aspirin" THRESHOLD 1.0 LIMIT 10"#).unwrap())
         .await
         .unwrap();
-    for hit in result.as_array().unwrap() {
-        assert_eq!(hit["metadata"]["_score"], json!(1.0));
-    }
+    assert_eq!(result, json!([]));
 
     // WITH TYPE constrains the result set.
     let (result, _) = nexus
@@ -4685,6 +4715,104 @@ async fn test_kql_multi_hop_zero_hop_and_cap() {
             "{quantifier}: {err:?}"
         );
     }
+}
+
+/// An unbounded `{m,}` quantifier on a chain deeper than the engine cap must
+/// fail with `KIP_4002` instead of silently returning an incomplete
+/// transitive closure (KIP §3.4.2: `{1,}` means the full closure).
+#[tokio::test]
+async fn test_kql_multi_hop_unbounded_incomplete_closure_errors() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_test_data(&nexus).await.unwrap();
+
+    // Deep13 -> Deep12 -> ... -> Deep0: 13 hops from bottom to root,
+    // beyond the 10-hop engine cap.
+    let mut setup = String::from(
+        r#"UPSERT {
+            CONCEPT ?cat_type { {type: "$ConceptType", name: "Category"} }
+            CONCEPT ?isa { {type: "$PropositionType", name: "is_subclass_of"} }
+            CONCEPT ?d0 { {type: "Category", name: "Deep0"} }
+"#,
+    );
+    for i in 1..=13 {
+        setup.push_str(&format!(
+            r#"            CONCEPT ?d{i} {{
+                {{type: "Category", name: "Deep{i}"}}
+                SET PROPOSITIONS {{ ("is_subclass_of", ?d{prev}) }}
+            }}
+"#,
+            prev = i - 1
+        ));
+    }
+    setup.push_str("        }");
+    nexus
+        .execute_kml(parse_kml(&setup).unwrap(), false)
+        .await
+        .unwrap();
+
+    // Unbounded from the bottom: closure needs 13 hops — must error, not truncate.
+    let kql = r#"
+        FIND(?parent.name)
+        WHERE {
+            ?concept {type: "Category", name: "Deep13"}
+            (?concept, "is_subclass_of"{1,}, ?parent)
+        }
+        "#;
+    let err = nexus
+        .execute_kql(parse_kql(kql).unwrap())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err.code, KipErrorCode::ResourceExhausted),
+        "unbounded over-cap closure must fail: {err:?}"
+    );
+
+    // Reverse direction (variable subject, bound object) is equally protected.
+    let kql = r#"
+        FIND(?desc.name)
+        WHERE {
+            (?desc, "is_subclass_of"{1,}, {type: "Category", name: "Deep0"})
+        }
+        "#;
+    let err = nexus
+        .execute_kql(parse_kql(kql).unwrap())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err.code, KipErrorCode::ResourceExhausted),
+        "reverse unbounded over-cap closure must fail: {err:?}"
+    );
+
+    // Unbounded from 3 hops below the root: closure completes within the cap.
+    let kql = r#"
+        FIND(?parent.name)
+        WHERE {
+            ?concept {type: "Category", name: "Deep3"}
+            (?concept, "is_subclass_of"{1,}, ?parent)
+        }
+        "#;
+    let (result, _) = nexus.execute_kql(parse_kql(kql).unwrap()).await.unwrap();
+    let names = result.as_array().unwrap();
+    assert_eq!(names.len(), 3, "complete closure: {names:?}");
+    for expected in ["Deep2", "Deep1", "Deep0"] {
+        assert!(
+            names.contains(&json!(expected)),
+            "missing {expected}: {names:?}"
+        );
+    }
+
+    // An explicit in-cap bound on the deep chain is a bounded walk, not a
+    // closure claim — it succeeds with exactly 10 ancestors.
+    let kql = r#"
+        FIND(?parent.name)
+        WHERE {
+            ?concept {type: "Category", name: "Deep13"}
+            (?concept, "is_subclass_of"{1,10}, ?parent)
+        }
+        "#;
+    let (result, _) = nexus.execute_kql(parse_kql(kql).unwrap()).await.unwrap();
+    let names = result.as_array().unwrap();
+    assert_eq!(names.len(), 10, "bounded walk: {names:?}");
 }
 
 /// Predicate variables participate in FILTER (KIP §3.4.2) — the associative

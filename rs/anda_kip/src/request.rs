@@ -280,6 +280,7 @@ impl Request {
     fn placeholder_usage_error(extra_hint: String) -> ErrorObject {
         ErrorObject {
             code: "KIP_1001".to_string(),
+            name: Some("InvalidSyntax".to_string()),
             message: "Invalid parameter placeholder usage".to_string(),
             hint: Some(extra_hint),
             data: None,
@@ -305,6 +306,7 @@ impl Request {
         if has_command && has_commands {
             return Some(ErrorObject {
                 code: "KIP_1001".to_string(),
+                name: Some("InvalidSyntax".to_string()),
                 message: "Invalid request: `command` and `commands` are mutually exclusive"
                     .to_string(),
                 hint: Some(
@@ -318,6 +320,7 @@ impl Request {
         if !has_command && !has_commands {
             return Some(ErrorObject {
                 code: "KIP_1001".to_string(),
+                name: Some("InvalidSyntax".to_string()),
                 message: "Invalid request: missing KIP command".to_string(),
                 hint: Some(
                     "Provide either a non-empty single `command` string or a non-empty batch `commands` array."
@@ -668,6 +671,11 @@ pub struct ErrorObject {
     /// KIP Standard Error Code (e.g., "KIP_1001", "KIP_2001")
     pub code: String,
 
+    /// Semantic error name matching the code (e.g., "InvalidSyntax",
+    /// "TypeMismatch") — spares the LLM from memorizing the code table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+
     /// Human-readable error message
     ///
     /// Provides detailed information about the error for debugging and user feedback.
@@ -709,6 +717,7 @@ impl From<String> for ErrorObject {
     fn from(message: String) -> Self {
         ErrorObject {
             code: "KIP_4003".to_string(),
+            name: Some("InternalError".to_string()),
             message,
             hint: Some("Contact system administrator or retry later.".to_string()),
             data: None,
@@ -723,6 +732,7 @@ impl From<serde_json::Error> for ErrorObject {
     fn from(error: serde_json::Error) -> Self {
         ErrorObject {
             code: "KIP_1001".to_string(),
+            name: Some("InvalidSyntax".to_string()),
             message: error.to_string(),
             hint: Some("Check JSON data format is valid.".to_string()),
             data: None,
@@ -738,6 +748,7 @@ impl From<KipError> for ErrorObject {
         let hint = error.hint().to_string();
         ErrorObject {
             code: error.code_str().to_string(),
+            name: Some(error.name().to_string()),
             message: error.message,
             hint: Some(hint),
             data: None,
@@ -1188,6 +1199,7 @@ mod tests {
 
         let res = Response::err(ErrorObject {
             code: "KIP_4003".to_string(),
+            name: None,
             message: "An error occurred".to_string(),
             hint: Some("Contact system administrator.".to_string()),
             data: Some(json!("Additional info")),
@@ -1267,6 +1279,7 @@ mod tests {
 
         let without_hint = ErrorObject {
             code: "KIP_TEST".to_string(),
+            name: None,
             message: "message".to_string(),
             hint: None,
             data: None,
@@ -1609,6 +1622,7 @@ mod tests {
         async fn execute(&self, _command: Command, _dry_run: bool) -> Response {
             Response::err(ErrorObject {
                 code: "KIP_3001".to_string(),
+                name: None,
                 message: "Not found".to_string(),
                 hint: Some("Check that the referenced concept exists.".to_string()),
                 data: None,
@@ -1627,6 +1641,7 @@ mod tests {
                 Command::Meta(_) => Response::ok(json!({"type": "meta"})),
                 Command::Kml(_) => Response::err(ErrorObject {
                     code: "KIP_4002".to_string(),
+                    name: None,
                     message: "Write failed".to_string(),
                     hint: Some("Check write constraints before retrying.".to_string()),
                     data: None,
@@ -2151,6 +2166,7 @@ mod tests {
         // Err without partial result
         let err = Response::err(ErrorObject {
             code: "KIP_2001".to_string(),
+            name: None,
             message: "boom".to_string(),
             hint: None,
             data: None,
@@ -2163,6 +2179,7 @@ mod tests {
         let err_partial = Response::Err {
             error: ErrorObject {
                 code: "KIP_2001".to_string(),
+                name: None,
                 message: "boom".to_string(),
                 hint: None,
                 data: None,

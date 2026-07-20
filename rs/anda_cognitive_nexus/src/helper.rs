@@ -65,14 +65,24 @@ where
     Ok(())
 }
 
-/// Normalizes a raw BM25 score into `[0, 1]` relative to the best hit of the
-/// result set, rounded to 6 decimal places for stable JSON output.
-pub fn normalize_search_score(score: f32, max_score: f32) -> f64 {
-    let normalized = if max_score > 0.0 {
-        (score / max_score) as f64
-    } else {
-        0.0
-    };
+/// Saturation pivot for absolute BM25 score normalization: a raw score equal
+/// to this value maps to `0.5`. Chosen so strong lexical matches land in the
+/// upper half of `[0, 1)` on typical corpora; agents calibrate `THRESHOLD`
+/// values against the engine (KIP §5.2.2).
+const SCORE_SATURATION_PIVOT: f64 = 2.0;
+
+/// Normalizes a raw BM25 score into `[0, 1)` with the corpus-independent
+/// saturation curve `score / (score + pivot)`, rounded to 6 decimal places
+/// for stable JSON output.
+///
+/// The normalization is deliberately **absolute** — independent of the best
+/// hit of the result set. KIP §5.2.2 frames `THRESHOLD` as an honest-miss
+/// gate ("a weak match is worse than an honest miss"), which a relative
+/// `score / max_score` scheme can never provide: its top hit always scores
+/// `1.0`, however weak the match.
+pub fn normalize_search_score(score: f32) -> f64 {
+    let score = (score as f64).max(0.0);
+    let normalized = score / (score + SCORE_SATURATION_PIVOT);
     (normalized.clamp(0.0, 1.0) * 1e6).round() / 1e6
 }
 

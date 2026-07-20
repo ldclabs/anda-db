@@ -8,12 +8,16 @@ const MAX_SUBJECT_OBJECT_RANGE_VARIANTS: usize = 4_096;
 
 /// Engine cap on multi-hop path traversal depth. An explicit quantifier
 /// beyond the cap is rejected with `KIP_4002` (rather than silently
-/// truncated); an unbounded `{m,}` quantifier traverses up to this depth.
+/// truncated); an unbounded `{m,}` quantifier traverses up to this depth
+/// and fails with `KIP_4002` if the transitive closure is still incomplete
+/// at the cap — a partial closure would be a silently wrong answer.
 const MAX_MULTI_HOP: u16 = 10;
 
 /// Resolves a `{m,n}` quantifier against the engine cap: explicit bounds
-/// beyond [`MAX_MULTI_HOP`] return `KIP_4002`; `None` (unbounded) is capped.
-fn checked_max_hops(min: u16, max: Option<u16>) -> Result<u16, KipError> {
+/// beyond [`MAX_MULTI_HOP`] return `KIP_4002`; `None` (unbounded) is capped,
+/// and the returned flag marks it so traversal can fail loudly instead of
+/// silently returning an incomplete transitive closure (KIP §3.4.2).
+fn checked_max_hops(min: u16, max: Option<u16>) -> Result<(u16, bool), KipError> {
     if min > MAX_MULTI_HOP {
         return Err(KipError::resource_exhausted(format!(
             "multi-hop quantifier minimum {min} exceeds the engine cap of {MAX_MULTI_HOP} hops"
@@ -24,8 +28,8 @@ fn checked_max_hops(min: u16, max: Option<u16>) -> Result<u16, KipError> {
             "multi-hop quantifier maximum {max} exceeds the engine cap of {MAX_MULTI_HOP} hops; \
              lower the bound or traverse in stages"
         ))),
-        Some(max) => Ok(max),
-        None => Ok(MAX_MULTI_HOP),
+        Some(max) => Ok((max, false)),
+        None => Ok((MAX_MULTI_HOP, true)),
     }
 }
 
@@ -63,7 +67,7 @@ impl CognitiveNexus {
                 _ => unreachable!(),
             };
 
-            let max_hops = checked_max_hops(min, max)?;
+            let (max_hops, capped_unbounded) = checked_max_hops(min, max)?;
 
             for start_node in start_nodes {
                 let paths = self
@@ -73,6 +77,7 @@ impl CognitiveNexus {
                         &predicate,
                         min,
                         max_hops,
+                        capped_unbounded,
                         &objects,
                         false,
                     )
@@ -104,7 +109,7 @@ impl CognitiveNexus {
                 }
             };
 
-            let max_hops = checked_max_hops(min, max)?;
+            let (max_hops, capped_unbounded) = checked_max_hops(min, max)?;
             for start_node in start_nodes {
                 let paths = self
                     .bfs_multi_hop(
@@ -113,6 +118,7 @@ impl CognitiveNexus {
                         &predicate,
                         min,
                         max_hops,
+                        capped_unbounded,
                         &subjects,
                         true,
                     )
@@ -421,6 +427,10 @@ impl CognitiveNexus {
     }
 
     // BFS 路径查找实现
+    //
+    // `capped_unbounded` 为 true 时表示原始量词是无界 `{m,}`、被引擎 cap 到
+    // `max_hops`：此时若在 cap 层仍能到达未发现的新节点，说明传递闭包不完整，
+    // 必须返回 `KIP_4002` 而不是静默截断。
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn bfs_multi_hop(
         &self,
@@ -429,6 +439,7 @@ impl CognitiveNexus {
         predicate: &str,
         min_hops: u16,
         max_hops: u16,
+        capped_unbounded: bool,
         targets: &TargetEntities,
         reverse: bool,
     ) -> Result<Vec<GraphPath>, KipError> {
@@ -453,6 +464,10 @@ impl CognitiveNexus {
         let mut queue: VecDeque<GraphPath> = VecDeque::new();
         let mut results: Vec<GraphPath> = Vec::new();
         let mut visited: FxHashSet<(EntityID, u16)> = FxHashSet::default(); // (node, depth) 防止循环
+        // 无界量词的完整性检查：记录 cap 内到达过的所有节点。BFS 按深度序
+        // 展开，弹出 cap 层节点时该集合已含全部 ≤ cap 跳可达节点。
+        let mut discovered: FxHashSet<EntityID> = FxHashSet::default();
+        discovered.insert(start.clone());
 
         let initial_path = GraphPath {
             start: start.clone(),
@@ -480,6 +495,21 @@ impl CognitiveNexus {
 
             // 达到最大跳数，停止扩展此路径（结果在扩展/零跳时已收集）
             if current_path.hops >= max_hops {
+                // 被 cap 的无界量词：探测 cap 层是否还有未发现的更深节点。
+                // 有则传递闭包不完整，报错而非静默返回部分结果。
+                if capped_unbounded {
+                    let props = self
+                        .find_propositions(cache, &current_path.end, predicate, reverse)
+                        .await?;
+                    if props.iter().any(|(_, target)| !discovered.contains(target)) {
+                        return Err(KipError::resource_exhausted(format!(
+                            "unbounded multi-hop traversal on \"{predicate}\" did not complete \
+                             within the engine cap of {MAX_MULTI_HOP} hops; results would be \
+                             incomplete. Use an explicit bound (e.g., {{1,{MAX_MULTI_HOP}}}) \
+                             and traverse in stages"
+                        )));
+                    }
+                }
                 continue;
             }
 
@@ -489,6 +519,7 @@ impl CognitiveNexus {
                 .await?;
 
             for (prop_id, target_node) in props {
+                discovered.insert(target_node.clone());
                 let mut new_path = current_path.clone();
                 new_path.end = target_node;
                 new_path.propositions.push(prop_id);
@@ -499,8 +530,9 @@ impl CognitiveNexus {
                     results.push(new_path.clone());
                 }
 
-                // 如果未达到最大跳数，继续扩展
-                if new_path.hops < max_hops {
+                // 如果未达到最大跳数，继续扩展；被 cap 的无界量词还需把
+                // cap 层节点入队，弹出时执行上面的完整性探测。
+                if new_path.hops < max_hops || (capped_unbounded && new_path.hops == max_hops) {
                     queue.push_back(new_path);
                 }
             }

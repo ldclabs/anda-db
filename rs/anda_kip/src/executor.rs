@@ -190,11 +190,30 @@ pub async fn execute_readonly(
     match parse_kip(command) {
         Ok(cmd) => {
             if matches!(cmd, Command::Kml(_)) {
+                // A mode restriction, not a syntax problem — build the error
+                // by hand so the hint points at the right recovery action
+                // instead of the generic "check parentheses" syntax hint.
+                // (The code stays KIP_1001 until the spec defines a
+                // permission-denied code, proposed for RC11 as KIP_4004.)
                 return (
                     CommandType::Kml,
-                    Response::err(crate::KipError::invalid_syntax(
-                        "Only KQL and META commands are allowed in read-only mode".to_string(),
-                    )),
+                    Response::Err {
+                        error: crate::ErrorObject {
+                            code: "KIP_1001".to_string(),
+                            name: Some("InvalidSyntax".to_string()),
+                            message: "KML write commands (UPSERT / UPDATE / MERGE / DELETE) \
+                                      are not allowed in read-only mode"
+                                .to_string(),
+                            hint: Some(
+                                "This interface only executes KQL FIND and META \
+                                 DESCRIBE / SEARCH / EXPORT. Re-send the command via \
+                                 `execute_kip` if the write is intended."
+                                    .to_string(),
+                            ),
+                            data: None,
+                        },
+                        result: None,
+                    },
                 );
             }
             // Delegate execution to the provided executor

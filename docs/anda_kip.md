@@ -7,11 +7,11 @@
 |                       |                                                                                                                                                                    |
 | :-------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Crate                 | [`anda_kip`](../rs/anda_kip/)                                                                                                                                      |
-| Version               | `0.7.x`                                                                                                                                                            |
-| Spec                  | KIP **v1.0-RC6** ([SPECIFICATION.md](../rs/anda_kip/SPECIFICATION.md))                                                                                             |
+| Version               | `0.10.x`                                                                                                                                                           |
+| Spec                  | KIP **v1.0-RC10** ([SPECIFICATION.md](../rs/anda_kip/SPECIFICATION.md))                                                                                            |
 | Reference executor    | [`anda_cognitive_nexus`](../rs/anda_cognitive_nexus/) (graph store backed by [Anda DB](../rs/anda_db/))                                                            |
 | Other implementations | [`anda_cognitive_nexus_server`](../rs/anda_cognitive_nexus_server/) (HTTP/JSON-RPC), [`anda_cognitive_nexus_py`](../py/anda_cognitive_nexus_py/) (Python bindings) |
-| Status                | Library is feature-complete for KIP v1.0-RC6 (parser + AST + request/response + executor trait). Bundled `kip_cli` provides an interactive REPL.                   |
+| Status                | Library is feature-complete for KIP v1.0-RC10 (parser + AST + request/response + executor trait). Bundled `kip_cli` provides an interactive REPL.                  |
 
 ---
 
@@ -51,7 +51,7 @@
   - [9. Genesis capsules (`anda_kip::capsule`)](#9-genesis-capsules-anda_kipcapsule)
   - [10. Entity types (`anda_kip::types`)](#10-entity-types-anda_kiptypes)
   - [11. Function-calling integration](#11-function-calling-integration)
-  - [12. Executor implementer's checklist (RC6 semantics)](#12-executor-implementers-checklist-rc6-semantics)
+  - [12. Executor implementer's checklist (RC10 semantics)](#12-executor-implementers-checklist-rc10-semantics)
   - [13. Cookbook](#13-cookbook)
     - [13.1 Parse and inspect](#131-parse-and-inspect)
     - [13.2 Single command via `execute_kip`](#132-single-command-via-execute_kip)
@@ -84,17 +84,17 @@ A KIP backend (a *Cognitive Nexus*) stores two kinds of entity:
 
 KIP defines three instruction families:
 
-| Family   | Purpose                          | Statements                                                                |
-| :------- | :------------------------------- | :------------------------------------------------------------------------ |
-| **KQL**  | Knowledge retrieval & reasoning  | `FIND … WHERE { … } [ORDER BY] [LIMIT] [CURSOR]`                          |
-| **KML**  | Knowledge evolution / writes     | `UPSERT { … }`, `DELETE CONCEPT/PROPOSITIONS/ATTRIBUTES/METADATA … `      |
-| **META** | Schema introspection & grounding | `DESCRIBE PRIMER/DOMAINS/CONCEPT TYPE[S]/PROPOSITION TYPE[S]`, `SEARCH …` |
+| Family   | Purpose                          | Statements                                                                                                          |
+| :------- | :------------------------------- | :------------------------------------------------------------------------------------------------------------------ |
+| **KQL**  | Knowledge retrieval & reasoning  | `FIND … WHERE { … } [ORDER BY] [LIMIT] [CURSOR]`                                                                    |
+| **KML**  | Knowledge evolution / writes     | `UPSERT { … }`, `UPDATE ?t SET … WHERE { … }`, `MERGE CONCEPT … INTO …`, `DELETE CONCEPT/PROPOSITIONS/ATTRIBUTES/METADATA …` |
+| **META** | Schema introspection & grounding | `DESCRIBE PRIMER/DOMAINS/CONCEPT TYPE[S]/PROPOSITION TYPE[S]`, `SEARCH …`, `EXPORT ?t WHERE { … }`                  |
 
 ### 1.2 What this crate provides
 
 `anda_kip` is the **protocol-only** layer (no storage, no I/O):
 
-- A complete, RC6-compliant **parser** (`nom` + `nom-language`, no regex).
+- A complete, RC10-compliant **parser** (`nom` + `nom-language`, no regex).
 - A strongly-typed **AST** for every KIP construct.
 - A small **`Executor` trait** (`async fn execute(Command, dry_run) -> Response`)
   that any backend can implement.
@@ -102,8 +102,8 @@ KIP defines three instruction families:
   substitution (`:name` placeholders) and **batch execution semantics**.
 - KIP **standard error codes** (`KIP_1xxx`–`KIP_4xxx`) with recovery hints.
 - The canonical **Genesis capsules** (`$ConceptType`, `$PropositionType`,
-  `Domain`, `Person`, `Event`, `Insight`, `Preference`, `SleepTask`, `$self`,
-  `$system`).
+  `Domain`, `Person`, `Event`, `Insight`, `Preference`, `Commitment`,
+  `SleepTask`, `$self`, `$system`).
 - LLM-facing **function-calling JSON schemas** for `execute_kip` and
   `execute_kip_readonly`.
 - An interactive REPL: `kip_cli` (built from the bundled `bin/kip_cli.rs`).
@@ -112,7 +112,7 @@ KIP defines three instruction families:
 
 ```toml
 [dependencies]
-anda_kip = "0.7"
+anda_kip = "0.10"
 ```
 
 ```rust
@@ -153,8 +153,8 @@ rs/anda_kip/src/
 │   ├── common.rs     # Shared combinators (identifier, ws, keyword/keywords, …)
 │   ├── json.rs       # JSON value parser (Value, Object, Array, …)
 │   ├── kql.rs        # FIND / WHERE / FILTER / ORDER BY / LIMIT / CURSOR
-│   ├── kml.rs        # UPSERT / DELETE / SET ATTRIBUTES / SET PROPOSITIONS
-│   └── meta.rs       # DESCRIBE / SEARCH
+│   ├── kml.rs        # UPSERT / UPDATE / MERGE / DELETE / EXPECT VERSION
+│   └── meta.rs       # DESCRIBE / SEARCH / EXPORT
 ├── request.rs        # Request / CommandItem / Response / ErrorObject
 ├── types.rs          # Entity / ConceptNode / PropositionLink (+ borrowed refs)
 └── bin/kip_cli.rs    # Interactive REPL using anda_cognitive_nexus
@@ -199,13 +199,15 @@ CURSOR "<opaque-token>"
 | `FIND( … )`                           | Projection list. Variables, dot-paths (`?x.attributes.k`), and aggregates (`COUNT`/`COUNT_DISTINCT`/`SUM`/`AVG`/`MIN`/`MAX`). |
 | Concept matcher `?v {type, name, id}` | Either `{id: "C:…"}`, `{type, name}`, `{type}`, or `{name}`.                                                                  |
 | Proposition matcher `(?s, "p", ?o)`   | Either `(id: "P:…")` or `(subject, predicate, object)`. Subject and object may themselves be matchers — *higher-order* facts. |
-| Predicate term                        | Literal `"treats"`, alternative `"treats" \| "cures"`, or **multi-hop** `"follows"{1,3}` (path operator).                     |
+| Predicate term                        | Literal `"treats"`, **variable** `?p` (binds the predicate name — associative recall), alternative `"treats" \| "cures"`, or **multi-hop** `"follows"{1,3}` (path operator). |
 | `OPTIONAL { … }`                      | Left-join semantics; missing variables project as `null`.                                                                     |
 | `NOT { … }`                           | Negation-as-failure; internal variable bindings stay private.                                                                 |
 | `UNION { … } UNION { … }`             | Row-wise union; branches have **independent** scopes; missing columns are filled with `null`.                                 |
 | `FILTER( expr )`                      | Comparisons, arithmetic, `&&`/`\|\|`/`!`, `CONTAINS`, `STARTS_WITH`, `ENDS_WITH`, `REGEX`, `IN`, `IS_NULL`, `IS_NOT_NULL`.    |
 | Pagination                            | `LIMIT n` (cap row count) and `CURSOR "<token>"` (resumable).                                                                 |
+| `ORDER BY`                            | One or more sort keys (dot-paths or aggregation expressions), each `ASC`/`DESC` — multi-key since RC9.                        |
 | Aggregation                           | When `FIND` mixes plain variables with aggregates, the plain variables form an **implicit `GROUP BY`** key.                   |
+| Result shape                          | **Columnar** (RC10 §6.2.2): one array per `FIND` expression; a single-expression `FIND` unwraps to the bare column. Duplicate solutions collapse (set semantics, RC10 §3.3). |
 | Path operator zero-hop                | `"p"{0,n}` includes the reflexive case `?s == ?o`.                                                                            |
 
 ### 3.2 KML — Knowledge Manipulation Language
@@ -245,6 +247,22 @@ Key rules:
    `$PropositionType`, `$self`, `$system`, core domains like `CoreSchema`)
    returns `KIP_3004 ImmutableTarget`.
 
+Beyond `UPSERT`/`DELETE`, RC9 added two more KML statements and a write guard
+(spec §4.3, §4.4, §2.11):
+
+- `UPDATE ?t SET ATTRIBUTES { … } SET METADATA { … } WHERE { … } [LIMIT n]` —
+  pattern-matched bulk mutation that never creates; values may be update
+  expressions built from `ADD` / `MUL` / `CLAMP` / `COALESCE`.
+- `MERGE CONCEPT ?src INTO ?dst WHERE { … }` — atomic entity consolidation:
+  links are repointed and deduplicated, missing attributes filled (target
+  wins, `aliases` unioned), and `_merged_from` provenance recorded.
+- `EXPECT VERSION <n>` after a block's identity clause — optimistic
+  concurrency against the engine-maintained `metadata._version`; a mismatch
+  aborts the whole statement with `KIP_3005 VersionConflict`.
+- Metadata keys starting with `_` (`_version`, `_updated_at`, …) are an
+  engine-maintained reserved namespace: readable in KQL, rejected in KML
+  writes with `KIP_2002`.
+
 ### 3.3 META — schema introspection
 
 ```kip
@@ -254,9 +272,16 @@ DESCRIBE CONCEPT TYPES                 -- all concept type names
 DESCRIBE CONCEPT TYPE "Drug"           -- single type definition
 DESCRIBE PROPOSITION TYPES
 DESCRIBE PROPOSITION TYPE "treats"
-SEARCH CONCEPT "antiinflammatory" WITH TYPE "Drug" LIMIT 10
+SEARCH CONCEPT "antiinflammatory" WITH TYPE "Drug" MODE "hybrid" THRESHOLD 0.4 LIMIT 10
 SEARCH PROPOSITION "treats" LIMIT 5
+EXPORT ?t WHERE { ?t {type: "Drug"} } LIMIT 100    -- idempotent UPSERT capsule (+ CURSOR)
 ```
+
+`SEARCH` supports retrieval modes (`MODE "keyword" | "semantic" | "hybrid"`)
+and a `THRESHOLD` on the transient, normalized `metadata._score`; engines
+without semantic capability degrade `semantic`/`hybrid` to `keyword`
+(spec §5.2). `EXPORT` serializes a matched subgraph into an idempotent
+`UPSERT` capsule, paginated via `CURSOR` (spec §5.3).
 
 ---
 
@@ -267,18 +292,18 @@ Every node implements `Clone + Debug + Serialize + Deserialize + PartialEq`.
 
 ### 4.1 Top-level
 
-| Type           | Variants / fields                                            |
-| :------------- | :----------------------------------------------------------- |
-| `Command`      | `Kql(KqlQuery)`, `Kml(KmlStatement)`, `Meta(MetaCommand)`    |
-| `CommandType`  | `Kql`, `Kml`, `Meta`, `Unknown` (used by `Request::execute`) |
-| `KqlQuery`     | `find`, `where_clauses`, `order_by`, `limit`, `cursor`       |
-| `KmlStatement` | `Upsert(Vec<UpsertBlock>)` \| `Delete(DeleteStatement)`      |
-| `MetaCommand`  | `Describe(DescribeCommand)` \| `Search(SearchCommand)`       |
+| Type           | Variants / fields                                                                                     |
+| :------------- | :----------------------------------------------------------------------------------------------------- |
+| `Command`      | `Kql(KqlQuery)`, `Kml(KmlStatement)`, `Meta(MetaCommand)`                                             |
+| `CommandType`  | `Kql`, `Kml`, `Meta`, `Unknown` (used by `Request::execute`)                                          |
+| `KqlQuery`     | `find_clause`, `where_clauses`, `order_by: Option<Vec<OrderByCondition>>` (multi-key), `limit`, `cursor` |
+| `KmlStatement` | `Upsert(Vec<UpsertBlock>)` \| `Update(UpdateStatement)` \| `Merge(MergeStatement)` \| `Delete(DeleteStatement)` |
+| `MetaCommand`  | `Describe(DescribeTarget)` \| `Search(SearchCommand)` \| `Export(ExportCommand)`                      |
 
 ### 4.2 KQL nodes
 
 - `FindClause` — list of `FindExpression`s.
-- `FindExpression::Variable(DotPathVar)` and `FindExpression::Aggregation { function, distinct, expression }`.
+- `FindExpression::Variable(DotPathVar)` and `FindExpression::Aggregation { func, var, distinct }`.
 - `AggregationFunction` — `Count | Sum | Avg | Min | Max`.
 - `WhereClause` —
   - `Concept(ConceptClause)` `?x {…}`
@@ -286,7 +311,7 @@ Every node implements `Clone + Debug + Serialize + Deserialize + PartialEq`.
   - `Filter(FilterClause)`
   - `Optional(Vec<WhereClause>)`
   - `Not(Vec<WhereClause>)`
-  - `Union(Vec<Vec<WhereClause>>)`
+  - `Union(Vec<WhereClause>)` (one entry per `UNION { … }` block)
 - `ConceptMatcher` — `ID(String)`, `Type(String)`, `Name(String)`,
   `Object { type, name }`.
 - `PropositionMatcher` — `ID(String)` or `Object { subject, predicate, object }`.
@@ -294,32 +319,44 @@ Every node implements `Clone + Debug + Serialize + Deserialize + PartialEq`.
   `Proposition(Box<PropositionMatcher>)`.
 - `PredTerm` —
   - `Literal(String)`,
-  - `Variable(String)`,
+  - `Variable(String)` (predicate variable — binds the predicate name, RC10 §3.4.2),
   - `Alternative(Vec<String>)` (`pred1 | pred2`),
-  - `MultiHop { predicates, min: u16, max: u16 }`. Zero-hop is encoded as
-    `min == 0` and is bound by the executor (RC6 §3.3).
+  - `MultiHop { predicate, min: u16, max: Option<u16> }` (`None` = unbounded,
+    engine-capped). Zero-hop is encoded as `min == 0` and is bound by the
+    executor (RC10 §3.4.2).
 - `FilterExpression`, `FilterOperand`, `ComparisonOperator`, `LogicalOperator`,
   `FilterFunction` (`Contains | StartsWith | EndsWith | Regex | In | IsNull | IsNotNull`).
-- `OrderClause`, `OrderDirection`.
+- `OrderByCondition { variable, direction, aggregation }` (one per sort key),
+  `OrderDirection`.
 
 ### 4.3 KML nodes
 
 - `UpsertBlock { items: Vec<UpsertItem>, metadata: Option<Map> }`.
 - `UpsertItem::Concept(ConceptBlock)` / `::Proposition(PropositionBlock)`.
-- `ConceptBlock { handle, matcher, attributes, propositions, metadata }`.
-- `PropositionBlock { handle, proposition, attributes, metadata }`.
+- `ConceptBlock { handle, concept, expect_version, set_attributes, set_propositions, metadata }`.
+- `PropositionBlock { handle, proposition, expect_version, set_attributes, metadata }`.
+  `expect_version` is the optional `EXPECT VERSION <n>` guard (RC10 §2.11.2);
+  on mismatch the whole statement aborts with `KIP_3005`.
+- `UpdateStatement { target, set_attributes, set_metadata, where_clauses, limit }` —
+  values are plain JSON or `UpdateExpr`s built from
+  `UpdateFunction::{Add, Mul, Clamp, Coalesce}` (RC10 §4.3).
+- `MergeStatement { source, target, where_clauses }` (RC10 §4.4).
 - `DeleteStatement` —
   - `DeleteAttributes { attributes, target, where_clauses }`,
   - `DeleteMetadata { keys, target, where_clauses }`,
   - `DeletePropositions { target, where_clauses }`,
-  - `DeleteConcept { target, where_clauses }` (RC6 mandates `DETACH`).
+  - `DeleteConcept { target, where_clauses }` (RC10 mandates `DETACH`).
 
 ### 4.4 META nodes
 
-- `DescribeCommand::Primer | Domains | ConceptTypes { limit, cursor }
+- `DescribeTarget::Primer | Domains | ConceptTypes { limit, cursor }
   | ConceptType(String) | PropositionTypes { limit, cursor } | PropositionType(String)`.
-- `SearchCommand { target: SearchTarget, term, with_type, limit }` where
-  `SearchTarget = Concept | Proposition`.
+- `SearchCommand { target: SearchTarget, term, in_type, mode, threshold, limit }`
+  where `SearchTarget = Concept | Proposition` and
+  `SearchMode = Keyword | Semantic | Hybrid` (RC10 §5.2).
+- `ExportCommand { target, where_clauses, limit, cursor }` — serializes the
+  matched subgraph as an idempotent `UPSERT` capsule, resumable via `CURSOR`
+  (RC10 §5.3).
 
 ### 4.5 Value / `Json` aliases
 
@@ -454,7 +491,7 @@ For a production-quality implementation, see
   short-circuiting `FILTER` evaluation, regex caching, and BTree-backed
   `CURSOR` pagination;
 - runs KML under a single `RwLock` write guard (KQL/META take the read
-  guard) and enforces RC6 protected-scope and transitive-cascade rules;
+  guard) and enforces RC10 protected-scope and transitive-cascade rules;
 - runs META through BM25 (CJK-aware via `jieba_tokenizer`) and BTree-backed
   type listings.
 
@@ -517,7 +554,7 @@ Batch path (`commands` non-empty):
 4. **Stop-on-write-error**: the first KML failure stops the batch; the
    partial array is wrapped in `Response::ok(json!(results))` so the caller
    knows what *did* execute.
-5. KQL / META / parse errors do **not** stop the batch (RC6 §6).
+5. KQL / META / parse errors do **not** stop the batch (RC10 §6.2.3).
 
 ### 7.3 `Response`
 
@@ -579,6 +616,7 @@ KIP standardizes error codes so LLM agents can self-correct.
 | `KIP_3002` | `NotFound`            | Target not in graph                                                      | "Try `SEARCH`/`FIND` first."                                           |
 | `KIP_3003` | `DuplicateExists`     | Uniqueness violation                                                     | "Use `UPSERT` instead of create-only."                                 |
 | `KIP_3004` | `ImmutableTarget`     | Modifying meta-types, system actors (`$self`/`$system`), or core domains | "**Operation Prohibited.** Do not modify system definitions."          |
+| `KIP_3005` | `VersionConflict`     | `EXPECT VERSION` mismatch on a conditional write                         | "Re-read the element (fresh `_version`), re-apply, and retry."         |
 | `KIP_4001` | `ExecutionTimeout`    | Query time budget exceeded                                               | "Reduce `UNION`, lower `LIMIT`, simplify regex/multi-hop."             |
 | `KIP_4002` | `ResourceExhausted`   | Result set / memory budget exceeded                                      | "Use `LIMIT` and `CURSOR` for pagination."                             |
 | `KIP_4003` | `InternalError`       | Unknown backend error                                                    | "Contact administrator or retry."                                      |
@@ -609,7 +647,7 @@ preserving the context stack and the offending source slice.
 ## 9. Genesis capsules (`anda_kip::capsule`)
 
 The capsule module exposes the canonical bootstrap KIP source as `&'static
-str` constants plus the reserved-name sigils used by RC6's protected-scope
+str` constants plus the reserved-name sigils used by RC10's protected-scope
 guard.
 
 | Constant                                                                          | Purpose                                                               |
@@ -619,10 +657,10 @@ guard.
 | `META_SELF_NAME`                                                                  | `"$self"` — the agent's waking persona name                           |
 | `META_SYSTEM_NAME`                                                                | `"$system"` — the agent's sleeping/maintenance persona                |
 | `DOMAIN_TYPE`                                                                     | `"Domain"`                                                            |
-| `EVENT_TYPE`, `INSIGHT_TYPE`, `PERSON_TYPE`, `PREFERENCE_TYPE`, `SLEEP_TASK_TYPE` | standard concept types defined in the bundled capsules                |
+| `EVENT_TYPE`, `INSIGHT_TYPE`, `PERSON_TYPE`, `PREFERENCE_TYPE`, `COMMITMENT_TYPE`, `SLEEP_TASK_TYPE` | standard concept types defined in the bundled capsules                |
 | `BELONGS_TO_DOMAIN_TYPE`                                                          | `"belongs_to_domain"` — predicate used by all CoreSchema entries      |
-| `GENESIS_KIP`                                                                     | bootstraps `$ConceptType`, `$PropositionType`, `Domain`, `CoreSchema` |
-| `EVENT_KIP`, `INSIGHT_KIP`, `PERSON_KIP`, `PREFERENCE_KIP`, `SLEEP_TASK_KIP`      | standard concept-type definitions                                     |
+| `GENESIS_KIP`                                                                     | bootstraps `$ConceptType`, `$PropositionType`, `Domain`, and the core domains (`CoreSchema`, `Unsorted`, `Archived`, `System` — the latter added in RC10) |
+| `EVENT_KIP`, `INSIGHT_KIP`, `PERSON_KIP`, `PREFERENCE_KIP`, `COMMITMENT_KIP`, `SLEEP_TASK_KIP` | standard concept-type definitions                                     |
 | `PERSON_SELF_KIP`, `PERSON_SYSTEM_KIP`                                            | the `$self` and `$system` actor instances                             |
 
 A typical bootstrap loop is therefore:
@@ -667,6 +705,10 @@ self-describing.
 contexts (e.g. cache keys, error builders) where the full payload is not
 needed.
 
+`UpsertResult { blocks, upsert_concept_nodes, upsert_proposition_links }` is
+the canonical `UPSERT` response payload (RC10 §6.2.2) that executors are
+expected to serialize.
+
 ---
 
 ## 11. Function-calling integration
@@ -704,9 +746,9 @@ let system = format!(
 
 ---
 
-## 12. Executor implementer's checklist (RC6 semantics)
+## 12. Executor implementer's checklist (RC10 semantics)
 
-When writing a new backend (or porting an old one to RC6), these are the
+When writing a new backend (or porting an old one to RC10), these are the
 points the parser does **not** enforce — they are the executor's contract:
 
 **KQL**
@@ -725,6 +767,11 @@ points the parser does **not** enforce — they are the executor's contract:
       reflexive `?s == ?o` row.
 - [ ] `CURSOR` tokens must be opaque, deterministic, and resumable (typical
       implementation: BTree key prefix).
+- [ ] Results are **columnar** (§6.2.2): one column per `FIND` expression,
+      index-aligned; a single-expression `FIND` unwraps to the bare column.
+      Deduplicate identical solutions before `ORDER BY` / `LIMIT` (§3.3).
+- [ ] Predicate variables `(?s, ?p, ?o)` bind the predicate **name** (a
+      string); reject quantifiers/alternatives on them with `KIP_1001`.
 - [ ] `expires_at` is a **signal**, not an automatic filter. Agents add
       `FILTER(IS_NULL(?x.metadata.expires_at) || ?x.metadata.expires_at > <now>)`
       explicitly.
@@ -743,8 +790,18 @@ points the parser does **not** enforce — they are the executor's contract:
     declared core domains and `core_directives`).
   - Cascade through **all** propositions referencing the concept, then
     through propositions referencing those propositions (transitively).
-- [ ] Report cascade counts so agents can audit impact (e.g. `{"deleted_concepts":
-      n, "deleted_propositions": m}`).
+- [ ] Report cascade counts so agents can audit impact
+      (`{"deleted_concepts": n, "deleted_propositions": m}`, §6.2.2).
+- [ ] `UPDATE`: never creates; mutate every matched element; report
+      `{"updated": n, "matched": m}` (an expression that resolves to
+      `null`/non-numeric skips that key, so `updated` may be `< matched`).
+- [ ] `MERGE`: repoint + deduplicate links, fill missing attributes (target
+      wins, `aliases` unioned), record `_merged_from` (carrying the source's
+      own trail forward); report the four counters from §6.2.2.
+- [ ] `EXPECT VERSION`: compare against `metadata._version`; on mismatch
+      abort the **whole** statement atomically with `KIP_3005`.
+- [ ] Maintain `_version` / `_updated_at`; reject KML writes to `_`-prefixed
+      metadata keys with `KIP_2002`.
 
 **META**
 
@@ -754,6 +811,12 @@ points the parser does **not** enforce — they are the executor's contract:
 - [ ] `SEARCH … WITH TYPE …` filters by concept type / predicate; `LIMIT`
       should default to a small bound (e.g. 10) and cap at a documented
       maximum.
+- [ ] `SEARCH` modes: degrade `semantic`/`hybrid` to `keyword` when there is
+      no embedding store; attach the transient normalized `metadata._score`
+      and apply `THRESHOLD` to it (§5.2).
+- [ ] `EXPORT`: emit an idempotent `UPSERT` capsule (strip `_` metadata,
+      handle out-of-set endpoints structurally) and paginate with `CURSOR`
+      (§5.3).
 
 **Concurrency**
 
@@ -772,8 +835,8 @@ use anda_kip::{parse_kip, Command, FindExpression, AggregationFunction};
 
 let cmd = parse_kip("FIND(COUNT(?x)) WHERE { ?x {type: \"Drug\"} }")?;
 if let Command::Kql(q) = cmd {
-    matches!(q.find.expressions[0],
-             FindExpression::Aggregation { function: AggregationFunction::Count, .. });
+    matches!(q.find_clause.expressions[0],
+             FindExpression::Aggregation { func: AggregationFunction::Count, .. });
 }
 # Ok::<_, anda_kip::KipError>(())
 ```
@@ -861,7 +924,7 @@ capsules.
   bindings (e.g. the Python module under `py/anda_cognitive_nexus_py`) rely
   on this.
 - **Spec drift**: the parser, AST, and request/response surface are aligned
-  with KIP **v1.0-RC6** (2026-04-25). When the spec advances, breaking
+  with KIP **v1.0-RC10** (2026-07-04). When the spec advances, breaking
   parser/AST changes will be released as a minor version bump and the
   `Compatibility notes` section will track the diff.
 - **Performance posture**: the parser is allocation-light (combinator-based,
@@ -872,4 +935,4 @@ capsules.
 
 ---
 
-*Last updated: KIP v1.0-RC6 (2026-04-25), `anda_kip` 0.7.10.*
+*Last updated: KIP v1.0-RC10 (2026-07-04), `anda_kip` 0.10.0.*
