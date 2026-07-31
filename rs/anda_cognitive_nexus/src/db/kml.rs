@@ -956,7 +956,7 @@ impl CognitiveNexus {
 
                 let ids = self
                     .propositions()
-                    .query_ids(filter, None)
+                    .query_all_ids(filter)
                     .await
                     .map_err(db_to_kip_error)?;
 
@@ -1527,19 +1527,16 @@ impl CognitiveNexus {
             let old_fv: Fv = old_eid.to_string().into();
             let row_ids = self
                 .propositions()
-                .query_ids(
-                    Filter::Or(vec![
-                        Box::new(Filter::Field((
-                            "subject".to_string(),
-                            RangeQuery::Eq(old_fv.clone()),
-                        ))),
-                        Box::new(Filter::Field((
-                            "object".to_string(),
-                            RangeQuery::Eq(old_fv),
-                        ))),
-                    ]),
-                    None,
-                )
+                .query_all_ids(Filter::Or(vec![
+                    Box::new(Filter::Field((
+                        "subject".to_string(),
+                        RangeQuery::Eq(old_fv.clone()),
+                    ))),
+                    Box::new(Filter::Field((
+                        "object".to_string(),
+                        RangeQuery::Eq(old_fv),
+                    ))),
+                ]))
                 .await
                 .map_err(db_to_kip_error)?;
 
@@ -1589,10 +1586,7 @@ impl CognitiveNexus {
                 .unwrap();
                 let existing = self
                     .propositions()
-                    .query_ids(
-                        Filter::Field((virtual_name, RangeQuery::Eq(virtual_val))),
-                        None,
-                    )
+                    .query_all_ids(Filter::Field((virtual_name, RangeQuery::Eq(virtual_val))))
                     .await
                     .map_err(db_to_kip_error)?
                     .into_iter()
@@ -1726,7 +1720,7 @@ impl CognitiveNexus {
                 };
                 let ids = self
                     .propositions()
-                    .query_ids(filter, None)
+                    .query_all_ids(filter)
                     .await
                     .map_err(db_to_kip_error)?;
 
@@ -1845,10 +1839,7 @@ impl CognitiveNexus {
 
                 let ids = self
                     .propositions()
-                    .query_ids(
-                        Filter::Field((virtual_name, RangeQuery::Eq(virtual_val))),
-                        None,
-                    )
+                    .query_all_ids(Filter::Field((virtual_name, RangeQuery::Eq(virtual_val))))
                     .await
                     .map_err(db_to_kip_error)?;
 
@@ -2323,10 +2314,7 @@ impl CognitiveNexus {
 
                     let ids = self
                         .propositions()
-                        .query_ids(
-                            Filter::Field((virtual_name, RangeQuery::Eq(virtual_val))),
-                            None,
-                        )
+                        .query_all_ids(Filter::Field((virtual_name, RangeQuery::Eq(virtual_val))))
                         .await
                         .map_err(db_to_kip_error)?;
 
@@ -2419,10 +2407,7 @@ impl CognitiveNexus {
                 .unwrap();
                 let ids = self
                     .propositions()
-                    .query_ids(
-                        Filter::Field((virtual_name, RangeQuery::Eq(virtual_val))),
-                        None,
-                    )
+                    .query_all_ids(Filter::Field((virtual_name, RangeQuery::Eq(virtual_val))))
                     .await
                     .map_err(db_to_kip_error)?;
                 ids.first().map(|id| (*id, predicate))

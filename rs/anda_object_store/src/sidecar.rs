@@ -771,7 +771,11 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
             match self.store.copy_opts(&src_path, &dst_path, options).await {
                 Ok(()) => return Ok((src, generation, in_flight)),
                 Err(Error::NotFound { source, .. }) => {
-                    if !retried && src.generation().is_some() {
+                    // The cached source pointer — generational or legacy —
+                    // may be stale after a concurrent overwrite: the
+                    // generation was replaced and reclaimed, or the legacy
+                    // payload was migrated away. Re-resolve once.
+                    if !retried {
                         retried = true;
                         self.refresh_meta(from).await?;
                         continue;

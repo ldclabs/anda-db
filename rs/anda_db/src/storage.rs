@@ -691,8 +691,18 @@ impl Storage {
         // Coerce both branches to the same trait-object type to avoid
         // concrete-type mismatches between `ZstdDecoder` and `BufReader`.
         if compressed {
-            let max_decompress_size =
-                (self.inner.metadata.config.max_small_object_size as u64).saturating_mul(16);
+            // The bomb bound must scale with the object actually stored:
+            // `stream_writer` compresses inputs of any size, so an absolute
+            // cap of `max_small_object_size * 16` (the buffered-fetch bound,
+            // sound there because buffered inputs never exceed
+            // `max_small_object_size`) would make every streamed object
+            // larger than that cap unreadable through its own read path.
+            // Bounding by 16x the on-disk size still rejects the
+            // tiny-input/huge-output shape that defines a decompression bomb.
+            let max_decompress_size = meta
+                .size
+                .saturating_mul(16)
+                .max((self.inner.metadata.config.max_small_object_size as u64).saturating_mul(16));
             let r: Pin<Box<dyn tokio::io::AsyncRead + Send>> = Box::pin(BoundedReader::new(
                 Box::pin(ZstdDecoder::new(reader)),
                 max_decompress_size,

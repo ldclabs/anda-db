@@ -292,6 +292,66 @@ Do not roll back after writing with 0.11.0.
 
 ### Fixed
 
+- **`Collection::query_all_ids` restores completeness for in-process
+  callers** — This release's `query_ids` clamp silently truncated the
+  `anda_cognitive_nexus` call sites whose correctness depends on the full
+  result set: `DELETE CONCEPT` cascades and `MERGE` re-pointing missed links
+  beyond the first 1 000 (leaving dangling references while reporting
+  success), KQL type/name matching, full scans and `NOT` evaluation returned
+  silently incomplete answers, and the nexus's own `KIP_4002` budget guards
+  sat above the clamp and could never fire. The new unbounded
+  `query_all_ids` serves those integrity-critical paths; the HTTP-facing
+  `query_ids` keeps its documented bound.
+- **`Or` filters evaluate every operand unbounded** — `filter_by_id`'s
+  `RangeQuery::Or` stopped evaluating operands once the union exceeded
+  `limit`, and `Filter::Or` passed the caller's `limit` into each branch even
+  though a `Lt`/`Le` branch scans descending and collects the largest keys.
+  Both made a page depend on operand order — logically equivalent filters
+  returned different pages, and some matching documents were unreachable at
+  any page size. `Or` operands now evaluate with no bound, like `And` and
+  `Not`, before the canonical ascending trim.
+- **A 0.10 B-tree index on a one-field nested struct no longer bricks the
+  collection** — 0.10's `BTree::new` accepted any one-entry `Map` field and
+  resolved it to the first key's own type; 0.11's stricter resolution
+  rejected that persisted shape during `bootstrap`, so `Collection::open`
+  failed forever with no way to remove the index. `bootstrap` (and only
+  `bootstrap`) now resolves the legacy shape as 0.10 did, with a warning
+  recommending the index be recreated.
+- **Intent replay sweeps phantom postings by id** — When a retained mutation
+  intent's recorded image no longer decodes against the schema, the replay
+  skipped it, but index removal is value-keyed, so a posting written under
+  the old image's value survived forever: a unique B-tree key kept rejecting
+  new documents (`AlreadyExists`) and queries kept matching a value the
+  document no longer holds. The replay now sweeps such ids out of every
+  index (the same by-id purge `reconcile_storage` uses) before re-indexing
+  the stored document.
+- **`stream_reader` scales its decompression bound to the object** — The new
+  decompression-bomb bound applied the buffered-fetch cap
+  (`max_small_object_size * 16`) to the streaming path, whose whole purpose
+  is objects larger than `max_small_object_size` — a 100 MiB document
+  written by `stream_writer` (or by 0.10) failed its own read path. The
+  streaming bound is now 16× the on-disk size (never below the buffered
+  cap), which still rejects the tiny-input/huge-output bomb shape.
+- **Schema-invalid stored documents stay manageable** — A document persisted
+  by an earlier release that a later validation tightening rejects (e.g. a
+  wildcard-map key variant 0.10 write paths accepted) made every matching
+  `search` fail wholesale and could be neither updated nor removed — a
+  permanently poisoned document with no in-band way out. `search` now skips
+  such a document with a warning, and `remove` deletes it by sweeping its
+  postings by id; `get`/`update` stay strict.
+- **`reopen_collections` is serialized against KML execution** — The public
+  recovery entry point swapped the two collection slots without `kml_lock`,
+  so a host-driven reopen during a running statement let that statement
+  finish "successfully" across two collection generations, and a reader
+  could observe one fresh and one stale handle. It now takes `kml_lock`
+  (internal callers already held it), `save_capsule_version` holds the lock
+  like every other mutating step, and both slots swap under their guards in
+  one step.
+- **Endpoint ID batches use `RangeQuery::Include`** — The subject/object
+  batching built an `Or` of per-id `Eq` nodes chunked at 4 096, but filter
+  validation caps `Or` at 1 024 branches, so batches of 1 025–4 096 ids were
+  rejected at query time — the exact queries the chunking exists to serve.
+  `Include` carries up to 4 096 keys as a single node.
 - **A read RPC can no longer poison a collection** — `anda_db_server` opened
   collections inline on the cancellable read path, but
   `AndaDB::open_collection` finishes a cold open with `Collection::flush`,
@@ -313,6 +373,36 @@ Do not roll back after writing with 0.11.0.
   `410 gone` for a deleted one, using the engine's own
   `CollectionState::is_recoverable` split. A `_id` B-Tree index, which the
   engine rejects, is also refused as a `400` at definition time.
+- **`anda_db_server` authorizes before reading the body** — Authorization ran
+  inside the RPC handlers, after the `Bytes` extractor had already buffered
+  the request body, so an anonymous caller could make the server buffer up to
+  `max_body_size` per request and could tell the body-limit `413` apart from
+  the `401`. A route layer now rejects unauthenticated `POST`s from the
+  headers and the matched path alone — an anonymous oversized body answers
+  `401`, matching `anda_cognitive_nexus_server` — and the in-handler check
+  remains as defense in depth. `GET /` stays unauthenticated.
+- **`collection.ensure` reports HNSW configuration drift as a `409`** —
+  `Collection::create_hnsw_index_nx` now refuses a request whose
+  configuration differs from the persisted one (see *Breaking*), but
+  `collection.ensure` passes the client's configuration on every call and the
+  engine's `DBError::Index` is sanitized into an opaque `500` — one that only
+  fired on the first load after a restart, making it look intermittent. The
+  server now proves the conflict inside the create/open callback and answers
+  `409 conflict` naming the field and both configurations, with the
+  remove-and-recreate remediation.
+- **Database-scope authorization does constant work** — When the named
+  database had no per-database key binding (or did not exist),
+  `anda_db_server::auth::authorize` skipped the hash-and-compare a bound
+  database performs on the presented token, so response timing could reveal
+  which names carry per-database keys despite the deliberately uniform `401`.
+  The unbound branch now verifies the token against a fixed dummy digest and
+  discards the result.
+- **Cold-open failures are logged after request cancellation** —
+  `anda_db_server` runs `AndaDB::open_collection` on a detached task so a
+  cancelled request cannot poison the handle (see above), but when the
+  awaiting request was gone its `JoinHandle` was dropped, and the engine open
+  paths log nothing — a failed cold open was observed by nobody. The spawned
+  task now logs its own failure.
 - **`anda_cognitive_nexus_server` shuts down on runaway KIP executions** —
   A timed-out execution was detached with no deadline while
   still holding its bounded mutation permit, so `MAX_CONCURRENT_MUTATIONS`
@@ -347,6 +437,24 @@ Do not roll back after writing with 0.11.0.
   path itself re-entered through the listener. A row written by a DBA, a
   migration, or an older build (`https://…`, `host:port`) made every request
   for every database on that shard fail. Bad rows are now rejected and logged.
+- **`anda_db_shard_proxy` range-checks shard ids in NOTIFY events** — The
+  NOTIFY listener validated the backend address but accepted the event's
+  shard id unchecked, while the startup reload rejects out-of-range rows. A
+  hand-crafted `pg_notify` payload with an id above `MAX_SHARD_ID` — which no
+  real `shard_backends` row can carry — could insert a cache entry the reload
+  path would never load. Such events are now ignored and logged like
+  out-of-range rows.
+- **`anda_db_shard_proxy` logs backend request failures** — A proxied request
+  that timed out or failed answered 504/502 without any log line, unlike
+  every route-resolution failure above it, leaving no way to tell which
+  backend was unreachable. Both arms now log the backend address (and the
+  hyper error for failures).
+- **`anda_db_shard_proxy` rejects unroutable database names at assignment** —
+  `PUT /_admin/db_shards` accepted any `db_name`, but routing only matches
+  `[a-z0-9_]{1,64}`, so assigning a name like `My-DB` answered 200 and
+  NOTIFYed yet could never route a single request. Such names are now
+  refused with 400. `DELETE /_admin/db_shards` deliberately stays
+  unvalidated so rows predating the check can still be removed.
 - **`reconcile_storage` repairs index postings for missing documents** —
   Dropping a dead document id from the bitmap is not a repair on its own: the
   derived index postings survive it. A unique B-tree key kept rejecting new
@@ -463,6 +571,15 @@ Do not roll back after writing with 0.11.0.
   the whole of a multipart upload), so a concurrent `collect_garbage` cannot
   delete a generation that is about to be committed. A cold read can no longer
   resurrect a replaced pointer.
+- **Legacy-layout objects heal the stale-pointer `NotFound` like generational
+  objects do** (`anda_object_store`) — The read paths' backend-`NotFound`
+  re-resolve was gated on the cached document carrying a generation, so a
+  cached pre-0.10 (generation-less) pointer was never refreshed after the
+  key's first overwrite migrated it to the generation layout and deleted
+  `data/<location>`: `get` / `get_ranges` / copy / rename through that cache
+  answered a spurious `NotFound` for an object that exists, sticky until the
+  cache entry expired (up to an hour). The re-resolve now runs once regardless
+  of the cached pointer's layout.
 - **`EncryptedStoreBuilder::with_meta_cache_ttl` keeps the configured
   capacity** — It used to rebuild the cache with the default capacity,
   silently discarding the value passed to `new`. It still discards a cache

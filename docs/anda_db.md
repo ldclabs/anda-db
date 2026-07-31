@@ -119,7 +119,9 @@ Important methods:
 - `update`
 - `remove`
 - `search` and `search_as`
-- `search_ids` and `query_ids`
+- `search_ids` and `query_ids` (results clamped to `MAX_SEARCH_LIMIT`)
+- `query_all_ids` (unbounded; for in-process callers whose correctness
+  depends on the complete result set)
 - `create_btree_index`, `create_bm25_index`, `create_hnsw_index`
 - `compact_btree_index`, `compact_bm25_index`
 - `flush` and `close`

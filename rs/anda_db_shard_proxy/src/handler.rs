@@ -14,6 +14,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::proxy::{AppState, proxy_handler, validate_backend_addr};
+use crate::router::is_valid_db_name;
 use crate::store::{MAX_SHARD_ID, ShardBackend};
 
 // ── Management API request/response types ───────────────────────────────────
@@ -79,6 +80,22 @@ pub struct UpsertBackendRequest {
     pub backend_addr: String,
 }
 
+/// Rejects a database name the router can never match
+/// ([`is_valid_db_name`], `[a-z0-9_]{1,64}`): the assignment would be
+/// accepted and NOTIFYed, yet the extractor never produces such a name, so
+/// not a single request could ever route to it.
+fn validate_db_name(db_name: &str) -> Result<(), (StatusCode, Json<RpcResponse<()>>)> {
+    if !is_valid_db_name(db_name) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(RpcResponse::<()>::err(format!(
+                "db_name {db_name:?} must match [a-z0-9_]{{1,64}}"
+            ))),
+        ));
+    }
+    Ok(())
+}
+
 /// Rejects a shard id the signed `INT` column cannot store, so it cannot be
 /// written as a negative value that no reader will route to.
 fn validate_shard_id(shard_id: u32) -> Result<(), (StatusCode, Json<RpcResponse<()>>)> {
@@ -123,6 +140,7 @@ async fn assign_db(
     State(state): State<AppState>,
     Json(req): Json<AssignDbRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, impl IntoResponse)> {
+    validate_db_name(&req.db_name)?;
     validate_shard_id(req.shard_id)?;
     state
         .store
@@ -155,6 +173,10 @@ async fn unassign_db(
     State(state): State<AppState>,
     Json(req): Json<UnassignDbRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, impl IntoResponse)> {
+    // Deliberately not validated like `assign_db`: rows with unroutable
+    // names can predate the validation (older builds accepted them, and a
+    // DBA can write rows directly), and unassign is the only way to remove
+    // them through this API.
     let deleted = state.store.unassign_db(&req.db_name).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -317,6 +339,19 @@ mod tests {
 
         headers.insert("authorization", HeaderValue::from_static("Bearer secret"));
         assert!(authorize_api_key(Some("secret"), &headers));
+    }
+
+    /// A database name the router can never match would be accepted with
+    /// 200 + NOTIFY yet never route a single request, so it is refused at
+    /// the API boundary.
+    #[test]
+    fn admin_api_rejects_db_names_the_router_cannot_match() {
+        assert!(validate_db_name("mydb").is_ok());
+        assert!(validate_db_name(&"a".repeat(64)).is_ok());
+        for db_name in ["My-DB", "", "db name", "db.name", &"a".repeat(65)] {
+            let (status, _) = validate_db_name(db_name).unwrap_err();
+            assert_eq!(status, StatusCode::BAD_REQUEST, "db_name: {db_name:?}");
+        }
     }
 
     /// A shard id above `i32::MAX` would be stored negative and become

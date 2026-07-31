@@ -217,9 +217,28 @@ impl BTree {
     /// type accepted at index creation must resolve to the same key type on
     /// reload, otherwise a collection with such an index can never be
     /// reopened. (Regression: `Map` fields were accepted by `new` but missing
-    /// here, bricking collections on restart.) Both now share [`key_type_of`].
+    /// here, bricking collections on restart.) Both now share [`key_type_of`],
+    /// plus one load-only widening: 0.10's `new` accepted any one-entry
+    /// non-wildcard `Map` (the `{"a": Text}` shape of a one-field nested
+    /// struct) and resolved it to the first key's own type, so persisted 0.10
+    /// metadata can carry such an index. `new` now rejects the shape, but
+    /// `bootstrap` must still load it — refusing here would make the
+    /// collection unopenable, and removing the index requires an open
+    /// collection.
     pub async fn bootstrap(name: String, ft: &Ft, storage: Storage) -> Result<Self, DBError> {
-        BTree::inner_bootstrap(name, &key_type_of(ft), storage).await
+        let mut key_type = key_type_of(ft);
+        if let Ft::Map(v) = &key_type
+            && v.len() == 1
+        {
+            let legacy = v.keys().next().expect("length checked above").field_type();
+            log::warn!(
+                "BTree index {name:?}: legacy non-wildcard map field type resolved to \
+                 {legacy:?} for load only; this index mis-indexes by field name — \
+                 remove and recreate it on a supported field type"
+            );
+            key_type = legacy;
+        }
+        BTree::inner_bootstrap(name, &key_type, storage).await
     }
 
     async fn inner_new(
@@ -1908,11 +1927,32 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, DBError::Index { .. }), "{err}");
 
-        // `bootstrap` must agree, so a collection can never persist an index
-        // that its own reload would resolve differently.
-        let err = BTree::bootstrap("nested".to_string(), &nested_one, storage.clone())
+        // `new` rejects the shape going forward, but 0.10 accepted it and
+        // persisted such indexes (resolved to the first key's own type), so
+        // `bootstrap` must still load them — refusing would make the
+        // collection unopenable with no way to remove the index. Simulate the
+        // 0.10 artifact: a String-keyed index persisted under this name.
+        let legacy = BTree::new(field("nested_legacy", Ft::Text), storage.clone(), now)
             .await
-            .unwrap_err();
+            .unwrap();
+        assert!(matches!(legacy, BTree::String(_)));
+        let reloaded = BTree::bootstrap("nested_legacy".to_string(), &nested_one, storage.clone())
+            .await
+            .unwrap();
+        assert!(matches!(reloaded, BTree::String(_)));
+
+        // Multi-entry non-wildcard maps were never accepted by any release:
+        // `bootstrap` keeps rejecting them.
+        let err = BTree::bootstrap(
+            "nested_two".to_string(),
+            &Ft::Map(BTreeMap::from([
+                ("a".into(), Ft::Text),
+                ("b".into(), Ft::U64),
+            ])),
+            storage.clone(),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, DBError::Index { .. }), "{err}");
 
         // All three wildcard sentinels remain indexable, each resolving to

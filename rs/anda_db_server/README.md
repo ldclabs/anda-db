@@ -294,7 +294,11 @@ document schema, and optional index definitions:
 The engine only allows index changes while it has exclusive access to a
 collection, so indexes are defined at creation time. `collection.ensure` is
 idempotent: it opens the collection when it already exists and only applies
-the index definitions when it actually creates (or first loads) it.
+the index definitions when it actually creates (or first loads) it. An HNSW
+configuration that has drifted from the persisted one is never silently
+kept: when the first load detects the difference, `collection.ensure`
+answers `409 conflict` naming the field and both configurations — remove
+and recreate the index (or the collection) to change it.
 
 ### Queries
 

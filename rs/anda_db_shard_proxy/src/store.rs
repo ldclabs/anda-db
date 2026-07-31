@@ -711,6 +711,10 @@ impl ShardStore {
     /// The address is validated here as well as in the administrative API:
     /// a row written by any other writer reaches the cache only through this
     /// path, and one unusable address takes down every database on its shard.
+    /// The shard id is range-checked like [`Self::reload_backend_cache`]
+    /// checks rows: an id above [`MAX_SHARD_ID`] cannot exist in the signed
+    /// `shard_id` column, so such an event (a hand-crafted `pg_notify`)
+    /// cannot describe a real row and must not reach the cache.
     fn apply_backend_event(&self, payload: &str) {
         match serde_json::from_str::<BackendEvent>(payload) {
             Ok(BackendEvent::Upsert {
@@ -718,6 +722,12 @@ impl ShardStore {
                 backend_addr,
                 ..
             }) => {
+                if shard_id > MAX_SHARD_ID {
+                    log::error!(
+                        "ignoring shard_backends event for out-of-range shard id {shard_id}"
+                    );
+                    return;
+                }
                 if let Err(err) = validate_backend_addr(&backend_addr) {
                     log::error!("ignoring shard_backends event for shard {shard_id}: {err}");
                     return;
@@ -734,6 +744,12 @@ impl ShardStore {
                     );
             }
             Ok(BackendEvent::Delete { shard_id }) => {
+                if shard_id > MAX_SHARD_ID {
+                    log::error!(
+                        "ignoring shard_backends event for out-of-range shard id {shard_id}"
+                    );
+                    return;
+                }
                 self.backend_cache
                     .write()
                     .unwrap_or_else(PoisonError::into_inner)
@@ -1277,6 +1293,38 @@ mod tests {
         // resolving to an address the proxy's HTTP client cannot use.
         store.apply_backend_event(r#"{"op":"upsert","shard_id":4,"backend_addr":"ftp://nope"}"#);
         assert!(store.resolve_by_shard(4).await.is_none());
+    }
+
+    /// A hand-crafted `pg_notify` payload can carry a shard id the signed
+    /// `shard_id` column cannot store, so it cannot describe a real row. The
+    /// NOTIFY path must ignore it exactly like `reload_backend_cache` ignores
+    /// out-of-range rows.
+    #[tokio::test]
+    async fn apply_backend_event_ignores_out_of_range_shard_ids() {
+        let store = test_store();
+
+        for shard_id in [MAX_SHARD_ID + 1, u32::MAX] {
+            store.apply_backend_event(&format!(
+                r#"{{"op":"upsert","shard_id":{shard_id},"backend_addr":"http://127.0.0.1:9000"}}"#
+            ));
+            assert!(
+                store.resolve_by_shard(shard_id).await.is_none(),
+                "shard id {shard_id} must not enter the cache"
+            );
+        }
+        assert!(store.list_shard_backends().is_empty());
+
+        // The delete arm is guarded the same way: an entry seeded outside the
+        // validated paths must not be touched by an event no real row can emit.
+        store.seed_backend(ShardBackend {
+            shard_id: MAX_SHARD_ID + 1,
+            backend_addr: "http://127.0.0.1:9000".to_string(),
+        });
+        store.apply_backend_event(&format!(
+            r#"{{"op":"delete","shard_id":{}}}"#,
+            MAX_SHARD_ID + 1
+        ));
+        assert_eq!(store.list_shard_backends().len(), 1);
     }
 
     /// A `reload_backend_cache` clearing the live map before refilling it

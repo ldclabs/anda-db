@@ -186,8 +186,14 @@ pub async fn proxy_handler(
 
     let mut resp = timeout(state.proxy_request_timeout, state.client.request(req))
         .await
-        .map_err(|_| (StatusCode::GATEWAY_TIMEOUT, "backend request timed out"))?
-        .map_err(|_| (StatusCode::BAD_GATEWAY, "backend request failed"))?;
+        .map_err(|_| {
+            log::warn!("backend request to {} timed out", route.backend_addr);
+            (StatusCode::GATEWAY_TIMEOUT, "backend request timed out")
+        })?
+        .map_err(|err| {
+            log::warn!("backend request to {} failed: {err}", route.backend_addr);
+            (StatusCode::BAD_GATEWAY, "backend request failed")
+        })?;
 
     remove_hop_by_hop_headers(resp.headers_mut());
     // add the shard ID header to the response so clients can know which shard they hit (optional but useful for debugging)

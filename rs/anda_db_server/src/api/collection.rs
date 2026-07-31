@@ -4,7 +4,9 @@
 //! allows index changes while it holds exclusive access to the collection
 //! (at creation or on the first open after a restart). `collection.ensure`
 //! therefore guarantees the listed indexes only when it actually creates or
-//! first opens the collection.
+//! first opens the collection; a requested HNSW configuration that differs
+//! from the persisted one is answered as a `409` at that point (see
+//! [`ensure`]).
 
 use anda_db::{
     collection::{Collection, CollectionConfig, CollectionMetadata, CollectionStats},
@@ -14,7 +16,7 @@ use anda_db::{
     schema::{FieldType, Fv, Schema, as_wildcard_map, validate_field_name},
 };
 use serde::Deserialize;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use super::db::{
     ExtensionKeyParams, SaveExtensionParams, SetReadOnlyParams,
@@ -110,7 +112,21 @@ pub async fn open(db: &AndaDB, name: &str) -> Result<Arc<Collection>, ApiError> 
     let opening = tokio::spawn({
         let db = db.clone();
         let name = name.to_string();
-        async move { db.open_collection(name, async |_| Ok(())).await }
+        async move {
+            let result = db.open_collection(name.clone(), async |_| Ok(())).await;
+            if let Err(err) = &result {
+                // The engine open paths log nothing on failure, and a caller
+                // that was cancelled has already dropped the JoinHandle —
+                // without this line a failed cold open would be observed by
+                // nobody at all.
+                log::warn!(
+                    action = "collection::open",
+                    collection = name;
+                    "collection open failed: {err:?}",
+                );
+            }
+            result
+        }
     });
     match opening.await {
         Ok(result) => Ok(result?),
@@ -295,6 +311,14 @@ pub async fn create(
 }
 
 /// `collection.ensure` — opens the collection or creates it if missing.
+///
+/// The engine refuses to silently keep an existing HNSW index whose persisted
+/// configuration differs from the request (`create_hnsw_index_nx`), but its
+/// `DBError::Index` would be sanitized into an opaque 500 that only fires on
+/// the first load after a restart. The conflict is proven here instead,
+/// inside the exclusive-access callback where the persisted configuration is
+/// loaded, and answered as an actionable `409 conflict`: the caller owns this
+/// configuration, so echoing it back leaks nothing.
 pub async fn ensure(
     db: &AndaDB,
     params: CreateCollectionParams,
@@ -308,12 +332,74 @@ pub async fn ensure(
         bm25_indexes,
         hnsw_indexes,
     } = params;
-    let collection = db
+    let collection_name = config.name.clone();
+    let hnsw_conflict: Mutex<Option<String>> = Mutex::new(None);
+    let result = db
         .open_or_create_collection(schema, config, async |collection| {
+            if let Some(conflict) = hnsw_config_conflict(collection, &hnsw_indexes) {
+                *hnsw_conflict
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(conflict);
+                // Abort the open: proceeding would either fail later inside
+                // `create_hnsw_index_nx` with an engine error this function
+                // could not safely attribute, or silently keep the old
+                // configuration.
+                return Err(DBError::Index {
+                    name: collection.name().to_string(),
+                    source: "HNSW index configuration conflict".into(),
+                });
+            }
             ensure_indexes(collection, &btree_indexes, &bm25_indexes, &hnsw_indexes).await
         })
-        .await?;
-    Ok(collection.metadata())
+        .await;
+    match result {
+        Ok(collection) => Ok(collection.metadata()),
+        Err(err) => {
+            // The callback proved the conflict against the persisted
+            // configuration before returning `err`, so the client-safe
+            // message wins over the sanitizing `DBError` fallback.
+            if let Some(conflict) = hnsw_conflict
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            {
+                log::warn!(
+                    action = "collection::ensure",
+                    collection = collection_name;
+                    "HNSW index configuration conflict: {conflict}",
+                );
+                return Err(ApiError::conflict(conflict));
+            }
+            Err(err.into())
+        }
+    }
+}
+
+/// Returns an actionable client-safe message when `collection` already
+/// carries an HNSW index whose persisted configuration differs from a
+/// requested one, or `None` when every requested index is absent or
+/// identical.
+///
+/// Must run inside the create/open callback: that is the only point where
+/// the server holds the collection exclusively with its persisted indexes
+/// loaded, so the comparison cannot race another request.
+fn hnsw_config_conflict(
+    collection: &Collection,
+    hnsw_indexes: &[HnswIndexParams],
+) -> Option<String> {
+    for index in hnsw_indexes {
+        if let Ok(view) = collection.get_hnsw_index(&index.field) {
+            let persisted = view.metadata().config;
+            if persisted != index.config {
+                return Some(format!(
+                    "HNSW index on field {:?} already exists with a different configuration; \
+                     remove and recreate the index to change it. \
+                     persisted={persisted:?}, requested={:?}",
+                    index.field, index.config
+                ));
+            }
+        }
+    }
+    None
 }
 
 async fn ensure_indexes(

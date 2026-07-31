@@ -531,13 +531,10 @@ impl CognitiveNexus {
         // 一次性查询所有具有此谓词的命题
         let proposition_ids = self
             .propositions()
-            .query_ids(
-                Filter::Field((
-                    "predicates".to_string(),
-                    RangeQuery::Eq(Fv::Text(predicate.to_string())),
-                )),
-                None,
-            )
+            .query_all_ids(Filter::Field((
+                "predicates".to_string(),
+                RangeQuery::Eq(Fv::Text(predicate.to_string())),
+            )))
             .await
             .map_err(db_to_kip_error)?;
 

@@ -1347,6 +1347,75 @@ async fn test_vector_collection_with_hnsw_index() {
     assert_eq!(docs[1]["text"], "gamma");
 }
 
+/// `collection.ensure` sends the client's HNSW configuration on every call,
+/// but the engine only compares it against the persisted one when it actually
+/// loads the collection — so a drifted configuration used to surface as an
+/// intermittent, sanitized 500 on the first load after a restart. It must be
+/// a 409 the caller can act on.
+#[tokio::test]
+async fn test_ensure_reports_hnsw_config_drift_as_conflict() {
+    let app = test_app().await;
+    rpc_ok(&app, "/", "db.create", json!({"name": "vector_db"})).await;
+
+    let ensure_params = |ef_search: u64| {
+        json!({
+            "config": {"name": "memories", "description": ""},
+            "schema": {
+                "fields": [
+                    {"name": "_id", "description": "", "type": "U64", "unique": true, "index": 0},
+                    {"name": "embedding", "description": "", "type": "Vector", "unique": false, "index": 1}
+                ]
+            },
+            "hnsw_indexes": [{
+                "field": "embedding",
+                "config": {
+                    "dimension": 4,
+                    "max_layers": 4,
+                    "max_connections": 8,
+                    "ef_construction": 50,
+                    "ef_search": ef_search,
+                    "distance_metric": "Cosine",
+                    "select_neighbors_strategy": "Heuristic"
+                }
+            }]
+        })
+    };
+    // Evicts the collection handle so the next ensure actually loads it from
+    // storage and applies the index definitions again.
+    let evict = || async {
+        rpc_ok(&app, "/", "db.close", json!({"name": "vector_db"})).await;
+        rpc_ok(&app, "/", "db.open", json!({"name": "vector_db"})).await;
+    };
+
+    rpc_ok(&app, "/vector_db", "collection.ensure", ensure_params(20)).await;
+
+    // An unchanged configuration stays idempotent across a cold load.
+    evict().await;
+    rpc_ok(&app, "/vector_db", "collection.ensure", ensure_params(20)).await;
+
+    // A drifted configuration on a cold load is an actionable conflict, not
+    // the sanitized 500 the raw engine error would produce.
+    evict().await;
+    let err = rpc_err(
+        &app,
+        "/vector_db",
+        "collection.ensure",
+        ensure_params(21),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    assert_eq!(err["code"], "conflict");
+    let message = err["message"].as_str().unwrap();
+    assert!(message.contains("\"embedding\""), "message: {message}");
+    assert!(message.contains("ef_search"), "message: {message}");
+    assert!(message.contains("remove"), "message: {message}");
+
+    // The rejected ensure aborted the open; the original configuration keeps
+    // working, so the caller can recover without touching storage.
+    let meta = rpc_ok(&app, "/vector_db", "collection.ensure", ensure_params(20)).await;
+    assert_eq!(meta["hnsw_indexes"].as_object().unwrap().len(), 1);
+}
+
 #[tokio::test]
 async fn test_payload_too_large_uses_rpc_error_envelope() {
     let mut options = test_options(None);
@@ -2122,6 +2191,66 @@ async fn test_database_authorization_isolation() {
     .await;
     let names = rpc_auth_ok(&app, Some(ADMIN_KEY), "/", "db.list", Value::Null).await;
     assert_eq!(names, json!(["tenant_a", "tenant_b", PRIMARY_DB]));
+}
+
+/// Authentication must run before the request body is buffered: an anonymous
+/// caller may not distinguish an oversized body (413) from a rejected key,
+/// nor make the server buffer up to `max_body_size` for unauthenticated
+/// input.
+#[tokio::test]
+async fn test_unauthenticated_requests_are_rejected_before_the_body_is_read() {
+    let mut options = test_options(Some(ADMIN_KEY.to_string()));
+    options.max_body_size = 1024;
+    let state = AppState::connect(Arc::new(InMemory::new()), options)
+        .await
+        .expect("failed to connect AppState");
+    let app = build_router(state);
+
+    let oversized = format!(
+        r#"{{"method": "info", "params": {{"junk": "{}"}}}}"#,
+        "x".repeat(4096)
+    );
+    let send = |token: Option<&'static str>, path: &'static str| {
+        let app = app.clone();
+        let body = oversized.clone();
+        async move {
+            let mut builder = Request::post(path).header(header::CONTENT_TYPE, "application/json");
+            if let Some(token) = token {
+                builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            let resp = app
+                .oneshot(builder.body(Body::from(body)).unwrap())
+                .await
+                .unwrap();
+            let status = resp.status();
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            (status, value)
+        }
+    };
+
+    // Missing and wrong keys answer 401 on both scopes — not the 413 the
+    // body-limit layer would produce if the body were read first.
+    for (token, path) in [
+        (None, "/"),
+        (None, "/test_db"),
+        (Some("wrong"), "/"),
+        (Some("wrong"), "/test_db"),
+    ] {
+        let (status, resp) = send(token, path).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "token: {token:?}, path: {path}, resp: {resp:?}"
+        );
+        assert_eq!(resp["error"]["code"], "unauthorized");
+    }
+
+    // With the admin key, the same oversized body is a normal 413 in the RPC
+    // error envelope.
+    let (status, resp) = send(Some(ADMIN_KEY), "/").await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "resp: {resp:?}");
+    assert_eq!(resp["error"]["code"], "payload_too_large");
 }
 
 #[tokio::test]

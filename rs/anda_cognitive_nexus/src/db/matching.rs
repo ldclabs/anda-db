@@ -48,18 +48,19 @@ fn checked_match_rows(count: usize, pattern: &str) -> Result<(), KipError> {
     Ok(())
 }
 
-/// 把 ID 集合切成不超过 [`MAX_SUBJECT_OBJECT_RANGE_VARIANTS`] 个分支的批次：
-/// `RangeQuery::Or` 在触碰索引之前就会被整体分配，一个 50 万分支的过滤器本身
-/// 就是一次内存尖峰。分批查询让过滤器规模有界，同时不牺牲可回答的查询。
+/// 把 ID 集合切成不超过 [`MAX_SUBJECT_OBJECT_RANGE_VARIANTS`] 个键的批次：
+/// 一个 50 万键的过滤器在触碰索引之前就会被整体分配，本身就是一次内存尖峰。
+/// 分批查询让过滤器规模有界，同时不牺牲可回答的查询。
+///
+/// 必须用 [`RangeQuery::Include`]（整体计一个节点，键数上限恰为
+/// `MAX_RANGE_INCLUDE_KEYS` = 4096）而不是 Or-of-Eq：`Or` 的分支数受
+/// `MAX_FILTER_BRANCHES` = 1024 约束，1025..=4096 个 id 的批次会在
+/// `validate_complexity` 处被整体拒绝。
 fn endpoint_range(ids: &[EntityID]) -> RangeQuery<Fv> {
     if ids.len() == 1 {
         RangeQuery::Eq(Fv::Text(ids[0].to_string()))
     } else {
-        RangeQuery::Or(
-            ids.iter()
-                .map(|id| Box::new(RangeQuery::Eq(Fv::Text(id.to_string()))))
-                .collect(),
-        )
+        RangeQuery::Include(ids.iter().map(|id| Fv::Text(id.to_string())).collect())
     }
 }
 
@@ -222,7 +223,7 @@ impl CognitiveNexus {
 
         let ids = self
             .propositions()
-            .query_ids(Filter::Field((virtual_name, range)), None)
+            .query_all_ids(Filter::Field((virtual_name, range)))
             .await
             .map_err(db_to_kip_error)?;
 
@@ -260,10 +261,10 @@ impl CognitiveNexus {
         for chunk in subject_ids.chunks(MAX_SUBJECT_OBJECT_RANGE_VARIANTS) {
             let ids = self
                 .propositions()
-                .query_ids(
-                    Filter::Field(("subject".to_string(), endpoint_range(chunk))),
-                    None,
-                )
+                .query_all_ids(Filter::Field((
+                    "subject".to_string(),
+                    endpoint_range(chunk),
+                )))
                 .await
                 .map_err(db_to_kip_error)?;
 
@@ -304,10 +305,7 @@ impl CognitiveNexus {
         for chunk in object_ids.chunks(MAX_SUBJECT_OBJECT_RANGE_VARIANTS) {
             let ids = self
                 .propositions()
-                .query_ids(
-                    Filter::Field(("object".to_string(), endpoint_range(chunk))),
-                    None,
-                )
+                .query_all_ids(Filter::Field(("object".to_string(), endpoint_range(chunk))))
                 .await
                 .map_err(db_to_kip_error)?;
 
@@ -351,13 +349,10 @@ impl CognitiveNexus {
         // so `subject > ""` enumerates the whole collection via the index.
         let ids = self
             .propositions()
-            .query_ids(
-                Filter::Field((
-                    "subject".to_string(),
-                    RangeQuery::Gt(Fv::Text(String::new())),
-                )),
-                None,
-            )
+            .query_all_ids(Filter::Field((
+                "subject".to_string(),
+                RangeQuery::Gt(Fv::Text(String::new())),
+            )))
             .await
             .map_err(db_to_kip_error)?;
 
@@ -419,18 +414,15 @@ impl CognitiveNexus {
 
         let ids = self
             .propositions()
-            .query_ids(
-                Filter::Field((
-                    "predicates".to_string(),
-                    RangeQuery::Or(
-                        predicates
-                            .into_iter()
-                            .map(|v| Box::new(RangeQuery::Eq(v.into())))
-                            .collect(),
-                    ),
-                )),
-                None,
-            )
+            .query_all_ids(Filter::Field((
+                "predicates".to_string(),
+                RangeQuery::Or(
+                    predicates
+                        .into_iter()
+                        .map(|v| Box::new(RangeQuery::Eq(v.into())))
+                        .collect(),
+                ),
+            )))
             .await
             .map_err(db_to_kip_error)?;
 
@@ -601,17 +593,14 @@ impl CognitiveNexus {
     ) -> Result<Vec<(EntityID, EntityID)>, KipError> {
         let ids = self
             .propositions()
-            .query_ids(
-                Filter::Field((
-                    if reverse {
-                        "object".to_string()
-                    } else {
-                        "subject".to_string()
-                    },
-                    RangeQuery::Eq(Fv::Text(node.to_string())),
-                )),
-                None,
-            )
+            .query_all_ids(Filter::Field((
+                if reverse {
+                    "object".to_string()
+                } else {
+                    "subject".to_string()
+                },
+                RangeQuery::Eq(Fv::Text(node.to_string())),
+            )))
             .await
             .map_err(db_to_kip_error)?;
 
@@ -898,5 +887,19 @@ mod tests {
         assert_eq!(checked_subject_object_variant_count(64, 64).unwrap(), 4_096);
         let err = checked_subject_object_variant_count(65, 64).unwrap_err();
         assert_eq!(err.code, anda_kip::KipErrorCode::ResourceExhausted);
+    }
+
+    /// 回归：满批（4096 个 id）的端点过滤器必须能通过
+    /// `validate_complexity`——Or-of-Eq 形式在 1025 个分支时就会被
+    /// `MAX_FILTER_BRANCHES` 整体拒绝，使本意支持的查询规模不可回答。
+    #[test]
+    fn endpoint_range_full_chunk_passes_filter_complexity_validation() {
+        let ids: Vec<EntityID> = (0..MAX_SUBJECT_OBJECT_RANGE_VARIANTS as u64)
+            .map(EntityID::Concept)
+            .collect();
+        let filter = Filter::Field(("subject".to_string(), endpoint_range(&ids)));
+        filter
+            .validate_complexity()
+            .expect("a full endpoint chunk must be a valid filter");
     }
 }

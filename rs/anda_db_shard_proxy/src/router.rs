@@ -36,8 +36,10 @@ impl PrefixExtractor {
 
 /// Mirrors the backend's database-name rules (`[a-z0-9_]{1,64}`, see
 /// `anda_db_schema::validate_field_name`) so invalid names are rejected
-/// before they reach the routing store (PostgreSQL).
-fn is_valid_db_name(name: &str) -> bool {
+/// before they reach the routing store (PostgreSQL). The administrative API
+/// applies the same rule when creating assignments, so a name this extractor
+/// can never produce is never stored.
+pub(crate) fn is_valid_db_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
         && name

@@ -7,13 +7,16 @@
 //!   admin key or the key bound to that database
 //!
 //! Every RPC request is authorized against the scope it addresses before its
-//! body is parsed and before the database registry is consulted; see
-//! [`crate::auth`] for the two key tiers and their precedence.
+//! body is even read: [`require_auth`] runs as a route layer ahead of the
+//! handlers' `Bytes` extractor, and [`execute_rpc`] authorizes again as
+//! defense in depth before the body is parsed and before the database
+//! registry is consulted. See [`crate::auth`] for the two key tiers and
+//! their precedence.
 
 use axum::{
     body::{Body, Bytes},
-    extract::{Path, Request, State},
-    http::{HeaderMap, StatusCode, header},
+    extract::{Path, RawPathParams, Request, State, rejection::RawPathParamsRejection},
+    http::{HeaderMap, Method, StatusCode, header},
     middleware::Next,
     response::Response,
 };
@@ -134,6 +137,10 @@ where
     F: FnOnce(AppState, Encoding, M, RpcParams, Principal) -> Fut,
     Fut: Future<Output = Result<Response, ApiError>> + Send + 'static,
 {
+    // [`require_auth`] already rejected unauthenticated requests before the
+    // body was buffered. This second check is deliberate defense in depth:
+    // it is cheap, and it keeps `execute_rpc` safe on its own even if a
+    // future route is wired up without the middleware.
     let principal = state.authorize(scope, bearer_token(headers))?;
     let RpcRequest { method, params } = RpcRequest::parse(headers, body)?;
     // Resolving the method and its side-effect class in one step is what
@@ -345,6 +352,52 @@ pub async fn normalize_rejections(req: Request<Body>, next: Next) -> Response {
         .respond(enc);
     }
     resp
+}
+
+/// Rejects an unauthorized RPC request before any handler extractor runs.
+///
+/// Authorizing only inside [`execute_rpc`] let the `Bytes` extractor buffer
+/// the request body (up to [`crate::state::ServerOptions::max_body_size`])
+/// first, so an anonymous caller could make the server hold that memory per
+/// request and could tell the body-limit `413` apart from the `401`. This
+/// route layer answers from the headers and the matched path alone; the
+/// in-handler check remains as defense in depth.
+///
+/// Only `POST` — the method every RPC endpoint uses — is checked: `GET /`
+/// (the health endpoint) deliberately stays unauthenticated, and other
+/// methods keep the router's own 405 answers.
+pub async fn require_auth(
+    State(state): State<AppState>,
+    params: Result<RawPathParams, RawPathParamsRejection>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if req.method() != Method::POST {
+        return next.run(req).await;
+    }
+    // Invalid UTF-8 in a percent-encoded path segment: fall through and let
+    // the handler's `Path` extractor answer the same 400 it does today —
+    // still before the body is read, and still behind the in-handler
+    // authorization.
+    let Ok(params) = params else {
+        return next.run(req).await;
+    };
+    if let Err(err) = state.authorize(scope_from_params(&params), bearer_token(req.headers())) {
+        return err.respond(Encoding::negotiate(req.headers()));
+    }
+    next.run(req).await
+}
+
+/// Derives the scope a matched RPC route addresses, mirroring the handler
+/// entry points exactly: `POST /` carries no `db_name` capture and addresses
+/// [`Scope::Root`]; `POST /{db_name}` addresses that database. The capture
+/// value is percent-decoded, like the `Path` extractor [`rpc_db`] uses.
+fn scope_from_params(params: &RawPathParams) -> Scope<'_> {
+    params
+        .iter()
+        .find(|(name, _)| *name == "db_name")
+        .map(|(_, value)| Scope::Database(value))
+        .unwrap_or(Scope::Root)
 }
 
 /// Extracts the credential from an `Authorization: Bearer <key>` header.

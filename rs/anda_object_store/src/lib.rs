@@ -405,9 +405,11 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
                     return Ok(res);
                 }
                 Err(Error::NotFound { source, .. }) => {
-                    // The cached pointer may be stale and its generation
-                    // already replaced and reclaimed; re-resolve once.
-                    if !retried && meta.generation.is_some() {
+                    // The cached pointer — generational or legacy — may be
+                    // stale after a concurrent overwrite: the generation was
+                    // replaced and reclaimed, or the legacy payload was
+                    // migrated away. Re-resolve once.
+                    if !retried {
                         retried = true;
                         self.inner.refresh_meta(location).await?;
                         continue;
@@ -438,7 +440,7 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
             match self.inner.store.get_ranges(&payload_path, ranges).await {
                 Ok(rt) => return Ok(rt),
                 Err(Error::NotFound { source, .. }) => {
-                    if !retried && meta.generation.is_some() {
+                    if !retried {
                         retried = true;
                         self.inner.refresh_meta(location).await?;
                         continue;
@@ -2371,6 +2373,57 @@ mod tests {
             inner.get(&Path::from("data/compat/legacy")).await,
             Err(Error::NotFound { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn cached_legacy_pointer_heals_after_migration() {
+        // A cached legacy (pre-0.10, generation-less) document points at
+        // `data/<location>`. The first overwrite — here through a second
+        // instance, so the first one's cache does not see it — migrates the
+        // key to the generation layout and deletes that payload. The stale
+        // pointer must heal through the `NotFound` re-resolve like a stale
+        // generational pointer does, not report the object missing until
+        // the cache entry expires.
+        let inner = InMemory::new();
+        let location = Path::from("compat/legacy-stale");
+        put_legacy_object(&inner, &location, b"legacy payload").await;
+
+        // Warm one instance per resolving path, so each exercises its own
+        // retry against a stale cache.
+        let getter = MetaStoreBuilder::new(inner.clone(), 100).build();
+        let ranger = MetaStoreBuilder::new(inner.clone(), 100).build();
+        let copier = MetaStoreBuilder::new(inner.clone(), 100).build();
+        for storage in [&getter, &ranger, &copier] {
+            let bytes = storage.get(&location).await.unwrap().bytes().await.unwrap();
+            assert_eq!(bytes, Bytes::from_static(b"legacy payload"));
+        }
+
+        // The overwrite migrates the key and removes the legacy payload.
+        let writer = MetaStoreBuilder::new(inner.clone(), 100).build();
+        writer
+            .put(&location, Bytes::from_static(b"upgraded").into())
+            .await
+            .unwrap();
+        assert!(matches!(
+            inner.get(&Path::from("data/compat/legacy-stale")).await,
+            Err(Error::NotFound { .. })
+        ));
+
+        let res = getter.get(&location).await.unwrap();
+        assert_eq!(
+            res.meta.e_tag,
+            Some(committed_e_tag(&getter, &location, b"upgraded").await)
+        );
+        let bytes = res.bytes().await.unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"upgraded"));
+
+        let ranges = ranger.get_ranges(&location, &[0..8]).await.unwrap();
+        assert_eq!(ranges[0], Bytes::from_static(b"upgraded"));
+
+        let target = Path::from("compat/legacy-copy");
+        copier.copy(&location, &target).await.unwrap();
+        let bytes = copier.get(&target).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"upgraded"));
     }
 
     #[tokio::test]

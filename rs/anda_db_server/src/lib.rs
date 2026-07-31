@@ -48,8 +48,10 @@
 //! instance that never provisions one behaves exactly as it did before this
 //! existed — including the unauthenticated loopback mode when no admin key is
 //! configured. Unauthorized database-scope requests always return the same
-//! `401`, whether or not the named database exists. See [`auth`] for the full
-//! precedence rules.
+//! `401`, whether or not the named database exists, and authorization runs
+//! before the request body is read, so an anonymous caller can neither make
+//! the server buffer its body nor observe the body-limit `413`. See [`auth`]
+//! for the full precedence rules.
 //!
 //! ## Methods
 //!
@@ -86,10 +88,13 @@ pub use state::{AppState, OpenMode, ServerInfo, ServerOptions};
 /// Builds the axum [`Router`] for the server.
 ///
 /// `GET /` is unauthenticated; the RPC endpoints authorize every request
-/// against the scope it addresses (see [`auth`]). The request body size limit comes
-/// from [`ServerOptions::max_body_size`] and over-limit requests receive
-/// the RPC error envelope (`payload_too_large`) instead of axum's plain
-/// text 413.
+/// against the scope it addresses (see [`auth`]) **before the body is
+/// read**: [`api::require_auth`] runs as a route layer ahead of the
+/// handlers' body extractor, so an anonymous oversized request is answered
+/// `401`, never `413`, and never buffered. The request body size limit comes
+/// from [`ServerOptions::max_body_size`] and over-limit (authorized)
+/// requests receive the RPC error envelope (`payload_too_large`) instead of
+/// axum's plain text 413.
 ///
 /// An outermost timeout layer ([`api::total_timeout`], 2× the request
 /// timeout) bounds the whole request including reading the body, so a
@@ -101,6 +106,14 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/", routing::get(api::get_info).post(api::rpc_root))
         .route("/{db_name}", routing::post(api::rpc_db))
+        // A *route* layer, innermost: it runs after routing (so the matched
+        // path captures are available for scope derivation) but before any
+        // handler extractor touches the body, and never for the 404
+        // fallback. See [`api::require_auth`].
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            api::require_auth,
+        ))
         .layer(DefaultBodyLimit::max(state.max_body_size()))
         .layer(middleware::from_fn(api::normalize_rejections))
         .layer(middleware::from_fn_with_state(

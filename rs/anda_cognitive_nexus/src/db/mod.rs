@@ -411,7 +411,20 @@ impl CognitiveNexus {
     /// [`ensure_live_collections`](Self::ensure_live_collections) and
     /// [`recover_if_poisoned`](Self::recover_if_poisoned)); exposed for hosts
     /// that drive their own recovery.
+    ///
+    /// Serialized against KML execution: swapping a handle mid-statement
+    /// would let the statement's later steps resolve the fresh handle and
+    /// silently complete "successfully" across two collection generations.
+    /// The internal callers above already run under `kml_lock`; this public
+    /// entry acquires it itself.
     pub async fn reopen_collections(&self) -> Result<(), KipError> {
+        let _guard = self.kml_lock.write().await;
+        self.reopen_collections_inner().await
+    }
+
+    /// [`reopen_collections`](Self::reopen_collections) without the
+    /// `kml_lock` acquisition, for callers that already hold it.
+    async fn reopen_collections_inner(&self) -> Result<(), KipError> {
         let concepts = self
             .db
             .open_collection("concepts".to_string(), async |collection| {
@@ -426,8 +439,13 @@ impl CognitiveNexus {
             })
             .await
             .map_err(reopen_error)?;
-        *self.concepts.write() = concepts;
-        *self.propositions.write() = propositions;
+        // Hold both slot guards before assigning so the pair swaps in one
+        // step; a reader cannot observe new-concepts/old-propositions
+        // between two separate assignments.
+        let mut concepts_slot = self.concepts.write();
+        let mut propositions_slot = self.propositions.write();
+        *concepts_slot = concepts;
+        *propositions_slot = propositions;
         Ok(())
     }
 
@@ -451,7 +469,7 @@ impl CognitiveNexus {
     /// with `anda_db`'s own authoritative error.
     async fn ensure_live_collections(&self) -> Result<(), KipError> {
         if self.has_poisoned_handle() {
-            self.reopen_collections().await?;
+            self.reopen_collections_inner().await?;
         }
         Ok(())
     }
@@ -478,7 +496,7 @@ impl CognitiveNexus {
         if !self.has_poisoned_handle() {
             return Err(err);
         }
-        match self.reopen_collections().await {
+        match self.reopen_collections_inner().await {
             // A failed reopen leaves the poisoned handle in place; the next
             // statement's pre-flight retries the recovery.
             Err(_) => Err(err),
@@ -534,6 +552,9 @@ impl CognitiveNexus {
     /// have been applied; downstream applications can call it to record
     /// their own migration steps.
     pub async fn save_capsule_version(&self, version: u64) -> Result<(), KipError> {
+        // A mutating step: hold `kml_lock` like every KML statement so the
+        // ensure/recover reopen paths stay serialized against execution.
+        let _guard = self.kml_lock.write().await;
         self.ensure_live_collections().await?;
         let result = self
             .concepts()
@@ -858,10 +879,7 @@ impl CognitiveNexus {
 
         let mut ids = self
             .concepts()
-            .query_ids(
-                Filter::Field((virtual_name, RangeQuery::Eq(virtual_val))),
-                None,
-            )
+            .query_all_ids(Filter::Field((virtual_name, RangeQuery::Eq(virtual_val))))
             .await
             .map_err(db_to_kip_error)?;
         ids.pop().ok_or(KipError::not_found(format!(
@@ -905,13 +923,10 @@ impl CognitiveNexus {
             ConceptMatcher::Type(type_name) => {
                 let ids = self
                     .concepts()
-                    .query_ids(
-                        Filter::Field((
-                            "type".to_string(),
-                            RangeQuery::Eq(Fv::Text(type_name.clone())),
-                        )),
-                        None,
-                    )
+                    .query_all_ids(Filter::Field((
+                        "type".to_string(),
+                        RangeQuery::Eq(Fv::Text(type_name.clone())),
+                    )))
                     .await
                     .map_err(db_to_kip_error)?;
                 Ok(ids)
@@ -919,10 +934,10 @@ impl CognitiveNexus {
             ConceptMatcher::Name(name) => {
                 let ids = self
                     .concepts()
-                    .query_ids(
-                        Filter::Field(("name".to_string(), RangeQuery::Eq(Fv::Text(name.clone())))),
-                        None,
-                    )
+                    .query_all_ids(Filter::Field((
+                        "name".to_string(),
+                        RangeQuery::Eq(Fv::Text(name.clone())),
+                    )))
                     .await
                     .map_err(db_to_kip_error)?;
                 Ok(ids)

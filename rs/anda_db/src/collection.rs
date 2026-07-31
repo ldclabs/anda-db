@@ -1067,6 +1067,7 @@ impl Collection {
     ) -> Result<(), DBError> {
         let now_ms = unix_ms();
         let mut affected_ids = BTreeSet::new();
+        let mut unindexable_image_ids = BTreeSet::new();
         for intent in intents.values() {
             affected_ids.insert(intent.document_id);
             for candidate in [&intent.previous, &intent.proposed].into_iter().flatten() {
@@ -1074,13 +1075,14 @@ impl Collection {
                 // current schema (e.g. after an upgrade) cannot be turned back
                 // into indexed values. Skip it rather than failing the open
                 // forever: the stored document below stays authoritative, and
-                // entries derived only from the undecodable image are left to
-                // the explicit `reconcile_storage` backstop.
+                // postings only the undecodable image could name are removed
+                // by the id sweep below before the document is re-indexed.
                 match Document::try_from_doc(self.schema(), candidate.clone()) {
                     Ok(document) => {
                         self.remove_document_from_indexes(intent.document_id, &document, now_ms)
                     }
                     Err(err) => {
+                        unindexable_image_ids.insert(intent.document_id);
                         log::warn!(
                             action = "Collection::reconcile_mutation_intents",
                             collection = self.name,
@@ -1091,6 +1093,16 @@ impl Collection {
                     }
                 }
             }
+        }
+
+        // Index removal is value-keyed, so a posting under a key derived from
+        // an undecodable image would survive every later remove/re-add and
+        // become a permanent phantom (a unique B-tree key then rejects new
+        // documents with that value forever). Sweep those ids out of every
+        // index first; the re-index below restores the postings the current
+        // document actually owns.
+        if !unindexable_image_ids.is_empty() {
+            self.purge_dead_ids_from_indexes(&unindexable_image_ids, now_ms);
         }
 
         for id in affected_ids {
@@ -3309,8 +3321,26 @@ impl Collection {
         // Best-effort fetch to drive index cleanup. If the document has already
         // been deleted from storage we still want to clear the in-memory state
         // (treat as a normal removal) but cannot retire stale index entries.
+        // A stored document that no longer satisfies the schema (e.g. legacy
+        // data a later validation tightening rejects) must stay removable —
+        // it is the only in-band way out of that state — so it is deleted
+        // with an id sweep instead of value-keyed index cleanup.
+        let mut undecodable = false;
         let doc = match self.storage.get::<DocumentOwned>(&path).await {
-            Ok((doc, _)) => Some(Document::try_from_doc(self.schema(), doc)?),
+            Ok((doc, _)) => match Document::try_from_doc(self.schema(), doc) {
+                Ok(doc) => Some(doc),
+                Err(err) => {
+                    log::warn!(
+                        action = "Collection::remove",
+                        collection = self.name,
+                        doc_id = id;
+                        "Removing document that does not match the schema; \
+                         sweeping its index postings by id: {err:?}",
+                    );
+                    undecodable = true;
+                    None
+                }
+            },
             Err(DBError::NotFound { .. }) => None,
             Err(err) => {
                 log::warn!(
@@ -3325,6 +3355,14 @@ impl Collection {
 
         if let Some(doc) = &doc {
             self.record_mutation_intent(id, Some(doc), None).await?;
+        }
+        if undecodable {
+            // No pre-image intent can be recorded (the image would not
+            // decode on replay either) and a purge has no value-keyed
+            // rollback; a crash or delete failure below leaves the document
+            // object present but unindexed, and re-running `remove`
+            // completes the deletion.
+            self.purge_dead_ids_from_indexes(&BTreeSet::from([id]), now_ms);
         }
 
         #[allow(clippy::mutable_key_type)]
@@ -3379,7 +3417,7 @@ impl Collection {
         // Phase 2: delete the document object before the bitmap so that a
         // failure here keeps the document visible (and recoverable) rather
         // than producing an orphan beyond the auto-repair scan window.
-        if doc.is_some()
+        if (doc.is_some() || undecodable)
             && let Err(err) = self.storage.delete(&path).await
         {
             rollback_indexes();
@@ -3438,10 +3476,22 @@ impl Collection {
             .buffered(8);
         while let Some((id, result)) = stream.next().await {
             match result {
-                Ok((doc, _)) => {
-                    let doc = Document::try_from_doc(schema.clone(), doc)?;
-                    docs.push(doc);
-                }
+                Ok((doc, _)) => match Document::try_from_doc(schema.clone(), doc) {
+                    Ok(doc) => docs.push(doc),
+                    Err(err) => {
+                        // One stored document that no longer satisfies the
+                        // schema (legacy data a later validation tightening
+                        // rejects) must not fail every search that matches
+                        // it. Skip it; `get`/`update` on the id still report
+                        // the error, and `remove` can delete it.
+                        log::warn!(
+                            action = "Collection::search",
+                            collection = self.name,
+                            doc_id = id;
+                            "Skipping document that does not match the schema: {err:?}",
+                        );
+                    }
+                },
                 Err(DBError::NotFound { .. }) => {
                     // Under the poison-on-unknown-outcome contract a live
                     // handle should never observe a dead id: crash recovery
@@ -3515,10 +3565,13 @@ impl Collection {
         }
     }
 
-    /// Removes index postings that still reference dead document ids.
+    /// Removes index postings that reference the given document ids without
+    /// knowing the indexed values.
     ///
-    /// The document bodies are gone, so the indexed values cannot be derived
-    /// the usual way. Each index is purged as far as it can be purged by id:
+    /// Used for dead ids (the document bodies are gone) and for live ids
+    /// whose historical indexed values cannot be derived (a mutation-intent
+    /// image that no longer decodes) — in both cases value-keyed removal is
+    /// impossible, so each index is purged as far as it can be purged by id:
     ///
     /// - **HNSW** stores one vector per id and is purged directly.
     /// - **B-tree** needs the key, so the key space is swept **once** for the
@@ -3766,6 +3819,37 @@ impl Collection {
         Ok(rt)
     }
 
+    /// Queries **every** document ID matching a filter, with no result bound.
+    ///
+    /// [`Collection::query_ids`] clamps its result to
+    /// [`Collection::MAX_SEARCH_LIMIT`] because it is reachable over HTTP.
+    /// In-process callers whose correctness depends on completeness — cascade
+    /// deletion, link re-pointing, set-difference (`NOT`) evaluation — must
+    /// use this method instead: a silently truncated result there corrupts
+    /// data rather than shortening a page. The caller owns bounding the
+    /// result (memory is one `u64` per match) and must not expose this
+    /// entry point to untrusted request paths.
+    ///
+    /// # Arguments
+    /// * `filter` - The filter condition to apply
+    ///
+    /// # Returns
+    /// All matching document IDs in ascending order (composite filters) or
+    /// index scan order, or an error if filtering fails.
+    pub async fn query_all_ids(&self, filter: Filter) -> Result<Vec<DocumentId>, DBError> {
+        filter
+            .validate_complexity()
+            .map_err(|source| DBError::Generic {
+                name: self.name.clone(),
+                source: source.into(),
+            })?;
+
+        self.search_count.fetch_add(1, Ordering::Relaxed);
+        // The internal scan uses `0` for "unbounded".
+        let (rt, _) = self.filter_by_field(filter, &[], 0)?;
+        Ok(rt)
+    }
+
     /// Gets a document by its ID.
     ///
     /// # Arguments
@@ -3919,11 +4003,13 @@ impl Collection {
             }
             Filter::Or(queries) => {
                 let mut rt: UniqueVec<u64> = UniqueVec::with_capacity(Self::reserve_hint(limit));
-                // Evaluate every branch (each bounded by `limit` on its own)
-                // instead of stopping once the union reaches `limit`: the
-                // early stop made the result depend on operand order.
+                // Evaluate every branch unbounded (limit = 0), like `And` and
+                // `Not`: a branch bounded by `limit` collects the wrong ids
+                // when its scan direction is descending (`Lt`/`Le` keep the
+                // largest keys), so the ascending trim below would drop
+                // matches from both ends of the union.
                 for query in queries {
-                    let (ids, _) = self.filter_by_field_with(*query, candidates, limit)?;
+                    let (ids, _) = self.filter_by_field_with(*query, candidates, 0)?;
                     rt.extend(ids);
                 }
 
@@ -4132,16 +4218,15 @@ impl Collection {
             }
             RangeQuery::Or(queries) => {
                 let mut rt = UniqueVec::new();
+                // 同 And：各分支均以 limit = 0 求值完整并集（不提前
+                // break——提前停止会让分页结果依赖操作数顺序），
+                // 由调用方按 order 截断长度
                 for query in queries {
                     let (keys, _) = self.filter_by_id(*query, candidates, 0);
                     rt.extend(keys);
-                    if limit > 0 && rt.len() > limit {
-                        break;
-                    }
                 }
 
                 result = rt.into();
-                // 同 And：各分支均以 limit = 0 求值，由调用方按 order 截断长度
             }
             RangeQuery::Not(query) => {
                 result.reserve_exact(Self::reserve_hint(limit));
@@ -6542,6 +6627,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_query_ids_or_pages_are_operand_order_independent() -> Result<(), DBError> {
+        let db = setup_test_db().await?;
+        let collection = create_test_collection(&db, async |collection| {
+            collection.create_btree_index_nx(&["age"]).await?;
+            Ok(())
+        })
+        .await?;
+
+        // age == _id == 1..=20
+        for i in 1..=20u64 {
+            let doc = create_test_doc(0, &format!("user_{i}"), i as u32, vec!["x"]);
+            assert_eq!(collection.add_from(&doc).await?, i);
+        }
+
+        // Or 各分支必须完整求值：过去 `_id` 快路径在并集超过 limit 时提前
+        // break，同一布尔集合的两种操作数顺序返回不同的页面。
+        for field in [Schema::ID_KEY, "age"] {
+            let pairs = [
+                (
+                    Filter::Field((
+                        field.to_string(),
+                        RangeQuery::Or(vec![
+                            Box::new(RangeQuery::Gt(Fv::U64(10))),
+                            Box::new(RangeQuery::Eq(Fv::U64(1))),
+                        ]),
+                    )),
+                    Filter::Field((
+                        field.to_string(),
+                        RangeQuery::Or(vec![
+                            Box::new(RangeQuery::Eq(Fv::U64(1))),
+                            Box::new(RangeQuery::Gt(Fv::U64(10))),
+                        ]),
+                    )),
+                ),
+                (
+                    Filter::Or(vec![
+                        Box::new(Filter::Field((
+                            field.to_string(),
+                            RangeQuery::Gt(Fv::U64(10)),
+                        ))),
+                        Box::new(Filter::Field((
+                            field.to_string(),
+                            RangeQuery::Eq(Fv::U64(1)),
+                        ))),
+                    ]),
+                    Filter::Or(vec![
+                        Box::new(Filter::Field((
+                            field.to_string(),
+                            RangeQuery::Eq(Fv::U64(1)),
+                        ))),
+                        Box::new(Filter::Field((
+                            field.to_string(),
+                            RangeQuery::Gt(Fv::U64(10)),
+                        ))),
+                    ]),
+                ),
+            ];
+            for (a, b) in pairs {
+                let ids_a = collection.query_ids(a.clone(), Some(2)).await?;
+                let ids_b = collection.query_ids(b.clone(), Some(2)).await?;
+                assert_eq!(ids_a, vec![1, 11], "field {field}, filter {a:?}");
+                assert_eq!(ids_b, vec![1, 11], "field {field}, filter {b:?}");
+            }
+        }
+
+        // Filter::Or 的分支过去以调用方 limit 求值：Le 分支的 B-tree 扫描
+        // 是降序的，收集到的是最大键，升序截断后两端的匹配都会被丢掉
+        // （此例中错误结果是 [8, 9, 10]）。
+        let ids = collection
+            .query_ids(
+                Filter::Or(vec![
+                    Box::new(Filter::Field((
+                        "age".to_string(),
+                        RangeQuery::Le(Fv::U64(10)),
+                    ))),
+                    Box::new(Filter::Field((
+                        "age".to_string(),
+                        RangeQuery::Eq(Fv::U64(19)),
+                    ))),
+                ]),
+                Some(3),
+            )
+            .await?;
+        assert_eq!(ids, vec![1, 2, 3]);
+
+        db.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_filter_by_id_inverted_between_is_empty() -> Result<(), DBError> {
         let db = setup_test_db().await?;
         let collection = create_test_collection(&db, async |_| Ok(())).await?;
@@ -8619,6 +8794,15 @@ mod tests {
             .create(&Collection::mutation_intent_path(3), &reserved)
             .await?;
 
+        // (d) A phantom posting a partial flush left behind under a key only
+        // the (undecodable) pre-image knew about. Value-keyed removal cannot
+        // reach it; the replay must sweep it out by id.
+        for index in &collection.btree_indexes {
+            if index.name() == "age" {
+                assert!(index.insert(id, &Fv::U64(99), unix_ms())?);
+            }
+        }
+
         db.close().await?;
         drop(db);
 
@@ -8642,6 +8826,17 @@ mod tests {
                 .await?,
             vec![id]
         );
+        // The phantom posting from (d) must be gone: the replay swept the id
+        // out of every index before re-indexing the stored document.
+        assert_eq!(
+            collection
+                .query_ids(
+                    Filter::Field(("age".to_string(), RangeQuery::Eq(Fv::U64(99)))),
+                    None,
+                )
+                .await?,
+            Vec::<DocumentId>::new()
+        );
 
         db.close().await?;
         assert!(collection.stale_mutation_intents.lock().is_empty());
@@ -8657,6 +8852,113 @@ mod tests {
                 meta.location
             );
         }
+        Ok(())
+    }
+
+    /// `query_all_ids` must return every match: in-process callers (cascade
+    /// deletion, link re-pointing, `NOT` evaluation) corrupt data when a
+    /// result is silently truncated, which is exactly what `query_ids`'s
+    /// `MAX_SEARCH_LIMIT` clamp does to them.
+    #[tokio::test]
+    async fn test_query_all_ids_is_unbounded() -> Result<(), DBError> {
+        let db = setup_test_db().await?;
+        let collection = create_test_collection(&db, async |c| {
+            c.create_btree_index_nx(&["age"]).await?;
+            Ok(())
+        })
+        .await?;
+
+        let n = Collection::MAX_SEARCH_LIMIT + 100;
+        for i in 0..n {
+            collection
+                .add_from(&create_test_doc(0, &format!("u{i}"), 1, vec![]))
+                .await?;
+        }
+
+        let filter = Filter::Field(("age".to_string(), RangeQuery::Eq(Fv::U64(1))));
+        assert_eq!(
+            collection.query_ids(filter.clone(), None).await?.len(),
+            Collection::MAX_SEARCH_LIMIT
+        );
+        assert_eq!(collection.query_all_ids(filter).await?.len(), n);
+
+        db.close().await?;
+        Ok(())
+    }
+
+    /// Legacy data a later validation tightening rejects must stay
+    /// manageable in-band: `search` skips such a document instead of failing
+    /// the whole batch, and `remove` deletes it via an id sweep even though
+    /// its values cannot drive value-keyed index cleanup. `get` stays strict.
+    #[tokio::test]
+    async fn test_schema_invalid_stored_document_is_skippable_and_removable() -> Result<(), DBError>
+    {
+        let db = setup_test_db().await?;
+        let collection = create_test_collection(&db, async |c| {
+            c.create_btree_index_nx(&["age"]).await?;
+            Ok(())
+        })
+        .await?;
+
+        let id_ok = collection
+            .add_from(&create_test_doc(0, "alice", 30, vec!["a"]))
+            .await?;
+        let id_bad = collection
+            .add_from(&create_test_doc(0, "bob", 40, vec!["b"]))
+            .await?;
+
+        // Overwrite the stored object with a raw image whose `name` is not
+        // Text — the shape 0.10 write paths could persist before validation
+        // covered it.
+        let name_idx = collection
+            .schema()
+            .get_field("name")
+            .expect("name field")
+            .idx();
+        let mut raw: DocumentOwned = Document::try_from(
+            collection.schema(),
+            &create_test_doc(id_bad, "bob", 40, vec!["b"]),
+        )?
+        .into();
+        raw.fields.insert(name_idx, Fv::U64(7));
+        collection
+            .storage
+            .put(&Collection::doc_path(id_bad), &raw, None)
+            .await?;
+
+        // Reads of the poisoned id stay strict.
+        assert!(collection.get_as::<TestDoc>(id_bad).await.is_err());
+
+        // A search matching both documents returns the healthy one instead
+        // of failing the whole batch.
+        let docs = collection
+            .search(Query {
+                filter: Some(Filter::Field((
+                    "age".to_string(),
+                    RangeQuery::Ge(Fv::U64(0)),
+                ))),
+                limit: Some(10),
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].id(), id_ok);
+
+        // `remove` deletes it (no recoverable pre-image, so it reports None)
+        // and sweeps its postings, so the id stops matching queries.
+        assert!(collection.remove(id_bad).await?.is_none());
+        assert_eq!(collection.len(), 1);
+        assert_eq!(
+            collection
+                .query_ids(
+                    Filter::Field(("age".to_string(), RangeQuery::Eq(Fv::U64(40)))),
+                    None,
+                )
+                .await?,
+            Vec::<DocumentId>::new()
+        );
+
+        db.close().await?;
         Ok(())
     }
 

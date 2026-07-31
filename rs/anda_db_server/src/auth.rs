@@ -31,16 +31,32 @@
 //! Rule 4 deliberately returns the same `401` whether the named database
 //! exists, exists under a different key, or does not exist at all: an
 //! unauthorized caller must not be able to probe the database namespace. Only
-//! an admin ever sees `404 not_found` for a missing database.
+//! an admin ever sees `404 not_found` for a missing database. The rejection
+//! also performs the same hashing work in every case (see [`TIMING_DUMMY`]),
+//! so its timing does not reveal which databases carry a per-database key.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use sha3::Digest;
-use std::fmt;
+use std::{fmt, sync::LazyLock};
 
 use crate::{api::constant_time_eq, error::ApiError};
 
 /// Length in bytes of a server-generated API key before hex encoding.
 const GENERATED_KEY_BYTES: usize = 32;
+
+/// Input of the fixed digest the unbound database-scope branch verifies
+/// against. Its value is arbitrary; presenting it as a token authorizes
+/// nothing, because the verification result there is discarded.
+const TIMING_DUMMY_KEY: &str = "anda-db-server-timing-equalization-dummy";
+
+/// Digest verified when a database-scope request presents a token but the
+/// named database has no bound key (or does not exist). Burning the same
+/// hash-and-compare work as the bound branch keeps the rejection timing
+/// independent of whether a per-database binding exists — the namespace
+/// non-probing rule (rule 4) must hold for timing, not only for status codes
+/// and bodies.
+static TIMING_DUMMY: LazyLock<ApiKeyHash> =
+    LazyLock::new(|| ApiKeyHash::from_key(TIMING_DUMMY_KEY));
 
 /// The scope an RPC request is dispatched into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,7 +191,19 @@ pub fn authorize(
             // Rule 4: a database with no bound key falls back to the admin
             // key, which was already rejected above. The response is
             // identical to the wrong-key and unknown-database cases.
-            _ => Err(ApiError::unauthorized()),
+            _ => {
+                // Timing equalization: a bound database already burned a
+                // hash-and-compare on the presented token in the guard above;
+                // do the same work when no binding exists, so the rejection
+                // cannot probe the namespace by timing either. The result is
+                // deliberately discarded.
+                if bound.is_none()
+                    && let Some(presented) = presented
+                {
+                    std::hint::black_box(TIMING_DUMMY.verify(presented));
+                }
+                Err(ApiError::unauthorized())
+            }
         },
     }
 }
@@ -296,6 +324,40 @@ mod tests {
         ));
         // ... and the root scope has no fallback at all.
         assert_unauthorized(authorize(Some(&admin), None, Scope::Root, Some("key-a")));
+    }
+
+    /// The unbound / unknown-database branch verifies the presented token
+    /// against [`TIMING_DUMMY`] so its work matches the bound branch. Only the
+    /// result can be asserted here (not the timing): the branch must reject
+    /// exactly like every other rule-4 case, and the dummy input itself must
+    /// never become a working credential.
+    #[test]
+    fn the_timing_dummy_never_authorizes_and_rejects_identically() {
+        let admin = hash("admin-key");
+        let bound = hash("key-a");
+
+        for scope in [
+            Scope::Root,
+            Scope::Database("bound"),
+            Scope::Database("does_not_exist"),
+        ] {
+            assert_unauthorized(authorize(Some(&admin), None, scope, Some(TIMING_DUMMY_KEY)));
+        }
+
+        // Wrong key on a bound database and any key on an unbound one take
+        // different verification paths but must produce equal errors.
+        let wrong_on_bound = authorize(
+            Some(&admin),
+            Some(&bound),
+            Scope::Database("bound"),
+            Some("nope"),
+        )
+        .unwrap_err();
+        let any_on_unbound =
+            authorize(Some(&admin), None, Scope::Database("unbound"), Some("nope")).unwrap_err();
+        assert_eq!(wrong_on_bound.status, any_on_unbound.status);
+        assert_eq!(wrong_on_bound.code, any_on_unbound.code);
+        assert_eq!(wrong_on_bound.message, any_on_unbound.message);
     }
 
     #[test]

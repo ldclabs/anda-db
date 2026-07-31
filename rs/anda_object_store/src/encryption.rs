@@ -679,9 +679,11 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
             let mut res = match self.inner.store.get_opts(&payload_path, options).await {
                 Ok(res) => res,
                 Err(Error::NotFound { source, .. }) => {
-                    // The cached pointer may be stale and its generation
-                    // already replaced and reclaimed; re-resolve once.
-                    if !retried && meta.generation.is_some() {
+                    // The cached pointer — generational or legacy — may be
+                    // stale after a concurrent overwrite: the generation was
+                    // replaced and reclaimed, or the legacy payload was
+                    // migrated away. Re-resolve once.
+                    if !retried {
                         retried = true;
                         self.inner.refresh_meta(location).await?;
                         continue;
@@ -774,7 +776,7 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
                     {
                         Ok(data) => data,
                         Err(Error::NotFound { source, .. }) => {
-                            if !retried && meta.generation.is_some() {
+                            if !retried {
                                 retried = true;
                                 self.inner.refresh_meta(location).await?;
                                 continue 'retry;
