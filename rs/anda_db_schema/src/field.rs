@@ -352,7 +352,9 @@ impl FieldType {
     /// - an `F32` field observed as an [`FieldValue::F64`] read-back shape
     ///   (see `is_f32_read_back`) becomes [`FieldValue::F32`],
     /// - a `Vector` field observed as an array of U64 bf16 bit patterns becomes
-    ///   [`FieldValue::Vector`].
+    ///   [`FieldValue::Vector`],
+    /// - a `Json` field observed as the `Map` / `Array` / primitive shape of
+    ///   its payload becomes [`FieldValue::Json`] again.
     ///
     /// Values that are not a read-back shape of this type are left unchanged
     /// (a following [`FieldType::validate`] reports them). Normalization is
@@ -420,9 +422,23 @@ impl FieldType {
                     }
                 }
             }
+            FieldType::Json => {
+                // A `Json` payload is stored as its plain CBOR/JSON shape, so
+                // it reads back as a `Map`, an `Array` or a primitive. Going
+                // back through CBOR — the same path `FieldType::extract`
+                // takes — rebuilds the declared variant. Shapes that have no
+                // JSON representation (e.g. `Bytes`) are left unchanged, and
+                // so are values too deeply nested for the bounded conversion.
+                if !matches!(value, FieldValue::Json(_))
+                    && let Ok(cbor) = value.clone().try_into_cbor()
+                    && let Ok(json) = FieldValue::json_from(cbor)
+                {
+                    *value = json;
+                }
+            }
             FieldType::Map(types) => {
                 if let FieldValue::Map(values) = value {
-                    if let Some(ft) = as_wildcard_map(types) {
+                    if let Some((_, ft)) = as_wildcard_map(types) {
                         for v in values.values_mut() {
                             ft.normalize_at(v, depth + 1);
                         }
@@ -441,6 +457,126 @@ impl FieldType {
                 ft.normalize_at(value, depth);
             }
             _ => {}
+        }
+    }
+
+    /// Drops [`FieldValue::Map`] entries whose key this type does not declare,
+    /// recursing into `Array` / `Map` / `Option` composites.
+    ///
+    /// A non-wildcard [`FieldType::Map`] — what `#[derive(FieldTyped)]` emits
+    /// for every nested struct — names its keys one by one, so a key it does
+    /// not declare can only be a *removed* nested field: stale data written
+    /// under an older schema, exactly like a top-level value stored under a
+    /// retired field index. [`FieldType::validate`] still rejects such keys,
+    /// so this runs on the read path just before validation
+    /// (`Document::try_from_doc`), which also makes the leftover disappear the
+    /// next time the document is rewritten. Without it, removing one field
+    /// from a nested struct makes every already-stored document unreadable.
+    ///
+    /// Wildcard maps declare no key names at all and are left untouched.
+    pub fn prune_undeclared(&self, value: &mut FieldValue) {
+        self.prune_undeclared_at(value, 0)
+    }
+
+    /// Depth-tracked body of [`FieldType::prune_undeclared`]: stops recursing
+    /// (and leaves the value unchanged) beyond [`MAX_CONVERSION_DEPTH`], where
+    /// validation rejects the value anyway.
+    fn prune_undeclared_at(&self, value: &mut FieldValue, depth: usize) {
+        if check_conversion_depth(depth).is_err() {
+            return;
+        }
+
+        match self {
+            FieldType::Array(types) => {
+                if let FieldValue::Array(values) = value {
+                    match types.len() {
+                        0 => {}
+                        1 => {
+                            for v in values.iter_mut() {
+                                types[0].prune_undeclared_at(v, depth + 1);
+                            }
+                        }
+                        _ => {
+                            for (ft, v) in types.iter().zip(values.iter_mut()) {
+                                ft.prune_undeclared_at(v, depth + 1);
+                            }
+                        }
+                    }
+                }
+            }
+            // An empty `Map` type declares nothing and accepts everything.
+            FieldType::Map(types) if !types.is_empty() => {
+                if let FieldValue::Map(values) = value {
+                    if let Some((_, ft)) = as_wildcard_map(types) {
+                        for v in values.values_mut() {
+                            ft.prune_undeclared_at(v, depth + 1);
+                        }
+                    } else {
+                        values.retain(|k, _| types.contains_key(k));
+                        for (k, v) in values.iter_mut() {
+                            if let Some(ft) = types.get(k) {
+                                ft.prune_undeclared_at(v, depth + 1);
+                            }
+                        }
+                    }
+                }
+            }
+            // `Option` wrapping is type-level nesting only; the value itself
+            // is not a container level.
+            FieldType::Option(ft) if value != &FieldValue::Null => {
+                ft.prune_undeclared_at(value, depth);
+            }
+            _ => {}
+        }
+    }
+
+    /// Returns `true` when a field previously declared as `old` may be
+    /// re-declared as `self` without rewriting the documents already stored.
+    ///
+    /// Types must match exactly, with one exception that mirrors the
+    /// *top-level* evolution rule enforced by [`Schema::upgrade_with`](crate::Schema::upgrade_with)
+    /// (a new field must be optional, a removed field is tolerated on read):
+    /// a non-wildcard [`FieldType::Map`] — the shape `#[derive(FieldTyped)]`
+    /// emits for a nested struct — may
+    ///
+    /// - **gain** a key, provided the new key is optional, so documents
+    ///   written before the upgrade (which lack it) still validate; and
+    /// - **lose** a key: stored values keep the stale entry, which
+    ///   [`FieldType::prune_undeclared`] drops on read.
+    ///
+    /// A key whose type changed, a new *required* key, and any change of the
+    /// wildcard-ness or key variant of a map remain incompatible, as do all
+    /// other type changes.
+    pub fn is_compatible_upgrade_of(&self, old: &FieldType) -> bool {
+        match (self, old) {
+            (FieldType::Array(new_types), FieldType::Array(old_types)) => {
+                // Array arity is part of the shape: a tuple-like array that
+                // gains or loses an element changes every stored value.
+                new_types.len() == old_types.len()
+                    && new_types
+                        .iter()
+                        .zip(old_types)
+                        .all(|(new, old)| new.is_compatible_upgrade_of(old))
+            }
+            (FieldType::Map(new_types), FieldType::Map(old_types)) => {
+                match (as_wildcard_map(new_types), as_wildcard_map(old_types)) {
+                    (Some((new_key, new_ft)), Some((old_key, old_ft))) => {
+                        new_key == old_key && new_ft.is_compatible_upgrade_of(old_ft)
+                    }
+                    // A wildcard map and an explicitly keyed one describe
+                    // different shapes; neither can become the other.
+                    (Some(_), None) | (None, Some(_)) => false,
+                    (None, None) => new_types.iter().all(|(k, new_ft)| match old_types.get(k) {
+                        Some(old_ft) => new_ft.is_compatible_upgrade_of(old_ft),
+                        // Keys only in `old` were removed: tolerated on read.
+                        None => new_ft.allows_null(),
+                    }),
+                }
+            }
+            (FieldType::Option(new_ft), FieldType::Option(old_ft)) => {
+                new_ft.is_compatible_upgrade_of(old_ft)
+            }
+            (new, old) => new == old,
         }
     }
 }
@@ -691,45 +827,70 @@ pub enum FieldValue {
 impl From<FieldValue> for Cbor {
     /// Convert a FieldValue to a CBOR value
     ///
+    /// This conversion is infallible and therefore cannot report a value
+    /// nested deeper than [`MAX_CONVERSION_DEPTH`]: the offending subtree is
+    /// truncated to [`Cbor::Null`] rather than recursing until the stack is
+    /// exhausted. Use [`FieldValue::try_into_cbor`] to get the same
+    /// [`SchemaError::FieldValue`] the opposite direction
+    /// ([`FieldValue::try_from`]) returns.
+    ///
     /// # Arguments
     /// * `value` - The FieldValue to convert
     ///
     /// # Returns
     /// * `Cbor` - The converted CBOR value
     fn from(value: FieldValue) -> Self {
-        match value {
-            FieldValue::Bool(b) => Cbor::Bool(b),
-            FieldValue::I64(i) => Cbor::Integer(i.into()),
-            FieldValue::U64(u) => Cbor::Integer(u.into()),
-            FieldValue::F64(f) => Cbor::Float(f),
-            FieldValue::F32(f) => Cbor::Float(f as f64),
-            FieldValue::Bytes(b) => Cbor::Bytes(b),
-            FieldValue::Text(t) => Cbor::Text(t),
-            FieldValue::Json(obj) => json_to_cbor(obj),
-            FieldValue::Vector(arr) => {
-                Cbor::Array(arr.into_iter().map(|f| f.to_bits().into()).collect())
-            }
-            FieldValue::Array(arr) => Cbor::Array(arr.into_iter().map(Cbor::from).collect()),
-            FieldValue::Map(obj) => {
-                let obj = obj
-                    .into_iter()
-                    .map(|(k, v)| {
-                        (
-                            match k {
-                                FieldKey::Text(s) => Cbor::Text(s),
-                                FieldKey::I64(i) => Cbor::Integer(i.into()),
-                                FieldKey::Bytes(b) => Cbor::Bytes(b),
-                            },
-                            Cbor::from(v),
-                        )
-                    })
-                    .collect();
-                Cbor::Map(obj)
-            }
-
-            FieldValue::Null => Cbor::Null,
-        }
+        // The best-effort path truncates instead of erroring, so the
+        // fallback is unreachable.
+        field_value_to_cbor(value, 0, false).unwrap_or(Cbor::Null)
     }
+}
+
+/// Depth-tracked body of the [`FieldValue`] → [`Cbor`] conversion.
+///
+/// Beyond [`MAX_CONVERSION_DEPTH`] `strict` decides the outcome: the fallible
+/// entry point ([`FieldValue::try_into_cbor`]) reports the overflow, while the
+/// infallible [`From`] impl truncates the over-deep subtree to [`Cbor::Null`].
+fn field_value_to_cbor(value: FieldValue, depth: usize, strict: bool) -> Result<Cbor, SchemaError> {
+    if let Err(err) = check_conversion_depth(depth) {
+        return if strict { Err(err) } else { Ok(Cbor::Null) };
+    }
+
+    Ok(match value {
+        FieldValue::Bool(b) => Cbor::Bool(b),
+        FieldValue::I64(i) => Cbor::Integer(i.into()),
+        FieldValue::U64(u) => Cbor::Integer(u.into()),
+        FieldValue::F64(f) => Cbor::Float(f),
+        FieldValue::F32(f) => Cbor::Float(f as f64),
+        FieldValue::Bytes(b) => Cbor::Bytes(b),
+        FieldValue::Text(t) => Cbor::Text(t),
+        // The JSON payload carries its own nesting, counted from here on.
+        FieldValue::Json(obj) => json_to_cbor_at(obj, depth, strict)?,
+        FieldValue::Vector(arr) => {
+            Cbor::Array(arr.into_iter().map(|f| f.to_bits().into()).collect())
+        }
+        FieldValue::Array(arr) => Cbor::Array(
+            arr.into_iter()
+                .map(|v| field_value_to_cbor(v, depth + 1, strict))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        FieldValue::Map(obj) => {
+            let mut entries = Vec::with_capacity(obj.len());
+            for (k, v) in obj {
+                entries.push((
+                    match k {
+                        FieldKey::Text(s) => Cbor::Text(s),
+                        FieldKey::I64(i) => Cbor::Integer(i.into()),
+                        FieldKey::Bytes(b) => Cbor::Bytes(b),
+                    },
+                    field_value_to_cbor(v, depth + 1, strict)?,
+                ));
+            }
+            Cbor::Map(entries)
+        }
+
+        FieldValue::Null => Cbor::Null,
+    })
 }
 
 impl From<bool> for FieldValue {
@@ -1225,6 +1386,20 @@ impl fmt::Debug for FieldValue {
 }
 
 impl FieldValue {
+    /// Converts this value into CBOR, rejecting containers nested deeper than
+    /// [`MAX_CONVERSION_DEPTH`].
+    ///
+    /// This is the bounded counterpart of the infallible
+    /// [`From<FieldValue> for Cbor`] impl (which truncates instead of
+    /// reporting) and the mirror image of [`FieldValue::try_from`]: both
+    /// directions now fail with the same [`SchemaError::FieldValue`] rather
+    /// than recursing until the stack is exhausted. `FieldValue` can carry
+    /// nesting up to the *format's* limit (`serde_json` 128, `cbor2` 256),
+    /// which is above the [`FieldValueBudget::max_depth`] validation applies.
+    pub fn try_into_cbor(self) -> Result<Cbor, SchemaError> {
+        field_value_to_cbor(self, 0, true)
+    }
+
     /// Validates this value against the default structural complexity budget.
     ///
     /// The check is iterative and covers nested [`FieldValue::Array`],
@@ -1603,7 +1778,11 @@ impl FieldValue {
 
                     let v = if types.is_empty() {
                         FieldValue::try_from_at(v, depth + 1)?
-                    } else if let Some(ft) = wildcard_map {
+                    } else if let Some((wildcard, ft)) = wildcard_map {
+                        // The sentinel pins the key variant too, otherwise a
+                        // `Map<Text, T>` could be filled with integer keys and
+                        // never read back into its declared Rust type.
+                        check_wildcard_key(&k, wildcard)?;
                         ft.extract_at(v, depth + 1)?
                     } else if let Some(ft) = types.get(&k) {
                         ft.extract_at(v, depth + 1)?
@@ -1916,6 +2095,42 @@ impl FieldEntry {
         }
     }
 
+    /// Coerces a field value into this field's declared shape, then validates
+    /// it. This is the entry point for values that did not arrive as CBOR
+    /// (a JSON API payload, say).
+    ///
+    /// [`FieldEntry::validate`] alone accepts only a value that already *is*
+    /// the declared variant (or a documented read-back shape of it), whereas
+    /// [`Document::try_from`](crate::Document::try_from) runs every value
+    /// through the [`FieldType::extract`] CBOR coercion first — so a `Bytes`
+    /// field accepts an array of `0..=255` there but not here. Any API that
+    /// takes [`FieldValue`]s from a client must go through this function, or
+    /// creating a document and updating the same field accept different
+    /// shapes and a client can write a document it cannot then update.
+    ///
+    /// # Arguments
+    /// * `value` - The field value to coerce
+    ///
+    /// # Returns
+    /// * `Result<FieldValue, SchemaError>` - The canonical value or an error
+    pub fn coerce(&self, value: FieldValue) -> Result<FieldValue, SchemaError> {
+        if value == FieldValue::Null {
+            // Keep `validate`'s "field is required" wording; `extract` would
+            // only report the type mismatch.
+            self.validate(&value)?;
+            return Ok(value);
+        }
+
+        let value = self.extract(value.try_into_cbor()?, false)?;
+        // Mirrors `Document::try_from`: `extract` is strict about types, but
+        // the structural complexity budget still has to be enforced, or the
+        // value could be written and then fail validation on read-back.
+        value.validate_complexity().map_err(|err| {
+            SchemaError::FieldValue(format!("field {} is invalid, error: {err}", self.name))
+        })?;
+        Ok(value)
+    }
+
     /// Validate a field value against this field entry's constraints
     ///
     /// # Arguments
@@ -1955,11 +2170,18 @@ pub fn vector_from_f64(v: Vec<f64>) -> Vector {
 
 /// Converts a JSON value into a CBOR value.
 ///
-/// This is a total function: every JSON value has a CBOR representation, so
-/// no error path (or panic) is required. Numbers map to the narrowest CBOR
-/// integer that fits, falling back to a float.
-fn json_to_cbor(value: Json) -> Cbor {
-    match value {
+/// Every JSON value has a CBOR representation, so the mapping itself needs no
+/// error path. Nesting does: `depth`/`strict` behave exactly as in
+/// [`field_value_to_cbor`] — beyond [`MAX_CONVERSION_DEPTH`] the over-deep
+/// subtree is either reported or truncated to [`Cbor::Null`], never recursed
+/// into. Numbers map to the narrowest CBOR integer that fits, falling back to
+/// a float.
+fn json_to_cbor_at(value: Json, depth: usize, strict: bool) -> Result<Cbor, SchemaError> {
+    if let Err(err) = check_conversion_depth(depth) {
+        return if strict { Err(err) } else { Ok(Cbor::Null) };
+    }
+
+    Ok(match value {
         Json::Null => Cbor::Null,
         Json::Bool(b) => Cbor::Bool(b),
         Json::Number(n) => {
@@ -1981,27 +2203,58 @@ fn json_to_cbor(value: Json) -> Cbor {
             }
         }
         Json::String(s) => Cbor::Text(s),
-        Json::Array(arr) => Cbor::Array(arr.into_iter().map(json_to_cbor).collect()),
-        Json::Object(obj) => Cbor::Map(
-            obj.into_iter()
-                .map(|(k, v)| (Cbor::Text(k), json_to_cbor(v)))
-                .collect(),
+        Json::Array(arr) => Cbor::Array(
+            arr.into_iter()
+                .map(|v| json_to_cbor_at(v, depth + 1, strict))
+                .collect::<Result<Vec<_>, _>>()?,
         ),
-    }
+        Json::Object(obj) => {
+            let mut entries = Vec::with_capacity(obj.len());
+            for (k, v) in obj {
+                entries.push((Cbor::Text(k), json_to_cbor_at(v, depth + 1, strict)?));
+            }
+            Cbor::Map(entries)
+        }
+    })
 }
 
 /// If `m` describes a *wildcard* map — i.e. it has exactly one entry whose
 /// key is [`TEXT_WILDCARD_KEY`], [`BYTES_WILDCARD_KEY`], or
-/// [`I64_WILDCARD_KEY`] — return the value type of that entry. Otherwise
-/// return `None`.
-fn as_wildcard_map(m: &BTreeMap<FieldKey, FieldType>) -> Option<&FieldType> {
+/// [`I64_WILDCARD_KEY`] — return that entry: the sentinel key, whose variant
+/// is the declared key type, and the value type every entry must have.
+/// Otherwise return `None`.
+///
+/// Every other `Map` declares its keys explicitly (this is what
+/// `#[derive(FieldTyped)]` emits for a nested struct), so it is homogeneous in
+/// neither key nor value. Consumers outside this crate — index key-type
+/// resolution in particular — must use this function rather than approximating
+/// it with a one-entry check, or the two layers disagree about which maps are
+/// wildcards.
+pub fn as_wildcard_map(m: &BTreeMap<FieldKey, FieldType>) -> Option<(&FieldKey, &FieldType)> {
     match m.len() {
         1 => m
-            .get(&TEXT_WILDCARD_KEY)
-            .or_else(|| m.get(&BYTES_WILDCARD_KEY))
-            .or_else(|| m.get(&I64_WILDCARD_KEY)),
+            .get_key_value(&TEXT_WILDCARD_KEY)
+            .or_else(|| m.get_key_value(&BYTES_WILDCARD_KEY))
+            .or_else(|| m.get_key_value(&I64_WILDCARD_KEY)),
         _ => None,
     }
+}
+
+/// Returns an error when `key` is not the key variant that the wildcard
+/// sentinel `wildcard` declares.
+///
+/// A wildcard sentinel pins the key *type* as well as the value type: values
+/// stored under a key of another variant validate structurally but can never
+/// be deserialized back into the declared Rust type (a `BTreeMap<String, _>`
+/// rejects an integer key).
+fn check_wildcard_key(key: &FieldKey, wildcard: &FieldKey) -> Result<(), SchemaError> {
+    if key.field_type() != wildcard.field_type() {
+        return Err(SchemaError::FieldValue(format!(
+            "invalid map key {key:?}, expected a {:?} key",
+            wildcard.field_type()
+        )));
+    }
+    Ok(())
 }
 
 fn validate_map_fields(
@@ -2012,8 +2265,9 @@ fn validate_map_fields(
         return Ok(());
     }
 
-    if let Some(ft) = as_wildcard_map(types) {
-        for fv in values.values() {
+    if let Some((wildcard, ft)) = as_wildcard_map(types) {
+        for (k, fv) in values {
+            check_wildcard_key(k, wildcard)?;
             ft.validate_inner(fv)?;
         }
         return Ok(());
@@ -2566,6 +2820,50 @@ mod tests {
     }
 
     #[test]
+    fn normalize_restores_json_values_after_a_storage_round_trip() {
+        // Regression: a `Json` payload is stored as its plain CBOR shape and
+        // reads back as `Map` / `Array` / a primitive. Without normalization
+        // index maintenance derives different text for the insert-time and
+        // the read-back value of the same document.
+        let value = FieldValue::Json(json!({"tags": [1, "urgent"], "note": "hello"}));
+        let mut data = Vec::new();
+        to_writer(&value, &mut data).unwrap();
+        let mut restored: FieldValue = from_reader(data.as_slice()).unwrap();
+        assert_eq!(
+            restored,
+            FieldValue::Map(BTreeMap::from([
+                ("note".into(), FieldValue::Text("hello".into())),
+                (
+                    "tags".into(),
+                    FieldValue::Array(vec![FieldValue::U64(1), FieldValue::Text("urgent".into())])
+                ),
+            ]))
+        );
+        FieldType::Json.normalize(&mut restored);
+        assert_eq!(restored, value);
+
+        // Scalar payloads and `Option(Json)` behave the same way.
+        let mut v = FieldValue::Text("hello".into());
+        FieldType::Json.normalize(&mut v);
+        assert_eq!(v, FieldValue::Json(json!("hello")));
+        let mut v = FieldValue::Array(vec![FieldValue::U64(1)]);
+        FieldType::Option(Box::new(FieldType::Json)).normalize(&mut v);
+        assert_eq!(v, FieldValue::Json(json!([1])));
+        let mut v = FieldValue::Null;
+        FieldType::Option(Box::new(FieldType::Json)).normalize(&mut v);
+        assert_eq!(v, FieldValue::Null);
+
+        // An already canonical value is left alone, and so is a shape with no
+        // JSON representation (validation accepts any value for `Json`).
+        let mut v = FieldValue::Json(json!({"a": 1}));
+        FieldType::Json.normalize(&mut v);
+        assert_eq!(v, FieldValue::Json(json!({"a": 1})));
+        let mut v = FieldValue::Bytes(vec![1, 2, 3]);
+        FieldType::Json.normalize(&mut v);
+        assert_eq!(v, FieldValue::Bytes(vec![1, 2, 3]));
+    }
+
+    #[test]
     fn test_map_from_rejects_duplicate_keys() {
         let dup = Cbor::Map(vec![
             (Cbor::Text("k".to_string()), Cbor::Integer(1.into())),
@@ -2580,6 +2878,217 @@ mod tests {
         let types = BTreeMap::from([(TEXT_WILDCARD_KEY.clone(), FieldType::U64)]);
         let err = FieldValue::map_from(dup, &types).unwrap_err();
         assert!(err.to_string().contains("duplicate map key"));
+    }
+
+    #[test]
+    fn wildcard_maps_enforce_the_declared_key_variant() {
+        // Regression: only the *value* type used to be checked, so a
+        // `Map<Text, U64>` accepted integer and byte keys. The document was
+        // persisted but could never be read back into its declared Rust type.
+        let text_keyed = FieldType::Map(BTreeMap::from([(TEXT_WILDCARD_KEY.clone(), Ft::U64)]));
+        let foreign_keys = Fv::Map(BTreeMap::from([
+            (FieldKey::I64(5), Fv::U64(1)),
+            (FieldKey::Bytes(vec![9]), Fv::U64(2)),
+        ]));
+        let err = text_keyed.validate(&foreign_keys).unwrap_err();
+        assert!(err.to_string().contains("expected a Text key"), "{err}");
+
+        // What the acceptance used to cost: the stored value no longer
+        // deserializes into the `BTreeMap<String, u64>` the schema declares.
+        let mut data = Vec::new();
+        to_writer(&foreign_keys, &mut data).unwrap();
+        let cbor: Cbor = from_reader(data.as_slice()).unwrap();
+        assert!(cbor.deserialized::<BTreeMap<String, u64>>().is_err());
+
+        // `map_from`'s wildcard branch is the same hole seen from the JSON
+        // API: `"i64:5"` decodes to `FieldKey::I64(5)` (see value_serde.rs).
+        let err = FieldValue::map_from(
+            Cbor::Map(vec![(Cbor::Integer(5.into()), Cbor::Integer(1.into()))]),
+            &BTreeMap::from([(TEXT_WILDCARD_KEY.clone(), Ft::U64)]),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("expected a Text key"), "{err}");
+
+        // The mirror holes: a `Map<I64, T>` / `Map<Bytes, T>` filled with
+        // keys of another variant.
+        let i64_keyed = FieldType::Map(BTreeMap::from([(I64_WILDCARD_KEY.clone(), Ft::U64)]));
+        let err = i64_keyed
+            .validate(&Fv::Map(BTreeMap::from([(
+                FieldKey::Text("5".into()),
+                Fv::U64(1),
+            )])))
+            .unwrap_err();
+        assert!(err.to_string().contains("expected a I64 key"), "{err}");
+        let err = i64_keyed
+            .extract(Cbor::Map(vec![(
+                Cbor::Text("5".into()),
+                Cbor::Integer(1.into()),
+            )]))
+            .unwrap_err();
+        assert!(err.to_string().contains("expected a I64 key"), "{err}");
+
+        let bytes_keyed = FieldType::Map(BTreeMap::from([(BYTES_WILDCARD_KEY.clone(), Ft::U64)]));
+        let err = bytes_keyed
+            .validate(&Fv::Map(BTreeMap::from([(
+                FieldKey::Text("k".into()),
+                Fv::U64(1),
+            )])))
+            .unwrap_err();
+        assert!(err.to_string().contains("expected a Bytes key"), "{err}");
+
+        // Matching keys — including the sentinel itself — still pass, and a
+        // map declaring its keys explicitly is unaffected (a non-wildcard
+        // `Map` is checked key by key, as before).
+        let matching = Fv::Map(BTreeMap::from([
+            (FieldKey::Text("a".into()), Fv::U64(1)),
+            (TEXT_WILDCARD_KEY.clone(), Fv::U64(2)),
+        ]));
+        assert!(text_keyed.validate(&matching).is_ok());
+        assert_eq!(
+            text_keyed
+                .extract(Cbor::Map(vec![
+                    (Cbor::Text("a".into()), Cbor::Integer(1.into())),
+                    (Cbor::Text("*".into()), Cbor::Integer(2.into())),
+                ]))
+                .unwrap(),
+            matching
+        );
+    }
+
+    #[test]
+    fn coerce_accepts_exactly_what_document_try_from_accepts() {
+        // Regression: `FieldEntry::validate` rejected wire shapes that
+        // `Document::try_from`'s CBOR coercion accepts, so an API validating
+        // raw values (`doc.update`) refused documents its own create path
+        // (`doc.add`) had just stored.
+        let blob = Fe::new("blob".to_string(), Ft::Bytes).unwrap();
+        let wire = Fv::Array(vec![Fv::U64(1), Fv::U64(2), Fv::U64(3)]);
+        assert!(blob.validate(&wire).is_err());
+        assert_eq!(blob.coerce(wire).unwrap(), Fv::Bytes(vec![1, 2, 3]));
+
+        // Canonical values pass through unchanged, and real mismatches still
+        // fail.
+        assert_eq!(blob.coerce(Fv::Bytes(vec![7])).unwrap(), Fv::Bytes(vec![7]));
+        assert!(blob.coerce(Fv::Text("nope".into())).is_err());
+        assert!(blob.coerce(Fv::Array(vec![Fv::U64(256)])).is_err());
+
+        // A missing value keeps `validate`'s required/optional wording.
+        let err = blob.coerce(Fv::Null).unwrap_err();
+        assert!(err.to_string().contains("is required"), "{err}");
+        let opt = Fe::new("opt".to_string(), Ft::Option(Box::new(Ft::Bytes))).unwrap();
+        assert_eq!(opt.coerce(Fv::Null).unwrap(), Fv::Null);
+        assert_eq!(
+            opt.coerce(Fv::Array(vec![Fv::U64(9)])).unwrap(),
+            Fv::Bytes(vec![9])
+        );
+
+        // Other read-back shapes are folded into the declared variant too.
+        let vector = Fe::new("v".to_string(), Ft::Vector).unwrap();
+        assert_eq!(
+            vector.coerce(Fv::Array(vec![Fv::U64(16256)])).unwrap(),
+            Fv::Vector(vec![bf16::from_bits(16256)])
+        );
+
+        // The complexity budget is enforced, exactly as in `try_from`.
+        let deep = Fe::new("deep".to_string(), Ft::Array(vec![])).unwrap();
+        let over_budget = deeply_nested_field_value(FieldValueBudget::default().max_depth + 2);
+        assert!(deep.coerce(over_budget).is_err());
+    }
+
+    #[test]
+    fn nested_map_upgrades_are_compatible_only_when_data_stays_readable() {
+        let v1 = Ft::Map(BTreeMap::from([("a".into(), Ft::Text)]));
+        let gained = Ft::Map(BTreeMap::from([
+            ("a".into(), Ft::Text),
+            ("b".into(), Ft::Option(Box::new(Ft::Text))),
+        ]));
+
+        // Gaining an *optional* key and losing a key are both compatible.
+        assert!(gained.is_compatible_upgrade_of(&v1));
+        assert!(v1.is_compatible_upgrade_of(&gained));
+        assert!(v1.is_compatible_upgrade_of(&v1));
+
+        // A new *required* key would make every stored document invalid.
+        let required = Ft::Map(BTreeMap::from([
+            ("a".into(), Ft::Text),
+            ("b".into(), Ft::Text),
+        ]));
+        assert!(!required.is_compatible_upgrade_of(&v1));
+        // A key whose type changed needs stored values rewritten.
+        assert!(!Ft::Map(BTreeMap::from([("a".into(), Ft::U64)])).is_compatible_upgrade_of(&v1));
+
+        // The rule recurses through `Option` and `Array` wrappers.
+        assert!(
+            Ft::Option(Box::new(gained.clone()))
+                .is_compatible_upgrade_of(&Ft::Option(Box::new(v1.clone())))
+        );
+        assert!(
+            Ft::Array(vec![gained.clone()]).is_compatible_upgrade_of(&Ft::Array(vec![v1.clone()]))
+        );
+        // Array arity is part of the shape.
+        assert!(
+            !Ft::Array(vec![Ft::Text, Ft::Text])
+                .is_compatible_upgrade_of(&Ft::Array(vec![Ft::Text]))
+        );
+
+        // Wildcard maps: the value type must stay put and the sentinel (hence
+        // the key variant) must not change; and a wildcard map is never
+        // interchangeable with an explicitly keyed one.
+        let wild_text = Ft::Map(BTreeMap::from([(TEXT_WILDCARD_KEY.clone(), Ft::U64)]));
+        let wild_i64 = Ft::Map(BTreeMap::from([(I64_WILDCARD_KEY.clone(), Ft::U64)]));
+        assert!(wild_text.is_compatible_upgrade_of(&wild_text));
+        assert!(!wild_i64.is_compatible_upgrade_of(&wild_text));
+        assert!(
+            !Ft::Map(BTreeMap::from([(TEXT_WILDCARD_KEY.clone(), Ft::Text)]))
+                .is_compatible_upgrade_of(&wild_text)
+        );
+        assert!(!wild_text.is_compatible_upgrade_of(&v1));
+        assert!(!v1.is_compatible_upgrade_of(&wild_text));
+
+        // Unrelated types never become one another.
+        assert!(!Ft::Text.is_compatible_upgrade_of(&Ft::U64));
+        assert!(!Ft::Option(Box::new(Ft::Text)).is_compatible_upgrade_of(&Ft::Text));
+    }
+
+    #[test]
+    fn prune_undeclared_drops_only_removed_nested_keys() {
+        let stale = || {
+            Fv::Map(BTreeMap::from([
+                ("a".into(), Fv::Text("keep".into())),
+                ("b".into(), Fv::Text("gone".into())),
+            ]))
+        };
+
+        // A non-wildcard map drops what it no longer declares, at every depth.
+        let mut v = stale();
+        Ft::Map(BTreeMap::from([("a".into(), Ft::Text)])).prune_undeclared(&mut v);
+        assert_eq!(
+            v,
+            Fv::Map(BTreeMap::from([("a".into(), Fv::Text("keep".into()))]))
+        );
+
+        let mut v = Fv::Array(vec![stale()]);
+        Ft::Array(vec![Ft::Option(Box::new(Ft::Map(BTreeMap::from([(
+            "a".into(),
+            Ft::Text,
+        )]))))])
+        .prune_undeclared(&mut v);
+        assert_eq!(
+            v,
+            Fv::Array(vec![Fv::Map(BTreeMap::from([(
+                "a".into(),
+                Fv::Text("keep".into())
+            )]))])
+        );
+
+        // A wildcard map declares no key names, so nothing is dropped; an
+        // empty `Map` type accepts everything, likewise.
+        let mut v = stale();
+        Ft::Map(BTreeMap::from([(TEXT_WILDCARD_KEY.clone(), Ft::Text)])).prune_undeclared(&mut v);
+        assert_eq!(v, stale());
+        let mut v = stale();
+        Ft::Map(BTreeMap::new()).prune_undeclared(&mut v);
+        assert_eq!(v, stale());
     }
 
     #[test]
@@ -3374,6 +3883,57 @@ mod tests {
         }
         let err = FieldValue::try_from(map).unwrap_err();
         assert!(err.to_string().contains("maximum nesting depth"));
+    }
+
+    /// Builds `depth` levels of single-element field arrays around a Bool.
+    fn deeply_nested_field_value(depth: usize) -> FieldValue {
+        let mut v = FieldValue::Bool(true);
+        for _ in 0..depth {
+            v = FieldValue::Array(vec![v]);
+        }
+        v
+    }
+
+    #[test]
+    fn deeply_nested_values_convert_to_cbor_without_overflowing_the_stack() {
+        // Regression: `From<FieldValue> for Cbor` and `json_to_cbor` used to
+        // recurse unbounded, so the outbound direction aborted the process on
+        // stack exhaustion where the inbound `FieldValue::try_from` returns an
+        // error for the identical structure.
+        let ok = deeply_nested_field_value(MAX_CONVERSION_DEPTH);
+        let cbor = ok.clone().try_into_cbor().unwrap();
+        assert_eq!(FieldValue::try_from(cbor).unwrap(), ok);
+
+        let err = deeply_nested_field_value(2000).try_into_cbor().unwrap_err();
+        assert!(err.to_string().contains("maximum nesting depth"));
+
+        // Nested maps are bounded too.
+        let mut map = FieldValue::Bool(true);
+        for _ in 0..2000 {
+            map = FieldValue::Map(BTreeMap::from([(FieldKey::Text("k".into()), map)]));
+        }
+        let err = map.try_into_cbor().unwrap_err();
+        assert!(err.to_string().contains("maximum nesting depth"));
+
+        // A `Json` payload carries its own nesting through `json_to_cbor`.
+        let mut json = Json::Bool(true);
+        for _ in 0..300 {
+            json = Json::Array(vec![json]);
+        }
+        let err = FieldValue::Json(json).try_into_cbor().unwrap_err();
+        assert!(err.to_string().contains("maximum nesting depth"));
+
+        // The infallible `From` impl has no way to report the overflow, so it
+        // truncates the over-deep subtree instead of exhausting the stack.
+        let truncated = Cbor::from(deeply_nested_field_value(2000));
+        let mut level = &truncated;
+        for _ in 0..=MAX_CONVERSION_DEPTH {
+            let Cbor::Array(items) = level else {
+                panic!("expected an array at every level within the bound");
+            };
+            level = &items[0];
+        }
+        assert_eq!(level, &Cbor::Null);
     }
 
     #[test]

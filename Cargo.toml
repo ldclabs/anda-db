@@ -20,6 +20,10 @@ members = [
 # builds because it links against a Python interpreter. To build or test it,
 # temporarily uncomment the member above, then:
 #   cargo test -p anda_cognitive_nexus_py --lib
+# The binding is pinned to the pyo3 0.20 line (see `[workspace.dependencies]`),
+# which supports CPython 3.7-3.12. If the `python3` on PATH is newer, point the
+# build at a supported interpreter:
+#   PYO3_PYTHON=python3.12 cargo test -p anda_cognitive_nexus_py --lib
 
 [workspace.package]
 description = "Anda DB is a Rust library designed as a specialized database for AI Agents, focusing on knowledge & memory."
@@ -105,6 +109,18 @@ regex = { version = "1.11", default-features = false }
 rustc-hash = { version = "2", default-features = false, features = ["std"] }
 mimalloc = { version = "0.1", features = ["v3"] }
 proptest = { version = "1", default-features = false, features = ["std"] }
+
+# Python bindings (used only by `py/anda_cognitive_nexus_py`, which is not a
+# default workspace member). These stay on the pyo3 0.20 line because
+# `pyo3-asyncio` — the async bridge the binding is written against — was never
+# released for pyo3 0.21+; moving off 0.20 means porting to
+# `pyo3-async-runtimes` and the `Bound<'py, T>` API at the same time.
+# pyo3 0.20 supports CPython 3.7–3.12; set `PYO3_PYTHON` when the default
+# `python3` on PATH is newer.
+pyo3 = { version = "0.20" }
+pyo3-asyncio = { version = "0.20", default-features = false }
+pyo3-build-config = { version = "0.20" }
+serde-pyobject = { version = "0.2" }
 
 [workspace.metadata.cargo-shear]
 ignored = []

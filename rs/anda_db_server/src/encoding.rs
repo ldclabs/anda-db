@@ -8,14 +8,14 @@
 //!
 //! Format negotiation:
 //!
-//! - The request body format follows `Content-Type` (`application/cbor` is
-//!   the default when the header is absent).
+//! - The request body format follows `Content-Type`, which must be present
+//!   and recognized (`application/cbor` or `application/json`).
 //! - The response format follows `Accept` when present, otherwise mirrors
 //!   the request `Content-Type`, otherwise defaults to CBOR.
 
 use anda_db::schema::{Cbor, Json};
 use axum::{
-    http::{HeaderMap, HeaderValue, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -162,10 +162,22 @@ pub enum RpcParams {
 }
 
 impl RpcRequest {
-    /// Parses the request body according to its `Content-Type`
-    /// (CBOR when the header is absent).
+    /// Parses the request body according to its `Content-Type`.
+    ///
+    /// The header is **required**: treating an absent or unrecognized type as
+    /// CBOR also accepted `text/plain`, which turns every RPC endpoint into a
+    /// browser "simple request" — a cross-site request forgery surface in the
+    /// supported loopback / `--insecure-no-api-key` modes, where no
+    /// `Authorization` header (and therefore no CORS preflight) is involved.
     pub fn parse(headers: &HeaderMap, body: &[u8]) -> Result<Self, ApiError> {
-        match Encoding::from_content_type(headers).unwrap_or(Encoding::Cbor) {
+        let Some(encoding) = Encoding::from_content_type(headers) else {
+            return Err(ApiError::new(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unsupported_media_type",
+                format!("request Content-Type must be {APPLICATION_CBOR} or {APPLICATION_JSON}"),
+            ));
+        };
+        match encoding {
             Encoding::Cbor => {
                 #[derive(Deserialize)]
                 struct Req {
@@ -246,7 +258,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_request_defaults_to_cbor() {
+    fn parse_request_reads_a_declared_cbor_body() {
         let mut body = Vec::new();
         cbor2::ser::to_writer(
             &serde_json::json!({"method": "info", "params": {"a": 1}}),
@@ -254,7 +266,8 @@ mod tests {
         )
         .unwrap();
 
-        let req = RpcRequest::parse(&HeaderMap::new(), &body).unwrap();
+        let h = headers(Some(APPLICATION_CBOR), None);
+        let req = RpcRequest::parse(&h, &body).unwrap();
         assert_eq!(req.method, "info");
         #[derive(Deserialize)]
         struct P {
@@ -262,6 +275,41 @@ mod tests {
         }
         let p: P = req.params.decode().unwrap();
         assert_eq!(p.a, 1);
+    }
+
+    /// An absent or unrecognized `Content-Type` used to be parsed as CBOR,
+    /// which made the RPC endpoints reachable as browser "simple requests"
+    /// (`text/plain`, no preflight) — a CSRF surface in the supported
+    /// loopback / `--insecure-no-api-key` modes.
+    #[test]
+    fn parse_request_requires_a_recognized_content_type() {
+        let mut body = Vec::new();
+        cbor2::ser::to_writer(&serde_json::json!({"method": "info"}), &mut body).unwrap();
+
+        for ct in [
+            None,
+            Some("text/plain"),
+            Some("application/x-www-form-urlencoded"),
+            Some("multipart/form-data"),
+            Some("application/octet-stream"),
+        ] {
+            let err = RpcRequest::parse(&headers(ct, None), &body).unwrap_err();
+            assert_eq!(
+                err.status,
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "content type: {ct:?}"
+            );
+            assert_eq!(err.code, "unsupported_media_type");
+        }
+
+        // Parameters on a recognized type are still accepted.
+        assert!(
+            RpcRequest::parse(
+                &headers(Some("application/cbor; charset=utf-8"), None),
+                &body
+            )
+            .is_ok()
+        );
     }
 
     #[test]

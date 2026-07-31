@@ -3,11 +3,21 @@ KIP_FUZZ_RUNS ?= 1000
 KIP_FUZZ_ARGS ?= -runs=$(KIP_FUZZ_RUNS)
 KIP_FUZZ_TARGETS ?= fuzz_kip fuzz_kql fuzz_kml fuzz_meta
 
-.PHONY: build-wasm build-did lint fix test test-all test-full test-anda-db-snapshots test-anda-db-format-compat test-kip-fuzz test-py coverage coverage-html
+.PHONY: build-wasm build-did lint fix test test-all test-full test-anda-db-snapshots test-anda-db-format-compat test-kip-fuzz test-py coverage coverage-html sync-agents-doc check-agents-doc
 
-lint:
+lint: check-agents-doc
 	@cargo fmt
 	@cargo clippy --all-targets --all-features
+
+# CLAUDE.md is the source of the shared agent instructions; AGENTS.md is a
+# byte-identical copy so non-Claude harnesses read the same document.
+sync-agents-doc:
+	@cp CLAUDE.md AGENTS.md
+	@echo "AGENTS.md regenerated from CLAUDE.md"
+
+check-agents-doc:
+	@cmp -s CLAUDE.md AGENTS.md || \
+		(echo "AGENTS.md has drifted from CLAUDE.md; run 'make sync-agents-doc'" >&2; exit 1)
 
 fix:
 	@cargo fmt --all
@@ -32,8 +42,14 @@ test-kip-fuzz:
 		(cd rs/anda_kip && cargo +nightly fuzz run $$target -- $(KIP_FUZZ_ARGS)); \
 	done
 
+# The Python binding is not a default workspace member: uncomment
+# `py/anda_cognitive_nexus_py` in the root Cargo.toml `members` first.
+# It is pinned to pyo3 0.20 (CPython 3.7-3.12); override PYO3_PYTHON when the
+# `python3` on PATH is newer, e.g. `make test-py PYO3_PYTHON=python3.12`.
 test-py:
-	@cargo test -p anda_cognitive_nexus_py --lib
+	@grep -q '^  "py/anda_cognitive_nexus_py",' Cargo.toml || \
+		(echo 'uncomment "py/anda_cognitive_nexus_py" in the root Cargo.toml [workspace] members first' >&2; exit 1)
+	@$(if $(PYO3_PYTHON),PYO3_PYTHON=$(PYO3_PYTHON) ,)cargo test -p anda_cognitive_nexus_py --lib
 
 # Coverage is a dashboard, not a gate: use it to find untested branches in
 # core code paths. Requires `cargo install cargo-llvm-cov`.

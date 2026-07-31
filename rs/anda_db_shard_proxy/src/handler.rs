@@ -14,7 +14,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::proxy::{AppState, proxy_handler, validate_backend_addr};
-use crate::store::ShardBackend;
+use crate::store::{MAX_SHARD_ID, ShardBackend};
 
 // ── Management API request/response types ───────────────────────────────────
 
@@ -77,9 +77,20 @@ pub struct UpsertBackendRequest {
     pub shard_id: u32,
     /// Backend base URL such as `http://10.0.0.12:8080`.
     pub backend_addr: String,
-    /// Whether the backend should be advertised as read-only.
-    #[serde(default)]
-    pub read_only: bool,
+}
+
+/// Rejects a shard id the signed `INT` column cannot store, so it cannot be
+/// written as a negative value that no reader will route to.
+fn validate_shard_id(shard_id: u32) -> Result<(), (StatusCode, Json<RpcResponse<()>>)> {
+    if shard_id > MAX_SHARD_ID {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(RpcResponse::<()>::err(format!(
+                "shard_id {shard_id} exceeds the maximum {MAX_SHARD_ID}"
+            ))),
+        ));
+    }
+    Ok(())
 }
 
 /// Request body for deleting a shard backend entry.
@@ -112,6 +123,7 @@ async fn assign_db(
     State(state): State<AppState>,
     Json(req): Json<AssignDbRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, impl IntoResponse)> {
+    validate_shard_id(req.shard_id)?;
     state
         .store
         .assign_db(&req.db_name, req.shard_id)
@@ -169,15 +181,17 @@ async fn upsert_backend(
     State(state): State<AppState>,
     Json(req): Json<UpsertBackendRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, impl IntoResponse)> {
+    validate_shard_id(req.shard_id)?;
     // A malformed or non-http address would take the whole shard down with
     // 500/BAD_GATEWAY on every request; reject it before it reaches the store.
+    // The store and the NOTIFY listener validate it again, because rows can
+    // also be written outside this endpoint.
     validate_backend_addr(&req.backend_addr)
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(RpcResponse::<()>::err(e))))?;
 
     let backend = ShardBackend {
         shard_id: req.shard_id,
         backend_addr: req.backend_addr,
-        read_only: req.read_only,
     };
     state.store.upsert_backend(&backend).await.map_err(|e| {
         (
@@ -192,6 +206,7 @@ async fn delete_backend(
     State(state): State<AppState>,
     Json(req): Json<DeleteBackendRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, impl IntoResponse)> {
+    validate_shard_id(req.shard_id)?;
     let deleted = state
         .store
         .delete_backend(req.shard_id)
@@ -302,5 +317,17 @@ mod tests {
 
         headers.insert("authorization", HeaderValue::from_static("Bearer secret"));
         assert!(authorize_api_key(Some("secret"), &headers));
+    }
+
+    /// A shard id above `i32::MAX` would be stored negative and become
+    /// invisible to external tooling, so it is refused at the API boundary.
+    #[test]
+    fn admin_api_rejects_shard_ids_the_column_cannot_store() {
+        assert!(validate_shard_id(0).is_ok());
+        assert!(validate_shard_id(MAX_SHARD_ID).is_ok());
+        for shard_id in [MAX_SHARD_ID + 1, u32::MAX] {
+            let (status, _) = validate_shard_id(shard_id).unwrap_err();
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
     }
 }

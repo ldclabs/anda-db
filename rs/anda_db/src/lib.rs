@@ -23,9 +23,17 @@
 //!
 //! Feature flags:
 //!
-//! - `full`: enables full-text search integrations exposed by the workspace setup
-//! - `tantivy`: enables the Tantivy-backed text search dependency
-//! - `tantivy-jieba`: enables Tantivy plus Jieba tokenization support
+//! - `full`: enables `object_store/fs`, the local-filesystem backend used by
+//!   the bundled `db_demo` example and by file-backed deployments.
+//!
+//! Tantivy-backed tokenization (including Jieba) is **not** optional: this
+//! crate always depends on `anda_db_tfs` with its `full` feature, because
+//! [`index::bm25`] re-exports `default_tokenizer`/`jieba_tokenizer`
+//! unconditionally and every [`collection::Collection`] installs
+//! `default_tokenizer()` when it opens. The `tantivy` and `tantivy-jieba`
+//! feature flags that used to be listed here gated nothing — they toggled a
+//! second, unused copy of the dependency — and were removed; enabling them is
+//! now a manifest error rather than a silent no-op.
 //!
 //! See also the technical guide in `docs/anda_db.md` for architecture,
 //! lifecycle, indexing, and operational guidance.

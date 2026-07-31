@@ -586,4 +586,56 @@ mod tests {
             ))
         );
     }
+
+    #[test]
+    fn test_multi_word_keywords_require_a_trailing_word_boundary() {
+        // `keywords` only required whitespace *between* tokens, so the final
+        // token could swallow the next keyword: these all parsed as valid
+        // commands even though §5.1.3 spells them as separate tokens.
+        assert!(crate::parse_meta("DESCRIBE CONCEPT TYPESLIMIT 5").is_err());
+        assert!(crate::parse_meta("DESCRIBE PROPOSITION TYPESLIMIT 5").is_err());
+        assert!(crate::parse_meta(r#"DESCRIBE CONCEPT TYPESCURSOR "tok""#).is_err());
+        // A quoted string glued to the keyword is two tokens too.
+        assert!(crate::parse_meta(r#"SEARCH CONCEPT "a" WITH TYPE"Drug""#).is_err());
+        assert!(crate::parse_meta(r#"DESCRIBE CONCEPT TYPE"Drug""#).is_err());
+        // This one was already rejected; it must stay rejected.
+        assert!(crate::parse_meta("DESCRIBE CONCEPT TYPESX").is_err());
+
+        // The spaced spellings still parse.
+        assert!(crate::parse_meta("DESCRIBE CONCEPT TYPES LIMIT 5").is_ok());
+        assert!(crate::parse_meta("DESCRIBE PROPOSITION TYPES LIMIT 5").is_ok());
+        assert!(crate::parse_meta(r#"DESCRIBE CONCEPT TYPES CURSOR "tok""#).is_ok());
+        assert!(crate::parse_meta(r#"SEARCH CONCEPT "a" WITH TYPE "Drug""#).is_ok());
+        assert!(crate::parse_meta(r#"DESCRIBE CONCEPT TYPE "Drug""#).is_ok());
+    }
+
+    #[test]
+    fn test_cursor_operand_errors_are_pointed_and_reject_empty_tokens() {
+        // Like LIMIT, CURSOR must fail hard once its keyword matched: the
+        // enclosing opt(...) otherwise swallows the error and the leftover
+        // "CURSOR ..." text is reported as trailing content.
+        for input in [
+            "DESCRIBE CONCEPT TYPES CURSOR abc",
+            "DESCRIBE PROPOSITION TYPES CURSOR abc",
+            r#"EXPORT ?x WHERE { ?x {type: "Drug"} } CURSOR abc"#,
+            // An empty pagination token is meaningless and silently meant
+            // "start from the beginning".
+            r#"DESCRIBE CONCEPT TYPES CURSOR """#,
+            r#"EXPORT ?x WHERE { ?x {type: "Drug"} } CURSOR """#,
+        ] {
+            let err = crate::parse_meta(input).unwrap_err();
+            let msg = &err.message;
+            assert!(
+                msg.contains("non-empty quoted pagination token"),
+                "error for {input:?} should explain the CURSOR operand: {msg}"
+            );
+            assert!(
+                !msg.contains("Unexpected trailing content"),
+                "error for {input:?} must not be reported as trailing content: {msg}"
+            );
+        }
+
+        // A non-empty token still parses.
+        assert!(crate::parse_meta(r#"DESCRIBE CONCEPT TYPES CURSOR "abc""#).is_ok());
+    }
 }

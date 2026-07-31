@@ -81,7 +81,7 @@ For fragmented indexes left over from earlier versions, or buckets hollowed out 
 - Use the **Best-Fit-Decreasing** algorithm, with `BTreeMap<remaining_capacity, bin_index>` for `O(n log n)` packing.
 - Rebuild `buckets`: bucket IDs are reassigned from `0` upward, all buckets are marked dirty, and the next `flush` rewrites the full on-disk layout.
 
-The return value `(old_count, new_count)` is useful for monitoring. It is best called under exclusive write ownership and should not be mixed with concurrent writes.
+The return value `(old_count, new_count)` is useful for monitoring. Concurrent `insert` / `remove` calls are safe: `compact_buckets` takes the index's internal mutation gate exclusively, so no mutation can observe — or add to — the half-rebuilt bucket map. It must still not overlap a `flush` (see [§5](#5-concurrency-model)).
 
 ---
 
@@ -89,8 +89,9 @@ The return value `(old_count, new_count)` is useful for monitoring. It is best c
 
 - All shared state is stored in `DashMap`, `RwLock`, and atomic counters, so **concurrent `insert` / `remove` / `search` can freely overlap across threads** without an outer lock.
 - In `insert` and `remove`, the critical regions involving bucket sizing and splitting use fine-grained entry locks via `DashMap::entry().or_default()`, avoiding holding a lock across `.await`.
-- Consistency for `avg_doc_tokens`: after `Vacant.insert()`, the code refreshes it using `doc_tokens.len()` together with the return value from `total_tokens.fetch_add`. Under multithreading this may be temporarily approximate, but it converges quickly as subsequent writes arrive.
-- **Coordinating mutations against `flush` / `compact_buckets`, and flushes against each other, is the caller's responsibility** (`anda_db`'s `Collection` holds an exclusive operation gate across every flush). A single writer per durable index is a deployment contract; the crate does not defend against a second writer.
+- Average document length is **derived, never cached**. There is no `avg_doc_tokens` field: the value is computed as `total_tokens / doc_tokens.len()` at its two read sites — `score_term` (once per query, not per document) and `refresh_live_stats` (once per `stats()` call). A cached quotient had to be resynchronized on every `insert` / `remove`, disagreed with its own inputs in between, and was wrong outright after a `load_metadata` that had not yet loaded any documents. Deriving it makes the reported value exactly consistent with the counters it comes from — there is no convergence window.
+- **`compact_buckets` is exclusive with mutations, and the crate enforces that.** `insert` / `insert_array` / `remove` / `remove_array` / `purge_ids` take an internal `mutation_gate` **shared** (so they still run concurrently with each other) and `compact_buckets` takes it **exclusively**, because it rebuilds the bucket map non-atomically: a posting created after compaction snapshotted `postings` would otherwise be re-binned into nothing and silently dropped by the next flush. The gate is the first lock a mutation acquires, so it never nests inside a `DashMap` shard guard. Callers do **not** need to serialize compaction against writes.
+- **Coordinating `flush` / `flush_with` against mutations, against compaction, and against another flush is the caller's responsibility** (`anda_db`'s `Collection` holds an exclusive operation gate across every flush). A single writer per durable index is a deployment contract; the crate does not defend against a second writer.
 - `flush` serializes every dirty bucket and the metadata into owned buffers before the first `.await`. It never holds a `DashMap` `Ref` across `.await`, which avoids deadlocks.
 - `top_k_results` uses `select_nth_unstable_by` for partial sorting (`O(n + k log k)`), then performs a final `sort` on the top-k tail, making queries significantly faster on large result sets.
 
@@ -261,7 +262,7 @@ Tuning guidance:
 - **`bucket_overload_size`**:
   - Small (for example `64KiB`): lower I/O amplification for incremental flushes, suitable for frequent checkpoints.
   - Large (for example `2MiB`): fewer total buckets and faster full loads, suitable for read-heavy AI memory stores.
-- **Periodic compaction**: call `compact_buckets()` periodically in a background task to keep bucket counts stable.
+- **Periodic compaction**: call `compact_buckets()` periodically in a background task to keep bucket counts stable. It is safe against concurrent `insert` / `remove` (the crate gates it internally); schedule it so it does not overlap a `flush`.
 
 ---
 
@@ -343,7 +344,7 @@ let idx = BM25Index::load_all(default_tokenizer(), metadata, async |object| {
 
 ## 13. Usage Notes
 
-1. **Removal requires the original text**: `remove(id, text, now_ms)` relies on re-tokenizing the original text to locate postings. If the original text is unavailable, call `get_doc_tokens` first or keep your own metadata. Historical misuse does not affect search correctness, but it may leave redundant postings that can be cleaned up with `compact_buckets()`.
+1. **Removal requires the original text**: `remove(id, text, now_ms)` relies on re-tokenizing the original text to locate postings. Historical misuse does not affect search correctness, but it may leave redundant postings that can be cleaned up with `compact_buckets()`. When the text is genuinely unrecoverable — a repair path whose document bodies are gone — use `purge_ids(&BTreeSet<u64>, now_ms)` instead: it sweeps every posting list once for the whole set, drops the ids from `doc_tokens` and `total_tokens`, and marks the affected buckets dirty. It is a maintenance-path `O(index size)` operation, so pass all the dead ids in one call rather than looping.
 2. **`top_k = 0`**: kept for API compatibility. It returns an empty set and does not trigger sorting.
 3. **Flush coordination**: the crate does not serialize flushes internally. The caller must ensure a flush never overlaps mutations, compaction, or another flush (`anda_db`'s `Collection` already guarantees this); a single writer per durable index is a deployment contract.
 4. **Search semantics under partial loading**: if `load_buckets` skips a posting bucket, terms owned by that bucket are unavailable. Loaded buckets also carry the document lengths needed to score their postings, so `len()` may include every document touched by those loaded terms even when other buckets are skipped. Search results remain the natural subset of the loaded postings.

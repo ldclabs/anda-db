@@ -73,18 +73,99 @@ mod tests;
 ///
 /// This prevents race conditions during complex KML transactions that may
 /// involve multiple concept and proposition updates across collections.
+///
+/// # Poison recovery
+///
+/// A cancelled mutating future — or a failed flush, which poisons on *any*
+/// error — puts an `anda_db` collection handle into the poisoned state, where
+/// it rejects every further mutation. Recovery lives in
+/// [`AndaDB::open_collection`] (drain the handle, drop it, reload with
+/// mutation-intent replay and the repair scan), so a handle captured once at
+/// [`connect`](CognitiveNexus::connect) would never reach it. The two handles
+/// therefore live in swappable slots and are re-resolved by
+/// [`reopen_collections`](CognitiveNexus::reopen_collections) instead of
+/// bricking the nexus until the process restarts: every mutating entry point
+/// checks [`Collection::is_poisoned`] before dispatching and reopens first, so
+/// a poison event costs no failed command, with a post-failure backstop for a
+/// handle poisoned mid-statement.
 #[derive(Clone, Debug)]
 pub struct CognitiveNexus {
     /// Underlying Anda DB instance shared with any other collections the
     /// host application may register.
     pub db: Arc<AndaDB>,
-    /// `concepts` collection — one row per [`Concept`].
-    pub concepts: Arc<Collection>,
-    /// `propositions` collection — one row per [`Proposition`].
-    pub propositions: Arc<Collection>,
+    /// `concepts` collection — one row per [`Concept`]. Read through
+    /// [`concepts`](CognitiveNexus::concepts); the slot is swapped on poison
+    /// recovery, and clones of this struct share it.
+    concepts: Arc<parking_lot::RwLock<Arc<Collection>>>,
+    /// `propositions` collection — one row per [`Proposition`]. Read through
+    /// [`propositions`](CognitiveNexus::propositions).
+    propositions: Arc<parking_lot::RwLock<Arc<Collection>>>,
     /// Read-write lock for KML execution consistency. KQL/META acquire
     /// the read lock; KML acquires the write lock.
     kml_lock: Arc<RwLock<()>>,
+}
+
+/// Tokenizer and index setup for the `concepts` collection.
+///
+/// Named (rather than inlined at the `connect` call site) because every
+/// *re*-open must run exactly the same setup: `create_*_nx` are no-ops once
+/// the index exists, but a freshly loaded handle starts with the default
+/// tokenizer and must have the jieba chain re-installed.
+async fn init_concepts_collection(collection: &mut Collection) -> Result<(), DBError> {
+    // set tokenizer
+    collection.set_tokenizer(jieba_tokenizer());
+    // create BTree indexes if not exists
+    collection.create_btree_index_nx(&["type", "name"]).await?;
+    collection.create_btree_index_nx(&["type"]).await?;
+    collection.create_btree_index_nx(&["name"]).await?;
+    collection
+        .create_bm25_index_nx(&["name", "attributes", "metadata"])
+        .await?;
+    Ok(())
+}
+
+/// Tokenizer and index setup for the `propositions` collection. See
+/// [`init_concepts_collection`].
+async fn init_propositions_collection(collection: &mut Collection) -> Result<(), DBError> {
+    // set tokenizer
+    collection.set_tokenizer(jieba_tokenizer());
+    // create BTree indexes if not exists
+    collection
+        .create_btree_index_nx(&["subject", "object"])
+        .await?;
+    collection.create_btree_index_nx(&["subject"]).await?;
+    collection.create_btree_index_nx(&["object"]).await?;
+    collection.create_btree_index_nx(&["predicates"]).await?;
+    collection
+        .create_bm25_index_nx(&["predicates", "properties"])
+        .await?;
+    Ok(())
+}
+
+/// Maps a failed collection reopen, telling "retry later" apart from "give
+/// up".
+///
+/// [`DBError::collection_state`] carries the rejecting handle's lifecycle
+/// state as a typed source, so a collection that is being deleted (or is
+/// already gone) is recognized structurally: it reports a state whose
+/// [`CollectionState::is_recoverable`](anda_db::error::CollectionState::is_recoverable)
+/// is `false`, and no amount of reopening brings its objects back. The error
+/// code is left untouched — only the hint is added.
+fn reopen_error(err: DBError) -> KipError {
+    let unrecoverable = err
+        .collection_state()
+        .is_some_and(|state| !state.is_recoverable());
+    let err = db_to_kip_error(err);
+    if unrecoverable {
+        return KipError::new(
+            err.code,
+            format!(
+                "{}; the collection is being deleted or is gone — reopening cannot recover it",
+                err.message
+            ),
+        );
+    }
+    err
 }
 
 /// Implementation of the Knowledge Interchange Protocol (KIP) executor.
@@ -218,19 +299,7 @@ impl CognitiveNexus {
                     name: "concepts".to_string(),
                     description: "Concept nodes".to_string(),
                 },
-                async |collection| {
-                    // set tokenizer
-                    collection.set_tokenizer(jieba_tokenizer());
-                    // create BTree indexes if not exists
-                    collection.create_btree_index_nx(&["type", "name"]).await?;
-                    collection.create_btree_index_nx(&["type"]).await?;
-                    collection.create_btree_index_nx(&["name"]).await?;
-                    collection
-                        .create_bm25_index_nx(&["name", "attributes", "metadata"])
-                        .await?;
-
-                    Ok::<(), DBError>(())
-                },
+                async |collection| init_concepts_collection(collection).await,
             )
             .await
             .map_err(db_to_kip_error)?;
@@ -243,29 +312,14 @@ impl CognitiveNexus {
                     name: "propositions".to_string(),
                     description: "Proposition links".to_string(),
                 },
-                async |collection| {
-                    // set tokenizer
-                    collection.set_tokenizer(jieba_tokenizer());
-                    // create BTree indexes if not exists
-                    collection
-                        .create_btree_index_nx(&["subject", "object"])
-                        .await?;
-                    collection.create_btree_index_nx(&["subject"]).await?;
-                    collection.create_btree_index_nx(&["object"]).await?;
-                    collection.create_btree_index_nx(&["predicates"]).await?;
-                    collection
-                        .create_bm25_index_nx(&["predicates", "properties"])
-                        .await?;
-
-                    Ok::<(), DBError>(())
-                },
+                async |collection| init_propositions_collection(collection).await,
             )
             .await
             .map_err(db_to_kip_error)?;
         let this = Self {
             db,
-            concepts,
-            propositions,
+            concepts: Arc::new(parking_lot::RwLock::new(concepts)),
+            propositions: Arc::new(parking_lot::RwLock::new(propositions)),
             kml_lock: Arc::new(RwLock::new(())),
         };
 
@@ -294,7 +348,7 @@ impl CognitiveNexus {
         for (name, source, anchor) in BUNDLED_CAPSULES {
             let key = format!("capsule_hash:{name}");
             let current = capsule_hash(source);
-            let stored: Option<String> = self.concepts.get_extension_as(&key);
+            let stored: Option<String> = self.concepts().get_extension_as(&key);
             let hash_current = stored.as_deref() == Some(current.as_str());
             let anchor_missing = !self
                 .has_concept(&ConceptPK::Object {
@@ -306,7 +360,7 @@ impl CognitiveNexus {
                 continue;
             }
 
-            self.execute_kml(parse_kml(source)?, false)
+            self.execute_kml_privileged(parse_kml(source)?)
                 .await
                 .map_err(|err| {
                     KipError::new(
@@ -316,7 +370,7 @@ impl CognitiveNexus {
                 })?;
 
             if !hash_current {
-                self.concepts
+                self.concepts()
                     .save_extension(key, Fv::Text(current))
                     .await
                     .map_err(db_to_kip_error)?;
@@ -324,6 +378,120 @@ impl CognitiveNexus {
         }
 
         Ok(())
+    }
+
+    /// The current `concepts` collection handle (one row per [`Concept`]).
+    ///
+    /// Resolved through a swappable slot, so a handle replaced by
+    /// [`reopen_collections`](Self::reopen_collections) is picked up by every
+    /// later call. Hold the returned `Arc` for one operation, not across
+    /// awaits that may recover it.
+    pub fn concepts(&self) -> Arc<Collection> {
+        self.concepts.read().clone()
+    }
+
+    /// The current `propositions` collection handle (one row per
+    /// [`Proposition`]). See [`concepts`](Self::concepts).
+    pub fn propositions(&self) -> Arc<Collection> {
+        self.propositions.read().clone()
+    }
+
+    /// Re-resolves both collection handles through the database, replacing a
+    /// handle that a cancelled mutation (or a failed flush) has poisoned.
+    ///
+    /// The recovery itself happens inside [`AndaDB::open_collection`]: it
+    /// drains the poisoned handle, drops it *without* flushing its in-memory
+    /// state, and reloads the collection with the mutation-intent replay and
+    /// the repair scan. Re-opening a healthy collection returns the very same
+    /// handle, so this is idempotent and cheap; the index setup is re-run
+    /// (`create_*_nx` are no-ops) so the fresh handle regains the jieba
+    /// tokenizer.
+    ///
+    /// Called automatically before and after every mutating statement (see
+    /// [`ensure_live_collections`](Self::ensure_live_collections) and
+    /// [`recover_if_poisoned`](Self::recover_if_poisoned)); exposed for hosts
+    /// that drive their own recovery.
+    pub async fn reopen_collections(&self) -> Result<(), KipError> {
+        let concepts = self
+            .db
+            .open_collection("concepts".to_string(), async |collection| {
+                init_concepts_collection(collection).await
+            })
+            .await
+            .map_err(reopen_error)?;
+        let propositions = self
+            .db
+            .open_collection("propositions".to_string(), async |collection| {
+                init_propositions_collection(collection).await
+            })
+            .await
+            .map_err(reopen_error)?;
+        *self.concepts.write() = concepts;
+        *self.propositions.write() = propositions;
+        Ok(())
+    }
+
+    /// Whether either handle has been poisoned by a cancelled mutation.
+    ///
+    /// Two relaxed atomic loads via [`Collection::is_poisoned`] — cheap enough
+    /// to run before every mutating statement.
+    fn has_poisoned_handle(&self) -> bool {
+        self.concepts().is_poisoned() || self.propositions().is_poisoned()
+    }
+
+    /// Replaces an already-poisoned handle *before* a mutating statement is
+    /// dispatched, so the statement runs on a live handle instead of costing
+    /// the caller one guaranteed failure per poison event.
+    ///
+    /// Only [`CollectionState::Poisoned`](anda_db::error::CollectionState) is
+    /// recovered here. `Closing` / `Closed` also count as recoverable in
+    /// `anda_db`'s sense — their storage is intact — but reopening one would
+    /// resurrect a collection the host deliberately closed; and from
+    /// `Deleting` on, nothing is recoverable at all. Both are left to fail
+    /// with `anda_db`'s own authoritative error.
+    async fn ensure_live_collections(&self) -> Result<(), KipError> {
+        if self.has_poisoned_handle() {
+            self.reopen_collections().await?;
+        }
+        Ok(())
+    }
+
+    /// Backstop for a handle poisoned *during* the statement that just failed
+    /// (a cancelled concurrent mutation, or a flush that poisons on any
+    /// error), so the next statement runs against a live handle instead of
+    /// every statement failing until the process restarts.
+    ///
+    /// The trigger is the handle's own lifecycle state, not the error:
+    /// `Collection::update` / `remove` poison on an unknown outcome and return
+    /// the *underlying storage* error, so [`DBError::is_poisoned`] is false for
+    /// exactly the case this backstop exists for. (A handle poisoned before
+    /// dispatch never reaches here — [`ensure_live_collections`] already
+    /// replaced it.)
+    ///
+    /// The failed statement is deliberately **not** retried: the poison may
+    /// have landed between two of its writes, so it can be partially applied,
+    /// and blindly re-running a non-idempotent `UPDATE` would apply it twice.
+    async fn recover_if_poisoned<T>(&self, result: Result<T, KipError>) -> Result<T, KipError> {
+        let Err(err) = result else {
+            return result;
+        };
+        if !self.has_poisoned_handle() {
+            return Err(err);
+        }
+        match self.reopen_collections().await {
+            // A failed reopen leaves the poisoned handle in place; the next
+            // statement's pre-flight retries the recovery.
+            Err(_) => Err(err),
+            Ok(()) => Err(KipError::new(
+                err.code,
+                format!(
+                    "{}; a collection handle was poisoned during this statement and has been \
+                     reopened — the statement may have applied partially, verify before \
+                     re-running it",
+                    err.message
+                ),
+            )),
+        }
     }
 
     /// Closes the database connection and releases resources.
@@ -355,7 +523,7 @@ impl CognitiveNexus {
     /// restructures). A return value of `0` means no version has been
     /// recorded yet (a fresh database).
     pub fn capsule_version(&self) -> u64 {
-        self.concepts
+        self.concepts()
             .get_extension("capsule_version")
             .and_then(|v| u64::try_from(v).ok())
             .unwrap_or(0)
@@ -366,10 +534,13 @@ impl CognitiveNexus {
     /// have been applied; downstream applications can call it to record
     /// their own migration steps.
     pub async fn save_capsule_version(&self, version: u64) -> Result<(), KipError> {
-        self.concepts
+        self.ensure_live_collections().await?;
+        let result = self
+            .concepts()
             .save_extension("capsule_version".to_string(), version.into())
             .await
-            .map_err(db_to_kip_error)
+            .map_err(db_to_kip_error);
+        self.recover_if_poisoned(result).await
     }
 
     /// Checks whether a concept exists in the database.
@@ -412,7 +583,7 @@ impl CognitiveNexus {
             },
         };
 
-        self.concepts.contains(id)
+        self.concepts().contains(id)
     }
 
     /// Retrieves a concept from the database.
@@ -435,7 +606,7 @@ impl CognitiveNexus {
             ConceptPK::Object { r#type, name } => self.query_concept_id(r#type, name).await?,
         };
 
-        self.concepts.get_as(id).await.map_err(db_to_kip_error)
+        self.concepts().get_as(id).await.map_err(db_to_kip_error)
     }
 
     /// Retrieves an existing concept or initialises a new one if it does
@@ -457,6 +628,10 @@ impl CognitiveNexus {
     /// into duplicate `{type, name}` concepts. A freshly created concept
     /// gets the engine-maintained `_version` / `_updated_at` system
     /// metadata, exactly like the KML `UPSERT` path (KIP §2.11).
+    ///
+    /// Like [`execute_kml`](Self::execute_kml), a poisoned handle is reopened
+    /// before the insert is attempted (and after it, should the poison land
+    /// mid-call).
     pub async fn get_or_init_concept(
         &self,
         r#type: String,
@@ -465,8 +640,9 @@ impl CognitiveNexus {
         metadata: Map<String, Json>,
     ) -> Result<Concept, KipError> {
         let _guard = self.kml_lock.write().await;
-        match self.query_concept_id(&r#type, &name).await {
-            Ok(id) => self.concepts.get_as(id).await.map_err(db_to_kip_error),
+        self.ensure_live_collections().await?;
+        let result = match self.query_concept_id(&r#type, &name).await {
+            Ok(id) => self.concepts().get_as(id).await.map_err(db_to_kip_error),
             Err(_) => {
                 let mut metadata = metadata;
                 init_system_metadata(&mut metadata, unix_ms());
@@ -477,16 +653,16 @@ impl CognitiveNexus {
                     attributes,
                     metadata,
                 };
-                let id = self
-                    .concepts
-                    .add_from(&concept)
-                    .await
-                    .map_err(db_to_kip_error)?;
-
-                concept._id = id;
-                Ok(concept)
+                match self.concepts().add_from(&concept).await {
+                    Ok(id) => {
+                        concept._id = id;
+                        Ok(concept)
+                    }
+                    Err(err) => Err(db_to_kip_error(err)),
+                }
             }
-        }
+        };
+        self.recover_if_poisoned(result).await
     }
 
     /// Executes a KQL `FIND` query and returns its result tuple.
@@ -542,15 +718,17 @@ impl CognitiveNexus {
     /// When `dry_run` is `true`:
     ///
     /// - `UPSERT` validates that all referenced concept / proposition
-    ///   types exist, that all variable handles can be resolved, and that
-    ///   every `EXPECT VERSION` guard matches (`KIP_3005` otherwise), but
-    ///   does **not** create or update any row.
+    ///   types exist, that all variable handles can be resolved, that no
+    ///   block writes attributes or metadata to a protected schema node
+    ///   (`KIP_3004`), and that every `EXPECT VERSION` guard matches
+    ///   (`KIP_3005` otherwise), but does **not** create or update any row.
     /// - `UPDATE` / `MERGE` run their full validation (including the
     ///   `KIP_3004` protected-scope checks) and pattern matching without
     ///   writing.
-    /// - `DELETE CONCEPT` and protected `DELETE ATTRIBUTES` targets still
-    ///   perform the `KIP_3004` protected-scope pre-flight check so agents
-    ///   can probe for safety without side effects.
+    /// - `DELETE CONCEPT`, `DELETE PROPOSITIONS` and protected
+    ///   `DELETE ATTRIBUTES` targets still perform the `KIP_3004`
+    ///   protected-scope pre-flight check so agents can probe for safety
+    ///   without side effects.
     /// - Other delete variants short-circuit and return zeroed counters.
     ///
     /// On success the returned JSON is shaped per KIP §4 — for upserts an
@@ -575,17 +753,41 @@ impl CognitiveNexus {
         dry_run: bool,
     ) -> Result<Json, KipError> {
         let _guard = self.kml_lock.write().await;
-        self.execute_kml_inner(command, dry_run).await
+        self.ensure_live_collections().await?;
+        let result = self.execute_kml_inner(command, dry_run, false).await;
+        self.recover_if_poisoned(result).await
     }
 
+    /// Bootstrap-privileged [`execute_kml`](Self::execute_kml): the
+    /// `KIP_3004` protected-scope checks that reject writes to the
+    /// foundational schema nodes are bypassed, because the bundled capsules
+    /// are precisely what *defines* those nodes (Genesis creates
+    /// `$ConceptType`, `$PropositionType`, `Domain`, `belongs_to_domain` and
+    /// the `CoreSchema` domain, and re-applies them on every crate upgrade).
+    ///
+    /// Deliberately private and only reachable from
+    /// [`sync_bundled_capsules`](Self::sync_bundled_capsules): every
+    /// caller-supplied statement goes through `execute_kml`, which never
+    /// raises the flag.
+    async fn execute_kml_privileged(&self, command: KmlStatement) -> Result<Json, KipError> {
+        let _guard = self.kml_lock.write().await;
+        self.ensure_live_collections().await?;
+        let result = self.execute_kml_inner(command, false, true).await;
+        self.recover_if_poisoned(result).await
+    }
+
+    /// `privileged` bypasses the protected-scope checks; see
+    /// [`execute_kml_privileged`](Self::execute_kml_privileged).
     async fn execute_kml_inner(
         &self,
         command: KmlStatement,
         dry_run: bool,
+        privileged: bool,
     ) -> Result<Json, KipError> {
         match command {
             KmlStatement::Upsert(upsert_blocks) => {
-                self.execute_upsert(upsert_blocks, dry_run).await
+                self.execute_upsert(upsert_blocks, dry_run, privileged)
+                    .await
             }
             KmlStatement::Update(update_statement) => {
                 self.execute_update(update_statement, dry_run).await
@@ -594,7 +796,8 @@ impl CognitiveNexus {
                 self.execute_merge(merge_statement, dry_run).await
             }
             KmlStatement::Delete(delete_statement) => {
-                self.execute_delete(delete_statement, dry_run).await
+                self.execute_delete(delete_statement, dry_run, privileged)
+                    .await
             }
         }
     }
@@ -654,7 +857,7 @@ impl CognitiveNexus {
         .unwrap();
 
         let mut ids = self
-            .concepts
+            .concepts()
             .query_ids(
                 Filter::Field((virtual_name, RangeQuery::Eq(virtual_val))),
                 None,
@@ -685,7 +888,7 @@ impl CognitiveNexus {
                     // Match-only `{id:}` target: a dangling id is a grounding
                     // error (`KIP_3002`), not an empty match — otherwise it
                     // would silently drain every joined pattern (spec RC8).
-                    if !self.concepts.contains(concept_id) {
+                    if !self.concepts().contains(concept_id) {
                         return Err(KipError::not_found(format!(
                             "Concept {} not found",
                             ConceptPK::ID(concept_id)
@@ -701,7 +904,7 @@ impl CognitiveNexus {
             }
             ConceptMatcher::Type(type_name) => {
                 let ids = self
-                    .concepts
+                    .concepts()
                     .query_ids(
                         Filter::Field((
                             "type".to_string(),
@@ -715,7 +918,7 @@ impl CognitiveNexus {
             }
             ConceptMatcher::Name(name) => {
                 let ids = self
-                    .concepts
+                    .concepts()
                     .query_ids(
                         Filter::Field(("name".to_string(), RangeQuery::Eq(Fv::Text(name.clone())))),
                         None,
@@ -743,7 +946,7 @@ impl CognitiveNexus {
         if let Some(concept) = cache.concepts.read().get(&id) {
             return f(concept);
         }
-        let concept: Concept = self.concepts.get_as(id).await.map_err(db_to_kip_error)?;
+        let concept: Concept = self.concepts().get_as(id).await.map_err(db_to_kip_error)?;
         let rt = f(&concept)?;
         cache.concepts.write().insert(id, concept);
         Ok(rt)
@@ -759,7 +962,7 @@ impl CognitiveNexus {
         entity_id: &EntityID,
     ) -> Result<(), KipError> {
         if let EntityID::Proposition(id, predicate) = entity_id {
-            if self.propositions.contains(*id)
+            if self.propositions().contains(*id)
                 && self
                     .try_get_proposition_with(cache, *id, |prop| {
                         Ok(prop.predicates.contains(predicate))
@@ -789,7 +992,7 @@ impl CognitiveNexus {
             return f(proposition);
         }
         let proposition: Proposition = self
-            .propositions
+            .propositions()
             .get_as(id)
             .await
             .map_err(db_to_kip_error)?;

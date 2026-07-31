@@ -103,7 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```toml
 [dependencies]
-anda_db = { version = "0.10", features = ["full"] }
+anda_db = { version = "0.11", features = ["full"] }
 object_store = { version = "0.14", features = ["fs"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -112,8 +112,8 @@ serde = { version = "1", features = ["derive"] }
 Add direct low-level crates only when using their public APIs directly:
 
 ```toml
-anda_db_hnsw = "0.10"       # e.g. DistanceMetric
-anda_object_store = "0.10" # MetaStoreBuilder / EncryptedStoreBuilder
+anda_db_hnsw = "0.11"       # e.g. DistanceMetric
+anda_object_store = "0.11" # MetaStoreBuilder / EncryptedStoreBuilder
 cbor2 = "1"               # direct CBOR values, readers, writers, size
 ```
 
@@ -216,8 +216,11 @@ c.create_btree_index_nx(&["tenant", "created_at"]).await?;
 c.create_bm25_index_nx(&["title", "body"]).await?;
 ```
 
-For Chinese tokenization with the `full` feature, see
-`rs/anda_db/examples/db_demo.rs` for `jieba_tokenizer()`.
+For Chinese tokenization, pass `anda_db::index::jieba_tokenizer()` to
+`Collection::set_tokenizer` before creating the BM25 index — it is always
+available and needs no cargo feature. See `rs/anda_db/examples/db_demo.rs`
+(the example itself requires `--features full`, which only enables
+`object_store/fs`).
 
 ## Document CRUD
 

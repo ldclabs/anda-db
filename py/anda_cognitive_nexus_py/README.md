@@ -11,18 +11,30 @@ This bridge is built using [`PyO3`](https://pyo3.rs/) and packaged using [`matur
 Before you begin, ensure you have the following tools installed on your system:
 
 -   **Rust Toolchain:** Installed via `rustup`. ([Installation Guide](https://www.rust-lang.org/tools/install))
--   **Python:** Version 3.8 or higher.
+-   **Python:** 3.8 – 3.12. The bindings are built on `pyo3` 0.20 (the last line
+    that `pyo3-asyncio` supports), which refuses interpreters newer than 3.12.
+    If the `python3` on your PATH is newer, select a supported one with
+    `PYO3_PYTHON=python3.12`.
 -   **uv:** A fast Python installer and resolver. ([Installation Guide](https://github.com/astral-sh/uv))
 
 ## Rust Lib Verification
+
+This crate is **not** a default member of the Rust workspace (it links against a
+Python interpreter). Uncomment `py/anda_cognitive_nexus_py` in the `members`
+array of the repository root `Cargo.toml` before running any `cargo` command
+against it, and comment it back out afterwards.
+
 ```bash
 git clone REPO_URL
-cd anda_db
+cd anda-db
+# edit Cargo.toml: uncomment "py/anda_cognitive_nexus_py" under [workspace] members
 cargo check -p anda_cognitive_nexus_py
 cargo test --package anda_cognitive_nexus_py -- tests::test_execute_kip_in_mem --show-output
-cargo run --example test_kip_stateful_execution
+cargo run -p anda_cognitive_nexus_py --example test_kip_stateful_execution
 cargo test -p anda_cognitive_nexus_py --doc
 ```
+
+`make test-py` wraps the `--lib` run and checks the member is uncommented first.
 
 ## Python Development Setup
 

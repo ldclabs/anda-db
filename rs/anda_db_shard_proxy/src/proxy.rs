@@ -72,7 +72,10 @@ pub struct AppState {
     /// the backend to start responding. Streaming the response body is not
     /// bounded by this timeout.
     pub proxy_request_timeout: Duration,
-    /// Default backend address to use if no shard mapping is found.
+    /// Backend serving databases that have no routing row yet (single-shard
+    /// deployments and pre-provisioning). It is reached **only** by requests
+    /// that carry a valid database name; a request the proxy cannot route to
+    /// a named database is rejected instead (see [`proxy_handler`]).
     pub default_backend: Option<ResolvedRoute>,
 }
 
@@ -101,6 +104,14 @@ pub fn validate_backend_addr(addr: &str) -> Result<(), String> {
 /// 1. Extracts the database name or shard ID from the incoming request.
 /// 2. Resolves which backend shard to forward to.
 /// 3. Rewrites the request URI and forwards it to the backend.
+///
+/// A request whose database name cannot be resolved is **rejected**. It must
+/// not fall through to [`AppState::default_backend`]: with the default
+/// `--path-prefix /`, `POST /` carries no database name at all and is the
+/// backend's root scope (`db.list`, `db.create`, `db.open`, `db.close`), so
+/// forwarding it would let any tenant that can reach the proxy enumerate,
+/// create, or close databases on the shared shard. The same catch-all also
+/// used to swallow every malformed or percent-encoded name.
 pub async fn proxy_handler(
     State(state): State<AppState>,
     mut req: Request<Body>,
@@ -108,30 +119,46 @@ pub async fn proxy_handler(
     let original_uri = req.uri().clone();
     let route = match state.db_name_extractor.extract(req.uri(), req.headers()) {
         (Some(id), _) => state.store.resolve_by_shard(id).await,
-        (_, Some(name)) => match resolve_with_limits(
-            &state.route_resolve_semaphore,
-            state.route_resolve_timeout,
-            || state.store.resolve(&name),
-        )
-        .await
-        {
-            Ok(route) => route,
-            Err(RouteResolveError::Timeout) => {
-                log::warn!("route resolution timed out for {name:?}");
-                return Err((StatusCode::GATEWAY_TIMEOUT, "route resolution timed out"));
-            }
-            Err(RouteResolveError::AdmissionClosed) => {
-                log::error!("route resolution admission is closed");
-                return Err((StatusCode::SERVICE_UNAVAILABLE, "routing store unavailable"));
-            }
-            // A routing-store failure is not "database not found": answer 503
-            // so clients retry instead of assuming the database is gone.
-            Err(RouteResolveError::Store(err)) => {
-                log::error!("failed to resolve route for {name:?}: {err}");
-                return Err((StatusCode::SERVICE_UNAVAILABLE, "routing store unavailable"));
-            }
-        },
-        _ => state.default_backend.clone(),
+        (_, Some(name)) => {
+            let resolved = match resolve_with_limits(
+                &state.route_resolve_semaphore,
+                state.route_resolve_timeout,
+                || state.store.resolve(&name),
+            )
+            .await
+            {
+                Ok(route) => route,
+                Err(RouteResolveError::Timeout) => {
+                    log::warn!("route resolution timed out for {name:?}");
+                    return Err((StatusCode::GATEWAY_TIMEOUT, "route resolution timed out"));
+                }
+                Err(RouteResolveError::AdmissionClosed) => {
+                    log::error!("route resolution admission is closed");
+                    return Err((StatusCode::SERVICE_UNAVAILABLE, "routing store unavailable"));
+                }
+                // A routing-store failure is not "database not found": answer
+                // 503 so clients retry instead of assuming the database is
+                // gone.
+                Err(RouteResolveError::Store(err)) => {
+                    log::error!("failed to resolve route for {name:?}: {err}");
+                    return Err((StatusCode::SERVICE_UNAVAILABLE, "routing store unavailable"));
+                }
+            };
+            // A named database with no assignment (or whose shard has no
+            // registered backend) may still be served by the default backend.
+            resolved.or_else(|| {
+                state.default_backend.clone().map(|route| ResolvedRoute {
+                    db_name: Some(name),
+                    ..route
+                })
+            })
+        }
+        (None, None) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                "request path carries no routable database name",
+            ));
+        }
     };
 
     let route = route.ok_or((StatusCode::NOT_FOUND, "No backend found"))?;
@@ -295,7 +322,166 @@ fn remove_hop_by_hop_headers(headers: &mut HeaderMap) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::router::PrefixExtractor;
+    use crate::store::ShardBackend;
     use axum::http::header::HeaderValue;
+    use axum::{Router, routing};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A backend that records every path it received, so a test can prove
+    /// whether the proxy forwarded a request at all.
+    struct TestBackend {
+        addr: String,
+        hits: Arc<AtomicUsize>,
+        shutdown: tokio_util::sync::CancellationToken,
+    }
+
+    impl Drop for TestBackend {
+        fn drop(&mut self) {
+            self.shutdown.cancel();
+        }
+    }
+
+    async fn spawn_backend() -> TestBackend {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().fallback(routing::any({
+            let hits = hits.clone();
+            move || {
+                let hits = hits.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    "backend"
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move {
+                let _ = axum::serve(listener, app)
+                    .with_graceful_shutdown(shutdown.cancelled_owned())
+                    .await;
+            }
+        });
+        TestBackend {
+            addr,
+            hits,
+            shutdown,
+        }
+    }
+
+    fn test_state(store: ShardStore, default_backend: Option<&str>) -> AppState {
+        AppState {
+            store,
+            client: Arc::new(
+                hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                    .http2_only(false)
+                    .build_http(),
+            ),
+            api_key: Arc::new(None),
+            db_name_extractor: Arc::new(PrefixExtractor::new("/")),
+            trusted_proxy_cidrs: Arc::from(Vec::new()),
+            route_resolve_timeout: Duration::from_secs(5),
+            route_resolve_semaphore: Arc::new(Semaphore::new(8)),
+            proxy_request_timeout: Duration::from_secs(5),
+            default_backend: default_backend.map(|addr| ResolvedRoute {
+                db_name: None,
+                shard_id: 0,
+                backend_addr: addr.to_string(),
+            }),
+        }
+    }
+
+    async fn proxy_request(state: &AppState, path: &str) -> Response<Body> {
+        let req = Request::post(path).body(Body::empty()).unwrap();
+        match proxy_handler(State(state.clone()), req).await {
+            Ok(resp) => resp,
+            Err(err) => err.into_response(),
+        }
+    }
+
+    /// The default backend must never be reachable without a database name.
+    /// `POST /` is the backend's root scope (`db.list`, `db.create`,
+    /// `db.open`, `db.close`), and malformed names must not silently share a
+    /// backend either.
+    #[tokio::test]
+    async fn unroutable_requests_are_rejected_instead_of_hitting_the_default_backend() {
+        let backend = spawn_backend().await;
+        let state = test_state(ShardStore::for_tests(), Some(&backend.addr));
+
+        for path in [
+            "/",
+            "//mydb",
+            "/My-Db/x",
+            "/db%20name/x",
+            "/db.name/x",
+            "/UPPER",
+        ] {
+            let resp = proxy_request(&state, path).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "path {path} must not be routed"
+            );
+        }
+        assert_eq!(
+            backend.hits.load(Ordering::SeqCst),
+            0,
+            "no unroutable request may reach a shared backend"
+        );
+    }
+
+    /// The default backend keeps its legitimate purpose: a valid database
+    /// name with no routing row is still served by it.
+    #[tokio::test]
+    async fn a_valid_database_name_still_reaches_the_default_backend() {
+        let backend = spawn_backend().await;
+        let store = ShardStore::for_tests();
+        // Cached "not assigned" so `resolve` answers without PostgreSQL.
+        store.seed_missing_db("mydb").await;
+        let state = test_state(store, Some(&backend.addr));
+
+        let resp = proxy_request(&state, "/mydb/query").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(backend.hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// Without a default backend, an assigned database reaches its shard and
+    /// an unassigned one is a plain 404, while an unreachable routing store
+    /// stays a server error instead of claiming the database is gone.
+    #[tokio::test]
+    async fn assigned_databases_route_to_their_shard_backend() {
+        let backend = spawn_backend().await;
+        let store = ShardStore::for_tests();
+        store.seed_missing_db("unassigned").await;
+        store.seed_db_shard("mydb", 4).await;
+        store.seed_backend(ShardBackend {
+            shard_id: 4,
+            backend_addr: backend.addr.clone(),
+        });
+        let mut state = test_state(store, None);
+        state.route_resolve_timeout = Duration::from_millis(200);
+
+        let resp = proxy_request(&state, "/mydb/query").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(backend.hits.load(Ordering::SeqCst), 1);
+
+        let resp = proxy_request(&state, "/unassigned/query").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // Not in either cache: the lookup must reach PostgreSQL, which this
+        // store cannot connect to. That is a routing-store failure, never
+        // "database not found".
+        let resp = proxy_request(&state, "/uncached/query").await;
+        assert!(
+            resp.status().is_server_error(),
+            "unexpected status: {}",
+            resp.status()
+        );
+        assert_eq!(backend.hits.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn build_target_uri_preserves_path_and_query() {

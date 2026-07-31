@@ -14,9 +14,10 @@ impl CognitiveNexus {
         &self,
         upsert_blocks: Vec<UpsertBlock>,
         dry_run: bool,
+        privileged: bool,
     ) -> Result<Json, KipError> {
         let blocks = upsert_blocks.len();
-        self.preflight_upsert(&upsert_blocks).await?;
+        self.preflight_upsert(&upsert_blocks, privileged).await?;
 
         if dry_run {
             return Ok(json!(UpsertResult {
@@ -43,6 +44,7 @@ impl CognitiveNexus {
                                 &mut handle_map,
                                 &mut cached_pks,
                                 dry_run,
+                                privileged,
                             )
                             .await?
                         {
@@ -68,8 +70,8 @@ impl CognitiveNexus {
         }
 
         let now_ms = unix_ms();
-        try_join!(self.concepts.flush(now_ms), self.propositions.flush(now_ms))
-            .map_err(db_to_kip_error)?;
+        let (concepts, propositions) = (self.concepts(), self.propositions());
+        try_join!(concepts.flush(now_ms), propositions.flush(now_ms)).map_err(db_to_kip_error)?;
 
         Ok(json!(UpsertResult {
             blocks,
@@ -84,6 +86,7 @@ impl CognitiveNexus {
     pub(super) async fn preflight_upsert(
         &self,
         upsert_blocks: &[UpsertBlock],
+        privileged: bool,
     ) -> Result<(), KipError> {
         let mut cached_pks: FxHashMap<EntityPK, EntityID> = FxHashMap::default();
 
@@ -101,6 +104,7 @@ impl CognitiveNexus {
                             &mut handle_map,
                             &mut cached_pks,
                             true,
+                            privileged,
                         )
                         .await?;
                     }
@@ -128,11 +132,12 @@ impl CognitiveNexus {
         handle_map: &mut FxHashMap<String, EntityID>,
         cached_pks: &mut FxHashMap<EntityPK, EntityID>,
         dry_run: bool,
+        privileged: bool,
     ) -> Result<Option<EntityID>, KipError> {
         let concept_pk = ConceptPK::try_from(concept_block.concept)?;
         match &concept_pk {
             ConceptPK::ID(id) => {
-                if !self.concepts.contains(*id) {
+                if !self.concepts().contains(*id) {
                     return Err(KipError::not_found(format!(
                         "Concept {} not found",
                         ConceptPK::ID(*id)
@@ -146,6 +151,31 @@ impl CognitiveNexus {
 
         if let Some(local) = &concept_block.metadata {
             reject_reserved_metadata_keys(local.keys())?;
+        }
+
+        // Protected-scope preflight (KIP_3004), aligned with UPDATE / DELETE:
+        // `UPSERT` must not graft attributes or metadata onto the foundational
+        // schema nodes either. Runs in both passes, so the preflight rejects
+        // the statement before any block is applied. A block that writes
+        // neither (a bare `{type, name}` handle binding, e.g. to point a
+        // proposition at `CoreSchema`) mutates nothing — `update_concept`
+        // no-ops on two empty maps — and stays allowed. Bundled capsules run
+        // privileged: Genesis *owns* these definitions and re-applies them on
+        // every crate upgrade.
+        if !privileged {
+            let writes_attributes = concept_block
+                .set_attributes
+                .as_ref()
+                .is_some_and(|attributes| !attributes.is_empty());
+            let writes_metadata = !default_metadata.is_empty()
+                || concept_block
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|local| !local.is_empty());
+            if writes_attributes || writes_metadata {
+                self.ensure_concept_not_protected_for_kml(&concept_pk)
+                    .await?;
+            }
         }
 
         if let Some(attributes) = &concept_block.set_attributes {
@@ -407,6 +437,7 @@ impl CognitiveNexus {
         &self,
         delete_statement: DeleteStatement,
         dry_run: bool,
+        privileged: bool,
     ) -> Result<Json, KipError> {
         let result = match delete_statement {
             DeleteStatement::DeleteAttributes {
@@ -429,7 +460,7 @@ impl CognitiveNexus {
                 target,
                 where_clauses,
             } => {
-                self.execute_delete_propositions(target, where_clauses, dry_run)
+                self.execute_delete_propositions(target, where_clauses, dry_run, privileged)
                     .await
             }
             DeleteStatement::DeleteConcept {
@@ -443,7 +474,8 @@ impl CognitiveNexus {
 
         if !dry_run {
             let now_ms = unix_ms();
-            try_join!(self.concepts.flush(now_ms), self.propositions.flush(now_ms))
+            let (concepts, propositions) = (self.concepts(), self.propositions());
+            try_join!(concepts.flush(now_ms), propositions.flush(now_ms))
                 .map_err(db_to_kip_error)?;
         }
 
@@ -517,7 +549,7 @@ impl CognitiveNexus {
                     }
                     if concept.attributes.len() < length {
                         bump_system_metadata(&mut concept.metadata, unix_ms());
-                        self.concepts
+                        self.concepts()
                             .update(
                                 *id,
                                 BTreeMap::from([
@@ -552,7 +584,7 @@ impl CognitiveNexus {
 
                     if prop.attributes.len() < length {
                         bump_system_metadata(&mut prop.metadata, unix_ms());
-                        self.propositions
+                        self.propositions()
                             .update(
                                 *id,
                                 BTreeMap::from([(
@@ -645,7 +677,7 @@ impl CognitiveNexus {
                     }
                     if concept.metadata.len() < length {
                         bump_system_metadata(&mut concept.metadata, unix_ms());
-                        self.concepts
+                        self.concepts()
                             .update(
                                 *id,
                                 BTreeMap::from([("metadata".to_string(), concept.metadata.into())]),
@@ -674,7 +706,7 @@ impl CognitiveNexus {
 
                     if prop.metadata.len() < length {
                         bump_system_metadata(&mut prop.metadata, unix_ms());
-                        self.propositions
+                        self.propositions()
                             .update(
                                 *id,
                                 BTreeMap::from([(
@@ -705,6 +737,7 @@ impl CognitiveNexus {
         target: String,
         where_clauses: Vec<WhereClause>,
         dry_run: bool,
+        privileged: bool,
     ) -> Result<Json, KipError> {
         let mut ctx = QueryContext::default();
         for clause in where_clauses {
@@ -714,6 +747,45 @@ impl CognitiveNexus {
         let target_entities = ctx.entity_values(&target).ok_or_else(|| {
             KipError::reference_error(format!("Target term '{}' not found in context", target))
         })?;
+
+        // Protected-scope preflight (KIP_3004): a link anchored to a protected
+        // schema node is part of that structure — severing e.g.
+        // `$ConceptType belongs_to_domain CoreSchema` would break the domain
+        // map `DESCRIBE PRIMER` reports. Rejected before any removal, and
+        // under dry_run too, like the sibling guards. The cascade below only
+        // ever reaches higher-order links whose endpoints are propositions,
+        // so checking the matched targets covers the statement. Deleting a
+        // *non*-protected concept still cleans up its links via
+        // `execute_delete_concepts`, which is scoped by its own guard.
+        if !privileged {
+            for entity_id in target_entities.as_ref() {
+                if let EntityID::Proposition(id, _) = entity_id {
+                    let Some((subject, object)) = Self::tolerate_not_found(
+                        self.try_get_proposition_with(&ctx.cache, *id, |prop| {
+                            Ok((prop.subject.clone(), prop.object.clone()))
+                        })
+                        .await,
+                    )?
+                    else {
+                        continue; // stale index hit: nothing to protect
+                    };
+                    for endpoint in [subject, object] {
+                        if let EntityID::Concept(concept_id) = endpoint {
+                            let (ty, name) = self
+                                .try_get_concept_with(&ctx.cache, concept_id, |concept| {
+                                    Ok((concept.r#type.clone(), concept.name.clone()))
+                                })
+                                .await?;
+                            if Self::is_protected_schema_concept(&ty, &name) {
+                                return Err(KipError::immutable_target(format!(
+                                    "Proposition link anchored to concept {{type: \"{ty}\", name: \"{name}\"}} is system-protected; narrow the WHERE pattern"
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         if dry_run {
             return Ok(json!({
@@ -751,7 +823,7 @@ impl CognitiveNexus {
 
                     // If no predicates left, delete the proposition
                     if proposition.predicates.is_empty() {
-                        self.propositions
+                        self.propositions()
                             .remove(*id)
                             .await
                             .map_err(db_to_kip_error)?;
@@ -760,7 +832,7 @@ impl CognitiveNexus {
                         cascade_seeds.push(entity_id.clone());
                     } else {
                         // Otherwise, update the proposition with remaining predicates
-                        self.propositions
+                        self.propositions()
                             .update(
                                 *id,
                                 BTreeMap::from([
@@ -817,12 +889,18 @@ impl CognitiveNexus {
         let mut concept_ids: Vec<u64> = Vec::new();
         for entity_id in target_entities.as_ref() {
             if let EntityID::Concept(id) = entity_id {
-                if let Ok((ty, name)) = self
-                    .try_get_concept_with(&ctx.cache, *id, |c| {
+                // Fail *closed*: only a `NotFound` (stale index hit — the row
+                // is already gone, so there is nothing to protect) may skip
+                // the guard. Any other load failure (storage error, typed
+                // deserialization failure after a schema change) must abort,
+                // otherwise a protected node would be deleted through the
+                // untyped removal path below.
+                if let Some((ty, name)) = Self::tolerate_not_found(
+                    self.try_get_concept_with(&ctx.cache, *id, |c| {
                         Ok((c.r#type.clone(), c.name.clone()))
                     })
-                    .await
-                    && Self::is_protected_concept(&ty, &name)
+                    .await,
+                )? && Self::is_protected_concept(&ty, &name)
                 {
                     return Err(KipError::immutable_target(format!(
                         "Concept {{type: \"{ty}\", name: \"{name}\"}} is system-protected and cannot be deleted",
@@ -877,7 +955,7 @@ impl CognitiveNexus {
                 };
 
                 let ids = self
-                    .propositions
+                    .propositions()
                     .query_ids(filter, None)
                     .await
                     .map_err(db_to_kip_error)?;
@@ -911,7 +989,7 @@ impl CognitiveNexus {
         let mut deleted_propositions: u64 = 0;
         for id in to_delete_proposition_ids {
             if self
-                .propositions
+                .propositions()
                 .remove(id)
                 .await
                 .map_err(db_to_kip_error)?
@@ -924,7 +1002,7 @@ impl CognitiveNexus {
         let mut deleted_concepts: u64 = 0;
         for id in concept_ids {
             if self
-                .concepts
+                .concepts()
                 .remove(id)
                 .await
                 .map_err(db_to_kip_error)?
@@ -1061,7 +1139,7 @@ impl CognitiveNexus {
                     bump_system_metadata(&mut concept.metadata, now_ms);
                     // A write failure aborts the statement (partial progress
                     // is reported by the error, not folded into "updated").
-                    self.concepts
+                    self.concepts()
                         .update(
                             *id,
                             BTreeMap::from([
@@ -1096,7 +1174,7 @@ impl CognitiveNexus {
                     prop.attributes.extend(attributes);
                     prop.metadata.extend(metadata);
                     bump_system_metadata(&mut prop.metadata, now_ms);
-                    self.propositions
+                    self.propositions()
                         .update(
                             *id,
                             BTreeMap::from([(
@@ -1116,8 +1194,8 @@ impl CognitiveNexus {
         }
 
         let now_ms = unix_ms();
-        try_join!(self.concepts.flush(now_ms), self.propositions.flush(now_ms))
-            .map_err(db_to_kip_error)?;
+        let (concepts, propositions) = (self.concepts(), self.propositions());
+        try_join!(concepts.flush(now_ms), propositions.flush(now_ms)).map_err(db_to_kip_error)?;
 
         Ok(json!({ "updated": updated, "matched": matched }))
     }
@@ -1200,12 +1278,12 @@ impl CognitiveNexus {
         }
 
         let source_concept: Concept = self
-            .concepts
+            .concepts()
             .get_as(source_id)
             .await
             .map_err(db_to_kip_error)?;
         let target_concept: Concept = self
-            .concepts
+            .concepts()
             .get_as(target_id)
             .await
             .map_err(db_to_kip_error)?;
@@ -1303,7 +1381,7 @@ impl CognitiveNexus {
             .insert(METADATA_MERGED_FROM.to_string(), Json::Array(merged_from));
         bump_system_metadata(&mut target_concept.metadata, unix_ms());
 
-        self.concepts
+        self.concepts()
             .update(
                 target_id,
                 BTreeMap::from([
@@ -1314,14 +1392,14 @@ impl CognitiveNexus {
             .await
             .map_err(db_to_kip_error)?;
 
-        self.concepts
+        self.concepts()
             .remove(source_id)
             .await
             .map_err(db_to_kip_error)?;
 
         let now_ms = unix_ms();
-        try_join!(self.concepts.flush(now_ms), self.propositions.flush(now_ms))
-            .map_err(db_to_kip_error)?;
+        let (concepts, propositions) = (self.concepts(), self.propositions());
+        try_join!(concepts.flush(now_ms), propositions.flush(now_ms)).map_err(db_to_kip_error)?;
 
         Ok(json!({
             "merged": true,
@@ -1448,7 +1526,7 @@ impl CognitiveNexus {
         while let Some((old_eid, new_eid)) = worklist.pop() {
             let old_fv: Fv = old_eid.to_string().into();
             let row_ids = self
-                .propositions
+                .propositions()
                 .query_ids(
                     Filter::Or(vec![
                         Box::new(Filter::Field((
@@ -1466,7 +1544,7 @@ impl CognitiveNexus {
                 .map_err(db_to_kip_error)?;
 
             for row_id in row_ids {
-                let mut row: Proposition = match self.propositions.get_as(row_id).await {
+                let mut row: Proposition = match self.propositions().get_as(row_id).await {
                     Ok(row) => row,
                     // Already merged away by an earlier worklist step.
                     Err(DBError::NotFound { .. }) => continue,
@@ -1494,7 +1572,7 @@ impl CognitiveNexus {
                         .iter()
                         .map(|pred| EntityID::Proposition(row_id, pred.clone()))
                         .collect();
-                    self.propositions
+                    self.propositions()
                         .remove(row_id)
                         .await
                         .map_err(db_to_kip_error)?;
@@ -1510,7 +1588,7 @@ impl CognitiveNexus {
                 ])
                 .unwrap();
                 let existing = self
-                    .propositions
+                    .propositions()
                     .query_ids(
                         Filter::Field((virtual_name, RangeQuery::Eq(virtual_val))),
                         None,
@@ -1530,7 +1608,7 @@ impl CognitiveNexus {
                             bump_system_metadata(&mut prop.metadata, now_ms);
                         }
                         links_repointed += row.predicates.len() as u64;
-                        self.propositions
+                        self.propositions()
                             .update(
                                 row_id,
                                 BTreeMap::from([
@@ -1544,7 +1622,7 @@ impl CognitiveNexus {
                     }
                     Some(dst_row_id) => {
                         let mut dst_row: Proposition = self
-                            .propositions
+                            .propositions()
                             .get_as(dst_row_id)
                             .await
                             .map_err(db_to_kip_error)?;
@@ -1591,7 +1669,7 @@ impl CognitiveNexus {
                                 EntityID::Proposition(dst_row_id, pred.clone()),
                             ));
                         }
-                        self.propositions
+                        self.propositions()
                             .update(
                                 dst_row_id,
                                 BTreeMap::from([
@@ -1601,7 +1679,7 @@ impl CognitiveNexus {
                             )
                             .await
                             .map_err(db_to_kip_error)?;
-                        self.propositions
+                        self.propositions()
                             .remove(row_id)
                             .await
                             .map_err(db_to_kip_error)?;
@@ -1647,7 +1725,7 @@ impl CognitiveNexus {
                     Filter::Or(filters)
                 };
                 let ids = self
-                    .propositions
+                    .propositions()
                     .query_ids(filter, None)
                     .await
                     .map_err(db_to_kip_error)?;
@@ -1656,7 +1734,7 @@ impl CognitiveNexus {
                     if !visited_rows.insert(id) {
                         continue;
                     }
-                    let row = match self.propositions.get_as::<Proposition>(id).await {
+                    let row = match self.propositions().get_as::<Proposition>(id).await {
                         Ok(row) => row,
                         // Stale index hit: the row is already gone.
                         Err(DBError::NotFound { .. }) => continue,
@@ -1666,7 +1744,7 @@ impl CognitiveNexus {
                         next.push(EntityID::Proposition(id, pred.clone()));
                     }
                     if self
-                        .propositions
+                        .propositions()
                         .remove(id)
                         .await
                         .map_err(db_to_kip_error)?
@@ -1709,7 +1787,7 @@ impl CognitiveNexus {
                     metadata,
                 };
                 let id = self
-                    .concepts
+                    .concepts()
                     .add_from(&concept)
                     .await
                     .map_err(db_to_kip_error)?;
@@ -1766,7 +1844,7 @@ impl CognitiveNexus {
                 .unwrap();
 
                 let ids = self
-                    .propositions
+                    .propositions()
                     .query_ids(
                         Filter::Field((virtual_name, RangeQuery::Eq(virtual_val))),
                         None,
@@ -1802,7 +1880,7 @@ impl CognitiveNexus {
                 };
 
                 let id = self
-                    .propositions
+                    .propositions()
                     .add_from(&proposition)
                     .await
                     .map_err(db_to_kip_error)?;
@@ -1817,7 +1895,7 @@ impl CognitiveNexus {
         attributes: Map<String, Json>,
         metadata: Map<String, Json>,
     ) -> Result<(), KipError> {
-        if !self.concepts.contains(id) {
+        if !self.concepts().contains(id) {
             return Err(KipError::not_found(format!(
                 "Concept {} not found",
                 ConceptPK::ID(id)
@@ -1829,7 +1907,7 @@ impl CognitiveNexus {
             return Ok(());
         }
 
-        let concept: Concept = self.concepts.get_as(id).await.map_err(db_to_kip_error)?;
+        let concept: Concept = self.concepts().get_as(id).await.map_err(db_to_kip_error)?;
         if attributes.contains_key("core_directives")
             && Self::is_system_actor(&concept.r#type, &concept.name)
         {
@@ -1851,7 +1929,7 @@ impl CognitiveNexus {
         fv.extend(metadata);
         bump_system_metadata(&mut fv, unix_ms());
         update_fields.insert("metadata".to_string(), fv.into());
-        self.concepts
+        self.concepts()
             .update(id, update_fields)
             .await
             .map_err(db_to_kip_error)?;
@@ -1866,7 +1944,7 @@ impl CognitiveNexus {
         attributes: Map<String, Json>,
         metadata: Map<String, Json>,
     ) -> Result<(), KipError> {
-        if !self.propositions.contains(id) {
+        if !self.propositions().contains(id) {
             return Err(KipError::not_found(format!(
                 "Proposition {} not found",
                 PropositionPK::ID(id, predicate)
@@ -1874,7 +1952,7 @@ impl CognitiveNexus {
         }
 
         let proposition: Proposition = self
-            .propositions
+            .propositions()
             .get_as(id)
             .await
             .map_err(db_to_kip_error)?;
@@ -1904,7 +1982,7 @@ impl CognitiveNexus {
         }
         update_fields.insert("properties".to_string(), properties.into());
 
-        self.propositions
+        self.propositions()
             .update(id, update_fields)
             .await
             .map_err(db_to_kip_error)?;
@@ -1932,7 +2010,7 @@ impl CognitiveNexus {
             return Ok(());
         }
         if let Ok(id) = self.query_concept_id(META_CONCEPT_TYPE, type_name).await
-            && self.concepts.contains(id)
+            && self.concepts().contains(id)
         {
             cached_pks.insert(entity_pk, EntityID::Concept(id));
             return Ok(());
@@ -1958,7 +2036,7 @@ impl CognitiveNexus {
         if let Ok(id) = self
             .query_concept_id(META_PROPOSITION_TYPE, predicate)
             .await
-            && self.concepts.contains(id)
+            && self.concepts().contains(id)
         {
             cached_pks.insert(entity_pk, EntityID::Concept(id));
             return Ok(());
@@ -1966,6 +2044,35 @@ impl CognitiveNexus {
         Err(KipError::type_mismatch(format!(
             "Proposition type {predicate} is not defined"
         )))
+    }
+
+    /// Rejects an `UPSERT` concept block that would write attributes or
+    /// metadata onto a protected schema node (`KIP_3004`), mirroring the
+    /// `UPDATE` / `DELETE` guards so the same nodes are immutable through
+    /// every KML statement. Unlike the system-actor `core_directives` rule
+    /// this does not probe for existence: the protected schema identities are
+    /// engine-owned, so a non-privileged statement may neither modify nor
+    /// mint them.
+    pub(super) async fn ensure_concept_not_protected_for_kml(
+        &self,
+        pk: &ConceptPK,
+    ) -> Result<(), KipError> {
+        let (ty, name) = match pk {
+            ConceptPK::ID(id) => {
+                let concept: Concept =
+                    self.concepts().get_as(*id).await.map_err(db_to_kip_error)?;
+                (concept.r#type, concept.name)
+            }
+            ConceptPK::Object { r#type, name } => (r#type.clone(), name.clone()),
+        };
+
+        if Self::is_protected_schema_concept(&ty, &name) {
+            return Err(KipError::immutable_target(format!(
+                "Concept {{type: \"{ty}\", name: \"{name}\"}} is system-protected and cannot be modified"
+            )));
+        }
+
+        Ok(())
     }
 
     pub(super) async fn ensure_concept_attributes_mutable_for_kml(
@@ -1980,7 +2087,8 @@ impl CognitiveNexus {
 
         match pk {
             ConceptPK::ID(id) => {
-                let concept: Concept = self.concepts.get_as(*id).await.map_err(db_to_kip_error)?;
+                let concept: Concept =
+                    self.concepts().get_as(*id).await.map_err(db_to_kip_error)?;
                 if Self::is_system_actor(&concept.r#type, &concept.name) {
                     return Err(Self::immutable_core_directives_error(
                         &concept.r#type,
@@ -2065,7 +2173,7 @@ impl CognitiveNexus {
                     EntityID::Proposition(id, predicate) => {
                         self.ensure_proposition_type_for_kml(&predicate, cached_pks)
                             .await?;
-                        if !self.propositions.contains(id) {
+                        if !self.propositions().contains(id) {
                             return Err(KipError::not_found(format!(
                                 "Proposition {} not found",
                                 PropositionPK::ID(id, predicate)
@@ -2160,7 +2268,7 @@ impl CognitiveNexus {
         let id = match entity_pk {
             EntityPK::Concept(concept_pk) => match concept_pk {
                 ConceptPK::ID(id) => {
-                    if self.concepts.contains(*id) {
+                    if self.concepts().contains(*id) {
                         Ok(EntityID::Concept(*id))
                     } else {
                         Err(KipError::not_found(format!(
@@ -2176,7 +2284,7 @@ impl CognitiveNexus {
             },
             EntityPK::Proposition(proposition_pk) => match proposition_pk {
                 PropositionPK::ID(id, predicate) => {
-                    if !self.propositions.contains(*id) {
+                    if !self.propositions().contains(*id) {
                         return Err(KipError::not_found(format!(
                             "Proposition {} not found",
                             PropositionPK::ID(*id, predicate.clone())
@@ -2214,7 +2322,7 @@ impl CognitiveNexus {
                     .unwrap();
 
                     let ids = self
-                        .propositions
+                        .propositions()
                         .query_ids(
                             Filter::Field((virtual_name, RangeQuery::Eq(virtual_val))),
                             None,
@@ -2263,9 +2371,9 @@ impl CognitiveNexus {
             ConceptPK::Object { r#type, name } => self.query_concept_id(r#type, name).await.ok(),
         };
         if let Some(id) = id
-            && self.concepts.contains(id)
+            && self.concepts().contains(id)
         {
-            let concept: Concept = self.concepts.get_as(id).await.map_err(db_to_kip_error)?;
+            let concept: Concept = self.concepts().get_as(id).await.map_err(db_to_kip_error)?;
             return Ok(system_metadata_version(&concept.metadata));
         }
         if cached_pks.contains_key(&EntityPK::Concept(pk.clone())) {
@@ -2310,7 +2418,7 @@ impl CognitiveNexus {
                 ])
                 .unwrap();
                 let ids = self
-                    .propositions
+                    .propositions()
                     .query_ids(
                         Filter::Field((virtual_name, RangeQuery::Eq(virtual_val))),
                         None,
@@ -2322,10 +2430,10 @@ impl CognitiveNexus {
         };
 
         if let Some((id, predicate)) = row_and_predicate
-            && self.propositions.contains(id)
+            && self.propositions().contains(id)
         {
             let proposition: Proposition = self
-                .propositions
+                .propositions()
                 .get_as(id)
                 .await
                 .map_err(db_to_kip_error)?;

@@ -173,9 +173,13 @@ pub struct HnswConfig {
     ///   index's structural write lock**, which can slow bulk deletions by
     ///   orders of magnitude.
     ///
-    /// Metadata persisted without the field (crate versions before 0.9.2 and
-    /// from 0.10.0 defaults) deserializes to `false`, matching the behavior
-    /// those indexes were built with.
+    /// Metadata persisted without this field deserializes to `false`, which is
+    /// the behavior those indexes were actually built with: every published
+    /// release up to and including 0.9.1 pruned the reverse edges and stopped
+    /// there (`remove()` had no re-link step at all). The unconditional
+    /// re-link existed only in the unpublished 0.9.2 line; 0.10.0 and later
+    /// always serialize this field explicitly, so an index missing it can only
+    /// come from a release that never repaired on delete.
     #[serde(default)]
     pub reconnect_on_delete: bool,
 }
@@ -1071,9 +1075,22 @@ impl HnswIndex {
             }
 
             // Record forward edges on the new node and queue reverse edges.
-            for (neighbor_id, dist, layer) in selected_neighbors {
+            for (neighbor_id, dist, neighbor_layer) in selected_neighbors {
                 if neighbor_id == id {
                     // Skip self-loops.
+                    continue;
+                }
+
+                if neighbor_layer < current_layer_build {
+                    // The candidate does not exist at this layer, so this
+                    // layer's graph must not link to it. This happens whenever
+                    // the new node raises the max layer: `search_layer` returns
+                    // the entry point unexpanded at a layer it does not belong
+                    // to and `select_neighbors` passes it through. Recording
+                    // the forward edge anyway would leave a permanently
+                    // asymmetric dead end — the reverse edge is (correctly)
+                    // refused below, and the descent would then follow an edge
+                    // to a node that is not on the layer it is descending.
                     continue;
                 }
 
@@ -1081,14 +1098,12 @@ impl HnswIndex {
                 // (1) Forward edge on the new node.
                 node_neighbors[current_layer_build as usize].push((neighbor_id, dist_bf16));
 
-                // (2) Reverse edge on the existing node, only if the target node
-                //     actually exists at this layer.
-                if layer >= current_layer_build {
-                    neighbor_updates_required
-                        .entry(neighbor_id)
-                        .or_default()
-                        .push((current_layer_build, (id, dist_bf16)));
-                }
+                // (2) Reverse edge on the existing node; guaranteed valid here
+                //     because the target exists at this layer.
+                neighbor_updates_required
+                    .entry(neighbor_id)
+                    .or_default()
+                    .push((current_layer_build, (id, dist_bf16)));
             }
         }
 
@@ -1210,8 +1225,8 @@ impl HnswIndex {
         self.insert(id, vector.into_iter().map(bf16::from_f32).collect(), now_ms)
     }
 
-    /// Removes a node, prunes the reverse edges that point to it and re-links
-    /// its former neighbors to each other.
+    /// Removes a node and prunes the reverse edges that point to it,
+    /// optionally re-linking its former neighbors to each other.
     ///
     /// This method only mutates the in-memory graph. The id is recorded as a
     /// tombstone; call [`Self::purge_removed_nodes`] after flushing so the
@@ -1224,21 +1239,23 @@ impl HnswIndex {
     /// neighbor list (e.g. after a prior prune) are harmless: they are skipped
     /// at search time when `nodes.get()` returns `None`.
     ///
-    /// When [`HnswConfig::reconnect_on_delete`] is `true` (the default), for
-    /// every layer where a neighbor lost its edge to the deleted node, the
-    /// deleted node's remaining neighbors at that layer are merged into the
-    /// neighbor's candidate set and the configured
-    /// [`SelectNeighborsStrategy`] re-selects its edges (the local repair
-    /// used by hnswlib). Without this step every deletion strictly reduces
-    /// the survivors' connectivity, so recall degrades monotonically over
-    /// many deletions and a cluster reachable only through the deleted node
-    /// can become unreachable entirely.
+    /// Only when [`HnswConfig::reconnect_on_delete`] is `true` — it is `false`
+    /// by default — the graph is additionally repaired: for every layer where
+    /// a neighbor lost its edge to the deleted node, the deleted node's
+    /// remaining neighbors at that layer are merged into the neighbor's
+    /// candidate set and the configured [`SelectNeighborsStrategy`] re-selects
+    /// its edges (the local repair used by hnswlib). The repair costs
+    /// `O(M²·L)` distance computations while the structural write lock is
+    /// held, which is why it is opt-in.
     ///
-    /// The repair costs `O(M²·L)` distance computations while the structural
-    /// write lock is held. Set [`HnswConfig::reconnect_on_delete`] to `false`
-    /// to skip it (deletions then only `swap_remove` the reverse edges) when
-    /// bulk-deletion throughput matters more than recall stability; see the
-    /// config field's documentation for the trade-offs.
+    /// With the default `false`, a deletion only `swap_remove`s the reverse
+    /// edges, so every deletion strictly reduces the survivors' connectivity:
+    /// recall degrades as deletions accumulate and a cluster reachable only
+    /// through the deleted node can become unreachable entirely. Enable
+    /// [`HnswConfig::reconnect_on_delete`] (or rebuild periodically) when
+    /// recall stability under delete-heavy workloads matters more than
+    /// deletion throughput; see the config field's documentation for the
+    /// trade-offs.
     ///
     /// # Returns
     /// * `true` if a node with `id` existed and was removed.
@@ -1771,6 +1788,14 @@ impl HnswIndex {
                     }
 
                     let (cand_id, cand_dist, _) = candidate;
+                    if !nodes.contains_key(&cand_id) {
+                        // The node is gone (removed concurrently or left over
+                        // as a stale neighbor id). It can never be a useful
+                        // edge, so drop it instead of letting it occupy — or
+                        // backfill — a slot ahead of live candidates.
+                        continue;
+                    }
+
                     let mut keep = true;
                     for &(sel_id, _, _) in &selected {
                         let cache_key = if cand_id < sel_id {
@@ -1792,8 +1817,10 @@ impl HnswIndex {
                                     entry.insert(dist);
                                     dist
                                 } else {
-                                    // Missing node (defensive): treat the pair
-                                    // as non-conflicting.
+                                    // The candidate was checked above, so only
+                                    // a concurrently removed `sel_id` reaches
+                                    // here (defensive): skip this pair and keep
+                                    // testing the candidate against the rest.
                                     continue;
                                 }
                             }
@@ -2325,8 +2352,14 @@ impl HnswIndex {
     ///
     /// # Arguments
     ///
-    /// * `f` - Async function that writes a node data to persistent storage
-    ///   The function takes a node ID and serialized data, and returns whether to continue
+    /// * `f` - Async function that writes a node's data to persistent storage.
+    ///   It takes a node ID and the serialized payload. Return `Ok(true)` to
+    ///   acknowledge the write and continue. `Ok(false)` stops early *without*
+    ///   acknowledging the current id, so it and all later unprocessed ids
+    ///   stay dirty and are retried by the next call; on `Err`, the failing id
+    ///   likewise stays dirty. This mirrors
+    ///   [`purge_removed_nodes`](Self::purge_removed_nodes), so one callback
+    ///   style is correct for both APIs.
     ///
     /// # Returns
     ///
@@ -2380,15 +2413,21 @@ impl HnswIndex {
                 source,
             })?;
 
+            // `Ok(false)` is a cooperative stop, not an acknowledgement that
+            // this node's bytes were persisted. Leave the id dirty — as
+            // `purge_removed_nodes` leaves its tombstone — so the next flush
+            // retries it; clearing the mark first would drop the rewritten
+            // adjacency list permanently, since `flush_with`'s snapshot logic
+            // keys off `dirty_nodes`.
+            if !keep_going {
+                return Ok(());
+            }
+
             {
                 let _structural_guard = self.structural_lock.lock();
                 if self.metadata.read().stats.version == generation {
                     self.dirty_nodes.write().remove(&id);
                 }
-            }
-
-            if !keep_going {
-                return Ok(());
             }
         }
 
@@ -3363,6 +3402,49 @@ mod tests {
         assert!(!index.has_dirty_nodes());
     }
 
+    /// Regression: `Ok(false)` means "stop", not "this id is persisted".
+    /// `store_dirty_nodes` used to retire the dirty mark *before* it looked at
+    /// the callback's answer, so a caller writing one callback style for both
+    /// this API and `purge_removed_nodes` silently lost that node's rewritten
+    /// adjacency list: `flush_with` keys its snapshot off `dirty_nodes`, so
+    /// nothing was pending afterwards and no later flush rewrote the blob.
+    #[tokio::test]
+    async fn test_store_dirty_nodes_stop_keeps_current_node_dirty() {
+        let index = HnswIndex::new("stop_keeps_dirty".to_string(), Some(test_config()));
+        index.insert_f32(1, vec![1.0, 1.0], 1).unwrap();
+        index.insert_f32(2, vec![2.0, 2.0], 1).unwrap();
+
+        // Stop on the very first id, acknowledging nothing.
+        let visited = Arc::new(Mutex::new(Vec::new()));
+        let first = visited.clone();
+        index
+            .store_dirty_nodes(async move |id, _| {
+                first.lock().push(id);
+                Ok(false)
+            })
+            .await
+            .unwrap();
+        assert_eq!(*visited.lock(), vec![1]);
+
+        // The next call must offer the stopped-on id again, together with the
+        // ids it never reached.
+        let retried = Arc::new(Mutex::new(Vec::new()));
+        let second = retried.clone();
+        index
+            .store_dirty_nodes(async move |id, _| {
+                second.lock().push(id);
+                Ok(true)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            *retried.lock(),
+            vec![1, 2],
+            "the id the callback stopped on must stay retryable"
+        );
+        assert!(!index.has_dirty_nodes());
+    }
+
     #[tokio::test]
     async fn test_purge_removed_nodes_cancellation_keeps_tombstone_retryable() {
         let index = Arc::new(HnswIndex::new(
@@ -3436,6 +3518,57 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// Regression: an edge recorded at layer `L` must point at a node that
+    /// exists at layer `L`. Every node that raised the max layer used to break
+    /// that invariant — at the brand-new top layer `search_layer` returns the
+    /// (lower-layer) entry point unexpanded, `select_neighbors` passes it
+    /// through, and the forward edge was recorded even though the reverse-edge
+    /// guard correctly refused the mirror. The new top layer then held exactly
+    /// one node whose only edge was a dead end, and the greedy descent
+    /// followed it into a layer the target does not belong to.
+    #[test]
+    fn test_forward_edges_never_point_below_their_layer() {
+        let config = HnswConfig {
+            dimension: 2,
+            max_layers: 6,
+            max_connections: 4,
+            ef_construction: 16,
+            ef_search: 16,
+            // Dense upper layers, so many inserts raise the max layer — the
+            // only situation that produced the asymmetric edge.
+            scale_factor: Some(3.0),
+            ..Default::default()
+        };
+        let index = HnswIndex::new("layer_edges".to_string(), Some(config));
+        for id in 0..300u64 {
+            index
+                .insert_f32(id, vec![(id % 17) as f32, (id / 17) as f32], 0)
+                .unwrap();
+        }
+        assert!(
+            index.stats().max_layer > 0,
+            "the corpus never raised the max layer, so nothing was exercised"
+        );
+
+        let nodes = index.nodes.pin();
+        for (_, node) in nodes.iter() {
+            for (layer, neighbors) in node.neighbors.iter().enumerate() {
+                for &(neighbor_id, _) in neighbors.iter() {
+                    let neighbor = nodes
+                        .get(&neighbor_id)
+                        .unwrap_or_else(|| panic!("edge to unknown node {neighbor_id}"));
+                    assert!(
+                        neighbor.layer as usize >= layer,
+                        "node {} has a layer-{layer} edge to node {neighbor_id}, \
+                         which only exists up to layer {}",
+                        node.id,
+                        neighbor.layer
+                    );
+                }
+            }
+        }
     }
 
     #[test]

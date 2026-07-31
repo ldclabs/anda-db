@@ -108,6 +108,7 @@ The workspace is layered rather than monolithic.
 | `anda_db_btree`               | Exact-match and range index engine                                             |
 | `anda_db_tfs`                 | Embedded BM25 full-text search engine                                          |
 | `anda_db_hnsw`                | HNSW approximate-nearest-neighbor vector index                                 |
+| `anda_db_utils`               | Shared utilities used across the index crates (e.g. `UniqueVec`)               |
 | `anda_object_store`           | Portable metadata and encryption wrappers for `object_store`                   |
 | `anda_kip`                    | KIP parser, AST, request/response model, executor framework                    |
 | `anda_cognitive_nexus`        | Reference KIP executor and AI memory graph runtime                             |
@@ -127,6 +128,7 @@ Application or Agent Runtime
      -> anda_db_btree            exact and range index
      -> anda_db_tfs              BM25 lexical search
      -> anda_db_hnsw             HNSW vector search
+     -> anda_db_utils            shared utilities for the index crates
      -> anda_object_store        metadata and encryption wrappers
      -> object_store             backend abstraction for local and cloud storage
 ```
@@ -137,7 +139,7 @@ Add the core dependencies to your `Cargo.toml`.
 
 ```toml
 [dependencies]
-anda_db = { version = "0.8", features = ["full"] }
+anda_db = { version = "0.11", features = ["full"] }
 object_store = { version = "0.14", features = ["fs"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

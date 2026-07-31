@@ -10,7 +10,7 @@ use parking_lot::RwLock;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     io::{Read, Write},
     sync::atomic::{AtomicU32, AtomicU64, Ordering},
@@ -86,13 +86,15 @@ struct BucketSnapshot {
 ///
 /// # Concurrency contract
 ///
-/// Concurrent `insert`/`remove`/`search` calls are safe. Coordinating
-/// mutations against [`flush`]/[`flush_with`] and against
-/// [`compact_buckets`](Self::compact_buckets) is the **caller's**
-/// responsibility (`anda_db`'s `Collection` holds an exclusive operation gate
-/// across every flush). Running a flush concurrently with mutations, or two
-/// flushes concurrently, is unsupported. A single writer per durable index is
-/// a deployment contract.
+/// Concurrent `insert`/`remove`/`search` calls are safe, and so is running
+/// [`compact_buckets`](Self::compact_buckets) alongside them: compaction
+/// rebuilds the bucket map non-atomically, so it holds an internal mutation
+/// gate exclusively while mutations hold it shared. Coordinating mutations
+/// against [`flush`]/[`flush_with`], and flushes against each other or against
+/// compaction, is the **caller's** responsibility (`anda_db`'s `Collection`
+/// holds an exclusive operation gate across every flush). Running a flush
+/// concurrently with mutations, or two flushes concurrently, is unsupported.
+/// A single writer per durable index is a deployment contract.
 ///
 /// [`flush`]: Self::flush
 /// [`flush_with`]: Self::flush_with
@@ -124,10 +126,10 @@ pub struct BM25Index<T: Tokenizer + Clone> {
     /// Maximum document ID currently in use
     max_document_id: AtomicU64,
 
-    /// Average number of tokens per document
-    avg_doc_tokens: RwLock<f32>,
-
-    /// Total number of tokens indexed.
+    /// Total number of tokens indexed. The average document length is derived
+    /// from it and `doc_tokens.len()` on demand (see
+    /// [`avg_doc_tokens`](BM25Index::avg_doc_tokens)); caching the quotient
+    /// only created a value that could disagree with its own inputs.
     total_tokens: AtomicU64,
 
     /// Number of search operations performed.
@@ -135,6 +137,15 @@ pub struct BM25Index<T: Tokenizer + Clone> {
 
     /// Last saved version of the index
     last_saved_version: AtomicU64,
+
+    /// Held *shared* by every synchronous mutation and *exclusively* by
+    /// [`BM25Index::compact_buckets`], which rebuilds the whole bucket map
+    /// non-atomically: a posting created after compaction snapshotted
+    /// `postings` would otherwise be re-binned into nothing and silently lost
+    /// on the next flush. Mutations still run concurrently with each other —
+    /// they only take the shared side — and this is the first lock a mutation
+    /// acquires, so it never nests inside a DashMap shard guard.
+    mutation_gate: RwLock<()>,
 }
 
 #[derive(Default)]
@@ -178,7 +189,8 @@ impl Bucket {
 ///   normalization; `1.0` applies full normalization. Typical value: `0.75`.
 ///
 /// Values outside their natural ranges are clamped at scoring time
-/// (`k1` to `>= 0`, `b` to `[0, 1]`) to avoid producing `NaN`/`inf` scores.
+/// (`k1` to `[0, `[`BM25Params::MAX_K1`]`]`, `b` to `[0, 1]`, non-finite values
+/// back to the defaults) to avoid producing `NaN`/`inf` scores.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BM25Params {
     /// Term-frequency saturation factor.
@@ -198,6 +210,39 @@ impl Default for BM25Params {
     /// for most use cases.
     fn default() -> Self {
         BM25Params { k1: 1.2, b: 0.75 }
+    }
+}
+
+impl BM25Params {
+    /// Largest `k1` honored at scoring time.
+    ///
+    /// Term-frequency saturation is already effectively linear far below this
+    /// value, while an arbitrary finite `k1` (`f32::MAX` passes an `is_finite`
+    /// check) overflows `tf + k1 · (1 − b + b · |d| / avgdl)` to `inf` and
+    /// turns the score into `inf / inf = NaN`. Clamping here removes no useful
+    /// ranking behavior and keeps the formula finite for any document length
+    /// that can exist in memory.
+    pub const MAX_K1: f32 = 1_000.0;
+
+    /// Returns `(k1, b)` clamped into the domain where the BM25 formula is
+    /// guaranteed to stay finite: non-finite values fall back to the defaults,
+    /// `k1` to `[0, MAX_K1]` and `b` to `[0, 1]`.
+    ///
+    /// Parameters reach scoring straight from deserialized queries, so this
+    /// runs per scored term instead of trusting the caller.
+    fn sanitized(&self) -> (f32, f32) {
+        let defaults = Self::default();
+        let k1 = if self.k1.is_finite() {
+            self.k1.clamp(0.0, Self::MAX_K1)
+        } else {
+            defaults.k1
+        };
+        let b = if self.b.is_finite() {
+            self.b.clamp(0.0, 1.0)
+        } else {
+            defaults.b
+        };
+        (k1, b)
     }
 }
 
@@ -364,10 +409,10 @@ where
             }),
             max_bucket_id: AtomicU32::new(0),
             max_document_id: AtomicU64::new(0),
-            avg_doc_tokens: RwLock::new(0.0),
             total_tokens: AtomicU64::new(0),
             search_count: AtomicU64::new(0),
             last_saved_version: AtomicU64::new(0),
+            mutation_gate: RwLock::new(()),
         }
     }
 
@@ -413,7 +458,6 @@ where
         let max_bucket_id = AtomicU32::new(index.metadata.stats.max_bucket_id);
         let max_document_id = AtomicU64::new(index.metadata.stats.max_document_id);
         let search_count = AtomicU64::new(index.metadata.stats.search_count);
-        let avg_doc_tokens = RwLock::new(index.metadata.stats.avg_doc_tokens);
         let last_saved_version = AtomicU64::new(index.metadata.stats.version);
 
         Ok(BM25Index {
@@ -426,10 +470,14 @@ where
             metadata: RwLock::new(index.metadata),
             max_bucket_id,
             max_document_id,
-            avg_doc_tokens,
             search_count,
             last_saved_version,
+            // No document is loaded yet; `load_buckets` seeds this from the
+            // documents it actually loads. The persisted
+            // `stats.avg_doc_tokens` is not carried over — it would disagree
+            // with an empty `doc_tokens` until then.
             total_tokens: AtomicU64::new(0),
+            mutation_gate: RwLock::new(()),
         })
     }
 
@@ -444,8 +492,9 @@ where
     /// partially loaded index must not be flushed, since a flush persists
     /// exactly the loaded content.
     ///
-    /// After this call, `total_tokens` and `avg_doc_tokens` are recomputed
-    /// from the documents that were actually loaded.
+    /// After this call, `total_tokens` — and therefore the average document
+    /// length derived from it — reflects exactly the documents that were
+    /// loaded.
     ///
     /// Posting entries that reference a document with no token count in any
     /// loaded bucket are pruned and the affected buckets are marked dirty, so
@@ -621,14 +670,6 @@ where
         self.total_tokens
             .store(total_tokens as u64, Ordering::Relaxed);
 
-        let doc_count = self.doc_tokens.len();
-        let avg = if doc_count == 0 {
-            0.0
-        } else {
-            total_tokens as f32 / doc_count as f32
-        };
-        *self.avg_doc_tokens.write() = avg;
-
         if legacy && !loaded_bucket_ids.is_empty() {
             // Record in memory where each loaded bucket's durable object
             // lives (generation 0 = legacy object). The next flush commits a
@@ -675,23 +716,40 @@ where
         stats
     }
 
-    /// Overlays the live atomic/lock-protected counters onto a snapshot of the
-    /// persisted statistics so callers always observe up-to-date values.
+    /// Overlays the live atomic counters onto a snapshot of the persisted
+    /// statistics so callers always observe up-to-date values.
     fn refresh_live_stats(&self, stats: &mut BM25Stats) {
         stats.search_count = self.search_count.load(Ordering::Relaxed);
         stats.num_elements = self.doc_tokens.len() as u64;
         stats.max_bucket_id = self.max_bucket_id.load(Ordering::Relaxed);
         stats.max_document_id = self.max_document_id.load(Ordering::Relaxed);
-        stats.avg_doc_tokens = *self.avg_doc_tokens.read();
+        stats.avg_doc_tokens = self.avg_doc_tokens();
+    }
+
+    /// Average number of tokens per document, derived on demand.
+    ///
+    /// Deriving instead of caching keeps the value consistent with its inputs
+    /// by construction: a cached copy has to be resynchronized on every
+    /// insert/remove and still disagrees with `total_tokens` in between (and
+    /// after a `load_metadata` that has no documents yet). The division is
+    /// performed once per query and once per `stats()` call, never per
+    /// document.
+    fn avg_doc_tokens(&self) -> f32 {
+        let doc_count = self.doc_tokens.len();
+        if doc_count == 0 {
+            return 0.0;
+        }
+        self.total_tokens.load(Ordering::Relaxed) as f32 / doc_count as f32
     }
 
     /// Inserts a document into the index.
     ///
     /// The text is tokenized with a clone of the index's tokenizer; token
     /// frequencies and the document length (total token count) are then used
-    /// to update both the posting list and the running `avg_doc_tokens`
-    /// statistic. Updates to buckets are staged and then applied in a second
-    /// phase so that at most one bucket is marked dirty per affected bucket.
+    /// to update the posting list and the `total_tokens` counter that the
+    /// average document length is derived from. Updates to buckets are staged
+    /// and then applied in a second phase so that at most one bucket is marked
+    /// dirty per affected bucket.
     ///
     /// # Arguments
     ///
@@ -709,6 +767,9 @@ where
     ///
     /// Safe to call concurrently with other `insert`/`remove`/`search` calls.
     pub fn insert(&self, id: u64, text: &str, now_ms: u64) -> Result<(), BM25Error> {
+        // Shared with other mutations, exclusive against `compact_buckets`.
+        let _mutation_guard = self.mutation_gate.read();
+
         // Tokenize the document
         let token_freqs = {
             let mut tokenizer = self.tokenizer.clone();
@@ -740,24 +801,12 @@ where
                 v.insert(tokens);
                 let _ = self.max_document_id.fetch_max(id, Ordering::Relaxed);
 
-                {
-                    // Recalculate the average document length. The counter
-                    // update, the `doc_tokens.len()` read and the `avg` write
-                    // are all performed under the `avg_doc_tokens` write lock
-                    // (every insert/remove updates its map entry BEFORE taking
-                    // this lock), so the last writer to release the lock always
-                    // leaves `avg == total_tokens / doc_tokens.len()` exactly.
-                    // Values observed while writers are in flight may briefly
-                    // mix snapshots, but the cached average converges instead
-                    // of drifting persistently.
-                    let mut avg_doc_tokens = self.avg_doc_tokens.write();
-                    let new_total = self
-                        .total_tokens
-                        .fetch_add(tokens as u64, Ordering::Relaxed)
-                        + tokens as u64;
-                    let doc_count = self.doc_tokens.len().max(1) as f32;
-                    *avg_doc_tokens = new_total as f32 / doc_count;
-                }
+                // The document's tokens are counted right after its
+                // `doc_tokens` entry is published, so the two only disagree
+                // inside this window; the average document length is derived
+                // from them at read time and needs no separate synchronization.
+                self.total_tokens
+                    .fetch_add(tokens as u64, Ordering::Relaxed);
 
                 // Update inverted index
                 for (token, freq) in token_freqs {
@@ -900,6 +949,9 @@ where
     /// * `true` if a document with the given id was found and removed.
     /// * `false` otherwise.
     pub fn remove(&self, id: u64, text: &str, now_ms: u64) -> bool {
+        // Shared with other mutations, exclusive against `compact_buckets`.
+        let _mutation_guard = self.mutation_gate.read();
+
         // Even when `doc_tokens` was already removed, continue through the
         // supplied text and bucket bookkeeping. Crash-replay may encounter a
         // prefix of an earlier remove, and the retry must still purge stale
@@ -908,21 +960,11 @@ where
         let was_present = removed_tokens.is_some();
 
         if let Some(removed_tokens) = removed_tokens {
-            // Recalculate the average document length under the
-            // `avg_doc_tokens` write lock; see the matching block in
-            // `insert` for why this makes the cached average converge to
-            // `total_tokens / doc_tokens.len()` once in-flight writers drain.
-            let mut avg_doc_tokens = self.avg_doc_tokens.write();
-            let prev_total = self
-                .total_tokens
+            // Mirror of `insert`: the token counter follows the `doc_tokens`
+            // entry it belongs to, and the average document length is derived
+            // from the pair at read time.
+            self.total_tokens
                 .fetch_sub(removed_tokens as u64, Ordering::Relaxed);
-            let new_total = prev_total.saturating_sub(removed_tokens as u64);
-            let remaining = self.doc_tokens.len();
-            *avg_doc_tokens = if remaining == 0 {
-                0.0
-            } else {
-                new_total as f32 / remaining as f32
-            };
         }
 
         // Tokenize the document
@@ -984,7 +1026,19 @@ where
                 for (token, size_decrease) in val {
                     b.size = b.size.saturating_sub(size_decrease);
                     if removed_postings.contains(&token) {
-                        b.tokens.swap_remove_if(|k| &token == k);
+                        // `removed_postings` is a snapshot: a concurrent insert
+                        // may have re-created the posting in this very bucket
+                        // afterwards. Only drop the token when the posting is
+                        // genuinely gone or now owned by another bucket,
+                        // otherwise no bucket would list it and `serialize_bucket`
+                        // would silently lose the term.
+                        let remove_from_bucket = match self.postings.get(&token) {
+                            Some(posting) => posting.0 != bucket_id,
+                            None => true,
+                        };
+                        if remove_from_bucket {
+                            b.tokens.swap_remove_if(|k| &token == k);
+                        }
                     }
                 }
                 b.doc_ids.remove(&id);
@@ -1018,6 +1072,196 @@ where
         }
 
         was_present
+    }
+
+    /// Erases a set of document ids from the index **without their text**.
+    ///
+    /// [`remove`](Self::remove) needs the document's original text to know
+    /// which posting lists mention the document. A repair path that lost the
+    /// document body — `anda_db`'s `Collection::reconcile_storage`, which
+    /// drops ids whose stored object vanished in a crash — has no text to
+    /// give, so this method sweeps the inverted index instead and drops every
+    /// posting entry whose document id is in `ids`.
+    ///
+    /// # Cost, and why there is no cheaper route
+    ///
+    /// One pass over every posting list: `O(distinct tokens + posting
+    /// entries)`. The per-bucket `doc_ids` sets look like a document → bucket
+    /// index that could narrow the sweep, but they are a best-effort
+    /// dirty-tracking hint, not a reverse index: a [`remove`](Self::remove)
+    /// given non-original text clears a document from `doc_ids` while leaving
+    /// its posting entries behind (that is exactly the state
+    /// [`load_buckets`](Self::load_buckets) self-heals), so `doc_ids` can
+    /// *under*-report. A repair path must not trust the bookkeeping it exists
+    /// to repair, hence the full sweep. That is acceptable here because this
+    /// is a maintenance operation whose caller already enumerates the
+    /// collection's entire document prefix — and because it takes a *set*, so
+    /// N dead ids cost one pass rather than N.
+    ///
+    /// # Consistency
+    ///
+    /// Every counter is left exactly consistent with the surviving postings:
+    ///
+    /// * each purged id's `doc_tokens` entry is dropped and its token count
+    ///   subtracted from `total_tokens`, so the average document length
+    ///   derived from the two stays correct (a wrong average silently skews
+    ///   every subsequent BM25 score);
+    /// * bucket sizes are decremented by the same estimates
+    ///   [`insert`](Self::insert) accumulated, and a token whose posting list
+    ///   became empty is unlisted from its bucket;
+    /// * every bucket whose serialized content mentioned a purged id is marked
+    ///   dirty, so the purge survives a flush + reload instead of being
+    ///   resurrected from a stale bucket object's `doc_tokens`.
+    ///
+    /// # Arguments
+    ///
+    /// * `ids` — document ids to erase.
+    /// * `now_ms` — wall-clock time, stored in `stats.last_deleted`.
+    ///
+    /// # Returns
+    ///
+    /// The number of ids that were actually present in the index.
+    ///
+    /// # Concurrency
+    ///
+    /// Takes the mutation gate *shared*, exactly like `insert`/`remove`: safe
+    /// alongside them and alongside searches, exclusive against
+    /// [`compact_buckets`](Self::compact_buckets). Like every other mutation
+    /// it must not run concurrently with a flush (see the [`BM25Index`]
+    /// concurrency contract).
+    pub fn purge_ids(&self, ids: &BTreeSet<u64>, now_ms: u64) -> usize {
+        if ids.is_empty() {
+            return 0;
+        }
+
+        // Shared with other mutations, exclusive against `compact_buckets`.
+        let _mutation_guard = self.mutation_gate.read();
+
+        // Phase 1: drop the document lengths. As in `insert`/`remove`, the
+        // token counter follows the `doc_tokens` entries it accounts for.
+        let mut removed_docs = 0usize;
+        let mut removed_tokens = 0u64;
+        for id in ids {
+            if let Some((_, tokens)) = self.doc_tokens.remove(id) {
+                removed_docs += 1;
+                removed_tokens += tokens as u64;
+            }
+        }
+        if removed_tokens > 0 {
+            self.total_tokens
+                .fetch_sub(removed_tokens, Ordering::Relaxed);
+        }
+
+        // Phase 2: sweep every posting list once, collecting bucket updates
+        // instead of applying them, so no `postings` shard guard is held while
+        // the `buckets` map is touched.
+        let mut bucket_size_decrease: FxHashMap<u32, usize> = FxHashMap::default();
+        let mut emptied_tokens: Vec<(u32, String)> = Vec::new();
+        for mut posting in self.postings.iter_mut() {
+            let bucket_id = posting.0;
+            let mut removed_entries: Vec<(u64, usize)> = Vec::new();
+            posting.1.retain(|entry| {
+                if ids.contains(&entry.0) {
+                    removed_entries.push(*entry);
+                    false
+                } else {
+                    true
+                }
+            });
+            if removed_entries.is_empty() {
+                continue;
+            }
+
+            // Mirror of `remove`: the whole `(token, (bucket, entries))` tuple
+            // when the posting disappears — that is what `insert` charged for
+            // a brand-new token — and the per-entry cost otherwise.
+            let size_decrease = if posting.1.is_empty() {
+                emptied_tokens.push((bucket_id, posting.key().clone()));
+                cbor_serialized_size(&(posting.key(), (bucket_id, &removed_entries))) + 2
+            } else {
+                removed_entries
+                    .iter()
+                    .map(|entry| cbor_serialized_size(entry) + 2)
+                    .sum()
+            };
+            *bucket_size_decrease.entry(bucket_id).or_default() += size_decrease;
+        }
+
+        // Phase 3: drop the emptied posting lists atomically. A concurrent
+        // insert may have appended an entry after the sweep released the shard
+        // guard, in which case the posting must survive; `remove_if` re-checks
+        // under the shard lock.
+        let mut removed_postings: FxHashSet<String> =
+            FxHashSet::with_capacity_and_hasher(emptied_tokens.len(), FxBuildHasher);
+        for (_, token) in emptied_tokens.iter() {
+            if self
+                .postings
+                .remove_if(token, |_, posting| posting.1.is_empty())
+                .is_some()
+            {
+                removed_postings.insert(token.clone());
+            }
+        }
+
+        // Phase 4: resize and dirty every bucket that owned an affected token.
+        let mut purged_postings = !bucket_size_decrease.is_empty();
+        for (bucket_id, size_decrease) in bucket_size_decrease {
+            if let Some(mut bucket) = self.buckets.get_mut(&bucket_id) {
+                bucket.mark_dirty();
+                bucket.size = bucket.size.saturating_sub(size_decrease);
+            }
+        }
+
+        // Phase 5: unlist the tokens whose posting is genuinely gone.
+        // `removed_postings` is a snapshot: a concurrent insert may have
+        // re-created the posting, possibly in another bucket. Only drop the
+        // token when no bucket claims it or a different one does, otherwise no
+        // bucket would list it and `serialize_bucket` would lose the term.
+        for (bucket_id, token) in emptied_tokens {
+            if !removed_postings.contains(&token) {
+                continue;
+            }
+            let unlist = match self.postings.get(&token) {
+                Some(posting) => posting.0 != bucket_id,
+                None => true,
+            };
+            if unlist && let Some(mut bucket) = self.buckets.get_mut(&bucket_id) {
+                bucket.tokens.swap_remove_if(|k| k == &token);
+            }
+        }
+
+        // Phase 6: drop the purged ids from every bucket's doc-id set. A
+        // bucket can still list one without owning a posting for it, and its
+        // serialized `doc_tokens` would resurrect the id on reload. Read-scan
+        // first so a purge that touches nothing does not write-lock every
+        // shard; probe by `ids` (the dead set is small) rather than by
+        // `doc_ids` (which can hold the whole collection).
+        let stale_buckets: Vec<u32> = self
+            .buckets
+            .iter()
+            .filter(|bucket| ids.iter().any(|id| bucket.doc_ids.contains(id)))
+            .map(|bucket| *bucket.key())
+            .collect();
+        purged_postings |= !stale_buckets.is_empty();
+        for bucket_id in stale_buckets {
+            if let Some(mut bucket) = self.buckets.get_mut(&bucket_id) {
+                let before = bucket.doc_ids.len();
+                bucket.doc_ids.retain(|id| !ids.contains(id));
+                if bucket.doc_ids.len() != before {
+                    bucket.mark_dirty();
+                }
+            }
+        }
+
+        if removed_docs > 0 || purged_postings {
+            self.update_metadata(|m| {
+                m.stats.version += 1;
+                m.stats.last_deleted = now_ms;
+                m.stats.delete_count += removed_docs as u64;
+            });
+        }
+
+        removed_docs
     }
 
     /// Searches the index and returns the highest-scoring documents.
@@ -1130,10 +1374,23 @@ where
         results
     }
 
+    /// Total order over scored documents: descending score, `NaN` last, ties
+    /// broken by ascending document id.
+    ///
+    /// `partial_cmp(..).unwrap_or(Equal)` is **not** a total order once a
+    /// single `NaN` is present (it degrades to id-order against the `NaN` while
+    /// the other pairs stay score-ordered, which produces comparison cycles and
+    /// can make `sort_unstable_by` / `select_nth_unstable_by` panic). Scoring
+    /// sanitizes its parameters so a `NaN` should be impossible, but the sort
+    /// must not depend on that: `total_cmp` orders every `f32` bit pattern, and
+    /// the explicit `NaN` bucket keeps unscorable documents at the end.
     fn compare_scored_docs(a: &(u64, f32), b: &(u64, f32)) -> std::cmp::Ordering {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.0.cmp(&b.0))
+        match (a.1.is_nan(), b.1.is_nan()) {
+            (true, true) => a.0.cmp(&b.0),
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            (false, false) => b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)),
+        }
     }
 
     /// Execute a query expression, returning a mapping of document IDs to scores
@@ -1159,17 +1416,7 @@ where
         }
 
         // Be defensive against invalid params to avoid NaNs/inf in ranking.
-        let defaults = BM25Params::default();
-        let k1 = if params.k1.is_finite() {
-            params.k1.max(0.0)
-        } else {
-            defaults.k1
-        };
-        let b = if params.b.is_finite() {
-            params.b.clamp(0.0, 1.0)
-        } else {
-            defaults.b
-        };
+        let (k1, b) = params.sanitized();
 
         let mut tokenizer = self.tokenizer.clone();
         let query_terms = collect_tokens(&mut tokenizer, term, None);
@@ -1184,8 +1431,7 @@ where
 
         let mut scores: FxHashMap<u64, f32> =
             FxHashMap::with_capacity_and_hasher(self.doc_tokens.len().min(1000), FxBuildHasher);
-        let avg_doc_tokens = *self.avg_doc_tokens.read();
-        let avg_doc_tokens = avg_doc_tokens.max(1.0);
+        let avg_doc_tokens = self.avg_doc_tokens().max(1.0);
 
         // Per-token dedup buffer, reused across query terms so a multi-term
         // query does not reallocate a fresh map for every term.
@@ -1591,17 +1837,27 @@ where
     /// * every resulting bucket is marked dirty so the next
     ///   [`flush`](Self::flush) will rewrite the full on-disk layout.
     ///
-    /// The operation runs in `O(n log n)` over the number of distinct tokens.
-    /// Like a flush, it must not be interleaved with concurrent writes or
-    /// flushes (see the [`BM25Index`] concurrency contract), and it requires
-    /// a fully loaded index. The repacked layout becomes durable atomically
-    /// with the next flush's manifest commit; the pre-compaction bucket
-    /// objects are reported in that flush's [`FlushOutcome::obsolete`].
+    /// The operation runs in `O(n log n)` over the number of distinct tokens
+    /// and requires a fully loaded index. It rebuilds the bucket map
+    /// non-atomically, so it takes the index's mutation gate **exclusively**:
+    /// concurrent `insert`/`remove` calls block for its duration instead of
+    /// creating a posting that lands in no bucket at all (only bucket contents
+    /// are serialized, so such a token would be silently dropped by the next
+    /// flush). Excluding *flushes* remains the caller's responsibility (see
+    /// the [`BM25Index`] concurrency contract). The repacked layout becomes
+    /// durable atomically with the next flush's manifest commit; the
+    /// pre-compaction bucket objects are reported in that flush's
+    /// [`FlushOutcome::obsolete`].
     ///
     /// # Returns
     ///
     /// `(old_bucket_count, new_bucket_count)`.
     pub fn compact_buckets(&self) -> (usize, usize) {
+        // Exclusive: no mutation may observe — or add to — the half-rebuilt
+        // bucket map. Every mutator takes the shared side of this gate before
+        // touching any other lock, so the ordering is uniform and deadlock-free.
+        let _mutation_guard = self.mutation_gate.write();
+
         let old_count = self.buckets.len();
         if old_count <= 1 {
             return (old_count, old_count);
@@ -2809,7 +3065,7 @@ mod tests {
     }
 
     #[test]
-    fn test_avg_doc_tokens_converges_under_concurrent_insert_remove() {
+    fn test_token_counters_stay_consistent_under_concurrent_insert_remove() {
         use std::thread;
 
         let index = Arc::new(BM25Index::new(
@@ -2840,16 +3096,17 @@ mod tests {
             handle.join().unwrap();
         }
 
-        // Once all writers drained, the cached average must exactly match
-        // total_tokens / doc_tokens.len() — the race previously left a stale
-        // mixed-snapshot value here until the next write.
-        let total = index.total_tokens.load(Ordering::Relaxed) as f32;
-        let expected = total / index.doc_tokens.len() as f32;
-        let cached = *index.avg_doc_tokens.read();
+        // Once all writers drained, `total_tokens` must account for exactly
+        // the documents still present, and the reported average must be the
+        // quotient of the two (it is derived from them, never cached).
+        let total = index.total_tokens.load(Ordering::Relaxed);
+        let live_tokens: usize = index.doc_tokens.iter().map(|entry| *entry.value()).sum();
         assert_eq!(
-            cached, expected,
-            "cached avg_doc_tokens {cached} != recomputed {expected}"
+            total, live_tokens as u64,
+            "total_tokens {total} != sum of live doc_tokens {live_tokens}"
         );
+        let expected = total as f32 / index.doc_tokens.len() as f32;
+        assert_eq!(index.stats().avg_doc_tokens, expected);
     }
 
     #[test]
@@ -2878,18 +3135,142 @@ mod tests {
     #[test]
     fn test_invalid_bm25_params_do_not_produce_non_finite_scores() {
         let index = create_test_index();
+        // A document longer than average that mentions the query term twice:
+        // the only shape for which an unclamped `k1` overflows *both* sides of
+        // the ratio and yields `NaN` rather than a harmless `0.0`.
+        index
+            .insert(
+                5,
+                "The fox and the other fox watched the quick brown fox run past the lazy dog again",
+                0,
+            )
+            .unwrap();
 
-        let results = index.search(
-            "fox",
-            10,
-            Some(BM25Params {
+        // `f32::MAX` (and any other large-but-finite `k1`) passes an
+        // `is_finite` guard, yet overflows the unclamped formula to
+        // `inf / inf = NaN`; `b` outside `[0, 1]` distorts the length
+        // normalization the same way.
+        let hostile = [
+            BM25Params {
                 k1: f32::NAN,
                 b: f32::INFINITY,
+            },
+            BM25Params {
+                k1: f32::MAX,
+                b: 1.0,
+            },
+            BM25Params {
+                k1: f32::MAX,
+                b: f32::MAX,
+            },
+            BM25Params { k1: 1e30, b: 1.0 },
+            BM25Params { k1: -1e30, b: -5.0 },
+        ];
+
+        for params in hostile {
+            let results = index.search("fox", 10, Some(params.clone()));
+            assert!(!results.is_empty(), "no results for {params:?}");
+            assert!(
+                results.iter().all(|(_, score)| score.is_finite()),
+                "non-finite score for {params:?}: {results:?}"
+            );
+        }
+    }
+
+    /// Regression: a hostile-but-finite `k1` used to make `score_term` emit
+    /// `NaN` for every document longer than average, which then fed
+    /// `select_nth_unstable_by` a non-transitive comparator (`NaN` compared
+    /// equal to everything, so ordering fell back to id order against it while
+    /// the remaining pairs stayed score-ordered). That can panic with
+    /// "user-provided comparison function does not correctly implement a total
+    /// order" and otherwise returns arbitrary, partly non-finite rankings.
+    ///
+    /// The corpus is large enough for `top_k_results` to take the partial-sort
+    /// path, and the documents deliberately straddle the average length with
+    /// term frequencies `>= 2`.
+    #[test]
+    fn test_large_finite_bm25_params_keep_ranking_total_and_finite() {
+        let index = BM25Index::new("hostile_params".to_string(), default_tokenizer(), None);
+        for id in 0..2_000u64 {
+            // Half the corpus is long with a repeated query term (tf >= 2 and
+            // doc_len > avg), the other half is short.
+            let text = if id % 2 == 0 {
+                format!("alpha alpha beta gamma delta epsilon zeta doc{id} padding padding padding")
+            } else {
+                format!("alpha doc{id}")
+            };
+            index.insert(id, &text, 0).unwrap();
+        }
+
+        let results = index.search(
+            "alpha",
+            1_000,
+            Some(BM25Params {
+                k1: f32::MAX,
+                b: 1.0,
             }),
         );
 
-        assert!(!results.is_empty());
-        assert!(results.iter().all(|(_, score)| score.is_finite()));
+        assert_eq!(results.len(), 1_000);
+        assert!(
+            results.iter().all(|(_, score)| score.is_finite()),
+            "hostile k1 produced non-finite scores: {} of {}",
+            results.iter().filter(|(_, s)| !s.is_finite()).count(),
+            results.len()
+        );
+        assert!(
+            results.windows(2).all(|w| w[0].1 >= w[1].1),
+            "results are not sorted by descending score"
+        );
+    }
+
+    /// `compare_scored_docs` must be a total order for *every* input, so no
+    /// future scoring change can trip the standard-library sorts. The triple
+    /// below is the exact cycle the old comparator produced: `cmp(x, n)` and
+    /// `cmp(n, y)` both said `Less` while `cmp(x, y)` said `Greater`.
+    #[test]
+    fn test_compare_scored_docs_is_a_total_order_with_nan() {
+        let x = (1u64, 1.0f32);
+        let n = (2u64, f32::NAN);
+        let y = (3u64, 2.0f32);
+        let entries = [
+            x,
+            n,
+            y,
+            (4, f32::INFINITY),
+            (5, f32::NEG_INFINITY),
+            (6, 1.0),
+        ];
+
+        for a in entries {
+            for b in entries {
+                for c in entries {
+                    let ab = BM25Index::<TokenizerChain>::compare_scored_docs(&a, &b);
+                    let bc = BM25Index::<TokenizerChain>::compare_scored_docs(&b, &c);
+                    let ac = BM25Index::<TokenizerChain>::compare_scored_docs(&a, &c);
+                    // Antisymmetry.
+                    assert_eq!(
+                        ab.reverse(),
+                        BM25Index::<TokenizerChain>::compare_scored_docs(&b, &a),
+                        "not antisymmetric for {a:?} / {b:?}"
+                    );
+                    // Transitivity.
+                    if ab != std::cmp::Ordering::Greater && bc != std::cmp::Ordering::Greater {
+                        assert_ne!(
+                            ac,
+                            std::cmp::Ordering::Greater,
+                            "cycle: {a:?} <= {b:?} <= {c:?} but {a:?} > {c:?}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // NaN scores rank last, never first.
+        let mut entries = [n, x, y];
+        entries.sort_unstable_by(BM25Index::<TokenizerChain>::compare_scored_docs);
+        assert_eq!(entries[0].0, 3);
+        assert_eq!(entries[2].0, 2);
     }
 
     #[test]
@@ -3152,6 +3533,90 @@ mod tests {
         let results = index.search("shared", 10, None);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, 10);
+    }
+
+    /// Regression: `remove()` strips a token from its bucket based on the
+    /// `removed_postings` snapshot taken a few lines earlier. When a
+    /// concurrent `insert` re-created that posting in the *same* bucket in
+    /// between, the token must stay listed — `serialize_bucket` only walks
+    /// `bucket.tokens`, so a live posting that no bucket lists is never
+    /// persisted and the term is silently lost on the next flush + reload.
+    ///
+    /// The interleaving is forced, never raced: `remove()` drops the emptied
+    /// posting from `postings` *before* it touches `buckets`, so holding
+    /// bucket 0's shard guard parks it precisely between those two steps. The
+    /// guard is taken before the remover starts, and the posting vanishing
+    /// from `postings` is the observable end of the first step — no sleeps and
+    /// no timing-dependent assertions.
+    #[tokio::test]
+    async fn test_remove_keeps_bucket_token_recreated_by_concurrent_insert() {
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let index = Arc::new(BM25Index::new(
+            "recreated_posting".to_string(),
+            default_tokenizer(),
+            None,
+        ));
+        index.insert(1, "alpha", 0).unwrap();
+        assert_eq!(index.postings.get("alpha").unwrap().0, 0);
+
+        let remover = {
+            // Parks `remove()` at its bucket-update phase.
+            let mut bucket0 = index.buckets.get_mut(&0).unwrap();
+            let remover = {
+                let index = index.clone();
+                thread::spawn(move || index.remove(1, "alpha", 0))
+            };
+
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while index.postings.contains_key("alpha") {
+                assert!(
+                    Instant::now() < deadline,
+                    "remove() never dropped the emptied posting"
+                );
+                thread::yield_now();
+            }
+
+            // What the concurrent `insert`'s phase 1 does: doc 2 re-creates
+            // the posting in bucket 0, which still lists the token, so the
+            // insert's phase 2 would only bump this bucket's accounting.
+            index
+                .postings
+                .insert("alpha".to_string(), (0, vec![(2u64, 1usize)].into()));
+            index.doc_tokens.insert(2, 1);
+            index.total_tokens.fetch_add(1, Ordering::Relaxed);
+            bucket0.doc_ids.insert(2);
+            bucket0.mark_dirty();
+            assert!(bucket0.tokens.contains("alpha"));
+            remover
+        };
+        assert!(remover.join().unwrap());
+
+        // The invariant: every live posting is listed by exactly the bucket it
+        // names, otherwise no bucket would ever serialize it.
+        let posting = index.postings.get("alpha").expect("posting must survive");
+        assert_eq!(posting.0, 0);
+        drop(posting);
+        assert!(
+            index.buckets.get(&0).unwrap().tokens.contains("alpha"),
+            "the owning bucket must keep listing a posting a concurrent insert re-created"
+        );
+
+        // ... and that bucket carries the term through a flush + reload.
+        let mut store = MemStore::default();
+        flush_to(&index, &mut store, 1).await;
+        let reloaded = load_from(&store).await;
+        let found: Vec<u64> = reloaded
+            .search("alpha", 10, None)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(
+            found,
+            vec![2],
+            "the re-created term must stay searchable after a flush + reload"
+        );
     }
 
     #[tokio::test]
@@ -3650,5 +4115,268 @@ mod tests {
                 q
             );
         }
+    }
+
+    /// Regression (twin of the B-Tree case): `compact_buckets` snapshots
+    /// `postings`, clears `buckets` and re-bins the snapshot. A posting created
+    /// by a concurrent `insert` after the snapshot ended up in no bucket at
+    /// all — and only bucket contents are serialized — so `insert` returned
+    /// `Ok` while the term silently vanished from the durable index on the
+    /// next flush. `anda_db` drives compaction under the same *shared*
+    /// operation lease as `add`/`update`/`remove`, so the exclusion has to
+    /// live here.
+    #[tokio::test]
+    async fn test_compaction_never_loses_concurrent_inserts() {
+        use std::thread;
+
+        let index = Arc::new(BM25Index::new(
+            "compact_concurrent_insert".to_string(),
+            default_tokenizer(),
+            Some(BM25Config {
+                bm25: BM25Params::default(),
+                bucket_overload_size: 64,
+            }),
+        ));
+        // Seed enough tokens that each compaction has real work to do.
+        for id in 0..64u64 {
+            index.insert(id, &format!("seed{id:04}"), 0).unwrap();
+        }
+
+        const WRITES: u64 = 400;
+        let writer_index = index.clone();
+        let writer = thread::spawn(move || {
+            for id in 0..WRITES {
+                writer_index
+                    .insert(1_000 + id, &format!("live{id:04}"), 0)
+                    .unwrap();
+            }
+        });
+        let mut compactions = 0usize;
+        while !writer.is_finished() {
+            index.compact_buckets();
+            compactions += 1;
+        }
+        writer.join().unwrap();
+        assert!(compactions > 0, "no compaction overlapped the writer");
+
+        let mut store = MemStore::default();
+        flush_to(&index, &mut store, 1).await;
+        let reloaded = load_from(&store).await;
+        let missing: Vec<String> = (0..WRITES)
+            .map(|id| format!("live{id:04}"))
+            .filter(|token| reloaded.search(token, 1, None).is_empty())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{} concurrently inserted terms were lost, e.g. {:?}",
+            missing.len(),
+            &missing[..missing.len().min(5)]
+        );
+        assert_eq!(reloaded.len(), index.len());
+    }
+
+    /// The corpus used by the `purge_ids` tests. Terms deliberately overlap so
+    /// that purging hits three different posting shapes: lists that disappear
+    /// entirely (`unicorn`), lists that merely shrink (`shared`), and lists the
+    /// purge must not touch at all (`walrus`).
+    const PURGE_DOCS: [(u64, &str); 6] = [
+        (1, "shared alpha unicorn"),
+        (2, "shared beta narwhal"),
+        (3, "shared gamma walrus"),
+        (4, "shared delta walrus"),
+        (5, "shared epsilon quokka"),
+        (6, "shared zeta quokka"),
+    ];
+
+    fn build_purge_index(name: &str, config: Option<BM25Config>) -> BM25Index<TokenizerChain> {
+        let index = BM25Index::new(name.to_string(), default_tokenizer(), config);
+        for (id, text) in PURGE_DOCS {
+            index.insert(id, text, 1).unwrap();
+        }
+        index
+    }
+
+    /// Normalizes the inverted index into a comparable shape: entry order
+    /// inside a posting list is an implementation detail (`swap_remove`
+    /// reorders), and so is the bucket a token happens to live in.
+    fn posting_snapshot(index: &BM25Index<TokenizerChain>) -> BTreeMap<String, Vec<(u64, usize)>> {
+        index
+            .postings
+            .iter()
+            .map(|entry| {
+                let mut docs: Vec<(u64, usize)> = entry.value().1.iter().copied().collect();
+                docs.sort_unstable();
+                (entry.key().clone(), docs)
+            })
+            .collect()
+    }
+
+    fn doc_token_snapshot(index: &BM25Index<TokenizerChain>) -> BTreeMap<u64, usize> {
+        index
+            .doc_tokens
+            .iter()
+            .map(|entry| (*entry.key(), *entry.value()))
+            .collect()
+    }
+
+    /// Asserts that `purged` is indistinguishable from an index that only ever
+    /// saw the surviving documents.
+    fn assert_matches_reference(purged: &BM25Index<TokenizerChain>, survivors: &[u64]) {
+        let reference = BM25Index::new(
+            purged.name().to_string(),
+            default_tokenizer(),
+            Some(purged.config.clone()),
+        );
+        for (id, text) in PURGE_DOCS {
+            if survivors.contains(&id) {
+                reference.insert(id, text, 1).unwrap();
+            }
+        }
+
+        assert_eq!(posting_snapshot(purged), posting_snapshot(&reference));
+        assert_eq!(doc_token_snapshot(purged), doc_token_snapshot(&reference));
+        assert_eq!(
+            purged.total_tokens.load(Ordering::Relaxed),
+            reference.total_tokens.load(Ordering::Relaxed),
+        );
+        assert_eq!(purged.len(), survivors.len());
+        // `avg_doc_tokens` is no longer cached; it must fall out of the two
+        // counters above rather than out of a stale field.
+        assert_eq!(
+            purged.stats().avg_doc_tokens,
+            reference.stats().avg_doc_tokens
+        );
+        assert_eq!(
+            purged.stats().avg_doc_tokens,
+            purged.total_tokens.load(Ordering::Relaxed) as f32 / survivors.len() as f32,
+        );
+        assert_eq!(purged.stats().num_elements, survivors.len() as u64);
+    }
+
+    /// `purge_ids` erases documents whose text is unrecoverable: every posting
+    /// entry goes, the counters land exactly where a survivors-only index would
+    /// have put them, and the repair survives a flush + reload.
+    #[tokio::test]
+    async fn test_purge_ids_erases_documents_without_their_text() {
+        let index = build_purge_index("purge_ids", None);
+        let dead: BTreeSet<u64> = [2, 4].into_iter().collect();
+
+        // Persist first, so every bucket is *clean* when the purge runs: only
+        // the purge's own dirty marks can make the repair durable below.
+        let mut store = MemStore::default();
+        assert!(flush_to(&index, &mut store, 10).await.saved);
+        assert!(!index.has_dirty_buckets());
+
+        // Sanity: the dead documents are findable before the purge.
+        assert_eq!(index.search("narwhal", 10, None).len(), 1);
+        assert_eq!(index.search("shared", 10, None).len(), 6);
+
+        let purged = index.purge_ids(&dead, 42);
+        assert_eq!(purged, 2);
+        // Re-purging is a no-op: nothing is left to remove.
+        assert_eq!(index.purge_ids(&dead, 43), 0);
+
+        // No posting list mentions a purged id anywhere.
+        for entry in index.postings.iter() {
+            for (doc_id, _) in entry.value().1.iter() {
+                assert!(
+                    !dead.contains(doc_id),
+                    "token {:?} still lists purged doc {doc_id}",
+                    entry.key(),
+                );
+            }
+        }
+        // Tokens that only the purged documents carried are gone entirely.
+        assert!(!index.postings.contains_key("narwhal"));
+        assert!(!index.postings.contains_key("delta"));
+        // Tokens shared with survivors stay, minus the purged entries.
+        assert_eq!(index.postings.get("walrus").unwrap().1.len(), 1);
+        assert!(index.search("narwhal", 10, None).is_empty());
+        assert!(index.search("delta", 10, None).is_empty());
+        assert_eq!(index.search("shared", 10, None).len(), 4);
+        assert_eq!(index.stats().last_deleted, 42);
+
+        let survivors = [1, 3, 5, 6];
+        assert_matches_reference(&index, &survivors);
+
+        // The purge must be durable: a bucket left clean would resurrect the
+        // ids from its stale serialized `doc_tokens` on the next load.
+        assert!(index.has_dirty_buckets(), "the purge dirtied nothing");
+        assert!(flush_to(&index, &mut store, 100).await.saved);
+        let reloaded = load_from(&store).await;
+        assert_matches_reference(&reloaded, &survivors);
+        assert!(reloaded.search("narwhal", 10, None).is_empty());
+        assert_eq!(reloaded.search("shared", 10, None).len(), 4);
+        assert!(
+            !reloaded.has_dirty_buckets(),
+            "reload had to repair postings the purge should have already fixed",
+        );
+    }
+
+    /// The same repair across a multi-bucket layout: only the buckets that
+    /// actually referenced a purged id may be rewritten, and the survivors'
+    /// buckets must stay byte-identical.
+    #[tokio::test]
+    async fn test_purge_ids_dirties_only_affected_buckets() {
+        // A tiny overload size forces one token per bucket or so.
+        let index = build_purge_index(
+            "purge_ids_buckets",
+            Some(BM25Config {
+                bucket_overload_size: 48,
+                ..Default::default()
+            }),
+        );
+        assert!(index.buckets.len() > 1, "expected a multi-bucket layout");
+
+        let mut store = MemStore::default();
+        assert!(flush_to(&index, &mut store, 1).await.saved);
+        let before = store.buckets.clone();
+
+        let dead: BTreeSet<u64> = [2, 4].into_iter().collect();
+        assert_eq!(index.purge_ids(&dead, 2), 2);
+
+        // Buckets that never referenced a purged id must not be rewritten.
+        let untouched: Vec<u32> = index
+            .buckets
+            .iter()
+            .filter(|bucket| !bucket.is_dirty())
+            .map(|bucket| *bucket.key())
+            .collect();
+        assert!(!untouched.is_empty(), "the purge dirtied every bucket");
+        for bucket_id in &untouched {
+            let object = BucketObject {
+                bucket_id: *bucket_id,
+                generation: index.metadata().buckets[bucket_id],
+            };
+            let bucket: BucketOwned = cbor2::from_reader(&before[&object][..]).unwrap();
+            for id in &dead {
+                assert!(!bucket.doc_tokens.contains_key(id));
+                assert!(
+                    bucket
+                        .postings
+                        .values()
+                        .all(|posting| posting.1.iter().all(|(doc, _)| doc != id)),
+                );
+            }
+        }
+
+        assert!(flush_to(&index, &mut store, 3).await.saved);
+        // Nothing durable mentions a purged id any more.
+        for data in store.buckets.values() {
+            let bucket: BucketOwned = cbor2::from_reader(&data[..]).unwrap();
+            for id in &dead {
+                assert!(!bucket.doc_tokens.contains_key(id), "stale doc_tokens");
+                for (token, posting) in &bucket.postings {
+                    assert!(
+                        posting.1.iter().all(|(doc, _)| doc != id),
+                        "token {token:?} still lists purged doc {id}",
+                    );
+                }
+            }
+        }
+
+        let reloaded = load_from(&store).await;
+        assert_matches_reference(&reloaded, &[1, 3, 5, 6]);
+        assert!(!reloaded.has_dirty_buckets());
     }
 }

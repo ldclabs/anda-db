@@ -3,7 +3,7 @@
 use nom::{
     IResult, Parser,
     branch::alt,
-    bytes::{tag, tag_no_case, take},
+    bytes::complete::{tag, take},
     character::{
         anychar,
         complete::{alpha1, alphanumeric1, char, none_of},
@@ -34,7 +34,37 @@ pub fn quoted_string(input: &str) -> IResult<&str, String, VerboseError<&str>> {
 }
 
 pub fn parse_number(input: &str) -> IResult<&str, Number, VerboseError<&str>> {
-    map_res(recognize_float, Number::from_str).parse(input)
+    map_res(recognize_float, |literal: &str| {
+        let number = Number::from_str(literal).map_err(|err| err.to_string())?;
+        if !is_integer_literal(literal) || number.is_i64() || number.is_u64() {
+            return Ok(number);
+        }
+
+        // `Number::from_str` (serde_json without `arbitrary_precision`) converts
+        // an out-of-range integer literal to `f64`, storing a *different* value
+        // than the one written — `18446744073709551617` becomes
+        // `1.8446744073709552e19` and an EXPORT capsule no longer round-trips.
+        // Recover the exact value when it still fits (this is also what turns
+        // `-0` into the integer `0` instead of the float `-0.0`), otherwise
+        // reject, matching how an overflowing float literal is already handled.
+        literal
+            .parse::<i64>()
+            .map(Number::from)
+            .or_else(|_| literal.parse::<u64>().map(Number::from))
+            .map_err(|_| {
+                format!(
+                    "integer literal {literal} is out of range: \
+                     KIP integers must be representable as i64 or u64"
+                )
+            })
+    })
+    .parse(input)
+}
+
+/// True when a `recognize_float` literal has no fraction and no exponent, i.e.
+/// the author wrote an integer and expects an integer back.
+fn is_integer_literal(literal: &str) -> bool {
+    !literal.contains(['.', 'e', 'E'])
 }
 
 pub fn ws<'a, O, F>(f: F) -> impl Parser<&'a str, Output = O, Error = VerboseError<&'a str>>
@@ -188,8 +218,20 @@ fn object<'a>() -> impl Parser<&'a str, Output = Map<String, Json>, Error = Verb
     })
 }
 
+/// Parses the four-hex-digit payload of a `\uXXXX` escape.
+///
+/// The digits are verified to be ASCII hex before conversion: `u16::from_str_radix`
+/// on its own accepts a leading sign, so `"\u+041"` used to decode to `A`.
+/// `take`/`tag` here are the `complete` variants for the same reason as
+/// [`identifier`]: a truncated escape must be a located parse error, not
+/// `Incomplete` (which `format_nom_error` reports with no line or column).
 fn u16_hex<'a>() -> impl Parser<&'a str, Output = u16, Error = VerboseError<&'a str>> {
-    map_res(take(4usize), |s| u16::from_str_radix(s, 16))
+    map_res(
+        verify(take(4usize), |s: &str| {
+            s.chars().all(|c| c.is_ascii_hexdigit())
+        }),
+        |s: &str| u16::from_str_radix(s, 16),
+    )
 }
 
 fn unicode_escape<'a>() -> impl Parser<&'a str, Output = char, Error = VerboseError<&'a str>> {
@@ -254,10 +296,13 @@ impl<'a> Parser<&'a str> for JsonParser {
         &mut self,
         input: &'a str,
     ) -> nom::PResult<OM, &'a str, Self::Output, Self::Error> {
+        // The KIP protocol is case-sensitive (§2.8.2), so `TRUE` / `NULL` /
+        // `FaLsE` are not JSON literals; they are rejected instead of being
+        // silently normalized.
         let mut parser = alt((
-            value(Json::Null, tag_no_case("null")),
-            value(Json::Bool(true), tag_no_case("true")),
-            value(Json::Bool(false), tag_no_case("false")),
+            value(Json::Null, tag("null")),
+            value(Json::Bool(true), tag("true")),
+            value(Json::Bool(false), tag("false")),
             map(string(), Json::String),
             map(parse_number, Json::Number),
             map(array(), Json::Array),
@@ -360,5 +405,89 @@ mod tests {
         // reported.
         let err = json_value().parse(r#"{ k: 1, k: 2, k: 3 }"#).unwrap_err();
         assert!(duplicate_key_position(err).starts_with("k: 2,"));
+    }
+
+    #[test]
+    fn test_unicode_escape_requires_four_hex_digits() {
+        // `u16::from_str_radix` accepts a leading `+`, so `\u+041` used to
+        // decode to "A"; JSON requires exactly four hex DIGITS.
+        assert_eq!(crate::unquote_str(r#""\u+041""#), None);
+        assert_eq!(crate::unquote_str(r#""\u-041""#), None);
+        assert_eq!(crate::unquote_str(r#""\u 041""#), None);
+        // Valid escapes (including surrogate pairs) still decode.
+        assert_eq!(crate::unquote_str(r#""A""#), Some("A".to_string()));
+        assert_eq!(crate::unquote_str(r#""😀""#), Some("😀".to_string()));
+    }
+
+    #[test]
+    fn test_truncated_unicode_escape_reports_a_location() {
+        // The streaming `take`/`tag` combinators returned `Incomplete`, which
+        // `format_nom_error` reports without line, column, or context — a total
+        // loss of location for a protocol whose errors exist so an LLM can
+        // self-correct.
+        let err = crate::parse_json(r#""\u12""#).unwrap_err();
+        let msg = &err.message;
+        assert!(
+            !msg.contains("Parse incomplete"),
+            "truncated escape must not report as incomplete: {msg}"
+        );
+        assert!(
+            msg.contains("line 1, column"),
+            "truncated escape must report a location: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_out_of_range_integer_literal_is_rejected() {
+        // serde_json (without `arbitrary_precision`) degrades an out-of-range
+        // integer to f64, storing 1.8446744073709552e19 — a DIFFERENT number —
+        // and re-serializing it in exponent form, so EXPORT no longer
+        // round-trips the literal.
+        assert!(crate::parse_json("18446744073709551617").is_err());
+        assert!(crate::parse_json("-9223372036854775809").is_err());
+
+        // In a statement the error is anchored at the offending literal.
+        let err = crate::parse_kml(
+            r#"UPSERT { CONCEPT ?c { {type: "T", name: "n"} SET ATTRIBUTES { id: 18446744073709551617 } } }"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.message.contains("line 1, column 67"),
+            "error should point at the literal: {}",
+            err.message
+        );
+
+        // The i64/u64 boundaries themselves still parse exactly.
+        assert_eq!(
+            crate::parse_json("18446744073709551615").unwrap(),
+            Json::Number(Number::from(u64::MAX))
+        );
+        assert_eq!(
+            crate::parse_json("-9223372036854775808").unwrap(),
+            Json::Number(Number::from(i64::MIN))
+        );
+        // Floats are unaffected: an out-of-range float was already rejected,
+        // an in-range one still parses.
+        assert!(crate::parse_json("1e400").is_err());
+        assert_eq!(
+            crate::parse_json("1.8446744073709552e19").unwrap(),
+            Json::Number(Number::from_f64(1.8446744073709552e19).unwrap())
+        );
+        // `-0` has no fraction or exponent, so it is the integer 0.
+        assert_eq!(
+            crate::parse_json("-0").unwrap(),
+            Json::Number(Number::from(0))
+        );
+    }
+
+    #[test]
+    fn test_json_literals_are_case_sensitive() {
+        // "The KIP protocol is case-sensitive" (§2.8.2).
+        assert!(crate::parse_json("TRUE").is_err());
+        assert!(crate::parse_json("FaLsE").is_err());
+        assert!(crate::parse_json("NULL").is_err());
+        assert_eq!(crate::parse_json("true").unwrap(), Json::Bool(true));
+        assert_eq!(crate::parse_json("false").unwrap(), Json::Bool(false));
+        assert_eq!(crate::parse_json("null").unwrap(), Json::Null);
     }
 }

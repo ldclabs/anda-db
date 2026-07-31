@@ -50,6 +50,32 @@ enum FindItem {
     },
 }
 
+/// Applies a `FIND` column's dot-notation paths to its loaded root values:
+/// a bare variable (or no path at all) projects the root, one path projects
+/// that field, several paths project an array of them in clause order.
+fn project_dot_paths(roots: Vec<Json>, dot_paths: &[DotPathVar]) -> Vec<Json> {
+    let fields: Vec<String> = dot_paths.iter().map(|d| d.to_pointer()).collect();
+    match fields.len() {
+        0 => roots,
+        1 if fields[0].is_empty() => roots,
+        1 => roots
+            .into_iter()
+            .map(|v| v.pointer(&fields[0]).cloned().unwrap_or(Json::Null))
+            .collect(),
+        _ => roots
+            .into_iter()
+            .map(|v| {
+                Json::Array(
+                    fields
+                        .iter()
+                        .map(|p| v.pointer(p).cloned().unwrap_or(Json::Null))
+                        .collect(),
+                )
+            })
+            .collect(),
+    }
+}
+
 fn collect_find_items(clause: &FindClause) -> Vec<FindItem> {
     let mut items: Vec<FindItem> = Vec::new();
     for expr in &clause.expressions {
@@ -504,7 +530,7 @@ impl CognitiveNexus {
     ) -> Result<(), KipError> {
         // 一次性查询所有具有此谓词的命题
         let proposition_ids = self
-            .propositions
+            .propositions()
             .query_ids(
                 Filter::Field((
                     "predicates".to_string(),
@@ -732,11 +758,30 @@ impl CognitiveNexus {
         // aggregates compute globally (legacy result shape).
         let mut result: Vec<Json> = Vec::with_capacity(items.len());
         let mut next_cursor: Option<String> = None;
+        // Only the first plain column paginates. The cursor it issues anchors
+        // *its* variable's bindings, so handing the same token to another
+        // variable's column would slice that column at an unrelated position;
+        // the remaining columns project completely, like the global
+        // aggregates beside them.
+        let mut pagination_taken = false;
         for item in &items {
             match item {
                 FindItem::Column { var, dot_paths } => {
+                    let (page_cursor, page_limit) = if pagination_taken {
+                        (None, 0)
+                    } else {
+                        pagination_taken = true;
+                        (raw_cursor, limit)
+                    };
                     let (col, cur) = self
-                        .project_single_column(ctx, var, dot_paths, &order_by, raw_cursor, limit)
+                        .project_single_column(
+                            ctx,
+                            var,
+                            dot_paths,
+                            &order_by,
+                            page_cursor,
+                            page_limit,
+                        )
                         .await?;
                     if cur.is_some() && next_cursor.is_none() {
                         next_cursor = cur;
@@ -760,7 +805,9 @@ impl CognitiveNexus {
     /// ascending `EntityID` order when unordered (deterministic pagination),
     /// `ORDER BY` on this variable's fields (KIP §3.5, nulls last), and an
     /// entity-anchored cursor. Predicate columns paginate with a numeric
-    /// offset cursor.
+    /// offset cursor. A column binding *both* kinds (reachable through
+    /// `UNION`) goes to [`project_mixed_column`](Self::project_mixed_column)
+    /// — neither kind may be dropped.
     async fn project_single_column(
         &self,
         ctx: &QueryContext,
@@ -776,10 +823,20 @@ impl CognitiveNexus {
             )));
         };
 
-        if values
+        let has_predicates = values
             .iter()
-            .any(|value| matches!(value, BindingValue::Predicate(_)))
-        {
+            .any(|value| matches!(value, BindingValue::Predicate(_)));
+        let has_entities = values
+            .iter()
+            .any(|value| matches!(value, BindingValue::Entity(_)));
+
+        if has_predicates && has_entities {
+            return self
+                .project_mixed_column(ctx, var, dot_paths, order_by, raw_cursor, limit, &values)
+                .await;
+        }
+
+        if has_predicates {
             // Predicate column: names in binding order, numeric offset
             // cursor. An unparseable token is rejected (KIP_1001) instead
             // of silently replaying from the start with duplicate pages.
@@ -848,9 +905,21 @@ impl CognitiveNexus {
 
         if has_order_by {
             loaded = apply_order_by(loaded, var, order_by);
-            if let Some(cursor) = cursor.as_ref()
-                && let Some(idx) = loaded.iter().position(|(eid, _)| *eid == cursor)
-            {
+            if let Some(cursor) = cursor.as_ref() {
+                // The cursor anchors the last row of the previous page. When
+                // that entity is gone from the ordered set (deleted between
+                // pages, or a token minted for another variable), its
+                // position is undefined — and leaving the rows unsliced would
+                // hand the client page one again labelled "page two". Reject
+                // it (KIP_3002), exactly as an unparseable token is rejected
+                // above.
+                let Some(idx) = loaded.iter().position(|(eid, _)| *eid == cursor) else {
+                    return Err(KipError::not_found(format!(
+                        "CURSOR token no longer resolves: {cursor} is not among the ordered \
+                         results of {var:?} (it may have been deleted); re-run the query \
+                         without CURSOR"
+                    )));
+                };
                 loaded = loaded.split_off(idx + 1);
             }
         }
@@ -863,26 +932,72 @@ impl CognitiveNexus {
             next_cursor = loaded.last().and_then(|(eid, _)| BTree::to_cursor(eid));
         }
 
-        let fields: Vec<String> = dot_paths.iter().map(|d| d.to_pointer()).collect();
-        let column = match fields.len() {
-            0 => loaded.into_iter().map(|(_, v)| v).collect(),
-            1 if fields[0].is_empty() => loaded.into_iter().map(|(_, v)| v).collect(),
-            1 => loaded
-                .into_iter()
-                .map(|(_, v)| v.pointer(&fields[0]).cloned().unwrap_or(Json::Null))
-                .collect(),
-            _ => loaded
-                .into_iter()
-                .map(|(_, v)| {
-                    let v: Vec<Json> = fields
-                        .iter()
-                        .map(|p| v.pointer(p).cloned().unwrap_or(Json::Null))
-                        .collect();
-                    Json::Array(v)
-                })
-                .collect(),
-        };
-        Ok((column, next_cursor))
+        let roots: Vec<Json> = loaded.into_iter().map(|(_, value)| value).collect();
+        Ok((project_dot_paths(roots, dot_paths), next_cursor))
+    }
+
+    /// Projects a column whose bindings mix entity ids and predicate names.
+    ///
+    /// Mixed columns are reachable through `UNION`: `union_padded` merges the
+    /// branches by variable *name*, and a variable in the predicate position
+    /// binds a name — so `?x {type: "Drug"} UNION { (?a, ?x, ?b) }` binds both
+    /// kinds. Neither kind may be dropped (a dropped kind would also
+    /// contradict `COUNT(?x)`, which counts every distinct binding).
+    ///
+    /// Because an entity-anchored cursor cannot address a predicate row, this
+    /// path paginates with a numeric offset cursor over one deterministic
+    /// order: entities by ascending id first, then predicate names in binding
+    /// order; `ORDER BY` re-sorts that base order stably.
+    #[allow(clippy::too_many_arguments)]
+    async fn project_mixed_column(
+        &self,
+        ctx: &QueryContext,
+        var: &str,
+        dot_paths: &[DotPathVar],
+        order_by: &[OrderByCondition],
+        raw_cursor: Option<&str>,
+        limit: usize,
+        values: &[BindingValue],
+    ) -> Result<(Vec<Json>, Option<String>), KipError> {
+        let mut ids: Vec<&EntityID> = values
+            .iter()
+            .filter_map(|value| match value {
+                BindingValue::Entity(id) => Some(id),
+                _ => None,
+            })
+            .collect();
+        ids.sort();
+
+        let mut roots: Vec<Json> = Vec::with_capacity(values.len());
+        for eid in ids {
+            roots.push(self.load_entity_field(&ctx.cache, eid, "").await?);
+        }
+        // A predicate binding is its own root value: a bare variable projects
+        // the name and any dot path projects `null` — which is exactly what
+        // pointing into a JSON string yields.
+        roots.extend(values.iter().filter_map(|value| match value {
+            BindingValue::Predicate(name) => Some(Json::String(name.clone())),
+            _ => None,
+        }));
+
+        if order_by
+            .iter()
+            .any(|cond| !cond.is_aggregation() && cond.variable.var == var)
+        {
+            roots.sort_by(|a, b| compare_order_row(a, b, var, order_by));
+        }
+
+        // An unparseable token is rejected (KIP_1001) instead of silently
+        // replaying from the start with duplicate pages.
+        let start = parse_offset_cursor(raw_cursor)?.min(roots.len());
+        let mut page = roots.split_off(start);
+        let mut next_cursor: Option<String> = None;
+        if limit > 0 && limit < page.len() {
+            page.truncate(limit);
+            next_cursor = Some((start + limit).to_string());
+        }
+
+        Ok((project_dot_paths(page, dot_paths), next_cursor))
     }
 
     /// Multi-variable projection (KIP §6.2.2): the tables covering the
@@ -900,8 +1015,8 @@ impl CognitiveNexus {
         limit: usize,
     ) -> Result<(Vec<Json>, Option<String>), KipError> {
         // Referenced variables in stable order: FIND order first, then
-        // ORDER BY-only variables (unbound sort keys are ignored, as on the
-        // legacy path).
+        // ORDER BY-only variables (a sort key on an unbound variable is
+        // ignored rather than an error — KIP §3.5).
         let mut referenced: Vec<String> = Vec::new();
         for item in items {
             if let FindItem::Column { var, .. } = item
@@ -935,17 +1050,11 @@ impl CognitiveNexus {
             .iter()
             .map(|var| table.column(var).expect("covered"))
             .collect();
-        let mut rows: Vec<Vec<BindingValue>> = table
+        let rows: Vec<Vec<BindingValue>> = table
             .rows
             .iter()
             .map(|row| cols.iter().map(|&col| row[col].clone()).collect())
             .collect();
-
-        // Solution deduplication (KIP §3.3): solutions whose bindings agree
-        // on every projected variable collapse before ORDER BY and LIMIT.
-        let mut seen: FxHashSet<Vec<BindingValue>> =
-            FxHashSet::with_capacity_and_hasher(rows.len(), Default::default());
-        rows.retain(|row| seen.insert(row[..find_var_count].to_vec()));
 
         let var_index: FxHashMap<&str, usize> = referenced
             .iter()
@@ -958,32 +1067,61 @@ impl CognitiveNexus {
                 !cond.is_aggregation() && var_index.contains_key(cond.variable.var.as_str())
             })
             .collect();
-        if !order_conditions.is_empty() && !rows.is_empty() {
-            let mut keyed_rows: Vec<(Vec<BindingValue>, Vec<Json>)> =
-                Vec::with_capacity(rows.len());
-            for row in rows {
-                let mut sort_values = Vec::with_capacity(order_conditions.len());
-                for cond in &order_conditions {
-                    let binding = &row[var_index[cond.variable.var.as_str()]];
-                    sort_values.push(
-                        self.load_binding_field(&ctx.cache, binding, &cond.variable)
-                            .await?,
-                    );
+        let compare_keys = |left: &[Json], right: &[Json]| -> std::cmp::Ordering {
+            for (pos, cond) in order_conditions.iter().enumerate() {
+                let ordering = compare_order_key(&left[pos], &right[pos], &cond.direction);
+                if ordering != std::cmp::Ordering::Equal {
+                    return ordering;
                 }
-                keyed_rows.push((row, sort_values));
             }
-            keyed_rows.sort_by(|(_, left_values), (_, right_values)| {
-                for (pos, cond) in order_conditions.iter().enumerate() {
-                    let ordering =
-                        compare_order_key(&left_values[pos], &right_values[pos], &cond.direction);
-                    if ordering != std::cmp::Ordering::Equal {
-                        return ordering;
+            std::cmp::Ordering::Equal
+        };
+
+        // Solution deduplication (KIP §3.3): solutions whose bindings agree
+        // on every projected variable collapse before ORDER BY and LIMIT.
+        //
+        // `ORDER BY` may grade a variable that is *not* projected, and that
+        // variable's column differs across the rows collapsing into one
+        // solution (an author with three books joins three rows). Taking the
+        // key from whichever duplicate happened to survive would make the
+        // order depend on join row order — and shift every numeric-offset
+        // cursor page when an unrelated link is inserted. Each solution
+        // therefore keeps its **best** key tuple for the requested direction:
+        // the one that ranks it earliest, i.e. the smallest under `ASC` and
+        // the largest under `DESC`, the order an explicit `MIN` / `MAX` sort
+        // key would give. Keys graded on projected variables are identical
+        // across the duplicates, so this is a no-op for them.
+        let mut keyed_rows: Vec<(Vec<BindingValue>, Vec<Json>)> = Vec::with_capacity(rows.len());
+        let mut solution_at: FxHashMap<Vec<BindingValue>, usize> =
+            FxHashMap::with_capacity_and_hasher(rows.len(), Default::default());
+        for row in rows {
+            let mut sort_values = Vec::with_capacity(order_conditions.len());
+            for cond in &order_conditions {
+                let binding = &row[var_index[cond.variable.var.as_str()]];
+                sort_values.push(
+                    self.load_binding_field(&ctx.cache, binding, &cond.variable)
+                        .await?,
+                );
+            }
+            let solution = row[..find_var_count].to_vec();
+            match solution_at.get(&solution) {
+                Some(&pos) => {
+                    if compare_keys(&sort_values, &keyed_rows[pos].1) == std::cmp::Ordering::Less {
+                        keyed_rows[pos].1 = sort_values;
                     }
                 }
-                std::cmp::Ordering::Equal
-            });
-            rows = keyed_rows.into_iter().map(|(row, _)| row).collect();
+                None => {
+                    solution_at.insert(solution, keyed_rows.len());
+                    keyed_rows.push((row, sort_values));
+                }
+            }
         }
+        if !order_conditions.is_empty() {
+            keyed_rows.sort_by(|(_, left_values), (_, right_values)| {
+                compare_keys(left_values, right_values)
+            });
+        }
+        let mut rows: Vec<Vec<BindingValue>> = keyed_rows.into_iter().map(|(row, _)| row).collect();
 
         // Numeric offset cursor over the deterministic row order. An
         // entity-anchored cursor cannot work here: rows without a
@@ -1128,9 +1266,16 @@ impl CognitiveNexus {
         // reports KIP_1001 (a silent replay would duplicate pages).
         let cursor_id: Option<EntityID> = BTree::from_cursor(cursor)
             .map_err(|err| KipError::invalid_syntax(format!("Invalid CURSOR token: {err}")))?;
-        if let Some(ref cid) = cursor_id
-            && let Some(pos) = rows.iter().position(|r| &r.gid == cid)
-        {
+        if let Some(ref cid) = cursor_id {
+            // A group whose entity is gone (deleted between pages) leaves the
+            // cursor unanchored: reject rather than return page one again
+            // labelled "page two", as on the single-column ORDER BY path.
+            let Some(pos) = rows.iter().position(|r| &r.gid == cid) else {
+                return Err(KipError::not_found(format!(
+                    "CURSOR token no longer resolves: {cid} is not among the groups of \
+                     {gvar:?} (it may have been deleted); re-run the query without CURSOR"
+                )));
+            };
             rows = rows.split_off(pos + 1);
         }
         let mut next_cursor: Option<String> = None;
@@ -1153,15 +1298,28 @@ impl CognitiveNexus {
                         }
                         result.push(Json::Array(col));
                     } else {
-                        // Non-group variable: global projection, as before.
+                        // Non-group variable: an independent *complete*
+                        // global column, like the global aggregates beside it
+                        // (a `SUM` over a non-group variable is likewise
+                        // computed over its whole binding set).
+                        //
+                        // It must receive neither the cursor nor the limit:
+                        // the cursor anchors a *group* entity, and
+                        // `project_single_column` would read it as a position
+                        // in this variable's own entity order — silently
+                        // dropping every binding whose id sorts below the
+                        // group's. The limit likewise belongs to the group
+                        // rows. Passing neither keeps this column identical on
+                        // every page instead of quietly varying with the group
+                        // cursor.
                         let (col, _) = self
                             .project_single_column(
                                 ctx,
                                 &dot_path.var,
                                 std::slice::from_ref(dot_path),
                                 order_by,
-                                cursor.as_deref(),
-                                limit,
+                                None,
+                                0,
                             )
                             .await?;
                         result.push(Json::Array(col));

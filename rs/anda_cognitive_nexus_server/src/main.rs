@@ -9,7 +9,7 @@ use anda_db::{
     unix_ms,
 };
 use anda_object_store::MetaStoreBuilder;
-use axum::{BoxError, Router, extract::DefaultBodyLimit, middleware, routing};
+use axum::BoxError;
 use clap::{Parser, Subcommand};
 use mimalloc::MiMalloc;
 use object_store::{ObjectStore, local::LocalFileSystem, memory::InMemory};
@@ -34,6 +34,13 @@ const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Bounded cleanup window after the graceful deadline has already forced an
 /// abort. This is not an extension of the graceful drain contract.
 const FORCED_ABORT_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// The hard execution deadline is this multiple of the per-request response
+/// deadline. It is derived instead of separately configurable so the two can
+/// never be set inconsistently: the response deadline must always fire first,
+/// and the hard deadline exists only to reclaim a bounded mutation permit
+/// from an execution that is never going to finish.
+const EXECUTION_TIMEOUT_FACTOR: u32 = 4;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -70,6 +77,12 @@ struct Cli {
     #[clap(long, env = "MAX_BODY_SIZE", default_value = "2097152")]
     max_body_size: usize,
 
+    /// Maximum size in bytes of the KIP request stored in one `kip_logs`
+    /// audit document. A larger request is stored truncated. Raise it to
+    /// `--max-body-size` to keep full request bodies.
+    #[clap(long, env = "MAX_LOGGED_REQUEST_BYTES", default_value = "8192")]
+    max_logged_request_bytes: usize,
+
     /// Maximum number of concurrently executing KIP mutations
     #[clap(long, env = "MAX_CONCURRENT_MUTATIONS", default_value = "64")]
     max_concurrent_mutations: usize,
@@ -78,9 +91,11 @@ struct Cli {
     #[clap(long, env = "SHUTDOWN_DRAIN_TIMEOUT_SECS", default_value = "300")]
     shutdown_drain_timeout_secs: u64,
 
-    /// Retention window for the `kip_logs` collection in days;
-    /// 0 disables pruning (default)
-    #[clap(long, env = "LOG_RETENTION_DAYS", default_value = "0")]
+    /// Retention window for the `kip_logs` collection in days. Every `/kip`
+    /// request appends a durable audit document, so unbounded retention
+    /// (`0`) grows storage and index memory forever and must be chosen
+    /// explicitly.
+    #[clap(long, env = "LOG_RETENTION_DAYS", default_value = "30")]
     log_retention_days: u64,
 
     #[command(subcommand)]
@@ -110,6 +125,9 @@ async fn main() -> Result<(), BoxError> {
     let cli = Cli::parse();
     let addr: SocketAddr = cli.addr.parse()?;
     validate_api_key_policy(cli.api_key.as_deref(), &addr, cli.insecure_no_api_key)?;
+    // Reject an out-of-range retention window before anything is opened: an
+    // unchecked `days * 24` wraps and would prune almost the whole audit log.
+    let retention_hours = retention_hours(cli.log_retention_days)?;
     // Initialize structured logging with JSON format
     Builder::with_level(&get_env_level().to_string())
         .with_target_writer("*", new_writer(tokio::io::stdout()))
@@ -135,33 +153,29 @@ async fn main() -> Result<(), BoxError> {
     };
 
     let db = Arc::new(AndaDB::connect(object_store.clone(), db_config).await?);
-    let nexus = nexus::Nexus::connect(db.clone(), cli.self_principal_id).await?;
+    let nexus = nexus::Nexus::connect(
+        db.clone(),
+        cli.self_principal_id,
+        cli.max_logged_request_bytes,
+    )
+    .await?;
 
     let admission = CancellationToken::new();
     let mutation_tasks = TaskTracker::new();
     let mutation_aborts = Arc::new(Mutex::new(Vec::new()));
+    let request_timeout = Duration::from_secs(cli.request_timeout_secs.max(1));
     let state = AppState {
         nexus: nexus.clone(),
         name: APP_NAME.to_string(),
         version: APP_VERSION.to_string(),
-        api_key: cli.api_key,
-        request_timeout: Duration::from_secs(cli.request_timeout_secs.max(1)),
+        request_timeout,
+        execution_timeout: request_timeout.saturating_mul(EXECUTION_TIMEOUT_FACTOR),
         admission: admission.clone(),
         mutation_tasks: mutation_tasks.clone(),
         mutation_permits: Arc::new(Semaphore::new(cli.max_concurrent_mutations.max(1))),
         mutation_aborts: mutation_aborts.clone(),
     };
-    let request_timeout = state.request_timeout;
-    let app = Router::new()
-        .route("/", routing::get(get_information))
-        .route("/kip", routing::post(post_kip))
-        .layer(DefaultBodyLimit::max(cli.max_body_size.max(1024)))
-        .layer(middleware::from_fn(normalize_rejections))
-        .layer(middleware::from_fn_with_state(
-            request_timeout,
-            total_timeout,
-        ))
-        .with_state(state);
+    let app = build_router(state, cli.api_key, cli.max_body_size);
     let auto_flush_cancel = CancellationToken::new();
     let retention_cancel = CancellationToken::new();
 
@@ -176,10 +190,9 @@ async fn main() -> Result<(), BoxError> {
 
     // Optional retention cleanup for the `kip_logs` collection, driven by
     // the indexed `period` field (hours since the Unix epoch).
-    let retention_task = if cli.log_retention_days > 0 {
+    let retention_task = if let Some(retention_hours) = retention_hours {
         let nexus = nexus.clone();
         let cancel = retention_cancel.child_token();
-        let retention_hours = cli.log_retention_days * 24;
         Some(tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -348,6 +361,28 @@ async fn main() -> Result<(), BoxError> {
     Ok(())
 }
 
+/// Converts the configured retention window from days to hours.
+///
+/// `None` means "keep every audit log forever" — an explicit operator
+/// choice, since every `/kip` request appends a durable document. An
+/// out-of-range value is refused at startup instead of wrapping: an
+/// unchecked `days * 24` turns `768614336404564651` into `8`, which would
+/// silently prune essentially the whole audit log (and panic in a debug
+/// build).
+fn retention_hours(days: u64) -> Result<Option<u64>, BoxError> {
+    if days == 0 {
+        return Ok(None);
+    }
+    match days.checked_mul(24) {
+        Some(hours) => Ok(Some(hours)),
+        None => Err(format!(
+            "LOG_RETENTION_DAYS={days} is out of range: it must not exceed {}",
+            u64::MAX / 24
+        )
+        .into()),
+    }
+}
+
 /// Refuses insecure listener configurations: `/kip` executes arbitrary KML
 /// graph mutations, so a non-loopback listener without an API key must be
 /// an explicit opt-in (`--insecure-no-api-key` / `INSECURE_NO_API_KEY`).
@@ -458,6 +493,29 @@ mod tests {
     fn api_key_policy_allows_loopback_without_key() {
         for listen in ["127.0.0.1:8080", "[::1]:8080"] {
             assert!(validate_api_key_policy(None, &addr(listen), false).is_ok());
+        }
+    }
+
+    /// An unchecked `days * 24` wraps modulo 2^64, so an operator typo could
+    /// turn a huge retention window into a few hours and delete essentially
+    /// the whole audit log (or panic at startup in a debug build).
+    #[test]
+    fn retention_window_rejects_out_of_range_days() {
+        assert_eq!(retention_hours(0).unwrap(), None);
+        assert_eq!(retention_hours(1).unwrap(), Some(24));
+        assert_eq!(retention_hours(30).unwrap(), Some(720));
+        assert_eq!(
+            retention_hours(u64::MAX / 24).unwrap(),
+            Some(u64::MAX / 24 * 24)
+        );
+
+        // 768614336404564651 * 24 wraps to 8.
+        for days in [768_614_336_404_564_651u64, u64::MAX / 24 + 1, u64::MAX] {
+            let err = retention_hours(days)
+                .err()
+                .unwrap_or_else(|| panic!("{days} must be refused"))
+                .to_string();
+            assert!(err.contains("out of range"), "unexpected error: {err}");
         }
     }
 }

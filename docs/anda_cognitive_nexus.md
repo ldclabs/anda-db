@@ -134,9 +134,9 @@ mutate through KQL/KML/META instructions.
 
 ```toml
 [dependencies]
-anda_cognitive_nexus = "0.10"
-anda_db = "0.10"
-anda_kip = "0.10"
+anda_cognitive_nexus = "0.11"
+anda_db = "0.11"
+anda_kip = "0.11"
 object_store = "0.14"
 tokio = { version = "1", features = ["full"] }
 ```

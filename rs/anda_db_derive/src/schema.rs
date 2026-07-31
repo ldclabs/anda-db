@@ -65,6 +65,11 @@ pub(crate) fn expand_anda_db_schema_derive(input: DeriveInput) -> TokenStream2 {
     // field is reported at once.
     let mut seen_names = std::collections::BTreeSet::new();
     let mut field_entries = Vec::with_capacity(fields.len());
+    // `SchemaBuilder` injects `_id` as a *required* entry and
+    // `Document::try_from` reads it back out of the serialized value, so a
+    // struct whose serialized form has no `"_id"` key can be built but never
+    // stored. Track the declaration to report that at compile time.
+    let mut has_serialized_id = false;
     for field in fields {
         let field_ident = field.ident.as_ref().unwrap();
         let rust_name = field_ident.unraw().to_string();
@@ -88,12 +93,29 @@ pub(crate) fn expand_anda_db_schema_derive(input: DeriveInput) -> TokenStream2 {
                     .to_compile_error(),
                 );
             }
+            // A malformed `_id` is reported below on its own; treat it as
+            // declared either way so the "missing `_id`" diagnostic does not
+            // pile a second, misleading error on top of it.
+            has_serialized_id = true;
             if !is_u64_type(&field.ty) {
                 field_entries.push(
                     syn::Error::new_spanned(&field.ty, "The '_id' field must be of type u64")
                         .to_compile_error(),
                 );
-            } else if !serde_attrs.skip_serializing {
+            } else if serde_attrs.skip_serializing {
+                // A skipped `_id` never reaches the serialized document, so
+                // `Document::try_from` would fail at runtime with
+                // `field "_id" is required`.
+                field_entries.push(
+                    syn::Error::new_spanned(
+                        field_ident,
+                        "`_id` must be serialized: #[serde(skip)] / #[serde(skip_serializing)] \
+                         drops it from the document, and `Document::try_from` then fails with \
+                         `field \"_id\" is required`",
+                    )
+                    .to_compile_error(),
+                );
+            } else {
                 // serde must keep serializing the primary key as "_id",
                 // otherwise stored documents would not match the schema.
                 let schema_name =
@@ -228,6 +250,20 @@ pub(crate) fn expand_anda_db_schema_derive(input: DeriveInput) -> TokenStream2 {
     } else {
         quote! { let mut builder = #root::Schema::builder(); }
     };
+
+    if !has_serialized_id {
+        field_entries.push(
+            syn::Error::new_spanned(
+                &input.ident,
+                "AndaDBSchema requires an `_id: u64` field: the schema builder injects `_id` as a \
+                 *required* entry, so `Document::try_from` (and therefore `Collection::add_from`) \
+                 rejects a value that does not serialize an \"_id\" key with \
+                 `field \"_id\" is required`. Declare `_id: u64` on the struct; the builder still \
+                 supplies its FieldEntry",
+            )
+            .to_compile_error(),
+        );
+    }
 
     // Generate the schema function implementation. Every schema item is
     // referenced through the resolved crate path (never imported into the
@@ -470,6 +506,46 @@ mod tests {
         assert!(
             expanded.contains("#[cbor(key = ...)] is not supported on top-level document fields")
         );
+    }
+
+    #[test]
+    fn expand_schema_requires_a_serialized_id_field() {
+        // `SchemaBuilder` injects `_id` as a *required* entry and
+        // `Document::try_from` reads it back out of the serialized value, so
+        // a struct that never serializes `"_id"` used to compile and then
+        // fail at runtime with `field "_id" is required`.
+        let input: DeriveInput = parse_quote! {
+            struct NoId {
+                name: String,
+            }
+        };
+        let expanded = tokens(expand_anda_db_schema_derive(input));
+        assert!(expanded.contains("compile_error"));
+        assert!(expanded.contains("AndaDBSchema requires an `_id: u64` field"));
+
+        // `#[serde(skip)]` drops `_id` from the serialized document; the
+        // macro used to let it through with no diagnostic at all.
+        let input: DeriveInput = parse_quote! {
+            struct SkippedId {
+                #[serde(skip)]
+                _id: u64,
+                name: String,
+            }
+        };
+        let expanded = tokens(expand_anda_db_schema_derive(input));
+        assert!(expanded.contains("`_id` must be serialized"));
+        // The field *is* declared, so the missing-field error must not pile on.
+        assert!(!expanded.contains("AndaDBSchema requires an `_id: u64` field"));
+
+        // Same for an `_id` rejected for another reason: one error, not two.
+        let input: DeriveInput = parse_quote! {
+            struct BadId {
+                _id: String,
+            }
+        };
+        let expanded = tokens(expand_anda_db_schema_derive(input));
+        assert!(expanded.contains("The '_id' field must be of type u64"));
+        assert!(!expanded.contains("AndaDBSchema requires an `_id: u64` field"));
     }
 
     #[test]

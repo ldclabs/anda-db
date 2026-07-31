@@ -176,11 +176,12 @@ The index is designed to be cloned into `Arc` and shared across tasks.
 
 | Operation                               | Locks acquired                                                                                                          |
 | --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `insert`, `insert_array`                | DashMap shard for the posting, then DashMap shard for the bucket; `btree` write lock **only** when a new key is added   |
+| `insert`, `insert_array`                | `mutation_gate` **read** (first, always), then DashMap shard for the posting, then DashMap shard for the bucket; `btree` write lock **only** when a new key is added |
 | `remove`, `remove_array`                | Same as insert; `btree` write lock only when a posting becomes empty                                                    |
 | `query_with`                            | DashMap read shard for the posting                                                                                      |
 | `range_query_with`, `prefix_query_with` | `btree` read lock for the duration of iteration; postings are fetched via DashMap read shards per key                   |
 | `flush`, `flush_owned_with`             | DashMap read for bucket scan; CBOR is built inside the bucket guard, then released before `await`-ing the user's writer |
+| `compact_buckets`                       | `mutation_gate` **write** (mutations hold it shared), then `btree` write lock and the DashMap shards for the rebuild    |
 
 ### 4.2 Race-free Guarantees
 
@@ -195,6 +196,18 @@ The index is designed to be cloned into `Arc` and shared across tasks.
   generation-suffixed objects and commits them atomically through the
   manifest, so no crash boundary can observe A without the posting while B is
   unreferenced.
+- **Compaction is gated internally.** `insert`, `insert_array`, `remove` and
+  `remove_array` take the index's `mutation_gate` **shared** — so they still
+  run concurrently with each other — while `compact_buckets` takes it
+  **exclusively**. Compaction rebuilds the bucket map non-atomically, so a
+  posting created after it snapshotted `postings` would otherwise be re-binned
+  into nothing and silently dropped by the next flush. The gate is the first
+  lock a mutation acquires, so it never nests inside a `DashMap` shard guard
+  and the ordering stays deadlock-free. Callers do **not** need to serialize
+  compaction against writes. `batch_update` inherits the guarantee through the
+  `insert_array` / `remove_array` calls it delegates to, each of which takes
+  the gate for its own phase — a compaction may still interleave *between* the
+  two phases, so a `batch_update` is not atomic with respect to compaction.
 - **Flush coordination is the caller's job.** The crate does not defend a
   flush against concurrent mutations, compaction, or another flush;
   `anda_db`'s `Collection` holds an exclusive operation gate across every
@@ -638,8 +651,10 @@ legacy index whose buckets were over-split by an older bug). The procedure:
 3. Places each posting into the first bucket that still has room.
 4. Clears `buckets`, rewrites bucket ids `0..=max`, marks all dirty.
 
-The next `flush` will rewrite every bucket file. Call `compact_buckets` only
-when the index is quiesced (no concurrent writers).
+The next `flush` will rewrite every bucket file. Concurrent writers are safe:
+`compact_buckets` holds the `mutation_gate` exclusively for the whole rebuild
+(see [§4.2](#42-race-free-guarantees)), so `insert` / `remove` block for its
+duration rather than racing it. It must still not overlap a `flush`.
 
 ---
 
@@ -749,7 +764,8 @@ multiple `BTreeIndex` instances by key prefix.
   storage space; they can be garbage-collected by comparing the store's
   listing against the manifest.
 - If you detect fragmentation or legacy over-split buckets, run
-  `compact_buckets()` once while the index is idle, then `flush` once more —
+  `compact_buckets()` once (concurrent writers are fine — it gates them
+  internally; just keep it off a concurrent `flush`), then `flush` once more —
   the flush retires every pre-compaction object via `FlushOutcome::obsolete`.
 
 ---

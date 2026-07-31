@@ -264,16 +264,58 @@ async fn all_checked_in_fixtures_remain_readable() {
         })
         .collect();
     fixtures.sort();
+
+    let names: Vec<String> = fixtures
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+
+    // A non-empty set is not the contract. Two things must hold, and asserting
+    // only "non-empty" hid both: before this was tightened, `v0_8` was the
+    // *only* fixture through the whole 0.10 development cycle, so the suite
+    // proved 0.10 could read 0.8 data and nothing about 0.10 itself.
+    //
+    // 1. The current version's fixture must exist, so an intentional format
+    //    change that nobody regenerated fails here (the `docs/testing.md`
+    //    rule) instead of silently going untested.
+    let current = current_fixture_name();
     assert!(
-        !fixtures.is_empty(),
-        "no format fixtures found; run `cargo test -p anda_db --test format_compat -- --ignored generate`"
+        names.iter().any(|n| n == &current),
+        "no fixture for the current version ({current}); after an intentional \
+         format change run `cargo test -p anda_db --test format_compat -- --ignored generate` \
+         and commit the result. Found: {names:?}"
     );
+
+    // 2. At least one *older* fixture must exist, or the suite only proves the
+    //    current release can read data it just wrote itself — self-consistency,
+    //    not backward compatibility.
+    assert!(
+        names.iter().any(|n| n != &current),
+        "only the current version's fixture ({current}) is checked in, so nothing \
+         verifies backward compatibility; older fixtures must not be deleted"
+    );
+
+    println!("verifying {} format fixtures: {names:?}", names.len());
 
     for dir in fixtures {
         let name = dir.file_name().unwrap().to_string_lossy().to_string();
         let store = load_fixture(&dir).await;
         verify_fixture(store, &name).await;
     }
+}
+
+/// Fixture directory name for the *current* crate version (`v<major>_<minor>`).
+///
+/// Shared by [`all_checked_in_fixtures_remain_readable`] and
+/// [`generate_fixture_for_current_version`] so the check and the generator can
+/// never disagree about which directory the current version owns.
+fn current_fixture_name() -> String {
+    let mut version = env!("CARGO_PKG_VERSION").split('.');
+    let (major, minor) = (
+        version.next().expect("major version"),
+        version.next().expect("minor version"),
+    );
+    format!("v{major}_{minor}")
 }
 
 /// Regenerates the fixture for the *current* crate version. Ignored by
@@ -303,12 +345,7 @@ async fn generate_fixture_for_current_version() {
     db.close().await.expect("close db");
 
     // Dump the object store into the fixture directory.
-    let mut version = env!("CARGO_PKG_VERSION").split('.');
-    let (major, minor) = (
-        version.next().expect("major version"),
-        version.next().expect("minor version"),
-    );
-    let root = PathBuf::from(FIXTURES_ROOT).join(format!("v{major}_{minor}"));
+    let root = PathBuf::from(FIXTURES_ROOT).join(current_fixture_name());
     if root.exists() {
         fs::remove_dir_all(&root).expect("clear old fixture");
     }

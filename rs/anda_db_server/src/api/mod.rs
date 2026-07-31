@@ -2,8 +2,13 @@
 //!
 //! Routes:
 //! - `GET /` — unauthenticated server health/info
-//! - `POST /` — root-scope methods (server info, database lifecycle)
-//! - `POST /{db_name}` — database-scoped methods (`db.*`, `collection.*`, `doc.*`)
+//! - `POST /` — root-scope methods (server info, database lifecycle), admin key only
+//! - `POST /{db_name}` — database-scoped methods (`db.*`, `collection.*`, `doc.*`),
+//!   admin key or the key bound to that database
+//!
+//! Every RPC request is authorized against the scope it addresses before its
+//! body is parsed and before the database registry is consulted; see
+//! [`crate::auth`] for the two key tiers and their precedence.
 
 use axum::{
     body::{Body, Bytes},
@@ -16,7 +21,8 @@ use serde::Serialize;
 use std::future::Future;
 
 use crate::{
-    encoding::{Encoding, RpcRequest},
+    auth::{Principal, Scope},
+    encoding::{Encoding, RpcParams, RpcRequest},
     error::ApiError,
     state::{AppState, OpenMode},
 };
@@ -31,7 +37,7 @@ pub use document::{
     AddManyParams, AddParams, DocumentIdParams, DocumentIdsParams, QueryIdsParams, SearchParams,
     UpdateParams,
 };
-pub use root::DatabaseParams;
+pub use root::{ApiKeyParams, ApiKeyResult, CreateDatabaseParams, DatabaseParams};
 
 /// `GET /` — unauthenticated health/info endpoint.
 ///
@@ -53,17 +59,26 @@ pub async fn get_info(State(state): State<AppState>, headers: HeaderMap) -> Resp
     })
 }
 
-/// `POST /` — root-scope RPC endpoint.
+/// `POST /` — root-scope RPC endpoint. Requires the admin key.
 pub async fn rpc_root(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     let enc = Encoding::negotiate(&headers);
-    let result = execute_rpc(&state, enc, &headers, &body, |state, enc, req| async move {
-        dispatch_root(&state, enc, req).await
-    })
+    let result = execute_rpc(
+        &state,
+        Scope::Root,
+        enc,
+        &headers,
+        &body,
+        RootMethod::parse,
+        |state, enc, method, params, _principal| async move {
+            dispatch_root(&state, enc, method, params).await
+        },
+    )
     .await;
     result.unwrap_or_else(|err| err.respond(enc))
 }
 
-/// `POST /{db_name}` — database-scoped RPC endpoint.
+/// `POST /{db_name}` — database-scoped RPC endpoint. Requires the admin key
+/// or the key bound to `db_name`.
 pub async fn rpc_db(
     State(state): State<AppState>,
     Path(db_name): Path<String>,
@@ -71,15 +86,31 @@ pub async fn rpc_db(
     body: Bytes,
 ) -> Response {
     let enc = Encoding::negotiate(&headers);
-    let result = execute_rpc(&state, enc, &headers, &body, |state, enc, req| async move {
-        dispatch_db(&state, &db_name, enc, req).await
-    })
+    // The scope borrows a separate copy: `db_name` itself moves into the
+    // dispatch future, which must be `'static`.
+    let scope_name = db_name.clone();
+    let result = execute_rpc(
+        &state,
+        Scope::Database(&scope_name),
+        enc,
+        &headers,
+        &body,
+        DbMethod::parse,
+        move |state, enc, method, params, principal| async move {
+            dispatch_db(&state, &db_name, principal, enc, method, params).await
+        },
+    )
     .await;
     result.unwrap_or_else(|err| err.respond(enc))
 }
 
 /// Authorizes and parses the request inline, then applies cancellation policy
 /// according to the method's side effects.
+///
+/// Authorization happens first and is keyed by `scope`, so every entry point
+/// is forced to declare what the request addresses and the resulting
+/// [`Principal`] is handed to the dispatcher — a database-scoped caller can
+/// then be told apart from an admin inside the method handlers.
 ///
 /// Read-only methods run directly in the HTTP handler. Their future is
 /// cancelled on timeout, disconnect, or shutdown, preventing abandoned
@@ -89,23 +120,30 @@ pub async fn rpc_db(
 /// semaphore slot and run in the state's mutation tracker. A timed-out or
 /// disconnected response drops only its `JoinHandle`; shutdown closes
 /// admission and drains the tracked task before closing databases.
-async fn execute_rpc<F, Fut>(
+async fn execute_rpc<M, F, Fut>(
     state: &AppState,
+    scope: Scope<'_>,
     enc: Encoding,
     headers: &HeaderMap,
     body: &Bytes,
+    parse_method: fn(&str) -> Option<(M, MethodEffect)>,
     dispatch: F,
 ) -> Result<Response, ApiError>
 where
-    F: FnOnce(AppState, Encoding, RpcRequest) -> Fut,
+    M: Send + 'static,
+    F: FnOnce(AppState, Encoding, M, RpcParams, Principal) -> Fut,
     Fut: Future<Output = Result<Response, ApiError>> + Send + 'static,
 {
-    authorize(state, headers)?;
-    let req = RpcRequest::parse(headers, body)?;
+    let principal = state.authorize(scope, bearer_token(headers))?;
+    let RpcRequest { method, params } = RpcRequest::parse(headers, body)?;
+    // Resolving the method and its side-effect class in one step is what
+    // keeps the cancellation policy below in sync with the dispatch table.
+    let (method, effect) =
+        parse_method(&method).ok_or_else(|| ApiError::method_not_found(&method))?;
     let deadline = tokio::time::Instant::now() + state.request_timeout();
 
-    if is_mutating_method(&req.method) {
-        let mutation = dispatch(state.clone(), enc, req);
+    if effect == MethodEffect::Mutating {
+        let mutation = dispatch(state.clone(), enc, method, params, principal);
         let task = tokio::time::timeout_at(deadline, state.spawn_mutation(mutation))
             .await
             .map_err(|_| ApiError::timeout())??;
@@ -122,41 +160,151 @@ where
         }
     } else {
         let cancel = state.admit_read()?;
+        let read = dispatch(state.clone(), enc, method, params, principal);
         tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(ApiError::unavailable()),
-            result = tokio::time::timeout_at(deadline, dispatch(state.clone(), enc, req)) => {
+            result = tokio::time::timeout_at(deadline, read) => {
                 result.map_err(|_| ApiError::timeout())?
             }
         }
     }
 }
 
-/// Methods whose futures may modify server, database, collection, index, or
-/// document state and therefore must not be dropped at an arbitrary await.
-fn is_mutating_method(method: &str) -> bool {
-    matches!(
-        method,
-        "db.create"
-            | "db.open"
-            | "db.connect"
-            | "db.close"
-            | "db.flush"
-            | "db.set_read_only"
-            | "db.save_extension"
-            | "db.remove_extension"
-            | "collection.create"
-            | "collection.ensure"
-            | "collection.delete"
-            | "collection.flush"
-            | "collection.set_read_only"
-            | "collection.save_extension"
-            | "collection.remove_extension"
-            | "doc.add"
-            | "doc.add_many"
-            | "doc.update"
-            | "doc.remove"
-    )
+/// Side-effect class of an RPC method. It selects the cancellation policy in
+/// [`execute_rpc`], which is a durability decision: a mutating future dropped
+/// at an arbitrary await can poison a collection handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MethodEffect {
+    /// The handler only reads. Its future may be dropped on timeout, client
+    /// disconnect, or shutdown.
+    Read,
+    /// The handler may modify server, database, collection, index, or
+    /// document state and must not be dropped at an arbitrary await.
+    Mutating,
+}
+
+/// Root-scope methods (`POST /`).
+///
+/// The classification lives in [`RootMethod::parse`], the same table that
+/// resolves the name, and the dispatch match below is exhaustive over this
+/// enum. Adding a method therefore cannot compile until it is both
+/// classified and handled — a hand-maintained list of method names parallel
+/// to the dispatch match let a new mutating method silently fall onto the
+/// cancellable path, which the compiler could not catch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootMethod {
+    Info,
+    DbList,
+    DbCreate,
+    DbOpen,
+    DbConnect,
+    DbClose,
+    DbSetApiKey,
+    DbRemoveApiKey,
+}
+
+impl RootMethod {
+    /// Resolves a method name to its handler selector *and* its side-effect
+    /// class. This is the only place either is declared.
+    fn parse(method: &str) -> Option<(Self, MethodEffect)> {
+        use MethodEffect::{Mutating, Read};
+        Some(match method {
+            "info" => (Self::Info, Read),
+            "db.list" => (Self::DbList, Read),
+            "db.create" => (Self::DbCreate, Mutating),
+            "db.open" => (Self::DbOpen, Mutating),
+            "db.connect" => (Self::DbConnect, Mutating),
+            "db.close" => (Self::DbClose, Mutating),
+            "db.set_api_key" => (Self::DbSetApiKey, Mutating),
+            "db.remove_api_key" => (Self::DbRemoveApiKey, Mutating),
+            _ => return None,
+        })
+    }
+}
+
+/// Database-scope methods (`POST /{db_name}`). See [`RootMethod`] for why the
+/// side-effect class is declared inside [`DbMethod::parse`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DbMethod {
+    Info,
+    DbMetadata,
+    DbStats,
+    DbFlush,
+    DbSetReadOnly,
+    DbGetExtension,
+    DbSaveExtension,
+    DbRemoveExtension,
+    CollectionList,
+    CollectionCreate,
+    CollectionEnsure,
+    CollectionMetadata,
+    CollectionStats,
+    CollectionDelete,
+    CollectionFlush,
+    CollectionSetReadOnly,
+    CollectionGetExtension,
+    CollectionSaveExtension,
+    CollectionRemoveExtension,
+    DocAdd,
+    DocAddMany,
+    DocGet,
+    DocGetMany,
+    DocUpdate,
+    DocRemove,
+    DocExists,
+    DocCount,
+    DocSearch,
+    DocSearchIds,
+    DocQueryIds,
+}
+
+impl DbMethod {
+    /// Resolves a method name to its handler selector *and* its side-effect
+    /// class. This is the only place either is declared.
+    fn parse(method: &str) -> Option<(Self, MethodEffect)> {
+        use MethodEffect::{Mutating, Read};
+        Some(match method {
+            "info" => (Self::Info, Read),
+
+            // ─── database ────────────────────────────────────────────────
+            "db.metadata" => (Self::DbMetadata, Read),
+            "db.stats" => (Self::DbStats, Read),
+            "db.flush" => (Self::DbFlush, Mutating),
+            "db.set_read_only" => (Self::DbSetReadOnly, Mutating),
+            "db.get_extension" => (Self::DbGetExtension, Read),
+            "db.save_extension" => (Self::DbSaveExtension, Mutating),
+            "db.remove_extension" => (Self::DbRemoveExtension, Mutating),
+
+            // ─── collections ─────────────────────────────────────────────
+            "collection.list" => (Self::CollectionList, Read),
+            "collection.create" => (Self::CollectionCreate, Mutating),
+            "collection.ensure" => (Self::CollectionEnsure, Mutating),
+            "collection.metadata" => (Self::CollectionMetadata, Read),
+            "collection.stats" => (Self::CollectionStats, Read),
+            "collection.delete" => (Self::CollectionDelete, Mutating),
+            "collection.flush" => (Self::CollectionFlush, Mutating),
+            "collection.set_read_only" => (Self::CollectionSetReadOnly, Mutating),
+            "collection.get_extension" => (Self::CollectionGetExtension, Read),
+            "collection.save_extension" => (Self::CollectionSaveExtension, Mutating),
+            "collection.remove_extension" => (Self::CollectionRemoveExtension, Mutating),
+
+            // ─── documents ───────────────────────────────────────────────
+            "doc.add" => (Self::DocAdd, Mutating),
+            "doc.add_many" => (Self::DocAddMany, Mutating),
+            "doc.get" => (Self::DocGet, Read),
+            "doc.get_many" => (Self::DocGetMany, Read),
+            "doc.update" => (Self::DocUpdate, Mutating),
+            "doc.remove" => (Self::DocRemove, Mutating),
+            "doc.exists" => (Self::DocExists, Read),
+            "doc.count" => (Self::DocCount, Read),
+            "doc.search" => (Self::DocSearch, Read),
+            "doc.search_ids" => (Self::DocSearchIds, Read),
+            "doc.query_ids" => (Self::DocQueryIds, Read),
+
+            _ => return None,
+        })
+    }
 }
 
 /// Route-level timeout covering the *entire* request, including reading the
@@ -199,31 +347,21 @@ pub async fn normalize_rejections(req: Request<Body>, next: Next) -> Response {
     resp
 }
 
-/// Verifies the `Authorization: Bearer <key>` header when an API key is set.
-fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
-    if let Some(expected) = state.api_key() {
-        if expected.trim().is_empty() {
-            return Err(ApiError::unauthorized());
-        }
-
-        let Some(provided) = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-        else {
-            return Err(ApiError::unauthorized());
-        };
-
-        if !constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
-            return Err(ApiError::unauthorized());
-        }
-    }
-    Ok(())
+/// Extracts the credential from an `Authorization: Bearer <key>` header.
+///
+/// A malformed or absent header yields `None`, which every authorization
+/// path treats exactly like a wrong key.
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
 }
 
 /// Constant-time byte comparison to avoid a timing side channel on the API
-/// key. Only the length may leak, which is not considered secret.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+/// key. Callers compare fixed-length hashes (see [`crate::auth::ApiKeyHash`]),
+/// so not even the key length leaks.
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -234,81 +372,102 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// Root-scope dispatch. Reached only by [`Principal::Admin`], so every method
+/// here may see and change server-level state.
+///
+/// The match is exhaustive over [`RootMethod`]: a new variant does not
+/// compile until it is dispatched here and classified in
+/// [`RootMethod::parse`].
 async fn dispatch_root(
     state: &AppState,
     enc: Encoding,
-    req: RpcRequest,
+    method: RootMethod,
+    params: RpcParams,
 ) -> Result<Response, ApiError> {
-    let RpcRequest { method, params } = req;
-    let resp = match method.as_str() {
-        "info" => enc.reply(&state.info().await),
-        "db.list" => enc.reply(&state.db_names().await),
-        "db.create" => enc.reply(&root::register(state, OpenMode::Create, params.decode()?).await?),
-        "db.open" => enc.reply(&root::register(state, OpenMode::Open, params.decode()?).await?),
-        "db.connect" => {
+    let resp = match method {
+        RootMethod::Info => enc.reply(&state.info().await),
+        RootMethod::DbList => enc.reply(&state.db_names().await),
+        RootMethod::DbCreate => enc.reply(&root::create(state, params.decode()?).await?),
+        RootMethod::DbOpen => {
+            enc.reply(&root::register(state, OpenMode::Open, params.decode()?).await?)
+        }
+        RootMethod::DbConnect => {
             enc.reply(&root::register(state, OpenMode::Connect, params.decode()?).await?)
         }
-        "db.close" => enc.reply(&root::close(state, params.decode()?).await?),
-        _ => return Err(ApiError::method_not_found(&method)),
+        RootMethod::DbClose => enc.reply(&root::close(state, params.decode()?).await?),
+        RootMethod::DbSetApiKey => enc.reply(&root::set_api_key(state, params.decode()?).await?),
+        RootMethod::DbRemoveApiKey => {
+            enc.reply(&root::remove_api_key(state, params.decode()?).await?)
+        }
     };
     Ok(resp)
 }
 
+/// Database-scope dispatch, entered only after `db_name` was authorized for
+/// `principal`. Every method here is confined to that one database; the
+/// `principal` is needed only by `info`, which must not enumerate the
+/// instance for a per-database caller.
+///
+/// The match is exhaustive over [`DbMethod`]: a new variant does not compile
+/// until it is dispatched here and classified in [`DbMethod::parse`].
 async fn dispatch_db(
     state: &AppState,
     db_name: &str,
+    principal: Principal,
     enc: Encoding,
-    req: RpcRequest,
+    method: DbMethod,
+    params: RpcParams,
 ) -> Result<Response, ApiError> {
     let db = state.get_db(db_name).await?;
-    let RpcRequest { method, params } = req;
-    let resp = match method.as_str() {
-        "info" => enc.reply(&state.info().await),
+    let resp = match method {
+        DbMethod::Info => enc.reply(&state.scoped_info(principal, db_name).await),
 
         // ─── database ────────────────────────────────────────────────
-        "db.metadata" => enc.reply(&db.metadata()),
-        "db.stats" => enc.reply(&db.stats()),
-        "db.flush" => enc.reply(&db::flush(&db).await?),
-        "db.set_read_only" => enc.reply(&db::set_read_only(&db, params.decode()?)),
-        "db.get_extension" => enc.reply(&db::get_extension(&db, params.decode()?)),
-        "db.save_extension" => enc.reply(&db::save_extension(&db, params.decode()?).await?),
-        "db.remove_extension" => enc.reply(&db::remove_extension(&db, params.decode()?).await?),
+        DbMethod::DbMetadata => enc.reply(&db.metadata()),
+        DbMethod::DbStats => enc.reply(&db.stats()),
+        DbMethod::DbFlush => enc.reply(&db::flush(&db).await?),
+        DbMethod::DbSetReadOnly => enc.reply(&db::set_read_only(&db, params.decode()?)),
+        DbMethod::DbGetExtension => enc.reply(&db::get_extension(&db, params.decode()?)),
+        DbMethod::DbSaveExtension => enc.reply(&db::save_extension(&db, params.decode()?).await?),
+        DbMethod::DbRemoveExtension => {
+            enc.reply(&db::remove_extension(&db, params.decode()?).await?)
+        }
 
         // ─── collections ─────────────────────────────────────────────
-        "collection.list" => enc.reply(&db.metadata().collections),
-        "collection.create" => enc.reply(&collection::create(&db, params.decode()?).await?),
-        "collection.ensure" => enc.reply(&collection::ensure(&db, params.decode()?).await?),
-        "collection.metadata" => enc.reply(&collection::metadata(&db, params.decode()?).await?),
-        "collection.stats" => enc.reply(&collection::stats(&db, params.decode()?).await?),
-        "collection.delete" => enc.reply(&collection::delete(&db, params.decode()?).await?),
-        "collection.flush" => enc.reply(&collection::flush(&db, params.decode()?).await?),
-        "collection.set_read_only" => {
+        DbMethod::CollectionList => enc.reply(&db.metadata().collections),
+        DbMethod::CollectionCreate => enc.reply(&collection::create(&db, params.decode()?).await?),
+        DbMethod::CollectionEnsure => enc.reply(&collection::ensure(&db, params.decode()?).await?),
+        DbMethod::CollectionMetadata => {
+            enc.reply(&collection::metadata(&db, params.decode()?).await?)
+        }
+        DbMethod::CollectionStats => enc.reply(&collection::stats(&db, params.decode()?).await?),
+        DbMethod::CollectionDelete => enc.reply(&collection::delete(&db, params.decode()?).await?),
+        DbMethod::CollectionFlush => enc.reply(&collection::flush(&db, params.decode()?).await?),
+        DbMethod::CollectionSetReadOnly => {
             enc.reply(&collection::set_read_only(&db, params.decode()?).await?)
         }
-        "collection.get_extension" => {
+        DbMethod::CollectionGetExtension => {
             enc.reply(&collection::get_extension(&db, params.decode()?).await?)
         }
-        "collection.save_extension" => {
+        DbMethod::CollectionSaveExtension => {
             enc.reply(&collection::save_extension(&db, params.decode()?).await?)
         }
-        "collection.remove_extension" => {
+        DbMethod::CollectionRemoveExtension => {
             enc.reply(&collection::remove_extension(&db, params.decode()?).await?)
         }
 
         // ─── documents ───────────────────────────────────────────────
-        "doc.add" => enc.reply(&document::add(&db, params.decode()?).await?),
-        "doc.add_many" => enc.reply(&document::add_many(&db, params.decode()?).await?),
-        "doc.get" => enc.reply(&document::get(&db, params.decode()?).await?),
-        "doc.get_many" => enc.reply(&document::get_many(&db, params.decode()?).await?),
-        "doc.update" => enc.reply(&document::update(&db, params.decode()?).await?),
-        "doc.remove" => enc.reply(&document::remove(&db, params.decode()?).await?),
-        "doc.exists" => enc.reply(&document::exists(&db, params.decode()?).await?),
-        "doc.count" => enc.reply(&document::count(&db, params.decode()?).await?),
-        "doc.search" => enc.reply(&document::search(&db, params.decode()?).await?),
-        "doc.search_ids" => enc.reply(&document::search_ids(&db, params.decode()?).await?),
-        "doc.query_ids" => enc.reply(&document::query_ids(&db, params.decode()?).await?),
-
-        _ => return Err(ApiError::method_not_found(&method)),
+        DbMethod::DocAdd => enc.reply(&document::add(&db, params.decode()?).await?),
+        DbMethod::DocAddMany => enc.reply(&document::add_many(&db, params.decode()?).await?),
+        DbMethod::DocGet => enc.reply(&document::get(&db, params.decode()?).await?),
+        DbMethod::DocGetMany => enc.reply(&document::get_many(&db, params.decode()?).await?),
+        DbMethod::DocUpdate => enc.reply(&document::update(&db, params.decode()?).await?),
+        DbMethod::DocRemove => enc.reply(&document::remove(&db, params.decode()?).await?),
+        DbMethod::DocExists => enc.reply(&document::exists(&db, params.decode()?).await?),
+        DbMethod::DocCount => enc.reply(&document::count(&db, params.decode()?).await?),
+        DbMethod::DocSearch => enc.reply(&document::search(&db, params.decode()?).await?),
+        DbMethod::DocSearchIds => enc.reply(&document::search_ids(&db, params.decode()?).await?),
+        DbMethod::DocQueryIds => enc.reply(&document::query_ids(&db, params.decode()?).await?),
     };
     Ok(resp)
 }
@@ -363,10 +522,12 @@ mod tests {
             async move {
                 execute_rpc(
                     &state,
+                    Scope::Root,
                     Encoding::Json,
                     &headers,
                     &body,
-                    move |_state, enc, _req| async move {
+                    RootMethod::parse,
+                    move |_state, enc, _method, _params, _principal| async move {
                         let _drop_flag = DropFlag(dropped);
                         entered.add_permits(1);
                         std::future::pending::<()>().await;
@@ -403,10 +564,12 @@ mod tests {
             async move {
                 execute_rpc(
                     &state,
+                    Scope::Root,
                     Encoding::Json,
                     &headers,
                     &body,
-                    move |_state, enc, _req| async move {
+                    DbMethod::parse,
+                    move |_state, enc, _method, _params, _principal| async move {
                         entered.add_permits(1);
                         release.acquire().await.unwrap().forget();
                         Ok(enc.reply(&()))
@@ -425,10 +588,12 @@ mod tests {
             async move {
                 execute_rpc(
                     &state,
+                    Scope::Root,
                     Encoding::Json,
                     &headers,
                     &body,
-                    move |_state, enc, _req| async move {
+                    DbMethod::parse,
+                    move |_state, enc, _method, _params, _principal| async move {
                         second_polled.store(true, Ordering::Release);
                         Ok(enc.reply(&()))
                     },

@@ -699,7 +699,8 @@ fn generate_recovery_suggestion(
     if innermost.contains("CONCEPT") && innermost.contains("?local_handle") {
         return Some(
             "CONCEPT block syntax: CONCEPT [?handle] { {type: \"T\", name: \"N\"} [SET ATTRIBUTES {...}] [SET PROPOSITIONS {...}] }. \
-             The concept matcher {type: \"...\", name: \"...\"} or {id: \"...\"} or {type: \"...\"} or {name: \"...\"} is required. \
+             The concept identity {type: \"...\", name: \"...\"} or {id: \"...\"} is required — \
+             {type: \"...\"} or {name: \"...\"} alone identifies no single node. \
              Handle is optional: CONCEPT { ... } is also valid."
                 .to_string(),
         );
@@ -708,7 +709,8 @@ fn generate_recovery_suggestion(
     if innermost.contains("PROPOSITION") && innermost.contains("?local_handle") {
         return Some(
             "PROPOSITION block syntax: PROPOSITION [?handle] { (subject, \"predicate\", object) [SET ATTRIBUTES {...}] }. \
-             Subject/object can be: ?variable, {type: \"T\", name: \"N\"}, {id: \"...\"}, or {type: \"...\"}, or {name: \"...\"}."
+             The predicate must be a literal string. \
+             Subject/object can be: ?variable, {type: \"T\", name: \"N\"}, or {id: \"...\"}."
                 .to_string(),
         );
     }
@@ -724,7 +726,8 @@ fn generate_recovery_suggestion(
     if innermost.contains("SET PROPOSITIONS") {
         return Some(
             "SET PROPOSITIONS syntax: SET PROPOSITIONS { (\"predicate\", target) [WITH METADATA {...}] ... }. \
-             Target can be: ?variable, {type: \"T\", name: \"N\"}, {id: \"...\"}, or {type: \"...\"}, or {name: \"...\"}."
+             Target can be: ?variable, {type: \"T\", name: \"N\"}, or {id: \"...\"} — it must identify \
+             one existing element, so {type: \"...\"} or {name: \"...\"} alone is not accepted."
                 .to_string(),
         );
     }

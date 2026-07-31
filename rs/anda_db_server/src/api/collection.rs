@@ -11,7 +11,7 @@ use anda_db::{
     database::AndaDB,
     error::DBError,
     index::HnswConfig,
-    schema::{FieldType, Fv, Schema, validate_field_name},
+    schema::{FieldType, Fv, Schema, as_wildcard_map, validate_field_name},
 };
 use serde::Deserialize;
 use std::sync::Arc;
@@ -88,6 +88,16 @@ pub struct CollectionSetReadOnlyParams {
 }
 
 /// Opens a collection, loading it from storage on first access.
+///
+/// The engine call runs on its own task, never inline. Read RPCs are
+/// dispatched on the cancellable path (their future is dropped on client
+/// disconnect, request timeout, or shutdown), but `AndaDB::open_collection`
+/// finishes a cold open with `Collection::flush`, which arms a cancel guard
+/// that **poisons the handle** if its future is dropped mid-write. Without
+/// this hop, the first `doc.get` on a cold collection that hit the request
+/// timeout poisoned a perfectly healthy collection for every concurrent and
+/// subsequent operation. Dropping the caller now only detaches the join
+/// handle; the open itself runs to completion.
 pub async fn open(db: &AndaDB, name: &str) -> Result<Arc<Collection>, ApiError> {
     // Prove the client-facing 404 from logical metadata before entering the
     // engine. A later NotFound can mean missing/corrupt persisted collection
@@ -97,9 +107,22 @@ pub async fn open(db: &AndaDB, name: &str) -> Result<Arc<Collection>, ApiError> 
             "collection {name:?} not found"
         )));
     }
-    Ok(db
-        .open_collection(name.to_string(), async |_| Ok(()))
-        .await?)
+    let opening = tokio::spawn({
+        let db = db.clone();
+        let name = name.to_string();
+        async move { db.open_collection(name, async |_| Ok(())).await }
+    });
+    match opening.await {
+        Ok(result) => Ok(result?),
+        Err(err) => {
+            log::error!(
+                action = "collection::open",
+                collection = name;
+                "collection open task failed: {err:?}",
+            );
+            Err(ApiError::internal("internal server error"))
+        }
+    }
 }
 
 fn btree_type_is_supported(field_type: &FieldType) -> bool {
@@ -112,10 +135,12 @@ fn btree_type_is_supported(field_type: &FieldType) -> bool {
     };
     let key_type = match field_type {
         FieldType::Array(inner) if inner.len() == 1 => inner[0].clone(),
-        FieldType::Map(inner) if inner.len() == 1 => {
-            let Some(key) = inner.keys().next() else {
-                return false;
-            };
+        // `as_wildcard_map` is the shared rule the engine uses. A one-entry
+        // map that a nested `FieldTyped` struct declares is *not* a wildcard,
+        // so it falls through and is rejected here — otherwise the index would
+        // be accepted and then fail inside `BTree::new`.
+        FieldType::Map(inner) if as_wildcard_map(inner).is_some() => {
+            let key = as_wildcard_map(inner).expect("wildcard checked above").0;
             key.field_type()
         }
         other => other.clone(),
@@ -142,6 +167,16 @@ fn validate_definition(params: &CreateCollectionParams) -> Result<(), ApiError> 
                     "B-Tree index field {name:?} is not declared in the schema"
                 )));
             }
+        }
+        // The engine rejects a single-field `_id` index: the primary key is
+        // answered from the always-present id bitmap, so such an index could
+        // never serve a query. Say so here instead of returning the engine's
+        // generic failure.
+        if fields.len() == 1 && fields[0] == Schema::ID_KEY {
+            return Err(ApiError::invalid_input(format!(
+                "B-Tree index on {:?} is not supported: the primary key is always queryable",
+                Schema::ID_KEY
+            )));
         }
         if fields.len() == 1 {
             let field = params
@@ -188,7 +223,19 @@ fn validate_definition(params: &CreateCollectionParams) -> Result<(), ApiError> 
     Ok(())
 }
 
+/// Rejects a write the collection cannot accept, with a status the client can
+/// act on.
+///
+/// `stats().read_only` alone is not enough: a handle that a cancelled
+/// operation poisoned, or that is closing or already deleted, is not
+/// read-only, so its writes surfaced as an opaque 500.
+/// [`ApiError::from_collection_state`] splits the recoverable states (retry)
+/// from the deleted ones (gone); the same classification is applied to errors
+/// the engine raises later, in `ApiError::from(DBError)`.
 pub(super) fn ensure_writable(collection: &Collection) -> Result<(), ApiError> {
+    if let Some(err) = ApiError::from_collection_state(collection.state()) {
+        return Err(err);
+    }
     if collection.stats().read_only {
         return Err(ApiError::conflict(format!(
             "collection {:?} is read-only",

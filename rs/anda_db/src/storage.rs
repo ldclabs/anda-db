@@ -319,7 +319,7 @@ impl Storage {
             .fetch::<StorageMetadata>(Storage::METADATA_PATH)
             .await
         {
-            Ok((metadata, _)) => {
+            Ok((mut metadata, _)) => {
                 // The persisted configuration is authoritative; the
                 // caller-supplied config is only used at first initialization.
                 if metadata.config != storage.inner.metadata.config {
@@ -331,6 +331,24 @@ impl Storage {
                         storage.inner.metadata.config,
                     );
                 }
+
+                // The caller-supplied path, unlike the config, is
+                // authoritative: a relocated or restored dataset must operate
+                // on the prefix it was opened at. Adopting the persisted path
+                // would send every read, write and `drop_data` to the original
+                // location. Reconcile the persisted field so it stays
+                // self-consistent from the next `store_metadata` on.
+                if metadata.path != storage.inner.metadata.path {
+                    log::warn!(
+                        action = "Storage::connect",
+                        path = storage.inner.metadata.path;
+                        "Adopting caller-supplied storage path that differs from the persisted one: persisted={:?}, supplied={:?}",
+                        metadata.path,
+                        storage.inner.metadata.path,
+                    );
+                    metadata.path = storage.inner.metadata.path.clone();
+                }
+
                 Storage::new(object_store, metadata)
             }
             Err(DBError::NotFound { .. }) => Ok(storage),
@@ -623,7 +641,14 @@ impl Storage {
     }
 
     /// Creates an asynchronous reader (`AsyncRead`) for streaming a document's content.
-    /// Handles decompression automatically if enabled.
+    ///
+    /// Decompression is decided by the object's **content**, exactly like the
+    /// buffered path ([`Storage::fetch_bytes`] / `try_decompress`): objects
+    /// that start with the zstd magic are decompressed, everything else is
+    /// streamed through untouched. Keying it off `compress_level` instead was
+    /// wrong in both directions — `try_compress` stores the *original* bytes
+    /// whenever compression did not shrink them, so a compressing storage
+    /// legitimately holds uncompressed objects.
     ///
     /// # Arguments
     ///
@@ -631,7 +656,9 @@ impl Storage {
     ///
     /// # Errors
     ///
-    /// Returns `DBError` if fetching the object metadata fails.
+    /// Returns `DBError` if fetching the object metadata fails. The returned
+    /// reader fails with an I/O error if a compressed object expands beyond
+    /// the same decompression-bomb bound `inner_fetch` applies.
     pub async fn stream_reader(
         &self,
         doc_path: &str,
@@ -643,16 +670,34 @@ impl Storage {
             .head(&path)
             .await
             .map_err(DBError::from)?;
-        let reader = BufReader::with_capacity(
+        let mut reader = BufReader::with_capacity(
             self.inner.object_store.clone(),
             &meta,
             self.inner.metadata.config.object_chunk_size,
         );
 
+        // `fill_buf` peeks at the head of the stream without consuming it, so
+        // the magic bytes are still delivered to whichever branch is chosen.
+        let compressed = {
+            let head = tokio::io::AsyncBufReadExt::fill_buf(&mut reader)
+                .await
+                .map_err(|err| DBError::Storage {
+                    name: path.to_string(),
+                    source: err.into(),
+                })?;
+            zstd_compressed(head)
+        };
+
         // Coerce both branches to the same trait-object type to avoid
         // concrete-type mismatches between `ZstdDecoder` and `BufReader`.
-        if self.inner.metadata.config.compress_level > 0 {
-            let r: Pin<Box<dyn tokio::io::AsyncRead + Send>> = Box::pin(ZstdDecoder::new(reader));
+        if compressed {
+            let max_decompress_size =
+                (self.inner.metadata.config.max_small_object_size as u64).saturating_mul(16);
+            let r: Pin<Box<dyn tokio::io::AsyncRead + Send>> = Box::pin(BoundedReader::new(
+                Box::pin(ZstdDecoder::new(reader)),
+                max_decompress_size,
+                path.to_string(),
+            ));
             Ok(r)
         } else {
             let r: Pin<Box<dyn tokio::io::AsyncRead + Send>> = Box::pin(reader);
@@ -789,6 +834,12 @@ impl Storage {
     /// Data is written in chunks using the underlying object store's multipart upload or equivalent.
     /// Handles compression automatically if enabled.
     ///
+    /// The object becomes visible when the writer is shut down; that is also
+    /// when the write is accounted in [`StorageStats`] and the path is
+    /// invalidated in the read cache, exactly like `InnerStorage::put`. A
+    /// writer that is dropped without `shutdown` never publishes an object,
+    /// so it needs no invalidation.
+    ///
     /// # Arguments
     ///
     /// * `doc_path` - The relative path of the object.
@@ -804,14 +855,21 @@ impl Storage {
         // Coerce both branches to the same `Send` trait-object type so the writer
         // can be held across await points and moved into spawned tasks, mirroring
         // `stream_reader`.
-        if self.inner.metadata.config.compress_level > 0 {
-            let w: Pin<Box<dyn tokio::io::AsyncWrite + Send>> =
-                Box::pin(ZstdEncoder::with_quality(writer, level));
-            w
-        } else {
-            let w: Pin<Box<dyn tokio::io::AsyncWrite + Send>> = Box::pin(writer);
-            w
-        }
+        let inner: Pin<Box<dyn tokio::io::AsyncWrite + Send>> =
+            if self.inner.metadata.config.compress_level > 0 {
+                Box::pin(ZstdEncoder::with_quality(writer, level))
+            } else {
+                Box::pin(writer)
+            };
+
+        Box::pin(StreamWriter {
+            storage: self.inner.clone(),
+            path,
+            inner,
+            written: 0,
+            completing: None,
+            completed: false,
+        })
     }
 
     /// Deletes a document from the object store and removes it from the cache if present.
@@ -1019,18 +1077,175 @@ impl InnerStorage {
             .await
             .map_err(DBError::from)?;
 
+        self.published_write(&path, original_len as u64).await;
+
+        Ok(result.into())
+    }
+
+    /// Records a write that just became visible in the object store: bumps the
+    /// generations that invalidate cached reads of `path`, evicts the stale
+    /// cache entry and accounts the write.
+    ///
+    /// Every write path must call this. The generation bump is what makes the
+    /// cache coherent (a cached entry whose `write_seq` no longer matches is
+    /// not served, and `inner_get` refuses to insert an entry across a
+    /// concurrent bump); the eviction only reclaims memory earlier.
+    async fn published_write(&self, path: &Path, bytes: u64) {
         self.write_seq.fetch_add(1, Ordering::AcqRel);
-        self.bump_cache_write_seq(&path);
+        self.bump_cache_write_seq(path);
         if let Some(cache) = &self.cache {
-            cache.remove(&path).await;
+            cache.remove(path).await;
         }
 
         self.stats.total_put_count.fetch_add(1, Ordering::Relaxed);
         self.stats
             .total_put_bytes
-            .fetch_add(original_len as u64, Ordering::Relaxed);
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+}
 
-        Ok(result.into())
+/// Streaming writer returned by [`Storage::stream_writer`].
+///
+/// It wraps the (optionally compressing) object-store writer purely to run the
+/// same post-write bookkeeping as [`InnerStorage::put`] once the object is
+/// actually published. Without it a `stream_writer` overwrite left the read
+/// cache holding the previous value: `get` kept returning stale data until an
+/// unrelated write happened to land in the same generation stripe.
+struct StreamWriter {
+    storage: Arc<InnerStorage>,
+    path: Path,
+    inner: Pin<Box<dyn tokio::io::AsyncWrite + Send>>,
+    /// Bytes handed to this writer (pre-compression), mirroring the
+    /// `original_len` accounting of `InnerStorage::put`.
+    written: u64,
+    /// In-flight bookkeeping future, polled to completion by `poll_shutdown`.
+    completing: Option<BoxFuture<'static, ()>>,
+    completed: bool,
+}
+
+impl tokio::io::AsyncWrite for StreamWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        match this.inner.as_mut().poll_write(cx, buf) {
+            Poll::Ready(Ok(n)) => {
+                this.written += n as u64;
+                Poll::Ready(Ok(n))
+            }
+            other => other,
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.get_mut().inner.as_mut().poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if this.completed {
+            return Poll::Ready(Ok(()));
+        }
+
+        if this.completing.is_none() {
+            // The object is published by the inner shutdown; only then may the
+            // cache be invalidated, or a concurrent reader could re-cache the
+            // pre-write bytes after the invalidation.
+            match this.inner.as_mut().poll_shutdown(cx) {
+                Poll::Ready(Ok(())) => {}
+                other => return other,
+            }
+
+            let storage = this.storage.clone();
+            let path = this.path.clone();
+            let written = this.written;
+            this.completing = Some(Box::pin(async move {
+                storage.published_write(&path, written).await;
+            }));
+        }
+
+        let fut = this
+            .completing
+            .as_mut()
+            .expect("completion future is set above");
+        match fut.poll_unpin(cx) {
+            Poll::Ready(()) => {
+                this.completing = None;
+                this.completed = true;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// Caps how many bytes a decompressing stream may produce.
+///
+/// The buffered path (`try_decompress`) refuses to expand an object beyond
+/// `max_small_object_size * 16`; without an equivalent bound a crafted object
+/// could stream unbounded data into the caller's buffer.
+struct BoundedReader {
+    inner: Pin<Box<dyn tokio::io::AsyncRead + Send>>,
+    remaining: u64,
+    limit: u64,
+    path: String,
+}
+
+impl BoundedReader {
+    fn new(inner: Pin<Box<dyn tokio::io::AsyncRead + Send>>, limit: u64, path: String) -> Self {
+        Self {
+            inner,
+            remaining: limit,
+            limit,
+            path,
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for BoundedReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+
+        if this.remaining == 0 {
+            // The budget is spent. Probe for one more byte to tell "the stream
+            // ends exactly at the bound" (EOF, a normal read) from "the stream
+            // keeps expanding" (over the bound, an error). The probe byte is
+            // discarded, which is safe because that case never returns data.
+            let mut probe = [0u8; 1];
+            let mut probe_buf = tokio::io::ReadBuf::new(&mut probe);
+            return match this.inner.as_mut().poll_read(cx, &mut probe_buf) {
+                Poll::Ready(Ok(())) if probe_buf.filled().is_empty() => Poll::Ready(Ok(())),
+                Poll::Ready(Ok(())) => Poll::Ready(Err(io::Error::other(format!(
+                    "decompressed stream of {} exceeds the maximum of {}",
+                    this.path, this.limit
+                )))),
+                other => other,
+            };
+        }
+
+        // Never hand the inner reader more room than the remaining budget:
+        // an `AsyncRead` that errors must not have filled the caller's buffer.
+        let cap = (this.remaining.min(buf.remaining() as u64)) as usize;
+        let mut limited = buf.take(cap);
+        match this.inner.as_mut().poll_read(cx, &mut limited) {
+            Poll::Ready(Ok(())) => {
+                let produced = limited.filled().len();
+                // Safety: `produced` bytes of `buf`'s unfilled region were
+                // just initialized by the inner reader (same contract as
+                // `tokio::io::Take`).
+                unsafe { buf.assume_init(produced) };
+                buf.advance(produced);
+                this.remaining -= produced as u64;
+                Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
     }
 }
 
@@ -1463,6 +1678,74 @@ mod tests {
         assert_eq!(reopened_stats.check_point, 42);
         assert_eq!(reopened_stats.last_saved, 123_456);
         assert_eq!(reopened_stats.version, 1);
+    }
+
+    #[tokio::test]
+    async fn test_storage_connect_adopts_caller_path_after_relocation() {
+        #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+        struct TestDoc {
+            value: i32,
+        }
+
+        let object_store = Arc::new(InMemory::new());
+        let config = StorageConfig {
+            compress_level: 0,
+            ..Default::default()
+        };
+
+        let origin = Storage::connect("p1".to_string(), object_store.clone(), config.clone())
+            .await
+            .unwrap();
+        origin.create("doc", &TestDoc { value: 1 }).await.unwrap();
+        origin.store_metadata(1, unix_ms()).await.unwrap();
+        drop(origin);
+
+        // 把 p1 下的所有对象复制到 p2，模拟数据集被搬迁/恢复到新前缀
+        let locations: Vec<Path> = object_store
+            .list(Some(&Path::from("p1")))
+            .map_ok(|meta| meta.location)
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(!locations.is_empty());
+        for from in &locations {
+            let to = Path::from(format!("p2/{}", from.as_ref().trim_start_matches("p1/")));
+            object_store.copy(from, &to).await.unwrap();
+        }
+
+        // 打开方给出的前缀才是权威：持久化的 path 必须被对齐，
+        // 否则所有读写（以及 drop_data）都会打到原始位置上
+        let relocated = Storage::connect("p2".to_string(), object_store.clone(), config)
+            .await
+            .unwrap();
+        assert_eq!(relocated.base_path().as_ref(), "p2");
+        assert_eq!(relocated.metadata().path, "p2");
+        // 持久化的其余字段仍然生效
+        assert_eq!(relocated.stats().check_point, 1);
+
+        relocated
+            .put("doc", &TestDoc { value: 2 }, None)
+            .await
+            .unwrap();
+        relocated.store_metadata(2, unix_ms()).await.unwrap();
+        relocated.drop_data().await.unwrap();
+
+        // p2 被清空，p1 原封不动
+        let remaining: Vec<Path> = object_store
+            .list(Some(&Path::from("p2")))
+            .map_ok(|meta| meta.location)
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(remaining.is_empty());
+
+        let origin = Storage::connect("p1".to_string(), object_store, StorageConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(origin.base_path().as_ref(), "p1");
+        assert_eq!(origin.metadata().path, "p1");
+        let (doc, _) = origin.get::<TestDoc>("doc").await.unwrap();
+        assert_eq!(doc, TestDoc { value: 1 });
     }
 
     #[tokio::test]
@@ -2275,5 +2558,150 @@ mod tests {
             .unwrap();
         assert_eq!(users_offset.len(), 1);
         assert_eq!(users_offset[0].0.id, 3);
+    }
+
+    /// Deterministic pseudo-random bytes: zstd cannot shrink them, so
+    /// `try_compress` stores the original payload even with compression on.
+    fn incompressible_bytes(len: usize) -> Vec<u8> {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 24) as u8
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_stream_reader_sniffs_content_instead_of_trusting_config() {
+        // compress_level > 0 does not mean every stored object is compressed:
+        // `try_compress` keeps the original bytes when compression does not
+        // shrink them. Decompressing based on the flag failed those objects
+        // with "Unknown frame descriptor" while `fetch_bytes` round-tripped.
+        let storage = create_test_storage().await;
+        assert!(storage.metadata().config.compress_level > 0);
+
+        let data = incompressible_bytes(4096);
+        storage
+            .put_bytes("blob", Bytes::from(data.clone()), PutMode::Create)
+            .await
+            .unwrap();
+
+        // The object was stored verbatim (no zstd magic).
+        let raw = storage
+            .inner
+            .object_store
+            .get(&storage.full_path("blob"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert!(!zstd_compressed(raw.as_ref()));
+
+        let (buffered, _) = storage.fetch_bytes("blob").await.unwrap();
+        assert_eq!(buffered.as_ref(), &data[..]);
+
+        let mut reader = storage.stream_reader("blob").await.unwrap();
+        let mut streamed = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut streamed)
+            .await
+            .expect("stream_reader must not decompress a plain object");
+        assert_eq!(streamed, data);
+
+        // A genuinely compressed object is still decompressed transparently.
+        let compressible = vec![b'z'; 8192];
+        storage
+            .put_bytes(
+                "compressible",
+                Bytes::from(compressible.clone()),
+                PutMode::Create,
+            )
+            .await
+            .unwrap();
+        let raw = storage
+            .inner
+            .object_store
+            .get(&storage.full_path("compressible"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert!(zstd_compressed(raw.as_ref()));
+        let mut reader = storage.stream_reader("compressible").await.unwrap();
+        let mut streamed = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut streamed)
+            .await
+            .unwrap();
+        assert_eq!(streamed, compressible);
+    }
+
+    #[tokio::test]
+    async fn test_stream_reader_bounds_decompressed_size() {
+        let object_store = Arc::new(InMemory::new());
+        // A tiny small-object limit keeps the bomb bound (16x) small enough to
+        // exercise without writing gigabytes.
+        let config = StorageConfig {
+            compress_level: 3,
+            max_small_object_size: 1024,
+            ..Default::default()
+        };
+        let storage = Storage::connect("bomb".to_string(), object_store, config)
+            .await
+            .unwrap();
+
+        // 16 KiB is exactly the bound; 16 KiB + 1 must fail. Both compress far
+        // below `max_small_object_size`, so they can be stored at all.
+        let payload = vec![b'q'; 1024 * 16 + 1];
+        let compressed = try_compress(Bytes::from(payload), 3);
+        assert!(zstd_compressed(compressed.as_ref()));
+        storage
+            .inner
+            .object_store
+            .put(&storage.full_path("bomb"), compressed.into())
+            .await
+            .unwrap();
+
+        let mut reader = storage.stream_reader("bomb").await.unwrap();
+        let mut out = Vec::new();
+        let err = tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut out)
+            .await
+            .expect_err("a stream expanding past the bound must fail");
+        assert!(err.to_string().contains("exceeds the maximum"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_stream_writer_invalidates_cache_and_accounts_the_write() {
+        let storage = create_test_storage().await;
+
+        storage.put("cached", &1u64, None).await.unwrap();
+        // Populate the read cache.
+        assert_eq!(storage.get::<u64>("cached").await.unwrap().0, 1u64);
+
+        let before = storage.stats();
+
+        let mut payload = Vec::new();
+        to_writer(&2u64, &mut payload).unwrap();
+        let payload_len = payload.len() as u64;
+        let mut writer = storage.stream_writer("cached");
+        tokio::io::AsyncWriteExt::write_all(&mut writer, &payload)
+            .await
+            .unwrap();
+        tokio::io::AsyncWriteExt::shutdown(&mut writer)
+            .await
+            .unwrap();
+        drop(writer);
+
+        // Before the fix this still returned the cached `1`: `stream_writer`
+        // bumped neither the write generation nor the cache entry.
+        assert_eq!(storage.get::<u64>("cached").await.unwrap().0, 2u64);
+        assert_eq!(storage.fetch::<u64>("cached").await.unwrap().0, 2u64);
+
+        let after = storage.stats();
+        assert_eq!(after.total_put_count, before.total_put_count + 1);
+        assert_eq!(after.total_put_bytes, before.total_put_bytes + payload_len);
     }
 }

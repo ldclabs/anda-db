@@ -11,9 +11,10 @@ use anda_db::{
     error::DBError,
     index::{from_virtual_field_name, virtual_field_value},
     query::{Filter, Query, RangeQuery},
-    schema::{Document, DocumentId, FieldType, Fv, Schema, bf16},
+    schema::{Document, DocumentId, FieldType, Fv, Schema, as_wildcard_map, bf16},
 };
 use anda_db_tfs::QueryType;
+use futures::stream::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -237,7 +238,12 @@ async fn add_validated_document(
     }
 }
 
-fn validate_update_fields(schema: &Schema, fields: &BTreeMap<String, Fv>) -> Result<(), ApiError> {
+/// Validates the requested field updates and returns them in the canonical
+/// shape the engine stores, so callers coerce exactly once.
+fn coerce_update_fields(
+    schema: &Schema,
+    fields: &BTreeMap<String, Fv>,
+) -> Result<BTreeMap<String, Fv>, ApiError> {
     if fields.is_empty() {
         return Err(ApiError::invalid_input(
             "doc.update requires at least one field",
@@ -246,15 +252,21 @@ fn validate_update_fields(schema: &Schema, fields: &BTreeMap<String, Fv>) -> Res
     if fields.contains_key(Schema::ID_KEY) {
         return Err(ApiError::invalid_input("document _id cannot be updated"));
     }
+    // `FieldEntry::coerce`, not `validate`: `doc.add` sends every value
+    // through `Document::try_from`'s CBOR coercion, so a `Bytes` field
+    // accepts `[1, 2, 3]` there. Validating the raw wire value here would let
+    // a client create a document it cannot then update.
+    let mut coerced = BTreeMap::new();
     for (name, value) in fields {
         let field = schema.get_field(name).ok_or_else(|| {
             ApiError::invalid_input(format!("field {name:?} is not declared in the schema"))
         })?;
-        field
-            .validate(value)
+        let value = field
+            .coerce(value.clone())
             .map_err(|err| ApiError::invalid_input(err.to_string()))?;
+        coerced.insert(name.clone(), value);
     }
-    Ok(())
+    Ok(coerced)
 }
 
 fn proposed_update(
@@ -277,9 +289,11 @@ fn range_matches_field_type(field_type: &FieldType, query: &RangeQuery<Fv>) -> O
         FieldType::Bytes => Some(RangeQuery::<Vec<u8>>::try_convert_from(query.clone()).is_ok()),
         FieldType::Option(inner) => range_matches_field_type(inner, query),
         FieldType::Array(inner) if inner.len() == 1 => range_matches_field_type(&inner[0], query),
-        FieldType::Map(inner) if inner.len() == 1 => {
-            let key_type = inner.keys().next()?.field_type();
-            range_matches_field_type(&key_type, query)
+        // Only a *wildcard* map indexes its keys. A one-entry map declared by
+        // a nested `FieldTyped` struct is not one, so `as_wildcard_map` is the
+        // shared rule rather than a one-entry approximation of it.
+        FieldType::Map(inner) => {
+            range_matches_field_type(&as_wildcard_map(inner)?.0.field_type(), query)
         }
         // A persisted B-Tree with any other key type is an internal metadata
         // inconsistency, not a client query error.
@@ -460,20 +474,43 @@ pub async fn get(db: &AndaDB, params: DocumentIdParams) -> Result<Fv, ApiError> 
     Ok(collection.get_as(params._id).await?)
 }
 
+/// Maximum number of IDs accepted by a single `doc.get_many` call.
+///
+/// Each ID costs one object-store fetch, and the request allocates a result
+/// vector sized from the client-supplied list, so an uncapped batch turns a
+/// 2 MiB body (roughly 230k IDs) into one request. The bound matches the
+/// number of documents a single `doc.search` can return.
+const MAX_GET_MANY_IDS: usize = 1_000;
+
 /// `doc.get_many` — returns one entry per requested ID, `null` for missing
-/// documents.
+/// documents. Duplicate IDs are answered once per occurrence.
 pub async fn get_many(db: &AndaDB, params: DocumentIdsParams) -> Result<Vec<Option<Fv>>, ApiError> {
+    if params._ids.len() > MAX_GET_MANY_IDS {
+        return Err(ApiError::invalid_input(format!(
+            "doc.get_many accepts at most {MAX_GET_MANY_IDS} ids, got {}",
+            params._ids.len()
+        )));
+    }
+
     let collection = open(db, &params.collection).await?;
-    let mut docs = Vec::with_capacity(params._ids.len());
-    for id in params._ids {
-        if !collection.contains(id) {
-            docs.push(None);
-            continue;
-        }
-        match collection.get_as::<Fv>(id).await {
-            Ok(doc) => docs.push(Some(doc)),
-            Err(err) => return Err(err.into()),
-        }
+    let requested = params._ids.len();
+    // Same shape as `Collection::search`'s id→document expansion: a batch
+    // request would otherwise be N serial object-store round trips.
+    let mut stream = futures::stream::iter(params._ids)
+        .map(|id| {
+            let collection = collection.clone();
+            async move {
+                if !collection.contains(id) {
+                    return Ok(None);
+                }
+                collection.get_as::<Fv>(id).await.map(Some)
+            }
+        })
+        .buffered(8);
+
+    let mut docs = Vec::with_capacity(requested);
+    while let Some(doc) = stream.next().await {
+        docs.push(doc?);
     }
     Ok(docs)
 }
@@ -490,7 +527,9 @@ pub async fn update(db: &AndaDB, params: UpdateParams) -> Result<Fv, ApiError> {
     }
     let mut fields = params.fields;
     coerce_vector_fields(&collection.schema(), &mut fields)?;
-    validate_update_fields(&collection.schema(), &fields)?;
+    // Coerce once; `proposed_update`'s `set_field` normalizes but does not
+    // coerce, so it must receive the canonical values.
+    let fields = coerce_update_fields(&collection.schema(), &fields)?;
     let prospective = proposed_update(collection.get(params._id).await?, &fields)?;
     if let Some(index) = find_unique_conflict(&collection, &prospective, Some(params._id))? {
         return Err(unique_conflict_error(&index));
@@ -571,15 +610,34 @@ pub async fn search_ids(db: &AndaDB, params: SearchParams) -> Result<Vec<Documen
     Ok(collection.search_ids(params.query).await?)
 }
 
+/// Maximum number of document IDs a single `doc.query_ids` call may return.
+///
+/// An omitted `limit` used to mean "every matching ID", so a one-line request
+/// with a broad filter returned one `DocumentId` per document in the
+/// collection in a single response body. It now means this bound, matching
+/// the engine's own `Collection::MAX_SEARCH_LIMIT`; an explicit `0` keeps its
+/// "no data requested" meaning.
+const MAX_QUERY_IDS: usize = 1_000;
+
 /// `doc.query_ids` — returns document IDs matching a B-Tree filter.
 pub async fn query_ids(db: &AndaDB, params: QueryIdsParams) -> Result<Vec<DocumentId>, ApiError> {
+    let limit = match params.limit {
+        Some(limit) if limit > MAX_QUERY_IDS => {
+            return Err(ApiError::invalid_input(format!(
+                "doc.query_ids accepts a limit of at most {MAX_QUERY_IDS}, got {limit}"
+            )));
+        }
+        Some(limit) => limit,
+        None => MAX_QUERY_IDS,
+    };
+
     let collection = open(db, &params.collection).await?;
     params
         .filter
         .validate_complexity()
         .map_err(ApiError::invalid_query)?;
     validate_filter(&collection.metadata(), &params.filter)?;
-    Ok(collection.query_ids(params.filter, params.limit).await?)
+    Ok(collection.query_ids(params.filter, Some(limit)).await?)
 }
 
 #[cfg(test)]

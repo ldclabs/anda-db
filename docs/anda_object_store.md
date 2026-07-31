@@ -6,7 +6,7 @@ with two composable wrappers:
 
 | Wrapper          | Purpose                                                                                                                                          |
 | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `MetaStore`      | Side-car metadata (size, content-addressable ETag). Provides uniform conditional-update semantics on top of any backend.                         |
+| `MetaStore`      | Side-car metadata (size, per-commit logical ETag). Provides uniform conditional-update semantics on top of any backend.                          |
 | `EncryptedStore` | Transparent, chunked AES-256-GCM encryption-at-rest. Random per-object nonce, per-chunk authentication tags, range-get friendly.                 |
 
 Both wrappers implement the [`object_store::ObjectStore`] trait, so any
@@ -97,15 +97,49 @@ re-resolve once, so the reader observes the new committed version.
   is forwarded with `PutMode::Create`, so **cross-process** `Create` races
   are arbitrated by the backend's conditional write: exactly one winner.
 - `PutMode::Update(v)` — `v.e_tag` is compared against the current
-  document's content-addressable ETag inside the per-key critical section.
-  This works uniformly on every backend, including `LocalFileSystem`.
+  document's logical ETag inside the per-key critical section. This works
+  uniformly on every backend, including `LocalFileSystem`.
 - `if_match` / `if_none_match` on reads are evaluated against the logical
   ETag and then stripped: once the precondition holds against the current
   commit point, the immutable payload cannot change under the reader.
+- `if_modified_since` / `if_unmodified_since` on reads are evaluated in the
+  wrapper too, against the same generation-derived `last_modified` the call
+  reports, and stripped before the request reaches the backend — otherwise
+  the backend would answer them against the payload object's own mtime, a
+  different clock. RFC 9110 §13.2.2 precedence is honoured: when `if_match`
+  is present `if_unmodified_since` is ignored, and when `if_none_match` is
+  present `if_modified_since` is ignored, so neither can reach the backend
+  and produce a spurious `Precondition` / `NotModified`. Pre-0.10 documents
+  carry no generation, so their date conditions are still left to the backend
+  — which evaluates them against the legacy payload object, the very
+  timestamp such a read reports.
 
 Versions are **not** reported (`PutResult::version`, `ObjectMeta::version`
 are `None`): replaced generations are reclaimed eagerly, so version-addressed
 reads cannot be honoured. Conditional updates rely on the ETag.
+
+#### The logical ETag is a CAS token, not a content fingerprint
+
+The ETag is **not** a hash of the payload. Every put mints a fresh generation
+and the ETag is `base64url(SHA3-256(generation ‖ payload))` — the generation
+first, so the token identifies the *commit*, not the bytes.
+
+This is load-bearing. `PutMode::Update(UpdateVersion { e_tag })` asks "is this
+still the version I read?". A bare content hash answers the different question
+"does it still hold the bytes I read?", and the two diverge on any A → B → A
+rewrite: a writer holding the token for A would still pass the precondition
+after two intervening commits and silently clobber them — a classic ABA lost
+update. Seeding with the per-commit generation closes it.
+
+Consequences:
+
+- **Two puts of identical bytes produce different ETags.** The token is not a
+  deduplication key and must not be used as a content digest.
+- **`copy` / `rename` mint a new token for the target** rather than
+  propagating the source's, so two distinct keys never share a CAS token and
+  the target never inherits a token it may already have retired.
+- `EncryptedStore` has always done the equivalent, seeding with its
+  per-commit random nonce instead of the generation (§4.6).
 
 ### 2.3 Garbage collection
 
@@ -155,7 +189,7 @@ back to a pre-0.10 binary after writing with this version.**
 
 ```text
 { "s": <u64 size>,
-  "e": <Option<String> base64url(SHA3-256(payload))>,
+  "e": <Option<String> base64url(SHA3-256(generation ‖ payload))>,
   "g": <Option<String> generation pointer; absent = legacy data/ layout> }
 ```
 
@@ -166,7 +200,7 @@ ETag/version fields. They still decode; new writes omit them.)
 
 ```text
 { "s": <u64 ciphertext_size>,
-  "e": <Option<String> base64url(SHA3-256(ciphertext))>,
+  "e": <Option<String> base64url(SHA3-256(base_nonce ‖ ciphertext))>,
   "o": <Option<String> legacy field, None for new writes>,
   "v": <Option<String> legacy field, None for new writes>,
   "n": <12-byte base nonce>,
@@ -210,9 +244,15 @@ let store = MetaStoreBuilder::new(
 ### 3.1 What it does
 
 - Tracks a per-object `Metadata { size, e_tag, generation }`.
-- Computes a content-addressable ETag (`base64url(SHA3-256(payload))`) on
-  every put. This ETag is what `MetaStore` exposes to callers and what
-  `PutMode::Update` / `if_match` / `if_none_match` are checked against.
+- Computes a per-commit logical ETag
+  (`base64url(SHA3-256(generation ‖ payload))`) on every put — see
+  [§2.2](#22-conditional-writes) for why the generation is mixed in. This
+  ETag is what `MetaStore` exposes to callers and what `PutMode::Update` /
+  `if_match` / `if_none_match` are checked against.
+- Reports the *logical* object on `get` / `head` / `list`: the committed
+  (authenticated) size from the metadata document rather than the backing
+  generation object's length, and one generation-derived `last_modified` that
+  is identical across all three calls.
 - Implements the immutable-generation write protocol of §2, so
   `LocalFileSystem` (which has no native CAS) gains the same
   optimistic-concurrency guarantee as S3 or Azure Blob.
@@ -239,10 +279,10 @@ metadata put never leaves a stale entry in front of the on-disk truth.
 | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `put_opts`                  | Writes a fresh generation, then commits the pointer, then reclaims the replaced payload best-effort. Atomic at the commit point.               |
 | `put_multipart`             | Streams parts into a fresh generation; `complete()` materializes it and switches the pointer. An unfinished upload never affects readers.       |
-| `get_opts`                  | Resolves the pointer, evaluates logical-ETag preconditions, reads the immutable payload (with one retry on a stale cached pointer).            |
+| `get_opts`                  | Resolves the pointer, evaluates the logical-ETag *and* date preconditions, reads the immutable payload (with one retry on a stale cached pointer). Reports the committed size and the generation-derived `last_modified`. |
 | `delete_stream`             | Per location: deletes the metadata document (the logical delete), then the payload best-effort. `NotFound` iff no commit point exists.         |
-| `copy_opts` / `rename_opts` | Copies the payload into a fresh generation of the target, then commits the target pointer; rename then deletes the source commit point.        |
-| `list*`                     | Enumerates `meta/` (commit points; 8-way concurrent decode). Uncommitted generations and crash leftovers are invisible by construction.        |
+| `copy_opts` / `rename_opts` | Copies the payload into a fresh generation of the target, then commits the target pointer with a **new** logical ETag (never the source's); rename then deletes the source commit point. |
+| `list*`                     | Enumerates `meta/` (commit points; 8-way concurrent decode). Uncommitted generations and crash leftovers are invisible by construction. Reports the same generation-derived `last_modified` as `get`/`head`. |
 
 ### 3.4 Path mapping helpers
 
@@ -370,10 +410,17 @@ across upload sessions.
 ### 4.6 Conditional semantics
 
 `PutMode::Update`, `if_match` and `if_none_match` are always honoured (see
-§2.2); they are evaluated against the content-addressable ETag over the
-ciphertext. `EncryptedStoreBuilder::with_conditional_put()` is retained as a
-no-op for API compatibility — the semantics it used to gate are now always
-on, since the protocol never forwards preconditions to the backend.
+§2.2); they are evaluated against the logical ETag, which is
+`base64url(SHA3-256(base_nonce ‖ ciphertext))` — the per-commit random nonce
+first, so the token identifies the commit rather than the ciphertext. Two
+puts of identical plaintext therefore produce different ETags, and a stale
+token cannot pass a precondition after an A → B → A rewrite.
+
+`EncryptedStoreBuilder::with_conditional_put()` is **`#[deprecated]`**:
+delete the call. It has done nothing since the immutable-generation refactor
+— the semantics it used to gate are unconditional on every backend, because
+the protocol never forwards preconditions to the backend. The method still
+compiles and is scheduled for removal.
 
 ### 4.7 Semantic guarantees (deltas vs `MetaStore`)
 
@@ -396,8 +443,15 @@ Both wrappers use [`moka::future::Cache`] keyed by logical path:
 - `MetaStoreBuilder::new(_, capacity)` — TTL 1h, custom TTL via
   `with_meta_cache_ttl`.
 - `EncryptedStoreBuilder::new(_, capacity, _)` — TTL 1h, time-to-idle 20 min.
+- `EncryptedStoreBuilder::with_meta_cache_ttl(ttl)` — rebuilds the built-in
+  cache with that TTL, **keeping the capacity passed to `new`** (it used to
+  rebuild at the default capacity, silently discarding it) and the default
+  time-to-idle. It also discards a cache previously supplied through
+  `with_meta_cache`, so call the two in the order you mean.
 - `EncryptedStoreBuilder::with_meta_cache(custom)` — supply a fully-tuned
-  cache (e.g. with eviction listeners for telemetry).
+  cache (e.g. with eviction listeners for telemetry). It replaces the
+  built-in cache wholesale, so the custom cache's own capacity and eviction
+  policy apply instead of the capacity passed to `new`.
 
 The cache is treated as an authoritative read-through layer for hot
 metadata; mutations are written through the underlying store first, inside
@@ -486,7 +540,7 @@ into `Error::Generic`.
   quiescent/single-writer operation.
 - **No version-addressed reads.** Replaced generations are reclaimed
   eagerly, so `GetOptions::version` cannot be honoured and versions are not
-  reported; conditional updates use the content-addressable ETag.
+  reported; conditional updates use the per-commit logical ETag.
 - **No envelope encryption / per-object DEKs.** All chunks of all objects
   share a single 256-bit key. Workloads that need per-tenant key isolation
   should layer multiple `EncryptedStore` instances on top of namespaced
@@ -514,7 +568,7 @@ let reclaimed = store.collect_garbage().await?;
 
 | Method                                              | Notes                                                             |
 | --------------------------------------------------- | ------------------------------------------------------------------ |
-| `put_opts`                                          | Computes content ETag; honours `PutMode::Create/Update` everywhere.|
+| `put_opts`                                          | Mints a per-commit logical ETag; honours `PutMode::Create/Update` everywhere. |
 | `put_multipart_opts`                                | Streams into a generation; commits the pointer in `complete()`.   |
 | `get_opts`                                          | Range, `if_match`, `if_none_match` all supported.                 |
 | `get_ranges`                                        | Validated against the logical size, then forwarded.               |
@@ -605,7 +659,7 @@ Enable whichever backend(s) you need at the application layer:
 
 ```toml
 [dependencies]
-anda_object_store = "0.10"
+anda_object_store = "0.11"
 object_store      = { version = "*", features = ["aws", "fs"] }
 ```
 

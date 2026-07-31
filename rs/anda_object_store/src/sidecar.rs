@@ -33,14 +33,16 @@
 //! authentication stay in the wrappers.
 
 use cbor2::{from_reader, to_writer};
+use chrono::{DateTime, Utc};
 use futures::{StreamExt, TryStreamExt, stream::BoxStream};
 use moka::{future::Cache, ops::compute::Op};
 use object_store::{path::Path, *};
 use rand::RngExt;
 use serde::{Serialize, de::DeserializeOwned};
-use std::{collections::HashMap, sync::Arc};
-
-use crate::map_arc_error;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex, MutexGuard},
+};
 
 type MetadataValidator<M> = dyn Fn(&Path, &M) -> Result<()> + Send + Sync;
 
@@ -93,7 +95,7 @@ pub(crate) trait SidecarMeta: Serialize + DeserializeOwned + Send + Sync + 'stat
     /// Store name used in error messages (e.g. `"MetaStore"`).
     const STORE_NAME: &'static str;
 
-    /// The logical, content-addressable ETag exposed to callers.
+    /// The logical ETag exposed to callers; unique per commit.
     fn e_tag(&self) -> Option<&str>;
 
     /// Size of the logical object in bytes, reported in listings.
@@ -127,6 +129,53 @@ fn generation_timestamp_ms(generation: &str) -> Option<u64> {
     u64::from_str_radix(ts, 16).ok()
 }
 
+/// The caller-visible `last_modified` of a logical object: the instant its
+/// current generation was minted, decoded from the generation pointer.
+///
+/// Every API must report the same timestamp for the same logical object —
+/// listings and reads resolve *different* backend objects (`meta/<loc>` and
+/// the payload), whose own timestamps differ by however long the write took,
+/// so neither can serve as the shared basis. The generation pointer can: it
+/// is part of the commit point (and, for `EncryptedStore`, covered by the
+/// metadata authentication tag), which also keeps the timestamp out of reach
+/// of anyone who can only write to the backend.
+///
+/// Returns `None` for pre-0.10 documents, which carry no generation (and for
+/// foreign generation identifiers). Callers then fall back to the backend
+/// timestamp of the object they resolved, and leave date preconditions to
+/// the backend so both stay on the same clock.
+pub(crate) fn logical_last_modified(generation: Option<&str>) -> Option<DateTime<Utc>> {
+    generation
+        .and_then(generation_timestamp_ms)
+        .and_then(|ms| DateTime::from_timestamp_millis(ms as i64))
+}
+
+/// The set of payloads that have been (or are being) written but whose
+/// pointer is not committed yet, keyed by `(location, generation)`.
+type InFlightSet = Arc<Mutex<HashSet<(Path, String)>>>;
+
+/// Locks the in-flight registry, ignoring poisoning: the guarded set is a
+/// plain [`HashSet`] whose critical sections cannot panic, and [`Drop`] of an
+/// [`InFlightGuard`] must not panic while unwinding.
+fn lock_in_flight(set: &InFlightSet) -> MutexGuard<'_, HashSet<(Path, String)>> {
+    set.lock().unwrap_or_else(|err| err.into_inner())
+}
+
+/// RAII registration of an in-flight generation; see
+/// [`SidecarStore::track_in_flight`]. Dropping it unregisters the generation,
+/// so an early `?` or a panic on the commit path releases the registration
+/// instead of leaking it.
+pub(crate) struct InFlightGuard {
+    in_flight: InFlightSet,
+    key: (Path, String),
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        lock_in_flight(&self.in_flight).remove(&self.key);
+    }
+}
+
 /// What a committed metadata document says about its key's payload, as
 /// gathered by the garbage collector's mark phase.
 enum PayloadRef {
@@ -156,7 +205,10 @@ pub(crate) struct SidecarStore<T: ObjectStore, M: SidecarMeta> {
     /// Prefix for metadata objects (the commit points).
     meta_prefix: Path,
     /// Cache for metadata to reduce storage operations.
-    meta_cache: Cache<Path, Arc<M>>,
+    pub(crate) meta_cache: Cache<Path, Arc<M>>,
+    /// Generations written by this process whose pointer is not committed
+    /// yet; see [`SidecarStore::track_in_flight`].
+    in_flight: InFlightSet,
 }
 
 impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
@@ -168,7 +220,31 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
             gen_prefix: Path::from("gen"),
             meta_prefix: Path::from("meta"),
             meta_cache,
+            in_flight: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    /// Registers `(location, generation)` as **in-flight**: its payload is
+    /// about to be written, but no commit point references it yet, so
+    /// [`SidecarStore::collect_garbage`] would otherwise be free to reclaim
+    /// it right out from under the writer.
+    ///
+    /// The registration lasts exactly as long as the returned guard, which
+    /// the caller must hold across the payload write *and* the pointer
+    /// switch that commits it.
+    pub(crate) fn track_in_flight(&self, location: &Path, generation: &str) -> InFlightGuard {
+        let key = (location.clone(), generation.to_string());
+        lock_in_flight(&self.in_flight).insert(key.clone());
+        InFlightGuard {
+            in_flight: self.in_flight.clone(),
+            key,
+        }
+    }
+
+    /// Whether this process is currently writing the given generation of
+    /// `location` (see [`SidecarStore::track_in_flight`]).
+    fn is_in_flight(&self, location: &Path, generation: &str) -> bool {
+        lock_in_flight(&self.in_flight).contains(&(location.clone(), generation.to_string()))
     }
 
     /// Maps a logical location to its metadata path: `loc` → `meta/<loc>`.
@@ -251,18 +327,34 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
     }
 
     /// Returns the metadata for `location`, loading and caching it on miss.
-    /// Concurrent loads of the same key are deduplicated by the cache.
+    ///
+    /// A miss loads **inside the per-key critical section** the commit paths
+    /// use, and never overwrites a document that appeared while it waited.
+    /// Loading outside that section would let a reader that resolved an old
+    /// document cache it *after* a concurrent commit replaced it, resurrecting
+    /// the previous version for the rest of the cache TTL — the same hazard
+    /// [`SidecarStore::refresh_meta`] and [`SidecarStore::listing_entry`]
+    /// avoid. Concurrent loads of the same key are deduplicated by the
+    /// section.
     pub(crate) async fn get_meta(&self, location: &Path) -> Result<Arc<M>> {
-        let meta = self
-            .meta_cache
-            .try_get_with(location.clone(), async {
-                let meta = self.load_meta(location).await?;
-                Ok(Arc::new(meta))
-            })
-            .await
-            .map_err(|err| map_arc_error(M::STORE_NAME, err))?;
+        if let Some(meta) = self.meta_cache.get(location).await {
+            return Ok(meta);
+        }
 
-        Ok(meta)
+        let rt = self
+            .meta_cache
+            .entry(location.clone())
+            .and_try_compute_with(|entry| async move {
+                if entry.is_some() {
+                    // Loaded or committed while we waited for the section:
+                    // that document is at least as fresh as ours would be.
+                    return Ok(Op::Nop);
+                }
+                let meta = self.load_meta(location).await?;
+                Ok::<_, Error>(Op::Put(Arc::new(meta)))
+            })
+            .await?;
+        Ok(rt.unwrap().value().clone())
     }
 
     /// Re-resolves the metadata from the backend **inside the per-key
@@ -488,8 +580,7 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
     /// Shared implementation of [`ObjectStore::list`]: enumerates the
     /// metadata documents (the commit points), so uncommitted generations and
     /// crash leftovers are invisible by construction. Each entry reports the
-    /// logical size and the content-addressable ETag from the decoded
-    /// document.
+    /// logical size and the logical ETag from the decoded document.
     pub(crate) fn list(
         self: Arc<Self>,
         prefix: Option<&Path>,
@@ -572,7 +663,7 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
         }
         Ok(Some(ObjectMeta {
             location,
-            last_modified: obj.last_modified,
+            last_modified: logical_last_modified(meta.generation()).unwrap_or(obj.last_modified),
             size: meta.size(),
             e_tag: meta.e_tag().map(String::from),
             // Versions are not reported; see the crate documentation.
@@ -628,13 +719,18 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
     /// target unchanged and the copied generation as collectable garbage.
     ///
     /// `verify` lets wrappers authenticate the source document before its
-    /// payload is copied.
+    /// payload is copied. `extensions` are the caller's, forwarded to the
+    /// backend so implementation-specific request context (tracing spans,
+    /// credentials) reaches it. The returned [`InFlightGuard`] keeps the
+    /// copied generation off the garbage collector's reach and must be held
+    /// until the caller has committed the pointer.
     pub(crate) async fn copy_payload<F>(
         &self,
         from: &Path,
         to: &Path,
+        extensions: Extensions,
         verify: F,
-    ) -> Result<(Arc<M>, String)>
+    ) -> Result<(Arc<M>, String, InFlightGuard)>
     where
         F: Fn(&Path, &M) -> Result<()>,
     {
@@ -645,8 +741,16 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
             let src_path = self.payload_path(from, src.generation());
             let generation = new_generation();
             let dst_path = self.generation_path(to, &generation);
-            match self.store.copy(&src_path, &dst_path).await {
-                Ok(()) => return Ok((src, generation)),
+            let in_flight = self.track_in_flight(to, &generation);
+            // The target generation path is fresh and unique, so the payload
+            // copy itself is unconditional; the caller's `CopyMode` is
+            // enforced by the pointer switch that commits it.
+            let options = CopyOptions {
+                mode: CopyMode::Overwrite,
+                extensions: extensions.clone(),
+            };
+            match self.store.copy_opts(&src_path, &dst_path, options).await {
+                Ok(()) => return Ok((src, generation, in_flight)),
                 Err(Error::NotFound { source, .. }) => {
                     if !retried && src.generation().is_some() {
                         retried = true;
@@ -688,15 +792,20 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
     /// when the marked state does not reference it, and immediately before
     /// deletion the key's metadata is re-read from the backend — a payload
     /// that is (or has become) referenced is never deleted. Generations
-    /// minted at or after the collection started are skipped, as are foreign
-    /// objects under `gen/` and every payload of a key whose metadata exists
-    /// but does not decode (conservative).
+    /// minted at or after the collection started are skipped, as are
+    /// generations this process registered as in-flight (see
+    /// [`SidecarStore::track_in_flight`]), foreign objects under `gen/` and
+    /// every payload of a key whose metadata exists but does not decode
+    /// (conservative).
     ///
     /// The collector is designed to run when no other **process** writes the
-    /// store (e.g. at open), in line with the crate's single-writer contract;
-    /// the re-check keeps concurrent in-process writers safe, but a foreign
-    /// process could still commit a swept generation between the re-check and
-    /// the delete.
+    /// store (e.g. at open), in line with the crate's single-writer contract.
+    /// Concurrent **in-process** writers are kept safe by the in-flight
+    /// registry, not by the re-check: the re-check only consults the commit
+    /// point, which a put publishes *after* its payload, so on its own it
+    /// would happily reclaim the payload of a put whose pointer switch is
+    /// still pending. A foreign process could still commit a swept generation
+    /// between the re-check and the delete.
     ///
     /// Returns the number of payload objects deleted.
     pub(crate) async fn collect_garbage(&self) -> Result<usize> {
@@ -763,6 +872,15 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
 
         let mut deleted = 0usize;
         for (full_path, location, generation) in candidates {
+            // Never reclaim a generation this process is still writing: its
+            // payload is already on the backend, but the pointer that will
+            // reference it has not been committed yet, so no amount of
+            // re-reading commit points can see it.
+            if let Some(generation) = &generation
+                && self.is_in_flight(&location, generation)
+            {
+                continue;
+            }
             // Re-read the commit point right before deleting: never delete a
             // payload that is referenced now, even if the mark snapshot is
             // stale.

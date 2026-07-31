@@ -452,7 +452,18 @@ impl AndaDB {
         loop {
             tokio::select! {
                 _ = cancel_token.cancelled() => {
-                    let _ = self.close().await;
+                    // The final close is the last chance to make the pending
+                    // generation durable. Its failure must be as visible as a
+                    // periodic flush failure below: callers observe this task
+                    // only through its `JoinHandle<()>`, so a discarded error
+                    // would be reported as a successful shutdown.
+                    if let Err(err) = self.close().await {
+                        log::error!(
+                            action = "AndaDB::auto_flush",
+                            database = self.inner.name;
+                            "Failed to close database on cancellation: {err:?}",
+                        );
+                    }
                     return;
                 }
                 _ = tokio::time::sleep(interval) => {}
@@ -1141,12 +1152,22 @@ impl AndaDB {
 
     /// Sets a user-defined extension key-value pair by serializing the value from a generic type.
     /// The change is persisted on the next `flush()` or `flush_metadata()`.
+    /// Values that fail to serialize are dropped with a warning, matching
+    /// [`AndaDB::set_extension`]'s handling of over-complex values.
     pub fn set_extension_from<T>(&self, key: String, value: T)
     where
         T: Serialize,
     {
-        if let Ok(value) = FieldValue::serialized(&value, None) {
-            self.set_extension(key, value);
+        match FieldValue::serialized(&value, None) {
+            Ok(value) => self.set_extension(key, value),
+            Err(err) => {
+                log::warn!(
+                    action = "AndaDB::set_extension_from",
+                    database = self.inner.name,
+                    key = key;
+                    "Dropping extension value that failed to serialize: {err:?}",
+                );
+            }
         }
     }
 

@@ -41,6 +41,14 @@ pub const MAX_KIP_INPUT_LEN: usize = 256 * 1024;
 /// from stack exhaustion.
 pub const MAX_KIP_NESTING_DEPTH: usize = 64;
 
+/// Maximum accepted number of commands in a single batch [`crate::Request`].
+///
+/// A request body is bounded by the transport, but the *count* of batch
+/// commands it decodes into is not: a small body yields tens of thousands of
+/// items and the batch result vector pre-allocates from that count. Requests
+/// over this cap are rejected with `KIP_4002` before any command runs.
+pub const MAX_KIP_BATCH_COMMANDS: usize = 256;
+
 /// The main entry point for parsing any KIP command.
 ///
 /// This function serves as the unified parser that can handle all three types of KIP commands.
@@ -226,9 +234,23 @@ fn validate_parser_budget(input: &str) -> Result<(), KipError> {
     let mut stack = Vec::new();
     let mut in_string = false;
     let mut escaped = false;
+    // Line comments must be skipped exactly as `skip_ws_and_comments` does, or
+    // this scan desynchronizes from the real parser: a single `"` inside a
+    // comment would latch `in_string` for the rest of the input and every
+    // bracket after it would go uncounted, defeating the depth guard entirely.
+    let mut in_line_comment = false;
+    let mut prev_slash = false;
 
     for ch in input.chars() {
+        if in_line_comment {
+            if ch == '\n' {
+                in_line_comment = false;
+            }
+            continue;
+        }
+
         if in_string {
+            prev_slash = false;
             if escaped {
                 escaped = false;
                 continue;
@@ -240,6 +262,17 @@ fn validate_parser_budget(input: &str) -> Result<(), KipError> {
             }
             continue;
         }
+
+        if ch == '/' {
+            if prev_slash {
+                in_line_comment = true;
+                prev_slash = false;
+            } else {
+                prev_slash = true;
+            }
+            continue;
+        }
+        prev_slash = false;
 
         match ch {
             '"' => in_string = true,
@@ -1107,5 +1140,44 @@ WITH METADATA {
         let kql = format!("FIND(?a) WHERE {{ {target} }}");
         let err = parse_kql(&kql).unwrap_err();
         assert_eq!(err.code, crate::KipErrorCode::ResourceExhausted);
+    }
+
+    #[test]
+    fn parser_budget_is_not_defeated_by_a_quote_inside_a_comment() {
+        // A lone `"` in a line comment used to latch the scanner's in-string
+        // state for the rest of the input, so every bracket after it went
+        // uncounted and the depth guard was bypassed entirely — the parser then
+        // recursed once per bracket and overflowed the stack.
+        let json = format!(
+            "// \"\n{}0{}",
+            "[".repeat(MAX_KIP_NESTING_DEPTH + 1),
+            "]".repeat(MAX_KIP_NESTING_DEPTH + 1)
+        );
+        let err = parse_json(&json).unwrap_err();
+        assert_eq!(err.code, crate::KipErrorCode::ResourceExhausted);
+
+        let mut target = "?a".to_string();
+        for _ in 0..=MAX_KIP_NESTING_DEPTH {
+            target = format!("({target}, \"related_to\", ?b)");
+        }
+        let kql = format!("// \"\nFIND(?a) WHERE {{ {target} }}");
+        let err = parse_kql(&kql).unwrap_err();
+        assert_eq!(err.code, crate::KipErrorCode::ResourceExhausted);
+    }
+
+    #[test]
+    fn brackets_inside_string_literals_do_not_count_against_the_depth_budget() {
+        // The mirror failure: brackets inside a *string* must stay uncounted
+        // even when a comment earlier in the input contains an odd number of
+        // quotes, which used to desynchronize the scanner the other way and
+        // reject valid input.
+        let deep = "(".repeat(MAX_KIP_NESTING_DEPTH + 8);
+        let kml = format!(
+            "// a 32\" monitor\nUPSERT {{ CONCEPT ?c {{ {{type: \"T\", name: \"{deep}\"}} }} }}"
+        );
+        assert!(
+            parse_kml(&kml).is_ok(),
+            "brackets inside a string literal must not trip the depth guard"
+        );
     }
 }

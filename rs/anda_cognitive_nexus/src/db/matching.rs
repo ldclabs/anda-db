@@ -33,6 +33,36 @@ fn checked_max_hops(min: u16, max: Option<u16>) -> Result<(u16, bool), KipError>
     }
 }
 
+/// 匹配行上限。`merge_table` / `natural_join` 只约束「连接之后」的解行，而模式
+/// 自身的匹配行是在那之前就全部物化的：单侧受限的模式（一端是 ID 集合或字面
+/// 谓词、另一端是变量）在大图上可以匹配出几十万行，LIMIT 同样管不住（它只在
+/// FIND 投影阶段生效）。因此在行累积过程中就设上限，超出报 KIP_4002。
+fn checked_match_rows(count: usize, pattern: &str) -> Result<(), KipError> {
+    if count > MAX_SOLUTION_COMBINATIONS {
+        return Err(KipError::resource_exhausted(format!(
+            "{pattern} materializes more than {MAX_SOLUTION_COMBINATIONS} match rows; \
+             constrain the pattern (a narrower endpoint set, a literal predicate, or a \
+             typed other endpoint) before matching"
+        )));
+    }
+    Ok(())
+}
+
+/// 把 ID 集合切成不超过 [`MAX_SUBJECT_OBJECT_RANGE_VARIANTS`] 个分支的批次：
+/// `RangeQuery::Or` 在触碰索引之前就会被整体分配，一个 50 万分支的过滤器本身
+/// 就是一次内存尖峰。分批查询让过滤器规模有界，同时不牺牲可回答的查询。
+fn endpoint_range(ids: &[EntityID]) -> RangeQuery<Fv> {
+    if ids.len() == 1 {
+        RangeQuery::Eq(Fv::Text(ids[0].to_string()))
+    } else {
+        RangeQuery::Or(
+            ids.iter()
+                .map(|id| Box::new(RangeQuery::Eq(Fv::Text(id.to_string()))))
+                .collect(),
+        )
+    }
+}
+
 fn checked_subject_object_variant_count(
     subject_count: usize,
     object_count: usize,
@@ -50,6 +80,12 @@ fn checked_subject_object_variant_count(
 
 impl CognitiveNexus {
     // 处理多跳匹配
+    //
+    // 路径枚举的规模是 `起点数 × 深度 × 出度` 的乘积，和
+    // `handle_full_scan_matching` 一样，LIMIT 只在 FIND 投影阶段生效，管不住
+    // 枚举本身的物化成本：一条 `{1,10}` 查询在大图上能在 merge_table /
+    // natural_join 拿到行之前就把内存拉爆。因此所有起点共用一份
+    // `MAX_SOLUTION_COMBINATIONS` 物化预算，超出即 KIP_4002。
     pub(super) async fn handle_multi_hop_matching(
         &self,
         ctx: &QueryContext,
@@ -60,6 +96,7 @@ impl CognitiveNexus {
         objects: TargetEntities,
     ) -> Result<PropositionsMatchResult, KipError> {
         let mut result = PropositionsMatchResult::default();
+        let mut budget = MAX_SOLUTION_COMBINATIONS;
 
         if matches!(&subjects, TargetEntities::IDs(_)) {
             let start_nodes = match subjects {
@@ -80,6 +117,7 @@ impl CognitiveNexus {
                         capped_unbounded,
                         &objects,
                         false,
+                        &mut budget,
                     )
                     .await?;
 
@@ -121,6 +159,7 @@ impl CognitiveNexus {
                         capped_unbounded,
                         &subjects,
                         true,
+                        &mut budget,
                     )
                     .await?;
 
@@ -182,7 +221,7 @@ impl CognitiveNexus {
         };
 
         let ids = self
-            .propositions
+            .propositions()
             .query_ids(Filter::Field((virtual_name, range)), None)
             .await
             .map_err(db_to_kip_error)?;
@@ -203,7 +242,9 @@ impl CognitiveNexus {
 
     // 处理主体ID和任意对象的匹配
     //
-    // 优化：将多个 subject 查询合并为单个 `subject IN [...]` OR 查询。
+    // 优化：将多个 subject 查询合并为 `subject IN [...]` OR 查询，并按
+    // `MAX_SUBJECT_OBJECT_RANGE_VARIANTS` 分批，避免一次性构造超大过滤器；
+    // 匹配行数受 `checked_match_rows` 约束。
     pub(super) async fn handle_subject_ids_any_matching(
         &self,
         ctx: &QueryContext,
@@ -216,34 +257,29 @@ impl CognitiveNexus {
             return Ok(result);
         }
 
-        let range = if subject_ids.len() == 1 {
-            RangeQuery::Eq(Fv::Text(subject_ids[0].to_string()))
-        } else {
-            RangeQuery::Or(
-                subject_ids
-                    .iter()
-                    .map(|id| Box::new(RangeQuery::Eq(Fv::Text(id.to_string()))))
-                    .collect(),
-            )
-        };
+        for chunk in subject_ids.chunks(MAX_SUBJECT_OBJECT_RANGE_VARIANTS) {
+            let ids = self
+                .propositions()
+                .query_ids(
+                    Filter::Field(("subject".to_string(), endpoint_range(chunk))),
+                    None,
+                )
+                .await
+                .map_err(db_to_kip_error)?;
 
-        let ids = self
-            .propositions
-            .query_ids(Filter::Field(("subject".to_string(), range)), None)
-            .await
-            .map_err(db_to_kip_error)?;
-
-        for id in ids {
-            if let Some((subj, preds, obj)) = self
-                .try_get_proposition_with(&ctx.cache, id, |proposition| {
-                    if any_propositions && matches!(proposition.object, EntityID::Concept(_)) {
-                        return Ok(None);
-                    }
-                    match_predicate_against_proposition(proposition, &predicate)
-                })
-                .await?
-            {
-                result.add_match(subj, obj, preds, id);
+            for id in ids {
+                if let Some((subj, preds, obj)) = self
+                    .try_get_proposition_with(&ctx.cache, id, |proposition| {
+                        if any_propositions && matches!(proposition.object, EntityID::Concept(_)) {
+                            return Ok(None);
+                        }
+                        match_predicate_against_proposition(proposition, &predicate)
+                    })
+                    .await?
+                {
+                    result.add_match(subj, obj, preds, id);
+                    checked_match_rows(result.rows.len(), "(<subjects>, ?p, ?o) pattern")?;
+                }
             }
         }
 
@@ -252,7 +288,7 @@ impl CognitiveNexus {
 
     // 处理任意主体和对象ID的匹配
     //
-    // 优化：将多个 object 查询合并为单个 `object IN [...]` OR 查询。
+    // 优化与上限同 `handle_subject_ids_any_matching`，方向相反。
     pub(super) async fn handle_any_to_object_ids_matching(
         &self,
         ctx: &QueryContext,
@@ -265,34 +301,29 @@ impl CognitiveNexus {
             return Ok(result);
         }
 
-        let range = if object_ids.len() == 1 {
-            RangeQuery::Eq(Fv::Text(object_ids[0].to_string()))
-        } else {
-            RangeQuery::Or(
-                object_ids
-                    .iter()
-                    .map(|id| Box::new(RangeQuery::Eq(Fv::Text(id.to_string()))))
-                    .collect(),
-            )
-        };
+        for chunk in object_ids.chunks(MAX_SUBJECT_OBJECT_RANGE_VARIANTS) {
+            let ids = self
+                .propositions()
+                .query_ids(
+                    Filter::Field(("object".to_string(), endpoint_range(chunk))),
+                    None,
+                )
+                .await
+                .map_err(db_to_kip_error)?;
 
-        let ids = self
-            .propositions
-            .query_ids(Filter::Field(("object".to_string(), range)), None)
-            .await
-            .map_err(db_to_kip_error)?;
-
-        for id in ids {
-            if let Some((subj, preds, obj)) = self
-                .try_get_proposition_with(&ctx.cache, id, |proposition| {
-                    if any_propositions && matches!(proposition.subject, EntityID::Concept(_)) {
-                        return Ok(None);
-                    }
-                    match_predicate_against_proposition(proposition, &predicate)
-                })
-                .await?
-            {
-                result.add_match(subj, obj, preds, id);
+            for id in ids {
+                if let Some((subj, preds, obj)) = self
+                    .try_get_proposition_with(&ctx.cache, id, |proposition| {
+                        if any_propositions && matches!(proposition.subject, EntityID::Concept(_)) {
+                            return Ok(None);
+                        }
+                        match_predicate_against_proposition(proposition, &predicate)
+                    })
+                    .await?
+                {
+                    result.add_match(subj, obj, preds, id);
+                    checked_match_rows(result.rows.len(), "(?s, ?p, <objects>) pattern")?;
+                }
             }
         }
 
@@ -319,7 +350,7 @@ impl CognitiveNexus {
         // Every stored row has a non-empty subject id ("C:..." / "P:..."),
         // so `subject > ""` enumerates the whole collection via the index.
         let ids = self
-            .propositions
+            .propositions()
             .query_ids(
                 Filter::Field((
                     "subject".to_string(),
@@ -365,6 +396,9 @@ impl CognitiveNexus {
     }
 
     // 处理谓词匹配
+    //
+    // OR 分支数由模式里的谓词字面量决定（有界），但一个热门谓词本身就能匹配出
+    // 任意多行，同样受 `checked_match_rows` 约束。
     pub(super) async fn handle_predicate_matching(
         &self,
         ctx: &QueryContext,
@@ -384,7 +418,7 @@ impl CognitiveNexus {
         };
 
         let ids = self
-            .propositions
+            .propositions()
             .query_ids(
                 Filter::Field((
                     "predicates".to_string(),
@@ -420,6 +454,7 @@ impl CognitiveNexus {
                 .await?
             {
                 result.add_match(subj, obj, preds, id);
+                checked_match_rows(result.rows.len(), "(?s, \"<predicate>\", ?o) pattern")?;
             }
         }
 
@@ -431,6 +466,10 @@ impl CognitiveNexus {
     // `capped_unbounded` 为 true 时表示原始量词是无界 `{m,}`、被引擎 cap 到
     // `max_hops`：此时若在 cap 层仍能到达未发现的新节点，说明传递闭包不完整，
     // 必须返回 `KIP_4002` 而不是静默截断。
+    //
+    // `budget` 是调用方（可能跨多个起点）共享的路径物化预算：每物化一条路径
+    // 扣 1，扣完即报 KIP_4002。计数发生在克隆之前，所以内存占用被真正限住，
+    // 而不是先撑爆再检查。
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn bfs_multi_hop(
         &self,
@@ -442,8 +481,17 @@ impl CognitiveNexus {
         capped_unbounded: bool,
         targets: &TargetEntities,
         reverse: bool,
+        budget: &mut usize,
     ) -> Result<Vec<GraphPath>, KipError> {
         use std::collections::VecDeque;
+
+        let exhausted = || {
+            KipError::resource_exhausted(format!(
+                "multi-hop traversal on \"{predicate}\" enumerates more than \
+                 {MAX_SOLUTION_COMBINATIONS} paths; narrow the start set, lower the hop \
+                 bound, or traverse in stages"
+            ))
+        };
 
         // O(1) 目标匹配（targets 为 ID 列表时避免每个节点 O(n) 线性查找）
         let target_ids: Option<FxHashSet<&EntityID>> = match targets {
@@ -479,6 +527,7 @@ impl CognitiveNexus {
         // 零跳自反匹配（KIP §3.4.2）：`{0,n}` 必须包含 subject == object
         // 的零跳解（无边遍历）。
         if min_hops == 0 && path_matches_targets(&initial_path.end) {
+            *budget = budget.checked_sub(1).ok_or_else(exhausted)?;
             results.push(initial_path.clone());
         }
 
@@ -520,6 +569,8 @@ impl CognitiveNexus {
 
             for (prop_id, target_node) in props {
                 discovered.insert(target_node.clone());
+                // 先扣预算再克隆：这一步是路径物化的唯一入口。
+                *budget = budget.checked_sub(1).ok_or_else(exhausted)?;
                 let mut new_path = current_path.clone();
                 new_path.end = target_node;
                 new_path.propositions.push(prop_id);
@@ -549,7 +600,7 @@ impl CognitiveNexus {
         reverse: bool,
     ) -> Result<Vec<(EntityID, EntityID)>, KipError> {
         let ids = self
-            .propositions
+            .propositions()
             .query_ids(
                 Filter::Field((
                     if reverse {

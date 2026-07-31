@@ -3,7 +3,9 @@
 //! The server always keeps one *primary* database open. Additional databases
 //! created or opened at runtime are recorded in the primary database's
 //! extension metadata (key [`DB_REGISTRY_KEY`]) so they are reopened
-//! automatically after a restart.
+//! automatically after a restart. The per-database API-key bindings live
+//! beside the registry under [`DB_API_KEYS_KEY`] and are reloaded the same
+//! way; see [`crate::auth`] for the authorization rules they feed.
 //!
 //! Every open database runs its own background auto-flush task. Closing a
 //! database (or shutting the server down) cancels the task, which flushes and
@@ -14,6 +16,7 @@ use anda_db::{
     schema::validate_field_name,
     storage::StorageConfig,
 };
+use axum::http::StatusCode;
 use object_store::ObjectStore;
 use serde::Serialize;
 use std::{
@@ -21,7 +24,7 @@ use std::{
     future::Future,
     net::SocketAddr,
     sync::{
-        Arc, Mutex as StdMutex, OnceLock,
+        Arc, Mutex as StdMutex, OnceLock, RwLock as StdRwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -32,11 +35,19 @@ use tokio::{
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
-use crate::error::ApiError;
+use crate::{
+    auth::{ApiKeyHash, Principal, Scope, generate_api_key},
+    error::ApiError,
+};
 
 /// Extension key in the primary database that stores the names of all
 /// non-primary databases to reopen on startup.
 pub const DB_REGISTRY_KEY: &str = "server:databases";
+
+/// Extension key in the primary database that stores the SHA3-256 hash of
+/// each database's API key, keyed by database name. Only hashes are
+/// persisted — never the keys themselves.
+pub const DB_API_KEYS_KEY: &str = "server:api_keys";
 
 /// Extra bounded window used only to observe task termination after issuing
 /// aborts at the graceful shutdown deadline.
@@ -56,7 +67,10 @@ pub struct ServerOptions {
     pub description: String,
     /// Storage configuration applied to every database this server opens.
     pub storage: StorageConfig,
-    /// Optional bearer token required for all RPC endpoints.
+    /// Optional bearer token for the *admin* tier: it authorizes the
+    /// root-scope methods and every database scope. When `None` the instance
+    /// is unauthenticated (development/loopback mode) and per-database keys
+    /// cannot be provisioned. See [`crate::auth`].
     pub api_key: Option<String>,
     /// Interval of the per-database background flush task.
     pub flush_interval: Duration,
@@ -69,6 +83,14 @@ pub struct ServerOptions {
     pub shutdown_timeout: Duration,
     /// Maximum accepted request body size in bytes.
     pub max_body_size: usize,
+    /// Maximum number of non-primary databases the registry may hold.
+    ///
+    /// Each registered database keeps a permanent auto-flush task and an
+    /// entry in the primary database's extension metadata, so without a cap
+    /// any authenticated caller can grow both without limit. Databases
+    /// reopened at startup are never rejected by this bound: lowering it must
+    /// not break a restart.
+    pub max_databases: usize,
 }
 
 impl Default for ServerOptions {
@@ -85,6 +107,7 @@ impl Default for ServerOptions {
             max_concurrent_mutations: 32,
             shutdown_timeout: Duration::from_secs(30),
             max_body_size: 2 * 1024 * 1024,
+            max_databases: 64,
         }
     }
 }
@@ -101,15 +124,19 @@ pub enum OpenMode {
 }
 
 /// Server information returned by the `info` method.
+///
+/// The fields are filtered by the caller's [`Principal`]: a per-database
+/// principal must not learn the shape of the instance it runs on, so it sees
+/// no primary database name and only the one database it authenticated for.
 #[derive(Debug, Serialize)]
 pub struct ServerInfo {
     /// Server display name.
     pub name: String,
     /// Server version.
     pub version: String,
-    /// Name of the primary database.
-    pub primary_db: String,
-    /// Names of all currently open databases.
+    /// Name of the primary database; `None` for a per-database principal.
+    pub primary_db: Option<String>,
+    /// Currently open databases visible to the caller.
     pub databases: Vec<String>,
 }
 
@@ -151,6 +178,17 @@ impl Drop for TrackedTaskRegistration {
 struct Inner {
     options: ServerOptions,
     object_store: Arc<dyn ObjectStore>,
+    /// Hash of [`ServerOptions::api_key`], precomputed so the request path
+    /// never touches the plaintext key. `None` on an unauthenticated
+    /// instance.
+    admin_key: Option<ApiKeyHash>,
+    /// Hash of the key that grants access to each database, by database name.
+    /// Persisted under [`DB_API_KEYS_KEY`].
+    ///
+    /// This is read on every RPC request, so it uses a synchronous lock: the
+    /// critical sections are a `BTreeMap` lookup or a clone of the map, and
+    /// the guard is never held across an await.
+    api_keys: StdRwLock<BTreeMap<String, ApiKeyHash>>,
     cancel: CancellationToken,
     /// Set once [`AppState::shutdown`] begins; the RPC entry points reject
     /// new requests with 503 so a request accepted after the graceful-drain
@@ -242,11 +280,38 @@ impl AppState {
             None => BTreeSet::new(),
         };
 
+        // Same reasoning as the registry, with a sharper edge: silently
+        // starting with an empty key map would downgrade every per-database
+        // key to the admin-key fallback and then persist that downgrade.
+        let api_keys: BTreeMap<String, ApiKeyHash> = match primary.get_extension(DB_API_KEYS_KEY) {
+            Some(value) => value.deserialized().map_err(|err| {
+                ApiError::internal(format!(
+                    "failed to parse API key extension {DB_API_KEYS_KEY:?}: {err}; \
+                     refusing to start to avoid overwriting the per-database API keys"
+                ))
+            })?,
+            None => BTreeMap::new(),
+        };
+
+        // Per-database keys are only enforceable next to an admin key (see
+        // `crate::auth`). Starting without one would silently turn every
+        // per-database key into "no key at all", exposing tenant databases.
+        if !api_keys.is_empty() && options.api_key.is_none() {
+            return Err(ApiError::bad_request(format!(
+                "{} database(s) have a per-database API key, but no admin API key is configured; \
+                 set API_KEY to the admin key, or remove the bindings with db.remove_api_key",
+                api_keys.len()
+            )));
+        }
+
+        let admin_key = options.api_key.as_deref().map(ApiKeyHash::from_key);
         let max_concurrent_mutations = options.max_concurrent_mutations.max(1);
         let state = Self {
             inner: Arc::new(Inner {
                 options,
                 object_store,
+                admin_key,
+                api_keys: StdRwLock::new(api_keys),
                 cancel: CancellationToken::new(),
                 shutting_down: AtomicBool::new(false),
                 rpc_admission: StdMutex::new(()),
@@ -305,9 +370,44 @@ impl AppState {
         Ok(state)
     }
 
-    /// Returns the configured API key, if any.
+    /// Returns the configured admin API key, if any.
     pub fn api_key(&self) -> Option<&str> {
         self.inner.options.api_key.as_deref()
+    }
+
+    /// Resolves the caller's [`Principal`] for `scope`, or fails with a
+    /// uniform `401` that reveals nothing about the database namespace.
+    ///
+    /// This is the single authorization gate for the RPC endpoints; the
+    /// policy itself lives in [`crate::auth::authorize`].
+    pub fn authorize(
+        &self,
+        scope: Scope<'_>,
+        presented: Option<&str>,
+    ) -> Result<Principal, ApiError> {
+        // Looked up before the database registry is consulted, so an
+        // unauthorized caller cannot distinguish "wrong key" from "no such
+        // database" by timing or by status code.
+        let bound = match scope {
+            Scope::Root => None,
+            Scope::Database(name) => self.db_api_key(name),
+        };
+        crate::auth::authorize(
+            self.inner.admin_key.as_ref(),
+            bound.as_ref(),
+            scope,
+            presented,
+        )
+    }
+
+    /// Returns the key hash bound to `name`, if any.
+    fn db_api_key(&self, name: &str) -> Option<ApiKeyHash> {
+        self.inner
+            .api_keys
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(name)
+            .cloned()
     }
 
     /// Returns the per-request processing deadline for the RPC endpoints.
@@ -413,12 +513,34 @@ impl AppState {
     }
 
     /// Returns server information including all open database names.
+    ///
+    /// Only ever returned to an admin principal; use [`AppState::scoped_info`]
+    /// on the database-scoped endpoint.
     pub async fn info(&self) -> ServerInfo {
         ServerInfo {
             name: self.inner.options.name.clone(),
             version: self.inner.options.version.clone(),
-            primary_db: self.inner.options.primary_db.clone(),
+            primary_db: Some(self.inner.options.primary_db.clone()),
             databases: self.db_names().await,
+        }
+    }
+
+    /// Returns the server information `principal` is entitled to see while
+    /// operating on `db_name`.
+    ///
+    /// An admin sees the whole instance, exactly as before per-database keys
+    /// existed. A per-database principal sees only the database it
+    /// authenticated for — enumerating the others (or even learning the
+    /// primary database's name) would defeat the isolation the key provides.
+    pub async fn scoped_info(&self, principal: Principal, db_name: &str) -> ServerInfo {
+        if principal.is_admin() {
+            return self.info().await;
+        }
+        ServerInfo {
+            name: self.inner.options.name.clone(),
+            version: self.inner.options.version.clone(),
+            primary_db: None,
+            databases: vec![db_name.to_string()],
         }
     }
 
@@ -440,14 +562,25 @@ impl AppState {
 
     /// Creates, opens, or connects a database and registers it for reopening
     /// on the next server start.
+    ///
+    /// `api_key`, when given, is bound to the new database before it becomes
+    /// reachable, so it is never briefly served under the admin-key fallback.
+    /// Only [`OpenMode::Create`] accepts one; an existing database's key is
+    /// changed with [`AppState::set_db_api_key`].
     pub async fn register_db(
         &self,
         mode: OpenMode,
         name: &str,
         description: Option<String>,
+        api_key: Option<String>,
     ) -> Result<DBMetadata, ApiError> {
         validate_field_name(name)
             .map_err(|e| ApiError::invalid_input(format!("invalid database name: {e}")))?;
+        // Rejected before any storage I/O so a misconfigured provisioning
+        // request never leaves a half-created database behind.
+        if let Some(key) = &api_key {
+            self.check_api_key_binding(name, key)?;
+        }
 
         // Serialize lifecycle operations; this also prevents two concurrent
         // requests from opening the same database twice.
@@ -462,6 +595,25 @@ impl AppState {
                     ))),
                     OpenMode::Open | OpenMode::Connect => Ok(entry.db.metadata()),
                 };
+            }
+        }
+        // Bound the registry. Every entry costs a permanent auto-flush task
+        // and a name in the primary database's registry extension, so an
+        // uncapped `register_db` lets any authorized caller grow the process
+        // without limit. Checked here (never during startup reopen) so
+        // lowering the limit cannot break a restart.
+        {
+            let registered = self.inner.registry.read().await.len();
+            let max = self.inner.options.max_databases;
+            if registered >= max {
+                return Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    "limit_exceeded",
+                    format!(
+                        "the server already holds the maximum of {max} databases; \
+                         close one before registering another"
+                    ),
+                ));
             }
         }
 
@@ -503,6 +655,24 @@ impl AppState {
             OpenMode::Connect => AndaDB::connect(self.inner.object_store.clone(), config).await?,
         };
 
+        // Bind the key while the database is still invisible to `get_db`:
+        // publishing it first would leave a window in which the admin-key
+        // fallback governs a database the caller asked to protect.
+        if let Some(key) = &api_key
+            && let Err(err) = self
+                .store_api_key(name, Some(ApiKeyHash::from_key(key)))
+                .await
+        {
+            if let Err(close_err) = db.close().await {
+                log::error!(
+                    action = "AppState::register_db",
+                    database = name;
+                    "failed to close database after API key binding failed: {close_err:?}",
+                );
+            }
+            return Err(err);
+        }
+
         let metadata = db.metadata();
         let mut pending_db = Some(db);
         let mut dbs = self.inner.databases.write().await;
@@ -531,6 +701,7 @@ impl AppState {
                     "failed to close database whose registration lost to shutdown: {err:?}",
                 );
             }
+            self.undo_api_key_binding(name, api_key.is_some()).await;
             return Err(ApiError::unavailable());
         }
         {
@@ -556,13 +727,179 @@ impl AppState {
                     "failed to close database after registry persistence failure: {close_err:?}",
                 );
             }
+            self.undo_api_key_binding(name, api_key.is_some()).await;
             return Err(err);
         }
         Ok(metadata)
     }
 
+    /// Best-effort rollback of a binding made earlier in `register_db`, so a
+    /// fully unwound registration leaves no key behind for a database that
+    /// does not exist. Failure is logged, never surfaced: the caller is
+    /// already returning the error that triggered the unwind.
+    async fn undo_api_key_binding(&self, name: &str, applied: bool) {
+        if !applied {
+            return;
+        }
+        if let Err(err) = self.store_api_key(name, None).await {
+            log::error!(
+                action = "AppState::register_db",
+                database = name;
+                "failed to unbind the API key of an unwound registration: {err:?}",
+            );
+        }
+    }
+
+    /// Binds an API key to an existing database, replacing any previous
+    /// binding (key rotation). Admin-only; enforced by the root scope.
+    ///
+    /// When `key` is `None` the server generates one with a CSPRNG and
+    /// returns it — this is the only time any key value leaves the server, so
+    /// a caller that loses it must rotate again. A caller-supplied key is
+    /// never echoed back.
+    pub async fn set_db_api_key(
+        &self,
+        name: &str,
+        key: Option<String>,
+    ) -> Result<Option<String>, ApiError> {
+        let generated = key.is_none();
+        let key = key.unwrap_or_else(generate_api_key);
+        self.check_api_key_binding(name, &key)?;
+
+        // Serializes with `register_db`/`close_db` and with concurrent
+        // rotations, so the in-memory map and its persisted copy cannot be
+        // reordered against each other.
+        let _guard = self.inner.lifecycle.lock().await;
+        self.require_known_db(name).await?;
+        self.store_api_key(name, Some(ApiKeyHash::from_key(&key)))
+            .await?;
+        Ok(generated.then_some(key))
+    }
+
+    /// Removes a database's API-key binding, returning it to the admin-key
+    /// fallback. Returns whether a binding existed. Admin-only.
+    pub async fn remove_db_api_key(&self, name: &str) -> Result<bool, ApiError> {
+        let _guard = self.inner.lifecycle.lock().await;
+        self.require_known_db(name).await?;
+        if self.db_api_key(name).is_none() {
+            return Ok(false);
+        }
+        self.store_api_key(name, None).await?;
+        Ok(true)
+    }
+
+    /// Validates a binding request before it can have any effect.
+    fn check_api_key_binding(&self, name: &str, key: &str) -> Result<(), ApiError> {
+        if key.trim().is_empty() {
+            return Err(ApiError::invalid_input("API key must not be empty"));
+        }
+        if self.inner.admin_key.is_none() {
+            // Without an admin key the whole instance is unauthenticated, so
+            // a per-database key would be enforced against callers that can
+            // simply rotate it away through the open root scope. Refusing
+            // here is what lets `crate::auth` treat "no admin key" as "no
+            // per-database keys" (see also the check in `connect`).
+            return Err(ApiError::conflict(
+                "per-database API keys require the server to be started with an admin API key",
+            ));
+        }
+        if name == self.inner.options.primary_db {
+            // The primary database stores the registry and these very key
+            // hashes in its extensions, which `db.metadata`/`db.get_extension`
+            // expose to anyone holding its key. Delegating it would hand a
+            // tenant the server's own control plane.
+            return Err(ApiError::conflict(
+                "the primary database holds server state and cannot be delegated to a \
+                 per-database API key",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Fails with `404` unless the database is open or registered for reopen.
+    /// Only reachable by an admin, so naming a missing database is safe here.
+    async fn require_known_db(&self, name: &str) -> Result<(), ApiError> {
+        if self.inner.databases.read().await.contains_key(name)
+            || self.inner.registry.read().await.contains(name)
+        {
+            return Ok(());
+        }
+        Err(ApiError::not_found(format!("database {name:?} not found")))
+    }
+
+    /// Applies one change to the key map and persists the result, restoring
+    /// the previous in-memory value if persistence fails so that memory and
+    /// storage never disagree.
+    ///
+    /// Callers must hold the `lifecycle` lock: it is what serializes
+    /// concurrent updates against each other and against the registry writes
+    /// that share the primary database's metadata.
+    async fn store_api_key(&self, name: &str, hash: Option<ApiKeyHash>) -> Result<(), ApiError> {
+        let previous = {
+            let mut keys = self
+                .inner
+                .api_keys
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match hash {
+                Some(hash) => keys.insert(name.to_string(), hash),
+                None => keys.remove(name),
+            }
+        };
+        if let Err(err) = self.persist_api_keys().await {
+            let mut keys = self
+                .inner
+                .api_keys
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match previous {
+                Some(previous) => keys.insert(name.to_string(), previous),
+                None => keys.remove(name),
+            };
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// Persists the per-database key hashes into the primary database's
+    /// extensions. Errors must be propagated: a caller that reported a
+    /// successful rotation while the old hash survives on disk would restore
+    /// the revoked key on the next restart.
+    async fn persist_api_keys(&self) -> Result<(), ApiError> {
+        let keys: BTreeMap<String, ApiKeyHash> = {
+            self.inner
+                .api_keys
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        };
+        let primary = {
+            let dbs = self.inner.databases.read().await;
+            dbs.get(&self.inner.options.primary_db)
+                .map(|entry| entry.db.clone())
+        };
+        if let Some(db) = primary
+            && let Err(err) = db
+                .save_extension_from(DB_API_KEYS_KEY.to_string(), &keys)
+                .await
+        {
+            log::error!(
+                action = "AppState::persist_api_keys",
+                database = self.inner.options.primary_db;
+                "failed to persist per-database API keys: {err:?}",
+            );
+            return Err(err.into());
+        }
+        Ok(())
+    }
+
     /// Flushes and closes a database, removing it from the registry so it is
     /// not reopened on the next start. The primary database cannot be closed.
+    ///
+    /// Any per-database API-key binding is *kept*: `db.close` is a lifecycle
+    /// operation, not a revocation, and a database reopened later must not
+    /// silently come back under the weaker admin-key fallback. Use
+    /// [`AppState::remove_db_api_key`] to revoke.
     pub async fn close_db(&self, name: &str) -> Result<(), ApiError> {
         if name == self.inner.options.primary_db {
             return Err(ApiError::invalid_input(

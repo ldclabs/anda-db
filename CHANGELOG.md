@@ -2,6 +2,591 @@
 
 All notable changes to this workspace are documented in this file.
 
+## [0.11.0] — 2026-07-31
+
+Workspace-wide audit pass. Shipped as a minor bump rather than a patch: it
+removes cargo features, changes public Rust signatures, and tightens request
+validation in ways an existing caller can observe. It also repairs the semver
+mistake made by 0.10.1 (see the note in that section).
+
+Every crate in `rs/` moves to 0.11.0 together, and the Python binding
+(`py/anda_cognitive_nexus_py`) to 0.5.0.
+
+### Breaking — public Rust API
+
+- **`anda_kip::ErrorObject` is `#[non_exhaustive]`** — Struct-literal
+  construction is no longer possible from outside the crate; build errors with
+  `ErrorObject::new(code, message)` plus the `with_name` / `with_hint` /
+  `with_data` setters, or convert from `KipError` (which fills in the matching
+  `name` and `hint`). This closes the hole that made 0.10.1's added `name`
+  field a source-breaking change on a patch release, and lets future fields be
+  added without another break. The JSON wire shape is unchanged.
+- **`anda_kip::CommandItem::WithParams` is a tuple variant** — Its inline
+  struct body moved into the new public `ParameterizedCommand`
+  (`CommandItem::WithParams(ParameterizedCommand { command, parameters })`).
+  Rust pattern matches must be updated; the JSON wire shape is unchanged.
+  The move exists so `#[serde(deny_unknown_fields)]` can apply to the item:
+  `#[serde(untagged)]` struct variants ignore unknown fields, so a misspelled
+  `"params"` key used to deserialize into a valid-looking item with an *empty*
+  parameter map, and batch execution then silently substituted the shared
+  parameters instead.
+- **`anda_db_schema::as_wildcard_map` is public and returns the key too** —
+  Signature is now `Option<(&FieldKey, &FieldType)>` (previously a private
+  `Option<&FieldType>`). Index key-type resolution has to agree with schema
+  validation about which maps are wildcards, and a one-entry approximation
+  outside the crate did not.
+- **`anda_db` drops the `tantivy` and `tantivy-jieba` cargo features** — Both
+  gated nothing: they toggled a second, unused copy of the dependency, while
+  `anda_db` depended on `anda_db_tfs` with `features = ["full"]`
+  unconditionally, so `cargo check -p anda_db --no-default-features` always
+  compiled `tantivy`, `tantivy-jieba` and `jieba-rs`. Tantivy + Jieba
+  tokenization is a hard requirement of the crate (`index::bm25` re-exports
+  `default_tokenizer` / `jieba_tokenizer` unconditionally and every
+  `Collection` installs `default_tokenizer()` on open), so the honest
+  representation is no feature at all. `full` remains and now means exactly
+  `object_store/fs`. Manifests naming the removed features fail with
+  "does not contain this feature" instead of silently doing nothing; drop them.
+- **`EncryptedStoreBuilder::with_conditional_put()` is `#[deprecated]`** — It
+  has been a no-op since the 0.10.0 immutable-generation refactor
+  (`PutMode::Update` / `if_match` / `if_none_match` are always evaluated
+  against the logical ETag on every backend). Remove the call; the method
+  still compiles and is scheduled for removal.
+- **`anda_db_server::ServerInfo::primary_db` is `Option<String>`** — It is
+  `None` when `info` is answered for a per-database key, which must not learn
+  the instance's layout; an admin still gets `Some(name)`, so the JSON/CBOR
+  shape an existing (necessarily admin) client sees is unchanged.
+  `AppState::register_db` also takes a fourth argument, the optional API key
+  to bind to a newly created database.
+
+### Breaking — request validation and response shape
+
+- **`anda_kip::Request` and `ParameterizedCommand` reject unknown fields** —
+  Both carry `#[serde(deny_unknown_fields)]`; JSON bodies that previously had
+  extra keys silently ignored now fail to deserialize. This is deliberate:
+  `readonly` and `dry_run` default to the *unsafe* value, so a typo
+  (`"read_only"`, `"dryRun"`) silently downgraded a validate-only request into
+  a committed write.
+- **Batch command count is capped** — More than
+  `anda_kip::MAX_KIP_BATCH_COMMANDS` (256) commands in one `Request` is
+  rejected with `KIP_4002` before any command runs; the count is
+  attacker-controlled and drives the result vector's pre-allocation.
+- **Parameter substitution output is bounded** — Substitution stops once the
+  expanded command exceeds `MAX_KIP_INPUT_LEN`; the oversized string was
+  rejected by the parser budget anyway, but a small body could expand without
+  limit first (`occurrences × value_len`).
+- **`doc.get` JSON responses no longer carry `"field": null` keys** —
+  `Document`'s named-map serialization (`Document::try_into`, the
+  `doc.get` HTTP payload) omits fields that are absent from the document
+  instead of emitting an explicit `null`. `#[serde(default)]` only fills in
+  *missing* keys, so the old shape made `Document::try_from` → `try_into` a
+  one-way trip for any type that skips a field on serialization. A field that
+  *is* present holding `Fv::Null` still serializes as `null`.
+- **KML writes to protected schema nodes are rejected everywhere** — `UPSERT`
+  concept blocks and `DELETE PROPOSITIONS` now enforce `KIP_3004` on the
+  engine-owned schema identities, matching the guards `UPDATE` and
+  `DELETE ATTRIBUTES` already had. Previously an `UPSERT` could graft
+  attributes or metadata onto the meta-type nodes or the `CoreSchema` domain,
+  and `DELETE PROPOSITIONS` could sever e.g.
+  `$ConceptType belongs_to_domain CoreSchema` (which `DESCRIBE PRIMER` builds
+  its domain map from). Bootstrap keeps working through a private privileged
+  path, so the bundled capsules still re-apply on crate upgrade — the
+  identical statement submitted by a caller is rejected.
+- **KIP JSON literals are case-sensitive** — `TRUE` / `FaLsE` / `NULL` are no
+  longer accepted as spellings of `true` / `false` / `null`; the protocol is
+  case-sensitive (§2.8.2).
+- **KIP keywords require a trailing word boundary** — Multi-word keywords no
+  longer glue to the next token: `DESCRIBE CONCEPT TYPESLIMIT 5` used to parse
+  as `DESCRIBE CONCEPT TYPES LIMIT 5`. `INTO?b` and `WITH TYPE"Drug"` are
+  likewise two tokens again.
+- **Out-of-range integer literals are rejected** — `serde_json` (without
+  `arbitrary_precision`) degrades an integer literal that does not fit into
+  `f64`, storing a *different* number (`18446744073709551617` became
+  `1.8446744073709552e19`) so `EXPORT` capsules stopped round-tripping. The
+  exact value is recovered when it fits and rejected otherwise, matching how
+  overflowing float literals were already handled. `-0` now yields the integer
+  `0` rather than the float `-0.0`.
+- **`\uXXXX` escapes require exactly four hex digits** —
+  `u16::from_str_radix` accepts a leading sign, so `\u+041` used to decode to
+  `A`.
+- **`AndaDBSchema` requires a serialized `_id: u64` field** — The schema
+  builder injects `_id` as a *required* entry and `Document::try_from` reads it
+  back out of the serialized value, so a struct without `_id` (or with it
+  hidden by `#[serde(skip)]` / `#[serde(skip_serializing)]`) could be derived
+  but never stored — it failed at runtime with `field "_id" is required`. It is
+  now a compile error with that explanation.
+- **`Collection::create_hnsw_index_nx` reports configuration conflicts** —
+  When the field already carries an HNSW index whose *persisted* configuration
+  differs from the request, it returns an error instead of silently keeping the
+  old one; a discarded `dimension` change used to surface much later as a
+  `DimensionMismatch` on every insert. Remove and recreate the index to change
+  its configuration. `create_btree_index_nx` / `create_bm25_index_nx` are
+  unaffected — their field list is their whole configuration.
+- **`Collection::query_ids` clamps `limit`** — `limit` is clamped to
+  `Collection::MAX_SEARCH_LIMIT` and `None` means "as many as that bound
+  allows" rather than "every match"; the call is reachable over HTTP as
+  `doc.query_ids` and an unbounded filter materialized one `u64` per matching
+  document. `Some(0)` returns an empty result, matching `search_ids`.
+- **`anda_db_server` requires an explicit request `Content-Type`** — An absent
+  or unrecognized type is answered with `415 unsupported_media_type` instead
+  of being parsed as CBOR. Accepting `text/plain` made every RPC endpoint
+  reachable as a browser "simple request", i.e. a CSRF surface in the
+  supported loopback / `--insecure-no-api-key` modes. Send
+  `application/cbor` or `application/json`; response negotiation is unchanged.
+- **`anda_db_server` caps `doc.query_ids` and `doc.get_many`** —
+  `doc.query_ids` returns at most 1 000 IDs and an omitted `limit` now means
+  that bound rather than "every match" (`limit: 0` still returns nothing); a
+  `limit` above it is a `400` rather than a silent clamp. `doc.get_many`
+  accepts at most 1 000 IDs, each of which costs one object-store fetch. IDs
+  are also fetched with the same bounded concurrency `doc.search` uses instead
+  of one serial round trip each.
+- **`anda_db_server` bounds the database registry** — At most
+  `--max-databases` (default 64) non-primary databases may be registered;
+  `db.create` / `db.open` / `db.connect` past the limit return `409
+  limit_exceeded`. Every registered database costs a permanent background
+  flush task. Reopening at startup is never blocked by the bound, so lowering
+  it cannot break a restart.
+- **`anda_cognitive_nexus_server` no longer returns HTTP 200 for a failed KIP
+  execution** — The JSON body is unchanged, but the status now reflects the
+  KIP error class: `400` for syntax/schema/reference errors and
+  `ResourceExhausted`, `404` for `NotFound`, `409` for `DuplicateExists` /
+  `VersionConflict`, `403` for `ImmutableTarget`, `408` for
+  `ExecutionTimeout`, `500` for internal or unrecognized codes. A failed KML
+  mutation used to be indistinguishable from success to load balancers, retry
+  policies, uptime probes, and 5xx alerting.
+- **`anda_cognitive_nexus_server` authenticates before parsing the body** —
+  `/kip` runs its API-key check as a route layer, so an unauthenticated caller
+  always receives `401` instead of a `400`/`413` that revealed how its body
+  was processed.
+- **`anda_cognitive_nexus_server` bounds the KIP audit log by default** —
+  `LOG_RETENTION_DAYS` now defaults to `30`; unbounded retention (`0`) must be
+  chosen explicitly. The stored request is capped by the new
+  `MAX_LOGGED_REQUEST_BYTES` (default 8 KiB) and truncated above it into a
+  still-parseable stand-in; raise it to `MAX_BODY_SIZE` to keep full bodies.
+  Previously each request appended its whole body (up to 2 MiB) forever.
+- **`anda_db_shard_proxy` rejects unroutable requests** — A request whose path
+  carries no valid database name is answered with `404` instead of being
+  forwarded to `--default-backend-addr`. With the default `--path-prefix /`,
+  `POST /` is the backend's root scope (`db.list`, `db.create`, `db.open`,
+  `db.close`), so any tenant able to reach the proxy could enumerate, create,
+  or close databases on the shared shard; malformed and percent-encoded names
+  were silently funnelled there too. The default backend still serves
+  requests that name a database.
+- **`anda_db_shard_proxy` drops the `read_only` flag** — It is gone from
+  `ShardBackend`, `ResolvedRoute`, the `PUT /_admin/shard_backends` body, the
+  NOTIFY payload, and the `shard_backends` DDL. Nothing enforced it: the RPC
+  protocol is POST-based with the method inside the body, so the proxy cannot
+  classify a request without buffering and parsing every body. Read-only
+  enforcement belongs to the backend (`db.set_read_only`). Existing rows keep
+  their column, which is simply no longer read.
+- **`anda_db_shard_proxy` rejects out-of-range shard ids** — `shard_id` is
+  stored in a signed `INT`, so an id above `i32::MAX` was silently written
+  negative and became invisible to external tooling; it is now a `400`. A
+  negative id read back is logged and ignored instead of wrapping into a huge
+  `u32` that routes to a shard no operator configured, and newly created
+  tables carry `CHECK (shard_id >= 0)`.
+
+### Breaking — object store observable behavior
+
+None of these change the on-disk format; they change what `anda_object_store`
+*reports* to callers. Data written by 0.10.0 stays readable.
+
+- **`MetaStore`'s logical ETag is a per-commit CAS token, not a content
+  hash** — It is now `base64url(SHA3-256(generation ‖ payload))`, seeded with
+  the freshly minted per-commit generation, mirroring what `EncryptedStore`
+  already did with its per-put nonce. A bare content hash made
+  `PutMode::Update(UpdateVersion { e_tag })` a content-*equality* check rather
+  than a version CAS: after an A → B → A rewrite a writer holding the token
+  for the first A still passed the precondition and silently clobbered both
+  intervening commits — a classic ABA lost update.
+  **Migration:** every ETag changes on upgrade, and **two puts of identical
+  bytes now produce different tokens**. Any consumer that persisted ETags
+  across the upgrade must re-read them; a persisted token will no longer match
+  and its next conditional update will fail with `Precondition` (safely — it
+  errors rather than clobbering). Do not use the ETag as a content digest or
+  deduplication key.
+- **`copy` / `rename` mint a new logical ETag for the target** — Previously
+  the source's token was propagated, so two distinct keys shared one CAS token
+  and the target could be handed a token it had already retired; either let a
+  stale `PutMode::Update` precondition pass. The target's token is now derived
+  from its own fresh generation, exactly as a put's is.
+- **`get` / `head` report the committed size** — The authenticated size from
+  the metadata commit point, not the backing generation object's length.
+- **`list` / `get` / `head` report one `last_modified`** — All three now
+  derive it from the generation. Previously listings used the `meta/<loc>`
+  object's mtime while `get` / `head` used the payload object's — two
+  different clocks for one logical object, so a listing and a subsequent read
+  could disagree about when the same object was written. Pre-0.10 documents
+  carry no generation and still report the backend's timestamp.
+- **Date preconditions are evaluated in-wrapper and stripped** —
+  `if_modified_since` / `if_unmodified_since` are answered against the same
+  generation-derived `last_modified` the call reports, and removed before the
+  request reaches the backend, which would otherwise evaluate them against the
+  payload object's own mtime. RFC 9110 §13.2.2 precedence is honoured: an
+  `if_match` suppresses `if_unmodified_since` and an `if_none_match`
+  suppresses `if_modified_since`, so a paired date condition can no longer
+  reach the backend and produce a spurious `Precondition` / `NotModified`.
+  Pre-0.10 documents (no generation) still defer to the backend, which matches
+  the timestamp such a read reports.
+
+### Added
+
+- **`anda_kip::ErrorObject::new` / `with_name` / `with_hint` / `with_data`** —
+  The supported construction path now that the type is `#[non_exhaustive]`.
+- **`anda_db_server::ApiError::from_collection_state`** — Classifies a
+  collection handle's lifecycle state into the status a client can act on.
+- **`anda_db_server` `--max-databases` / `MAX_DATABASES`** — Bounds the
+  registry of non-primary databases (default 64).
+- **`anda_cognitive_nexus_server` `--max-logged-request-bytes` /
+  `MAX_LOGGED_REQUEST_BYTES`** — Caps the KIP request stored in each audit log
+  document (default 8 KiB).
+- **`anda_kip::MAX_KIP_BATCH_COMMANDS`** — Public batch-size cap (256).
+- **`anda_db_schema::FieldValue::try_into_cbor`** — Depth-bounded counterpart
+  of the infallible `From<FieldValue> for Cbor`, which truncates an over-deep
+  subtree to `Cbor::Null` instead of recursing until the stack is exhausted.
+  Both directions now report the same `SchemaError::FieldValue`.
+- **`anda_db_tfs::BM25Params::MAX_K1`** — Largest `k1` honored at scoring time
+  (1000).
+- **`EncryptedStoreBuilder::with_meta_cache_ttl`** — Sets the metadata cache
+  TTL while preserving the capacity passed to `EncryptedStoreBuilder::new`.
+- **`anda_cognitive_nexus::compare_sort_key` / `compare_order_row`** — The
+  total order `ORDER BY` sorts with, exposed for downstream executors.
+- **`anda_db_shard_proxy::MAX_SHARD_ID`** — The largest shard id representable
+  in the PostgreSQL `int4` column.
+- **`anda_db_schema::FieldType::prune_undeclared` /
+  `FieldType::is_compatible_upgrade_of`** — Nested-struct schema evolution:
+  the first drops stale keys of a removed nested field on the read path, the
+  second states which nested-map changes are compatible upgrades.
+- **Per-database API keys** (`anda_db_server`) — `db.create` accepts an
+  `api_key` for the new database, and the new root-scope methods
+  `db.set_api_key` (rotates; generates a CSPRNG key and returns it once when
+  none is supplied) and `db.remove_api_key` manage it afterwards. Only the
+  SHA3-256 hash is persisted, alongside the database registry in the primary
+  database's extensions (`server:api_keys`), and it is compared in constant
+  time. The new `anda_db_server::auth` module documents the precedence rules.
+  Provisioning requires an admin key, the primary database cannot be
+  delegated, and a server started without `API_KEY` while bindings exist in
+  storage refuses to start rather than silently serving them unauthenticated.
+- **`anda_db_tfs::BM25Index::purge_ids`** — Erases a *set* of document ids
+  without their indexed text, for repair paths whose document bodies are gone
+  and which therefore cannot call `remove(id, text, now_ms)`. Sweeps every
+  posting list once for the whole set, keeps `doc_tokens` / `total_tokens` (and
+  the average document length derived from them) consistent with the surviving
+  postings, and marks the affected buckets dirty so the purge survives a flush
+  and reload. Re-exported as `anda_db::index::BM25::purge_ids`.
+- **`anda_db::error::CollectionState` / `CollectionStateError`,
+  `DBError::collection_state` / `DBError::is_poisoned`,
+  `Collection::state`, and `Collection::is_poisoned` (was `pub(crate)`)** — The
+  collection lifecycle state (closing, closed, deleting, deleted, poisoned) is
+  now structurally detectable. It travels as a typed source inside the
+  `DBError::Generic` a rejected call returns, so downstream crates can classify
+  a poisoned handle — and tell "reopen and retry"
+  (`CollectionState::is_recoverable`) from "give up" — without matching on the
+  message text. No `DBError` variant was added and the rendered message is
+  unchanged, so this is purely additive.
+
+### Fixed
+
+- **A read RPC can no longer poison a collection** — `anda_db_server` opened
+  collections inline on the cancellable read path, but
+  `AndaDB::open_collection` finishes a cold open with `Collection::flush`,
+  whose cancel guard poisons the handle when its future is dropped. The first
+  `doc.get` on a cold collection that hit the request timeout (or a shutdown)
+  therefore abandoned a storage write mid-flight and invalidated a healthy
+  collection. The open now runs on its own task and completes even when the
+  request that started it is gone.
+- **The cancellation policy is declared with the dispatch entry** — The list
+  of mutating method names in `anda_db_server` was maintained by hand next to
+  the dispatch match, so a new mutating method that nobody added to the list
+  silently ran on the cancellable path — a durability classification the
+  compiler could not check. Method name, side-effect class, and handler now
+  come from one table per scope, and the dispatch match is exhaustive over it.
+- **A poisoned or deleted collection is reported honestly** — Every non-active
+  collection handle state used to surface as an opaque `internal` 500.
+  `anda_db_server` now answers `503 collection_unavailable` for the states a
+  reopen recovers (poisoned by a cancelled operation, closing, closed) and
+  `410 gone` for a deleted one, using the engine's own
+  `CollectionState::is_recoverable` split. A `_id` B-Tree index, which the
+  engine rejects, is also refused as a `400` at definition time.
+- **`anda_cognitive_nexus_server` reclaims capacity from runaway KIP
+  executions** — A timed-out execution was detached with no deadline while
+  still holding its bounded mutation permit, so `MAX_CONCURRENT_MUTATIONS`
+  expensive requests could exhaust capacity for the rest of the process's
+  life (every later request answering "server mutation capacity is
+  exhausted", and shutdown escalating to an abort). Detached executions now
+  carry a hard deadline of four times the response timeout, after which they
+  are abandoned — crash-equivalent, exactly like the existing shutdown abort
+  path, and far enough above the response deadline that a normal slow request
+  is never affected.
+- **`anda_db_shard_proxy` no longer answers 404 during a routing-cache
+  resync** — `reload_backend_cache` cleared the live cache before refilling
+  it, so every request during the window (any `PgListener` reconnect,
+  i.e. a routine network blip) reported "no backend found" instead of the 503
+  a routing-store problem is supposed to produce.
+- **`anda_db_shard_proxy` validates backend addresses wherever the cache is
+  filled** — `validate_backend_addr` ran only in the admin handler, while the
+  startup reload and the NOTIFY listener inserted rows verbatim; the admin
+  path itself re-entered through the listener. A row written by a DBA, a
+  migration, or an older build (`https://…`, `host:port`) made every request
+  for every database on that shard fail. Bad rows are now rejected and logged.
+- **`reconcile_storage` repairs index postings for missing documents** —
+  Dropping a dead document id from the bitmap is not a repair on its own: the
+  derived index postings survive it. A unique B-tree key kept rejecting new
+  documents with `AlreadyExists` forever, and `query_ids` / `search_ids` kept
+  returning the dead id (`search_ids` does not filter BM25 hits against the
+  bitmap), while the dead document's length kept skewing every BM25 score. The
+  bodies are gone, so the indexed values cannot be recomputed; each index is
+  now purged as far as it can be purged *by id*: HNSW directly, B-tree by one
+  sweep of the key space for the whole dead set, and BM25 by one sweep of the
+  inverted index through the new `BM25Index::purge_ids`, which also drops the
+  dead documents from the counters BM25 scores are derived from. Each sweep is
+  `O(index size)` per index, proportional to the `data/` listing
+  `reconcile_storage` already performs.
+
+- **B-Tree flush no longer persists postings owned by another bucket** — A
+  bucket's key list could name a key whose posting had since migrated
+  elsewhere; the flush wrote a stale copy into the non-owning bucket, and the
+  higher-numbered bucket then won on load, resurrecting deleted ids. The flush
+  now only serializes postings the bucket actually owns.
+- **B-Tree scan direction is reported, not guessed** — `Lt`/`Le` range scans
+  walk the key space backwards and are trimmed from the head; every other path
+  collects ascending and is trimmed from the tail. The direction cannot be
+  re-derived from the filter AST (composite `And`/`Or`/`Not` filters evaluate
+  their operands unbounded and always yield ascending results), so guessing
+  from the AST made logically equivalent filters return disjoint pages —
+  `Between(5, 14)` and `And(Ge(5), Lt(15))` returned opposite ends of the same
+  key range. The scan now reports its own direction, and `query_ids` returns
+  the same ids for equivalent filters. A `Filter::Id` inverted `Between` that
+  matches nothing now returns empty instead of a spurious page.
+- **HNSW forward edges never point below their layer** — Neighbor selection
+  could record a forward edge to a node that does not exist at the current
+  build layer (the reverse edge was correctly skipped), leaving a dangling
+  half-edge that search had to defend against. Candidates below the build layer
+  are now skipped on both sides, and neighbor selection skips candidates that
+  are no longer present in the node map.
+- **BM25 average document length is derived, not cached** — The cached
+  `avg_doc_tokens` could disagree with `total_tokens` / `doc_tokens.len()` (in
+  particular after a `load_metadata` with no documents loaded yet, which seeded
+  it from persisted stats). It is now computed on demand, once per query and
+  once per `stats()` call.
+- **BM25 parameters can no longer produce `NaN` scores** — `k1` and `b` arrive
+  straight from deserialized queries; a finite-but-huge `k1` (`f32::MAX` passes
+  `is_finite`) overflowed the scoring formula to `inf` and turned the score into
+  `inf / inf = NaN`, which broke the ranking comparator's total order. `k1` is
+  clamped to `[0, MAX_K1]`, `b` to `[0, 1]`, and non-finite values fall back to
+  the defaults. Score comparison is a total order in the presence of `NaN`.
+- **BM25 token counters stay consistent under concurrent insert/remove**, and
+  `remove` keeps a bucket token that a concurrent insert recreated.
+- **`compact_buckets` is exclusive with mutations again** (`anda_db_tfs`,
+  `anda_db_btree`) — 0.10.0 deleted the internal mutation gate and made
+  "coordinate compaction against writes" the caller's problem (see *Changed —
+  de-complexity pass* under 0.10.0). That contract was not safe to hand out:
+  compaction rebuilds the bucket map non-atomically, so a posting created
+  after it snapshotted `postings` was re-binned into nothing and silently
+  dropped by the next flush. Both crates restore a `mutation_gate` that
+  `insert` / `insert_array` / `remove` / `remove_array` take **shared** (they
+  still run concurrently with each other) and `compact_buckets` takes
+  **exclusively**; it is the first lock a mutation acquires, so it never nests
+  inside a `DashMap` shard guard. **Callers no longer need to serialize
+  compaction against writes.** Excluding `flush` against mutations,
+  compaction and other flushes remains the caller's responsibility, unchanged.
+- **KIP parser budget cannot be defeated by a quote inside a comment** — The
+  budget pre-scan did not skip line comments, so a lone `"` in a comment
+  latched its in-string state for the rest of the input: every bracket after it
+  went uncounted, the depth guard was bypassed entirely, and the parser then
+  recursed once per bracket and overflowed the stack. The mirror failure
+  (brackets inside a string literal counted against the budget, rejecting valid
+  input) is fixed by the same change.
+- **Truncated KIP escapes report a location** — Streaming `take`/`tag`
+  combinators returned `Incomplete`, which `format_nom_error` renders without
+  line, column or context; the `complete` variants are used so a truncated
+  `\uXX` is a located parse error.
+- **Batch responses keep their partial result** — A batch item that failed with
+  a partial result (e.g. an over-budget KQL query carrying the page it did
+  manage to produce) had the response rebuilt without it, silently dropping the
+  data.
+- **`"error": null` deserializes as success** — The canonical JSON-RPC success
+  shape spells an absent error as an explicit `null`; `Response`'s
+  deserializer treated it as an unparseable error payload.
+- **Placeholder-misuse hints are produced up front** — The post-hoc hint
+  rewriting that ran after a `KIP_1xxx` failure is replaced by the existing
+  `validate_placeholder_usage` pre-check, so the hint no longer depends on the
+  parser having failed in a particular way.
+- **`Json` field values survive a storage round trip** — A `FieldType::Json`
+  field reads back as its plain `Map` / `Array` / primitive shape;
+  normalization now rebuilds the declared `Fv::Json` variant instead of leaving
+  the read-back shape in place.
+- **Wildcard maps enforce the declared key variant** — A `Map<Text, T>` could
+  be filled with integer keys: the value validated structurally but could never
+  be deserialized back into its declared Rust type. Non-wildcard maps are
+  rejected rather than indexed by name.
+- **`FieldValue` → CBOR conversion is depth-bounded** — Deeply nested values no
+  longer recurse until the stack is exhausted (see `try_into_cbor` above).
+- **An unusable write-ahead intent no longer makes a collection unopenable** —
+  Nothing cleared such a record, so every reopen replayed it and failed
+  identically with no operator escape hatch. Unusable records are logged and
+  skipped (the treatment a schema-mismatched document already got) and retired
+  by the next flush.
+- **`Storage::connect` adopts the caller's path after relocation** — A database
+  directory moved on disk kept the recorded path and read from the old
+  location.
+- **`AndaDB::auto_flush` no longer swallows its final close error** — The
+  cancellation path discarded the result of `close()`, and callers observe the
+  task only through a `JoinHandle<()>`, so a failed shutdown flush was reported
+  as a clean shutdown. It is now logged at error level. (`auto_flush` still
+  returns `()`; it is not a `Result`.) `set_extension_from` likewise logs the
+  values it drops instead of discarding them silently.
+- **`read_only` is live handle state, not durable state** — `Collection::open`
+  always starts a handle writable, so the flag is written as `false` in every
+  persisted snapshot; only `stats()` / `metadata()` report the live value.
+- **Object-store garbage collection cannot reclaim an in-flight generation** —
+  A freshly written payload is unreferenced between the payload write and the
+  pointer switch; it is now registered as in-flight for that window (and for
+  the whole of a multipart upload), so a concurrent `collect_garbage` cannot
+  delete a generation that is about to be committed. A cold read can no longer
+  resurrect a replaced pointer.
+- **`EncryptedStoreBuilder::with_meta_cache_ttl` keeps the configured
+  capacity** — It used to rebuild the cache with the default capacity,
+  silently discarding the value passed to `new`. It still discards a cache
+  previously supplied through `with_meta_cache` (which replaces the built-in
+  cache wholesale, capacity and eviction policy included), so the two are
+  order-sensitive; both behaviors are now documented.
+- **KQL `FIND` columns that mix entity ids and predicate names** — Reachable
+  through `UNION` (branches merge by variable name, and a variable in the
+  predicate position binds a name). One kind used to be dropped, which also
+  contradicted `COUNT(?x)`. Mixed columns now paginate with a numeric offset
+  cursor over one deterministic order. An invalid cursor on a single-column
+  projection is rejected instead of being misread.
+- **KQL `ORDER BY` is a total order** — Sort keys are partitioned into the
+  classes on which `compare_json` applies a single rule (booleans, numbers and
+  numeric-looking strings, datetime strings, other strings, containers, null),
+  so sorting is deterministic across mixed-type columns.
+- **Removing a field from a nested struct no longer bricks stored documents** —
+  A non-wildcard `FieldType::Map` (what `#[derive(FieldTyped)]` emits for a
+  nested struct) names its keys one by one and `validate` rejects undeclared
+  ones, so dropping one nested field made every already-stored document
+  unreadable. Undeclared keys are now pruned on the read path just before
+  validation — the same treatment a value stored under a retired top-level
+  field index already got — and disappear on the next rewrite. Schema upgrade
+  compatibility follows the same rule as top-level fields: a nested map may
+  gain an *optional* key or lose a key; a changed key type, a new *required*
+  key, and any change of wildcard-ness or key variant remain incompatible.
+- **Shard ids round-trip through PostgreSQL** — Conversion to and from the
+  `int4` column is checked against `MAX_SHARD_ID` instead of wrapping; an id
+  above `i32::MAX` used to be stored negative and become invisible to every
+  reader.
+- **Unroutable shard-proxy requests are rejected, not sent to the default
+  backend** (security) — A request whose database name could not be resolved
+  fell through to `default_backend`. With the default `--path-prefix /`,
+  `POST /` carries no database name at all and is the backend's *root* scope
+  (`db.list`, `db.create`, `db.open`, `db.close`), so any tenant that could
+  reach the proxy could enumerate, create or close databases on the shared
+  shard; the same catch-all also swallowed every malformed or percent-encoded
+  name. The default backend keeps its legitimate purpose: a valid database
+  name with no routing row is still served by it. `ResolvedRoute` drops its
+  `read_only` field — read-only is backend RPC state
+  (`db.set_read_only` / `collection.set_read_only`), never proxy routing state.
+- **One API key no longer opens every database** (`anda_db_server`, security)
+  — The single process-global key authorized *all* scopes, so any holder
+  could `POST /{any_db}` (including `doc.remove` and `collection.delete`) and
+  reach the root scope. Keys now have two tiers: the configured `API_KEY` is
+  the **admin** key (root scope plus every database), and a database may be
+  given its **own** key, accepted on `POST /{that_db}` only and never at the
+  root scope. Unauthorized database-scope requests all return the same `401`,
+  so a caller cannot probe which databases exist, and database-scoped `info`
+  stops enumerating the instance for a per-database key. Existing deployments
+  are unaffected until they provision a per-database key: with none bound,
+  every database falls back to the admin key exactly as before, and the
+  keyless loopback mode is unchanged.
+
+### Documentation and packaging
+
+- **The Python binding builds again** (`py/anda_cognitive_nexus_py`) — Its
+  manifest inherited `pyo3`, `pyo3-asyncio`, `serde-pyobject` and
+  `pyo3-build-config` from `[workspace.dependencies]`, where none of them was
+  declared, so `cargo metadata` on it failed outright; and it pinned its four
+  sibling crates at `"0.9"`, which cannot match `0.10.x`. The pyo3 family is
+  now declared at the workspace root (pinned to the 0.20 line, the last one
+  `pyo3-asyncio` supports — CPython 3.7–3.12; set `PYO3_PYTHON` when the
+  `python3` on PATH is newer) and the sibling requirements are `"0.10"`. The
+  documented `cargo test -p anda_cognitive_nexus_py --lib` flow, broken for two
+  minor releases, passes again; `make test-py` now checks that the workspace
+  member is uncommented first.
+- **`AGENTS.md` no longer drifts from `CLAUDE.md`** — The two files are the
+  same document (`AGENTS.md` was stale by two minor versions, telling every
+  non-Claude harness to pin `anda_db` 0.8 and `object_store` 0.13). `CLAUDE.md`
+  is the source; `AGENTS.md` is a byte-identical copy regenerated by
+  `make sync-agents-doc`, and `make lint` fails when they differ.
+- **`README.md`** — The copy-paste dependency block pinned `anda_db = "0.8"`,
+  two minor versions behind the example ten lines below it.
+- **`skills/anda-db/references/anda_db_quick_ref.md`** — Pinned `0.9` while
+  `SKILL.md` in the same skill said `0.10`, and told readers to call
+  `EncryptedStoreBuilder::with_conditional_put()` for compare-and-swap
+  semantics that have been unconditional since 0.10.0.
+
+## [0.10.1] — 2026-07-20
+
+### Semver note — 0.10.1 should have been 0.11.0
+
+This release added the public field `name` to `anda_kip::ErrorObject`, a fully
+public, non-`#[non_exhaustive]` struct, and shipped it as a **patch** bump. Any
+consumer that built an `ErrorObject` with a struct literal — the only
+documented way at the time — stops compiling with ``missing field `name` `` on
+a plain `cargo update` while pinned to `anda_kip = "0.10"`.
+
+The same release changed
+`anda_cognitive_nexus::normalize_search_score` from `(f32, f32) -> f64` to
+`(f32) -> f64`, also source-breaking, also on a patch bump.
+
+Both are addressed in 0.11.0: `ErrorObject` becomes `#[non_exhaustive]` with an
+`ErrorObject::new` + `with_*` construction path, so this cannot recur.
+Consumers pinned to `anda_kip = "0.10"` who cannot take a source break should
+pin `=0.10.0`.
+
+### Added
+
+- **`ErrorObject::name`** (`anda_kip`) — Optional semantic error name
+  accompanying the `KIP_xxxx` code (`"InvalidSyntax"`, `"TypeMismatch"`, …), so
+  an LLM does not have to memorize the code table. Serialized only when
+  present (`skip_serializing_if`), and `#[serde(default)]` on the way in, so
+  the JSON wire shape stays backward compatible in both directions.
+  `From<KipError>` fills it in automatically. **Source-breaking for struct
+  literals** — see the semver note above.
+
+### Changed
+
+- **BM25 search scores are absolute, not relative to the top hit**
+  (`anda_cognitive_nexus`; breaking behavior) — `META SEARCH` scores were
+  normalized as `score / max_score` over the returned set, so the best hit
+  always scored `1.0` however weak the match, and the same document scored
+  differently depending on what else came back. Scores now use the
+  corpus-independent saturation curve `score / (score + 2)`, rounded to six
+  decimals, which makes `THRESHOLD` the honest-miss gate KIP §5.2.2 describes.
+  **Every existing `THRESHOLD` value now means something different** and must
+  be recalibrated: values tuned against the relative curve (where the top hit
+  was pinned at `1.0`) will be far too aggressive against the absolute one.
+  `normalize_search_score` loses its `max_score` parameter —
+  `(f32, f32) -> f64` becomes `(f32) -> f64`, source-breaking; see the semver
+  note above.
+- **Unbounded `{m,}` multi-hop queries fail instead of answering partially**
+  (`anda_cognitive_nexus`; breaking behavior) — An unbounded quantifier is
+  still capped at the 10-hop engine limit, but if the transitive closure is
+  incomplete at the cap the query now fails with `KIP_4002` rather than
+  returning the paths found so far. A partial closure is a silently wrong
+  answer (KIP §3.4.2). Queries that used to return partial results now error;
+  bound the quantifier explicitly (`{m,n}` with `n <= 10`) or traverse in
+  stages.
+- **Read-only mode rejects KML with an actionable hint** (`anda_kip`) — The
+  generic "check parentheses" syntax hint is replaced by a message naming the
+  rejected statement kinds and the recovery action. The code stays `KIP_1001`
+  until the spec defines a permission-denied code.
+
+### Documentation
+
+- `docs/anda_kip.md` and `docs/anda_cognitive_nexus.md` synced to KIP v1.0-RC10
+  and the row-based solution model; `KIPSyntax.md`, `SPECIFICATION.md`, the
+  system/self instruction documents and the `Insight` / `Preference` capsules
+  refreshed.
+
 ## [0.10.0] — 2026-07-16
 
 De-complexity release. 0.9.2 was never published; its review-driven hardening
@@ -42,9 +627,11 @@ data written by 0.10** (do not roll back after writing):
 ### Migration note: HNSW deletion repair is now opt-in
 
 `HnswConfig::reconnect_on_delete` now defaults to **`false`** for new
-configurations *and* for persisted metadata that lacks the field (matching
-the behavior those indexes were built with; the unpublished 0.9.2 defaulted
-it to `true`). Neighbor repair keeps recall stable under delete-heavy
+configurations *and* for persisted metadata that lacks the field — which
+matches the behavior those indexes were built with, since `remove()` in every
+published release through 0.9.1 pruned the reverse edges without any re-link
+step. (The unconditional re-link, and the `true` default that preserved it,
+existed only in the unpublished 0.9.2.) Neighbor repair keeps recall stable under delete-heavy
 workloads but runs O(M²·L) distance computations while holding the
 structural write lock; enable it explicitly when recall stability matters
 more than deletion throughput.

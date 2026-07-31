@@ -41,6 +41,30 @@ If you set `API_KEY`, clients must send:
 Authorization: Bearer <API_KEY>
 ```
 
+The key is checked before the request body is read, so an unauthenticated
+caller always gets `401` — never a body-parsing or body-size error.
+
+## Response Statuses
+
+`POST /kip` answers `200` only for a successful execution. A failed KIP
+execution keeps the same JSON body (`{"error": {"code": "KIP_...", ...}}`) but
+carries a status matching the error class, so load balancers, retry policies,
+and 5xx alerting see the failure: `400` for syntax/schema/reference errors and
+oversized result sets, `404` for `NotFound`, `409` for `DuplicateExists` /
+`VersionConflict`, `403` for `ImmutableTarget`, `408` for `ExecutionTimeout`,
+and `500` for internal or unrecognized errors.
+
+## Audit Log
+
+Every `/kip` request appends a durable document to the `kip_logs` collection.
+Two bounds keep it from growing without limit:
+
+- `LOG_RETENTION_DAYS` (default `30`) prunes documents older than the window.
+  `0` disables pruning entirely and must be chosen explicitly.
+- `MAX_LOGGED_REQUEST_BYTES` (default `8192`) caps the request stored in each
+  document; a larger request is stored truncated but still parseable. Raise it
+  to `MAX_BODY_SIZE` to keep full request bodies.
+
 ## Related Crates
 
 - `anda_cognitive_nexus` for the reference KIP executor

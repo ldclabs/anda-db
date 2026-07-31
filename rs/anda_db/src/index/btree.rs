@@ -11,7 +11,7 @@ pub use anda_db_btree::{BTreeConfig, BTreeMetadata, BTreeStats, RangeQuery};
 use super::from_virtual_field_name;
 use crate::{
     error::DBError,
-    schema::{BoxError, DocumentId, Fe, Ft, Fv},
+    schema::{BoxError, DocumentId, Fe, Ft, Fv, as_wildcard_map},
     storage::{ObjectVersion, PutMode, Storage},
     unix_ms,
 };
@@ -64,6 +64,38 @@ impl Hash for &BTree {
             BTree::String(btree) => btree.name.hash(state),
             BTree::Bytes(btree) => btree.name.hash(state),
         }
+    }
+}
+
+/// Resolves the key type a B-tree index uses for a declared field type:
+/// at most one `Option` layer is unwrapped, then at most one homogeneous
+/// container layer — an `Array` of a single element type (indexed by its
+/// elements) or a *wildcard* `Map` (indexed by its keys).
+///
+/// Wildcard detection must come from the schema itself
+/// ([`as_wildcard_map`]), which requires one of the sentinel keys `"*"` /
+/// `b"*"` / `i64::MIN`. A `Map` that declares its keys explicitly — what
+/// `#[derive(FieldTyped)]` emits for *every* nested struct — is returned
+/// unchanged, so [`BTree::inner_new`] rejects it as an unsupported field type.
+/// (Regression: treating any one-entry `Map` as a wildcard resolved a nested
+/// one-field struct such as `struct One { a: String }` to a `String` index,
+/// where [`BTree::insert`] then indexed every document under the constant
+/// field *name* `"a"`: equality queries returned the whole collection and a
+/// `#[unique]` field failed the second insert with a spurious conflict.)
+///
+/// Anything else is returned as-is and validated by the caller.
+fn key_type_of(ft: &Ft) -> Ft {
+    let ft = match ft {
+        Ft::Option(inner) => inner.as_ref(),
+        other => other,
+    };
+    match ft {
+        Ft::Array(v) if v.len() == 1 => v[0].clone(),
+        Ft::Map(v) => match as_wildcard_map(v) {
+            Some((key, _)) => key.field_type(),
+            None => ft.clone(),
+        },
+        other => other.clone(),
     }
 }
 
@@ -147,38 +179,14 @@ impl BTree {
             allow_duplicates: !field.unique(),
         };
         let field_name = field.name().to_string();
-        match field.r#type() {
-            Ft::Option(ft) => match ft.as_ref() {
-                Ft::Array(v) if v.len() == 1 => {
-                    BTree::inner_new(vec![field_name], &v[0], config, storage, now_ms).await
-                }
-                Ft::Map(v) if v.len() == 1 => {
-                    BTree::inner_new(
-                        vec![field_name],
-                        &v.keys().next().unwrap().field_type(),
-                        config,
-                        storage,
-                        now_ms,
-                    )
-                    .await
-                }
-                v => BTree::inner_new(vec![field_name], v, config, storage, now_ms).await,
-            },
-            Ft::Array(v) if v.len() == 1 => {
-                BTree::inner_new(vec![field_name], &v[0], config, storage, now_ms).await
-            }
-            Ft::Map(v) if v.len() == 1 => {
-                BTree::inner_new(
-                    vec![field_name],
-                    &v.keys().next().unwrap().field_type(),
-                    config,
-                    storage,
-                    now_ms,
-                )
-                .await
-            }
-            v => BTree::inner_new(vec![field_name], v, config, storage, now_ms).await,
-        }
+        BTree::inner_new(
+            vec![field_name],
+            &key_type_of(field.r#type()),
+            config,
+            storage,
+            now_ms,
+        )
+        .await
     }
 
     /// Creates a persisted multi-field B-tree index.
@@ -209,23 +217,9 @@ impl BTree {
     /// type accepted at index creation must resolve to the same key type on
     /// reload, otherwise a collection with such an index can never be
     /// reopened. (Regression: `Map` fields were accepted by `new` but missing
-    /// here, bricking collections on restart.)
+    /// here, bricking collections on restart.) Both now share [`key_type_of`].
     pub async fn bootstrap(name: String, ft: &Ft, storage: Storage) -> Result<Self, DBError> {
-        match ft {
-            Ft::Option(ft) => match ft.as_ref() {
-                Ft::Array(v) if v.len() == 1 => BTree::inner_bootstrap(name, &v[0], storage).await,
-                Ft::Map(v) if v.len() == 1 => {
-                    BTree::inner_bootstrap(name, &v.keys().next().unwrap().field_type(), storage)
-                        .await
-                }
-                v => BTree::inner_bootstrap(name, v, storage).await,
-            },
-            Ft::Array(v) if v.len() == 1 => BTree::inner_bootstrap(name, &v[0], storage).await,
-            Ft::Map(v) if v.len() == 1 => {
-                BTree::inner_bootstrap(name, &v.keys().next().unwrap().field_type(), storage).await
-            }
-            v => BTree::inner_bootstrap(name, v, storage).await,
-        }
+        BTree::inner_bootstrap(name, &key_type_of(ft), storage).await
     }
 
     async fn inner_new(
@@ -1243,10 +1237,12 @@ mod tests {
         .unwrap();
         assert!(matches!(option_array, BTree::U64(_)));
 
+        // Only *wildcard* maps are indexable; `{"k": Text}` used to resolve
+        // here too (see `non_wildcard_maps_are_rejected_not_indexed_by_name`).
         let option_map = BTree::new(
             field(
                 "option_map",
-                Ft::Option(Box::new(Ft::Map(BTreeMap::from([("k".into(), Ft::Text)])))),
+                Ft::Option(Box::new(Ft::Map(BTreeMap::from([("*".into(), Ft::Text)])))),
             ),
             storage.clone(),
             now,
@@ -1258,7 +1254,7 @@ mod tests {
         let map_tree = BTree::new(
             field(
                 "map_field",
-                Ft::Map(BTreeMap::from([(vec![1_u8].into(), Ft::Bytes)])),
+                Ft::Map(BTreeMap::from([(b"*".to_vec().into(), Ft::Bytes)])),
             ),
             storage.clone(),
             now,
@@ -1836,7 +1832,7 @@ mod tests {
             field(
                 "option_map_boot",
                 Ft::Option(Box::new(Ft::Map(BTreeMap::from([(
-                    vec![1_u8].into(),
+                    b"*".to_vec().into(),
                     Ft::Text,
                 )])))),
             ),
@@ -1853,7 +1849,7 @@ mod tests {
         let reloaded = BTree::bootstrap(
             "option_map_boot".to_string(),
             &Ft::Option(Box::new(Ft::Map(BTreeMap::from([(
-                vec![1_u8].into(),
+                b"*".to_vec().into(),
                 Ft::Text,
             )])))),
             storage,
@@ -1861,5 +1857,100 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(reloaded, BTree::Bytes(_)));
+    }
+
+    /// Regression: the B-tree layer treated *any* one-entry `Map` as a
+    /// wildcard map, while the schema (`as_wildcard_map`) requires one of the
+    /// sentinel keys. `#[derive(FieldTyped)]` emits `Map({Text("a"): Text})`
+    /// for `struct One { a: String }`, which therefore resolved to a `String`
+    /// index whose keys came from `Fv::Map::keys()` — the constant field
+    /// *name* `"a"` for every document. Equality queries returned the whole
+    /// collection and a `#[unique]` field rejected the second insert as a
+    /// duplicate.
+    #[tokio::test]
+    async fn non_wildcard_maps_are_rejected_not_indexed_by_name() {
+        let storage = test_storage().await;
+        let now = unix_ms();
+
+        // The shape `#[derive(FieldTyped)]` produces for a one-field struct.
+        let nested_one = Ft::Map(BTreeMap::from([("a".into(), Ft::Text)]));
+
+        let err = BTree::new(field("nested", nested_one.clone()), storage.clone(), now)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, DBError::Index { source, .. } if source.to_string().contains("unsupported field type")),
+            "{err}"
+        );
+
+        // The same through an `Option` layer, and for a multi-field struct.
+        let err = BTree::new(
+            field("nested_opt", Ft::Option(Box::new(nested_one.clone()))),
+            storage.clone(),
+            now,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, DBError::Index { .. }), "{err}");
+
+        let err = BTree::new(
+            field(
+                "nested_two",
+                Ft::Map(BTreeMap::from([
+                    ("a".into(), Ft::Text),
+                    ("b".into(), Ft::U64),
+                ])),
+            ),
+            storage.clone(),
+            now,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, DBError::Index { .. }), "{err}");
+
+        // `bootstrap` must agree, so a collection can never persist an index
+        // that its own reload would resolve differently.
+        let err = BTree::bootstrap("nested".to_string(), &nested_one, storage.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DBError::Index { .. }), "{err}");
+
+        // All three wildcard sentinels remain indexable, each resolving to
+        // the B-tree matching its key variant.
+        let text_map = BTree::new(
+            field(
+                "wild_text",
+                Ft::Map(BTreeMap::from([("*".into(), Ft::U64)])),
+            ),
+            storage.clone(),
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(text_map, BTree::String(_)));
+
+        let i64_map = BTree::new(
+            field(
+                "wild_i64",
+                Ft::Map(BTreeMap::from([(i64::MIN.into(), Ft::U64)])),
+            ),
+            storage.clone(),
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(i64_map, BTree::I64(_)));
+
+        let bytes_map = BTree::new(
+            field(
+                "wild_bytes",
+                Ft::Map(BTreeMap::from([(b"*".to_vec().into(), Ft::U64)])),
+            ),
+            storage,
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(bytes_map, BTree::Bytes(_)));
     }
 }

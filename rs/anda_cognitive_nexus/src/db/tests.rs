@@ -107,7 +107,7 @@ async fn test_connect_syncs_bundled_capsules_by_content_hash() {
     for (name, source, _) in BUNDLED_CAPSULES {
         assert_eq!(
             first
-                .concepts
+                .concepts()
                 .get_extension_as::<String>(&format!("capsule_hash:{name}")),
             Some(capsule_hash(source)),
             "missing hash for capsule {name}"
@@ -133,7 +133,7 @@ async fn test_connect_syncs_bundled_capsules_by_content_hash() {
         .await
         .unwrap();
     first
-        .concepts
+        .concepts()
         .save_extension(
             "capsule_hash:person".to_string(),
             Fv::Text("stale".to_string()),
@@ -157,7 +157,7 @@ async fn test_connect_syncs_bundled_capsules_by_content_hash() {
     assert_eq!(person_def.attributes["display_hint"], json!("👤"));
     assert_eq!(
         second
-            .concepts
+            .concepts()
             .get_extension_as::<String>("capsule_hash:person"),
         Some(capsule_hash(PERSON_KIP))
     );
@@ -732,6 +732,9 @@ async fn test_kml_proposition_id_matcher_and_object_error_paths() {
         .unwrap_err();
     assert!(matches!(err.code, KipErrorCode::NotFound));
 
+    // A KML proposition identity needs a literal predicate; the tightened KML
+    // grammar now rejects a variable one at parse time, so the statement never
+    // reaches the executor's own check.
     let variable_predicate = r#"
             UPSERT {
                 PROPOSITION ?link {
@@ -739,12 +742,7 @@ async fn test_kml_proposition_id_matcher_and_object_error_paths() {
                 }
             }
             "#;
-    let err = nexus
-        .execute_kml(parse_kml(variable_predicate).unwrap(), false)
-        .await
-        .unwrap_err();
-    assert!(matches!(err.code, KipErrorCode::InvalidSyntax));
-    assert!(err.message.contains("predicate must be a literal string"));
+    assert!(parse_kml(variable_predicate).is_err());
 
     let same_target = r#"
             UPSERT {
@@ -3403,6 +3401,11 @@ async fn test_kql_grouped_find_with_limit() {
     let columns = result.as_array().unwrap();
     assert_eq!(columns.len(), 4);
     assert_eq!(columns[0], json!(["Headache"]));
+    // `?all` is not the group variable, so it projects its *complete* binding
+    // set — exactly like the `SUM(?all…)` beside it, which is a global scalar.
+    // It must be neither truncated by the group LIMIT nor sliced by the group
+    // cursor (the cursor anchors a Symptom, not a Drug).
+    assert_eq!(columns[1], json!(["Aspirin", "Ibuprofen"]));
     assert_eq!(columns[2], json!([2]));
     // Integer inputs keep integer typing under SUM (anda_kip semantics).
     assert_eq!(columns[3], json!(5));
@@ -3591,6 +3594,282 @@ async fn test_kml_delete_concept_protected_scope_returns_kip_3004() {
             })
             .await
     );
+}
+
+/// `UPSERT` is a write path like `UPDATE` and must honour the same
+/// `KIP_3004` protected scope: without this guard a concept block could
+/// graft arbitrary attributes / metadata onto the meta-type nodes or the
+/// `CoreSchema` domain, bypassing every sibling check.
+#[tokio::test]
+async fn test_kml_upsert_protected_scope_returns_kip_3004() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+
+    // Reference behaviour: the UPDATE path rejects this with KIP_3004.
+    let update = r#"
+        UPDATE ?c SET ATTRIBUTES { status: "hijacked" }
+        WHERE { ?c {type: "$ConceptType", name: "$ConceptType"} }
+        "#;
+    let update_err = nexus
+        .execute_kml(parse_kml(update).unwrap(), false)
+        .await
+        .unwrap_err();
+    assert!(matches!(update_err.code, KipErrorCode::ImmutableTarget));
+
+    let cases = [
+        // Attribute write onto the root meta-type node.
+        r#"UPSERT {
+            CONCEPT ?c {
+                {type: "$ConceptType", name: "$ConceptType"}
+                SET ATTRIBUTES { status: "hijacked" }
+            }
+        }"#,
+        // Attribute write onto the protected core domain.
+        r#"UPSERT {
+            CONCEPT ?d {
+                {type: "Domain", name: "CoreSchema"}
+                SET ATTRIBUTES { description: "pwned" }
+            }
+        }"#,
+        // The remaining protected schema identities.
+        r#"UPSERT {
+            CONCEPT ?c {
+                {type: "$ConceptType", name: "$PropositionType"}
+                SET ATTRIBUTES { status: "hijacked" }
+            }
+        }"#,
+        r#"UPSERT {
+            CONCEPT ?c {
+                {type: "$ConceptType", name: "Domain"}
+                SET ATTRIBUTES { status: "hijacked" }
+            }
+        }"#,
+        r#"UPSERT {
+            CONCEPT ?c {
+                {type: "$PropositionType", name: "belongs_to_domain"}
+                SET ATTRIBUTES { status: "hijacked" }
+            }
+        }"#,
+        // Metadata-only writes are modifications too — concept-local …
+        r#"UPSERT {
+            CONCEPT ?d {
+                {type: "Domain", name: "CoreSchema"}
+            }
+            WITH METADATA { source: "attacker" }
+        }"#,
+        // … and inherited from the statement's default metadata.
+        r#"UPSERT {
+            CONCEPT ?d {
+                {type: "Domain", name: "CoreSchema"}
+            }
+        }
+        WITH METADATA { source: "attacker" }"#,
+    ];
+    for kml in cases {
+        let stmt = parse_kml(kml).unwrap();
+        let err = nexus.execute_kml(stmt.clone(), false).await.unwrap_err();
+        assert_eq!(
+            err.code, update_err.code,
+            "expected KIP_3004 for {kml}, got {:?}",
+            err.code
+        );
+        // dry_run = true: the preflight rejects it as well, so agents can probe.
+        let err = nexus.execute_kml(stmt, true).await.unwrap_err();
+        assert_eq!(
+            err.code, update_err.code,
+            "expected KIP_3004 (dry_run) for {kml}, got {:?}",
+            err.code
+        );
+    }
+
+    // Nothing was grafted onto the protected nodes.
+    let meta_type = nexus
+        .get_concept(&ConceptPK::Object {
+            r#type: META_CONCEPT_TYPE.to_string(),
+            name: META_CONCEPT_TYPE.to_string(),
+        })
+        .await
+        .unwrap();
+    assert!(meta_type.attributes.get("status").is_none());
+    let core_domain = nexus
+        .get_concept(&ConceptPK::Object {
+            r#type: DOMAIN_TYPE.to_string(),
+            name: "CoreSchema".to_string(),
+        })
+        .await
+        .unwrap();
+    assert_ne!(core_domain.attributes["description"], json!("pwned"));
+    // `source` is Genesis' own "SystemBootstrap"; it must not have been
+    // overwritten by the rejected statements.
+    assert_ne!(core_domain.metadata["source"], json!("attacker"));
+
+    // A bare `{type, name}` block writes nothing, so it stays usable for
+    // binding a handle to a protected node, and ordinary concepts are of
+    // course still upsertable.
+    nexus
+        .execute_kml(
+            parse_kml(
+                r#"UPSERT {
+                    CONCEPT ?core { {type: "Domain", name: "CoreSchema"} }
+                    CONCEPT ?d {
+                        {type: "Domain", name: "TestDomain"}
+                        SET ATTRIBUTES { description: "scratch domain" }
+                        SET PROPOSITIONS { ("belongs_to_domain", ?core) }
+                    }
+                }"#,
+            )
+            .unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+}
+
+/// A proposition anchored to a protected schema node is part of that
+/// structure: `DELETE PROPOSITIONS` must not sever e.g. `$ConceptType
+/// belongs_to_domain CoreSchema`, which the `DESCRIBE PRIMER` domain map
+/// is built from.
+#[tokio::test]
+async fn test_kml_delete_propositions_protected_scope_returns_kip_3004() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_test_data(&nexus).await.unwrap();
+
+    let link = r#"
+        FIND(?p)
+        WHERE {
+            ?c {type: "$ConceptType", name: "$ConceptType"}
+            ?p (?c, "belongs_to_domain", ?d)
+        }
+        "#;
+    let (before, _) = nexus.execute_kql(parse_kql(link).unwrap()).await.unwrap();
+    assert_eq!(before.as_array().map(|links| links.len()), Some(1));
+
+    let delete = r#"
+        DELETE PROPOSITIONS ?p
+        WHERE {
+            ?c {type: "$ConceptType", name: "$ConceptType"}
+            ?p (?c, "belongs_to_domain", ?d)
+        }
+        "#;
+    let stmt = parse_kml(delete).unwrap();
+    let err = nexus.execute_kml(stmt.clone(), false).await.unwrap_err();
+    assert!(
+        matches!(err.code, KipErrorCode::ImmutableTarget),
+        "expected KIP_3004, got {:?}",
+        err.code
+    );
+    let err = nexus.execute_kml(stmt, true).await.unwrap_err();
+    assert!(
+        matches!(err.code, KipErrorCode::ImmutableTarget),
+        "expected KIP_3004 (dry_run), got {:?}",
+        err.code
+    );
+
+    // The link — and with it the CoreSchema domain map — survived.
+    let (after, _) = nexus.execute_kql(parse_kql(link).unwrap()).await.unwrap();
+    assert_eq!(after, before);
+
+    // Links between ordinary concepts are still deletable.
+    let result = nexus
+        .execute_kml(
+            parse_kml(
+                r#"DELETE PROPOSITIONS ?p
+                    WHERE { ?p ({type: "Drug", name: "Aspirin"}, "treats", ?s) }"#,
+            )
+            .unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(result["deleted_propositions"].as_u64().unwrap_or(0) > 0);
+}
+
+/// The protected-scope guards must not lock out the bootstrap itself: the
+/// bundled capsules own the very nodes they write, so `sync_bundled_capsules`
+/// re-applies them through the privileged path on every crate upgrade — while
+/// the identical source submitted by a caller is rejected.
+#[tokio::test]
+async fn test_genesis_capsule_still_applies_through_privileged_bootstrap() {
+    let object_store = Arc::new(InMemory::new());
+    let db_config = DBConfig {
+        name: "test_genesis_reapply".to_string(),
+        description: "Test Anda Cognitive Nexus genesis re-apply".to_string(),
+        storage: StorageConfig {
+            compress_level: 0,
+            ..Default::default()
+        },
+        lock: None,
+    };
+    let db = Arc::new(
+        AndaDB::connect(object_store, db_config)
+            .await
+            .map_err(db_to_kip_error)
+            .unwrap(),
+    );
+
+    // First connect performs the initial bootstrap.
+    let nexus = CognitiveNexus::connect(Arc::clone(&db), async |_| Ok(()))
+        .await
+        .unwrap();
+
+    // Invalidate the recorded capsule hash to emulate a crate upgrade that
+    // revised Genesis: the next connect must re-apply it.
+    nexus
+        .concepts()
+        .save_extension(
+            "capsule_hash:genesis".to_string(),
+            Fv::Text("stale".to_string()),
+        )
+        .await
+        .unwrap();
+    let nexus = CognitiveNexus::connect(Arc::clone(&db), async |_| Ok(()))
+        .await
+        .unwrap();
+
+    // Re-applying it directly through the privileged path is fine too …
+    nexus
+        .execute_kml_privileged(parse_kml(GENESIS_KIP).unwrap())
+        .await
+        .unwrap();
+    // … while the same source from a caller hits the protected-scope guard.
+    let err = nexus
+        .execute_kml(parse_kml(GENESIS_KIP).unwrap(), false)
+        .await
+        .unwrap_err();
+    assert!(matches!(err.code, KipErrorCode::ImmutableTarget));
+
+    // The bootstrapped structure is intact: meta-types, core domain, and the
+    // domain map linking them.
+    for (ty, name) in [
+        (META_CONCEPT_TYPE, META_CONCEPT_TYPE),
+        (META_CONCEPT_TYPE, META_PROPOSITION_TYPE),
+        (META_CONCEPT_TYPE, DOMAIN_TYPE),
+        (META_PROPOSITION_TYPE, BELONGS_TO_DOMAIN_TYPE),
+        (DOMAIN_TYPE, "CoreSchema"),
+    ] {
+        assert!(
+            nexus
+                .has_concept(&ConceptPK::Object {
+                    r#type: ty.to_string(),
+                    name: name.to_string(),
+                })
+                .await,
+            "{ty}/{name} missing after re-apply"
+        );
+    }
+    let (links, _) = nexus
+        .execute_kql(
+            parse_kql(
+                r#"FIND(?p)
+                    WHERE {
+                        ?c {type: "$ConceptType", name: "$ConceptType"}
+                        ?p (?c, "belongs_to_domain", ?d)
+                    }"#,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(links.as_array().map(|l| l.len()), Some(1));
 }
 
 #[tokio::test]
@@ -4102,20 +4381,17 @@ async fn test_kml_update_statement() {
         .unwrap_err();
     assert!(matches!(err.code, KipErrorCode::ConstraintViolation));
 
-    // Expression paths must address the UPDATE target itself.
-    let err = nexus
-        .execute_kml(
-            parse_kml(
-                r#"UPDATE ?s
+    // Expression paths must address the UPDATE target itself — now enforced by
+    // the KML grammar, so the statement is rejected at parse time instead of
+    // by the executor.
+    assert!(
+        parse_kml(
+            r#"UPDATE ?s
                     SET ATTRIBUTES { n: ADD(?other.attributes.n, 1) }
                     WHERE { ?s {type: "Symptom"} }"#,
-            )
-            .unwrap(),
-            false,
         )
-        .await
-        .unwrap_err();
-    assert!(matches!(err.code, KipErrorCode::InvalidSyntax));
+        .is_err()
+    );
 
     // Protected schema structures fail the whole statement (KIP_3004).
     let err = nexus
@@ -4414,10 +4690,15 @@ async fn test_meta_export_round_trip() {
 
     // Export the Drug subgraph: the concept, its outgoing links, plus the
     // schema nodes so the capsule can bootstrap a fresh nexus (KIP §5.3).
+    // The type definitions are selected by name: the protected meta-types
+    // (`$ConceptType`, `$PropositionType`, `Domain`, …) are bootstrapped by
+    // Genesis on every nexus, and re-importing them is refused as a
+    // protected-scope write (KIP_3004).
     let export = r#"
         EXPORT ?n
         WHERE {
-            UNION { ?n {type: "$ConceptType"} }
+            UNION { ?n {type: "$ConceptType", name: "Drug"} }
+            UNION { ?n {type: "$ConceptType", name: "Symptom"} }
             UNION { ?n {type: "$PropositionType", name: "treats"} }
             UNION { ?n {type: "Drug"} }
             UNION { ?n {type: "Symptom"} }
@@ -6057,13 +6338,13 @@ async fn test_kql_grouped_find_order_by_group_var() {
 }
 
 #[tokio::test]
-async fn test_kql_invalid_cursor_rejected_on_legacy_path() {
+async fn test_kql_invalid_cursor_rejected_on_single_column_projection() {
     let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
     setup_test_data(&nexus).await.unwrap();
 
-    // Single-variable concept projection goes through the legacy path; an
-    // unparseable cursor must be rejected (KIP_1001), not silently replayed
-    // from the start with duplicate pages.
+    // Single-variable concept projection goes through
+    // `project_single_column`; an unparseable cursor must be rejected
+    // (KIP_1001), not silently replayed from the start with duplicate pages.
     let err = nexus
         .execute_kql(
             parse_kql(
@@ -6079,6 +6360,328 @@ async fn test_kql_invalid_cursor_rejected_on_legacy_path() {
         .await
         .unwrap_err();
     assert!(matches!(err.code, KipErrorCode::InvalidSyntax), "{err:?}");
+}
+
+#[tokio::test]
+async fn test_kql_order_by_paginates_mixed_type_column_without_gaps() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_test_data(&nexus).await.unwrap();
+
+    // A column whose values mix numbers and non-numeric strings: the sort
+    // comparator must be a *total* order, or the row order is an arbitrary
+    // interleaving (and `sort_by` may even panic), and the numeric-offset /
+    // entity-anchored cursor paging over it silently duplicates and skips.
+    let seed = r#"
+        UPSERT {
+            CONCEPT ?a { {type: "Drug", name: "Mixed0"} SET ATTRIBUTES { "grade": 0 } }
+            CONCEPT ?b { {type: "Drug", name: "MixedAbc1"} SET ATTRIBUTES { "grade": "abc" } }
+            CONCEPT ?c { {type: "Drug", name: "Mixed1"} SET ATTRIBUTES { "grade": 1 } }
+            CONCEPT ?d { {type: "Drug", name: "MixedAbc2"} SET ATTRIBUTES { "grade": "abc" } }
+            CONCEPT ?e { {type: "Drug", name: "Mixed2"} SET ATTRIBUTES { "grade": 2 } }
+            CONCEPT ?f { {type: "Drug", name: "Mixed10"} SET ATTRIBUTES { "grade": "10" } }
+            CONCEPT ?g { {type: "Drug", name: "Mixed1abc"} SET ATTRIBUTES { "grade": "1abc" } }
+        }
+        "#;
+    nexus
+        .execute_kml(parse_kml(seed).unwrap(), false)
+        .await
+        .unwrap();
+
+    let query = |cursor: Option<&str>| {
+        let cursor = cursor
+            .map(|c| format!("CURSOR \"{c}\""))
+            .unwrap_or_default();
+        format!(
+            r#"
+            FIND(?d.name)
+            WHERE {{ ?d {{type: "Drug"}} }}
+            ORDER BY ?d.attributes.grade ASC
+            LIMIT 3
+            {cursor}
+            "#
+        )
+    };
+
+    // Page through the whole column: every drug appears exactly once.
+    let mut seen: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..10 {
+        let (page, next) = nexus
+            .execute_kql(parse_kql(&query(cursor.as_deref())).unwrap())
+            .await
+            .unwrap();
+        for name in page.as_array().unwrap() {
+            seen.push(name.as_str().unwrap().to_string());
+        }
+        match next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    let mut unique = seen.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        seen.len(),
+        unique.len(),
+        "pages must not duplicate: {seen:?}"
+    );
+    assert_eq!(unique.len(), 8, "no drug may be skipped: {seen:?}");
+
+    // The order itself: numbers (and numeric strings) ascend ahead of
+    // non-numeric strings, and a missing key sorts last (KIP §3.5).
+    // "1abc" is not numeric, so it ranks with the plain strings — which is
+    // exactly what makes `"2" < "10" < "1abc"` consistent.
+    assert_eq!(
+        seen,
+        vec![
+            "Mixed0",
+            "Mixed1",
+            "Mixed2",
+            "Mixed10",
+            "Mixed1abc",
+            "MixedAbc1",
+            "MixedAbc2",
+            "Aspirin",
+        ],
+        "{seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_kql_union_column_projects_entities_and_predicates() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_test_data(&nexus).await.unwrap();
+
+    // `UNION` merges branches by variable *name*, so ?x binds concept ids on
+    // the left and predicate names on the right. Projecting the column must
+    // keep both kinds: the predicate branch used to `filter_map` away every
+    // entity binding as soon as one predicate was present, silently dropping
+    // the Drug rows while `COUNT(?x)` still counted them.
+    let kql = r#"
+        FIND(?x)
+        WHERE {
+            ?x {type: "Drug"}
+            UNION { (?a, ?x, ?b) }
+        }
+        "#;
+    let (result, _) = nexus.execute_kql(parse_kql(kql).unwrap()).await.unwrap();
+    let values = result.as_array().unwrap();
+
+    let concept_names: Vec<&str> = values
+        .iter()
+        .filter_map(|v| v.get("name").and_then(|n| n.as_str()))
+        .collect();
+    let predicates: Vec<&str> = values.iter().filter_map(|v| v.as_str()).collect();
+    assert_eq!(concept_names, vec!["Aspirin"], "{result}");
+    assert!(
+        predicates.contains(&"treats") && predicates.contains(&"belongs_to_domain"),
+        "{result}"
+    );
+
+    // COUNT(?x) counts every distinct binding, so the column length must
+    // match it.
+    let (count, _) = nexus
+        .execute_kql(
+            parse_kql(
+                r#"
+                FIND(COUNT(?x))
+                WHERE {
+                    ?x {type: "Drug"}
+                    UNION { (?a, ?x, ?b) }
+                }
+                "#,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(count, json!(values.len()), "{result}");
+}
+
+#[tokio::test]
+async fn test_kql_grouped_projection_does_not_leak_group_cursor() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_test_data(&nexus).await.unwrap();
+
+    let more_drugs_kml = r#"
+        UPSERT {
+            CONCEPT ?ibuprofen {
+                {type: "Drug", name: "Ibuprofen"}
+                SET ATTRIBUTES { "risk_level": 3 }
+                SET PROPOSITIONS {
+                    ("treats", {type: "Symptom", name: "Headache"})
+                }
+            }
+        }
+        "#;
+    nexus
+        .execute_kml(parse_kml(more_drugs_kml).unwrap(), false)
+        .await
+        .unwrap();
+
+    // `?all` is unrelated to the (symptom, drug) grouping. Its column must be
+    // the same complete projection on every page: it used to receive the
+    // GROUP-ENTITY cursor, which `project_single_column` read as a position in
+    // `?all`'s own entity order and used to drop every Drug whose concept id
+    // sorted at or below the group's — plus the group LIMIT, which truncated
+    // it independently of the group column.
+    let kql = |cursor: Option<&str>| {
+        let cursor = cursor
+            .map(|c| format!("CURSOR \"{c}\""))
+            .unwrap_or_default();
+        format!(
+            r#"
+            FIND(?symptom.name, ?all.name, COUNT(?drug))
+            WHERE {{
+                ?symptom {{type: "Symptom"}}
+                (?drug, "treats", ?symptom)
+                ?all {{type: "Drug"}}
+            }}
+            ORDER BY COUNT(?drug) DESC
+            LIMIT 1
+            {cursor}
+            "#
+        )
+    };
+
+    let (page1, cursor) = nexus
+        .execute_kql(parse_kql(&kql(None)).unwrap())
+        .await
+        .unwrap();
+    let columns = page1.as_array().unwrap();
+    assert_eq!(columns[0], json!(["Headache"]), "{page1}");
+    assert_eq!(columns[1], json!(["Aspirin", "Ibuprofen"]), "{page1}");
+    assert_eq!(columns[2], json!([2]), "{page1}");
+
+    let (page2, _) = nexus
+        .execute_kql(parse_kql(&kql(cursor.as_deref())).unwrap())
+        .await
+        .unwrap();
+    let columns = page2.as_array().unwrap();
+    assert_eq!(columns[0], json!(["Fever"]), "{page2}");
+    assert_eq!(columns[1], json!(["Aspirin", "Ibuprofen"]), "{page2}");
+    assert_eq!(columns[2], json!([1]), "{page2}");
+}
+
+#[tokio::test]
+async fn test_kql_order_by_cursor_rejected_when_anchor_entity_is_gone() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_test_data(&nexus).await.unwrap();
+
+    let more_drugs_kml = r#"
+        UPSERT {
+            CONCEPT ?ibuprofen {
+                {type: "Drug", name: "Ibuprofen"}
+                SET ATTRIBUTES { "risk_level": 3 }
+            }
+        }
+        "#;
+    nexus
+        .execute_kml(parse_kml(more_drugs_kml).unwrap(), false)
+        .await
+        .unwrap();
+
+    let kql = |cursor: Option<&str>| {
+        let cursor = cursor
+            .map(|c| format!("CURSOR \"{c}\""))
+            .unwrap_or_default();
+        format!(
+            r#"
+            FIND(?d.name)
+            WHERE {{ ?d {{type: "Drug"}} }}
+            ORDER BY ?d.name ASC
+            LIMIT 1
+            {cursor}
+            "#
+        )
+    };
+
+    let (page1, cursor) = nexus
+        .execute_kql(parse_kql(&kql(None)).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(page1, json!(["Aspirin"]), "{page1}");
+    let cursor = cursor.expect("a second page remains");
+
+    // The cursor's anchor disappears between pages. The ORDER BY branch used
+    // to fail to locate it, skip the slice entirely and hand back page one
+    // labelled "page two"; it must reject instead, like an unparseable token.
+    nexus
+        .execute_kml(
+            parse_kml(r#"DELETE CONCEPT ?d DETACH WHERE { ?d {type: "Drug", name: "Aspirin"} }"#)
+                .unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let err = nexus
+        .execute_kql(parse_kql(&kql(Some(&cursor))).unwrap())
+        .await
+        .unwrap_err();
+    assert!(matches!(err.code, KipErrorCode::NotFound), "{err:?}");
+    assert!(
+        err.message.contains("CURSOR token no longer resolves"),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_kml_delete_concept_protected_preflight_is_fail_closed() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_test_data(&nexus).await.unwrap();
+
+    // The preflight must decide on a *loaded* concept: a protected node is
+    // rejected before any destructive work (dry runs included), and only a
+    // NotFound — the row is already gone, so there is nothing to protect —
+    // may skip the guard. Any other load failure now propagates instead of
+    // falling through to the untyped removal path.
+    for statement in [
+        r#"DELETE CONCEPT ?x DETACH WHERE { ?x {type: "$ConceptType", name: "$ConceptType"} }"#,
+        r#"DELETE CONCEPT ?x DETACH WHERE { ?x {type: "Domain", name: "CoreSchema"} }"#,
+    ] {
+        for dry_run in [true, false] {
+            let err = nexus
+                .execute_kml(parse_kml(statement).unwrap(), dry_run)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err.code, KipErrorCode::ImmutableTarget),
+                "{statement} (dry_run={dry_run}): {err:?}"
+            );
+        }
+    }
+    // The protected nodes are still there.
+    assert!(
+        nexus
+            .has_concept(&ConceptPK::Object {
+                r#type: META_CONCEPT_TYPE.to_string(),
+                name: META_CONCEPT_TYPE.to_string(),
+            })
+            .await
+    );
+
+    // A target whose row vanished is tolerated: nothing to protect, nothing
+    // to delete. Drop Aspirin's row behind the engine's back and reach the
+    // dangling id through a proposition endpoint.
+    let drug = nexus
+        .get_concept(&ConceptPK::Object {
+            r#type: "Drug".to_string(),
+            name: "Aspirin".to_string(),
+        })
+        .await
+        .unwrap();
+    nexus.concepts().remove(drug._id).await.unwrap();
+    let result = nexus
+        .execute_kml(
+            parse_kml(r#"DELETE CONCEPT ?x DETACH WHERE { (?x, "treats", ?s) }"#).unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["deleted_concepts"], json!(0), "{result}");
+    assert_eq!(result["deleted_propositions"], json!(2), "{result}");
 }
 
 #[tokio::test]
@@ -6207,6 +6810,270 @@ async fn test_meta_search_uppercase_attribute_text() {
             .any(|hit| hit["attributes"]["note"] == json!("SHOUTED UNIQUEMARKER TEXT")),
         "all-caps attribute text must survive the re-check: {result}"
     );
+}
+
+#[tokio::test]
+async fn test_meta_search_proposition_rejects_incidental_substring_match() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_test_data(&nexus).await.unwrap();
+
+    nexus
+        .execute_kml(
+            parse_kml(
+                r#"
+                UPSERT {
+                    CONCEPT ?t { {type: "$PropositionType", name: "contraindicated_for"} }
+                }
+                "#,
+            )
+            .unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+    // Both predicates live on the *same* row (one row per subject/object
+    // pair), so both share the row-level BM25 score.
+    nexus
+        .execute_kml(
+            parse_kml(
+                r#"
+                UPSERT {
+                    PROPOSITION ?hit {
+                        ({type: "Drug", name: "Aspirin"}, "treats", {type: "Symptom", name: "Headache"})
+                        SET ATTRIBUTES { "note": "cat" }
+                    }
+                    PROPOSITION ?miss {
+                        ({type: "Drug", name: "Aspirin"}, "contraindicated_for", {type: "Symptom", name: "Headache"})
+                        SET ATTRIBUTES { "note": "concatenated dosing notes" }
+                    }
+                }
+                "#,
+            )
+            .unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    // The per-link re-check is token-aware: "cat" is a token of the `treats`
+    // link only. A raw `contains` test also admitted `contraindicated_for`,
+    // because "cat" occurs inside its "concatenated" — and both links then
+    // carried the identical row score, so THRESHOLD could not tell them apart.
+    let (result, _) = nexus
+        .execute_meta(parse_meta(r#"SEARCH PROPOSITION "cat""#).unwrap())
+        .await
+        .unwrap();
+    let hits = result.as_array().unwrap();
+    assert_eq!(hits.len(), 1, "{result}");
+    assert_eq!(hits[0]["predicate"], json!("treats"), "{result}");
+    assert!(
+        hits[0]["metadata"]["_score"].as_f64().unwrap() > 0.0,
+        "{result}"
+    );
+}
+
+#[tokio::test]
+async fn test_reopen_collections_is_idempotent_and_keeps_handles_usable() {
+    let nexus = setup_test_db(async |_| Ok(())).await.unwrap();
+    setup_test_data(&nexus).await.unwrap();
+
+    // Re-resolving healthy collections returns the very same handles, so the
+    // poison-recovery path is safe to run at any time; only a poisoned handle
+    // is actually replaced (by `AndaDB::open_collection`).
+    let (concepts, propositions) = (nexus.concepts(), nexus.propositions());
+    nexus.reopen_collections().await.unwrap();
+    assert!(Arc::ptr_eq(&concepts, &nexus.concepts()));
+    assert!(Arc::ptr_eq(&propositions, &nexus.propositions()));
+
+    // The re-run initializer is a no-op for existing indexes and re-installs
+    // the tokenizer, so reads and writes keep working afterwards.
+    nexus
+        .execute_kml(
+            parse_kml(
+                r#"
+                UPSERT {
+                    CONCEPT ?d { {type: "Drug", name: "PostReopen"} SET ATTRIBUTES { "risk_level": 1 } }
+                }
+                "#,
+            )
+            .unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+    let (result, _) = nexus
+        .execute_kql(parse_kql(r#"FIND(?d.name) WHERE { ?d {type: "Drug"} }"#).unwrap())
+        .await
+        .unwrap();
+    let names: Vec<&str> = result
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"PostReopen"), "{result}");
+}
+
+/// An object store that yields once inside every write, so a mutating
+/// collection future is guaranteed to be *pending* at its first storage write.
+///
+/// Dropping it there is exactly the cancellation `anda_db` treats as a crash,
+/// and it is the only way to poison a handle from outside that crate: the
+/// plain in-memory store completes every write within a single poll, leaving a
+/// cancelled future nothing to cancel.
+#[derive(Debug)]
+struct YieldingStore {
+    inner: Arc<InMemory>,
+}
+
+impl std::fmt::Display for YieldingStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("YieldingStore")
+    }
+}
+
+#[async_trait]
+impl object_store::ObjectStore for YieldingStore {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        tokio::task::yield_now().await;
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+#[tokio::test]
+async fn test_poisoned_handle_is_recovered_before_the_next_statement() {
+    let store = Arc::new(YieldingStore {
+        inner: Arc::new(InMemory::new()),
+    });
+    let db = AndaDB::connect(
+        store,
+        DBConfig {
+            name: "test_poison_recovery".to_string(),
+            description: "Poison recovery".to_string(),
+            storage: StorageConfig {
+                compress_level: 0,
+                ..Default::default()
+            },
+            lock: None,
+        },
+    )
+    .await
+    .unwrap();
+    let nexus = CognitiveNexus::connect(Arc::new(db), async |_| Ok(()))
+        .await
+        .unwrap();
+    setup_test_data(&nexus).await.unwrap();
+
+    // Cancel a mutating call mid-flight: `anda_db` treats that as a crash and
+    // poisons the handle, which then rejects every further mutation. One poll
+    // parks the future inside the guarded region (the store yields on its first
+    // write); dropping the boxed future there *is* the cancellation.
+    let poisoned = nexus.concepts();
+    {
+        let concept = Concept {
+            _id: 0,
+            r#type: "Drug".to_string(),
+            name: "CancelledWrite".to_string(),
+            attributes: Map::new(),
+            metadata: Map::new(),
+        };
+        let mut add = Box::pin(poisoned.add_from(&concept));
+        assert!(
+            futures::poll!(add.as_mut()).is_pending(),
+            "the add must still be in flight to be cancellable"
+        );
+        drop(add);
+    }
+    assert!(poisoned.is_poisoned(), "the cancelled add must poison");
+
+    // The next KML statement must *succeed*: the pre-flight sees the poisoned
+    // handle and reopens the collection first, so a poison event costs no
+    // failed command and never requires a process restart.
+    nexus
+        .execute_kml(
+            parse_kml(
+                r#"
+                UPSERT {
+                    CONCEPT ?d { {type: "Drug", name: "AfterPoison"} SET ATTRIBUTES { "risk_level": 1 } }
+                }
+                "#,
+            )
+            .unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    // The nexus now holds a fresh, live handle; the poisoned one is retired.
+    assert!(!nexus.concepts().is_poisoned());
+    assert!(!Arc::ptr_eq(&poisoned, &nexus.concepts()));
+
+    let (result, _) = nexus
+        .execute_kql(parse_kql(r#"FIND(?d.name) WHERE { ?d {type: "Drug"} }"#).unwrap())
+        .await
+        .unwrap();
+    let names: Vec<&str> = result
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"AfterPoison"), "{result}");
+    assert!(names.contains(&"Aspirin"), "{result}");
 }
 
 #[tokio::test]

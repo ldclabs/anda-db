@@ -16,6 +16,97 @@ use super::kql::{
 };
 use crate::ast::*;
 
+// --- KML Identity Clauses ---
+//
+// KML shares its matcher parsers with KQL, but the two have opposite intent: a
+// KQL matcher is a *pattern* and is deliberately allowed to be non-unique
+// (`{type: "Drug"}` selects every drug), whereas a KML clause *identifies* the
+// single element to create or mutate. Per SPECIFICATION.md §4.1 only
+// `{type, name}` (match-or-create) and `{id}` (match existing) are admissible,
+// and a proposition identity needs a literal `"predicate"`. Without these
+// checks the wildcard forms parsed happily and only failed much later, deep in
+// the executor's `ConceptPK::try_from`.
+
+const CONCEPT_IDENTITY_HELP: &str = "a KML concept identity must be {type: \"<Type>\", name: \"<name>\"} or {id: \"<id>\"}; \
+     {type: \"...\"} and {name: \"...\"} alone are KQL patterns, not identities";
+
+const PROPOSITION_IDENTITY_HELP: &str = "a KML proposition identity must be (id: \"<id>\") or (<subject>, \"<predicate>\", <object>) \
+     with a literal predicate; predicate variables, alternatives (\"a\"|\"b\") and \
+     multi-hop quantifiers (\"a\"{1,3}) are KQL patterns, not identities";
+
+fn require_unique_concept(matcher: ConceptMatcher) -> Result<ConceptMatcher, String> {
+    if matcher.is_unique() {
+        Ok(matcher)
+    } else {
+        Err(CONCEPT_IDENTITY_HELP.to_string())
+    }
+}
+
+fn check_identity_target(term: &TargetTerm) -> Result<(), String> {
+    match term {
+        // A local handle is resolved to a concrete element by the enclosing
+        // UPSERT block, so it is already unique.
+        TargetTerm::Variable(_) => Ok(()),
+        TargetTerm::Concept(matcher) => {
+            if matcher.is_unique() {
+                Ok(())
+            } else {
+                Err(CONCEPT_IDENTITY_HELP.to_string())
+            }
+        }
+        TargetTerm::Proposition(matcher) => check_identity_proposition(matcher),
+    }
+}
+
+fn check_identity_proposition(matcher: &PropositionMatcher) -> Result<(), String> {
+    match matcher {
+        PropositionMatcher::ID(_) => Ok(()),
+        PropositionMatcher::Object {
+            subject,
+            predicate,
+            object,
+        } => {
+            if !matches!(predicate, PredTerm::Literal(_)) {
+                return Err(PROPOSITION_IDENTITY_HELP.to_string());
+            }
+            check_identity_target(subject)?;
+            check_identity_target(object)
+        }
+    }
+}
+
+/// Parses the identity clause of a KML `CONCEPT` block.
+fn parse_concept_identity(input: &str) -> VResult<'_, ConceptMatcher> {
+    context(
+        "KML concept identity: {type: \"<Type>\", name: \"<name>\"} or {id: \"<id>\"}",
+        map_res(parse_concept_matcher, require_unique_concept),
+    )
+    .parse(input)
+}
+
+/// Parses a KML endpoint that must address exactly one existing element
+/// (a `SET PROPOSITIONS` object).
+fn parse_identity_target_term(input: &str) -> VResult<'_, TargetTerm> {
+    context(
+        "KML target: ?handle, {type: \"<Type>\", name: \"<name>\"}, {id: \"<id>\"}, or an existing proposition",
+        map_res(parse_target_term, |term| {
+            check_identity_target(&term).map(|()| term)
+        }),
+    )
+    .parse(input)
+}
+
+/// Parses the identity clause of a KML `PROPOSITION` block.
+fn parse_proposition_identity(input: &str) -> VResult<'_, PropositionMatcher> {
+    context(
+        "KML proposition identity: (<subject>, \"<predicate>\", <object>) or (id: \"<id>\")",
+        map_res(parse_prop_mather, |matcher| {
+            check_identity_proposition(&matcher).map(|()| matcher)
+        }),
+    )
+    .parse(input)
+}
+
 // --- Top Level KML Parser ---
 
 pub fn parse_kml_statement(input: &str) -> VResult<'_, KmlStatement> {
@@ -88,7 +179,7 @@ fn parse_concept_block(input: &str) -> VResult<'_, ConceptBlock> {
             (
                 preceded(ws(keyword("CONCEPT")), opt(ws(variable))),
                 cut(braced_block((
-                    ws(parse_concept_matcher),
+                    ws(parse_concept_identity),
                     opt(ws(parse_expect_version)),
                     opt(context(
                         "SET ATTRIBUTES { ... }",
@@ -123,10 +214,14 @@ fn parse_set_proposition(input: &str) -> VResult<'_, SetProposition> {
     map(
         terminated(
             (
+                // Past `("predicate",` there is no other reading of the input,
+                // so a bad target is a hard failure: otherwise the enclosing
+                // `many1`/`opt` swallows it and the error resurfaces at the
+                // `SET PROPOSITIONS` keyword instead of at the target.
                 parenthesized_block(separated_pair(
                     quoted_string,
                     ws(char(',')),
-                    parse_target_term,
+                    cut(parse_identity_target_term),
                 )),
                 opt(parse_with_metadata),
             ),
@@ -148,7 +243,7 @@ fn parse_proposition_block(input: &str) -> VResult<'_, PropositionBlock> {
             (
                 preceded(ws(keyword("PROPOSITION")), opt(ws(variable))),
                 cut(braced_block((
-                    ws(parse_prop_mather),
+                    ws(parse_proposition_identity),
                     opt(ws(parse_expect_version)),
                     opt(context(
                         "SET ATTRIBUTES { ... }",
@@ -174,10 +269,14 @@ fn parse_proposition_block(input: &str) -> VResult<'_, PropositionBlock> {
 fn parse_update_statement(input: &str) -> VResult<'_, UpdateStatement> {
     context(
         "UPDATE ?target SET ATTRIBUTES { ... } / SET METADATA { ... } WHERE { ... } [LIMIT N]",
-        map_res(
-            preceded(
-                ws(keyword("UPDATE")),
-                cut((
+        // The semantic guards below live *inside* the `cut` so that a statement
+        // which is shaped like an UPDATE but violates them fails hard, at the
+        // offending statement, instead of backtracking out of the top-level
+        // `alt` and reporting "unrecognized KIP command" at column 1.
+        preceded(
+            ws(keyword("UPDATE")),
+            cut(map_res(
+                (
                     ws(variable),
                     opt(context(
                         "SET ATTRIBUTES { ... }",
@@ -195,47 +294,89 @@ fn parse_update_statement(input: &str) -> VResult<'_, UpdateStatement> {
                     )),
                     parse_where_block,
                     opt(ws(parse_limit_clause)),
-                )),
-            ),
-            |(target, set_attributes, set_metadata, where_clauses, limit)| {
-                if set_attributes.is_none() && set_metadata.is_none() {
-                    return Err(
-                        "UPDATE requires at least one SET ATTRIBUTES or SET METADATA block"
-                            .to_string(),
-                    );
-                }
-                Ok(UpdateStatement {
-                    target,
-                    set_attributes,
-                    set_metadata,
-                    where_clauses,
-                    limit,
-                })
-            },
+                ),
+                |(target, set_attributes, set_metadata, where_clauses, limit)| {
+                    if set_attributes.is_none() && set_metadata.is_none() {
+                        return Err(
+                            "UPDATE requires at least one SET ATTRIBUTES or SET METADATA block"
+                                .to_string(),
+                        );
+                    }
+                    check_update_expr_targets(&target, set_attributes.as_deref())?;
+                    check_update_expr_targets(&target, set_metadata.as_deref())?;
+                    Ok(UpdateStatement {
+                        target,
+                        set_attributes,
+                        set_metadata,
+                        where_clauses,
+                        limit,
+                    })
+                },
+            )),
         ),
     )
     .parse(input)
 }
 
+/// Rejects update-expression operands that read a variable other than the
+/// UPDATE target.
+///
+/// Per §4.3 each element's new value must be computable from its *own* state,
+/// which is what keeps a bulk update deterministic and order-independent; the
+/// AST documents the same restriction on [`UpdateExpr::Variable`]. The parser
+/// reused the generic `dot_path_var`, so `UPDATE ?a SET METADATA { c:
+/// MUL(?b.metadata.confidence, 0.9) } ...` parsed with no way to resolve `?b`.
+fn check_update_expr_targets(
+    target: &str,
+    set_block: Option<&[(String, UpdateValue)]>,
+) -> Result<(), String> {
+    let Some(set_block) = set_block else {
+        return Ok(());
+    };
+
+    for (key, value) in set_block {
+        let UpdateValue::Expr(expr) = value else {
+            continue;
+        };
+        for path in expr.referenced_paths() {
+            if path.var != target {
+                return Err(format!(
+                    "UPDATE expression for `{key}` reads ?{}, but operands may only use \
+                     dot-notation paths on the UPDATE target ?{target}",
+                    path.var
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Parses an UPDATE SET map whose values may be JSON values or update expressions.
 /// Duplicate keys are rejected as a parse error.
+///
+/// An *empty* block is rejected too: `SET ATTRIBUTES { }` updates nothing, yet
+/// it used to satisfy the "at least one SET ATTRIBUTES or SET METADATA block"
+/// guard in [`parse_update_statement`] (the block parsed to `Some(vec![])`,
+/// which is not `None`), producing a silently no-op UPDATE.
 fn parse_update_value_map(input: &str) -> VResult<'_, Vec<(String, UpdateValue)>> {
-    let (remaining, opt_kvs) = context(
+    let (remaining, kvs) = context(
         "UPDATE SET map",
         preceded(
             ws(char('{')),
             cut(terminated(
-                opt(terminated(
-                    separated_list1(ws(char(',')), parse_update_key_value),
-                    opt(ws(char(','))), // Allow trailing comma
-                )),
+                context(
+                    "an UPDATE SET block must contain at least one `key: value` pair",
+                    terminated(
+                        separated_list1(ws(char(',')), parse_update_key_value),
+                        opt(ws(char(','))), // Allow trailing comma
+                    ),
+                ),
                 ws(char('}')),
             )),
         ),
     )
     .parse(input)?;
 
-    let kvs = opt_kvs.unwrap_or_default();
     ensure_unique_keys(&kvs)?;
     Ok((
         remaining,
@@ -700,7 +841,7 @@ mod tests {
         let input = r#"
         UPSERT {
             PROPOSITION ?stmt {
-                ( { name: "Zhang San" }, "stated", { type: "Paper", name: "paper_doi" } )
+                ( { type: "Person", name: "Zhang San" }, "stated", { type: "Paper", name: "paper_doi" } )
                 SET ATTRIBUTES {
                     doi: "10.1000/xyz",
                     created_at: "2023-11-10T14:20:10Z"
@@ -728,9 +869,10 @@ mod tests {
                         assert_eq!(
                             prop.proposition,
                             PropositionMatcher::Object {
-                                subject: TargetTerm::Concept(ConceptMatcher::Name(
-                                    "Zhang San".to_string()
-                                )),
+                                subject: TargetTerm::Concept(ConceptMatcher::Object {
+                                    r#type: "Person".to_string(),
+                                    name: "Zhang San".to_string(),
+                                }),
                                 predicate: PredTerm::Literal("stated".to_string()),
                                 object: TargetTerm::Concept(ConceptMatcher::Object {
                                     r#type: "Paper".to_string(),
@@ -1003,7 +1145,7 @@ mod tests {
         let input = r#"
         UPSERT {
             PROPOSITION {
-                ( { name: "Zhang San" }, "stated", { type: "Paper", name: "paper_doi" } )
+                ( { type: "Person", name: "Zhang San" }, "stated", { type: "Paper", name: "paper_doi" } )
             }
         }
         "#;
@@ -1447,5 +1589,164 @@ mod tests {
         assert!(crate::parse_kml(r#"DELETE CONCEPTS ?c DETACH WHERE { ?c {id: "1"} }"#).is_err());
         // The regular spellings still parse.
         assert!(crate::parse_kml(r#"DELETE CONCEPT ?c DETACH WHERE { ?c {id: "1"} }"#).is_ok());
+    }
+
+    #[test]
+    fn test_kml_keywords_are_not_glued_to_variables_or_strings() {
+        // `?` and `"` are neither identifier characters nor delimiters, so a
+        // keyword used to swallow the start of the next token: these three all
+        // parsed as valid statements.
+        assert!(
+            crate::parse_kml(r#"MERGE CONCEPT?a INTO?b WHERE { ?a {id: "1"} ?b {id: "2"} }"#)
+                .is_err()
+        );
+        assert!(
+            crate::parse_kml(r#"DELETE ATTRIBUTES {"a"} FROM?x WHERE { ?x {id: "1"} }"#).is_err()
+        );
+        assert!(
+            crate::parse_kml(r#"DELETE METADATA {"a"} FROM?x WHERE { ?x {id: "1"} }"#).is_err()
+        );
+        // Spaced spellings still parse.
+        assert!(
+            crate::parse_kml(r#"MERGE CONCEPT ?a INTO ?b WHERE { ?a {id: "1"} ?b {id: "2"} }"#)
+                .is_ok()
+        );
+        assert!(
+            crate::parse_kml(r#"DELETE ATTRIBUTES {"a"} FROM ?x WHERE { ?x {id: "1"} }"#).is_ok()
+        );
+        // A keyword glued to a delimiter is still fine.
+        assert!(
+            crate::parse_kml(
+                r#"UPSERT { CONCEPT ?c { {type: "T", name: "n"} SET ATTRIBUTES{a: 1} } }"#
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_kml_concept_identity_must_be_unique() {
+        // §4.1: only `{type, name}` (match-or-create) and `{id}` (match
+        // existing) identify a concept. The KQL patterns `{type: "..."}` and
+        // `{name: "..."}` parsed here and only failed later, at
+        // `ConceptPK::try_from`.
+        assert!(
+            crate::parse_kml(r#"UPSERT { CONCEPT ?c { {type: "Drug"} SET ATTRIBUTES { a: 1 } } }"#)
+                .is_err()
+        );
+        assert!(
+            crate::parse_kml(
+                r#"UPSERT { CONCEPT ?c { {name: "Aspirin"} SET ATTRIBUTES { a: 1 } } }"#
+            )
+            .is_err()
+        );
+        // The two admissible identities still parse.
+        assert!(
+            crate::parse_kml(
+                r#"UPSERT { CONCEPT ?c { {type: "Drug", name: "Aspirin"} SET ATTRIBUTES { a: 1 } } }"#
+            )
+            .is_ok()
+        );
+        assert!(
+            crate::parse_kml(r#"UPSERT { CONCEPT ?c { {id: "CNPX"} SET ATTRIBUTES { a: 1 } } }"#)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_set_propositions_target_must_be_unique() {
+        // §4.1: a SET PROPOSITIONS object links to an *existing* element, so
+        // `{type: "X"}` cannot identify it.
+        assert!(
+            crate::parse_kml(
+                r#"UPSERT { CONCEPT ?c { {type: "T", name: "n"} SET PROPOSITIONS { ("p", {type: "X"}) } } }"#
+            )
+            .is_err()
+        );
+        assert!(
+            crate::parse_kml(
+                r#"UPSERT { CONCEPT ?c { {type: "T", name: "n"} SET PROPOSITIONS { ("p", {name: "X"}) } } }"#
+            )
+            .is_err()
+        );
+        // Handles, full identities and proposition references still parse.
+        for target in [
+            r#"?other"#,
+            r#"{type: "X", name: "n"}"#,
+            r#"{id: "CNPX"}"#,
+            r#"(id: "LNPX")"#,
+            r#"({type: "A", name: "a"}, "knows", {type: "B", name: "b"})"#,
+        ] {
+            let input = format!(
+                r#"UPSERT {{ CONCEPT ?c {{ {{type: "T", name: "n"}} SET PROPOSITIONS {{ ("p", {target}) }} }} }}"#
+            );
+            assert!(crate::parse_kml(&input).is_ok(), "should parse: {input}");
+        }
+    }
+
+    #[test]
+    fn test_proposition_identity_requires_a_literal_predicate() {
+        // §4.1: a PROPOSITION block matches or creates ONE link, so the
+        // predicate must be a literal — a variable, an alternative or a
+        // multi-hop quantifier is a KQL pattern.
+        assert!(crate::parse_kml(r#"UPSERT { PROPOSITION ?p { (?s, ?pred, ?o) } }"#).is_err());
+        assert!(
+            crate::parse_kml(r#"UPSERT { PROPOSITION ?p { (?s, "knows"{1,3}, ?o) } }"#).is_err()
+        );
+        assert!(crate::parse_kml(r#"UPSERT { PROPOSITION ?p { (?s, "a"|"b", ?o) } }"#).is_err());
+        // Endpoints follow the same identity rule as SET PROPOSITIONS.
+        assert!(
+            crate::parse_kml(r#"UPSERT { PROPOSITION ?p { ({type: "A"}, "knows", ?o) } }"#)
+                .is_err()
+        );
+        // Literal predicates still parse.
+        assert!(crate::parse_kml(r#"UPSERT { PROPOSITION ?p { (?s, "knows", ?o) } }"#).is_ok());
+        assert!(crate::parse_kml(r#"UPSERT { PROPOSITION ?p { (id: "LNPX") } }"#).is_ok());
+    }
+
+    #[test]
+    fn test_update_expression_operands_must_read_the_update_target() {
+        // §4.3: operands may only use dot-notation paths on the UPDATE target
+        // itself, which is what keeps a bulk update order-independent.
+        assert!(
+            crate::parse_kml(
+                r#"UPDATE ?a SET METADATA { c: MUL(?b.metadata.confidence, 0.9) } WHERE { ?a (?s, "p", ?o) }"#
+            )
+            .is_err()
+        );
+        assert!(
+            crate::parse_kml(
+                r#"UPDATE ?a SET ATTRIBUTES { n: ADD(COALESCE(?b.attributes.n, 0), 1) } WHERE { ?a (?s, "p", ?o) }"#
+            )
+            .is_err()
+        );
+        // Paths on the target itself still parse.
+        assert!(
+            crate::parse_kml(
+                r#"UPDATE ?a SET METADATA { c: CLAMP(MUL(?a.metadata.confidence, 0.9), 0.0, 1.0) } WHERE { ?a (?s, "p", ?o) }"#
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_empty_update_set_block_is_rejected() {
+        // `Some(vec![])` is not `None`, so an empty block used to satisfy the
+        // "at least one SET ATTRIBUTES or SET METADATA block" guard while
+        // updating nothing.
+        assert!(
+            crate::parse_kml(r#"UPDATE ?t SET ATTRIBUTES { } WHERE { ?t {type: "T"} }"#).is_err()
+        );
+        assert!(crate::parse_kml(r#"UPDATE ?t SET METADATA {} WHERE { ?t {type: "T"} }"#).is_err());
+        assert!(
+            crate::parse_kml(
+                r#"UPDATE ?t SET ATTRIBUTES { } SET METADATA { a: 1 } WHERE { ?t {type: "T"} }"#
+            )
+            .is_err()
+        );
+        // A non-empty block still parses.
+        assert!(
+            crate::parse_kml(r#"UPDATE ?t SET ATTRIBUTES { a: 1 } WHERE { ?t {type: "T"} }"#)
+                .is_ok()
+        );
     }
 }

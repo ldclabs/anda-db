@@ -5,10 +5,20 @@
 //! brain:
 //!
 //! - [`MetaStore`] — augments any [`ObjectStore`] backend with side-car
-//!   metadata (object size, content hash). This enables a uniform,
-//!   content-addressable ETag and conditional `PutMode::Update` semantics on
-//!   top of backends that lack them natively (notably
+//!   metadata (object size, payload hash). This enables a uniform logical
+//!   ETag and conditional `PutMode::Update` semantics on top of backends
+//!   that lack them natively (notably
 //!   `object_store::local::LocalFileSystem`).
+//!
+//! ## Logical ETag
+//!
+//! Both wrappers expose an ETag that identifies the **commit**, not the
+//! bytes: it hashes the payload together with the generation minted for that
+//! commit. Two commits of identical content therefore carry different ETags,
+//! which is what makes `PutMode::Update` a compare-and-swap on the version
+//! rather than on the content — an ETag that repeated for repeating content
+//! would let a token captured before an A → B → A sequence still pass the
+//! precondition (a lost update).
 //! - [`EncryptedStore`] — provides transparent, chunked AES-256-GCM
 //!   encryption-at-rest. Objects are split into fixed-size chunks, each
 //!   encrypted with a per-chunk nonce derived from a random per-object base
@@ -65,6 +75,7 @@
 use async_trait::async_trait;
 use base64::{Engine, prelude::BASE64_URL_SAFE};
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use futures::stream::BoxStream;
 use moka::future::Cache;
 use object_store::{path::Path, *};
@@ -81,7 +92,10 @@ mod sidecar;
 pub use encryption::{EncryptedStore, EncryptedStoreBuilder, EncryptedStoreUploader};
 pub use fault::{FaultHandle, FaultKind, FaultOp, FaultRule, FaultStore};
 
-use sidecar::{ListingMetaPolicy, SidecarMeta, SidecarStore, new_generation};
+use sidecar::{
+    InFlightGuard, ListingMetaPolicy, SidecarMeta, SidecarStore, logical_last_modified,
+    new_generation,
+};
 
 /// `MetaStore` is a wrapper around an `ObjectStore` implementation that adds metadata capabilities.
 ///
@@ -90,7 +104,7 @@ use sidecar::{ListingMetaPolicy, SidecarMeta, SidecarStore, new_generation};
 ///
 /// The metadata includes:
 /// - Size of the object
-/// - E-Tag (SHA3-256 hash of the content)
+/// - E-Tag (SHA3-256 over the generation and the content, unique per commit)
 /// - The generation pointer to the immutable payload object
 ///
 /// # Example
@@ -135,10 +149,11 @@ struct Metadata {
     #[serde(rename = "s")]
     size: u64,
 
-    /// Content-addressable ETag produced by [`sha3_256`] over the payload,
+    /// Logical ETag: SHA3-256 over the generation followed by the payload,
     /// encoded as URL-safe Base64 (without padding). This ETag is what
     /// [`MetaStore`] exposes to callers via [`ObjectStore`] APIs and uses
-    /// for `PutMode::Update` precondition checks.
+    /// for `PutMode::Update` precondition checks; the generation makes it
+    /// unique per commit (see the crate documentation).
     #[serde(rename = "e")]
     e_tag: Option<String>,
 
@@ -253,6 +268,12 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
         opts: PutOptions,
     ) -> Result<PutResult> {
         let create = matches!(opts.mode, PutMode::Create);
+        // Mint the generation and register it as in-flight before anything
+        // reaches the backend: between the payload write and the pointer
+        // switch nothing references it, so garbage collection must be told
+        // to leave it alone. The guard is released when this call returns.
+        let generation = new_generation();
+        let _in_flight = self.inner.track_in_flight(location, &generation);
         let rt = self
             .inner
             .update_meta_with(location, create, async |meta| {
@@ -270,17 +291,25 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
                     }
                 }
 
+                // The logical ETag must be unique per commit: conditional
+                // updates compare it as the CAS token, and hashing the bare
+                // payload makes it repeat whenever the content does — a
+                // reader holding the token for content A can then still pass
+                // the precondition after A → B → A committed twice, which is
+                // a lost update. Seeding the hash with the generation, minted
+                // fresh for every commit, turns it into a commit identity.
+                //
                 // Hash segment-by-segment so multi-segment payloads are not
                 // concatenated into a temporary contiguous buffer.
                 let mut hasher = sha3::Sha3_256::new();
+                hasher.update(generation.as_bytes());
                 for segment in payload.iter() {
                     hasher.update(segment);
                 }
                 let hash: [u8; 32] = hasher.finalize().into();
 
-                // Write the payload to a fresh immutable generation; the
+                // Write the payload to the fresh immutable generation; the
                 // metadata put below is the commit point.
-                let generation = new_generation();
                 let gen_path = self.inner.generation_path(location, &generation);
                 let mut data_opts = opts.clone();
                 data_opts.mode = PutMode::Overwrite;
@@ -294,7 +323,7 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
                     e_tag: Some(BASE64_URL_SAFE.encode(hash)),
                     original_tag: None,
                     original_version: None,
-                    generation: Some(generation),
+                    generation: Some(generation.clone()),
                 })
             })
             .await?;
@@ -314,14 +343,20 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
         // Upload into a fresh immutable generation; `complete` switches the
         // metadata pointer, so an unfinished upload never affects readers.
         let generation = new_generation();
+        let in_flight = self.inner.track_in_flight(location, &generation);
         let gen_path = self.inner.generation_path(location, &generation);
         let inner = self.inner.store.put_multipart_opts(&gen_path, opts).await?;
 
+        // Seed the running payload hasher with the generation so the logical
+        // ETag is unique per commit; see `put_opts`.
+        let mut hasher = sha3::Sha3_256::new();
+        hasher.update(generation.as_bytes());
         Ok(Box::new(MetaStoreUploader {
-            hasher: sha3::Sha3_256::new(),
+            hasher,
             size: 0,
             location: location.clone(),
             generation,
+            _in_flight: in_flight,
             store: self.inner.clone(),
             inner,
         }))
@@ -332,7 +367,8 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
         loop {
             let meta = self.inner.get_meta(location).await?;
             let mut options = options.clone();
-            check_get_preconditions(location, &mut options, meta.e_tag.as_deref())?;
+            let last_modified = logical_last_modified(meta.generation.as_deref());
+            check_get_preconditions(location, &mut options, meta.e_tag.as_deref(), last_modified)?;
 
             let payload_path = self
                 .inner
@@ -341,9 +377,17 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
                 Ok(mut res) => {
                     res.meta.location = location.clone();
                     res.meta.e_tag = meta.e_tag.clone();
+                    // Report the logical object, not the payload object it
+                    // resolves to: the size comes from the commit point (the
+                    // payload's own length is whatever the backend holds),
+                    // and the timestamp from the generation pointer so
+                    // listings and reads agree.
+                    res.meta.size = meta.size;
+                    res.meta.last_modified = last_modified.unwrap_or(res.meta.last_modified);
                     // Versions are not reported: replaced generations are
                     // reclaimed eagerly, so version-addressed reads cannot be
-                    // honoured. Conditional updates use the logical e_tag.
+                    // honoured. Conditional updates use the logical e_tag,
+                    // which is unique per commit.
                     res.meta.version = None;
                     return Ok(res);
                 }
@@ -426,15 +470,20 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
     }
 
     async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
-        let create = matches!(options.mode, CopyMode::Create);
+        let CopyOptions { mode, extensions } = options;
+        let create = matches!(mode, CopyMode::Create);
         // Copy the payload into a fresh generation of the target; the
-        // pointer switch below is the commit point.
-        let (src, generation) = self.inner.copy_payload(from, to, |_, _| Ok(())).await?;
+        // pointer switch below is the commit point. `_in_flight` shields the
+        // copied generation from garbage collection until then.
+        let (src, generation, _in_flight) = self
+            .inner
+            .copy_payload(from, to, extensions, |_, _| Ok(()))
+            .await?;
         self.inner
             .update_meta_with(to, create, async |_| {
                 Ok(Metadata {
                     size: src.size,
-                    e_tag: src.e_tag.clone(),
+                    e_tag: Some(derive_copy_e_tag(&generation, src.e_tag.as_deref())),
                     original_tag: None,
                     original_version: None,
                     generation: Some(generation.clone()),
@@ -487,6 +536,10 @@ pub struct MetaStoreUploader<T: ObjectStore> {
     location: Path,
     /// Generation the parts are uploaded into
     generation: String,
+    /// Keeps that generation registered as in-flight for the whole upload,
+    /// so garbage collection cannot reclaim it before `complete` commits the
+    /// pointer
+    _in_flight: InFlightGuard,
     /// Shared sidecar core of the originating `MetaStore`
     store: Arc<SidecarStore<T, Metadata>>,
     /// Underlying multipart upload handler
@@ -548,8 +601,8 @@ impl<T: ObjectStore> MultipartUpload for MetaStoreUploader<T> {
 
 /// Computes the SHA3-256 hash of `data` and returns it as a 32-byte array.
 ///
-/// Used by [`MetaStore`] to derive a content-addressable ETag, and by
-/// [`crate::encryption::EncryptedStore`] to hash the produced ciphertext.
+/// Test-only helper for building the fixtures of pre-0.10 layouts, whose
+/// ETag was the bare hash of the payload.
 #[cfg(test)]
 pub(crate) fn sha3_256(data: &[u8]) -> [u8; 32] {
     let mut hasher = sha3::Sha3_256::new();
@@ -557,6 +610,28 @@ pub(crate) fn sha3_256(data: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// Derives the target's logical ETag for a copy.
+///
+/// A copy publishes the source bytes under a *new* commit of a *different*
+/// key, and the logical ETag identifies the commit rather than the bytes.
+/// Propagating the source token would hand two keys the same CAS token, and
+/// would hand the target a token it may already have retired — both let a
+/// stale `PutMode::Update` precondition pass. Mixing in the freshly minted
+/// generation makes the token unique per commit, exactly as a put does.
+pub(crate) fn derive_copy_e_tag(generation: &str, source_e_tag: Option<&str>) -> String {
+    let mut hasher = sha3::Sha3_256::new();
+    hasher.update(generation.as_bytes());
+    hasher.update(source_e_tag.unwrap_or_default().as_bytes());
+    let hash: [u8; 32] = hasher.finalize().into();
+    BASE64_URL_SAFE.encode(hash)
+}
+
+/// Evaluates a `PutMode::Update` precondition against the committed metadata.
+///
+/// The logical ETag is the compare-and-swap token: it is minted fresh for
+/// every commit (see the crate documentation), so comparing it answers "is
+/// this still the version I read?" rather than "does it still hold the bytes
+/// I read?".
 fn check_update_version(
     location: &Path,
     current_e_tag: &Option<String>,
@@ -599,37 +674,71 @@ fn check_update_version(
     Ok(())
 }
 
-/// Evaluates `if_match` / `if_none_match` against the logical
-/// (content-addressable) ETag and strips them from the request: the payload
-/// object is immutable, so once the precondition holds against the current
-/// metadata there is nothing further for the backend to check.
+/// Evaluates the read preconditions against the logical object described by
+/// the metadata commit point and strips what it answered from the request.
+///
+/// The ETag conditions are always answered here: the payload object is
+/// immutable and carries the backend's own ETag, which is not the logical
+/// one. The date conditions are answered here whenever the logical
+/// `last_modified` is known (`Some`, the regular generation layout), so the
+/// answer is consistent with the timestamp the same call reports; for
+/// pre-0.10 documents (`None`) they are left to the backend, which evaluates
+/// them against the legacy payload object — the very timestamp such a read
+/// reports.
+///
+/// The evaluation mirrors [`GetOptions::check_preconditions`], including RFC
+/// 9110 §13.2.2 precedence: when an ETag condition is present the
+/// corresponding date condition is ignored, so it must not reach the backend
+/// either.
 fn check_get_preconditions(
     location: &Path,
     options: &mut GetOptions,
     logical_e_tag: Option<&str>,
+    last_modified: Option<DateTime<Utc>>,
 ) -> Result<()> {
+    // The use of the invalid etag "*" means no ETag is equivalent to never matching.
     let e_tag = logical_e_tag.unwrap_or("*");
+    let if_match = options.if_match.take();
+    let if_none_match = options.if_none_match.take();
 
-    if let Some(if_match) = options.if_match.take()
-        && if_match != "*"
-        && if_match.split(',').map(str::trim).all(|tag| tag != e_tag)
+    if let Some(if_match) = if_match {
+        options.if_unmodified_since = None;
+        if if_match != "*" && if_match.split(',').map(str::trim).all(|tag| tag != e_tag) {
+            return Err(Error::Precondition {
+                path: location.to_string(),
+                source: format!("{e_tag} does not match {if_match}").into(),
+            });
+        }
+    } else if let Some(last_modified) = last_modified
+        && let Some(date) = options.if_unmodified_since.take()
+        && last_modified > date
     {
         return Err(Error::Precondition {
             path: location.to_string(),
-            source: format!("{e_tag} does not match {if_match}").into(),
+            source: format!("{date} < {last_modified}").into(),
         });
     }
 
-    if let Some(if_none_match) = options.if_none_match.take()
-        && (if_none_match == "*"
+    if let Some(if_none_match) = if_none_match {
+        options.if_modified_since = None;
+        if if_none_match == "*"
             || if_none_match
                 .split(',')
                 .map(str::trim)
-                .any(|tag| tag == e_tag))
+                .any(|tag| tag == e_tag)
+        {
+            return Err(Error::NotModified {
+                path: location.to_string(),
+                source: format!("{e_tag} matches {if_none_match}").into(),
+            });
+        }
+    } else if let Some(last_modified) = last_modified
+        && let Some(date) = options.if_modified_since.take()
+        && last_modified <= date
     {
         return Err(Error::NotModified {
             path: location.to_string(),
-            source: format!("{e_tag} matches {if_none_match}").into(),
+            source: format!("{date} >= {last_modified}").into(),
         });
     }
 
@@ -660,52 +769,12 @@ pub(crate) fn validate_ranges(store: &'static str, ranges: &[Range<u64>], len: u
     Ok(())
 }
 
-/// Re-clones an [`Arc<Error>`] returned from a `moka` shared computation
-/// (e.g. [`Cache::try_get_with`]) into an owned [`Error`].
-///
-/// `moka` deduplicates concurrent loaders by returning the same `Arc<Error>`
-/// to every waiter. Because [`object_store::Error`] is not [`Clone`], we must
-/// reconstruct an equivalent variant by hand. Variants that carry a `path`
-/// are reconstructed with their `path` and a stringified `source`; everything
-/// else collapses into [`Error::Generic`].
-fn map_arc_error(store: &'static str, err: Arc<Error>) -> Error {
-    match err.as_ref() {
-        Error::NotFound { path, source } => Error::NotFound {
-            path: path.clone(),
-            source: source.to_string().into(),
-        },
-        Error::AlreadyExists { path, source } => Error::AlreadyExists {
-            path: path.clone(),
-            source: source.to_string().into(),
-        },
-        Error::Precondition { path, source } => Error::Precondition {
-            path: path.clone(),
-            source: source.to_string().into(),
-        },
-        Error::NotModified { path, source } => Error::NotModified {
-            path: path.clone(),
-            source: source.to_string().into(),
-        },
-        Error::PermissionDenied { path, source } => Error::PermissionDenied {
-            path: path.clone(),
-            source: source.to_string().into(),
-        },
-        Error::Unauthenticated { path, source } => Error::Unauthenticated {
-            path: path.clone(),
-            source: source.to_string().into(),
-        },
-        err => Error::Generic {
-            store,
-            source: err.to_string().into(),
-        },
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use futures::TryStreamExt;
     use object_store::{integration::*, local::LocalFileSystem, memory::InMemory};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tempfile::TempDir;
 
     const NON_EXISTENT_NAME: &str = "nonexistentname";
@@ -748,12 +817,223 @@ mod tests {
             .unwrap();
     }
 
+    /// The logical ETag the currently committed generation of `location` must
+    /// carry for `payload`.
+    ///
+    /// The ETag is unique per commit — it hashes the generation together with
+    /// the payload — so a test cannot derive it from the content alone;
+    /// asserting against this value still proves that the committed metadata
+    /// and the committed payload describe the same write.
+    async fn committed_e_tag<T: ObjectStore>(
+        storage: &MetaStore<T>,
+        location: &Path,
+        payload: &[u8],
+    ) -> String {
+        let meta = storage.inner.get_meta(location).await.unwrap();
+        let mut hasher = sha3::Sha3_256::new();
+        hasher.update(meta.generation.as_deref().unwrap_or_default().as_bytes());
+        hasher.update(payload);
+        let hash: [u8; 32] = hasher.finalize().into();
+        BASE64_URL_SAFE.encode(hash)
+    }
+
     /// Resolves the full backend path of `location`'s current payload.
     async fn payload_backend_path<T: ObjectStore>(storage: &MetaStore<T>, location: &Path) -> Path {
         let meta = storage.inner.get_meta(location).await.unwrap();
         storage
             .inner
             .payload_path(location, meta.generation.as_deref())
+    }
+
+    /// Where a [`Gate`] suspends the operation it is armed for.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum GateOp {
+        /// Before the put reaches the backend, i.e. with the payload written
+        /// and the pointer switch still pending.
+        BeforePut,
+        /// After the backend answered the get, i.e. with the caller holding a
+        /// document a concurrent commit may replace at any moment.
+        AfterGet,
+    }
+
+    /// Suspends exactly one matching backend operation until the test
+    /// releases it, so writer/reader/collector interleavings can be driven
+    /// deterministically instead of hoped for.
+    struct Gate {
+        op: GateOp,
+        path: String,
+        armed: AtomicBool,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl Gate {
+        fn new(op: GateOp, path: &str) -> Arc<Self> {
+            Arc::new(Self {
+                op,
+                path: path.to_string(),
+                armed: AtomicBool::new(true),
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            })
+        }
+
+        /// Suspends the caller if it is the operation this gate waits for.
+        async fn check(&self, op: GateOp, location: &Path) {
+            if op != self.op
+                || !location.as_ref().contains(self.path.as_str())
+                || !self.armed.swap(false, Ordering::SeqCst)
+            {
+                return;
+            }
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+
+        /// Waits until the gated operation has reached the gate.
+        async fn wait_entered(&self) {
+            self.entered.notified().await;
+        }
+
+        /// Lets the suspended operation continue.
+        fn release(&self) {
+            self.release.notify_one();
+        }
+    }
+
+    /// [`ObjectStore`] wrapper that applies a [`Gate`] to the backend.
+    struct GateStore<T: ObjectStore> {
+        inner: T,
+        gate: Arc<Gate>,
+    }
+
+    impl<T: ObjectStore> std::fmt::Debug for GateStore<T> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "GateStore({:?})", self.inner)
+        }
+    }
+
+    impl<T: ObjectStore> std::fmt::Display for GateStore<T> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "GateStore({})", self.inner)
+        }
+    }
+
+    #[async_trait]
+    impl<T: ObjectStore> ObjectStore for GateStore<T> {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> Result<PutResult> {
+            self.gate.check(GateOp::BeforePut, location).await;
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+            let rt = self.inner.get_opts(location, options).await;
+            self.gate.check(GateOp::AfterGet, location).await;
+            rt
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, Result<Path>>,
+        ) -> BoxStream<'static, Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// Marker inserted into a request's [`Extensions`] to observe that the
+    /// caller's context reaches the backend.
+    #[derive(Clone, Debug, PartialEq)]
+    struct Marker(&'static str);
+
+    /// [`ObjectStore`] wrapper recording the [`Marker`] each backend copy
+    /// carried.
+    struct RecordingStore<T: ObjectStore> {
+        inner: T,
+        copies: Arc<std::sync::Mutex<Vec<Option<Marker>>>>,
+    }
+
+    impl<T: ObjectStore> std::fmt::Debug for RecordingStore<T> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "RecordingStore({:?})", self.inner)
+        }
+    }
+
+    impl<T: ObjectStore> std::fmt::Display for RecordingStore<T> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "RecordingStore({})", self.inner)
+        }
+    }
+
+    #[async_trait]
+    impl<T: ObjectStore> ObjectStore for RecordingStore<T> {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> Result<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, Result<Path>>,
+        ) -> BoxStream<'static, Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
+            self.copies
+                .lock()
+                .unwrap()
+                .push(options.extensions.get::<Marker>().cloned());
+            self.inner.copy_opts(from, to, options).await
+        }
     }
 
     #[test]
@@ -807,67 +1087,6 @@ mod tests {
 
         let err = check(1..4, 3).unwrap_err();
         assert!(err.to_string().contains("end 4 is larger than length 3"));
-    }
-
-    #[test]
-    fn map_arc_error_reconstructs_path_variants_and_generic_fallback() {
-        let cases = [
-            Error::NotFound {
-                path: "not-found".to_string(),
-                source: "missing".into(),
-            },
-            Error::AlreadyExists {
-                path: "exists".to_string(),
-                source: "exists".into(),
-            },
-            Error::Precondition {
-                path: "precondition".to_string(),
-                source: "stale".into(),
-            },
-            Error::NotModified {
-                path: "not-modified".to_string(),
-                source: "fresh".into(),
-            },
-            Error::PermissionDenied {
-                path: "denied".to_string(),
-                source: "denied".into(),
-            },
-            Error::Unauthenticated {
-                path: "unauthenticated".to_string(),
-                source: "auth".into(),
-            },
-        ];
-
-        for err in cases {
-            let mapped = map_arc_error("MetaStore", Arc::new(err));
-            match mapped {
-                Error::NotFound { path, source }
-                | Error::AlreadyExists { path, source }
-                | Error::Precondition { path, source }
-                | Error::NotModified { path, source }
-                | Error::PermissionDenied { path, source }
-                | Error::Unauthenticated { path, source } => {
-                    assert!(!path.is_empty());
-                    assert!(!source.to_string().is_empty());
-                }
-                other => panic!("unexpected mapped error: {other:?}"),
-            }
-        }
-
-        let mapped = map_arc_error(
-            "MetaStore",
-            Arc::new(Error::Generic {
-                store: "Inner",
-                source: "fallback".into(),
-            }),
-        );
-        assert!(matches!(
-            mapped,
-            Error::Generic {
-                store: "MetaStore",
-                ..
-            }
-        ));
     }
 
     #[tokio::test]
@@ -967,7 +1186,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn copy_and_rename_preserve_logical_etag_preconditions() {
+    async fn copy_and_rename_mint_their_own_logical_etag() {
         let storage = MetaStoreBuilder::new(InMemory::new(), 100).build();
         let source = Path::from("copy-source");
         let copied = Path::from("copy-target");
@@ -978,12 +1197,66 @@ mod tests {
             .unwrap();
         let e_tag = put.e_tag.unwrap();
 
+        // A copy is a commit of its own: it must not hand the target the
+        // source's CAS token, or the two keys would share one.
         storage.copy(&source, &copied).await.unwrap();
-        let bytes = storage
+        let copied_meta = storage.head(&copied).await.unwrap();
+        let copied_e_tag = copied_meta.e_tag.clone().unwrap();
+        assert_ne!(copied_e_tag, e_tag);
+        let err = storage
             .get_opts(
                 &copied,
                 GetOptions {
                     if_match: Some(e_tag.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Precondition { .. }));
+
+        // The target's own token addresses it, on both the read and the
+        // write path.
+        let bytes = storage
+            .get_opts(
+                &copied,
+                GetOptions {
+                    if_match: Some(copied_e_tag.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"abc"));
+        let err = storage
+            .put_opts(
+                &copied,
+                Bytes::from_static(b"def").into(),
+                PutOptions {
+                    mode: PutMode::Update(UpdateVersion {
+                        e_tag: Some(e_tag.clone()),
+                        version: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Precondition { .. }));
+
+        // A rename is a copy plus a delete, so the target is a new commit too.
+        storage.rename(&copied, &renamed).await.unwrap();
+        let renamed_e_tag = storage.head(&renamed).await.unwrap().e_tag.unwrap();
+        assert_ne!(renamed_e_tag, e_tag);
+        assert_ne!(renamed_e_tag, copied_e_tag);
+        let bytes = storage
+            .get_opts(
+                &renamed,
+                GetOptions {
+                    if_match: Some(renamed_e_tag),
                     ..Default::default()
                 },
             )
@@ -994,12 +1267,132 @@ mod tests {
             .unwrap();
         assert_eq!(bytes, Bytes::from_static(b"abc"));
 
-        storage.rename(&copied, &renamed).await.unwrap();
+        // The source is untouched by either operation.
+        assert_eq!(storage.head(&source).await.unwrap().e_tag, Some(e_tag));
+    }
+
+    #[tokio::test]
+    async fn stale_cas_token_cannot_survive_an_aba_rewrite() {
+        // The logical ETag identifies the commit, not the content: a token
+        // captured before an A -> B -> A sequence must not pass the
+        // `PutMode::Update` precondition afterwards, or the two intervening
+        // writes are silently lost.
+        let storage = MetaStoreBuilder::new(InMemory::new(), 100).build();
+        let location = Path::from("aba");
+
+        let first = storage
+            .put(&location, Bytes::from_static(b"A").into())
+            .await
+            .unwrap();
+        let stale = first.e_tag.unwrap();
+        let second = storage
+            .put(&location, Bytes::from_static(b"B").into())
+            .await
+            .unwrap();
+        let third = storage
+            .put_opts(
+                &location,
+                Bytes::from_static(b"A").into(),
+                PutOptions {
+                    mode: PutMode::Update(UpdateVersion {
+                        e_tag: second.e_tag,
+                        version: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        // Back to the original content, but a different commit.
+        assert_ne!(third.e_tag.as_deref(), Some(stale.as_str()));
+
+        let err = storage
+            .put_opts(
+                &location,
+                Bytes::from_static(b"C").into(),
+                PutOptions {
+                    mode: PutMode::Update(UpdateVersion {
+                        e_tag: Some(stale.clone()),
+                        version: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Precondition { .. }));
+
+        // The read path rejects it for the same reason.
+        let err = storage
+            .get_opts(
+                &location,
+                GetOptions {
+                    if_match: Some(stale),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Precondition { .. }));
+
+        // The current token still commits.
+        storage
+            .put_opts(
+                &location,
+                Bytes::from_static(b"C").into(),
+                PutOptions {
+                    mode: PutMode::Update(UpdateVersion {
+                        e_tag: third.e_tag,
+                        version: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let bytes = storage.get(&location).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"C"));
+
+        // Multipart commits mint their own token as well.
+        let mut upload = storage.put_multipart(&location).await.unwrap();
+        upload
+            .put_part(Bytes::from_static(b"D").into())
+            .await
+            .unwrap();
+        let one = upload.complete().await.unwrap();
+        let mut upload = storage.put_multipart(&location).await.unwrap();
+        upload
+            .put_part(Bytes::from_static(b"D").into())
+            .await
+            .unwrap();
+        let two = upload.complete().await.unwrap();
+        assert_ne!(one.e_tag, two.e_tag);
+    }
+
+    #[tokio::test]
+    async fn get_opts_ignores_date_conditions_paired_with_etag_conditions() {
+        // RFC 9110 §13.2.2: a present ETag condition makes the corresponding
+        // date condition irrelevant, so it must not be forwarded to the
+        // backend either — there it would be answered against the payload
+        // object and fail a request the specification says must succeed.
+        let storage = MetaStoreBuilder::new(InMemory::new(), 100).build();
+        let location = Path::from("etag-outranks-date");
+        let put = storage
+            .put(&location, Bytes::from_static(b"abc").into())
+            .await
+            .unwrap();
+        let e_tag = put.e_tag.unwrap();
+        let head = storage.head(&location).await.unwrap();
+        let before = head.last_modified - chrono::TimeDelta::hours(10);
+        let after = head.last_modified + chrono::TimeDelta::hours(10);
+
+        // `if_match` holds, so the failing `if_unmodified_since` is ignored.
         let bytes = storage
             .get_opts(
-                &renamed,
+                &location,
                 GetOptions {
-                    if_match: Some(e_tag),
+                    if_match: Some(e_tag.clone()),
+                    if_unmodified_since: Some(before),
                     ..Default::default()
                 },
             )
@@ -1009,6 +1402,172 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bytes, Bytes::from_static(b"abc"));
+
+        // `if_none_match` does not match, so the matching `if_modified_since`
+        // is ignored instead of reporting NotModified.
+        let bytes = storage
+            .get_opts(
+                &location,
+                GetOptions {
+                    if_none_match: Some("other".to_string()),
+                    if_modified_since: Some(after),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"abc"));
+
+        // On their own the date conditions still apply.
+        let err = storage
+            .get_opts(
+                &location,
+                GetOptions {
+                    if_unmodified_since: Some(before),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Precondition { .. }));
+        let err = storage
+            .get_opts(
+                &location,
+                GetOptions {
+                    if_modified_since: Some(after),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotModified { .. }));
+    }
+
+    #[tokio::test]
+    async fn every_api_reports_the_same_size_and_timestamp() {
+        let inner = InMemory::new();
+        let storage = MetaStoreBuilder::new(inner.clone(), 100).build();
+        let location = Path::from("one-clock");
+        storage
+            .put(&location, Bytes::from_static(b"abc").into())
+            .await
+            .unwrap();
+
+        let listed: Vec<_> = storage.list(None).try_collect().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        let head = storage.head(&location).await.unwrap();
+        assert_eq!(head.last_modified, listed[0].last_modified);
+        assert_eq!(head.size, listed[0].size);
+        assert_eq!(head.e_tag, listed[0].e_tag);
+        let res = storage.get(&location).await.unwrap();
+        assert_eq!(res.meta.last_modified, listed[0].last_modified);
+        assert_eq!(res.meta.size, listed[0].size);
+
+        // A timestamp taken from a listing therefore answers a conditional
+        // read about the same commit.
+        let err = storage
+            .get_opts(
+                &location,
+                GetOptions {
+                    if_modified_since: Some(listed[0].last_modified),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotModified { .. }));
+        storage
+            .get_opts(
+                &location,
+                GetOptions {
+                    if_unmodified_since: Some(listed[0].last_modified),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // The reported size is the committed one: replacing the payload
+        // behind the wrapper's back cannot change what `head` reports.
+        let payload = payload_backend_path(&storage, &location).await;
+        inner
+            .put(&payload, Bytes::from_static(b"abcdefghij").into())
+            .await
+            .unwrap();
+        assert_eq!(storage.head(&location).await.unwrap().size, 3);
+    }
+
+    #[tokio::test]
+    async fn copy_forwards_extensions_and_preserves_attributes() {
+        let inner = InMemory::new();
+        let recorder = Arc::new(std::sync::Mutex::new(Vec::<Option<Marker>>::new()));
+        let storage = MetaStoreBuilder::new(
+            RecordingStore {
+                inner: inner.clone(),
+                copies: recorder.clone(),
+            },
+            100,
+        )
+        .build();
+
+        let attributes = Attributes::from_iter([(Attribute::ContentType, "text/plain")]);
+        let source = Path::from("ext-source");
+        let target = Path::from("ext-target");
+        storage
+            .put_opts(
+                &source,
+                Bytes::from_static(b"abc").into(),
+                PutOptions {
+                    attributes: attributes.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut extensions = Extensions::new();
+        extensions.insert(Marker("copy"));
+        storage
+            .copy_opts(
+                &source,
+                &target,
+                CopyOptions {
+                    mode: CopyMode::Overwrite,
+                    extensions,
+                },
+            )
+            .await
+            .unwrap();
+
+        // The caller's request context reached the backend copy...
+        assert_eq!(recorder.lock().unwrap().as_slice(), &[Some(Marker("copy"))]);
+        // ...and `copy` + `get` answers with the same attributes as
+        // `put` + `get`.
+        let res = storage.get(&target).await.unwrap();
+        assert_eq!(res.attributes, attributes);
+        assert_eq!(res.bytes().await.unwrap(), Bytes::from_static(b"abc"));
+
+        // A rename forwards its own extensions the same way.
+        let mut extensions = Extensions::new();
+        extensions.insert(Marker("rename"));
+        storage
+            .rename_opts(
+                &target,
+                &Path::from("ext-renamed"),
+                RenameOptions {
+                    target_mode: RenameTargetMode::Overwrite,
+                    extensions,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            recorder.lock().unwrap().as_slice(),
+            &[Some(Marker("copy")), Some(Marker("rename"))]
+        );
     }
 
     #[tokio::test]
@@ -1071,7 +1630,7 @@ mod tests {
 
         // Replaced generations are reclaimed eagerly, so version-addressed
         // reads cannot be honoured; no operation reports a version and
-        // conditional updates rely on the content-addressable e_tag.
+        // conditional updates rely on the per-commit logical e_tag.
         let put = storage
             .put(&location, Bytes::from_static(b"v1").into())
             .await
@@ -1415,8 +1974,8 @@ mod tests {
             .unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(
-            listed[0].e_tag.as_deref(),
-            Some(BASE64_URL_SAFE.encode(sha3_256(b"v1")).as_str())
+            listed[0].e_tag,
+            Some(committed_e_tag(&reopened, &location, b"v1").await)
         );
 
         // The abandoned generation is garbage; collection reclaims it and
@@ -1569,6 +2128,156 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_garbage_spares_uncommitted_generations() {
+        // A put publishes its payload before its pointer, so a collection
+        // that runs in between finds no commit point for the key. Reclaiming
+        // the payload there would make the put return `Ok` for an object
+        // whose payload is already gone — a silent data loss the commit-point
+        // re-check cannot catch, because there is nothing to re-check yet.
+        let inner = InMemory::new();
+        let gate = Gate::new(GateOp::BeforePut, "meta/gc/object");
+        let storage = Arc::new(
+            MetaStoreBuilder::new(
+                GateStore {
+                    inner: inner.clone(),
+                    gate: gate.clone(),
+                },
+                100,
+            )
+            .build(),
+        );
+        let location = Path::from("gc/object");
+
+        // Real garbage, so the run below still has something to reclaim.
+        inner
+            .put(
+                &Path::from("gen/gc/stale/0000000000000001-deadbeef"),
+                Bytes::from_static(b"stale").into(),
+            )
+            .await
+            .unwrap();
+
+        let writer = {
+            let storage = storage.clone();
+            let location = location.clone();
+            tokio::spawn(async move {
+                storage
+                    .put(&location, Bytes::from_static(b"v1").into())
+                    .await
+            })
+        };
+        // The payload is on the backend; the pointer switch is suspended.
+        gate.wait_entered().await;
+
+        // Age the generation past the collection's floor, so only the
+        // in-flight registration can save it.
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        assert_eq!(
+            storage.collect_garbage().await.unwrap(),
+            1,
+            "only the planted stale generation is garbage"
+        );
+
+        gate.release();
+        writer.await.unwrap().unwrap();
+
+        // The committed pointer still resolves to a payload that exists.
+        let bytes = storage.get(&location).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"v1"));
+
+        // The registration ends with the put: drop the commit point and the
+        // payload is ordinary garbage again (a leaked entry would keep it
+        // alive forever).
+        let gen_path = payload_backend_path(&storage, &location).await;
+        inner.delete(&Path::from("meta/gc/object")).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        assert_eq!(storage.collect_garbage().await.unwrap(), 1);
+        assert!(matches!(
+            inner.get(&gen_path).await,
+            Err(Error::NotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn cold_read_cannot_resurrect_a_replaced_pointer() {
+        // A reader resolves the commit point before it caches it. If that
+        // insert is not serialized with the commits, a reader holding a
+        // pre-commit document can land it *after* a newer one was committed,
+        // pinning the previous version (its payload, size and ETag) for the
+        // rest of the cache TTL.
+        let inner = InMemory::new();
+        let location = Path::from("race/object");
+
+        // Seed v1 through a separate instance, so the store under test starts
+        // with a cold cache for the key.
+        let seed = MetaStoreBuilder::new(inner.clone(), 100).build();
+        seed.put(&location, Bytes::from_static(b"v1").into())
+            .await
+            .unwrap();
+
+        let (fault, handle) = crate::FaultStore::wrap(inner.clone());
+        let gate = Gate::new(GateOp::AfterGet, "meta/race/object");
+        let storage = Arc::new(
+            MetaStoreBuilder::new(
+                GateStore {
+                    inner: fault,
+                    gate: gate.clone(),
+                },
+                100,
+            )
+            .build(),
+        );
+        // Fail the (best-effort) cleanup of v1's generation, so a resurrected
+        // pointer keeps resolving instead of being healed by the read path's
+        // `NotFound` retry.
+        handle.push_rule(crate::FaultRule::fail_once(crate::FaultOp::Delete, "gen/"));
+
+        let reader = {
+            let storage = storage.clone();
+            let location = location.clone();
+            tokio::spawn(async move { storage.get(&location).await?.bytes().await })
+        };
+        // The reader holds the v1 document and has not cached it yet.
+        gate.wait_entered().await;
+
+        let writer = {
+            let storage = storage.clone();
+            let location = location.clone();
+            tokio::spawn(async move {
+                storage
+                    .put(&location, Bytes::from_static(b"v2-longer").into())
+                    .await
+            })
+        };
+        // Give the writer every chance to commit while the reader is parked.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        gate.release();
+
+        // Either version is a legitimate answer for the reader itself; what
+        // matters is that its document does not outlive the commit.
+        let read = reader.await.unwrap().unwrap();
+        assert!(read == Bytes::from_static(b"v1") || read == Bytes::from_static(b"v2-longer"));
+        writer.await.unwrap().unwrap();
+
+        let bytes = storage.get(&location).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"v2-longer"));
+
+        // Listings answer from the same documents, so a resurrected one also
+        // reports the previous version's size and ETag.
+        let listed: Vec<_> = storage
+            .list(Some(&Path::from("race")))
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].size, 9);
+        assert_eq!(
+            listed[0].e_tag,
+            Some(committed_e_tag(&storage, &location, b"v2-longer").await)
+        );
+    }
+
+    #[tokio::test]
     async fn legacy_layout_readable_and_upgraded_on_overwrite() {
         let inner = InMemory::new();
         let location = Path::from("compat/legacy");
@@ -1662,8 +2371,8 @@ mod tests {
         let e_tag = res.meta.e_tag.clone();
         let bytes = res.bytes().await.unwrap();
         assert_eq!(
-            e_tag.as_deref(),
-            Some(BASE64_URL_SAFE.encode(sha3_256(&bytes)).as_str())
+            e_tag,
+            Some(committed_e_tag(&fresh, &location, &bytes).await)
         );
     }
 
@@ -1693,8 +2402,10 @@ mod tests {
         let e_tag = res.meta.e_tag.clone();
         let bytes = res.bytes().await.unwrap();
         assert!(contents.contains(&bytes));
-        let expected = BASE64_URL_SAFE.encode(sha3_256(&bytes));
-        assert_eq!(e_tag.as_deref(), Some(expected.as_str()));
+        assert_eq!(
+            e_tag,
+            Some(committed_e_tag(&storage, &location, &bytes).await)
+        );
 
         // The object stays intact across garbage collection.
         storage.collect_garbage().await.unwrap();
@@ -1724,8 +2435,10 @@ mod tests {
         let e_tag = res.meta.e_tag.clone();
         let bytes = res.bytes().await.unwrap();
         assert!(bytes == content_a || bytes == content_b);
-        let expected = BASE64_URL_SAFE.encode(sha3_256(&bytes));
-        assert_eq!(e_tag.as_deref(), Some(expected.as_str()));
+        assert_eq!(
+            e_tag,
+            Some(committed_e_tag(&storage, &location, &bytes).await)
+        );
     }
 
     #[tokio::test]
@@ -1773,7 +2486,7 @@ mod tests {
             panic!("unexpected error type: {err:?}");
         }
 
-        // put_get_delete_list(&storage).await;
+        put_get_delete_list(&storage).await;
         put_get_attributes(&storage).await;
         get_opts(&storage).await;
         put_opts(&storage, true).await;

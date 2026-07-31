@@ -5,7 +5,10 @@
 //! Client-safe failures are constructed explicitly at the HTTP boundary;
 //! raw engine [`DBError`] values are logged and sanitized by default.
 
-use anda_db::{error::DBError, schema::SchemaError};
+use anda_db::{
+    error::{CollectionState, DBError},
+    schema::SchemaError,
+};
 use axum::http::StatusCode;
 use serde::Serialize;
 
@@ -129,9 +132,46 @@ impl ApiError {
         )
     }
 
+    /// `410 Gone` — the collection was (or is being) deleted; its objects are
+    /// removed, so no retry brings it back.
+    pub fn gone(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::GONE, "gone", message)
+    }
+
     /// `500 Internal Server Error` — storage or index failure.
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", message)
+    }
+
+    /// Classifies a collection handle's lifecycle state, or `None` when it is
+    /// [`CollectionState::Active`].
+    ///
+    /// Every non-active state rejects operations with the same engine error,
+    /// which used to be flattened into an opaque 500 — the client could not
+    /// tell "retry, this recovers itself" from "this is gone". The split is
+    /// taken from [`CollectionState::is_recoverable`] rather than enumerated
+    /// here, so a state added later lands on the engine's own answer.
+    pub fn from_collection_state(state: CollectionState) -> Option<Self> {
+        match state {
+            CollectionState::Active => None,
+            // Poisoned / Closing / Closed: the storage is intact and
+            // reopening the collection yields a usable handle, which the next
+            // request does on its own.
+            state if state.is_recoverable() => Some(Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "collection_unavailable",
+                if state.is_poisoned() {
+                    "collection was invalidated by a cancelled operation and is \
+                     being recovered; retry the request"
+                } else {
+                    "collection is closing and will be reopened on demand; \
+                     retry the request"
+                },
+            )),
+            _ => Some(Self::gone(
+                "collection has been deleted; the request cannot be retried",
+            )),
+        }
     }
 
     pub(crate) fn envelope(&self) -> ErrorEnvelope<'_> {
@@ -170,6 +210,15 @@ impl From<DBError> for ApiError {
             action = "ApiError::from";
             "database engine error: {err:?}",
         );
+        // A collection handle rejected the operation because of its lifecycle
+        // state. The engine reports that state as a typed source (never a
+        // message the server has to parse), so it can be answered honestly
+        // instead of being folded into the opaque internal fallback.
+        if let Some(state) = err.collection_state()
+            && let Some(api) = Self::from_collection_state(state)
+        {
+            return api;
+        }
         match err {
             DBError::Generic { .. }
             | DBError::Collection { .. }
@@ -201,6 +250,7 @@ impl From<SchemaError> for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anda_db::error::CollectionStateError;
     use std::io;
 
     const SECRET: &str = "/srv/private/tenant-a/db_meta.cbor";
@@ -309,6 +359,60 @@ mod tests {
         let conflict = ApiError::conflict("document changed concurrently");
         assert_eq!(conflict.status, StatusCode::CONFLICT);
         assert_eq!(conflict.code, "conflict");
+    }
+
+    /// Every non-active handle state used to collapse into one opaque 500, so
+    /// a client could not tell "retry, this recovers itself" from "this is
+    /// gone". Both must be distinguishable, and neither may leak a path.
+    #[test]
+    fn collection_lifecycle_states_are_classified_not_flattened_to_500() {
+        for state in [
+            CollectionState::Poisoned,
+            CollectionState::Closing,
+            CollectionState::Closed,
+        ] {
+            let api = ApiError::from(DBError::Generic {
+                name: "articles".to_string(),
+                source: CollectionStateError(state).into(),
+            });
+            assert_eq!(
+                api.status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "state: {state:?}"
+            );
+            assert_eq!(api.code, "collection_unavailable", "state: {state:?}");
+            assert!(api.message.contains("retry"), "state: {state:?}");
+            assert!(!api.message.contains(SECRET));
+        }
+        // The poisoned message names its cause so an operator reading a log
+        // or a client reading the body can tell the two apart.
+        let poisoned = ApiError::from(DBError::Generic {
+            name: "articles".to_string(),
+            source: CollectionStateError(CollectionState::Poisoned).into(),
+        });
+        assert!(poisoned.message.contains("cancelled"));
+
+        // A deleted collection is not coming back: retrying is pointless.
+        for state in [CollectionState::Deleting, CollectionState::Deleted] {
+            let api = ApiError::from(DBError::Generic {
+                name: "articles".to_string(),
+                source: CollectionStateError(state).into(),
+            });
+            assert_eq!(api.status, StatusCode::GONE, "state: {state:?}");
+            assert_eq!(api.code, "gone", "state: {state:?}");
+            assert!(!api.message.contains(SECRET));
+        }
+
+        // Other generic engine failures keep the conservative mapping.
+        assert_sanitized(
+            DBError::Generic {
+                name: "db".to_string(),
+                source: source(),
+            },
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "internal server error",
+        );
     }
 
     #[test]

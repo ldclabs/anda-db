@@ -66,11 +66,14 @@
 //!
 //! ## Concurrency contract
 //!
-//! Concurrent `insert*`/`remove*`/query calls are safe. Coordinating
-//! mutations against `flush`/`compact_buckets`, and flushes against each
-//! other, is the **caller's** responsibility (`anda_db`'s `Collection` holds
-//! an exclusive operation gate across every flush). A single writer per
-//! durable index is a deployment contract.
+//! Concurrent `insert*`/`remove*`/query calls are safe, and so is running
+//! [`BTreeIndex::compact_buckets`] alongside them: compaction rebuilds the
+//! bucket map non-atomically, so it holds an internal mutation gate
+//! exclusively while mutations hold it shared. Coordinating mutations against
+//! `flush`, and flushes against each other or against compaction, is the
+//! **caller's** responsibility (`anda_db`'s `Collection` holds an exclusive
+//! operation gate across every flush). A single writer per durable index is a
+//! deployment contract.
 //!
 //! ## Features
 //!
@@ -252,6 +255,15 @@ where
     /// Version of the last successfully persisted metadata.
     /// Prevents re-serializing identical metadata.
     last_saved_version: AtomicU64,
+
+    /// Held *shared* by every synchronous mutation and *exclusively* by
+    /// [`BTreeIndex::compact_buckets`], which rebuilds the whole bucket map
+    /// non-atomically: a posting created after compaction snapshotted
+    /// `postings` would otherwise be re-binned into nothing and silently lost
+    /// on the next flush. Mutations still run concurrently with each other —
+    /// they only take the shared side — and this is the first lock a mutation
+    /// acquires, so it never nests inside a DashMap shard guard.
+    mutation_gate: RwLock<()>,
 }
 
 /// Identifies one durable bucket object.
@@ -619,13 +631,17 @@ where
         // Clone an owned payload. The coordinated flush may await several
         // object-store writes after this point, so neither DashMap guards nor
         // a later mutation may influence the bytes being committed.
+        // A migrated posting can still be listed by its source bucket; writing
+        // it here too would let the stale copy win on load (the loader forces
+        // `posting.0 = i` walking buckets in ascending id order). Persist only
+        // the postings this bucket actually owns.
         let postings: FxHashMap<_, _> = bucket
             .2
             .iter()
             .filter_map(|field_value| {
                 self.postings
                     .get(field_value)
-                    .filter(|posting| !posting.2.is_empty())
+                    .filter(|posting| posting.0 == bucket_id && !posting.2.is_empty())
                     .map(|posting| (field_value.clone(), posting.clone()))
             })
             .collect();
@@ -755,6 +771,7 @@ where
             max_bucket_id: AtomicU32::new(0),
             query_count: AtomicU64::new(0),
             last_saved_version: AtomicU64::new(0),
+            mutation_gate: RwLock::new(()),
         }
     }
 
@@ -823,6 +840,7 @@ where
             query_count,
             max_bucket_id,
             last_saved_version,
+            mutation_gate: RwLock::new(()),
         })
     }
 
@@ -837,6 +855,16 @@ where
     /// Returning `Ok(None)` leaves that bucket empty, which allows read-only
     /// partial loads; a partially loaded index must not be flushed, since a
     /// flush persists exactly the loaded content.
+    ///
+    /// # Ordering
+    ///
+    /// This is a bootstrap step: it must complete before the index takes any
+    /// mutation. Loaded postings are authoritative and *replace* the in-memory
+    /// entry for the same field value — that replacement is what implements
+    /// the higher-bucket-wins repair of stale duplicates, so it cannot merge
+    /// instead. A pair inserted between [`load_metadata`](Self::load_metadata)
+    /// and this call would therefore be discarded without a trace. Prefer
+    /// [`load_all`](Self::load_all), which sequences both steps.
     ///
     /// # Arguments
     ///
@@ -1032,6 +1060,9 @@ where
     /// * `Ok(bool)` if the document_id-field_value pair was successfully added
     /// * `Err(BTreeError)` if failed
     pub fn insert(&self, doc_id: PK, field_value: FV, now_ms: u64) -> Result<bool, BTreeError> {
+        // Shared with other mutations, exclusive against `compact_buckets`.
+        let _mutation_guard = self.mutation_gate.read();
+
         // Validate `doc_id` serialization up-front, before any state is
         // mutated, so a failing `Serialize` impl surfaces as an error instead
         // of a panic (and never leaves a half-applied insert behind).
@@ -1045,7 +1076,10 @@ where
 
         // Ensure the current bucket exists.
         // This avoids races where max_bucket_id advances before the bucket entry is created,
-        // and also supports calling insert() after load_metadata() but before load_buckets().
+        // and also covers an index restored by load_metadata() alone (its
+        // `max_bucket_id` watermark is ahead of the buckets it materialized).
+        // Inserting between load_metadata() and load_buckets() is NOT supported:
+        // the load overwrites postings by design (see `load_buckets`).
         // contains_key (shard read lock) first: every insert hits the same current
         // bucket id, so taking the shard write lock via entry() each time would
         // serialize concurrent inserts on this hot path.
@@ -1225,6 +1259,9 @@ where
     ///
     /// * `bool` - `true` if the document_id-field_value pair was successfully removed, `false` otherwise
     pub fn remove(&self, doc_id: PK, field_value: FV, now_ms: u64) -> bool {
+        // Shared with other mutations, exclusive against `compact_buckets`.
+        let _mutation_guard = self.mutation_gate.read();
+
         let mut removed = false;
         let mut doc_size_decrease = 0;
         let mut full_size_decrease = 0;
@@ -1351,6 +1388,9 @@ where
         if field_values.is_empty() {
             return Ok(0);
         }
+
+        // Shared with other mutations, exclusive against `compact_buckets`.
+        let _mutation_guard = self.mutation_gate.read();
 
         // Validate `doc_id` serialization up-front, before any state is
         // mutated (see `insert`).
@@ -1627,6 +1667,9 @@ where
         if field_values.is_empty() {
             return 0;
         }
+
+        // Shared with other mutations, exclusive against `compact_buckets`.
+        let _mutation_guard = self.mutation_gate.read();
 
         // Track removal statistics
         let mut removed_count = 0;
@@ -2189,6 +2232,20 @@ where
     /// * `now_ms`   - current unix-ms timestamp, recorded into `stats.last_saved`.
     /// * `f`        - async function used to persist each dirty bucket.
     ///
+    /// # Durability
+    ///
+    /// `W` must be a "written means durable" target: this method treats the
+    /// `write_all` into `metadata` as the manifest commit point. Once it
+    /// returns, the index advances `last_saved_version`, publishes the new
+    /// manifest, clears every dirty mark, and reports the objects the previous
+    /// manifest referenced in [`FlushOutcome::obsolete`] — which the caller is
+    /// expected to delete. If `W` merely stages bytes for a later fallible
+    /// upload and that upload fails, the durable metadata still points at
+    /// generations the caller was just told to delete: unrecoverable bucket
+    /// loss. Use [`flush_owned_with`](Self::flush_owned_with) and perform the
+    /// upload inside its metadata callback, so a failure leaves the generation
+    /// uncommitted and fully retryable.
+    ///
     /// # Returns
     ///
     /// See [`flush_owned_with`](Self::flush_owned_with).
@@ -2240,6 +2297,20 @@ where
     /// ordering under this protocol: the repacked layout becomes visible
     /// atomically with the manifest commit, and every pre-compaction object
     /// is reported as obsolete.
+    ///
+    /// # Durability
+    ///
+    /// `metadata_writer` returning `Ok(())` *is* the commit: this method then
+    /// advances `last_saved_version`, publishes the manifest in memory, clears
+    /// every dirty mark and reports the replaced objects as
+    /// [`FlushOutcome::obsolete`] for the caller to delete. It must therefore
+    /// return `Ok(())` only once the metadata blob is durably stored — never
+    /// after merely staging it for a later fallible upload. A failure after a
+    /// premature `Ok(())` leaves the durable metadata referencing generations
+    /// the caller was just told to delete, and those buckets cannot be
+    /// recovered. Perform the upload *inside* the callback and propagate its
+    /// error instead: nothing is committed and the whole flush is retried at a
+    /// later generation.
     ///
     /// # Concurrency
     ///
@@ -2412,10 +2483,13 @@ where
     ///
     /// # Concurrency
     ///
-    /// This method rebuilds the bucket map non-atomically and must NOT run
-    /// concurrently with writers (`insert*` / `remove*`) or flushes (see the
-    /// crate-level concurrency contract). It also requires a fully loaded
-    /// index.
+    /// This method rebuilds the bucket map non-atomically, so it takes the
+    /// index's mutation gate **exclusively**: concurrent `insert*` / `remove*`
+    /// calls block for its duration instead of losing postings created between
+    /// the `postings` snapshot and the rebuild (such a posting would belong to
+    /// no bucket, and buckets are what gets serialized). Excluding *flushes*
+    /// remains the caller's responsibility (see the crate-level concurrency
+    /// contract). It also requires a fully loaded index.
     ///
     /// # Persistence
     ///
@@ -2429,6 +2503,11 @@ where
     ///
     /// `(old_bucket_count, new_bucket_count)`
     pub fn compact_buckets(&self) -> (usize, usize) {
+        // Exclusive: no mutation may observe — or add to — the half-rebuilt
+        // bucket map. Every mutator takes the shared side of this gate before
+        // touching any other lock, so the ordering is uniform and deadlock-free.
+        let _mutation_guard = self.mutation_gate.write();
+
         let old_count = self.buckets.len();
         if old_count <= 1 {
             return (old_count, old_count);
@@ -5501,6 +5580,68 @@ mod tests {
         assert!(bucket.postings.contains_key("b"));
     }
 
+    /// A posting owned by bucket N must be written **only** into bucket N's
+    /// object, even while a higher-numbered bucket still lists its field value
+    /// (a leftover of a migration or of compaction). Persisting it into both
+    /// makes the stale copy win on reload — `load_buckets` forces
+    /// `posting.0 = i` walking buckets in ascending id order — which
+    /// resurrects the doc set that was current when the non-owning bucket was
+    /// last written and drops everything appended to the posting since.
+    #[tokio::test]
+    async fn test_flush_skips_posting_listed_by_a_non_owning_bucket() {
+        let index = create_test_index();
+        let mut store = MemStore::default();
+        let apple = "apple".to_string();
+        let banana = "banana".to_string();
+
+        // Bucket 0 owns "apple", bucket 1 owns "banana".
+        index.insert(1, apple.clone(), now_ms()).unwrap();
+        index.max_bucket_id.store(1, Ordering::Relaxed);
+        index.insert(10, banana.clone(), now_ms()).unwrap();
+        assert_eq!(index.postings.get(&apple).unwrap().0, 0);
+        assert_eq!(index.postings.get(&banana).unwrap().0, 1);
+
+        // Corrupt the packing metadata the way an interrupted migration can:
+        // bucket 1 also lists "apple", whose posting bucket 0 owns.
+        index.buckets.get_mut(&1).unwrap().2.push(apple.clone());
+
+        flush_to(&index, &mut store, now_ms()).await;
+        assert!(!index.has_dirty_buckets());
+
+        // Appending to the posting dirties its owner only, so the stale
+        // bucket 1 object stays pinned at the generation committed above.
+        index.insert(2, apple.clone(), now_ms()).unwrap();
+        assert!(index.buckets.get(&0).unwrap().1, "owner must be dirty");
+        assert!(
+            !index.buckets.get(&1).unwrap().1,
+            "the non-owning bucket must not be rewritten"
+        );
+        flush_to(&index, &mut store, now_ms()).await;
+
+        // The non-owning bucket's object must not carry the foreign posting.
+        let generation = *index.metadata().buckets.get(&1).unwrap();
+        let bucket1: BucketOwned<u64, String> = cbor2::from_reader(
+            &store.buckets[&BucketObject {
+                bucket_id: 1,
+                generation,
+            }][..],
+        )
+        .unwrap();
+        assert!(
+            !bucket1.postings.contains_key(&apple),
+            "a bucket must never persist a posting owned by another bucket"
+        );
+        assert!(bucket1.postings.contains_key(&banana));
+
+        let loaded: BTreeIndex<u64, String> = load_from(&store).await;
+        assert_eq!(
+            loaded.query_with(&apple, |ids| Some(ids.clone())),
+            Some(vec![1, 2]),
+            "the stale copy in the higher-numbered bucket must not win on load"
+        );
+        assert_eq!(loaded.postings.get(&apple).unwrap().0, 0);
+    }
+
     #[test]
     fn test_compact_buckets_restores_ownership_invariants() {
         let index = create_test_index();
@@ -5545,6 +5686,104 @@ mod tests {
             index.postings.len(),
             "every posting must be tracked by exactly one bucket"
         );
+    }
+
+    /// Compaction must exclude mutations, not merely be documented as
+    /// requiring the caller to do so: it holds the mutation gate exclusively
+    /// while every mutator holds it shared.
+    #[test]
+    fn test_compaction_excludes_mutations() {
+        let index = Arc::new(BTreeIndex::new(
+            "compact_exclusion".to_string(),
+            Some(BTreeConfig {
+                bucket_overload_size: BTreeConfig::MIN_BUCKET_OVERLOAD_SIZE,
+                allow_duplicates: true,
+            }),
+        ));
+        for id in 0..8_u64 {
+            index
+                .insert(id, format!("key-{id}-{}", "x".repeat(96)), now_ms())
+                .unwrap();
+        }
+        assert!(index.buckets.len() > 1);
+
+        let mutation_in_progress = index.mutation_gate.read();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let compact_index = index.clone();
+        let compact = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = compact_index.compact_buckets();
+            done_tx.send(result).unwrap();
+        });
+
+        started_rx.recv().unwrap();
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "compaction ran while a mutation held the shared gate"
+        );
+        drop(mutation_in_progress);
+        let (old_count, new_count) = done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        compact.join().unwrap();
+        assert!(new_count <= old_count);
+    }
+
+    /// Regression: `compact_buckets` snapshots `postings`, clears `buckets`
+    /// and re-bins the snapshot. A posting created by a concurrent `insert`
+    /// after the snapshot ended up in no bucket at all — and only bucket
+    /// contents are serialized — so `insert` returned `Ok` while the value
+    /// silently vanished from the durable index on the next flush.
+    #[tokio::test]
+    async fn test_compaction_never_loses_concurrent_inserts() {
+        let index = Arc::new(BTreeIndex::<u64, String>::new(
+            "compact_concurrent_insert".to_string(),
+            Some(BTreeConfig {
+                bucket_overload_size: BTreeConfig::MIN_BUCKET_OVERLOAD_SIZE,
+                allow_duplicates: true,
+            }),
+        ));
+        // Seed enough postings that each compaction has real work to do.
+        for id in 0..64u64 {
+            index.insert(id, format!("seed-{id:04}"), now_ms()).unwrap();
+        }
+
+        const WRITES: u64 = 400;
+        let writer_index = index.clone();
+        let writer = std::thread::spawn(move || {
+            for id in 0..WRITES {
+                writer_index
+                    .insert(1_000 + id, format!("live-{id:04}"), now_ms())
+                    .unwrap();
+            }
+        });
+        let mut compactions = 0usize;
+        while !writer.is_finished() {
+            index.compact_buckets();
+            compactions += 1;
+        }
+        writer.join().unwrap();
+        assert!(compactions > 0, "no compaction overlapped the writer");
+
+        // A flush persists bucket contents only, so a posting that no bucket
+        // lists disappears on reload even though `insert` reported success.
+        let mut store = MemStore::default();
+        flush_to(&index, &mut store, now_ms()).await;
+        let loaded: BTreeIndex<u64, String> = load_from(&store).await;
+        let missing: Vec<String> = (0..WRITES)
+            .map(|id| format!("live-{id:04}"))
+            .filter(|key| loaded.query_with(key, |ids| Some(ids.clone())).is_none())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{} concurrently inserted values were lost, e.g. {:?}",
+            missing.len(),
+            &missing[..missing.len().min(5)]
+        );
+        assert_eq!(loaded.len(), index.len());
     }
 
     #[test]

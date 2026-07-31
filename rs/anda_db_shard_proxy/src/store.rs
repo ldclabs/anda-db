@@ -14,11 +14,14 @@ use moka::{Expiry, future::Cache};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use sqlx::postgres::PgListener;
+use std::collections::HashMap;
 use std::future::Future;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, PoisonError, RwLock, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
+
+use crate::proxy::validate_backend_addr;
 
 /// How long a positive db→shard cache entry is trusted before it is
 /// re-validated against PostgreSQL.
@@ -41,6 +44,32 @@ const DB_CACHE_NEGATIVE_TTL: Duration = Duration::from_secs(5);
 /// attacker grow proxy memory without limit by probing random names.
 const DB_CACHE_CAPACITY: u64 = 100_000;
 
+/// Largest shard id that fits the `INT` (signed 32-bit) `shard_id` columns.
+///
+/// The routing layer works in `u32` while PostgreSQL stores `i32`, so both
+/// directions of the conversion are checked: an unchecked `as` cast reads
+/// `-1` back as shard `4294967295` (routing to a shard no operator
+/// configured) and writes `u32::MAX` as `-1` (invisible to external tooling).
+pub const MAX_SHARD_ID: u32 = i32::MAX as u32;
+
+/// Converts a routing-layer shard id into the signed column type, refusing
+/// values that would be stored negative.
+fn shard_id_to_sql(shard_id: u32) -> Result<i32, sqlx::Error> {
+    i32::try_from(shard_id).map_err(|_| {
+        sqlx::Error::Configuration(
+            format!("shard_id {shard_id} exceeds the maximum {MAX_SHARD_ID} storable in the shard_id column")
+                .into(),
+        )
+    })
+}
+
+/// Converts a stored shard id back into the routing-layer type, refusing a
+/// negative value that predates the `CHECK (shard_id >= 0)` constraint or was
+/// written by external tooling.
+fn shard_id_from_sql(shard_id: i32) -> Option<u32> {
+    u32::try_from(shard_id).ok()
+}
+
 /// Mapping from database name to its assigned shard ID.
 /// This binding can be updated by administrators when needed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,12 +88,6 @@ pub struct ShardBackend {
     pub shard_id: u32,
     /// Base URL of the shard backend that should receive proxied traffic.
     pub backend_addr: String,
-    /// Advisory flag: the backend is in read-only mode (e.g. during
-    /// migration). The proxy forwards it in routing metadata but does **not**
-    /// enforce it — the RPC protocol is POST-based, so the HTTP method cannot
-    /// distinguish reads from writes; enforcement is the backend's job.
-    #[serde(default)]
-    pub read_only: bool,
 }
 
 /// A cached db→shard lookup result. Both positive and negative entries
@@ -189,8 +212,6 @@ pub struct ResolvedRoute {
     pub shard_id: u32,
     /// Backend base URL that will receive the forwarded request.
     pub backend_addr: String,
-    /// Whether the selected backend currently advertises read-only status.
-    pub read_only: bool,
 }
 
 // Incremental events sent via PostgreSQL NOTIFY payloads.
@@ -207,11 +228,7 @@ enum DbShardEvent {
 #[serde(tag = "op")]
 enum BackendEvent {
     #[serde(rename = "upsert")]
-    Upsert {
-        shard_id: u32,
-        backend_addr: String,
-        read_only: bool,
-    },
+    Upsert { shard_id: u32, backend_addr: String },
     #[serde(rename = "delete")]
     Delete { shard_id: u32 },
 }
@@ -240,18 +257,24 @@ pub struct ShardStore {
     /// the last lease removes the key immediately so random names cannot grow
     /// this map without bound.
     lookup_gates: Arc<DashMap<String, Weak<Mutex<()>>>>,
-    /// shard_id → ShardBackend
-    backend_cache: Arc<DashMap<u32, ShardBackend>>,
+    /// shard_id → ShardBackend. The whole map is replaced under one write
+    /// lock, so a reload never exposes a window in which a live backend is
+    /// missing and requests answer 404 "database not found".
+    backend_cache: Arc<RwLock<HashMap<u32, ShardBackend>>>,
 }
 
 impl ShardStore {
     /// Create the store, ensure tables exist, and load the initial data into caches.
     pub async fn new(pool: PgPool) -> Result<Self, sqlx::Error> {
+        // `CHECK (shard_id >= 0)` keeps the signed column inside the range
+        // the routing layer can represent. It only applies to tables created
+        // by this statement; a pre-existing deployment keeps its unchecked
+        // column, which is why every read also converts defensively.
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS db_shards (
                 db_name     TEXT    PRIMARY KEY,
-                shard_id    INT     NOT NULL,
+                shard_id    INT     NOT NULL CHECK (shard_id >= 0),
                 created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
             )
             "#,
@@ -262,9 +285,8 @@ impl ShardStore {
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS shard_backends (
-                shard_id      INT     PRIMARY KEY,
+                shard_id      INT     PRIMARY KEY CHECK (shard_id >= 0),
                 backend_addr  TEXT    NOT NULL,
-                read_only     BOOLEAN NOT NULL DEFAULT false,
                 updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
             )
             "#,
@@ -276,7 +298,7 @@ impl ShardStore {
             pool,
             db_cache: new_db_cache(),
             lookup_gates: Arc::new(DashMap::new()),
-            backend_cache: Arc::new(DashMap::new()),
+            backend_cache: Arc::new(RwLock::new(HashMap::new())),
         };
         store.reload_all().await?;
         Ok(store)
@@ -293,23 +315,53 @@ impl ShardStore {
     ///
     /// This is primarily used during startup and listener reconnects so the
     /// proxy can recover from missed notifications while it was offline.
+    ///
+    /// The replacement map is built first and swapped in under one write
+    /// lock: clearing the live cache before refilling it would make every
+    /// request during the resync answer 404 "no backend found" instead of the
+    /// 503 that a routing-store problem is supposed to produce.
+    ///
+    /// Rows are validated exactly as the administrative API validates them.
+    /// A row written directly by a DBA, a migration, or an older build is
+    /// rejected and logged rather than loaded verbatim — a single bad address
+    /// would otherwise fail every request for every database on that shard.
     async fn reload_backend_cache(&self) -> Result<(), sqlx::Error> {
-        let rows: Vec<(i32, String, bool)> =
-            sqlx::query_as("SELECT shard_id, backend_addr, read_only FROM shard_backends")
+        let rows: Vec<(i32, String)> =
+            sqlx::query_as("SELECT shard_id, backend_addr FROM shard_backends")
                 .fetch_all(&self.pool)
                 .await?;
-        self.backend_cache.clear();
-        for (shard_id, backend_addr, read_only) in rows {
-            self.backend_cache.insert(
-                shard_id as u32,
+        let mut next = HashMap::with_capacity(rows.len());
+        for (shard_id, backend_addr) in rows {
+            let Some(shard_id) = shard_id_from_sql(shard_id) else {
+                log::error!("ignoring shard_backends row with negative shard_id {shard_id}");
+                continue;
+            };
+            if let Err(err) = validate_backend_addr(&backend_addr) {
+                log::error!("ignoring shard_backends row for shard {shard_id}: {err}");
+                continue;
+            }
+            next.insert(
+                shard_id,
                 ShardBackend {
-                    shard_id: shard_id as u32,
+                    shard_id,
                     backend_addr,
-                    read_only,
                 },
             );
         }
+        *self
+            .backend_cache
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = next;
         Ok(())
+    }
+
+    /// Returns the cached backend for a shard, if any.
+    fn backend(&self, shard_id: u32) -> Option<ShardBackend> {
+        self.backend_cache
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&shard_id)
+            .cloned()
     }
 
     // ── Lookups ─────────────────────────────────────────────────────────────
@@ -326,7 +378,20 @@ impl ShardStore {
                 .bind(db_name)
                 .fetch_optional(&self.pool)
                 .await
-                .map(|row| row.map(|(shard_id,)| shard_id as u32))
+                .map(|row| {
+                    row.and_then(|(shard_id,)| match shard_id_from_sql(shard_id) {
+                        Some(shard_id) => Some(shard_id),
+                        // A negative assignment cannot address any shard the
+                        // operator configured; treat it as unassigned instead
+                        // of wrapping it into a huge positive shard id.
+                        None => {
+                            log::error!(
+                                "db_shards row for {db_name:?} has a negative shard_id {shard_id}"
+                            );
+                            None
+                        }
+                    })
+                })
         })
         .await
     }
@@ -414,14 +479,13 @@ impl ShardStore {
         let Some(shard_id) = self.lookup_db_shard(db_name).await? else {
             return Ok(None);
         };
-        let Some(backend) = self.backend_cache.get(&shard_id) else {
+        let Some(backend) = self.backend(shard_id) else {
             return Ok(None);
         };
         Ok(Some(ResolvedRoute {
             db_name: Some(db_name.to_string()),
             shard_id,
-            backend_addr: backend.backend_addr.clone(),
-            read_only: backend.read_only,
+            backend_addr: backend.backend_addr,
         }))
     }
 
@@ -430,12 +494,11 @@ impl ShardStore {
     /// This path is used when the client already knows the target shard and
     /// sends `Shard-ID` or `X-Shard` instead of a database name.
     pub async fn resolve_by_shard(&self, shard_id: u32) -> Option<ResolvedRoute> {
-        let backend = self.backend_cache.get(&shard_id)?;
+        let backend = self.backend(shard_id)?;
         Some(ResolvedRoute {
             db_name: None,
             shard_id,
-            backend_addr: backend.backend_addr.clone(),
-            read_only: backend.read_only,
+            backend_addr: backend.backend_addr,
         })
     }
 
@@ -460,8 +523,10 @@ impl ShardStore {
     /// from the in-memory cache so it stays cheap at request time.
     pub fn list_shard_backends(&self) -> Vec<ShardBackend> {
         self.backend_cache
-            .iter()
-            .map(|e| e.value().clone())
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .cloned()
             .collect()
     }
 
@@ -474,13 +539,14 @@ impl ShardStore {
     /// effect or neither does, and other instances receive the event exactly
     /// when the row becomes visible.
     pub async fn assign_db(&self, db_name: &str, shard_id: u32) -> Result<(), sqlx::Error> {
+        let stored_shard_id = shard_id_to_sql(shard_id)?;
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO db_shards (db_name, shard_id) VALUES ($1, $2) \
              ON CONFLICT (db_name) DO UPDATE SET shard_id = EXCLUDED.shard_id",
         )
         .bind(db_name)
-        .bind(shard_id as i32)
+        .bind(stored_shard_id)
         .execute(&mut *tx)
         .await?;
         Self::notify_tx(
@@ -534,20 +600,24 @@ impl ShardStore {
     /// This operation is intentionally mutable so operators can redirect a
     /// shard to a new backend during maintenance, failover, or migration.
     pub async fn upsert_backend(&self, backend: &ShardBackend) -> Result<(), sqlx::Error> {
+        let stored_shard_id = shard_id_to_sql(backend.shard_id)?;
+        // The local mirror is refreshed by the self-delivered NOTIFY, which
+        // validates the address again; rejecting it here keeps an invalid row
+        // out of PostgreSQL in the first place.
+        validate_backend_addr(&backend.backend_addr)
+            .map_err(|err| sqlx::Error::Configuration(err.into()))?;
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             r#"
-            INSERT INTO shard_backends (shard_id, backend_addr, read_only, updated_at)
-            VALUES ($1, $2, $3, now())
+            INSERT INTO shard_backends (shard_id, backend_addr, updated_at)
+            VALUES ($1, $2, now())
             ON CONFLICT (shard_id) DO UPDATE
                 SET backend_addr = EXCLUDED.backend_addr,
-                    read_only = EXCLUDED.read_only,
                     updated_at = now()
             "#,
         )
-        .bind(backend.shard_id as i32)
+        .bind(stored_shard_id)
         .bind(&backend.backend_addr)
-        .bind(backend.read_only)
         .execute(&mut *tx)
         .await?;
         Self::notify_tx(
@@ -556,7 +626,6 @@ impl ShardStore {
             &BackendEvent::Upsert {
                 shard_id: backend.shard_id,
                 backend_addr: backend.backend_addr.clone(),
-                read_only: backend.read_only,
             },
         )
         .await?;
@@ -573,9 +642,10 @@ impl ShardStore {
     ///
     /// Returns `true` when the entry existed and was removed.
     pub async fn delete_backend(&self, shard_id: u32) -> Result<bool, sqlx::Error> {
+        let stored_shard_id = shard_id_to_sql(shard_id)?;
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query("DELETE FROM shard_backends WHERE shard_id = $1")
-            .bind(shard_id as i32)
+            .bind(stored_shard_id)
             .execute(&mut *tx)
             .await?;
         Self::notify_tx(
@@ -628,24 +698,36 @@ impl ShardStore {
     }
 
     /// Apply a shard-backend event received from PostgreSQL.
+    ///
+    /// The address is validated here as well as in the administrative API:
+    /// a row written by any other writer reaches the cache only through this
+    /// path, and one unusable address takes down every database on its shard.
     fn apply_backend_event(&self, payload: &str) {
         match serde_json::from_str::<BackendEvent>(payload) {
             Ok(BackendEvent::Upsert {
                 shard_id,
                 backend_addr,
-                read_only,
             }) => {
-                self.backend_cache.insert(
-                    shard_id,
-                    ShardBackend {
+                if let Err(err) = validate_backend_addr(&backend_addr) {
+                    log::error!("ignoring shard_backends event for shard {shard_id}: {err}");
+                    return;
+                }
+                self.backend_cache
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(
                         shard_id,
-                        backend_addr,
-                        read_only,
-                    },
-                );
+                        ShardBackend {
+                            shard_id,
+                            backend_addr,
+                        },
+                    );
             }
             Ok(BackendEvent::Delete { shard_id }) => {
-                self.backend_cache.remove(&shard_id);
+                self.backend_cache
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&shard_id);
             }
             Err(e) => {
                 log::warn!("failed to parse shard_backends_changed payload: {}", e);
@@ -730,23 +812,54 @@ impl ShardStore {
 }
 
 #[cfg(test)]
+impl ShardStore {
+    /// Builds a store whose PostgreSQL pool is never connected, for tests
+    /// that only exercise the in-memory caches and the routing decisions
+    /// layered on top of them.
+    pub(crate) fn for_tests() -> Self {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://user:pass@localhost/test")
+            .expect("connect_lazy should parse URL");
+        Self {
+            pool,
+            db_cache: new_db_cache(),
+            lookup_gates: Arc::new(DashMap::new()),
+            backend_cache: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Seeds the backend mirror directly, bypassing PostgreSQL.
+    pub(crate) fn seed_backend(&self, backend: ShardBackend) {
+        self.backend_cache
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(backend.shard_id, backend);
+    }
+
+    /// Seeds a negative db→shard cache entry so `resolve` can answer
+    /// "not assigned" without a PostgreSQL round trip.
+    pub(crate) async fn seed_missing_db(&self, db_name: &str) {
+        self.db_cache
+            .insert(db_name.to_string(), DbCacheEntry::not_found())
+            .await;
+    }
+
+    /// Seeds a positive db→shard cache entry, bypassing PostgreSQL.
+    pub(crate) async fn seed_db_shard(&self, db_name: &str, shard_id: u32) {
+        self.db_cache
+            .insert(db_name.to_string(), DbCacheEntry::found(shard_id))
+            .await;
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::postgres::PgPoolOptions;
-    use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use tokio::sync::{Barrier, Semaphore};
 
     fn test_store() -> ShardStore {
-        let pool = PgPoolOptions::new()
-            .connect_lazy("postgres://user:pass@localhost/test")
-            .expect("connect_lazy should parse URL");
-        ShardStore {
-            pool,
-            db_cache: new_db_cache(),
-            lookup_gates: Arc::new(DashMap::new()),
-            backend_cache: Arc::new(DashMap::new()),
-        }
+        ShardStore::for_tests()
     }
 
     async fn cached_shard(store: &ShardStore, db_name: &str) -> Option<Option<u32>> {
@@ -1070,7 +1183,7 @@ mod tests {
         let store = test_store();
 
         store.apply_backend_event(
-            r#"{"op":"upsert","shard_id":7,"backend_addr":"http://127.0.0.1:7000","read_only":true}"#,
+            r#"{"op":"upsert","shard_id":7,"backend_addr":"http://127.0.0.1:7000"}"#,
         );
 
         let resolved = store
@@ -1080,32 +1193,114 @@ mod tests {
         assert_eq!(resolved.db_name, None);
         assert_eq!(resolved.shard_id, 7);
         assert_eq!(resolved.backend_addr, "http://127.0.0.1:7000");
-        assert!(resolved.read_only);
 
         store.apply_backend_event(r#"{"op":"delete","shard_id":7}"#);
         assert!(store.resolve_by_shard(7).await.is_none());
+    }
+
+    /// A row written outside the administrative API (DBA, migration, older
+    /// build) must not poison a whole shard: the NOTIFY path validates it and
+    /// keeps the previous usable address instead.
+    #[tokio::test]
+    async fn apply_backend_event_rejects_addresses_the_client_cannot_serve() {
+        let store = test_store();
+        store.apply_backend_event(
+            r#"{"op":"upsert","shard_id":3,"backend_addr":"http://127.0.0.1:9000"}"#,
+        );
+
+        for payload in [
+            r#"{"op":"upsert","shard_id":3,"backend_addr":"https://db.internal"}"#,
+            r#"{"op":"upsert","shard_id":3,"backend_addr":"db.internal:8080"}"#,
+            r#"{"op":"upsert","shard_id":3,"backend_addr":"/relative/path"}"#,
+            r#"{"op":"upsert","shard_id":3,"backend_addr":"not a uri"}"#,
+        ] {
+            store.apply_backend_event(payload);
+            let resolved = store
+                .resolve_by_shard(3)
+                .await
+                .expect("the previous valid backend must survive a rejected event");
+            assert_eq!(
+                resolved.backend_addr, "http://127.0.0.1:9000",
+                "payload: {payload}"
+            );
+        }
+
+        // A shard whose only row is invalid stays unrouted rather than
+        // resolving to an address the proxy's HTTP client cannot use.
+        store.apply_backend_event(r#"{"op":"upsert","shard_id":4,"backend_addr":"ftp://nope"}"#);
+        assert!(store.resolve_by_shard(4).await.is_none());
+    }
+
+    /// A `reload_backend_cache` clearing the live map before refilling it
+    /// answers 404 for the whole resync window. Reads must never observe an
+    /// intermediate state, so the replacement map is swapped in atomically.
+    #[tokio::test]
+    async fn backend_cache_reload_is_observed_atomically() {
+        let store = test_store();
+        store.seed_backend(ShardBackend {
+            shard_id: 1,
+            backend_addr: "http://127.0.0.1:8001".to_string(),
+        });
+
+        let reader = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                for _ in 0..2_000 {
+                    assert!(
+                        store.resolve_by_shard(1).await.is_some(),
+                        "a live backend disappeared during a cache reload"
+                    );
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+
+        for i in 0..200 {
+            let mut next = HashMap::new();
+            next.insert(
+                1,
+                ShardBackend {
+                    shard_id: 1,
+                    backend_addr: format!("http://127.0.0.1:{}", 8001 + i % 3),
+                },
+            );
+            *store
+                .backend_cache
+                .write()
+                .unwrap_or_else(PoisonError::into_inner) = next;
+            tokio::task::yield_now().await;
+        }
+
+        reader.await.expect("reader task panicked");
+    }
+
+    #[test]
+    fn shard_id_conversions_are_checked_in_both_directions() {
+        assert_eq!(shard_id_to_sql(0).unwrap(), 0);
+        assert_eq!(shard_id_to_sql(MAX_SHARD_ID).unwrap(), i32::MAX);
+        // Without the check this would be stored as -1 and become invisible
+        // to external tooling.
+        assert!(shard_id_to_sql(MAX_SHARD_ID + 1).is_err());
+        assert!(shard_id_to_sql(u32::MAX).is_err());
+
+        assert_eq!(shard_id_from_sql(0), Some(0));
+        assert_eq!(shard_id_from_sql(i32::MAX), Some(MAX_SHARD_ID));
+        // Without the check this would route to shard 4294967295.
+        assert_eq!(shard_id_from_sql(-1), None);
     }
 
     #[tokio::test]
     async fn list_shard_backends_returns_cached_items() {
         let store = test_store();
 
-        store.backend_cache.insert(
-            1,
-            ShardBackend {
-                shard_id: 1,
-                backend_addr: "http://127.0.0.1:8001".to_string(),
-                read_only: false,
-            },
-        );
-        store.backend_cache.insert(
-            2,
-            ShardBackend {
-                shard_id: 2,
-                backend_addr: "http://127.0.0.1:8002".to_string(),
-                read_only: true,
-            },
-        );
+        store.seed_backend(ShardBackend {
+            shard_id: 1,
+            backend_addr: "http://127.0.0.1:8001".to_string(),
+        });
+        store.seed_backend(ShardBackend {
+            shard_id: 2,
+            backend_addr: "http://127.0.0.1:8002".to_string(),
+        });
 
         let backends = store.list_shard_backends();
         assert_eq!(backends.len(), 2);
@@ -1119,11 +1314,9 @@ mod tests {
             by_id.get(&1).map(|backend| backend.backend_addr.as_str()),
             Some("http://127.0.0.1:8001")
         );
-        assert_eq!(by_id.get(&1).map(|backend| backend.read_only), Some(false));
         assert_eq!(
             by_id.get(&2).map(|backend| backend.backend_addr.as_str()),
             Some("http://127.0.0.1:8002")
         );
-        assert_eq!(by_id.get(&2).map(|backend| backend.read_only), Some(true));
     }
 }

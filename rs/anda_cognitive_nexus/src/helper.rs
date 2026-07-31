@@ -6,11 +6,12 @@
 use anda_db::error::DBError;
 use anda_db_utils::Pipe;
 use anda_kip::{
-    EntityType, Json, KipError, METADATA_SCORE, METADATA_UPDATED_AT, METADATA_VERSION, Map,
+    EntityType, Json, KipError, METADATA_SCORE, METADATA_UPDATED_AT, METADATA_VERSION, Map, Number,
     OrderByCondition, OrderDirection, PredTerm, compare_json, is_reserved_metadata_key,
     validate_dot_path_var,
 };
-use std::{borrow::Cow, cmp::Ordering};
+use chrono::DateTime;
+use std::{borrow::Cow, cmp::Ordering, str::FromStr};
 
 use crate::entity::{Concept, EntityID, Properties, Proposition};
 
@@ -308,25 +309,134 @@ pub fn extract_proposition_field_value(
     }
 }
 
+/// Parses a datetime string as RFC 3339, falling back to RFC 2822 — the
+/// exact predicate [`compare_json`] uses to decide whether two strings
+/// compare as *instants* instead of lexically.
+///
+/// NOTE: this duplicates `anda_kip`'s private `parse_datetime` because
+/// [`sort_key_class`] must partition strings by the *same* predicate; the
+/// duplication disappears the day `anda_kip` exposes either the predicate or
+/// a total-order comparator of its own.
+fn is_datetime(s: &str) -> bool {
+    DateTime::parse_from_rfc3339(s).is_ok() || DateTime::parse_from_rfc2822(s).is_ok()
+}
+
+/// Sort-key class of a JSON value — the primary component of the
+/// [`compare_sort_key`] total order.
+///
+/// The classes are exactly the domains on which [`compare_json`] applies a
+/// *single* comparison rule:
+///
+/// | class | values | rule inside the class |
+/// |-------|--------|-----------------------|
+/// | 0 | booleans | `false < true` |
+/// | 1 | numbers **and** numeric-looking strings | numeric |
+/// | 2 | datetime strings (RFC 3339 / RFC 2822) | by instant |
+/// | 3 | all other strings | lexical |
+/// | 4 | arrays / objects | none (KIP §2.7) — all tie |
+/// | 5 | `null` | all tie |
+///
+/// Numbers and numeric strings share one class so `5` and `"5"` keep
+/// comparing numerically, as [`compare_json`] does.
+fn sort_key_class(value: &Json) -> u8 {
+    match value {
+        Json::Bool(_) => 0,
+        Json::Number(_) => 1,
+        Json::String(s) => {
+            if Number::from_str(s).is_ok() {
+                1
+            } else if is_datetime(s) {
+                2
+            } else {
+                3
+            }
+        }
+        Json::Array(_) | Json::Object(_) => 4,
+        Json::Null => 5,
+    }
+}
+
+/// Total order on ORDER BY sort keys.
+///
+/// [`compare_json`] on its own is **not** a total order, and the sort keys it
+/// grades come straight from user-stored attributes, so the violations are
+/// reachable from ordinary data — and `slice::sort_by` is explicitly allowed
+/// to panic on a comparator that is not one:
+///
+/// - it returns `None` for mixed types, and folding `None` into `Equal`
+///   breaks transitivity of equality (`5 ~ "abc"`, `"abc" ~ 7`, yet `5 < 7`);
+/// - for two strings it picks *numeric* or *lexical* ordering per pair, which
+///   breaks transitivity of `<` (`"2" < "10"` numerically, `"10" < "1abc"`
+///   lexically, yet `"2" > "1abc"`).
+///
+/// Both are fixed by comparing [`sort_key_class`] first and only then
+/// delegating to [`compare_json`] *within* a class, where it always takes one
+/// fixed branch. Values that legitimately tie (`"1.10"` vs `"1.1"`, two
+/// arrays) keep their input order — every sort site uses the stable
+/// `sort_by`, so the row order stays deterministic and cursors over it stay
+/// stable.
+pub fn compare_sort_key(a: &Json, b: &Json) -> Ordering {
+    let (ca, cb) = (sort_key_class(a), sort_key_class(b));
+    if ca != cb {
+        return ca.cmp(&cb);
+    }
+    // Same class ⇒ one fixed `compare_json` branch. `None` is only reachable
+    // for the no-ordering classes (arrays / objects), which tie.
+    compare_json(a, b).unwrap_or(Ordering::Equal)
+}
+
 /// Compares two ORDER BY sort key values per KIP §3.5.
 ///
 /// `null` (or missing) values always sort **last regardless of direction**;
-/// non-null pairs are compared via [`compare_json`] (numeric, boolean,
-/// datetime-aware string ordering) with `direction` applied. Incomparable
-/// non-null pairs (e.g., string vs number) are treated as equal.
+/// non-null pairs are compared with the [`compare_sort_key`] total order
+/// (numeric, boolean, datetime-aware string ordering, then a deterministic
+/// cross-type ranking) with `direction` applied.
 pub fn compare_order_key(a: &Json, b: &Json, direction: &OrderDirection) -> Ordering {
     match (a.is_null(), b.is_null()) {
         (true, true) => Ordering::Equal,
         (true, false) => Ordering::Greater, // null last, direction-independent
         (false, true) => Ordering::Less,
         (false, false) => {
-            let ord = compare_json(a, b).unwrap_or(Ordering::Equal);
+            let ord = compare_sort_key(a, b);
             match direction {
                 OrderDirection::Asc => ord,
                 OrderDirection::Desc => ord.reverse(),
             }
         }
     }
+}
+
+/// Compares two projected root values by every `ORDER BY` condition that
+/// grades `var`, in clause order.
+///
+/// Sort keys are compared with [`compare_order_key`]: numbers numerically,
+/// booleans by boolean order, strings with numeric / RFC 3339 awareness,
+/// unrelated types by a deterministic type ranking, and `null` (or missing)
+/// values always last regardless of direction (KIP §3.5). The result is a
+/// total order, so it is safe to hand to `sort_by`.
+pub fn compare_order_row(a: &Json, b: &Json, var: &str, order_by: &[OrderByCondition]) -> Ordering {
+    for cond in order_by {
+        // Skip aggregation ORDER BY — handled in grouped execution path
+        if cond.is_aggregation() {
+            continue;
+        }
+        if cond.variable.var != var {
+            continue; // Only process conditions for the current variable
+        }
+
+        // `to_pointer` escapes `/` and `~` in path components and maps an
+        // empty (bare-variable) path to `""` — the whole value — instead
+        // of `"/"` (the `""` key), unlike a naive join.
+        let path = cond.variable.to_pointer();
+        let a_val = a.pointer(&path).unwrap_or(&Json::Null);
+        let b_val = b.pointer(&path).unwrap_or(&Json::Null);
+
+        let result = compare_order_key(a_val, b_val, &cond.direction);
+        if result != Ordering::Equal {
+            return result;
+        }
+    }
+    Ordering::Equal
 }
 
 /// Applies sorting to entity-value pairs based on order conditions.
@@ -343,38 +453,14 @@ pub fn compare_order_key(a: &Json, b: &Json, direction: &OrderDirection) -> Orde
 ///
 /// # Semantics
 ///
-/// Sort keys are compared with [`compare_order_key`]: numbers numerically,
-/// booleans by boolean order, strings with numeric / RFC 3339 awareness, and
-/// `null` (or missing) values always last regardless of direction (KIP §3.5).
+/// See [`compare_order_row`]. The sort is stable, so values that tie on every
+/// condition keep their input order.
 pub fn apply_order_by<'a>(
     mut values: Vec<(&'a EntityID, Json)>,
     var: &str,
     order_by: &[OrderByCondition],
 ) -> Vec<(&'a EntityID, Json)> {
-    values.sort_by(|(_, a), (_, b)| {
-        for cond in order_by {
-            // Skip aggregation ORDER BY — handled in grouped execution path
-            if cond.is_aggregation() {
-                continue;
-            }
-            if cond.variable.var != var {
-                continue; // Only process conditions for the current variable
-            }
-
-            // `to_pointer` escapes `/` and `~` in path components and maps an
-            // empty (bare-variable) path to `""` — the whole value — instead
-            // of `"/"` (the `""` key), unlike a naive join.
-            let path = cond.variable.to_pointer();
-            let a_val = a.pointer(&path).unwrap_or(&Json::Null);
-            let b_val = b.pointer(&path).unwrap_or(&Json::Null);
-
-            let result = compare_order_key(a_val, b_val, &cond.direction);
-            if result != Ordering::Equal {
-                return result;
-            }
-        }
-        Ordering::Equal
-    });
+    values.sort_by(|(_, a), (_, b)| compare_order_row(a, b, var, order_by));
 
     values
 }
@@ -855,10 +941,108 @@ mod tests {
             ),
             Ordering::Less
         );
-        // Incomparable non-null pairs are treated as equal.
+        // Cross-type pairs get a deterministic ranking (numbers ahead of
+        // non-numeric strings) instead of collapsing to `Equal`: folding
+        // "incomparable" into equality destroys transitivity — `5 ~ "abc"`,
+        // `"abc" ~ 7` and `5 < 7` cannot all hold — and `sort_by` is allowed
+        // to panic on such a comparator. See `compare_sort_key_is_a_total_order`.
         assert_eq!(
             compare_order_key(&json!("abc"), &json!(1), &OrderDirection::Asc),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_order_key(&json!("abc"), &json!(1), &OrderDirection::Desc),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn compare_sort_key_is_a_total_order() {
+        use serde_json::json;
+
+        // The sample covers both violations `compare_json` alone exhibits on
+        // ordinary stored data:
+        //   (a) `5 ~ "abc"`, `"abc" ~ 7`, yet `5 < 7`   — equality not transitive
+        //   (b) `"2" < "10" < "1abc"`, yet `"2" > "1abc"` — `<` not transitive
+        let values = vec![
+            json!(5),
+            json!(7),
+            json!("abc"),
+            json!("2"),
+            json!("10"),
+            json!("1abc"),
+            json!("1.10"),
+            json!("1.1"),
+            json!(true),
+            json!(false),
+            json!("2025-01-01T00:00:00Z"),
+            json!("Wed, 01 Jan 2025 00:00:00 +0000"),
+            json!([1]),
+            json!({"k": 1}),
+            json!(0),
+            json!(1),
+            json!(2),
+        ];
+        for a in &values {
+            for b in &values {
+                assert_eq!(
+                    compare_sort_key(a, b),
+                    compare_sort_key(b, a).reverse(),
+                    "antisymmetry: {a} vs {b}"
+                );
+                for c in &values {
+                    if compare_sort_key(a, b) == Ordering::Less
+                        && compare_sort_key(b, c) == Ordering::Less
+                    {
+                        assert_eq!(
+                            compare_sort_key(a, c),
+                            Ordering::Less,
+                            "transitivity of `<`: {a} < {b} < {c}"
+                        );
+                    }
+                    if compare_sort_key(a, b) == Ordering::Equal
+                        && compare_sort_key(b, c) == Ordering::Equal
+                    {
+                        assert_eq!(
+                            compare_sort_key(a, c),
+                            Ordering::Equal,
+                            "transitivity of `==`: {a} == {b} == {c}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // The useful rules survive the fix: numeric-looking strings order
+        // numerically and always ahead of non-numeric ones, numbers and
+        // numeric strings still compare numerically, and datetimes compare by
+        // instant across RFC 3339 / RFC 2822.
+        assert_eq!(compare_sort_key(&json!("2"), &json!("10")), Ordering::Less);
+        assert_eq!(
+            compare_sort_key(&json!("10"), &json!("1abc")),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_sort_key(&json!("2"), &json!("1abc")),
+            Ordering::Less
+        );
+        assert_eq!(compare_sort_key(&json!(5), &json!("5")), Ordering::Equal);
+        assert_eq!(
+            compare_sort_key(
+                &json!("Wed, 01 Jan 2025 00:00:00 +0000"),
+                &json!("2025-01-01T00:00:00Z")
+            ),
             Ordering::Equal
+        );
+
+        // A column mixing numbers and non-numeric strings sorts into a
+        // deterministic, grouped order instead of an arbitrary interleaving
+        // (and cannot trip `sort_by`'s total-order panic).
+        let mut mixed = vec![json!(0), json!("abc"), json!(1), json!("abc"), json!(2)];
+        mixed.sort_by(compare_sort_key);
+        assert_eq!(
+            mixed,
+            vec![json!(0), json!(1), json!(2), json!("abc"), json!("abc")]
         );
     }
 }

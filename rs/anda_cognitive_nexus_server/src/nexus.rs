@@ -14,7 +14,11 @@ use anda_kip::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
+
+/// Smallest accepted value for the stored-request size cap. The truncated
+/// stand-in itself needs room for its marker.
+const MIN_LOGGED_REQUEST_BYTES: usize = 256;
 
 #[derive(Debug, Deserialize, Serialize, AndaDBSchema)]
 pub struct KIPLog {
@@ -60,12 +64,61 @@ pub enum ListLogsError {
 pub struct Nexus {
     nexus: Arc<CognitiveNexus>,
     logs: Arc<Collection>,
+    /// Upper bound on the serialized KIP request stored in one audit
+    /// document; see [`truncate_request`].
+    max_logged_request_bytes: usize,
+}
+
+/// Returns the request to persist in the audit log.
+///
+/// Every `/kip` request appends a durable document containing the client's
+/// request, so a client sending bodies near the configured limit would add
+/// megabytes of permanent storage (and B-Tree/BM25 memory) per call. Once the
+/// serialized request exceeds `max_bytes` it is replaced by a bounded
+/// stand-in that still deserializes as a [`Request`], so `list_logs` keeps
+/// working; the audit record then states what was dropped instead of storing
+/// it. Operators who need full request bodies raise the limit.
+fn truncate_request(request: &Request, max_bytes: usize) -> Cow<'_, Request> {
+    let max_bytes = max_bytes.max(MIN_LOGGED_REQUEST_BYTES);
+    // A request that cannot be serialized at all is stored truncated as well:
+    // it certainly cannot be stored verbatim.
+    let size = serde_json::to_vec(request).map_or(usize::MAX, |bytes| bytes.len());
+    if size <= max_bytes {
+        return Cow::Borrowed(request);
+    }
+
+    // Keep a prefix of the command for forensics. Half the budget leaves room
+    // for the marker regardless of how the rest serializes.
+    let keep = max_bytes / 2;
+    let end = request
+        .command
+        .char_indices()
+        .map(|(i, _)| i)
+        .take_while(|i| *i <= keep)
+        .last()
+        .unwrap_or(0);
+    Cow::Owned(Request {
+        command: format!(
+            "{}… [truncated: the {size}-byte request exceeded the {max_bytes}-byte audit log limit]",
+            &request.command[..end]
+        ),
+        dry_run: request.dry_run,
+        readonly: request.readonly,
+        ..Default::default()
+    })
 }
 
 impl Nexus {
     /// Connects to the cognitive nexus, initializing the `$self` genesis KML
     /// with `self_principal_id` on first start.
-    pub async fn connect(db: Arc<AndaDB>, self_principal_id: String) -> Result<Self, BoxError> {
+    ///
+    /// `max_logged_request_bytes` bounds the request stored in each audit log
+    /// document (see [`truncate_request`]).
+    pub async fn connect(
+        db: Arc<AndaDB>,
+        self_principal_id: String,
+        max_logged_request_bytes: usize,
+    ) -> Result<Self, BoxError> {
         let id = self_principal_id;
         let nexus = CognitiveNexus::connect(db.clone(), async |nexus| {
             if !nexus
@@ -108,6 +161,7 @@ impl Nexus {
         Ok(Self {
             nexus: Arc::new(nexus),
             logs,
+            max_logged_request_bytes,
         })
     }
 
@@ -115,10 +169,11 @@ impl Nexus {
         let timestamp = unix_ms();
 
         let (command, res) = request.execute(self.nexus.as_ref()).await;
+        let logged_request = truncate_request(&request, self.max_logged_request_bytes);
         let log = KIPLogRef {
             _id: 0, // This will be set by the database
             command,
-            request: &request,
+            request: &logged_request,
             response: match &res {
                 Response::Ok { .. } => json!({"result": "..."}),
                 Response::Err { error, .. } => json!({"error": error}),
@@ -239,7 +294,7 @@ mod tests {
         )
         .await
         .unwrap();
-        Nexus::connect(Arc::new(db), "uuc56-gyb".to_string())
+        Nexus::connect(Arc::new(db), "uuc56-gyb".to_string(), 8 * 1024)
             .await
             .unwrap()
     }
@@ -348,5 +403,74 @@ mod tests {
 
         // Idempotent when nothing is expired.
         assert_eq!(nexus.prune_logs(10).await.unwrap(), 0);
+    }
+
+    /// A request that fits the cap is stored verbatim.
+    #[test]
+    fn small_requests_are_logged_unchanged() {
+        let request = Request {
+            command: "DESCRIBE PRIMER".to_string(),
+            dry_run: true,
+            ..Default::default()
+        };
+        let logged = truncate_request(&request, 8 * 1024);
+        assert!(matches!(logged, Cow::Borrowed(_)));
+        assert_eq!(logged.command, "DESCRIBE PRIMER");
+    }
+
+    /// A near-body-limit request must not add megabytes of permanent storage
+    /// per call. The stand-in stays bounded, keeps a forensic prefix, and
+    /// still deserializes as a `Request` so `list_logs` keeps working.
+    #[test]
+    fn oversized_requests_are_logged_truncated_but_still_parseable() {
+        let request = Request {
+            command: format!("UPSERT {{ {} }}", "x".repeat(2 * 1024 * 1024)),
+            parameters: serde_json::from_value(json!({"blob": "y".repeat(4096)})).unwrap(),
+            readonly: true,
+            ..Default::default()
+        };
+
+        let logged = truncate_request(&request, 1024);
+        assert!(matches!(logged, Cow::Owned(_)));
+        let encoded = serde_json::to_vec(&*logged).unwrap();
+        assert!(encoded.len() < 2048, "stored {} bytes", encoded.len());
+        assert!(logged.command.starts_with("UPSERT { xxx"));
+        assert!(logged.command.contains("truncated"));
+        assert!(logged.parameters.is_empty());
+        assert!(logged.readonly);
+
+        // The persisted map must round-trip back into a `Request`, which is
+        // `deny_unknown_fields`.
+        let value = serde_json::to_value(&*logged).unwrap();
+        let parsed: Request = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.command, logged.command);
+    }
+
+    /// The cap is enforced end to end: an oversized request is readable
+    /// through `list_logs` in its truncated form.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_kip_logs_a_bounded_request() {
+        let nexus = test_nexus().await;
+        let command = format!(
+            "FIND(?x) WHERE {{ ?x {{name: \"{}\"}} }}",
+            "z".repeat(100_000)
+        );
+        let _ = nexus
+            .execute_kip(Request {
+                command: command.clone(),
+                ..Default::default()
+            })
+            .await;
+
+        let (logs, _) = nexus
+            .list_logs(ListLogParams {
+                cursor: None,
+                limit: Some(10),
+            })
+            .await
+            .unwrap();
+        let log = logs.last().expect("the request must be logged");
+        assert!(log.request.command.len() < command.len());
+        assert!(log.request.command.contains("truncated"));
     }
 }

@@ -247,8 +247,8 @@ impl CognitiveNexus {
 
         match target {
             SearchTarget::Concept => {
-                let index = self
-                    .concepts
+                let concepts = self.concepts();
+                let index = concepts
                     .get_bm25_index(&["name", "attributes", "metadata"])
                     .map_err(db_to_kip_error)?;
                 let scored = index.search_advanced(&term, top_k, None);
@@ -284,23 +284,31 @@ impl CognitiveNexus {
                 Ok(json!(result))
             }
             SearchTarget::Proposition => {
-                let index = self
-                    .propositions
+                let propositions = self.propositions();
+                let index = propositions
                     .get_bm25_index(&["predicates", "properties"])
                     .map_err(db_to_kip_error)?;
                 let scored = index.search_advanced(&term, top_k, None);
 
-                let tokens = self.propositions.tokenize(&term);
+                // Distinct query tokens, produced by the same tokenizer chain
+                // (and hence the same lowercasing / segmentation) that fed the
+                // index.
+                let query_tokens: FxHashSet<String> =
+                    self.propositions().tokenize(&term).into_iter().collect();
                 let cache = QueryCache::default();
-                let mut result: Vec<Json> = Vec::new();
-                'scored: for (id, score) in scored {
-                    let score = normalize_search_score(score);
-                    if score < threshold {
+                let mut hits: Vec<(f64, Json)> = Vec::new();
+                for (id, score) in scored {
+                    // One row holds every predicate connecting the same
+                    // (subject, object) pair, so this score is row-level: it
+                    // is the *upper bound* of the per-link scores derived from
+                    // it below, which is what makes it a sound early filter.
+                    let row_score = normalize_search_score(score);
+                    if row_score < threshold {
                         continue;
                     }
                     let links = self
                         .try_get_proposition_with(&cache, id, |proposition| {
-                            let mut rt: Vec<Json> = Vec::new();
+                            let mut rt: Vec<(f64, Json)> = Vec::new();
                             for (predicate, prop) in &proposition.properties {
                                 if let Some(ty) = &in_type
                                     && predicate != ty
@@ -315,16 +323,38 @@ impl CognitiveNexus {
                                 for (_, val) in &prop.metadata {
                                     extract_json_text(&mut texts, val);
                                 }
-                                // The tokenizer chain lowercases its tokens;
-                                // fold the source texts too, or all-caps
-                                // attribute values ("TREATS") never re-match
-                                // the BM25 hit during this per-predicate
-                                // re-check.
-                                let texts = texts.join("\n").to_lowercase();
-                                if tokens.iter().any(|t| texts.contains(t.as_str()))
-                                    && let Some(val) = proposition.to_proposition_link(predicate)
-                                {
-                                    rt.push(val);
+                                // Token-aware re-check: run this link's own
+                                // text through the real tokenizer instead of
+                                // testing raw substrings, or a link joins the
+                                // result because "cat" happens to sit inside
+                                // a *sibling* predicate's "concatenated dosing
+                                // notes".
+                                let link_tokens: FxHashSet<String> = self
+                                    .propositions()
+                                    .tokenize(&texts.join("\n"))
+                                    .into_iter()
+                                    .collect();
+                                let matched = query_tokens
+                                    .iter()
+                                    .filter(|token| link_tokens.contains(*token))
+                                    .count();
+                                if matched == 0 {
+                                    continue;
+                                }
+                                // Per-link score: the row score scaled by the
+                                // share of query tokens *this* link carries. A
+                                // link covering the whole term keeps the row
+                                // score; a partial match is graded down, so
+                                // THRESHOLD can separate a genuine hit from an
+                                // incidental one (KIP §5.2.2 honest-miss gate)
+                                // instead of seeing one flat row-level score.
+                                let coverage = matched as f64 / query_tokens.len() as f64;
+                                let link_score = (row_score * coverage * 1e6).round() / 1e6;
+                                if link_score < threshold {
+                                    continue;
+                                }
+                                if let Some(val) = proposition.to_proposition_link(predicate) {
+                                    rt.push((link_score, val));
                                 }
                             }
 
@@ -334,14 +364,23 @@ impl CognitiveNexus {
                     let Ok(links) = links else {
                         continue; // stale index hit
                     };
-                    for mut link in links {
-                        attach_search_score(&mut link, score);
-                        result.push(link);
-                        if result.len() >= limit {
-                            break 'scored;
-                        }
-                    }
+                    hits.extend(links);
                 }
+
+                // Rank by the per-link score across the whole candidate pool
+                // before truncating: `limit` counts links, so stopping at the
+                // first row that fills the page would let one many-predicate
+                // row starve better-scoring links behind it. The sort is
+                // stable, so links of equal score keep BM25 row order.
+                hits.sort_by(|(left, _), (right, _)| right.total_cmp(left));
+                hits.truncate(limit);
+                let result: Vec<Json> = hits
+                    .into_iter()
+                    .map(|(score, mut link)| {
+                        attach_search_score(&mut link, score);
+                        link
+                    })
+                    .collect();
                 Ok(json!(result))
             }
         }

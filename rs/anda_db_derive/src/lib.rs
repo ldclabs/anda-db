@@ -152,13 +152,19 @@ pub fn field_typed_derive(input: TokenStream) -> TokenStream {
 ///
 /// # Special fields
 ///
-/// The `_id: u64` primary-key column is injected by the schema builder
-/// automatically, so declaring it on the struct is optional. When declared,
-/// it must be of type `u64` and keep serializing as `"_id"` (beware
-/// `rename_all` rules: add `#[serde(rename = "_id")]` if needed); it is
-/// validated at compile time and skipped during code generation. A
-/// `#[field_type]` override on `_id` is rejected: the primary key is always
-/// `FieldType::U64`.
+/// The struct **must** declare an `_id: u64` field. Its `FieldEntry` is
+/// injected by the schema builder (so it is skipped during code generation),
+/// but the builder injects it as *required*, and `Document::try_from` reads
+/// every required field out of the serialized value — a struct that does not
+/// serialize an `"_id"` key would fail at runtime with
+/// `field "_id" is required`. A missing `_id`, or one removed from the
+/// serialized form by `#[serde(skip)]` / `#[serde(skip_serializing)]`, is
+/// therefore a compile error.
+///
+/// `_id` must be of type `u64` and keep serializing as `"_id"` (beware
+/// `rename_all` rules: add `#[serde(rename = "_id")]` if needed); this is
+/// validated at compile time. A `#[field_type]` override on `_id` is
+/// rejected: the primary key is always `FieldType::U64`.
 ///
 /// # Example
 ///

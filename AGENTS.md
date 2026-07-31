@@ -1,3 +1,9 @@
+<!--
+  CLAUDE.md and AGENTS.md are the same document, kept byte-identical so every
+  agent harness reads the same instructions. CLAUDE.md is the source: edit it,
+  then run `make sync-agents-doc`. `make lint` fails if the two drift apart.
+-->
+
 # AndaDB - AI Agent Database
 
 Anda DB is a modular Rust workspace for embedded AI memory systems. The core
@@ -49,8 +55,8 @@ That skill contains the current API patterns for:
 For embedded database usage, start with:
 
 ```toml
-anda_db = { version = "0.8", features = ["full"] }
-object_store = { version = "0.13", features = ["fs"] }
+anda_db = { version = "0.11", features = ["full"] }
+object_store = { version = "0.14", features = ["fs"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 ```

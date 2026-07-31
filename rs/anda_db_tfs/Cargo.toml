@@ -2,7 +2,7 @@
 name = "anda_db_tfs"
 description = "A full-text search library using the BM25 ranking algorithm in Rust."
 repository = "https://github.com/ldclabs/anda-db/tree/main/rs/anda_db_tfs"
-version = "0.10.0"
+version = "0.11.0"
 publish = true
 edition.workspace = true
 keywords.workspace = true
@@ -10,7 +10,7 @@ categories.workspace = true
 license.workspace = true
 
 [dependencies]
-anda_db_utils = { version = "0.10", path = "../anda_db_utils" }
+anda_db_utils = { version = "0.11", path = "../anda_db_utils" }
 cbor2 = { workspace = true }
 dashmap = { workspace = true, features = ["serde"] }
 serde = { workspace = true }

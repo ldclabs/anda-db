@@ -8,16 +8,17 @@ examples that used unwrapped object stores, borrowed `Query` values, or direct
 
 ```toml
 [dependencies]
-anda_db = { version = "0.9", features = ["full"] }
+anda_db = { version = "0.11", features = ["full"] }
 object_store = { version = "0.14", features = ["fs"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # Optional direct dependencies for low-level APIs
-anda_db_hnsw = "0.9"
-anda_object_store = "0.9"
+anda_db_hnsw = "0.11"
+anda_object_store = "0.11"
 cbor2 = "1"
+tokio-util = "0.7" # CancellationToken, for AndaDB::auto_flush
 ```
 
 ## Common Imports
@@ -37,6 +38,7 @@ use anda_db::{
 use object_store::local::LocalFileSystem;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use tokio_util::sync::CancellationToken; // only for `AndaDB::auto_flush`
 ```
 
 Use `anda_db_hnsw::DistanceMetric` only when you need to override
@@ -58,8 +60,12 @@ let db = AndaDB::create(store.clone(), config.clone()).await?;  // fail if exist
 let db = AndaDB::open(store, config).await?;                    // fail if missing
 
 db.flush().await?;
-db.auto_flush(cancel_token, Duration::from_secs(30)).await?;
 db.close().await?;
+
+// `auto_flush` returns `()`, not a `Result`: it loops until the token is
+// cancelled, then closes the database and logs a close failure itself.
+// Spawn it; do not `?` it.
+db.auto_flush(cancel_token, Duration::from_secs(30)).await;
 ```
 
 The object store argument is `Arc<dyn object_store::ObjectStore>`. For local
@@ -262,6 +268,8 @@ All metrics are distances, so smaller is more similar.
 ```rust
 StorageConfig {
     cache_max_capacity: 10000,          // number of cached items; 0 disables cache
+    cache_max_bytes: None,              // Some(n>0) bounds the cache by bytes and
+                                        // overrides cache_max_capacity; Some(0) disables it
     compress_level: 3,                  // zstd level; 0 disables compression
     object_chunk_size: 256 * 1024,      // 256 KiB
     max_small_object_size: 2000 * 1024, // 2 MiB
@@ -322,12 +330,14 @@ let metastore = MetaStoreBuilder::new(local, 10000).build();
 
 let encrypted = EncryptedStoreBuilder::with_secret(metastore, 10000, [0_u8; 32])
     .with_chunk_size(1024 * 1024)
-    .with_conditional_put()
     .build();
 ```
 
-Enable `EncryptedStoreBuilder::with_conditional_put()` for local-file backed
-encrypted deployments that need portable compare-and-swap semantics.
+Do not call `EncryptedStoreBuilder::with_conditional_put()`. Since the
+immutable-generation refactor, compare-and-swap semantics (`PutMode::Update`,
+`if_match`, `if_none_match`, evaluated against the logical ETag) are always on
+for every backend, so the builder method is a deprecated no-op scheduled for
+removal.
 
 ## Async Runtime Setup
 

@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 
 #[derive(Debug, Serialize, Deserialize, AndaDBSchema)]
 struct TestUser {
+    _id: u64,
     /// User's unique username handle
     #[unique]
     handle: String,
@@ -41,6 +42,7 @@ struct TestUserWithId {
 // 测试各种数据类型
 #[derive(Debug, Serialize, Deserialize, AndaDBSchema)]
 struct TestAllTypes {
+    _id: u64,
     // 数字类型
     byte_val: u8,
     short_val: u16,
@@ -82,6 +84,7 @@ struct TestAllTypes {
 // 测试自定义字段类型属性
 #[derive(Debug, Serialize, Deserialize, AndaDBSchema)]
 struct TestCustomFieldType {
+    _id: u64,
     #[field_type = "Json"]
     custom_field: String,
     #[field_type = "Bytes"]
@@ -93,6 +96,7 @@ struct TestCustomFieldType {
 // 测试重命名和唯一性约束
 #[derive(Debug, Serialize, Deserialize, AndaDBSchema)]
 struct TestConstraints {
+    _id: u64,
     #[unique]
     #[serde(rename = "user_id")]
     id: String,

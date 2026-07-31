@@ -509,6 +509,10 @@ async fn collection_public_error_paths_and_id_filters() -> Result<(), DBError> {
             .await?,
         vec![1, 2, 4]
     );
+    // A composite range query evaluates its operands unbounded, so the
+    // "keep the largest keys" pushdown of a bare `Lt`/`Le` does not apply to
+    // it: the result is ascending and truncation keeps the smallest ids. This
+    // is what the equivalent `Between`/`And` spellings return as well.
     assert_eq!(
         collection
             .query_ids(
@@ -519,7 +523,7 @@ async fn collection_public_error_paths_and_id_filters() -> Result<(), DBError> {
                 Some(2),
             )
             .await?,
-        vec![2, 3]
+        vec![1, 2]
     );
 
     assert!(matches!(
@@ -570,7 +574,10 @@ async fn collection_search_update_remove_and_extensions() -> Result<(), DBError>
             PublicDoc::schema()?,
             collection_config("docs"),
             async |collection| {
-                collection.create_btree_index(&["_id"]).await?;
+                // A B-tree index on `_id` is rejected: primary-key filters are
+                // always served from the collection's own id index, so such an
+                // index could never answer a query.
+                assert!(collection.create_btree_index(&["_id"]).await.is_err());
                 collection.create_btree_index(&["age"]).await?;
                 collection.create_bm25_index(&["body", "tags"]).await?;
                 collection
@@ -734,7 +741,6 @@ async fn collection_auto_repair_recovers_dirty_documents_and_indexes() -> Result
         schema.clone(),
         collection_config("docs"),
         async |collection| {
-            collection.create_btree_index(&["_id"]).await?;
             collection.create_btree_index(&["age"]).await?;
             collection.create_bm25_index(&["body"]).await?;
             collection

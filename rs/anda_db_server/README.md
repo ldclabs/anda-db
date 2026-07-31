@@ -15,7 +15,8 @@ format for debugging and non-CBOR clients.
   shutdown; tracked mutations drain before database close
 - Cancel-safe read RPCs and bounded concurrency for non-cancel-safe mutations
 - Structured errors with meaningful HTTP status codes and stable error codes
-- Optional bearer-token authentication
+- Two-tier bearer-token authentication: one admin key plus optional
+  per-database keys, so one tenant's key cannot reach another tenant's data
 - Compatible with [`anda_db_shard_proxy`](../anda_db_shard_proxy): the first
   path segment is the database name
 
@@ -31,15 +32,22 @@ cargo run -p anda_db_server -- local --path ./debug/db
 # S3-compatible storage, configured via AWS_* environment variables
 cargo run -p anda_db_server -- s3
 
-# With API key authentication
+# With API key authentication (this is the admin key)
 cargo run -p anda_db_server -- --api-key my-secret local --path ./debug/db
 ```
 
 Options: `--addr` (default `127.0.0.1:8080`), `--api-key`, `--primary-db`
 (default `anda_db`), `--flush-interval-secs` (default `30`),
 `--request-timeout-secs` (default `300`), `--max-concurrent-mutations`
-(default `32`), and `--shutdown-timeout-secs` (default `30`). All options can
+(default `32`), `--max-body-size` (default `2097152`), `--max-databases`
+(default `64`), and `--shutdown-timeout-secs` (default `30`). All options can
 also be set through their uppercase environment variables.
+
+`--max-databases` bounds the registry of non-primary databases. Each
+registered database keeps a permanent background flush task and a name in the
+primary database's registry extension, so registration past the limit is
+refused with `409 limit_exceeded`. The bound is not applied when reopening
+databases at startup, so lowering it never blocks a restart.
 
 On shutdown, new RPC admission closes immediately, active reads are
 cancelled, and admitted mutations drain before databases close. If the
@@ -78,7 +86,13 @@ Error response (HTTP 4xx/5xx):
 
 Error codes: `bad_request`, `invalid_input`, `invalid_query`,
 `method_not_found`, `unauthorized`, `not_found`, `already_exists`, `conflict`,
-`timeout`, `payload_too_large`, `unavailable`, `internal`.
+`timeout`, `payload_too_large`, `unsupported_media_type`, `limit_exceeded`,
+`unavailable`, `collection_unavailable`, `gone`, `internal`.
+
+`collection_unavailable` (503) means the collection handle is temporarily
+unusable — a cancelled operation invalidated it, or it is closing — and
+reopening recovers it, so the request can simply be retried. `gone` (410)
+means the collection was deleted and no retry will help.
 
 Only failures positively classified at the HTTP boundary are returned with
 client-facing details. Database, storage, serialization, and index failures
@@ -87,28 +101,118 @@ object paths and nested error sources never cross the API boundary.
 
 ### Encoding negotiation
 
-- The request body format follows `Content-Type`: `application/cbor`
-  (default when absent) or `application/json`.
+- The request body format follows `Content-Type`, which must be present and
+  be `application/cbor` or `application/json`. Anything else is refused with
+  `415 unsupported_media_type`; treating an unrecognized type as CBOR would
+  make the RPC endpoints reachable as browser "simple requests".
 - The response format follows `Accept` when present, otherwise mirrors the
   request `Content-Type`, otherwise CBOR.
 
-### Authentication
+### Authentication and authorization
 
-When the server is started with `--api-key`, every RPC request must carry
-`Authorization: Bearer <key>`. `GET /` stays open for health checks.
+Credentials are always presented as `Authorization: Bearer <key>`. `GET /`
+stays open for health checks. There are two tiers:
+
+| Tier | Configured by | Reaches |
+|------|---------------|---------|
+| **Admin key** | `--api-key` / `API_KEY` (one per process) | `POST /` (all root-scope methods) and every `POST /{db_name}` |
+| **Per-database key** | `db.create {api_key}` / `db.set_api_key` | `POST /{that_db_name}` only |
+
+A per-database key is never accepted at the root scope, so it cannot list,
+create, open, close, or re-key any database — including its own. Only the
+SHA3-256 hash of a key is stored, in the primary database's extension
+metadata (`server:api_keys`) next to the database registry, so bindings
+survive a restart and a copy of the metadata does not yield working
+credentials. Comparison is constant-time over the hashes.
+
+**Precedence.** For `POST /{db_name}`:
+
+1. No admin key configured → the instance is unauthenticated and every
+   request is treated as an admin (see the compatibility notes below).
+2. The presented key matches the admin key → full access.
+3. The named database has a key bound and the presented key matches it →
+   access to that database only.
+4. Otherwise → `401 unauthorized`. A database with no key of its own falls
+   back to rule 2, which is exactly how every database behaved before
+   per-database keys existed.
+
+Rule 4 returns the *same* `401` whether the database exists under another
+key, exists without a key, or does not exist at all — an unauthorized caller
+cannot probe the database namespace. Only an admin ever receives `404
+not_found` for a missing database. For the same reason the database-scoped
+`info` method returns only the caller's own database (and no primary database
+name) when it is answered for a per-database key; admins keep the full view.
+
+### Provisioning and rotating per-database keys
+
+All three methods are root-scope, hence admin-only:
+
+```bash
+# Create a database with its own key
+curl -H 'Authorization: Bearer $ADMIN_KEY' -H 'Content-Type: application/json' \
+  -d '{"method":"db.create","params":{"name":"tenant_a","api_key":"<tenant key>"}}' \
+  http://127.0.0.1:8080/
+
+# Rotate it (the previous key stops working immediately)
+... '{"method":"db.set_api_key","params":{"name":"tenant_a","api_key":"<new key>"}}'
+
+# Rotate without supplying one: the server generates a 256-bit key with a
+# CSPRNG and returns it exactly once, in {"result":{"name":...,"api_key":...}}.
+... '{"method":"db.set_api_key","params":{"name":"tenant_a"}}'
+
+# Revoke, returning the database to the admin key only
+... '{"method":"db.remove_api_key","params":{"name":"tenant_a"}}'
+```
+
+A caller-supplied key is never echoed back, and a generated key is
+unrecoverable afterwards — rotate again if it is lost. `db.close` keeps a
+binding so that reopening a database cannot silently weaken it; use
+`db.remove_api_key` to revoke.
+
+Two bindings are refused: the **primary database** cannot be delegated (its
+extension metadata *is* the server's registry and key map), and no
+per-database key can be bound while the server runs **without** an admin key,
+since the open root scope would let anyone rotate it away. Consequently, if
+per-database keys exist in storage and the server is restarted without
+`API_KEY`, it refuses to start rather than silently downgrading those
+databases to unauthenticated access.
+
+### Upgrade and compatibility
+
+- **Single-key deployments keep working unchanged.** The existing
+  `--api-key` becomes the admin key. With no per-database keys provisioned,
+  every route behaves exactly as before: that one key opens the root scope
+  and every database, `info` still enumerates the instance, and a wrong or
+  missing key is still `401`.
+- **The keyless loopback/development mode is unchanged.** Without
+  `--api-key` the server still accepts every request on a loopback listener
+  (or with `--insecure-no-api-key`); per-database keys simply cannot be
+  provisioned in that mode.
+- **Nothing is required at upgrade time.** Per-database keys are opt-in, one
+  database at a time, and can be revoked back to the previous behaviour.
+- Deployments fronted by [`anda_db_shard_proxy`](../anda_db_shard_proxy) are
+  unaffected: the proxy strips only hop-by-hop headers, so the client's
+  `Authorization` reaches the backend unchanged and a per-database key is
+  enforced there. The proxy's own `API_KEY` guards its `/_admin/*` API and is
+  unrelated to these tiers. Note that each shard backend keeps its own
+  bindings, so a database moved to another shard must be re-keyed there.
 
 ## Methods
 
 ### Root scope (`POST /`)
 
+Admin key only — a per-database key is rejected on `POST /` with `401`.
+
 | Method | Params | Result |
 |--------|--------|--------|
 | `info` | — | Server name, version, primary database, open databases |
 | `db.list` | — | Open database names |
-| `db.create` | `{name, description?}` | Database metadata; `409` if it exists |
+| `db.create` | `{name, description?, api_key?}` | Database metadata; `409` if it exists |
 | `db.open` | `{name}` | Database metadata; `404` if missing |
 | `db.connect` | `{name, description?}` | Database metadata; creates if missing |
 | `db.close` | `{name}` | Flushes, closes, and unregisters the database |
+| `db.set_api_key` | `{name, api_key?}` | `{name, api_key}`; `api_key` is set only when generated |
+| `db.remove_api_key` | `{name}` | `true` if a key was bound |
 
 Databases created or opened at runtime are recorded in the primary
 database's extensions and reopened automatically on the next start;
@@ -117,9 +221,11 @@ cannot be closed.
 
 ### Database scope (`POST /{db_name}`)
 
+Admin key, or the key bound to `{db_name}`.
+
 | Method | Params | Result |
 |--------|--------|--------|
-| `info` | — | Server info |
+| `info` | — | Server info; only this database for a per-database key |
 | `db.metadata` | — | Database config, collections, extensions |
 | `db.stats` | — | Aggregated storage I/O statistics |
 | `db.flush` | — | Flushes all collections and metadata |
@@ -139,16 +245,16 @@ cannot be closed.
 | `collection.save_extension` | `{collection, key, value}` | Persists an extension entry |
 | `collection.remove_extension` | `{collection, key}` | Previous value or `null` |
 | `doc.add` | `{collection, doc}` | `{_id}` (engine-assigned) |
-| `doc.add_many` | `{collection, docs}` | `[{_id}, ...]`; not atomic |
+| `doc.add_many` | `{collection, docs}` | `[{_id}, ...]`; not atomic; at most 10 000 documents |
 | `doc.get` | `{collection, _id}` | The document |
-| `doc.get_many` | `{collection, _ids}` | One entry per ID, `null` for missing |
+| `doc.get_many` | `{collection, _ids}` | One entry per ID, `null` for missing; at most 1 000 IDs |
 | `doc.update` | `{collection, _id, fields}` | The updated document |
 | `doc.remove` | `{collection, _id}` | The removed document or `null` |
 | `doc.exists` | `{collection, _id}` | `true` / `false` |
 | `doc.count` | `{collection}` | Number of documents |
 | `doc.search` | `{collection, query}` | Matching documents |
 | `doc.search_ids` | `{collection, query}` | Matching document IDs |
-| `doc.query_ids` | `{collection, filter, limit?}` | IDs matching a B-Tree filter |
+| `doc.query_ids` | `{collection, filter, limit?}` | IDs matching a B-Tree filter; `limit` defaults to and is capped at 1 000, `0` returns nothing |
 
 ### Creating collections
 

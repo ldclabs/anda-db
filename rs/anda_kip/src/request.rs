@@ -13,7 +13,28 @@ use crate::{
     CommandType, Json, Map,
     error::KipError,
     executor::{Executor, execute_kip, execute_readonly},
+    parser::{MAX_KIP_BATCH_COMMANDS, MAX_KIP_INPUT_LEN},
 };
+
+/// A batch command carrying its own parameter map.
+///
+/// This is a named struct rather than an inline enum variant so that
+/// `#[serde(deny_unknown_fields)]` applies: an `#[serde(untagged)]` struct
+/// variant silently ignores unknown fields, so a misspelled key (`"params"`
+/// instead of `"parameters"`) used to deserialize into a valid-looking item
+/// with an *empty* map — and [`Request::iter_commands`] then quietly fell back
+/// to the shared parameters, substituting values the caller never asked for.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ParameterizedCommand {
+    /// The KIP command string
+    pub command: String,
+
+    /// Optional independent parameters for this specific command.
+    /// These parameters override any shared parameters with the same key.
+    #[serde(default)]
+    pub parameters: Map<String, Json>,
+}
 
 /// Represents a single command item in the batch `commands` array.
 ///
@@ -27,15 +48,7 @@ pub enum CommandItem {
     Simple(String),
 
     /// A command with its own independent parameters that override shared parameters
-    WithParams {
-        /// The KIP command string
-        command: String,
-
-        /// Optional independent parameters for this specific command.
-        /// These parameters override any shared parameters with the same key.
-        #[serde(default)]
-        parameters: Map<String, Json>,
-    },
+    WithParams(ParameterizedCommand),
 }
 
 /// Defines the arguments for the `execute_kip` function, which is the standard interface
@@ -69,6 +82,7 @@ pub enum CommandItem {
 /// }
 /// ```
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Request {
     /// The complete KIP command string (KQL, KML, or META).
     /// It can include placeholders like `:param_name` for parameter substitution.
@@ -138,10 +152,10 @@ impl Request {
                 CommandItem::Simple(cmd) => {
                     (Cow::Borrowed(cmd.as_str()), Cow::Borrowed(shared_params))
                 }
-                CommandItem::WithParams {
+                CommandItem::WithParams(ParameterizedCommand {
                     command,
                     parameters,
-                } => {
+                }) => {
                     if parameters.is_empty() {
                         (
                             Cow::Borrowed(command.as_str()),
@@ -192,6 +206,16 @@ impl Request {
         let mut in_line_comment = false;
 
         while index < command.len() {
+            // Substitution re-emits the full value at every occurrence, so the
+            // output grows as `occurrences * value_len` with no relation to the
+            // input length. Stop once the result is already past the parser's
+            // input cap: the oversized string is rejected by
+            // `validate_parser_budget` anyway, and bailing here bounds the
+            // allocation instead of letting a small body expand without limit.
+            if result.len() > MAX_KIP_INPUT_LEN {
+                break;
+            }
+
             let ch = command[index..]
                 .chars()
                 .next()
@@ -330,6 +354,20 @@ impl Request {
             });
         }
 
+        // The batch length is attacker-controlled and drives the result
+        // vector's pre-allocation, so cap it here — before any command runs —
+        // in the same over-budget error class as the parser's length/depth
+        // guards.
+        if self.commands.len() > MAX_KIP_BATCH_COMMANDS {
+            return Some(
+                KipError::resource_exhausted(format!(
+                    "batch command count {} exceeds maximum {MAX_KIP_BATCH_COMMANDS}",
+                    self.commands.len()
+                ))
+                .into(),
+            );
+        }
+
         None
     }
 
@@ -449,8 +487,9 @@ impl Request {
     /// returning an array of per-command results collected up to that point.
     ///
     /// # Note
-    /// If a parse error occurs, this method will check for common misuse patterns
-    /// (like placeholders inside quoted strings) and include helpful hints in the error.
+    /// Common misuse patterns (like placeholders inside quoted strings) are detected
+    /// up front by [`Self::validate_placeholder_usage`], which reports them with a
+    /// recovery hint instead of letting the parser fail on the unsubstituted text.
     pub async fn execute(&self, nexus: &impl Executor) -> (CommandType, Response) {
         if let Some(error) = self.validate_request_mode() {
             return (CommandType::Unknown, Response::err(error));
@@ -464,35 +503,11 @@ impl Request {
             }
 
             let command = self.to_command();
-            let (cmd_type, response) = if self.readonly {
+            if self.readonly {
                 execute_readonly(nexus, &command, self.dry_run).await
             } else {
                 execute_kip(nexus, &command, self.dry_run).await
-            };
-
-            // If there's an error and we have parameters, check for placeholder misuse
-            if let Response::Err { ref error, .. } = response
-                && error.code.starts_with("KIP_1")
-                && !self.parameters.is_empty()
-            {
-                let warnings = Self::find_placeholders_in_strings(&self.command, &self.parameters);
-                if let Err(extra_hint) = warnings {
-                    let mut new_error = error.clone();
-                    new_error.hint = Some(match &error.hint {
-                        Some(existing) => format!("{} {}", existing, extra_hint),
-                        None => extra_hint,
-                    });
-                    return (
-                        cmd_type,
-                        Response::Err {
-                            error: new_error,
-                            result: None,
-                        },
-                    );
-                }
             }
-
-            (cmd_type, response)
         }
     }
 
@@ -524,18 +539,12 @@ impl Request {
                 Response::Ok { .. } => {
                     results.push(response);
                 }
-                Response::Err { mut error, .. } => {
-                    // Check for placeholder misuse if it's a syntax error
-                    if error.code.starts_with("KIP_1") && !params.is_empty() {
-                        let warnings = Self::find_placeholders_in_strings(&cmd, &params);
-                        if let Err(extra_hint) = warnings {
-                            error.hint = Some(match &error.hint {
-                                Some(existing) => format!("{} {}", existing, extra_hint),
-                                None => extra_hint,
-                            });
-                        }
-                    }
-                    results.push(Response::err(error));
+                Response::Err { error, result } => {
+                    // Keep the partial result attached to the error: an
+                    // over-budget KQL error (KIP_4002) carries the page it did
+                    // manage to produce, and rebuilding the response without it
+                    // silently dropped that data.
+                    results.push(Response::Err { error, result });
 
                     if !self.readonly && cmd_type == CommandType::Kml {
                         // Stop on first write error.
@@ -601,13 +610,18 @@ impl<'de> Deserialize<'de> for Response {
             .as_object_mut()
             .ok_or_else(|| D::Error::custom("KIP response must be a JSON object"))?;
 
-        if let Some(error) = obj.remove("error") {
-            let error: ErrorObject = serde_json::from_value(error)
-                .map_err(|err| D::Error::custom(format!("invalid `error` object: {err}")))?;
-            return Ok(Response::Err {
-                error,
-                result: obj.remove("result"),
-            });
+        // An explicit `"error": null` is the canonical JSON-RPC success shape;
+        // treat it as absent rather than as an (unparseable) error payload.
+        match obj.remove("error") {
+            None | Some(Json::Null) => {}
+            Some(error) => {
+                let error: ErrorObject = serde_json::from_value(error)
+                    .map_err(|err| D::Error::custom(format!("invalid `error` object: {err}")))?;
+                return Ok(Response::Err {
+                    error,
+                    result: obj.remove("result"),
+                });
+            }
         }
 
         let result = obj
@@ -666,7 +680,12 @@ impl Response {
 /// - **2xxx (Schema Errors)**: Schema errors violating type definitions or data constraints.
 /// - **3xxx (Logic/Data Errors)**: Logic or data errors, such as referencing non-existent variables.
 /// - **4xxx (System Errors)**: System-level errors, such as timeouts or insufficient permissions.
+///
+/// The type is `#[non_exhaustive]`: build it with [`ErrorObject::new`] plus the
+/// `with_*` setters instead of a struct literal, so that a future field (as
+/// `name` was in 0.10.1) can be added without breaking downstream compilation.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ErrorObject {
     /// KIP Standard Error Code (e.g., "KIP_1001", "KIP_2001")
     pub code: String,
@@ -693,6 +712,42 @@ pub struct ErrorObject {
     /// such as validation details or context information.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<Json>,
+}
+
+impl ErrorObject {
+    /// Creates an error object from a KIP standard error code and message.
+    ///
+    /// `name` / `hint` / `data` are left unset; add them with [`Self::with_name`],
+    /// [`Self::with_hint`] and [`Self::with_data`]. Prefer converting from
+    /// [`KipError`] when the error already exists in that form — the conversion
+    /// fills in the matching `name` and `hint` for you.
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            name: None,
+            message: message.into(),
+            hint: None,
+            data: None,
+        }
+    }
+
+    /// Sets the semantic error name (e.g., `"InvalidSyntax"`).
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Sets the recovery hint shown to the AI Agent.
+    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
+    }
+
+    /// Attaches structured error data.
+    pub fn with_data(mut self, data: Json) -> Self {
+        self.data = Some(data);
+        self
+    }
 }
 
 // #[cfg(feature = "nightly")]
@@ -1302,10 +1357,10 @@ mod tests {
         )
         .unwrap();
         match with_params {
-            CommandItem::WithParams {
+            CommandItem::WithParams(ParameterizedCommand {
                 command,
                 parameters,
-            } => {
+            }) => {
                 assert_eq!(command, "FIND(?x) WHERE { ?x {name: :name} }");
                 assert_eq!(
                     parameters.get("name"),
@@ -1319,10 +1374,10 @@ mod tests {
         let with_empty_params: CommandItem =
             serde_json::from_str(r#"{"command": "DESCRIBE PRIMER", "parameters": {}}"#).unwrap();
         match with_empty_params {
-            CommandItem::WithParams {
+            CommandItem::WithParams(ParameterizedCommand {
                 command,
                 parameters,
-            } => {
+            }) => {
                 assert_eq!(command, "DESCRIBE PRIMER");
                 assert!(parameters.is_empty());
             }
@@ -1356,10 +1411,10 @@ mod tests {
         assert!(matches!(&request.commands[0], CommandItem::Simple(s) if s == "DESCRIBE PRIMER"));
         assert!(matches!(&request.commands[1], CommandItem::Simple(s) if s.contains("FIND")));
         match &request.commands[2] {
-            CommandItem::WithParams {
+            CommandItem::WithParams(ParameterizedCommand {
                 command,
                 parameters,
-            } => {
+            }) => {
                 assert!(command.contains("UPSERT"));
                 assert_eq!(
                     parameters.get("name"),
@@ -1409,14 +1464,14 @@ mod tests {
             command: String::new(),
             commands: vec![
                 CommandItem::Simple("DESCRIBE PRIMER".to_string()),
-                CommandItem::WithParams {
+                CommandItem::WithParams(ParameterizedCommand {
                     command: "FIND(?x) WHERE { ?x {type: :type} }".to_string(),
                     parameters: Map::new(),
-                },
-                CommandItem::WithParams {
+                }),
+                CommandItem::WithParams(ParameterizedCommand {
                     command: "UPSERT { CONCEPT ?e { {name: :name} } }".to_string(),
                     parameters: cmd_params,
-                },
+                }),
             ],
             parameters: shared_params,
             ..Default::default()
@@ -1463,10 +1518,10 @@ mod tests {
             command: String::new(),
             commands: vec![
                 CommandItem::Simple("DESCRIBE PRIMER".to_string()),
-                CommandItem::WithParams {
+                CommandItem::WithParams(ParameterizedCommand {
                     command: "UPSERT { CONCEPT ?e { {name: :name} } }".to_string(),
                     parameters: cmd_params,
-                },
+                }),
             ],
             parameters: shared_params,
             dry_run: true,
@@ -1871,10 +1926,10 @@ mod tests {
         let request = Request {
             commands: vec![
                 CommandItem::Simple("DESCRIBE PRIMER".to_string()),
-                CommandItem::WithParams {
+                CommandItem::WithParams(ParameterizedCommand {
                     command: r#"UPSERT { CONCEPT ?d { {type: "Drug", name: :name} } }"#.to_string(),
                     parameters: cmd_params,
-                },
+                }),
             ],
             parameters: shared_params,
             ..Default::default()
@@ -1936,10 +1991,10 @@ mod tests {
 
         let request = Request {
             commands: vec![
-                CommandItem::WithParams {
+                CommandItem::WithParams(ParameterizedCommand {
                     command: r#"FIND(?x) WHERE { ?x {name: "Hello :name"} }"#.to_string(),
                     parameters: params,
-                },
+                }),
                 CommandItem::Simple("DESCRIBE PRIMER".to_string()),
             ],
             ..Default::default()
@@ -2129,10 +2184,10 @@ mod tests {
         let request = Request {
             commands: vec![
                 CommandItem::Simple("DESCRIBE PRIMER".to_string()),
-                CommandItem::WithParams {
+                CommandItem::WithParams(ParameterizedCommand {
                     command: r#"FIND(?x) WHERE { ?x {name: "Hello :name"} }"#.to_string(),
                     parameters: params,
-                },
+                }),
             ],
             ..Default::default()
         };
@@ -2195,5 +2250,206 @@ mod tests {
         assert!(serde_json::from_str::<Response>("{}").is_err());
         // Non-object responses are invalid.
         assert!(serde_json::from_str::<Response>("[1,2]").is_err());
+    }
+
+    #[test]
+    fn misspelled_safety_flags_are_rejected_instead_of_failing_open() {
+        // `readonly` and `dry_run` default to the UNSAFE value, so a typo used
+        // to silently downgrade a validate-only request into a committed write.
+        let body = r#"{"command":"DESCRIBE PRIMER","read_only":true,"dryRun":true}"#;
+        let err = serde_json::from_str::<Request>(body).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field"),
+            "expected an unknown-field rejection, got: {err}"
+        );
+
+        // The correctly spelled flags still deserialize.
+        let ok: Request =
+            serde_json::from_str(r#"{"command":"DESCRIBE PRIMER","readonly":true,"dry_run":true}"#)
+                .unwrap();
+        assert!(ok.readonly);
+        assert!(ok.dry_run);
+    }
+
+    #[test]
+    fn parameter_substitution_output_is_bounded() {
+        // Substitution re-emits the value at every occurrence, so a small body
+        // could expand without limit before the parser's length cap ever ran.
+        let occurrences = 2_000;
+        let command = ":p ".repeat(occurrences);
+        let value = "A".repeat(100_000);
+        let mut parameters = Map::new();
+        parameters.insert("p".to_string(), Json::String(value));
+
+        let out = Request::substitute_params(&command, &parameters);
+        assert!(
+            out.len() <= MAX_KIP_INPUT_LEN + 100_002,
+            "substitution expanded to {} bytes, expected it to stop near the {MAX_KIP_INPUT_LEN}-byte cap",
+            out.len()
+        );
+
+        // The truncated result is still rejected downstream rather than parsed.
+        let err = crate::parse_kip(&out).unwrap_err();
+        assert_eq!(err.code, crate::KipErrorCode::ResourceExhausted);
+    }
+
+    #[test]
+    fn misspelled_command_parameters_key_is_rejected_not_silently_swapped() {
+        // The untagged `WithParams` variant used to ignore unknown fields, so a
+        // typo'd `params` key produced an item with an EMPTY parameter map and
+        // `iter_commands` fell back to the SHARED parameters: this body wrote
+        // "Alice" where the request said "Bob".
+        let body = r#"{"commands":[{"command":"UPSERT { CONCEPT ?e { {type:\"Event\", name: :name} } }","params":{"name":"Bob"}}],"parameters":{"name":"Alice"}}"#;
+        let err = serde_json::from_str::<Request>(body).unwrap_err();
+        assert!(
+            err.to_string().contains("did not match any variant"),
+            "expected the typo'd key to be rejected, got: {err}"
+        );
+
+        // The correctly spelled key still deserializes and wins over the shared
+        // value, byte-identical wire shape.
+        let request: Request = serde_json::from_str(
+            r#"{"commands":[{"command":"UPSERT { CONCEPT ?e { {type:\"Event\", name: :name} } }","parameters":{"name":"Bob"}}],"parameters":{"name":"Alice"}}"#,
+        )
+        .unwrap();
+        let items: Vec<_> = request.iter_commands().collect();
+        assert_eq!(items.len(), 1);
+        let substituted = Request::substitute_params(&items[0].0, &items[0].1);
+        assert!(
+            substituted.contains(r#"name: "Bob""#),
+            "expected the per-command value to win, got: {substituted}"
+        );
+        assert!(!substituted.contains("Alice"));
+    }
+
+    #[test]
+    fn command_item_wire_shape_is_unchanged() {
+        // The named `ParameterizedCommand` must serialize exactly like the old
+        // inline variant, so existing clients keep round-tripping.
+        let item = CommandItem::WithParams(ParameterizedCommand {
+            command: "DESCRIBE PRIMER".to_string(),
+            parameters: [("a".to_string(), json!(1))].into_iter().collect(),
+        });
+        assert_eq!(
+            serde_json::to_string(&item).unwrap(),
+            r#"{"command":"DESCRIBE PRIMER","parameters":{"a":1}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&CommandItem::Simple("DESCRIBE PRIMER".to_string())).unwrap(),
+            r#""DESCRIBE PRIMER""#
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_batch_is_rejected_before_execution() {
+        let executor = MockExecutor;
+        let request = Request {
+            commands: vec![
+                CommandItem::Simple("DESCRIBE PRIMER".to_string());
+                MAX_KIP_BATCH_COMMANDS + 1
+            ],
+            ..Default::default()
+        };
+
+        let (cmd_type, response) = request.execute(&executor).await;
+        assert_eq!(cmd_type, CommandType::Unknown);
+        match response {
+            Response::Err { error, .. } => {
+                assert_eq!(error.code, "KIP_4002");
+                assert!(error.message.contains("batch command count"));
+            }
+            other => panic!("Expected a resource-exhausted rejection, got {other:?}"),
+        }
+
+        // A batch exactly at the cap still runs.
+        let request = Request {
+            commands: vec![
+                CommandItem::Simple("DESCRIBE PRIMER".to_string());
+                MAX_KIP_BATCH_COMMANDS
+            ],
+            ..Default::default()
+        };
+        let (_, response) = request.execute(&executor).await;
+        match response {
+            Response::Ok { result, .. } => {
+                assert_eq!(result.as_array().unwrap().len(), MAX_KIP_BATCH_COMMANDS);
+            }
+            other => panic!("Expected the at-cap batch to execute, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explicit_null_error_deserializes_as_success() {
+        // `{"result": ..., "error": null}` is the canonical JSON-RPC success
+        // shape; it used to hard-fail as an unparseable error payload.
+        let res: Response = serde_json::from_str(r#"{"result":"ok","error":null}"#).unwrap();
+        assert_eq!(res, Response::ok(json!("ok")));
+
+        // Still a success when a null cursor rides along.
+        let res: Response =
+            serde_json::from_str(r#"{"result":[1,2],"error":null,"next_cursor":null}"#).unwrap();
+        assert_eq!(res, Response::ok(json!([1, 2])));
+
+        // A non-null error is still an error.
+        let res: Response =
+            serde_json::from_str(r#"{"error":{"code":"KIP_2001","message":"boom"}}"#).unwrap();
+        assert!(matches!(res, Response::Err { ref error, .. } if error.code == "KIP_2001"));
+    }
+
+    #[derive(Debug)]
+    struct PartialResultExecutor;
+
+    #[async_trait]
+    impl Executor for PartialResultExecutor {
+        async fn execute(&self, _command: Command, _dry_run: bool) -> Response {
+            Response::Err {
+                error: ErrorObject::new("KIP_4002", "materialization cap exceeded"),
+                result: Some(json!({"page": [1, 2, 3]})),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_preserves_partial_result_on_error() {
+        let executor = PartialResultExecutor;
+        let request = Request {
+            commands: vec![CommandItem::Simple(
+                r#"FIND(?d) WHERE { ?d {type: "Drug"} }"#.to_string(),
+            )],
+            ..Default::default()
+        };
+
+        let (_cmd_type, response) = request.execute(&executor).await;
+        match response {
+            Response::Ok { result, .. } => {
+                let arr = result.as_array().unwrap();
+                assert_eq!(arr.len(), 1);
+                assert_eq!(arr[0]["error"]["code"], "KIP_4002");
+                assert_eq!(
+                    arr[0]["result"],
+                    json!({"page": [1, 2, 3]}),
+                    "the partial page must survive the batch wrapper"
+                );
+            }
+            other => panic!("Expected Ok response wrapping batch results, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_object_builders_match_struct_literals() {
+        let built = ErrorObject::new("KIP_1001", "bad")
+            .with_name("InvalidSyntax")
+            .with_hint("fix it")
+            .with_data(json!({"at": 1}));
+        assert_eq!(
+            built,
+            ErrorObject {
+                code: "KIP_1001".to_string(),
+                name: Some("InvalidSyntax".to_string()),
+                message: "bad".to_string(),
+                hint: Some("fix it".to_string()),
+                data: Some(json!({"at": 1})),
+            }
+        );
     }
 }

@@ -88,7 +88,9 @@ impl Document {
     /// instead of failing validation: [`Schema::upgrade_with`] allows field
     /// removal and never reuses removed indexes, so such values can only be
     /// stale data written under an older schema. They disappear from storage
-    /// the next time the document is rewritten.
+    /// the next time the document is rewritten. Entries of removed keys of a
+    /// *nested* struct are dropped the same way (see
+    /// [`FieldType::prune_undeclared`](crate::FieldType::prune_undeclared)).
     ///
     /// Generic (schema-less) deserialization cannot restore the declared
     /// variant of every value: a non-negative `I64` reads back as `U64` and
@@ -140,11 +142,16 @@ impl Document {
         Ok(())
     }
 
-    /// Normalizes read-back value shapes into the schema's canonical
-    /// variants; see [`Document::try_from_doc`].
+    /// Prepares freshly deserialized values for validation: entries of
+    /// removed *nested* struct fields are dropped — the one-level-down
+    /// analogue of [`Document::drop_retired_fields`], see
+    /// [`FieldType::prune_undeclared`](crate::FieldType::prune_undeclared) —
+    /// and read-back value shapes are folded into the schema's canonical
+    /// variants. See [`Document::try_from_doc`].
     fn normalize_fields(schema: &Schema, fields: &mut IndexedFieldValues) {
         for field in schema.iter() {
             if let Some(value) = fields.get_mut(&field.idx()) {
+                field.r#type().prune_undeclared(value);
                 field.r#type().normalize(value);
             }
         }
@@ -236,8 +243,13 @@ impl Document {
             }
         }
 
-        // Serializes the document as a name-keyed CBOR map. Missing optional
-        // fields are emitted as `null`.
+        // Serializes the document as a name-keyed CBOR map. Fields absent
+        // from the document are omitted instead of being emitted as `null`:
+        // `#[serde(default)]` only fills in *missing* keys, so writing an
+        // explicit `null` would make `Document::try_from` -> `try_into` a
+        // one-way trip for any type that skips a field on serialization. A
+        // field that is present with a stored [`Fv::Null`] still serializes
+        // as `null`.
         struct DocAsNamedMap<'a> {
             schema: &'a Schema,
             fields: &'a IndexedFieldValues,
@@ -250,9 +262,18 @@ impl Document {
             {
                 use serde::ser::SerializeMap;
 
-                let mut map = serializer.serialize_map(Some(self.schema.len()))?;
+                // The map length hint must count only the entries actually
+                // emitted below, or the CBOR map header would be wrong.
+                let len = self
+                    .schema
+                    .iter()
+                    .filter(|field| self.fields.contains_key(&field.idx()))
+                    .count();
+                let mut map = serializer.serialize_map(Some(len))?;
                 for field in self.schema.iter() {
-                    map.serialize_entry(field.name(), &self.fields.get(&field.idx()))?;
+                    if let Some(value) = self.fields.get(&field.idx()) {
+                        map.serialize_entry(field.name(), value)?;
+                    }
                 }
                 map.end()
             }
@@ -468,7 +489,7 @@ impl Serialize for Document {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AndaDBSchema, Fv, Resource, Vector, vector_from_f32};
+    use crate::{AndaDBSchema, FieldTyped, Fv, Resource, Vector, vector_from_f32};
     use serde::{Deserialize, Serialize};
     use std::collections::BTreeMap;
 
@@ -1011,6 +1032,177 @@ mod tests {
     }
 
     #[test]
+    fn nested_structs_can_gain_an_optional_key_and_lose_a_key() {
+        // Regression: a nested `FieldTyped` struct could never gain or lose a
+        // field in either direction. `upgrade_with` rejected every FieldType
+        // change, and a non-wildcard `Map` rejected any key it did not
+        // declare -- so removing a nested field made every already-stored
+        // document fail `try_from_doc`, i.e. the collection became unreadable.
+        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, FieldTyped)]
+        struct NestedV1 {
+            a: String,
+        }
+
+        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, FieldTyped)]
+        struct NestedV2 {
+            a: String,
+            b: Option<String>,
+        }
+
+        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, AndaDBSchema)]
+        struct DocV1 {
+            _id: u64,
+            nested: NestedV1,
+        }
+
+        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, AndaDBSchema)]
+        struct DocV2 {
+            _id: u64,
+            nested: NestedV2,
+        }
+
+        // Forward: adding an optional nested key is a compatible upgrade.
+        let v1 = DocV1::schema().unwrap();
+        let mut v2 = DocV2::schema().unwrap();
+        v2.with_version(v1.version() + 1);
+        v2.upgrade_with(&v1).unwrap();
+
+        // A document written under v1 still reads under v2: the new key is
+        // simply absent, which an optional type accepts.
+        let v1 = Arc::new(v1);
+        let stored = Document::try_from(
+            v1.clone(),
+            &DocV1 {
+                _id: 1,
+                nested: NestedV1 { a: "x".to_string() },
+            },
+        )
+        .unwrap();
+        let v2 = Arc::new(v2);
+        let read = Document::try_from_doc(v2.clone(), stored.clone().into()).unwrap();
+        assert_eq!(
+            read.clone().try_into::<DocV2>().unwrap(),
+            DocV2 {
+                _id: 1,
+                nested: NestedV2 {
+                    a: "x".to_string(),
+                    b: None,
+                },
+            }
+        );
+
+        // Backward: removing a nested key is compatible too, and the stale
+        // entry every stored document carries is dropped on read instead of
+        // making the document unreadable.
+        let mut back = DocV1::schema().unwrap();
+        back.with_version(v2.version() + 1);
+        back.upgrade_with(&v2).unwrap();
+        let back = Arc::new(back);
+
+        let stored_v2 = Document::try_from(
+            v2.clone(),
+            &DocV2 {
+                _id: 2,
+                nested: NestedV2 {
+                    a: "y".to_string(),
+                    b: Some("gone".to_string()),
+                },
+            },
+        )
+        .unwrap();
+        let read = Document::try_from_doc(back.clone(), stored_v2.clone().into()).unwrap();
+        assert_eq!(
+            read.get_field("nested"),
+            Some(&Fv::Map(BTreeMap::from([(
+                "a".into(),
+                Fv::Text("y".to_string())
+            )])))
+        );
+        assert_eq!(
+            read.try_into::<DocV1>().unwrap(),
+            DocV1 {
+                _id: 2,
+                nested: NestedV1 { a: "y".to_string() },
+            }
+        );
+        // `set_doc` takes the same path.
+        let mut doc = Document::new(back);
+        doc.set_doc(stored_v2.into()).unwrap();
+        assert_eq!(
+            doc.get_field("nested"),
+            Some(&Fv::Map(BTreeMap::from([(
+                "a".into(),
+                Fv::Text("y".to_string())
+            )])))
+        );
+
+        // Genuinely incompatible nested changes are still rejected: a new
+        // *required* key, and a key whose type changed.
+        //
+        // These four types exist only so the derive macros can emit the schema
+        // shapes compared below; the fields are consumed by the macro, never
+        // read by the test itself.
+        #[derive(Debug, FieldTyped)]
+        #[allow(dead_code)]
+        struct NestedRequired {
+            a: String,
+            b: String,
+        }
+
+        #[derive(Debug, FieldTyped)]
+        #[allow(dead_code)]
+        struct NestedRetyped {
+            a: u64,
+        }
+
+        #[derive(Debug, AndaDBSchema)]
+        #[allow(dead_code)]
+        struct DocRequired {
+            _id: u64,
+            nested: NestedRequired,
+        }
+
+        #[derive(Debug, AndaDBSchema)]
+        #[allow(dead_code)]
+        struct DocRetyped {
+            _id: u64,
+            nested: NestedRetyped,
+        }
+
+        let mut bad = DocRequired::schema().unwrap();
+        bad.with_version(v1.version() + 1);
+        let err = bad.upgrade_with(&v1).unwrap_err();
+        assert!(
+            err.to_string().contains("incompatible type changes"),
+            "{err}"
+        );
+
+        let mut bad = DocRetyped::schema().unwrap();
+        bad.with_version(v1.version() + 1);
+        let err = bad.upgrade_with(&v1).unwrap_err();
+        assert!(
+            err.to_string().contains("incompatible type changes"),
+            "{err}"
+        );
+
+        // Writing an undeclared nested key is still an error -- exactly like
+        // an undeclared *top-level* field name. Evolution needs a version
+        // bump, it is not silently absorbed at write time.
+        let err = Document::try_from(
+            v1,
+            &DocV2 {
+                _id: 3,
+                nested: NestedV2 {
+                    a: "z".to_string(),
+                    b: Some("new".to_string()),
+                },
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("invalid map key"), "{err}");
+    }
+
+    #[test]
     fn try_from_enforces_the_complexity_budget() {
         #[derive(Debug, Serialize, Deserialize, AndaDBSchema)]
         struct JsonDoc {
@@ -1047,6 +1239,51 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn absent_fields_are_omitted_so_serde_defaults_apply() {
+        // Regression: absent fields used to serialize as an explicit `null`,
+        // which `#[serde(default)]` never fills in (it only covers *missing*
+        // keys). A value whose serialization skips a field could therefore be
+        // written but never read back into its own type.
+        #[derive(Debug, Serialize, Deserialize, PartialEq, AndaDBSchema)]
+        struct TagDoc {
+            _id: u64,
+            /// Tags, skipped entirely when empty.
+            #[field_type = "Option<Array<Text>>"]
+            #[serde(default, skip_serializing_if = "Vec::is_empty")]
+            tags: Vec<String>,
+        }
+
+        let schema = Arc::new(TagDoc::schema().unwrap());
+        let value = TagDoc {
+            _id: 1,
+            tags: Vec::new(),
+        };
+        let doc = Document::try_from(schema.clone(), &value).unwrap();
+        assert_eq!(doc.fields().len(), 1);
+
+        let round: TagDoc = doc.try_into().unwrap();
+        assert_eq!(round, value);
+
+        // A field that *is* present with a null value still serializes as
+        // `null`; only genuinely absent fields disappear.
+        let schema = Arc::new(TestUser::schema().unwrap());
+        let mut doc = Document::new(schema);
+        doc.set_id(7);
+        doc.set_field("name", Fv::Text("Ada".to_string())).unwrap();
+        doc.set_field("age", Fv::U64(42)).unwrap();
+        doc.set_field("active", Fv::Null).unwrap();
+
+        let named: BTreeMap<String, Fv> = doc.clone().try_into().unwrap();
+        assert_eq!(named.get("active"), Some(&Fv::Null));
+        assert!(!named.contains_key("tags"));
+        assert_eq!(named.len(), 4);
+
+        let user: TestUser = doc.try_into().unwrap();
+        assert_eq!(user.active, None);
+        assert_eq!(user.tags, None);
     }
 
     #[test]

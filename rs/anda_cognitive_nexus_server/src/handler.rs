@@ -1,10 +1,11 @@
-use anda_kip::{KipError, Request, Response};
+use anda_kip::{ErrorObject, KipError, Request, Response};
 use axum::{
-    Json,
-    extract::{Request as HttpRequest, State},
+    Json, Router,
+    extract::{DefaultBodyLimit, Request as HttpRequest, State},
     http::{StatusCode, header},
-    middleware::Next,
+    middleware::{self, Next},
     response::IntoResponse,
+    routing,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -19,11 +20,14 @@ pub struct AppState {
     pub name: String,
     pub version: String,
     pub nexus: Nexus,
-    pub api_key: Option<String>,
     /// Per-request **response** deadline for `/kip`. A KIP execution that
     /// exceeds it gets a 408 response, but the already-started execution
     /// finishes in the background (see [`run_detached_with_timeout`]).
     pub request_timeout: Duration,
+    /// Hard upper bound on a detached KIP execution. It exists only so a
+    /// stuck or pathologically slow execution eventually returns its bounded
+    /// mutation permit; see [`run_detached_with_timeout`].
+    pub execution_timeout: Duration,
     /// Stops new KIP work as soon as graceful shutdown begins.
     pub admission: CancellationToken,
     /// Tracks non-cancel-safe KIP mutations that may outlive their HTTP
@@ -40,8 +44,11 @@ pub struct AppState {
 /// How a detached execution failed to produce a value before the deadline.
 #[derive(Debug)]
 pub enum DetachedError {
-    /// The deadline elapsed; the detached task keeps running to completion.
+    /// The response deadline elapsed; the detached task keeps running until
+    /// it finishes or reaches its own hard deadline.
     Timeout,
+    /// The detached task exceeded its hard deadline and was abandoned.
+    Abandoned,
     /// The detached task itself failed (panicked or was aborted).
     Join(tokio::task::JoinError),
     /// Shutdown has closed request admission.
@@ -76,20 +83,32 @@ where
     }
 }
 
-/// Runs `fut` on a detached task with a response deadline.
+/// Runs `fut` on a detached task with a response deadline and a hard
+/// execution deadline.
 ///
 /// KML execution mutates the graph in multiple steps and has no rollback
 /// log: cancelling it mid-flight — which is exactly what dropping the
 /// future inside `tokio::time::timeout` does — can leave half-written
 /// graph state (e.g. an `UPSERT` with only a prefix of its blocks
-/// applied). Spawning first means a timeout only abandons the *response*;
-/// the execution itself runs to completion in the background.
+/// applied). Spawning first means `deadline` only abandons the *response*;
+/// the execution itself keeps running in the background.
+///
+/// `hard_deadline` bounds that background execution. Without it the bounded
+/// permit lives as long as the execution does, so a batch of expensive
+/// requests that all time out keeps its permits forever and every later
+/// request is refused with "server mutation capacity is exhausted" — until
+/// the process exits, since shutdown then also has to escalate to an abort.
+/// Reaching the hard deadline is deliberately crash-equivalent (exactly what
+/// the shutdown abort path already does): the graph may be left partially
+/// written and recovers on reopen. It must therefore be set well above the
+/// response deadline so a normal slow request is never abandoned.
 pub(crate) async fn run_detached_with_timeout<T, F>(
     admission: &CancellationToken,
     tracker: &TaskTracker,
     permits: Arc<Semaphore>,
     aborts: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
     deadline: Duration,
+    hard_deadline: Duration,
     fut: F,
 ) -> Result<T, DetachedError>
 where
@@ -110,16 +129,32 @@ where
         return Err(DetachedError::ShuttingDown);
     }
     let task = tracker.spawn(async move {
+        // The permit is released when this task ends, never when the response
+        // waiter gives up, so the hard deadline is what actually reclaims
+        // capacity from a runaway execution.
         let _permit = permit;
-        fut.await
+        match tokio::time::timeout(hard_deadline, fut).await {
+            Ok(value) => Some(value),
+            Err(_) => {
+                log::error!(
+                    action = "run_detached_with_timeout",
+                    hard_deadline_secs = hard_deadline.as_secs();
+                    "detached execution exceeded its hard deadline and was abandoned; \
+                     the graph may be left partially written and recovers on reopen",
+                );
+                None
+            }
+        }
     });
     handles.retain(|handle| !handle.is_finished());
     handles.push(task.abort_handle());
     drop(handles);
     match tokio::time::timeout(deadline, task).await {
-        Ok(Ok(value)) => Ok(value),
+        Ok(Ok(Some(value))) => Ok(value),
+        Ok(Ok(None)) => Err(DetachedError::Abandoned),
         Ok(Err(join_error)) => Err(DetachedError::Join(join_error)),
-        // Dropping the JoinHandle detaches the task: it keeps running.
+        // Dropping the JoinHandle detaches the task: it keeps running until
+        // it finishes or hits `hard_deadline`.
         Err(_) => Err(DetachedError::Timeout),
     }
 }
@@ -141,18 +176,63 @@ pub async fn get_information(State(app): State<AppState>) -> impl IntoResponse {
     Json(info)
 }
 
+/// Maps a KIP error response onto an HTTP status.
+///
+/// A failed KIP execution used to be returned as HTTP 200, so a broken KML
+/// mutation or an internal graph error was indistinguishable from success to
+/// load balancers, retry policies, uptime probes, and 5xx alerting — while a
+/// malformed `params` on the same endpoint already produced 400 and a bad key
+/// 401. The JSON body is unchanged, so existing clients keep parsing it.
+///
+/// The mapping follows the KIP standard code ranges (1xxx syntax, 2xxx
+/// schema, 3xxx logic/data, 4xxx system). An unrecognized code is treated as
+/// internal: a code the server does not know cannot be proven client-caused.
+fn kip_error_status(error: &ErrorObject) -> StatusCode {
+    match error.code.as_str() {
+        // 1xxx / 2xxx: the submitted KQL/KML is malformed or violates the
+        // schema. 3001 references an undefined variable or handle.
+        "KIP_1001" | "KIP_1002" | "KIP_2001" | "KIP_2002" | "KIP_2003" | "KIP_3001" => {
+            StatusCode::BAD_REQUEST
+        }
+        "KIP_3002" => StatusCode::NOT_FOUND,
+        // DuplicateExists / VersionConflict: retryable after re-reading.
+        "KIP_3003" | "KIP_3005" => StatusCode::CONFLICT,
+        // ImmutableTarget: modifying protected system nodes is prohibited.
+        "KIP_3004" => StatusCode::FORBIDDEN,
+        "KIP_4001" => StatusCode::REQUEST_TIMEOUT,
+        // ResourceExhausted: the recovery hint is client-side pagination.
+        "KIP_4002" => StatusCode::BAD_REQUEST,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+/// The HTTP status for a KIP response, logging the ones that count as server
+/// failures so a 5xx in the access log is also visible in the service log.
+fn kip_status(response: &Response) -> StatusCode {
+    match response {
+        Response::Ok { .. } => StatusCode::OK,
+        Response::Err { error, .. } => {
+            let status = kip_error_status(error);
+            if status.is_server_error() {
+                log::error!(
+                    action = "post_kip",
+                    code = error.code;
+                    "KIP execution failed: {}", error.message,
+                );
+            }
+            status
+        }
+    }
+}
+
 /// POST /kip
+///
+/// Authentication runs in the router layer ([`build_router`]), before this
+/// handler and before the `Json` extractor parses the body.
 pub async fn post_kip(
     State(app): State<AppState>,
-    header: header::HeaderMap,
     Json(req): Json<JsonRpcRequest>,
 ) -> Result<Json<Response>, (StatusCode, Json<Response>)> {
-    if !authorize_api_key(app.api_key.as_deref(), &header) {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json(Response::err("invalid API key".to_string())),
-        ));
-    }
     if app.admission.is_cancelled() {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -179,6 +259,7 @@ pub async fn post_kip(
                 app.mutation_permits.clone(),
                 app.mutation_aborts.clone(),
                 app.request_timeout,
+                app.execution_timeout,
                 async move { nexus.execute_kip(params).await },
             )
             .await
@@ -193,6 +274,21 @@ pub async fn post_kip(
                     timeout_error(
                         "request processing exceeded the configured timeout; \
                          the started KIP execution continues on the server",
+                    )
+                }
+                DetachedError::Abandoned => {
+                    log::error!(
+                        action = "post_kip",
+                        method = "execute_kip",
+                        execution_timeout_secs = app.execution_timeout.as_secs();
+                        "KIP execution exceeded the hard execution deadline and was abandoned",
+                    );
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(Response::err(KipError::execution_timeout(
+                            "KIP execution exceeded the maximum execution time and was abandoned"
+                                .to_string(),
+                        ))),
                     )
                 }
                 DetachedError::Join(join_error) => {
@@ -219,7 +315,10 @@ pub async fn post_kip(
                     )),
                 ),
             })?;
-            Ok(Json(response))
+            match kip_status(&response) {
+                StatusCode::OK => Ok(Json(response)),
+                status => Err((status, Json(response))),
+            }
         }
         "list_logs" => {
             let params: ListLogParams = serde_json::from_value(req.params).map_err(|e| {
@@ -337,6 +436,51 @@ pub async fn normalize_rejections(
     resp
 }
 
+/// Rejects an unauthenticated `/kip` request before any extractor runs.
+///
+/// Checking the key inside the handler let the `Json` extractor parse the
+/// body (and the body-limit layer reject it) first, so an anonymous caller
+/// could tell 400/413 apart from 401 and make the server spend parsing work
+/// on unauthenticated input.
+async fn require_api_key(
+    State(api_key): State<Arc<Option<String>>>,
+    request: HttpRequest,
+    next: Next,
+) -> Result<axum::response::Response, (StatusCode, Json<Response>)> {
+    if !authorize_api_key(api_key.as_deref(), request.headers()) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(Response::err("invalid API key".to_string())),
+        ));
+    }
+    Ok(next.run(request).await)
+}
+
+/// Builds the HTTP router.
+///
+/// `GET /` stays unauthenticated so load balancers can probe the instance;
+/// `/kip` runs [`require_api_key`] as a route layer, i.e. before the body is
+/// read or parsed.
+pub fn build_router(state: AppState, api_key: Option<String>, max_body_size: usize) -> Router {
+    let request_timeout = state.request_timeout;
+    Router::new()
+        .route("/", routing::get(get_information))
+        .route(
+            "/kip",
+            routing::post(post_kip).layer(middleware::from_fn_with_state(
+                Arc::new(api_key),
+                require_api_key,
+            )),
+        )
+        .layer(DefaultBodyLimit::max(max_body_size.max(1024)))
+        .layer(middleware::from_fn(normalize_rejections))
+        .layer(middleware::from_fn_with_state(
+            request_timeout,
+            total_timeout,
+        ))
+        .with_state(state)
+}
+
 fn authorize_api_key(expected: Option<&str>, header: &header::HeaderMap) -> bool {
     let Some(expected) = expected else {
         return true;
@@ -368,14 +512,64 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anda_db::{
+        database::{AndaDB, DBConfig},
+        storage::StorageConfig,
+    };
+    use anda_kip::KipErrorCode;
     use axum::{
-        Router,
         body::{Body, Bytes},
         http::{HeaderValue, Request as AxumRequest},
-        middleware, routing,
     };
     use http_body_util::BodyExt;
+    use object_store::memory::InMemory;
     use tower::ServiceExt;
+
+    async fn test_app(api_key: Option<String>) -> Router {
+        let db = AndaDB::connect(
+            Arc::new(InMemory::new()),
+            DBConfig {
+                name: "kip_handler_test".to_string(),
+                description: String::new(),
+                storage: StorageConfig::default(),
+                lock: None,
+            },
+        )
+        .await
+        .unwrap();
+        let nexus = Nexus::connect(Arc::new(db), "uuc56-gyb".to_string(), 8 * 1024)
+            .await
+            .unwrap();
+        let state = AppState {
+            name: "test".to_string(),
+            version: "0.0.0".to_string(),
+            nexus,
+            request_timeout: Duration::from_secs(30),
+            execution_timeout: Duration::from_secs(120),
+            admission: CancellationToken::new(),
+            mutation_tasks: TaskTracker::new(),
+            mutation_permits: Arc::new(Semaphore::new(4)),
+            mutation_aborts: Arc::new(Mutex::new(Vec::new())),
+        };
+        build_router(state, api_key, 2 * 1024 * 1024)
+    }
+
+    async fn post_json(app: &Router, body: &str, api_key: Option<&str>) -> (StatusCode, Value) {
+        let mut builder =
+            AxumRequest::post("/kip").header(header::CONTENT_TYPE, "application/json");
+        if let Some(key) = api_key {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {key}"));
+        }
+        let resp = app
+            .clone()
+            .oneshot(builder.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, value)
+    }
 
     #[test]
     fn api_key_auth_rejects_empty_expected_key_and_missing_header() {
@@ -457,6 +651,7 @@ mod tests {
             Arc::new(Semaphore::new(1)),
             Arc::new(Mutex::new(Vec::new())),
             Duration::from_millis(20),
+            Duration::from_secs(30),
             async move {
                 started_tx.send(()).unwrap();
                 // Held open well past the deadline until the test releases it.
@@ -498,6 +693,7 @@ mod tests {
             permits.clone(),
             Arc::new(Mutex::new(Vec::new())),
             Duration::from_secs(5),
+            Duration::from_secs(30),
             async { 7u32 },
         )
         .await;
@@ -509,6 +705,7 @@ mod tests {
             permits,
             Arc::new(Mutex::new(Vec::new())),
             Duration::from_secs(5),
+            Duration::from_secs(30),
             async {
                 panic!("boom");
                 #[allow(unreachable_code)]
@@ -536,6 +733,7 @@ mod tests {
             permits.clone(),
             Arc::new(Mutex::new(Vec::new())),
             Duration::from_secs(1),
+            Duration::from_secs(30),
             async { 1u8 },
         )
         .await;
@@ -549,6 +747,7 @@ mod tests {
             permits,
             Arc::new(Mutex::new(Vec::new())),
             Duration::from_secs(1),
+            Duration::from_secs(30),
             async { 2u8 },
         )
         .await;
@@ -575,6 +774,7 @@ mod tests {
                     permits,
                     registry,
                     Duration::from_secs(1),
+                    Duration::from_secs(30),
                     async { 1u8 },
                 )
                 .await
@@ -623,5 +823,190 @@ mod tests {
             .expect("cancel-safe read must observe shutdown promptly")
             .expect("cancel-safe read task panicked");
         assert_eq!(result, Err(CancelSafeError::ShuttingDown));
+    }
+
+    /// A timed-out execution used to keep its bounded permit until it
+    /// finished — with nothing to stop it, a batch of expensive requests
+    /// exhausted mutation capacity for the rest of the process's life. The
+    /// hard deadline must actually return the permit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_hard_deadline_reclaims_a_runaway_executions_permit() {
+        let admission = CancellationToken::new();
+        let tracker = TaskTracker::new();
+        let permits = Arc::new(Semaphore::new(1));
+
+        let result = run_detached_with_timeout(
+            &admission,
+            &tracker,
+            permits.clone(),
+            Arc::new(Mutex::new(Vec::new())),
+            Duration::from_millis(20),
+            Duration::from_millis(100),
+            std::future::pending::<u8>(),
+        )
+        .await;
+
+        // The client sees the response deadline, and the execution is still
+        // running (and still holding the only permit).
+        assert!(matches!(result, Err(DetachedError::Timeout)));
+        assert_eq!(permits.available_permits(), 0);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while permits.available_permits() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the hard deadline must return the mutation permit");
+
+        // Capacity is genuinely available again instead of answering 503.
+        let admitted = run_detached_with_timeout(
+            &admission,
+            &tracker,
+            permits,
+            Arc::new(Mutex::new(Vec::new())),
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            async { 1u8 },
+        )
+        .await;
+        assert!(matches!(admitted, Ok(1)));
+
+        tracker.close();
+        tokio::time::timeout(Duration::from_secs(5), tracker.wait())
+            .await
+            .expect("abandoned execution must have ended");
+    }
+
+    /// A response whose deadline is shorter than the hard deadline can still
+    /// observe an abandoned execution; it must not be reported as success.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_abandoned_execution_is_not_reported_as_success() {
+        let admission = CancellationToken::new();
+        let tracker = TaskTracker::new();
+        let result = run_detached_with_timeout(
+            &admission,
+            &tracker,
+            Arc::new(Semaphore::new(1)),
+            Arc::new(Mutex::new(Vec::new())),
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            std::future::pending::<u8>(),
+        )
+        .await;
+        assert!(matches!(result, Err(DetachedError::Abandoned)));
+        tracker.close();
+        tracker.wait().await;
+    }
+
+    /// Every KIP error class maps to a status a load balancer, retry policy,
+    /// or 5xx alert can act on — client-caused to 4xx, internal to 5xx.
+    #[test]
+    fn kip_error_classes_map_to_meaningful_statuses() {
+        let status = |code: KipErrorCode| {
+            kip_error_status(&ErrorObject::new(code.code(), "boom".to_string()))
+        };
+
+        for code in [
+            KipErrorCode::InvalidSyntax,
+            KipErrorCode::InvalidIdentifier,
+            KipErrorCode::TypeMismatch,
+            KipErrorCode::ConstraintViolation,
+            KipErrorCode::InvalidValueType,
+            KipErrorCode::ReferenceError,
+            KipErrorCode::ResourceExhausted,
+        ] {
+            assert_eq!(
+                status(code),
+                StatusCode::BAD_REQUEST,
+                "code: {}",
+                code.code()
+            );
+        }
+        assert_eq!(status(KipErrorCode::NotFound), StatusCode::NOT_FOUND);
+        assert_eq!(status(KipErrorCode::DuplicateExists), StatusCode::CONFLICT);
+        assert_eq!(status(KipErrorCode::VersionConflict), StatusCode::CONFLICT);
+        assert_eq!(status(KipErrorCode::ImmutableTarget), StatusCode::FORBIDDEN);
+        assert_eq!(
+            status(KipErrorCode::ExecutionTimeout),
+            StatusCode::REQUEST_TIMEOUT
+        );
+        assert_eq!(
+            status(KipErrorCode::InternalError),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        // An unknown code cannot be proven client-caused.
+        assert_eq!(
+            kip_error_status(&ErrorObject::new("KIP_9999", "boom".to_string())),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    /// A failed KIP execution must not answer HTTP 200; the JSON body shape
+    /// stays exactly the same so existing clients keep parsing it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_kip_execution_is_not_http_200() {
+        let app = test_app(None).await;
+
+        let (status, body) = post_json(
+            &app,
+            r#"{"method":"execute_kip","params":{"command":"THIS IS NOT KIP"}}"#,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert!(
+            body["error"]["code"].as_str().unwrap().starts_with("KIP_"),
+            "body: {body}"
+        );
+        assert!(body["error"]["message"].is_string(), "body: {body}");
+
+        // A successful execution still answers 200 with the same shape.
+        let (status, body) = post_json(
+            &app,
+            r#"{"method":"execute_kip","params":{"command":"DESCRIBE PRIMER"}}"#,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert!(body.get("error").is_none(), "body: {body}");
+    }
+
+    /// Authentication must run before the body is parsed: an anonymous caller
+    /// may not distinguish a malformed body (400) or an oversized one (413)
+    /// from a rejected key, nor make the server parse its input.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unauthenticated_requests_are_rejected_before_the_body_is_parsed() {
+        let app = test_app(Some("secret".to_string())).await;
+
+        for (body, key) in [
+            (r#"{"method": "#.to_string(), None),
+            ("not json at all".to_string(), None),
+            (r#"{"method":"execute_kip"}"#.to_string(), None),
+            (
+                format!(r#"{{"junk":"{}"}}"#, "x".repeat(4 * 1024 * 1024)),
+                None,
+            ),
+            (r#"{"method": "#.to_string(), Some("wrong")),
+        ] {
+            let (status, _) = post_json(&app, &body, key).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "body prefix: {:.20}",
+                body
+            );
+        }
+
+        // With the right key the same malformed body is a normal 400.
+        let (status, body) = post_json(&app, r#"{"method": "#, Some("secret")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+
+        // The health endpoint stays unauthenticated.
+        let resp = app
+            .oneshot(AxumRequest::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

@@ -27,10 +27,19 @@
 //! shard headers are ignored; only server-side routing metadata selects a
 //! shard. Names must match the backend rules (`[a-z0-9_]{1,64}`).
 //!
-//! The `read_only` flag on a shard backend is advisory routing metadata: the
-//! RPC protocol is POST-based, so the proxy cannot tell reads from writes by
-//! HTTP method and does not enforce it; enforcement is up to the backend
-//! (e.g. `db.set_read_only`).
+//! A request whose path carries no valid database name is answered with 404.
+//! It is never forwarded to `--default-backend-addr`: with the default
+//! `--path-prefix /`, `POST /` is the backend's root scope (`db.list`,
+//! `db.create`, `db.open`, `db.close`), so a catch-all fallback would expose
+//! every database on the shared shard to any client that can reach the proxy.
+//! The default backend serves only requests that name a database.
+//!
+//! The proxy does not carry a `read_only` flag for a shard backend. The RPC
+//! protocol is POST-based with the method inside the body, so the proxy
+//! cannot classify a request as a read or a write without buffering and
+//! parsing every request body; an advisory flag that nothing enforces is
+//! worse than none. Read-only enforcement belongs to the backend
+//! (`db.set_read_only` / `collection.set_read_only`).
 //!
 //! ## Management API (auth required)
 //!
@@ -40,7 +49,7 @@
 //! | `PUT`    | `/_admin/db_shards`         | `{"db_name": "mydb", "shard_id": 1}`                | Assign a database to a shard   |
 //! | `DELETE` | `/_admin/db_shards`         | `{"db_name": "mydb"}`                               | Remove a db→shard binding      |
 //! | `GET`    | `/_admin/shard_backends`    | –                                                   | List all shard backends        |
-//! | `PUT`    | `/_admin/shard_backends`    | `{"shard_id": 1, "backend_addr": "http://10.0.0.1:8080", "read_only": false}` | Add or update a shard backend |
+//! | `PUT`    | `/_admin/shard_backends`    | `{"shard_id": 1, "backend_addr": "http://10.0.0.1:8080"}` | Add or update a shard backend |
 //! | `DELETE` | `/_admin/shard_backends`    | `{"shard_id": 1}`                                   | Delete a shard backend         |
 //!
 //! ## Usage
@@ -128,7 +137,8 @@ struct Cli {
     #[clap(long, env = "TRUSTED_PROXY_CIDRS", value_delimiter = ',')]
     trusted_proxy_cidrs: Vec<IpNet>,
 
-    /// Default backend address to use if no shard mapping is found
+    /// Default backend address for databases that have no routing row yet.
+    /// Only requests that carry a valid database name can reach it.
     #[clap(long, env = "DEFAULT_BACKEND_ADDR")]
     default_backend_addr: Option<String>,
 }
@@ -191,7 +201,6 @@ async fn main() -> Result<(), BoxError> {
                 db_name: None,
                 shard_id: 0,
                 backend_addr: addr,
-                read_only: true,
             })
         }
         None => None,

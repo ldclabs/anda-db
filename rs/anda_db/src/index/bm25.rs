@@ -1,7 +1,7 @@
 use anda_db_tfs::{BM25Index, BucketObject};
 use bytes::Bytes;
 use parking_lot::RwLock;
-use std::{fmt::Debug, hash::Hash, sync::Arc};
+use std::{collections::BTreeSet, fmt::Debug, hash::Hash, sync::Arc};
 use tokio::sync::Mutex;
 
 use super::from_virtual_field_name;
@@ -317,6 +317,18 @@ impl BM25 {
     /// Removes the indexed text for `id`.
     pub fn remove(&self, id: DocumentId, text: &str, now_ms: u64) -> bool {
         self.index.remove(id, text, now_ms)
+    }
+
+    /// Erases `ids` from the index without needing their indexed text.
+    ///
+    /// Used by the dead-id repair path, where the document bodies are gone and
+    /// [`remove`](Self::remove) therefore has no text to re-tokenize. Sweeps
+    /// every posting list once for the whole set; see
+    /// [`BM25Index::purge_ids`] for the cost and consistency guarantees.
+    ///
+    /// Returns the number of ids that were actually present in the index.
+    pub fn purge_ids(&self, ids: &BTreeSet<DocumentId>, now_ms: u64) -> usize {
+        self.index.purge_ids(ids, now_ms)
     }
 
     /// Searches the index and returns `(document_id, score)` pairs.

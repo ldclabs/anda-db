@@ -13,14 +13,21 @@ use sha3::Digest;
 use std::{ops::Range, sync::Arc, time::Duration};
 
 use crate::{
-    check_get_preconditions, check_update_version,
-    sidecar::{ListingMetaPolicy, SidecarMeta, SidecarStore, new_generation},
+    check_get_preconditions, check_update_version, derive_copy_e_tag,
+    sidecar::{
+        InFlightGuard, ListingMetaPolicy, SidecarMeta, SidecarStore, logical_last_modified,
+        new_generation,
+    },
     validate_ranges,
 };
 
 const DEFAULT_CHUNK_SIZE: u64 = 256 * 1024;
 const CHUNK_AAD_LEGACY: u8 = 0;
 const CHUNK_AAD_BOUND: u8 = 1;
+/// Default time-to-live of the metadata cache.
+const DEFAULT_META_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
+/// Default time-to-idle of the metadata cache.
+const DEFAULT_META_CACHE_TTI: Duration = Duration::from_secs(20 * 60);
 
 /// An object store implementation that provides transparent AES-256-GCM encryption and decryption
 /// for stored objects.
@@ -129,6 +136,10 @@ pub struct EncryptedStoreBuilder<T: ObjectStore> {
     strict_metadata_auth: bool,
     /// In-memory metadata cache to avoid round-trips on hot paths.
     meta_cache: Cache<Path, Arc<Metadata>>,
+    /// Maximum number of metadata entries the built-in cache holds. Retained
+    /// so [`EncryptedStoreBuilder::with_meta_cache_ttl`] can rebuild the
+    /// cache without losing the configured capacity.
+    meta_cache_capacity: u64,
 }
 
 /// Per-object encryption metadata stored alongside the ciphertext.
@@ -147,9 +158,10 @@ pub struct Metadata {
     #[serde(rename = "s")]
     size: u64,
 
-    /// Content-addressable ETag computed as the URL-safe Base64 encoding of
-    /// SHA3-256 over the *ciphertext*. Exposed to callers as the object's
-    /// ETag.
+    /// Logical ETag: the URL-safe Base64 encoding of SHA3-256 over the
+    /// per-object base nonce followed by the *ciphertext*. Exposed to callers
+    /// as the object's ETag; the nonce is fresh per commit, which is what
+    /// makes the ETag a version token (see the crate documentation).
     #[serde(rename = "e")]
     e_tag: Option<String>,
 
@@ -275,17 +287,20 @@ impl<T: ObjectStore> EncryptedStoreBuilder<T> {
             cipher,
             chunk_size: DEFAULT_CHUNK_SIZE,
             strict_metadata_auth: false,
-            meta_cache: Cache::builder()
-                .max_capacity(meta_cache_capacity)
-                .time_to_live(Duration::from_secs(60 * 60))
-                .time_to_idle(Duration::from_secs(20 * 60))
-                .build(),
+            meta_cache: build_meta_cache(meta_cache_capacity, DEFAULT_META_CACHE_TTL),
+            meta_cache_capacity,
         }
     }
 
     /// Sets the cache for metadata.
     ///
     /// This cache is used to store metadata for objects, improving performance.
+    ///
+    /// The supplied cache replaces the built-in one wholesale, so its own
+    /// capacity and eviction policy apply instead of the capacity passed to
+    /// [`EncryptedStoreBuilder::new`]. A later
+    /// [`EncryptedStoreBuilder::with_meta_cache_ttl`] rebuilds the built-in
+    /// cache and discards the supplied one.
     ///
     /// # Parameters
     /// - `cache`: The cache to use for metadata
@@ -297,6 +312,15 @@ impl<T: ObjectStore> EncryptedStoreBuilder<T> {
             meta_cache: cache,
             ..self
         }
+    }
+
+    /// Sets the time-to-live (TTL) for the metadata cache.
+    ///
+    /// The cache is rebuilt with the capacity passed to
+    /// [`EncryptedStoreBuilder::new`] and the default time-to-idle.
+    pub fn with_meta_cache_ttl(mut self, ttl: Duration) -> Self {
+        self.meta_cache = build_meta_cache(self.meta_cache_capacity, ttl);
+        self
     }
 
     /// Sets the chunk size for encryption operations.
@@ -321,14 +345,18 @@ impl<T: ObjectStore> EncryptedStoreBuilder<T> {
         }
     }
 
-    /// Retained for API compatibility: conditional-put semantics (the
-    /// content-addressable ETag, `PutMode::Update` and
-    /// `if_match`/`if_none_match` preconditions) are now always enabled on
-    /// every backend, because the immutable-generation protocol evaluates
-    /// them against the metadata commit point instead of forwarding them.
+    /// Retained for API compatibility: conditional-put semantics (the logical
+    /// ETag, `PutMode::Update` and `if_match`/`if_none_match` preconditions)
+    /// are now always enabled on every backend, because the
+    /// immutable-generation protocol evaluates them against the metadata
+    /// commit point instead of forwarding them.
     ///
     /// # Returns
     /// The builder, unchanged
+    #[deprecated(
+        since = "0.10.0",
+        note = "no-op: conditional-put semantics are unconditional since the immutable-generation refactor; remove the call"
+    )]
     pub fn with_conditional_put(self) -> Self {
         self
     }
@@ -441,6 +469,12 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
         opts: PutOptions,
     ) -> Result<PutResult> {
         let create = matches!(opts.mode, PutMode::Create);
+        // Mint the generation and register it as in-flight before anything
+        // reaches the backend: between the ciphertext write and the pointer
+        // switch nothing references it, so garbage collection must be told
+        // to leave it alone. The guard is released when this call returns.
+        let generation = new_generation();
+        let _in_flight = self.inner.track_in_flight(location, &generation);
         let rt = self
             .inner
             .update_meta_with(location, create, async |meta| {
@@ -499,7 +533,6 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
                 hasher.update(base_nonce);
                 hasher.update(&data);
                 let hash: [u8; 32] = hasher.finalize().into();
-                let generation = new_generation();
                 let mut meta = Metadata {
                     size: data.len() as u64,
                     e_tag: Some(BASE64_URL_SAFE.encode(hash)),
@@ -514,7 +547,7 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
                     generation: Some(generation.clone()),
                 };
 
-                // Write the ciphertext to a fresh immutable generation; the
+                // Write the ciphertext to the fresh immutable generation; the
                 // metadata put below is the commit point.
                 let gen_path = self.inner.generation_path(location, &generation);
                 let ciphertext: PutPayload = data.into();
@@ -545,6 +578,7 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
         // Upload into a fresh immutable generation; `complete` switches the
         // metadata pointer, so an unfinished upload never affects readers.
         let generation = new_generation();
+        let in_flight = self.inner.track_in_flight(location, &generation);
         let gen_path = self.inner.generation_path(location, &generation);
         let inner = self.inner.store.put_multipart_opts(&gen_path, opts).await?;
 
@@ -562,6 +596,7 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
             chunk_index: 0,
             location: location.clone(),
             generation,
+            _in_flight: in_flight,
             store: self.inner.clone(),
             cipher: self.cipher.clone(),
             chunk_size: self.chunk_size,
@@ -576,7 +611,8 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
             self.verify_metadata(location, &meta)?;
 
             let mut options = options.clone();
-            check_get_preconditions(location, &mut options, meta.e_tag.as_deref())?;
+            let last_modified = logical_last_modified(meta.generation.as_deref());
+            check_get_preconditions(location, &mut options, meta.e_tag.as_deref(), last_modified)?;
 
             // Resolve the caller-supplied (plaintext) range, defaulting to the
             // full object when no range is specified.
@@ -649,6 +685,13 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
             let mut obj = res.meta.clone();
             obj.location = location.clone();
             obj.e_tag = meta.e_tag.clone();
+            // Report the logical object, not the ciphertext object it
+            // resolves to: the size comes from the authenticated commit point
+            // (the ciphertext's own length is whatever the backend holds),
+            // and the timestamp from the generation pointer so listings and
+            // reads agree.
+            obj.size = meta.size;
+            obj.last_modified = last_modified.unwrap_or(obj.last_modified);
             // Versions are not reported; see the crate documentation.
             obj.version = None;
 
@@ -821,22 +864,27 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
     }
 
     async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
-        let create = matches!(options.mode, CopyMode::Create);
+        let CopyOptions { mode, extensions } = options;
+        let create = matches!(mode, CopyMode::Create);
         // The ciphertext chunks are not bound to the path (their AAD carries
         // chunk size and index only), so the payload is copied verbatim;
         // only the metadata document is resealed below for the target path.
-        // The pointer switch is the commit point.
+        // The pointer switch is the commit point; `_in_flight` shields the
+        // copied generation from garbage collection until then.
         let cipher = self.cipher.clone();
         let strict = self.strict_metadata_auth;
-        let (src, generation) = self
+        let (src, generation, _in_flight) = self
             .inner
-            .copy_payload(from, to, |location, meta| {
+            .copy_payload(from, to, extensions, |location, meta| {
                 verify_metadata(&cipher, location, meta, strict)?;
                 Ok(())
             })
             .await?;
 
         let mut meta = (*src).clone();
+        // A copy is a commit of its own, so it gets its own CAS token
+        // instead of the source's; see `derive_copy_e_tag`.
+        meta.e_tag = Some(derive_copy_e_tag(&generation, src.e_tag.as_deref()));
         meta.generation = Some(generation);
         meta.original_tag = None;
         meta.original_version = None;
@@ -903,7 +951,7 @@ pub struct EncryptedStoreUploader<T: ObjectStore> {
     buf: Vec<u8>,
     /// Running SHA3-256 hasher over the per-upload nonce followed by the
     /// *ciphertext* (unique per commit; see `put_opts`). Provides the
-    /// content-addressable e_tag for the finished object.
+    /// logical e_tag for the finished object.
     hasher: sha3::Sha3_256,
     /// Total number of plaintext bytes accepted so far.
     size: usize,
@@ -918,6 +966,10 @@ pub struct EncryptedStoreUploader<T: ObjectStore> {
     location: Path,
     /// Generation the ciphertext is uploaded into.
     generation: String,
+    /// Keeps that generation registered as in-flight for the whole upload,
+    /// so garbage collection cannot reclaim it before `complete` commits the
+    /// pointer.
+    _in_flight: InFlightGuard,
     /// Shared sidecar core of the originating [`EncryptedStore`].
     store: Arc<SidecarStore<T, Metadata>>,
     /// Shared AES-256-GCM cipher.
@@ -1202,6 +1254,15 @@ fn create_decryption_stream(
 
 fn normalize_chunk_size(chunk_size: u64) -> u64 {
     chunk_size.clamp(1, usize::MAX as u64)
+}
+
+/// Builds the built-in metadata cache with the configured capacity and TTL.
+fn build_meta_cache(capacity: u64, ttl: Duration) -> Cache<Path, Arc<Metadata>> {
+    Cache::builder()
+        .max_capacity(capacity)
+        .time_to_live(ttl)
+        .time_to_idle(DEFAULT_META_CACHE_TTI)
+        .build()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1577,9 +1638,12 @@ mod tests {
     #[test]
     fn builder_custom_cache_and_display_debug_are_exercised() {
         let cache = Cache::builder().max_capacity(1).build();
+        // `with_conditional_put` is a deprecated no-op that is still part of
+        // the public API, so it must keep compiling and building a store.
+        #[allow(deprecated)]
         let storage = EncryptedStoreBuilder::with_secret(InMemory::new(), 100, [0u8; 32])
             .with_meta_cache(cache)
-            .with_conditional_put() // retained no-op, part of the public API
+            .with_conditional_put()
             .build();
 
         assert!(format!("{storage}").contains("EncryptedStore"));
@@ -1601,6 +1665,26 @@ mod tests {
                 .to_string(),
             "gen/nested/object/0123-abcd"
         );
+    }
+
+    #[test]
+    fn meta_cache_ttl_preserves_the_configured_capacity() {
+        // Regression: `with_meta_cache_ttl` must rebuild the cache from the
+        // capacity passed to the constructor instead of silently dropping it.
+        let storage = EncryptedStoreBuilder::with_secret(InMemory::new(), 1000, [0u8; 32])
+            .with_meta_cache_ttl(Duration::from_secs(30))
+            .build();
+        let policy = storage.inner.meta_cache.policy();
+        assert_eq!(policy.max_capacity(), Some(1000));
+        assert_eq!(policy.time_to_live(), Some(Duration::from_secs(30)));
+        assert_eq!(policy.time_to_idle(), Some(DEFAULT_META_CACHE_TTI));
+
+        // Without the knob the defaults apply.
+        let storage = EncryptedStoreBuilder::with_secret(InMemory::new(), 7, [0u8; 32]).build();
+        let policy = storage.inner.meta_cache.policy();
+        assert_eq!(policy.max_capacity(), Some(7));
+        assert_eq!(policy.time_to_live(), Some(DEFAULT_META_CACHE_TTL));
+        assert_eq!(policy.time_to_idle(), Some(DEFAULT_META_CACHE_TTI));
     }
 
     #[tokio::test]
@@ -1986,6 +2070,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_api_reports_the_same_authenticated_size_and_timestamp() {
+        let inner = InMemory::new();
+        let storage = EncryptedStoreBuilder::with_secret(inner.clone(), 100, [0u8; 32]).build();
+        let location = Path::from("one-clock");
+        storage
+            .put(&location, Bytes::from_static(b"abc").into())
+            .await
+            .unwrap();
+
+        let listed: Vec<_> = storage.list(None).try_collect().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        let head = storage.head(&location).await.unwrap();
+        assert_eq!(head.last_modified, listed[0].last_modified);
+        assert_eq!(head.size, listed[0].size);
+        assert_eq!(head.e_tag, listed[0].e_tag);
+        let res = storage.get(&location).await.unwrap();
+        assert_eq!(res.meta.last_modified, listed[0].last_modified);
+        assert_eq!(res.meta.size, listed[0].size);
+
+        // A timestamp taken from a listing therefore answers a conditional
+        // read about the same commit.
+        let err = storage
+            .get_opts(
+                &location,
+                GetOptions {
+                    if_modified_since: Some(listed[0].last_modified),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotModified { .. }));
+        storage
+            .get_opts(
+                &location,
+                GetOptions {
+                    if_unmodified_since: Some(listed[0].last_modified),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // The size comes from the authenticated metadata: swapping the
+        // ciphertext for a longer object — the one thing an attacker with
+        // backend write access controls — cannot change what `head` reports
+        // (and the content itself stays protected by the chunk tags).
+        let ciphertext = ciphertext_path(&inner, &location).await;
+        inner
+            .put(&ciphertext, Bytes::from_static(b"0123456789").into())
+            .await
+            .unwrap();
+        assert_eq!(storage.head(&location).await.unwrap().size, 3);
+        assert!(storage.get(&location).await.unwrap().bytes().await.is_err());
+    }
+
+    #[tokio::test]
     async fn get_opts_accepts_comma_separated_logical_etags() {
         let storage = EncryptedStoreBuilder::with_secret(InMemory::new(), 100, [0u8; 32]).build();
         let location = Path::from("encrypted-etag-list");
@@ -2024,7 +2165,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn copy_and_rename_preserve_logical_etag_preconditions() {
+    async fn copy_and_rename_mint_their_own_logical_etag() {
         let storage = EncryptedStoreBuilder::with_secret(InMemory::new(), 100, [0u8; 32]).build();
         let source = Path::from("encrypted-copy-source");
         let copied = Path::from("encrypted-copy-target");
@@ -2035,12 +2176,30 @@ mod tests {
             .unwrap();
         let e_tag = put.e_tag.unwrap();
 
+        // A copy is a commit of its own: it must not hand the target the
+        // source's CAS token, or the two keys would share one.
         storage.copy(&source, &copied).await.unwrap();
-        let bytes = storage
+        let copied_e_tag = storage.head(&copied).await.unwrap().e_tag.unwrap();
+        assert_ne!(copied_e_tag, e_tag);
+        let err = storage
             .get_opts(
                 &copied,
                 GetOptions {
                     if_match: Some(e_tag.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Precondition { .. }));
+
+        // The target's own token addresses it, and the resealed document
+        // still decrypts.
+        let bytes = storage
+            .get_opts(
+                &copied,
+                GetOptions {
+                    if_match: Some(copied_e_tag.clone()),
                     ..Default::default()
                 },
             )
@@ -2051,12 +2210,16 @@ mod tests {
             .unwrap();
         assert_eq!(bytes, Bytes::from_static(b"abc"));
 
+        // A rename is a copy plus a delete, so the target is a new commit too.
         storage.rename(&copied, &renamed).await.unwrap();
+        let renamed_e_tag = storage.head(&renamed).await.unwrap().e_tag.unwrap();
+        assert_ne!(renamed_e_tag, e_tag);
+        assert_ne!(renamed_e_tag, copied_e_tag);
         let bytes = storage
             .get_opts(
                 &renamed,
                 GetOptions {
-                    if_match: Some(e_tag),
+                    if_match: Some(renamed_e_tag),
                     ..Default::default()
                 },
             )
@@ -2066,6 +2229,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bytes, Bytes::from_static(b"abc"));
+
+        // The source is untouched by either operation.
+        assert_eq!(storage.head(&source).await.unwrap().e_tag, Some(e_tag));
     }
 
     #[tokio::test]
@@ -2636,7 +2802,7 @@ mod tests {
             panic!("unexpected error type: {err:?}");
         }
 
-        // put_get_delete_list(&storage).await;
+        put_get_delete_list(&storage).await;
         put_get_attributes(&storage).await;
         get_opts(&storage).await;
         put_opts(&storage, true).await;

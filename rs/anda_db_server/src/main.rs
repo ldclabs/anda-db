@@ -11,7 +11,8 @@
 //! # S3-compatible storage, configured via AWS_* environment variables
 //! cargo run -p anda_db_server -- s3
 //!
-//! # With API key authentication
+//! # With API key authentication (this is the admin key; per-database keys
+//! # are provisioned at runtime with db.create / db.set_api_key)
 //! cargo run -p anda_db_server -- --api-key my-secret local --path ./debug/db
 //! ```
 
@@ -38,9 +39,11 @@ struct Cli {
     #[clap(long, env = "ADDR", default_value = "127.0.0.1:8080")]
     addr: String,
 
-    /// API key required as `Authorization: Bearer <key>`. Required when
-    /// listening on a non-loopback address unless --insecure-no-api-key is
-    /// passed.
+    /// Admin API key, presented as `Authorization: Bearer <key>`. It
+    /// authorizes the root scope and every database; per-database keys are
+    /// provisioned at runtime with `db.create` / `db.set_api_key` and require
+    /// this key to be set. Required when listening on a non-loopback address
+    /// unless --insecure-no-api-key is passed.
     #[clap(long, env = "API_KEY")]
     api_key: Option<String>,
 
@@ -69,6 +72,11 @@ struct Cli {
     /// Maximum accepted request body size in bytes
     #[clap(long, env = "MAX_BODY_SIZE", default_value = "2097152")]
     max_body_size: usize,
+
+    /// Maximum number of non-primary databases registered on this server.
+    /// Each one keeps a permanent background flush task.
+    #[clap(long, env = "MAX_DATABASES", default_value = "64")]
+    max_databases: usize,
 
     /// Grace period for in-flight RPC drain; a final durable DB close may take longer
     #[clap(long, env = "SHUTDOWN_TIMEOUT_SECS", default_value = "30")]
@@ -130,6 +138,7 @@ async fn main() -> Result<(), BoxError> {
             max_concurrent_mutations: cli.max_concurrent_mutations.max(1),
             shutdown_timeout: Duration::from_secs(cli.shutdown_timeout_secs.max(1)),
             max_body_size: cli.max_body_size.max(1024),
+            max_databases: cli.max_databases.max(1),
             ..Default::default()
         },
     )

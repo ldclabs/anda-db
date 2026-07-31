@@ -1,6 +1,6 @@
 [package]
 name = "anda_db_server"
-version = "0.10.0"
+version = "0.11.0"
 description = "An HTTP server for Anda DB with a CBOR-first RPC API (JSON supported)."
 categories = ["database", "data-structures", "web-programming"]
 repository = "https://github.com/ldclabs/anda-db/tree/main/rs/anda_db_server"
@@ -9,26 +9,31 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-anda_db = { version = "0.10", path = "../anda_db", features = ["full"] }
-anda_db_tfs = { version = "0.10", path = "../anda_db_tfs" }
-anda_object_store = { version = "0.10", path = "../anda_object_store" }
+anda_db = { version = "0.11", path = "../anda_db", features = ["full"] }
+anda_db_tfs = { version = "0.11", path = "../anda_db_tfs" }
+anda_object_store = { version = "0.11", path = "../anda_object_store" }
 axum = { workspace = true }
 cbor2 = { workspace = true }
 clap = { workspace = true }
 dotenv = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
 log = { workspace = true }
 mimalloc = { workspace = true }
 object_store = { workspace = true, features = ["fs", "aws"] }
+rand = { workspace = true, features = ["thread_rng"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha3 = { workspace = true }
 structured-logger = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
+anda_db = { version = "0.11", path = "../anda_db", features = ["full"] }
 async-trait = { workspace = true }
-futures = { workspace = true }
 http-body-util = { version = "0.1", features = ["channel"] }
+serde_bytes = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 
 [lib]

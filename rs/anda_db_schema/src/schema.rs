@@ -76,7 +76,9 @@ impl Schema {
     /// fixed indexes. This method ensures index consistency by:
     ///
     /// 1. For fields present in both schemas: inherits the `idx` from the old schema,
-    ///    and verifies the field type has not changed (type changes are not allowed).
+    ///    and verifies the field type has not changed incompatibly (see
+    ///    [`FieldType::is_compatible_upgrade_of`] — a nested struct may gain an
+    ///    optional key or lose a key, nothing else changes).
     /// 2. For new fields (in self but not in old): assigns fresh indexes starting
     ///    from `max(old indexes) + 1`, ensuring no conflicts with any old index.
     /// 3. For removed fields (in old but not in self): their indexes are simply not
@@ -87,7 +89,7 @@ impl Schema {
     ///
     /// # Errors
     /// - If `self.version` is not greater than `old.version`.
-    /// - If a field that exists in both schemas has a different type.
+    /// - If a field that exists in both schemas changed to an incompatible type.
     /// - If a field that exists only in the new schema is required.
     /// - If assigning indexes to new fields would exceed `u16::MAX`.
     ///
@@ -108,10 +110,13 @@ impl Schema {
         let mut next_idx = old.allocated_idx_end();
         for (name, field) in self.fields.iter() {
             if let Some(old_field) = old.fields.get(name) {
-                // Field exists in both: the type must not change.
-                if field.r#type() != old_field.r#type() {
+                // Field exists in both: the type may only change in ways that
+                // leave every already-stored document readable — a nested
+                // struct gaining an optional key or losing one. Nothing here
+                // rewrites documents, so anything else is rejected.
+                if !field.r#type().is_compatible_upgrade_of(old_field.r#type()) {
                     return Err(SchemaError::Schema(format!(
-                        "field {name:?} type changed from {:?} to {:?}, type changes are not allowed",
+                        "field {name:?} type changed from {:?} to {:?}, incompatible type changes are not allowed",
                         old_field.r#type(),
                         field.r#type()
                     )));

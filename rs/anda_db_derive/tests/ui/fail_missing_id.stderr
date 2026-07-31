@@ -1,0 +1,11 @@
+error: AndaDBSchema requires an `_id: u64` field: the schema builder injects `_id` as a *required* entry, so `Document::try_from` (and therefore `Collection::add_from`) rejects a value that does not serialize an "_id" key with `field "_id" is required`. Declare `_id: u64` on the struct; the builder still supplies its FieldEntry
+ --> tests/ui/fail_missing_id.rs:8:8
+  |
+8 | struct NoId {
+  |        ^^^^
+
+error: `_id` must be serialized: #[serde(skip)] / #[serde(skip_serializing)] drops it from the document, and `Document::try_from` then fails with `field "_id" is required`
+  --> tests/ui/fail_missing_id.rs:15:5
+   |
+15 |     _id: u64,
+   |     ^^^

@@ -18,7 +18,7 @@ use std::{
 
 use crate::{
     database::AndaDB,
-    error::DBError,
+    error::{CollectionState, CollectionStateError, DBError},
     index::*,
     query::*,
     schema::*,
@@ -176,6 +176,52 @@ struct MutationIntent {
     proposed: Option<DocumentOwned>,
 }
 
+/// The direction a filter scan walked the key space before it stopped.
+///
+/// `Lt`/`Le` range scans walk backwards so they can stop as soon as `limit`
+/// hits are found, which means they keep the *largest* matching keys and an
+/// over-long result has to be trimmed from the head. Every other path collects
+/// from the smallest key upwards and is trimmed from the tail.
+///
+/// The scan reports this itself: it cannot be re-derived from the filter AST,
+/// because composite filters (`And`/`Or`/`Not`) evaluate their operands
+/// unbounded and always yield an ascending result even when a `Lt`/`Le` operand
+/// appears inside them. Guessing from the AST used to make logically equivalent
+/// filters (`Between(5, 14)` vs `And(Ge(5), Lt(15))`) return disjoint pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanOrder {
+    Ascending,
+    Descending,
+}
+
+impl ScanOrder {
+    /// The direction the range scan for `query` walks the key space.
+    ///
+    /// Only a top-level `Lt`/`Le` walks backwards; composite range queries
+    /// (`And`/`Or`/`Not`) resolve their operands unbounded first and then
+    /// collect ascending.
+    fn of_range_query<T>(query: &RangeQuery<T>) -> Self {
+        match query {
+            RangeQuery::Lt(_) | RangeQuery::Le(_) => ScanOrder::Descending,
+            _ => ScanOrder::Ascending,
+        }
+    }
+
+    /// Trims `result` down to `limit`, dropping the ids the scan did not select.
+    fn truncate(self, result: &mut Vec<DocumentId>, limit: usize) {
+        if limit == 0 || result.len() <= limit {
+            return;
+        }
+
+        match self {
+            ScanOrder::Ascending => result.truncate(limit),
+            ScanOrder::Descending => {
+                result.drain(0..(result.len() - limit));
+            }
+        }
+    }
+}
+
 /// Collection configuration parameters.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CollectionConfig {
@@ -251,7 +297,14 @@ pub struct CollectionStats {
     /// Number of delete operations performed.
     pub delete_count: u64,
 
-    /// Whether the collection is in read-only mode
+    /// Whether the collection handle is in read-only mode.
+    ///
+    /// This is **live handle state, not durable state**: [`Collection::open`]
+    /// always starts a handle as writable, so the flag is deliberately
+    /// written as `false` in every persisted snapshot (see
+    /// [`Collection::store_metadata`]). Reading it back from a stored
+    /// snapshot says nothing about the collection; only
+    /// [`Collection::stats`] / [`Collection::metadata`] report the live value.
     pub read_only: bool,
 }
 
@@ -463,19 +516,12 @@ impl Collection {
     }
 
     fn lifecycle_error(&self) -> DBError {
-        let state = match self.lifecycle.load(Ordering::Acquire) {
-            LIFECYCLE_CLOSING => "closing",
-            LIFECYCLE_CLOSED => "closed",
-            LIFECYCLE_DELETING => "being deleted",
-            LIFECYCLE_DELETED => "deleted",
-            LIFECYCLE_POISONED => {
-                "poisoned (a mutating call was cancelled mid-operation); reopen the collection to recover"
-            }
-            _ => "not writable",
-        };
         DBError::Generic {
             name: self.name.clone(),
-            source: format!("Collection handle is {state}").into(),
+            // Typed, not stringly: `DBError::collection_state` downcasts this
+            // back out so callers can tell "reopen and retry" from "give up"
+            // without reading the message.
+            source: CollectionStateError(self.state()).into(),
         }
     }
 
@@ -493,13 +539,35 @@ impl Collection {
         Ok(())
     }
 
+    /// Returns the handle's current lifecycle state.
+    ///
+    /// Any state other than [`CollectionState::Active`] rejects operations
+    /// with an error that carries the same value; see
+    /// [`DBError::collection_state`] to classify an error you already hold
+    /// without a second call.
+    pub fn state(&self) -> CollectionState {
+        match self.lifecycle.load(Ordering::Acquire) {
+            LIFECYCLE_CLOSING => CollectionState::Closing,
+            LIFECYCLE_CLOSED => CollectionState::Closed,
+            LIFECYCLE_DELETING => CollectionState::Deleting,
+            LIFECYCLE_DELETED => CollectionState::Deleted,
+            LIFECYCLE_POISONED => CollectionState::Poisoned,
+            _ => CollectionState::Active,
+        }
+    }
+
     /// Returns whether this registered handle still admits new operations.
     pub(crate) fn is_active_handle(&self) -> bool {
         self.lifecycle.load(Ordering::Acquire) == LIFECYCLE_ACTIVE
     }
 
     /// Returns whether this handle was poisoned by a cancelled mutation.
-    pub(crate) fn is_poisoned(&self) -> bool {
+    ///
+    /// A poisoned handle rejects every operation; reopening the collection
+    /// through the database discards it and loads a consistent generation from
+    /// storage. Prefer [`DBError::is_poisoned`] when you already hold the
+    /// error a rejected call returned.
+    pub fn is_poisoned(&self) -> bool {
         self.lifecycle.load(Ordering::Acquire) == LIFECYCLE_POISONED
     }
 
@@ -906,18 +974,43 @@ impl Collection {
     /// Replays intents left by a crash or failed flush. Historical values are
     /// removed first; the document currently present in storage is then the
     /// sole source of truth for both the bitmap and every derived index.
+    ///
+    /// A single unusable intent must never make the collection unopenable:
+    /// nothing clears it, so every reopen would replay it and fail
+    /// identically, with no operator escape hatch. Unusable records are
+    /// therefore logged and skipped (the same treatment
+    /// [`Self::repair_document`] gives a document that no longer matches the
+    /// schema); the skipped records are retired by the next flush.
     async fn replay_mutation_intents(&self) -> Result<usize, DBError> {
         let mut stream = self
             .storage
             .list::<MutationIntent>(Some(Self::MUTATION_INTENT_PREFIX), None);
         let mut intents = BTreeMap::<u64, MutationIntent>::new();
         while let Some(intent) = stream.next().await {
-            let intent = intent?.0;
+            let intent = match intent {
+                Ok((intent, _)) => intent,
+                // An intent object that no longer decodes carries no usable
+                // recovery information. Storage-level failures still
+                // propagate: those are transient and retrying the open is the
+                // right answer.
+                Err(err @ DBError::Serialization { .. }) => {
+                    log::warn!(
+                        action = "Collection::replay_mutation_intents",
+                        collection = self.name;
+                        "Skipping undecodable mutation intent: {err:?}",
+                    );
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
             if intent.document_id == 0 {
-                return Err(DBError::Serialization {
-                    name: self.name.clone(),
-                    source: "mutation intent contains reserved document id 0".into(),
-                });
+                log::warn!(
+                    action = "Collection::replay_mutation_intents",
+                    collection = self.name,
+                    sequence = intent.sequence;
+                    "Skipping mutation intent with the reserved document id 0",
+                );
+                continue;
             }
             intents.insert(intent.sequence, intent);
         }
@@ -944,8 +1037,26 @@ impl Collection {
         for intent in intents.values() {
             affected_ids.insert(intent.document_id);
             for candidate in [&intent.previous, &intent.proposed].into_iter().flatten() {
-                let document = Document::try_from_doc(self.schema(), candidate.clone())?;
-                self.remove_document_from_indexes(intent.document_id, &document, now_ms);
+                // A recorded pre/post image that no longer satisfies the
+                // current schema (e.g. after an upgrade) cannot be turned back
+                // into indexed values. Skip it rather than failing the open
+                // forever: the stored document below stays authoritative, and
+                // entries derived only from the undecodable image are left to
+                // the explicit `reconcile_storage` backstop.
+                match Document::try_from_doc(self.schema(), candidate.clone()) {
+                    Ok(document) => {
+                        self.remove_document_from_indexes(intent.document_id, &document, now_ms)
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            action = "Collection::reconcile_mutation_intents",
+                            collection = self.name,
+                            doc_id = intent.document_id,
+                            sequence = intent.sequence;
+                            "Skipping mutation intent image that does not match the schema: {err:?}",
+                        );
+                    }
+                }
             }
         }
 
@@ -956,13 +1067,38 @@ impl Collection {
                 .await
             {
                 Ok((current, _)) => {
-                    let current = Document::try_from_doc(self.schema(), current)?;
+                    // Same tolerance as `repair_document`: a stored document
+                    // that does not match the schema is skipped (leaving the
+                    // bitmap untouched) instead of bricking every open.
+                    let current = match Document::try_from_doc(self.schema(), current) {
+                        Ok(current) => current,
+                        Err(err) => {
+                            self.max_document_id.fetch_max(id, Ordering::AcqRel);
+                            log::warn!(
+                                action = "Collection::reconcile_mutation_intents",
+                                collection = self.name,
+                                doc_id = id;
+                                "Skipping document that does not match the schema: {err:?}",
+                            );
+                            continue;
+                        }
+                    };
                     // The final state may already have reached some index
                     // objects during a partial flush. Remove it before the
                     // idempotent insert so unique indexes cannot reject their
                     // own surviving posting.
                     self.remove_document_from_indexes(id, &current, now_ms);
-                    self.insert_document_into_indexes(id, &current, now_ms)?;
+                    if let Err(err) = self.insert_document_into_indexes(id, &current, now_ms) {
+                        // Mirrors `repair_document`: an idempotent re-insert of
+                        // an already-indexed document commonly reports
+                        // duplicates, which must not fail the open.
+                        log::warn!(
+                            action = "Collection::reconcile_mutation_intents",
+                            collection = self.name,
+                            doc_id = id;
+                            "Failed to re-index document during intent replay: {err:?}",
+                        );
+                    }
                     self.max_document_id.fetch_max(id, Ordering::AcqRel);
                     self.doc_ids.write().add(id);
                     self.doc_ids_index.write().insert(id);
@@ -1084,7 +1220,7 @@ impl Collection {
         // Direction 2: drop bitmap ids whose object no longer exists. Ids
         // beyond the pre-listing snapshot are skipped — they belong to adds
         // that raced the listing, not to dead documents.
-        let dead_ids: Vec<DocumentId> = {
+        let dead_ids: BTreeSet<DocumentId> = {
             let doc_ids = self.doc_ids.read();
             doc_ids
                 .iter()
@@ -1092,9 +1228,7 @@ impl Collection {
                 .collect()
         };
         let dropped = dead_ids.len();
-        for id in dead_ids {
-            self.heal_missing_doc(id);
-        }
+        self.heal_missing_docs(&dead_ids, now_ms);
 
         if recovered > 0 || dropped > 0 {
             log::warn!(
@@ -1506,19 +1640,35 @@ impl Collection {
         // and simply retires the intents afterwards. Reconciliation happens
         // only on reopen (`replay_mutation_intents`).
         let has_pending_mutations = { !self.pending_mutations.lock().is_empty() };
-        let stored_check_point = self.store_metadata(now_ms).await?;
-
-        // Fast path: no collection metadata update and no index has pending data.
         let has_pending_indexes = self.has_pending_index_flush();
-        if stored_check_point.is_none() && !has_pending_indexes && !has_pending_mutations {
+        // Fast path: no collection metadata update and no index has pending
+        // data. `store_metadata` re-checks the version itself; the check is
+        // repeated here so the index flush below can run *before* the
+        // metadata write without turning a no-op flush into a PUT.
+        let has_pending_metadata = {
+            let version = self.metadata.read().stats.version;
+            self.last_saved_version.load(Ordering::Acquire) < version
+        };
+        if !has_pending_metadata && !has_pending_indexes && !has_pending_mutations {
             return Ok(false);
         }
 
+        // Indexes are persisted **before** the collection metadata that
+        // registers them. Metadata is the durable pointer to the index set:
+        // publishing it first makes a newly created index reachable while its
+        // own objects are still empty, and nothing ever re-backfills it — the
+        // next open bootstraps the empty durable index, `create_*_index_nx`
+        // sees it registered and swallows `AlreadyExists`, and the repair scan
+        // only covers ids above the storage checkpoint. The reverse order can
+        // only leave unreferenced index objects behind, which index creation
+        // overwrites.
         let indexes_saved = if has_pending_indexes {
             self.store_indexes(now_ms).await?
         } else {
             false
         };
+
+        let stored_check_point = self.store_metadata(now_ms).await?;
 
         if let Some(check_point) = stored_check_point {
             // The metadata snapshot was taken under the exclusive operation
@@ -1625,6 +1775,12 @@ impl Collection {
             return Ok(None);
         }
         metadata.stats.last_saved = now_ms.max(metadata.stats.last_saved);
+        // `read_only` describes this handle, not the collection: `close`
+        // flips it to `true` before its final flush, so persisting the live
+        // value made every clean shutdown record `read_only: true` for a
+        // field both constructors then ignore on load. Persist the neutral
+        // value instead of a snapshot nothing honors.
+        metadata.stats.read_only = false;
         let mut payload = Vec::new();
         cbor2::to_writer(&metadata, &mut payload).map_err(|err| DBError::Serialization {
             name: self.name.clone(),
@@ -1662,7 +1818,10 @@ impl Collection {
     /// `Precondition` here means a second writer and is not retried.
     async fn store_metadata_unclaimed(&self) -> Result<(), DBError> {
         let _gate = self.extension_write_gate.lock().await;
-        let metadata = self.metadata();
+        let mut metadata = self.metadata();
+        // See `store_metadata`: the read-only flag is live handle state and is
+        // never persisted.
+        metadata.stats.read_only = false;
         let mut payload = Vec::new();
         cbor2::to_writer(&metadata, &mut payload).map_err(|err| DBError::Serialization {
             name: self.name.clone(),
@@ -1886,12 +2045,22 @@ impl Collection {
     }
 
     /// Sets a user-defined extension key-value pair with a serializable value.
+    /// Values that fail to serialize are dropped with a warning, matching
+    /// [`Collection::set_extension`]'s handling of over-complex values.
     pub fn set_extension_from<T>(&self, key: String, value: T)
     where
         T: Serialize,
     {
-        if let Ok(value) = FieldValue::serialized(&value, None) {
-            self.set_extension(key, value);
+        match FieldValue::serialized(&value, None) {
+            Ok(value) => self.set_extension(key, value),
+            Err(err) => {
+                log::warn!(
+                    action = "Collection::set_extension_from",
+                    collection = self.name,
+                    key = key;
+                    "Dropping extension value that failed to serialize: {err:?}",
+                );
+            }
         }
     }
 
@@ -2072,6 +2241,26 @@ impl Collection {
         let now_ms = unix_ms();
         let name = virtual_field_name(fields);
 
+        // The primary key is served directly from the always-present id
+        // bitmap: `filter_by_field_with` dispatches `_id` to `filter_by_id`
+        // before consulting the B-tree registry, so an index registered under
+        // this exact name could never answer a query — it would only be
+        // backfilled, persisted and flushed forever. Rejecting it here is
+        // preferable to routing `_id` through the registry, which would make
+        // `_id` filters fail on every collection that has no such index (all
+        // of them today) and would keep a second, redundant copy of the id
+        // set in sync for no gain.
+        if name == Schema::ID_KEY {
+            return Err(DBError::Schema {
+                name: self.name.clone(),
+                source: format!(
+                    "BTree index on {:?} is not supported: the primary key is always queryable through the collection id index",
+                    Schema::ID_KEY
+                )
+                .into(),
+            });
+        }
+
         {
             if self.metadata.read().btree_indexes.contains_key(&name) {
                 return Err(DBError::AlreadyExists {
@@ -2127,6 +2316,11 @@ impl Collection {
     }
 
     /// Creates a BTree index if it doesn't already exist.
+    ///
+    /// A B-tree index takes no configuration beyond its field list (which is
+    /// its identity) and the schema entry those fields resolve to, so an
+    /// existing index can never disagree with the request — unlike
+    /// [`Collection::create_hnsw_index_nx`].
     ///
     /// # Arguments
     /// * `fields` - Fields to index
@@ -2204,6 +2398,10 @@ impl Collection {
     }
 
     /// Creates a BM25 index if it doesn't already exist.
+    ///
+    /// Like [`Collection::create_btree_index_nx`], a BM25 index takes no
+    /// configuration beyond its field list, so an existing index cannot
+    /// disagree with the request.
     ///
     /// # Arguments
     /// * `fields` - Fields to index
@@ -2285,6 +2483,16 @@ impl Collection {
 
     /// Creates a HNSW index if it doesn't already exist.
     ///
+    /// # Configuration conflicts
+    ///
+    /// "If it doesn't already exist" means exactly that: an existing index is
+    /// never reconfigured in place. When the field already carries an index
+    /// whose **persisted** configuration differs from `config`, this returns
+    /// an error instead of silently keeping the old one — a discarded
+    /// `dimension` change used to surface much later as a `DimensionMismatch`
+    /// on every insert. Remove the index and recreate it to change its
+    /// configuration.
+    ///
     /// # Arguments
     /// * `field` - Name of the field to index
     /// * `config` - HNSW index configuration
@@ -2296,12 +2504,38 @@ impl Collection {
         field: &str,
         config: HnswConfig,
     ) -> Result<(), DBError> {
-        match self.create_hnsw_index(field, config).await {
+        match self.create_hnsw_index(field, config.clone()).await {
             Ok(_) => Ok(()),
-            Err(DBError::AlreadyExists { .. }) => {
-                // Ignore the error if the index already exists
-                Ok(())
-            }
+            Err(DBError::AlreadyExists {
+                name,
+                path,
+                source,
+                _id,
+            }) => match self.hnsw_indexes.iter().find(|i| i.field_name() == field) {
+                Some(index) => {
+                    let persisted = index.metadata().config;
+                    if persisted == config {
+                        return Ok(());
+                    }
+                    Err(DBError::Index {
+                        name: field.to_string(),
+                        source: format!(
+                            "HNSW index already exists with a different configuration; \
+                             remove it before recreating it. persisted={persisted:?}, requested={config:?}"
+                        )
+                        .into(),
+                    })
+                }
+                // The name is registered in metadata but no index is loaded,
+                // or the duplicate came from somewhere else entirely: there is
+                // no configuration to compare, so surface the original error.
+                None => Err(DBError::AlreadyExists {
+                    name,
+                    path,
+                    source,
+                    _id,
+                }),
+            },
             Err(err) => Err(err),
         }
     }
@@ -2351,17 +2585,28 @@ impl Collection {
     /// index before its files disappear, otherwise reopening the collection
     /// would fail to bootstrap the index. Leftover files from a failed deletion
     /// are harmless and will be overwritten if the index is re-created.
+    ///
+    /// Like every other durable-write path, this holds an `operation_gate`
+    /// lease (required by [`Self::store_metadata_unclaimed`], which relies on
+    /// it to be serialized against flush) and arms a [`CancelGuard`].
     async fn cleanup_removed_index(&self, dir_path: &str) -> Result<(), DBError> {
-        self.store_metadata_unclaimed().await?;
-        if let Err(err) = self.storage.drop_prefix(dir_path).await {
-            log::warn!(
-                action = "Collection::cleanup_removed_index",
-                collection = self.name,
-                index_dir = dir_path;
-                "Failed to drop index data: {err:?}",
-            );
+        let _operation_lease = self.mutation_lease().await?;
+        let guard = self.cancel_guard("Collection::cleanup_removed_index");
+        let rt = async {
+            self.store_metadata_unclaimed().await?;
+            if let Err(err) = self.storage.drop_prefix(dir_path).await {
+                log::warn!(
+                    action = "Collection::cleanup_removed_index",
+                    collection = self.name,
+                    index_dir = dir_path;
+                    "Failed to drop index data: {err:?}",
+                );
+            }
+            Ok(())
         }
-        Ok(())
+        .await;
+        guard.disarm();
+        rt
     }
 
     /// Removes a BM25 full-text index and its persisted files.
@@ -2501,8 +2746,16 @@ impl Collection {
     }
 
     /// Compacts the specified BM25 index to optimize storage and performance.
+    ///
+    /// Takes the **exclusive** operation gate, like [`Collection::flush`] and
+    /// not like the shared lease `add`/`update`/`remove` hold: compaction ends
+    /// in a persistence pass over the index, and a checkpoint must never
+    /// interleave with document mutations. The index crate's own gate is the
+    /// first lock a mutator takes and is always released before it returns, so
+    /// acquiring the collection gate first cannot deadlock against it.
     pub async fn compact_bm25_index(&self, fields: &[&str]) -> Result<(), DBError> {
-        let _operation_lease = self.mutation_lease().await?;
+        let _operation_guard = self.operation_gate.clone().write_owned().await;
+        self.ensure_mutable()?;
         let index = self.find_bm25_index(fields)?;
         let guard = self.cancel_guard("Collection::compact_bm25_index");
         let rt = index.compact_index().await;
@@ -2511,8 +2764,12 @@ impl Collection {
     }
 
     /// Compacts the specified BTree index to optimize storage and performance.
+    ///
+    /// See [`Collection::compact_bm25_index`] for why this takes the exclusive
+    /// operation gate.
     pub async fn compact_btree_index(&self, fields: &[&str]) -> Result<(), DBError> {
-        let _operation_lease = self.mutation_lease().await?;
+        let _operation_guard = self.operation_gate.clone().write_owned().await;
+        self.ensure_mutable()?;
         let index = self.find_btree_index(fields)?;
         let guard = self.cancel_guard("Collection::compact_btree_index");
         let rt = index.compact_index().await;
@@ -2651,21 +2908,29 @@ impl Collection {
         let path = Self::doc_path(id);
         if let Err(err) = self.storage.create(&path, &doc).await {
             rollback_indexes();
-            // The PUT outcome is unknown: it may have committed. Delete the
-            // object so the id cannot survive as an orphan below a future
-            // checkpoint. If even the delete outcome is unknown, treat it
-            // like a crash — the reopen repair scan (whose checkpoint has not
-            // advanced past this id) decides whether the document exists.
-            match self.storage.delete(&path).await {
-                Ok(()) | Err(DBError::NotFound { .. }) => {}
-                Err(delete_err) => {
-                    log::error!(
-                        action = "Collection::add",
-                        collection = self.name,
-                        doc_id = id;
-                        "Failed to clean up document after failed add: {delete_err:?}",
-                    );
-                    self.poison("Collection::add");
+            // `AlreadyExists` is the one *known* outcome of `PutMode::Create`:
+            // this add wrote nothing, the object at `path` is someone else's
+            // committed document (another writer, or a document this handle
+            // has not observed). Deleting it would destroy their data, so the
+            // compensating delete is deliberately skipped.
+            if !matches!(err, DBError::AlreadyExists { .. }) {
+                // Any other failure leaves the PUT outcome unknown: it may
+                // have committed. Delete the object so the id cannot survive
+                // as an orphan below a future checkpoint. If even the delete
+                // outcome is unknown, treat it like a crash — the reopen
+                // repair scan (whose checkpoint has not advanced past this
+                // id) decides whether the document exists.
+                match self.storage.delete(&path).await {
+                    Ok(()) | Err(DBError::NotFound { .. }) => {}
+                    Err(delete_err) => {
+                        log::error!(
+                            action = "Collection::add",
+                            collection = self.name,
+                            doc_id = id;
+                            "Failed to clean up document after failed add: {delete_err:?}",
+                        );
+                        self.poison("Collection::add");
+                    }
                 }
             }
             return Err(err);
@@ -2865,7 +3130,13 @@ impl Collection {
             Ok(())
         })();
 
+        // Restores the pre-update index state. Returns `false` when any
+        // restore failed: the in-memory indexes then no longer describe the
+        // stored document, and since the caller returns an error the next
+        // `flush_inner` would retire this mutation's intent and make the
+        // divergence durable with nothing left to reconcile it.
         let rollback_indexes = || {
+            let mut restored = true;
             for (k, v) in bm25_inserted {
                 k.remove(v.0, &v.1, now_ms);
             }
@@ -2874,26 +3145,60 @@ impl Collection {
             }
 
             for (k, v) in btree_updated {
-                let _ = k.update(id, &v.1, &v.0, now_ms);
+                if let Err(err) = k.update(id, &v.1, &v.0, now_ms) {
+                    restored = false;
+                    log::error!(
+                        action = "Collection::update",
+                        collection = self.name,
+                        doc_id = id,
+                        index = k.name();
+                        "Failed to restore BTree index during update rollback: {err:?}",
+                    );
+                }
             }
 
             for (k, v) in bm25_removed {
-                let _ = k.insert(v.0, &v.1, now_ms);
+                if let Err(err) = k.insert(v.0, &v.1, now_ms) {
+                    restored = false;
+                    log::error!(
+                        action = "Collection::update",
+                        collection = self.name,
+                        doc_id = id,
+                        index = k.name();
+                        "Failed to restore BM25 index during update rollback: {err:?}",
+                    );
+                }
             }
             for (k, v) in hnsw_removed {
-                let _ = k.insert(v.0, v.1.to_vec(), now_ms);
+                if let Err(err) = k.insert(v.0, v.1.to_vec(), now_ms) {
+                    restored = false;
+                    log::error!(
+                        action = "Collection::update",
+                        collection = self.name,
+                        doc_id = id,
+                        index = k.name();
+                        "Failed to restore HNSW index during update rollback: {err:?}",
+                    );
+                }
             }
+            restored
         };
 
         if let Err(err) = rt {
-            rollback_indexes();
+            if !rollback_indexes() {
+                // Memory and storage are diverged in a way this handle no
+                // longer tracks; recover on reopen, exactly like the unknown
+                // storage outcome below. `remove_impl` poisons unconditionally
+                // on its equivalent path for the same reason.
+                self.poison("Collection::update");
+            }
             return Err(err);
         }
 
         // persist the updated document with update version
         let path = Self::doc_path(id);
         if let Err(err) = self.storage.put(&path, &doc, Some(ver)).await {
-            rollback_indexes();
+            let _ = rollback_indexes();
             // The PUT outcome is unknown: the new document may be durable
             // while memory was just rolled back. The retained intent plus a
             // reopen reconcile the divergence; this handle must not continue.
@@ -3110,42 +3415,115 @@ impl Collection {
         Ok(docs)
     }
 
-    /// Drops a document id whose object is missing from storage from the
-    /// in-memory id structures, so the next flush persists the repair.
+    /// Drops document ids whose objects are missing from storage, from the
+    /// in-memory id structures **and from every index that can still be
+    /// purged**, so the next flush persists the repair.
     ///
     /// Only [`Self::reconcile_storage`] calls this: under the
     /// poison-on-unknown-outcome contract, dead ids (bitmap entry without a
     /// backing object) can only be produced by a crash, and reopen recovery
     /// resolves them before the handle serves reads. No-op in read-only mode
-    /// or when the id is not in the bitmap.
-    fn heal_missing_doc(&self, id: DocumentId) {
-        if self.read_only.load(Ordering::Relaxed) {
+    /// or when the ids are not in the bitmap.
+    ///
+    /// Dropping the id from the bitmap alone is not a repair: the derived
+    /// index postings survive, so a unique B-tree key keeps rejecting new
+    /// documents (`AlreadyExists`) forever and `query_ids` / `search_ids`
+    /// keep returning the dead id. The document body is gone, so its indexed
+    /// values cannot be recomputed; each index is purged as far as its API
+    /// allows — see [`Self::purge_dead_ids_from_indexes`].
+    fn heal_missing_docs(&self, ids: &BTreeSet<DocumentId>, now_ms: u64) {
+        if ids.is_empty() || self.read_only.load(Ordering::Relaxed) {
             return;
         }
 
+        self.purge_dead_ids_from_indexes(ids, now_ms);
+
         // Same lock order as add() / remove(): doc_ids, then doc_ids_index.
-        let removed = {
+        let removed: Vec<DocumentId> = {
             let mut doc_ids = self.doc_ids.write();
             let mut doc_ids_index = self.doc_ids_index.write();
-            if doc_ids.contains(id) {
-                doc_ids.remove(id);
-                doc_ids_index.remove(&id);
-                true
-            } else {
-                false
-            }
+            ids.iter()
+                .copied()
+                .filter(|id| {
+                    if doc_ids.contains(*id) {
+                        doc_ids.remove(*id);
+                        doc_ids_index.remove(id);
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .collect()
         };
 
-        if removed {
+        if !removed.is_empty() {
             self.update_metadata(|meta| {
                 meta.stats.version += 1;
             });
             log::warn!(
-                action = "Collection::heal_missing_doc",
+                action = "Collection::heal_missing_docs",
                 collection = self.name,
-                doc_id = id;
-                "Removed dead document id without a backing object",
+                dropped = removed.len();
+                "Removed {} dead document ids without a backing object: {removed:?}",
+                removed.len(),
             );
+        }
+    }
+
+    /// Removes index postings that still reference dead document ids.
+    ///
+    /// The document bodies are gone, so the indexed values cannot be derived
+    /// the usual way. Each index is purged as far as it can be purged by id:
+    ///
+    /// - **HNSW** stores one vector per id and is purged directly.
+    /// - **B-tree** needs the key, so the key space is swept **once** for the
+    ///   whole dead set and every posting list that references a dead id is
+    ///   repaired. That is O(distinct keys) per index, which is proportional
+    ///   to the `data/` listing [`Self::reconcile_storage`] already performs.
+    /// - **BM25** postings are keyed by the document's tokens, so the inverted
+    ///   index is swept **once** for the whole dead set as well
+    ///   ([`anda_db_tfs::BM25Index::purge_ids`]), which also drops the dead
+    ///   documents' lengths from the BM25 counters the scores are derived
+    ///   from.
+    ///
+    /// Both sweeps are `O(index size)` per index, which is proportional to the
+    /// `data/` listing [`Self::reconcile_storage`] already performs.
+    fn purge_dead_ids_from_indexes(&self, dead_ids: &BTreeSet<DocumentId>, now_ms: u64) {
+        for index in &self.btree_indexes {
+            // `Not(Include([]))` excludes nothing, i.e. it walks every key.
+            // The scan holds the index read lock while `f` runs, so the
+            // matching keys are only collected here and removed afterwards.
+            let stale: Vec<(Fv, Vec<DocumentId>)> = index.range_query_with(
+                RangeQuery::Not(Box::new(RangeQuery::Include(Vec::new()))),
+                |key, ids| {
+                    let hits: Vec<DocumentId> = ids
+                        .iter()
+                        .copied()
+                        .filter(|id| dead_ids.contains(id))
+                        .collect();
+                    if hits.is_empty() {
+                        (true, Vec::new())
+                    } else {
+                        (true, vec![(key, hits)])
+                    }
+                },
+            );
+
+            for (key, ids) in stale {
+                for id in ids {
+                    index.remove(id, &key, now_ms);
+                }
+            }
+        }
+
+        for index in &self.hnsw_indexes {
+            for id in dead_ids {
+                index.remove(*id, now_ms);
+            }
+        }
+
+        for index in &self.bm25_indexes {
+            index.purge_ids(dead_ids, now_ms);
         }
     }
 
@@ -3281,35 +3659,41 @@ impl Collection {
             }
         }
 
-        let mut truncate_head = false;
+        // 截断哪一端由扫描自己上报（见 ScanOrder）：混合搜索的结果按相关性
+        // 降序排列，必须保留头部，否则会丢弃最相关的命中，因此带 candidates
+        // 的过滤路径总是上报 Ascending。
+        let mut order = ScanOrder::Ascending;
         match query.filter {
             Some(filter) => {
-                // 「保留尾部」截断只适用于纯过滤路径（结果按 id 升序）；
-                // 混合搜索的结果按相关性降序排列，必须保留头部，
-                // 否则会丢弃最相关的命中。
-                truncate_head = candidates.is_empty() && Self::filter_has_lt_or_le(&filter);
-                result = self.filter_by_field(filter, &candidates, top_k)?;
+                let (ids, scan_order) = self.filter_by_field(filter, &candidates, top_k)?;
+                result = ids;
+                order = scan_order;
             }
             None => result = candidates,
         };
-        if limit > 0 && result.len() > limit {
-            if truncate_head {
-                result.drain(0..(result.len() - limit));
-            } else {
-                result.truncate(limit);
-            }
-        }
+        order.truncate(&mut result, limit);
 
         Ok(result)
     }
 
     /// Queries document IDs based on a filter condition.
     ///
+    /// # Limit semantics
+    ///
+    /// `limit` is clamped to [`Collection::MAX_SEARCH_LIMIT`], and `None`
+    /// means "as many as that bound allows" rather than "every match": this
+    /// is a public entry point (reachable over HTTP as `doc.query_ids`) and
+    /// an unbounded filter materializes one `u64` per matching document.
+    /// An explicit `Some(0)` returns an empty result, deliberately keeping
+    /// the same zero-is-nothing convention as [`Collection::search_ids`]
+    /// instead of overloading it as "unlimited" — the internal scan already
+    /// uses `0` for "unbounded", and letting a caller reach that meaning is
+    /// exactly the trap this bound removes.
+    ///
     /// # Arguments
     /// * `filter` - The filter condition to apply
-    /// * `limit` - Maximum number of results to return. `None` means no
-    ///   limit; an explicit `Some(0)` returns an empty result, consistent
-    ///   with [`Collection::search_ids`].
+    /// * `limit` - Maximum number of results to return, clamped as above.
+    ///
     /// # Returns
     /// A vector of document IDs matching the filter, or an error if filtering fails.
     pub async fn query_ids(
@@ -3328,37 +3712,13 @@ impl Collection {
         if limit == Some(0) {
             return Ok(Vec::new());
         }
-        let limit = limit.unwrap_or(0);
-        let truncate_head = Self::filter_has_lt_or_le(&filter);
+        let limit = limit
+            .unwrap_or(Self::MAX_SEARCH_LIMIT)
+            .min(Self::MAX_SEARCH_LIMIT);
 
-        let mut rt = self.filter_by_field(filter, &[], limit)?;
-        if limit > 0 && rt.len() > limit {
-            if truncate_head {
-                rt.drain(0..(rt.len() - limit));
-            } else {
-                rt.truncate(limit);
-            }
-        }
+        let (mut rt, order) = self.filter_by_field(filter, &[], limit)?;
+        order.truncate(&mut rt, limit);
         Ok(rt)
-    }
-
-    // 临时策略：当过滤条件中出现 Lt/Le 时，结果采用“保留尾部”的截断方式
-    fn filter_has_lt_or_le(filter: &Filter) -> bool {
-        match filter {
-            Filter::Field((_name, rq)) => Self::range_has_lt_or_le(rq),
-            Filter::Or(qs) | Filter::And(qs) => qs.iter().any(|q| Self::filter_has_lt_or_le(q)),
-            Filter::Not(_) => false,
-        }
-    }
-
-    fn range_has_lt_or_le<T>(rq: &RangeQuery<T>) -> bool {
-        match rq {
-            RangeQuery::Lt(_) | RangeQuery::Le(_) => true,
-            RangeQuery::And(qs) | RangeQuery::Or(qs) => {
-                qs.iter().any(|q| Self::range_has_lt_or_le(q))
-            }
-            _ => false,
-        }
     }
 
     /// Gets a document by its ID.
@@ -3427,21 +3787,23 @@ impl Collection {
     /// * `limit` - The number of results to stop retrieving. The returned vector may be shorter or larger than this limit.
     ///
     /// # Returns
-    /// A vector of document IDs matching the filter, or an error if filtering fails
+    /// A vector of document IDs matching the filter paired with the direction
+    /// the scan walked (see [`ScanOrder`]), or an error if filtering fails
     fn filter_by_field(
         &self,
         filter: Filter,
         candidates: &[DocumentId],
         limit: usize,
-    ) -> Result<Vec<DocumentId>, DBError> {
+    ) -> Result<(Vec<DocumentId>, ScanOrder), DBError> {
         if candidates.is_empty() {
-            let mut result = self.filter_by_field_with(filter, None, limit)?;
+            let (mut result, order) = self.filter_by_field_with(filter, None, limit)?;
             result.sort_unstable();
-            Ok(result)
+            Ok((result, order))
         } else {
             let cand_set: FxHashSet<DocumentId> = candidates.iter().copied().collect();
             let matched: FxHashSet<DocumentId> = self
                 .filter_by_field_with(filter, Some(&cand_set), 0)?
+                .0
                 .into_iter()
                 .collect();
 
@@ -3451,7 +3813,10 @@ impl Collection {
                     result.push(*id);
                 }
             }
-            Ok(result)
+            // The result follows the caller's candidate order (relevance
+            // descending for a hybrid search) and the inner scan ran unbounded,
+            // so an over-long result is always trimmed from the tail.
+            Ok((result, ScanOrder::Ascending))
         }
     }
 
@@ -3461,7 +3826,7 @@ impl Collection {
         filter: Filter,
         candidates: Option<&FxHashSet<DocumentId>>,
         limit: usize,
-    ) -> Result<Vec<DocumentId>, DBError> {
+    ) -> Result<(Vec<DocumentId>, ScanOrder), DBError> {
         let mut result = Vec::new();
         match filter {
             Filter::Field((index_name, filter)) => {
@@ -3475,19 +3840,31 @@ impl Collection {
                 } else if let Some(index) =
                     self.btree_indexes.iter().find(|i| i.name() == index_name)
                 {
-                    result.reserve_exact(Self::reserve_hint(limit));
+                    // The index scan honors `limit`, so the direction it walks
+                    // decides which end of an over-long result is kept.
+                    let order = ScanOrder::of_range_query(&filter);
+                    // A range scan visits one posting list per key, and a
+                    // non-unique index (array field, or plain duplicates) maps
+                    // the same document under several keys. Without de-dup the
+                    // same id is emitted once per matching key: `search` would
+                    // return the same document repeatedly and the duplicates
+                    // would consume the caller's `limit`. First-occurrence
+                    // order is preserved, matching the other branches.
+                    let mut rt: UniqueVec<DocumentId> =
+                        UniqueVec::with_capacity(Self::reserve_hint(limit));
                     index.try_range_query_ids(filter, |ids| {
                         for id in ids {
                             if candidates.is_none_or(|s| s.contains(id)) {
-                                result.push(*id);
-                                if limit > 0 && result.len() >= limit {
+                                rt.push(*id);
+                                if limit > 0 && rt.len() >= limit {
                                     return false;
                                 }
                             }
                         }
                         true
                     })?;
-                    Ok(result)
+                    result = rt.into();
+                    Ok((result, order))
                 } else {
                     Err(DBError::Index {
                         name: self.name.clone(),
@@ -3501,7 +3878,7 @@ impl Collection {
                 // instead of stopping once the union reaches `limit`: the
                 // early stop made the result depend on operand order.
                 for query in queries {
-                    let ids = self.filter_by_field_with(*query, candidates, limit)?;
+                    let (ids, _) = self.filter_by_field_with(*query, candidates, limit)?;
                     rt.extend(ids);
                 }
 
@@ -3509,38 +3886,39 @@ impl Collection {
                 // Canonical order, so equal boolean sets yield equal results
                 // regardless of branch order; the caller applies `limit`.
                 result.sort_unstable();
-                Ok(result)
+                Ok((result, ScanOrder::Ascending))
             }
             Filter::And(queries) => {
                 let mut iter = queries.into_iter();
                 if let Some(query) = iter.next() {
                     let mut rt: FxHashSet<DocumentId> = self
                         .filter_by_field_with(*query, candidates, 0)?
+                        .0
                         .into_iter()
                         .collect();
 
                     for query in iter {
                         rt = self
                             .filter_by_field_with(*query, Some(&rt), 0)?
+                            .0
                             .into_iter()
                             .collect();
                         if rt.is_empty() {
-                            return Ok(vec![]);
+                            return Ok((vec![], ScanOrder::Ascending));
                         }
                     }
 
                     result = rt.into_iter().collect();
-                    // 由调用方控制结果长度
-                    // if limit > 0 && result.len() > limit {
-                    //     result.truncate(limit);
-                    // }
                 }
-                Ok(result)
+                // 每个操作数都以 limit = 0 求值，得到的是完整交集，
+                // 由调用方按升序截断长度
+                Ok((result, ScanOrder::Ascending))
             }
             Filter::Not(query) => {
                 result.reserve_exact(Self::reserve_hint(limit));
                 let exclude: FxHashSet<u64> = self
                     .filter_by_field_with(*query, None, 0)?
+                    .0
                     .into_iter()
                     .collect();
                 for id in self.doc_ids_index.read().iter() {
@@ -3551,7 +3929,7 @@ impl Collection {
                         }
                     }
                 }
-                Ok(result)
+                Ok((result, ScanOrder::Ascending))
             }
         }
     }
@@ -3564,13 +3942,17 @@ impl Collection {
     /// * `limit` - The number of results to stop retrieving. The returned vector may be shorter or larger than this limit.
     ///
     /// # Returns
-    /// A vector of document IDs matching the range query
+    /// A vector of document IDs matching the range query paired with the
+    /// direction the scan walked (see [`ScanOrder`])
     fn filter_by_id(
         &self,
         query: RangeQuery<DocumentId>,
         candidates: Option<&FxHashSet<DocumentId>>,
         limit: usize,
-    ) -> Vec<DocumentId> {
+    ) -> (Vec<DocumentId>, ScanOrder) {
+        // 扫描方向由查询形态决定（只有 Lt/Le 倒序遍历），在此上报，
+        // 调用方不必再从过滤条件反推
+        let order = ScanOrder::of_range_query(&query);
         let mut result = Vec::new();
         match query {
             RangeQuery::Eq(id) => {
@@ -3589,7 +3971,7 @@ impl Collection {
                     if candidates.is_none_or(|s| s.contains(id)) {
                         result.push(*id);
                         if limit > 0 && result.len() >= limit {
-                            return result;
+                            return (result, order);
                         }
                     }
                 }
@@ -3604,7 +3986,7 @@ impl Collection {
                     if candidates.is_none_or(|s| s.contains(id)) {
                         result.push(*id);
                         if limit > 0 && result.len() >= limit {
-                            return result;
+                            return (result, order);
                         }
                     }
                 }
@@ -3648,6 +4030,12 @@ impl Collection {
                 result.extend(tmp);
             }
             RangeQuery::Between(start_key, end_key) => {
+                if start_key > end_key {
+                    // 与 anda_db_btree 的语义一致：区间反转匹配空集，
+                    // 而不是让 BTreeSet::range 直接 panic
+                    return (result, order);
+                }
+
                 result.reserve_exact(Self::reserve_hint(
                     limit.min(end_key.saturating_sub(start_key).saturating_add(1) as usize),
                 ));
@@ -3655,47 +4043,52 @@ impl Collection {
                     if candidates.is_none_or(|s| s.contains(id)) {
                         result.push(*id);
                         if limit > 0 && result.len() >= limit {
-                            return result;
+                            return (result, order);
                         }
                     }
                 }
             }
             RangeQuery::Include(ids) => {
-                result.reserve_exact(limit.min(ids.len()));
+                // 与 anda_db_btree 的 Include 一致：重复的 key 只产出一次
+                // （那边用 BTreeSet 去重）。否则调用方传入的重复 id 会让同一个
+                // 文档重复出现，并且提前占满 limit。这里保留首次出现的顺序。
+                let mut rt: UniqueVec<DocumentId> =
+                    UniqueVec::with_capacity(limit.min(ids.len()).min(Self::MAX_RESERVE_HINT));
                 let doc_ids_index = self.doc_ids_index.read();
                 for id in ids.into_iter() {
                     if doc_ids_index.contains(&id) && candidates.is_none_or(|s| s.contains(&id)) {
-                        result.push(id);
-                        if limit > 0 && result.len() >= limit {
-                            return result;
+                        rt.push(id);
+                        if limit > 0 && rt.len() >= limit {
+                            break;
                         }
                     }
                 }
+                drop(doc_ids_index);
+                result = rt.into();
             }
             RangeQuery::And(queries) => {
                 let mut iter = queries.into_iter();
                 if let Some(query) = iter.next() {
-                    let mut rt: UniqueVec<u64> = self.filter_by_id(*query, candidates, 0).into();
+                    let mut rt: UniqueVec<u64> = self.filter_by_id(*query, candidates, 0).0.into();
 
                     for query in iter {
-                        let keys: UniqueVec<u64> = self.filter_by_id(*query, candidates, 0).into();
+                        let keys: UniqueVec<u64> =
+                            self.filter_by_id(*query, candidates, 0).0.into();
                         rt.intersect_with(&keys);
                         if rt.is_empty() {
-                            return vec![];
+                            return (vec![], order);
                         }
                     }
 
                     result = rt.into();
-                    // 由调用方控制结果长度
-                    // if limit > 0 && result.len() > limit {
-                    //     result.truncate(limit);
-                    // }
                 }
+                // 每个操作数都以 limit = 0 求值，得到的是完整交集（升序），
+                // 由调用方按 order 截断长度
             }
             RangeQuery::Or(queries) => {
                 let mut rt = UniqueVec::new();
                 for query in queries {
-                    let keys = self.filter_by_id(*query, candidates, 0);
+                    let (keys, _) = self.filter_by_id(*query, candidates, 0);
                     rt.extend(keys);
                     if limit > 0 && rt.len() > limit {
                         break;
@@ -3703,28 +4096,25 @@ impl Collection {
                 }
 
                 result = rt.into();
-                // 由调用方控制结果长度
-                // if limit > 0 && result.len() > limit {
-                //     result.truncate(limit);
-                // }
+                // 同 And：各分支均以 limit = 0 求值，由调用方按 order 截断长度
             }
             RangeQuery::Not(query) => {
                 result.reserve_exact(Self::reserve_hint(limit));
                 // 先收集要排除的 key，再遍历全集差集
                 let exclude: FxHashSet<u64> =
-                    self.filter_by_id(*query, None, 0).into_iter().collect();
+                    self.filter_by_id(*query, None, 0).0.into_iter().collect();
                 for id in self.doc_ids_index.read().iter() {
                     if !exclude.contains(id) && candidates.is_none_or(|s| s.contains(id)) {
                         result.push(*id);
                         if limit > 0 && result.len() >= limit {
-                            return result;
+                            return (result, order);
                         }
                     }
                 }
             }
         }
 
-        result
+        (result, order)
     }
 
     /// Updates the collection metadata with the provided function.
@@ -3745,7 +4135,7 @@ mod tests {
     use super::*;
     use crate::{
         database::{AndaDB, DBConfig},
-        error::DBError,
+        error::{CollectionState, DBError},
         index::HnswConfig,
         query::{Filter, Query, RangeQuery, Search},
         schema::{AndaDBSchema, Document, Fv, Json, Schema, Vector},
@@ -5488,13 +5878,16 @@ mod tests {
 
         // candidates 为空：结果应为正序
         let filter_all = Filter::Field((Schema::ID_KEY.to_string(), RangeQuery::Gt(Fv::U64(0))));
-        let ids = collection.filter_by_field(filter_all, &[], 0)?;
+        let (ids, order) = collection.filter_by_field(filter_all, &[], 0)?;
         assert_eq!(ids, vec![1, 2, 3]);
+        assert_eq!(order, ScanOrder::Ascending);
 
         // candidates 非空：结果顺序应遵循 candidates 顺序
         let filter_subset = Filter::Field((Schema::ID_KEY.to_string(), RangeQuery::Ge(Fv::U64(2))));
-        let ids = collection.filter_by_field(filter_subset, &[3, 1, 2], 0)?;
+        let (ids, order) = collection.filter_by_field(filter_subset, &[3, 1, 2], 0)?;
         assert_eq!(ids, vec![3, 2]);
+        // 候选集按相关性排序，只能从尾部截断
+        assert_eq!(order, ScanOrder::Ascending);
 
         db.close().await?;
         Ok(())
@@ -6031,6 +6424,117 @@ mod tests {
             })
             .await?;
         assert_eq!(ids, vec![3, 4]);
+
+        db.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_query_ids_equivalent_filters_return_the_same_page() -> Result<(), DBError> {
+        let db = setup_test_db().await?;
+        let collection = create_test_collection(&db, async |collection| {
+            collection.create_btree_index_nx(&["age"]).await?;
+            Ok(())
+        })
+        .await?;
+
+        // age == _id == 1..=20
+        for i in 1..=20u64 {
+            let doc = create_test_doc(0, &format!("user_{i}"), i as u32, vec!["x"]);
+            assert_eq!(collection.add_from(&doc).await?, i);
+        }
+
+        // 三种等价写法（5 <= x < 15），分别走 BTree 索引路径和 _id 快路径。
+        // 截断端过去是从过滤条件反推的，导致 And 被误判为“保留尾部”，
+        // 同一 limit 下三者返回互不相交的结果。
+        for field in [Schema::ID_KEY, "age"] {
+            let filters = [
+                Filter::And(vec![
+                    Box::new(Filter::Field((
+                        field.to_string(),
+                        RangeQuery::Ge(Fv::U64(5)),
+                    ))),
+                    Box::new(Filter::Field((
+                        field.to_string(),
+                        RangeQuery::Lt(Fv::U64(15)),
+                    ))),
+                ]),
+                Filter::Field((
+                    field.to_string(),
+                    RangeQuery::Between(Fv::U64(5), Fv::U64(14)),
+                )),
+                Filter::Field((
+                    field.to_string(),
+                    RangeQuery::And(vec![
+                        Box::new(RangeQuery::Ge(Fv::U64(5))),
+                        Box::new(RangeQuery::Lt(Fv::U64(15))),
+                    ]),
+                )),
+            ];
+
+            let full: Vec<DocumentId> = (5..=14).collect();
+            for filter in filters {
+                let ids = collection.query_ids(filter.clone(), Some(3)).await?;
+                assert_eq!(ids, vec![5, 6, 7], "field {field}, filter {filter:?}");
+
+                let ids = collection.query_ids(filter.clone(), None).await?;
+                assert_eq!(ids, full, "field {field}, filter {filter:?}");
+
+                // 纯过滤的 search_ids 走同一条路径，结果必须一致
+                let ids = collection
+                    .search_ids(Query {
+                        filter: Some(filter.clone()),
+                        limit: Some(3),
+                        ..Default::default()
+                    })
+                    .await?;
+                assert_eq!(ids, vec![5, 6, 7], "field {field}, filter {filter:?}");
+            }
+        }
+
+        db.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_filter_by_id_inverted_between_is_empty() -> Result<(), DBError> {
+        let db = setup_test_db().await?;
+        let collection = create_test_collection(&db, async |_| Ok(())).await?;
+
+        for i in 1..=5u64 {
+            let doc = create_test_doc(0, &format!("user_{i}"), i as u32, vec!["x"]);
+            assert_eq!(collection.add_from(&doc).await?, i);
+        }
+
+        // 反转区间匹配空集（此前 BTreeSet::range 会直接 panic）
+        let inverted = Filter::Field((
+            Schema::ID_KEY.to_string(),
+            RangeQuery::Between(Fv::U64(4), Fv::U64(2)),
+        ));
+        assert!(
+            collection
+                .query_ids(inverted.clone(), None)
+                .await?
+                .is_empty()
+        );
+
+        // 嵌套在复合查询里同样不能 panic
+        let nested = Filter::Field((
+            Schema::ID_KEY.to_string(),
+            RangeQuery::Or(vec![
+                Box::new(RangeQuery::Between(Fv::U64(4), Fv::U64(2))),
+                Box::new(RangeQuery::Eq(Fv::U64(1))),
+            ]),
+        ));
+        assert_eq!(collection.query_ids(nested, None).await?, vec![1]);
+
+        let ids = collection
+            .search_ids(Query {
+                filter: Some(inverted),
+                ..Default::default()
+            })
+            .await?;
+        assert!(ids.is_empty());
 
         db.close().await?;
         Ok(())
@@ -6800,7 +7304,8 @@ mod tests {
             .flush(same_ms)
             .await
             .expect_err("poisoned handle must reject flush");
-        assert!(err.to_string().contains("poisoned"), "{err}");
+        assert!(err.is_poisoned(), "{err:?}");
+        assert_eq!(err.collection_state(), Some(CollectionState::Poisoned));
         assert!(
             collection
                 .add_from(&create_test_doc(0, "three", 22, vec!["three"]))
@@ -6895,7 +7400,8 @@ mod tests {
             .save_extension("after_cancel".to_string(), Fv::Text("durable".to_string()))
             .await
             .expect_err("poisoned handle must reject writes");
-        assert!(err.to_string().contains("poisoned"), "{err}");
+        assert!(err.is_poisoned(), "{err:?}");
+        assert_eq!(err.collection_state(), Some(CollectionState::Poisoned));
 
         // Reopening through the same database discards the poisoned handle
         // without flushing it. The watermark-bounded repair scan recovers the
@@ -7810,6 +8316,628 @@ mod tests {
                 .await
                 .is_err()
         );
+
+        db.close().await?;
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------
+    // Regression tests for audited defects
+    // ---------------------------------------------------------------------
+
+    fn test_db_config() -> DBConfig {
+        DBConfig {
+            name: "test_db".to_string(),
+            description: "Test database".to_string(),
+            storage: StorageConfig {
+                compress_level: 0,
+                ..Default::default()
+            },
+            lock: None,
+        }
+    }
+
+    async fn connect_test_db(object_store: Arc<dyn ObjectStore>) -> Result<AndaDB, DBError> {
+        AndaDB::connect(object_store, test_db_config()).await
+    }
+
+    /// An `InMemory` store that rejects `put` for every location containing a
+    /// configured substring while armed.
+    #[derive(Debug)]
+    struct FailPutStore {
+        inner: Arc<InMemory>,
+        fail_put_substr: String,
+        armed: Arc<TestAtomicBool>,
+    }
+
+    impl FailPutStore {
+        fn new(fail_put_substr: impl Into<String>) -> Self {
+            Self {
+                inner: Arc::new(InMemory::new()),
+                fail_put_substr: fail_put_substr.into(),
+                armed: Arc::new(TestAtomicBool::new(false)),
+            }
+        }
+
+        fn arm(&self, armed: bool) {
+            self.armed.store(armed, TestOrdering::Release);
+        }
+    }
+
+    impl fmt::Display for FailPutStore {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("FailPutStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for FailPutStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> ObjectStoreResult<PutResult> {
+            if self.armed.load(TestOrdering::Acquire)
+                && location.as_ref().contains(&self.fail_put_substr)
+            {
+                return Err(object_store::Error::Generic {
+                    store: "fail_put",
+                    source: "injected put failure".into(),
+                });
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> ObjectStoreResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, ObjectStoreResult<Path>>,
+        ) -> BoxStream<'static, ObjectStoreResult<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> ObjectStoreResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> ObjectStoreResult<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// A newly created index must be durable **before** the collection
+    /// metadata that registers it. Publishing the registration first left the
+    /// index permanently empty on the next start: bootstrap loaded the empty
+    /// durable index, `create_bm25_index_nx` swallowed `AlreadyExists`, and the
+    /// repair scan only covers ids above the storage checkpoint.
+    #[tokio::test]
+    async fn test_flush_persists_index_before_registering_it() -> Result<(), DBError> {
+        let store = Arc::new(FailPutStore::new("bm25_indexes/name/b_"));
+        let object_store: Arc<dyn ObjectStore> = store.clone();
+
+        let db = connect_test_db(object_store.clone()).await?;
+        let collection = create_test_collection(&db, async |_| Ok(())).await?;
+        for i in 0..20u32 {
+            collection
+                .add_from(&create_test_doc(0, &format!("doc-{i}"), 20 + i, vec!["t"]))
+                .await?;
+        }
+        assert_eq!(collection.len(), 20);
+        db.close().await?;
+        drop(db);
+
+        // Reopen and create the BM25 index: the backfill only exists in
+        // memory until a flush persists it. The index bucket write fails.
+        store.arm(true);
+        let db = connect_test_db(object_store.clone()).await?;
+        let opened = db
+            .open_collection("test_collection".to_string(), async |c| {
+                c.create_bm25_index_nx(&["name"]).await?;
+                Ok(())
+            })
+            .await;
+        assert!(
+            opened.is_err(),
+            "the failing index flush must fail the open that created it"
+        );
+        drop(db);
+
+        // Next start: whatever is durable must not claim to be a usable index.
+        store.arm(false);
+        let db = connect_test_db(object_store.clone()).await?;
+        let collection = db
+            .open_collection("test_collection".to_string(), async |c| {
+                c.create_bm25_index_nx(&["name"]).await?;
+                Ok(())
+            })
+            .await?;
+        assert_eq!(collection.len(), 20);
+        let hits = collection
+            .search_ids(Query {
+                search: Some(Search {
+                    text: Some("doc-3".to_string()),
+                    ..Default::default()
+                }),
+                limit: Some(20),
+                ..Default::default()
+            })
+            .await?;
+        assert!(
+            !hits.is_empty(),
+            "the BM25 index must be backfilled instead of silently staying empty"
+        );
+
+        db.close().await?;
+        Ok(())
+    }
+
+    /// A single unusable retained intent must not make the collection
+    /// permanently unopenable: nothing clears it, so every reopen would fail
+    /// identically with no operator escape hatch.
+    #[tokio::test]
+    async fn test_open_tolerates_unusable_mutation_intents() -> Result<(), DBError> {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = connect_test_db(object_store.clone()).await?;
+        let collection = create_test_collection(&db, async |c| {
+            c.create_btree_index_nx(&["age"]).await?;
+            Ok(())
+        })
+        .await?;
+        let id = collection
+            .add_from(&create_test_doc(0, "alice", 30, vec!["a"]))
+            .await?;
+        collection.flush(unix_ms()).await?;
+
+        // (a) An intent object that no longer decodes at all.
+        collection
+            .storage
+            .put_bytes(
+                &Collection::mutation_intent_path(1),
+                Bytes::from_static(b"not a mutation intent"),
+                PutMode::Overwrite,
+            )
+            .await?;
+
+        // (b) A decodable intent whose recorded pre-image no longer satisfies
+        // the schema — what a crash plus a later schema change produces.
+        let name_idx = collection
+            .schema()
+            .get_field("name")
+            .expect("name field")
+            .idx();
+        let mut previous: DocumentOwned = Document::try_from(
+            collection.schema(),
+            &create_test_doc(id, "alice", 30, vec!["a"]),
+        )?
+        .into();
+        previous.fields.insert(name_idx, Fv::U64(7));
+        assert!(
+            Document::try_from_doc(collection.schema(), previous.clone()).is_err(),
+            "the pre-image must be undecodable for this test to mean anything"
+        );
+        let intent = MutationIntent {
+            sequence: 2,
+            document_id: id,
+            previous: Some(previous),
+            proposed: None,
+        };
+        collection
+            .storage
+            .create(&Collection::mutation_intent_path(2), &intent)
+            .await?;
+
+        db.close().await?;
+        drop(db);
+
+        let db = connect_test_db(object_store).await?;
+        let collection = db
+            .open_collection("test_collection".to_string(), async |_| Ok(()))
+            .await?;
+        assert_eq!(collection.len(), 1);
+        let doc: TestDoc = collection.get_as(id).await?;
+        assert_eq!(doc.name, "alice");
+        assert_eq!(
+            collection
+                .query_ids(
+                    Filter::Field(("age".to_string(), RangeQuery::Eq(Fv::U64(30)))),
+                    None,
+                )
+                .await?,
+            vec![id]
+        );
+
+        db.close().await?;
+        Ok(())
+    }
+
+    /// Neither a multi-key posting scan nor a caller-supplied `Include` list
+    /// may emit the same document id twice: duplicates make `search` return
+    /// the same document repeatedly and consume the caller's `limit`.
+    #[tokio::test]
+    async fn test_filter_results_are_deduplicated() -> Result<(), DBError> {
+        let db = setup_test_db().await?;
+        let collection = create_test_collection(&db, async |c| {
+            c.create_btree_index_nx(&["tags"]).await?;
+            Ok(())
+        })
+        .await?;
+
+        let id = collection
+            .add_from(&create_test_doc(0, "alice", 30, vec!["x", "y", "z"]))
+            .await?;
+
+        // The document is indexed under three keys; a range scan visits all
+        // three postings.
+        let tags_filter = Filter::Field((
+            "tags".to_string(),
+            RangeQuery::Between(Fv::Text("a".to_string()), Fv::Text("zz".to_string())),
+        ));
+        assert_eq!(
+            collection.query_ids(tags_filter.clone(), None).await?,
+            vec![id]
+        );
+        let docs = collection
+            .search(Query {
+                filter: Some(tags_filter.clone()),
+                limit: Some(10),
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!(docs.len(), 1);
+
+        // A `limit` must count distinct documents, not postings.
+        let second = collection
+            .add_from(&create_test_doc(0, "bob", 31, vec!["x", "y", "z"]))
+            .await?;
+        assert_eq!(
+            collection.query_ids(tags_filter, Some(2)).await?,
+            vec![id, second]
+        );
+
+        // Duplicated keys in an `Include` list yield one hit each, matching
+        // `anda_db_btree`'s own `Include` semantics.
+        assert_eq!(
+            collection
+                .query_ids(
+                    Filter::Field((
+                        "_id".to_string(),
+                        RangeQuery::Include(vec![
+                            Fv::U64(id),
+                            Fv::U64(id),
+                            Fv::U64(second),
+                            Fv::U64(id),
+                        ]),
+                    )),
+                    None,
+                )
+                .await?,
+            vec![id, second]
+        );
+
+        db.close().await?;
+        Ok(())
+    }
+
+    /// `create_hnsw_index_nx` must not silently keep an index whose persisted
+    /// configuration differs from the requested one.
+    #[tokio::test]
+    async fn test_create_hnsw_index_nx_rejects_changed_config() -> Result<(), DBError> {
+        let db = setup_test_db().await?;
+        let collection = create_test_collection(&db, async |c| {
+            c.create_hnsw_index_nx(
+                "vector",
+                HnswConfig {
+                    dimension: 10,
+                    ..Default::default()
+                },
+            )
+            .await?;
+            // Same configuration: still idempotent.
+            c.create_hnsw_index_nx(
+                "vector",
+                HnswConfig {
+                    dimension: 10,
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+            let err = c
+                .create_hnsw_index_nx(
+                    "vector",
+                    HnswConfig {
+                        dimension: 4,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect_err("a changed configuration must not be discarded");
+            assert!(matches!(err, DBError::Index { .. }), "{err:?}");
+
+            // A non-dimension change must be reported too.
+            let err = c
+                .create_hnsw_index_nx(
+                    "vector",
+                    HnswConfig {
+                        dimension: 10,
+                        ef_search: 999,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect_err("a changed configuration must not be discarded");
+            assert!(matches!(err, DBError::Index { .. }), "{err:?}");
+            Ok(())
+        })
+        .await?;
+
+        // The existing index is untouched and still accepts its own vectors.
+        assert_eq!(collection.get_hnsw_index("vector")?.dimension(), 10);
+        collection
+            .add_from(&create_test_doc(0, "alice", 30, vec!["a"]))
+            .await?;
+
+        db.close().await?;
+        Ok(())
+    }
+
+    /// `PutMode::Create` reporting `AlreadyExists` means this add wrote
+    /// nothing and the object belongs to someone else. The compensating
+    /// delete must not run, or it destroys a committed document.
+    #[tokio::test]
+    async fn test_add_conflict_does_not_delete_the_existing_document() -> Result<(), DBError> {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        let db_a = connect_test_db(object_store.clone()).await?;
+        let collection_a = create_test_collection(&db_a, async |_| Ok(())).await?;
+        // Publish the collection so the second writer can open it while its
+        // own `max_document_id` is still 0.
+        db_a.flush().await?;
+
+        let db_b = connect_test_db(object_store.clone()).await?;
+        let collection_b = create_test_collection(&db_b, async |_| Ok(())).await?;
+        assert_eq!(collection_b.max_document_id(), 0);
+
+        let id = collection_a
+            .add_from(&create_test_doc(0, "alice", 30, vec!["a"]))
+            .await?;
+        assert_eq!(id, 1);
+        collection_a.flush(unix_ms()).await?;
+
+        // The second writer allocates the same id and loses the create race.
+        let err = collection_b
+            .add_from(&create_test_doc(0, "bob", 31, vec!["b"]))
+            .await
+            .expect_err("the conflicting add must fail");
+        assert!(matches!(err, DBError::AlreadyExists { .. }), "{err:?}");
+
+        // Writer A's document must still be there.
+        let stored = object_store
+            .head(&Path::from(format!(
+                "test_db/test_collection/{}",
+                Collection::doc_path(id)
+            )))
+            .await;
+        assert!(
+            stored.is_ok(),
+            "the losing add must not delete the winner's document: {stored:?}"
+        );
+        let doc: TestDoc = collection_a.get_as(id).await?;
+        assert_eq!(doc.name, "alice");
+
+        db_a.close().await?;
+        Ok(())
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, AndaDBSchema)]
+    struct UniqueNameDoc {
+        pub _id: u64,
+        #[unique]
+        pub name: String,
+        pub body: String,
+        pub vector: Vector,
+    }
+
+    fn unique_name_doc(name: &str, vector: [f32; 4]) -> UniqueNameDoc {
+        UniqueNameDoc {
+            _id: 0,
+            name: name.to_string(),
+            body: format!("{name} keeps a journal"),
+            vector: vector.into_iter().map(bf16::from_f32).collect(),
+        }
+    }
+
+    /// Dropping a dead id from the bitmap is only half the repair: the index
+    /// postings survive, so a unique key stays occupied forever and queries
+    /// keep returning the dead id.
+    #[tokio::test]
+    async fn test_reconcile_storage_purges_index_postings_of_dead_ids() -> Result<(), DBError> {
+        let db = setup_test_db().await?;
+        let collection = db
+            .open_or_create_collection(
+                UniqueNameDoc::schema()?,
+                CollectionConfig {
+                    name: "unique_docs".to_string(),
+                    description: String::new(),
+                },
+                async |c| {
+                    c.create_btree_index_nx(&["name"]).await?;
+                    c.create_bm25_index_nx(&["body"]).await?;
+                    c.create_hnsw_index_nx(
+                        "vector",
+                        HnswConfig {
+                            dimension: 4,
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                    Ok(())
+                },
+            )
+            .await?;
+
+        let alice = collection
+            .add_from(&unique_name_doc("alice", [1.0, 0.0, 0.0, 0.0]))
+            .await?;
+        collection
+            .add_from(&unique_name_doc("bob", [0.0, 1.0, 0.0, 0.0]))
+            .await?;
+        collection.flush(unix_ms()).await?;
+
+        // Simulate a crash that lost the document object.
+        collection
+            .storage
+            .delete(&Collection::doc_path(alice))
+            .await?;
+
+        let (recovered, dropped) = collection.reconcile_storage().await?;
+        assert_eq!((recovered, dropped), (0, 1));
+        assert!(!collection.contains(alice));
+
+        // The B-tree posting must be gone: queries no longer return the dead
+        // id, and the unique key is free again.
+        assert!(
+            collection
+                .query_ids(
+                    Filter::Field((
+                        "name".to_string(),
+                        RangeQuery::Eq(Fv::Text("alice".to_string())),
+                    )),
+                    None,
+                )
+                .await?
+                .is_empty()
+        );
+
+        // The BM25 postings must be gone too. They are keyed by the document's
+        // tokens, which the lost body no longer supplies, so the index has to
+        // be swept by id — otherwise a full-text search keeps resurrecting the
+        // dead id (`search_ids` returns BM25 hits unfiltered).
+        let text_hits = collection
+            .search_ids(Query {
+                search: Some(Search {
+                    text: Some("alice".to_string()),
+                    ..Default::default()
+                }),
+                limit: Some(10),
+                ..Default::default()
+            })
+            .await?;
+        assert!(text_hits.is_empty(), "{text_hits:?}");
+
+        let reborn = collection
+            .add_from(&unique_name_doc("alice", [1.0, 0.0, 0.0, 0.0]))
+            .await?;
+        assert_ne!(reborn, alice);
+
+        // The reborn document is the only text hit; the dead id stays gone.
+        let text_hits = collection
+            .search_ids(Query {
+                search: Some(Search {
+                    text: Some("alice".to_string()),
+                    ..Default::default()
+                }),
+                limit: Some(10),
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!(text_hits, vec![reborn]);
+
+        // The HNSW posting must be gone as well.
+        let hits = collection
+            .search_ids(Query {
+                search: Some(Search {
+                    vector: Some(vec![1.0, 0.0, 0.0, 0.0]),
+                    ..Default::default()
+                }),
+                limit: Some(10),
+                ..Default::default()
+            })
+            .await?;
+        assert!(!hits.contains(&alice), "{hits:?}");
+
+        // Surviving documents keep their postings.
+        assert_eq!(
+            collection
+                .query_ids(
+                    Filter::Field((
+                        "name".to_string(),
+                        RangeQuery::Eq(Fv::Text("bob".to_string())),
+                    )),
+                    None,
+                )
+                .await?
+                .len(),
+            1
+        );
+        let bob_hits = collection
+            .search_ids(Query {
+                search: Some(Search {
+                    text: Some("bob".to_string()),
+                    ..Default::default()
+                }),
+                limit: Some(10),
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!(bob_hits.len(), 1, "{bob_hits:?}");
+
+        db.close().await?;
+        Ok(())
+    }
+
+    /// A B-tree index on the primary key can never answer a query: the filter
+    /// dispatcher serves `_id` from the collection's own id index.
+    #[tokio::test]
+    async fn test_btree_index_on_primary_key_is_rejected() -> Result<(), DBError> {
+        let db = setup_test_db().await?;
+        create_test_collection(&db, async |c| {
+            let err = c
+                .create_btree_index(&["_id"])
+                .await
+                .expect_err("an unreachable index must be rejected");
+            assert!(matches!(err, DBError::Schema { .. }), "{err:?}");
+            // `_nx` must not swallow it either.
+            assert!(c.create_btree_index_nx(&["_id"]).await.is_err());
+            Ok(())
+        })
+        .await?;
 
         db.close().await?;
         Ok(())

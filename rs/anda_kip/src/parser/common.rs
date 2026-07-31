@@ -1,7 +1,7 @@
 use nom::{
     IResult, Parser,
     branch::alt,
-    bytes::complete::{tag, tag_no_case},
+    bytes::complete::tag,
     character::complete::{anychar, char, multispace1},
     combinator::{cut, map, not, opt, value, verify},
     error::{ErrorKind, ParseError, context},
@@ -51,6 +51,11 @@ pub fn keyword<'a>(
 /// (e.g., `ORDER BY`, `CONCEPT TYPES`, `WITH METADATA`). Whitespace is only
 /// mandatory *between* tokens; trailing whitespace after the final keyword is
 /// the caller's responsibility (typically via `ws(keywords(...))`).
+///
+/// The final token is still checked for a word boundary ([`word_boundary`]),
+/// exactly like the single-token [`word`]. Without it `DESCRIBE CONCEPT
+/// TYPESLIMIT 5` parsed as a valid `DESCRIBE CONCEPT TYPES LIMIT 5`, even
+/// though the spec (§5.1.3) spells those as separate tokens.
 pub fn keywords<'a>(
     words: &'static [&'static str],
 ) -> impl Parser<&'a str, Output = (), Error = VerboseError<&'a str>> {
@@ -63,22 +68,31 @@ pub fn keywords<'a>(
                 input = rest;
             }
         }
+        let (input, _) = word_boundary().parse(input)?;
         Ok((input, ()))
     }
 }
 
-/// Matches a keyword at a word boundary: the keyword must not be immediately
-/// followed by an identifier character (letter, digit, or underscore), so
-/// `FIND` does not match the prefix of `FINDX`. Unlike [`keyword`], no
-/// trailing whitespace is required or consumed, which makes it safe for
-/// keywords directly followed by `(`, `{`, or end of input.
+/// Asserts that the input is at a keyword boundary, consuming nothing.
+///
+/// A keyword ends where the next token begins, so it must not be glued to
+/// an identifier character (`FIND` must not match the prefix of `FINDX`), to a
+/// variable (`INTO?b`), or to a quoted string (`WITH TYPE"Drug"`) — each of
+/// those is two tokens in the grammar. Delimiters (`(`, `{`, `,`, `:`, ...),
+/// whitespace and end of input are all valid boundaries.
+pub fn word_boundary<'a>() -> impl Parser<&'a str, Output = (), Error = VerboseError<&'a str>> {
+    not(verify(anychar, |c: &char| {
+        c.is_alphanumeric() || matches!(c, '_' | '?' | '"')
+    }))
+}
+
+/// Matches a keyword at a word boundary (see [`word_boundary`]). Unlike
+/// [`keyword`], no trailing whitespace is required or consumed, which makes it
+/// safe for keywords directly followed by `(`, `{`, or end of input.
 pub fn word<'a>(
     w: &'static str,
 ) -> impl Parser<&'a str, Output = &'a str, Error = VerboseError<&'a str>> {
-    terminated(
-        tag(w),
-        not(verify(anychar, |c: &char| c.is_alphanumeric() || *c == '_')),
-    )
+    terminated(tag(w), word_boundary())
 }
 
 /// Parses a valid identifier (e.g., for variables, types, predicates).
@@ -128,13 +142,17 @@ pub fn dot_path_var(input: &str) -> VResult<'_, DotPathVar> {
 }
 
 /// Parses any KIP value (string, number, boolean, null).
+///
+/// The literals are matched case-sensitively: the KIP protocol is
+/// case-sensitive (§2.8.2), so `TRUE` / `NULL` are not spellings of `true` /
+/// `null`.
 pub fn kip_value(input: &str) -> VResult<'_, Value> {
     context(
         "KIP value: string, number, true, false, or null",
         alt((
-            value(Value::Null, tag_no_case("null")),
-            value(Value::Bool(true), tag_no_case("true")),
-            value(Value::Bool(false), tag_no_case("false")),
+            value(Value::Null, tag("null")),
+            value(Value::Bool(true), tag("true")),
+            value(Value::Bool(false), tag("false")),
             map(quoted_string, Value::String),
             map(parse_number, Value::Number),
         )),
@@ -402,11 +420,13 @@ mod tests {
             Ok(("", Value::String("hello".to_string())))
         );
         assert_eq!(kip_value("true"), Ok(("", Value::Bool(true))));
-        assert_eq!(kip_value("TRUE"), Ok(("", Value::Bool(true))));
         assert_eq!(kip_value("false"), Ok(("", Value::Bool(false))));
-        assert_eq!(kip_value("FALSE"), Ok(("", Value::Bool(false))));
         assert_eq!(kip_value("null"), Ok(("", Value::Null)));
-        assert_eq!(kip_value("NULL"), Ok(("", Value::Null)));
+        // The KIP protocol is case-sensitive (§2.8.2): uppercase spellings are
+        // not literals.
+        assert!(kip_value("TRUE").is_err());
+        assert!(kip_value("FALSE").is_err());
+        assert!(kip_value("NULL").is_err());
     }
 
     #[test]
@@ -572,17 +592,17 @@ mod tests {
         assert_eq!(kip_value("false"), Ok(("", Value::Bool(false))));
         assert_eq!(kip_value("null"), Ok(("", Value::Null)));
 
-        // Test mixed case
-        assert_eq!(kip_value("True"), Ok(("", Value::Bool(true))));
-        assert_eq!(kip_value("False"), Ok(("", Value::Bool(false))));
-        assert_eq!(kip_value("Null"), Ok(("", Value::Null)));
+        // Mixed case is not a literal spelling: the KIP protocol is
+        // case-sensitive (§2.8.2).
+        assert!(kip_value("True").is_err());
+        assert!(kip_value("False").is_err());
+        assert!(kip_value("Null").is_err());
 
         // Test that numbers are parsed correctly
         assert_eq!(kip_value("0"), Ok(("", Value::Number(Number::from(0)))));
-        assert_eq!(
-            kip_value("-0"),
-            Ok(("", Value::Number(Number::from_f64(-0.0).unwrap())))
-        );
+        // `-0` is an integer literal (RFC 8259 has no fraction/exponent here),
+        // so it yields the integer 0 rather than the float -0.0.
+        assert_eq!(kip_value("-0"), Ok(("", Value::Number(Number::from(0)))));
         assert_eq!(
             kip_value("0.0"),
             Ok(("", Value::Number(Number::from_f64(0.0).unwrap())))

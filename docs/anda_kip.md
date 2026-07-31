@@ -112,7 +112,7 @@ KIP defines three instruction families:
 
 ```toml
 [dependencies]
-anda_kip = "0.10"
+anda_kip = "0.11"
 ```
 
 ```rust

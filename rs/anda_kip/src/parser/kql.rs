@@ -567,7 +567,21 @@ pub fn parse_limit_clause(input: &str) -> VResult<'_, usize> {
 }
 
 pub fn parse_cursor_clause(input: &str) -> VResult<'_, String> {
-    preceded(ws(keyword("CURSOR")), quoted_string).parse(input)
+    // An empty cursor is rejected: a pagination token is opaque but never
+    // empty, and `CURSOR ""` would silently mean "start from the beginning".
+    //
+    // The `cut` is for the same reason as in `parse_limit_clause`: every caller
+    // wraps this parser in `opt(...)`, which would otherwise swallow the error
+    // and let the leftover "CURSOR ..." text surface as a misleading
+    // "Unexpected trailing content" error.
+    preceded(
+        ws(keyword("CURSOR")),
+        cut(context(
+            "CURSOR must be followed by a non-empty quoted pagination token (CURSOR \"<opaque_token>\")",
+            verify(quoted_string, |token: &str| !token.is_empty()),
+        )),
+    )
+    .parse(input)
 }
 
 #[cfg(test)]

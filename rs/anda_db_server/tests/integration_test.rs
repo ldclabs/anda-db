@@ -5,7 +5,9 @@
 //! easy assertions. JSON round-trips and encoding negotiation are covered
 //! separately.
 
-use anda_db_server::{AppState, ServerOptions, build_router, state::check_startup_api_key};
+use anda_db_server::{
+    ApiError, AppState, ServerOptions, build_router, state::check_startup_api_key,
+};
 use anda_object_store::{FaultKind, FaultOp, FaultRule, FaultStore};
 use async_trait::async_trait;
 use axum::{
@@ -28,7 +30,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -42,6 +44,9 @@ struct PutGate {
     armed: AtomicBool,
     blocked: Semaphore,
     release: Semaphore,
+    /// Completed `put_opts` calls, so a test can prove that an operation
+    /// wrote nothing.
+    puts: AtomicUsize,
 }
 
 #[derive(Clone, Debug)]
@@ -69,6 +74,21 @@ impl PutGateHandle {
     fn release(&self) {
         self.gate.release.add_permits(1);
     }
+
+    fn puts(&self) -> usize {
+        self.gate.puts.load(Ordering::Acquire)
+    }
+
+    /// Waits until at least `expected` puts have completed.
+    async fn wait_for_puts(&self, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while self.puts() < expected {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("storage writes did not complete");
+    }
 }
 
 #[derive(Debug)]
@@ -83,6 +103,7 @@ impl GatedStore {
             armed: AtomicBool::new(false),
             blocked: Semaphore::new(0),
             release: Semaphore::new(0),
+            puts: AtomicUsize::new(0),
         });
         (
             Self {
@@ -117,7 +138,9 @@ impl ObjectStore for GatedStore {
                 .expect("put gate release semaphore closed")
                 .forget();
         }
-        self.inner.put_opts(location, payload, opts).await
+        let result = self.inner.put_opts(location, payload, opts).await;
+        self.gate.puts.fetch_add(1, Ordering::Release);
+        result
     }
 
     async fn put_multipart_opts(
@@ -222,6 +245,47 @@ async fn rpc_ok(app: &Router, path: &str, method: &str, params: Value) -> Value 
     resp.get("result")
         .unwrap_or_else(|| panic!("missing result: {resp:?}"))
         .clone()
+}
+
+/// A document with a `Bytes` field, decoded straight from CBOR: a CBOR byte
+/// string has no JSON equivalent, so [`rpc_cbor`]'s transcode cannot carry it.
+#[derive(Debug, serde::Deserialize)]
+struct BlobDoc {
+    #[serde(with = "serde_bytes")]
+    blob: Vec<u8>,
+}
+
+/// Like [`rpc_ok`] but decodes `result` into a typed value without the JSON
+/// transcode, for responses carrying binary field values.
+async fn rpc_typed<T: serde::de::DeserializeOwned>(
+    app: &Router,
+    path: &str,
+    method: &str,
+    params: Value,
+) -> T {
+    #[derive(serde::Deserialize)]
+    struct Envelope<T> {
+        result: T,
+    }
+
+    let req = json!({"method": method, "params": params});
+    let mut body = Vec::new();
+    cbor2::ser::to_writer(&req, &mut body).unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post(path)
+                .header(header::CONTENT_TYPE, "application/cbor")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let envelope: Envelope<T> = cbor2::de::from_reader(&bytes[..]).unwrap();
+    envelope.result
 }
 
 /// Like [`rpc_cbor`] but asserts an error status and unwraps `error`.
@@ -635,6 +699,261 @@ async fn test_search_and_query_ids() {
     assert_eq!(ids.as_array().unwrap().len(), 1);
 }
 
+/// `doc.query_ids` with no `limit` used to return one ID per matching
+/// document — an unbounded response body from a one-line request — and
+/// `doc.get_many` accepted an unbounded ID list, each ID costing an
+/// object-store fetch. Both are now capped like their siblings.
+#[tokio::test]
+async fn test_batch_read_surfaces_are_capped() {
+    let app = test_app().await;
+    let path = format!("/{PRIMARY_DB}");
+    setup_articles(&app, PRIMARY_DB).await;
+
+    for i in 0u64..5 {
+        add_article(&app, PRIMARY_DB, &format!("A{i}"), "body", i).await;
+    }
+
+    // An omitted limit is the cap, not "everything".
+    let ids = rpc_ok(
+        &app,
+        &path,
+        "doc.query_ids",
+        json!({"collection": "articles", "filter": {"Field": ["score", {"Ge": 0}]}}),
+    )
+    .await;
+    assert_eq!(ids.as_array().unwrap().len(), 5);
+
+    // An explicit limit above the cap is a client error rather than a
+    // silently-clamped success, so the caller knows the bound exists.
+    let err = rpc_err(
+        &app,
+        &path,
+        "doc.query_ids",
+        json!({
+            "collection": "articles",
+            "filter": {"Field": ["score", {"Ge": 0}]},
+            "limit": 1_000_001
+        }),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert_eq!(err["code"], "invalid_input");
+    assert!(
+        err["message"].as_str().unwrap().contains("at most 1000"),
+        "unexpected message: {}",
+        err["message"]
+    );
+    // `limit: 0` keeps its "no data requested" meaning.
+    let ids = rpc_ok(
+        &app,
+        &path,
+        "doc.query_ids",
+        json!({
+            "collection": "articles",
+            "filter": {"Field": ["score", {"Ge": 0}]},
+            "limit": 0
+        }),
+    )
+    .await;
+    assert!(ids.as_array().unwrap().is_empty());
+
+    // `doc.get_many` refuses an oversized id list instead of issuing one
+    // object-store fetch per id.
+    let too_many: Vec<u64> = (0..1_001).collect();
+    let err = rpc_err(
+        &app,
+        &path,
+        "doc.get_many",
+        json!({"collection": "articles", "_ids": too_many}),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert_eq!(err["code"], "invalid_input");
+    assert!(
+        err["message"]
+            .as_str()
+            .unwrap()
+            .contains("at most 1000 ids"),
+        "unexpected message: {}",
+        err["message"]
+    );
+
+    // A batch at the cap still works, and duplicates are answered per entry.
+    let docs = rpc_ok(
+        &app,
+        &path,
+        "doc.get_many",
+        json!({"collection": "articles", "_ids": [0u64, 0u64, 4u64]}),
+    )
+    .await;
+    let docs = docs.as_array().unwrap();
+    assert_eq!(docs.len(), 3);
+    assert_eq!(docs[0], docs[1]);
+}
+
+/// `doc.add` coerces values through the engine's CBOR extraction, so a
+/// `Bytes` field accepts `[1, 2, 3]`. `doc.update` used to validate the raw
+/// wire value, letting a client create a document it could not then update.
+#[tokio::test]
+async fn test_update_accepts_every_shape_add_accepts() {
+    let app = test_app().await;
+    let path = format!("/{PRIMARY_DB}");
+
+    rpc_ok(
+        &app,
+        &path,
+        "collection.create",
+        json!({
+            "config": {"name": "blobs", "description": ""},
+            "schema": {
+                "fields": [
+                    {"name": "_id", "description": "", "type": "U64", "unique": true, "index": 0},
+                    {"name": "blob", "description": "", "type": "Bytes", "unique": false, "index": 1}
+                ]
+            }
+        }),
+    )
+    .await;
+
+    let added = rpc_ok(
+        &app,
+        &path,
+        "doc.add",
+        json!({"collection": "blobs", "doc": {"blob": [1, 2, 3]}}),
+    )
+    .await;
+    let id = added["_id"].as_u64().unwrap();
+
+    // The same shape must be accepted by `doc.update`, and stored as bytes.
+    let updated: BlobDoc = rpc_typed(
+        &app,
+        &path,
+        "doc.update",
+        json!({"collection": "blobs", "_id": id, "fields": {"blob": [4, 5, 6]}}),
+    )
+    .await;
+    assert_eq!(updated.blob.as_slice(), &[4, 5, 6]);
+
+    let doc: BlobDoc = rpc_typed(
+        &app,
+        &path,
+        "doc.get",
+        json!({"collection": "blobs", "_id": id}),
+    )
+    .await;
+    assert_eq!(doc.blob.as_slice(), &[4, 5, 6]);
+
+    // A value the field genuinely cannot hold is still a client error.
+    let err = rpc_err(
+        &app,
+        &path,
+        "doc.update",
+        json!({"collection": "blobs", "_id": id, "fields": {"blob": [1, 999]}}),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert_eq!(err["code"], "invalid_input");
+}
+
+/// A one-entry `Map` declared by a nested struct is not a wildcard map, so it
+/// cannot key a B-Tree index. The engine rejects it, and the API must reject
+/// it at definition time instead of reporting success followed by an
+/// undiagnosable failure at the first insert.
+#[tokio::test]
+async fn test_btree_index_on_a_nested_struct_field_is_rejected_at_definition() {
+    let app = test_app().await;
+    let path = format!("/{PRIMARY_DB}");
+
+    let nested_schema = json!({
+        "fields": [
+            {"name": "_id", "description": "", "type": "U64", "unique": true, "index": 0},
+            {
+                "name": "meta",
+                "description": "",
+                "type": {"Map": {"owner": "Text"}},
+                "unique": false,
+                "index": 1
+            }
+        ]
+    });
+
+    for method in ["collection.create", "collection.ensure"] {
+        let err = rpc_err(
+            &app,
+            &path,
+            method,
+            json!({
+                "config": {"name": "nested", "description": ""},
+                "schema": nested_schema,
+                "btree_indexes": [["meta"]]
+            }),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        assert_eq!(err["code"], "invalid_input", "method: {method}");
+        assert!(
+            err["message"]
+                .as_str()
+                .unwrap()
+                .contains("cannot be used by a B-Tree index"),
+            "method {method}: unexpected message {}",
+            err["message"]
+        );
+    }
+
+    // The primary key is answered from the collection's id bitmap, so the
+    // engine refuses a `_id` B-Tree index; say so as a client error instead
+    // of letting it surface as an engine failure at creation time.
+    let err = rpc_err(
+        &app,
+        &path,
+        "collection.create",
+        json!({
+            "config": {"name": "id_indexed", "description": ""},
+            "schema": {
+                "fields": [
+                    {"name": "_id", "description": "", "type": "U64", "unique": true, "index": 0}
+                ]
+            },
+            "btree_indexes": [["_id"]]
+        }),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert_eq!(err["code"], "invalid_input");
+    assert!(
+        err["message"].as_str().unwrap().contains("_id"),
+        "unexpected message: {}",
+        err["message"]
+    );
+
+    // A wildcard map keys its entries and stays indexable.
+    let wildcard_schema = json!({
+        "fields": [
+            {"name": "_id", "description": "", "type": "U64", "unique": true, "index": 0},
+            {
+                "name": "tags",
+                "description": "",
+                "type": {"Map": {"*": "U64"}},
+                "unique": false,
+                "index": 1
+            }
+        ]
+    });
+    let meta = rpc_ok(
+        &app,
+        &path,
+        "collection.create",
+        json!({
+            "config": {"name": "wildcard", "description": ""},
+            "schema": wildcard_schema,
+            "btree_indexes": [["tags"]]
+        }),
+    )
+    .await;
+    assert_eq!(meta["btree_indexes"].as_object().unwrap().len(), 1);
+}
+
 #[tokio::test]
 async fn test_database_isolation() {
     let app = test_app().await;
@@ -839,19 +1158,36 @@ async fn test_encoding_negotiation() {
     let value: Value = cbor2::de::from_reader(&bytes[..]).unwrap();
     assert_eq!(value["result"]["name"], "test");
 
-    // No Content-Type at all: the body is parsed as CBOR.
+    // An absent or unrecognized Content-Type is refused. Parsing such a body
+    // as CBOR made every RPC endpoint reachable as a browser "simple request"
+    // (`text/plain`, no preflight), i.e. a CSRF surface in the supported
+    // loopback / `--insecure-no-api-key` modes. Response negotiation is
+    // unaffected: the 415 itself still answers in the default encoding.
     let mut body = Vec::new();
     cbor2::ser::to_writer(&json!({"method": "info"}), &mut body).unwrap();
-    let resp = app
-        .clone()
-        .oneshot(Request::post("/").body(Body::from(body)).unwrap())
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(
-        resp.headers().get(header::CONTENT_TYPE).unwrap(),
-        "application/cbor"
-    );
+    for content_type in [None, Some("text/plain"), Some("application/octet-stream")] {
+        let mut builder = Request::post("/");
+        if let Some(content_type) = content_type {
+            builder = builder.header(header::CONTENT_TYPE, content_type);
+        }
+        let resp = app
+            .clone()
+            .oneshot(builder.body(Body::from(body.clone())).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "content type: {content_type:?}"
+        );
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/cbor"
+        );
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let value: Value = cbor2::de::from_reader(&bytes[..]).unwrap();
+        assert_eq!(value["error"]["code"], "unsupported_media_type");
+    }
 }
 
 #[tokio::test]
@@ -1231,6 +1567,256 @@ async fn test_shutdown_deadline_uses_crash_style_abort_without_database_close() 
     gate.release();
 }
 
+/// The registry is bounded: each entry costs a permanent auto-flush task and
+/// a name in the primary database's registry extension, so an authorized
+/// caller must not be able to grow it without limit.
+#[tokio::test]
+async fn test_database_registry_is_capped() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut options = test_options(None);
+    options.max_databases = 2;
+    let state = AppState::connect(store.clone(), options)
+        .await
+        .expect("failed to connect AppState");
+    let app = build_router(state.clone());
+
+    rpc_ok(&app, "/", "db.create", json!({"name": "tenant_a"})).await;
+    rpc_ok(&app, "/", "db.create", json!({"name": "tenant_b"})).await;
+
+    let err = rpc_err(
+        &app,
+        "/",
+        "db.create",
+        json!({"name": "tenant_c"}),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    assert_eq!(err["code"], "limit_exceeded");
+    assert!(
+        err["message"].as_str().unwrap().contains("maximum of 2"),
+        "unexpected message: {}",
+        err["message"]
+    );
+
+    // Closing one frees a slot.
+    rpc_ok(&app, "/", "db.close", json!({"name": "tenant_a"})).await;
+    rpc_ok(&app, "/", "db.create", json!({"name": "tenant_c"})).await;
+    state.shutdown().await;
+
+    // Lowering the cap below the number of registered databases must not
+    // break a restart: the bound applies to registration, not to reopening.
+    let mut options = test_options(None);
+    options.max_databases = 1;
+    let state = AppState::connect(store, options)
+        .await
+        .expect("a restart must not be blocked by the registry cap");
+    let app = build_router(state.clone());
+    let names = rpc_ok(&app, "/", "db.list", Value::Null).await;
+    let names: Vec<String> = serde_json::from_value(names).unwrap();
+    assert!(names.contains(&"tenant_b".to_string()), "names: {names:?}");
+    assert!(names.contains(&"tenant_c".to_string()), "names: {names:?}");
+    state.shutdown().await;
+}
+
+/// A *read* RPC must never be able to poison a collection.
+///
+/// Reads run on the cancellable path, but opening a collection ends in
+/// `Collection::flush`, whose cancel guard poisons the handle when its future
+/// is dropped. The first `doc.get` on a cold collection that hits the request
+/// timeout therefore used to poison a healthy collection, after which every
+/// in-flight and subsequent operation failed with a generic 500.
+#[tokio::test]
+async fn test_a_timed_out_read_does_not_poison_a_cold_collection() {
+    let (gated, gate) = GatedStore::new();
+    let store: Arc<dyn ObjectStore> = Arc::new(gated);
+    let path = format!("/{PRIMARY_DB}");
+
+    // Leave the collection with unflushed state: shutdown hits its drain
+    // deadline and takes the crash-style path, so nothing is flushed and the
+    // mutation intents stay on disk. The next open must therefore replay
+    // them and write a checkpoint — the flush whose cancel guard poisons.
+    let mut options = test_options(None);
+    options.request_timeout = Duration::from_millis(100);
+    options.shutdown_timeout = Duration::from_millis(20);
+    let state = AppState::connect(store.clone(), options)
+        .await
+        .expect("failed to connect AppState");
+    let app = build_router(state.clone());
+    setup_articles(&app, PRIMARY_DB).await;
+    let id = add_article(&app, PRIMARY_DB, "cold", "body", 1).await;
+
+    gate.arm();
+    let stuck = tokio::spawn({
+        let app = app.clone();
+        let path = path.clone();
+        async move {
+            rpc_cbor(
+                &app,
+                &path,
+                "doc.add",
+                json!({"collection": "articles", "doc": {"title": "stuck", "body": "b"}}),
+            )
+            .await
+        }
+    });
+    gate.wait_until_blocked().await;
+    tokio::time::timeout(Duration::from_secs(5), state.shutdown())
+        .await
+        .expect("crash-style shutdown did not finish");
+    let _ = tokio::time::timeout(Duration::from_secs(5), stuck).await;
+    // The blocked put was aborted with the mutation, so the gate is idle
+    // again and must not be released: a stray permit would let the next
+    // armed put through.
+
+    // A fresh server over the same storage: the collection is not in memory
+    // and its first open has real work to write.
+    let mut options = test_options(None);
+    options.request_timeout = Duration::from_millis(100);
+    let state = AppState::connect(store, options)
+        .await
+        .expect("failed to connect AppState");
+    let app = build_router(state.clone());
+
+    gate.arm();
+    let read = tokio::spawn({
+        let app = app.clone();
+        let path = path.clone();
+        async move {
+            rpc_cbor(
+                &app,
+                &path,
+                "doc.get",
+                json!({"collection": "articles", "_id": id}),
+            )
+            .await
+        }
+    });
+    gate.wait_until_blocked().await;
+
+    // The client gives up while the open is still writing.
+    let blocked_puts = gate.puts();
+    let (status, resp) = tokio::time::timeout(Duration::from_secs(5), read)
+        .await
+        .expect("read did not time out")
+        .expect("read task panicked");
+    assert_eq!(status, StatusCode::REQUEST_TIMEOUT, "resp: {resp:?}");
+
+    // Let the (detached) open finish the write the client stopped waiting for.
+    gate.release();
+    gate.wait_for_puts(blocked_puts + 1).await;
+    let settled = gate.puts();
+
+    // The open ran to completion, so the collection is registered, active and
+    // clean: the next read is served from the open handle and writes nothing.
+    // When the cancelled request was allowed to take the open future down with
+    // it, the handle was poisoned instead and the next read had to discard it,
+    // reload from storage, and flush again.
+    let doc = rpc_ok(
+        &app,
+        &path,
+        "doc.get",
+        json!({"collection": "articles", "_id": id}),
+    )
+    .await;
+    assert_eq!(doc["title"], "cold");
+    assert_eq!(
+        gate.puts(),
+        settled,
+        "a cancelled read left the collection needing a fresh open"
+    );
+
+    // And it must still be writable and close cleanly.
+    add_article(&app, PRIMARY_DB, "after", "body", 2).await;
+    let collection = state
+        .get_db(PRIMARY_DB)
+        .await
+        .unwrap()
+        .open_collection("articles".to_string(), async |_| Ok(()))
+        .await
+        .expect("the collection must still open");
+    state.shutdown().await;
+    assert!(collection.metadata().stats.read_only);
+}
+
+/// A handle poisoned by a cancelled mutation is not read-only, so writes to
+/// it used to surface as an opaque `internal` 500. The condition is
+/// transient — reopening recovers it — and must be reported as such.
+#[tokio::test]
+async fn test_a_poisoned_collection_answers_with_a_retryable_status() {
+    let (gated, gate) = GatedStore::new();
+    let store: Arc<dyn ObjectStore> = Arc::new(gated);
+    let path = format!("/{PRIMARY_DB}");
+
+    let mut options = test_options(None);
+    options.request_timeout = Duration::from_millis(100);
+    options.shutdown_timeout = Duration::from_millis(20);
+    let state = AppState::connect(store, options)
+        .await
+        .expect("failed to connect AppState");
+    let app = build_router(state.clone());
+    setup_articles(&app, PRIMARY_DB).await;
+
+    // Hold the handle the server uses, so the poisoning is observable instead
+    // of being repaired by the next open.
+    let collection = state
+        .get_db(PRIMARY_DB)
+        .await
+        .unwrap()
+        .open_collection("articles".to_string(), async |_| Ok(()))
+        .await
+        .unwrap();
+
+    // A mutation cancelled mid-write poisons the handle. The crash-style
+    // shutdown path aborts it exactly that way.
+    gate.arm();
+    let stuck = tokio::spawn({
+        let app = app.clone();
+        let path = path.clone();
+        async move {
+            rpc_cbor(
+                &app,
+                &path,
+                "doc.add",
+                json!({"collection": "articles", "doc": {"title": "stuck", "body": "b"}}),
+            )
+            .await
+        }
+    });
+    gate.wait_until_blocked().await;
+    tokio::time::timeout(Duration::from_secs(5), state.shutdown())
+        .await
+        .expect("crash-style shutdown did not finish");
+    let _ = tokio::time::timeout(Duration::from_secs(5), stuck).await;
+    assert!(
+        collection.is_poisoned(),
+        "the aborted mutation must poison the handle"
+    );
+
+    // The pre-flight check every document mutation runs must refuse the
+    // handle, with the reason and a retry hint rather than "internal".
+    let err = ApiError::from_collection_state(collection.state())
+        .expect("a poisoned handle must not be treated as writable");
+    assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(err.code, "collection_unavailable");
+    assert!(
+        err.message.contains("cancelled"),
+        "message: {}",
+        err.message
+    );
+    assert!(err.message.contains("retry"), "message: {}", err.message);
+
+    // And an operation that reaches the engine anyway is classified from the
+    // engine's own error, not flattened into an opaque 500.
+    let engine_error = collection
+        .flush(0)
+        .await
+        .expect_err("a poisoned handle must reject operations");
+    let err = ApiError::from(engine_error);
+    assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(err.code, "collection_unavailable");
+    assert_ne!(err.message, "internal server error");
+}
+
 #[tokio::test]
 async fn test_shutdown_rejects_new_requests_with_503() {
     let state = test_state(Arc::new(InMemory::new()), None).await;
@@ -1378,4 +1964,500 @@ async fn test_failed_reopen_keeps_database_registered() {
     assert!(names.contains(&"auxdb".to_string()), "names: {names:?}");
     assert!(names.contains(&"otherdb".to_string()), "names: {names:?}");
     state.shutdown().await;
+}
+
+// ─── authorization ───────────────────────────────────────────────────────
+//
+// Two key tiers: the process-global admin key (`ServerOptions::api_key`)
+// reaches everything, a per-database key reaches only `POST /{its_db}`.
+
+/// Admin key used by the authorization tests.
+const ADMIN_KEY: &str = "admin-secret";
+
+/// Sends a CBOR RPC request carrying an optional bearer token.
+///
+/// Deliberately separate from [`rpc_cbor`] instead of generalizing it, so the
+/// pre-existing tests keep exercising the header-free request path verbatim.
+async fn rpc_auth(
+    app: &Router,
+    token: Option<&str>,
+    path: &str,
+    method: &str,
+    params: Value,
+) -> (StatusCode, Value) {
+    let req = json!({"method": method, "params": params});
+    let mut body = Vec::new();
+    cbor2::ser::to_writer(&req, &mut body).unwrap();
+
+    let mut builder = Request::post(path).header(header::CONTENT_TYPE, "application/cbor");
+    if let Some(token) = token {
+        builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+    }
+    let resp = app
+        .clone()
+        .oneshot(builder.body(Body::from(body)).unwrap())
+        .await
+        .unwrap();
+
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let value: Value = cbor2::de::from_reader(&bytes[..]).unwrap();
+    (status, value)
+}
+
+/// Like [`rpc_auth`] but asserts HTTP 200 and unwraps `result`.
+async fn rpc_auth_ok(
+    app: &Router,
+    token: Option<&str>,
+    path: &str,
+    method: &str,
+    params: Value,
+) -> Value {
+    let (status, resp) = rpc_auth(app, token, path, method, params).await;
+    assert_eq!(status, StatusCode::OK, "unexpected response: {resp:?}");
+    resp.get("result")
+        .unwrap_or_else(|| panic!("missing result: {resp:?}"))
+        .clone()
+}
+
+/// Asserts that a request is rejected with the uniform authorization failure.
+async fn assert_unauthorized(app: &Router, token: Option<&str>, path: &str, method: &str) {
+    let (status, resp) = rpc_auth(app, token, path, method, Value::Null).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "{path} {method} was not rejected: {resp:?}"
+    );
+    assert_eq!(resp["error"]["code"], "unauthorized");
+}
+
+/// A server with an admin key and two tenant databases, each with its own key.
+async fn tenants_app(store: Arc<dyn ObjectStore>) -> Router {
+    let app = build_router(test_state(store, Some(ADMIN_KEY.to_string())).await);
+    for (name, key) in [("tenant_a", "key-a"), ("tenant_b", "key-b")] {
+        rpc_auth_ok(
+            &app,
+            Some(ADMIN_KEY),
+            "/",
+            "db.create",
+            json!({"name": name, "api_key": key}),
+        )
+        .await;
+    }
+    app
+}
+
+/// Companion to `test_database_isolation`, which covers *data* separation:
+/// this one covers *authorization* separation.
+#[tokio::test]
+async fn test_database_authorization_isolation() {
+    let app = tenants_app(Arc::new(InMemory::new())).await;
+
+    // Each key opens its own database ...
+    rpc_auth_ok(&app, Some("key-a"), "/tenant_a", "db.metadata", Value::Null).await;
+    rpc_auth_ok(&app, Some("key-b"), "/tenant_b", "db.metadata", Value::Null).await;
+
+    // ... and nothing else: not the sibling tenant, not the primary database
+    // (which has no key of its own and therefore falls back to the admin key),
+    // and not for a write either.
+    assert_unauthorized(&app, Some("key-a"), "/tenant_b", "db.metadata").await;
+    assert_unauthorized(&app, Some("key-a"), "/tenant_b", "doc.add").await;
+    assert_unauthorized(&app, Some("key-a"), "/tenant_b", "collection.delete").await;
+    assert_unauthorized(
+        &app,
+        Some("key-a"),
+        &format!("/{PRIMARY_DB}"),
+        "db.metadata",
+    )
+    .await;
+
+    // A per-database key never reaches the root scope, in any of its methods.
+    for method in [
+        "info",
+        "db.list",
+        "db.create",
+        "db.open",
+        "db.connect",
+        "db.close",
+        "db.set_api_key",
+        "db.remove_api_key",
+    ] {
+        assert_unauthorized(&app, Some("key-a"), "/", method).await;
+    }
+
+    // Missing and malformed credentials behave like a wrong key.
+    assert_unauthorized(&app, None, "/tenant_a", "db.metadata").await;
+    assert_unauthorized(&app, Some(""), "/tenant_a", "db.metadata").await;
+    assert_unauthorized(&app, Some("key-a "), "/tenant_a", "db.metadata").await;
+
+    // The admin key reaches every database and the root scope.
+    rpc_auth_ok(
+        &app,
+        Some(ADMIN_KEY),
+        "/tenant_a",
+        "db.metadata",
+        Value::Null,
+    )
+    .await;
+    rpc_auth_ok(
+        &app,
+        Some(ADMIN_KEY),
+        "/tenant_b",
+        "db.metadata",
+        Value::Null,
+    )
+    .await;
+    let names = rpc_auth_ok(&app, Some(ADMIN_KEY), "/", "db.list", Value::Null).await;
+    assert_eq!(names, json!(["tenant_a", "tenant_b", PRIMARY_DB]));
+}
+
+#[tokio::test]
+async fn test_unauthorized_response_hides_database_existence() {
+    let app = tenants_app(Arc::new(InMemory::new())).await;
+
+    // Existing-but-forbidden, existing-without-a-key, and non-existent
+    // databases must be indistinguishable to an unauthorized caller.
+    let forbidden = rpc_auth(&app, Some("key-a"), "/tenant_b", "db.metadata", Value::Null).await;
+    let unbound = rpc_auth(
+        &app,
+        Some("key-a"),
+        &format!("/{PRIMARY_DB}"),
+        "db.metadata",
+        Value::Null,
+    )
+    .await;
+    let missing = rpc_auth(
+        &app,
+        Some("key-a"),
+        "/no_such_db",
+        "db.metadata",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(forbidden.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(forbidden, unbound);
+    assert_eq!(forbidden, missing);
+
+    // Only an admin — who is entitled to know — sees the difference.
+    let (status, resp) = rpc_auth(
+        &app,
+        Some(ADMIN_KEY),
+        "/no_such_db",
+        "db.metadata",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "resp: {resp:?}");
+    assert_eq!(resp["error"]["code"], "not_found");
+}
+
+#[tokio::test]
+async fn test_per_database_key_cannot_enumerate_the_instance() {
+    let app = tenants_app(Arc::new(InMemory::new())).await;
+
+    // A tenant sees only itself, and not even the primary database's name.
+    let info = rpc_auth_ok(&app, Some("key-a"), "/tenant_a", "info", Value::Null).await;
+    assert_eq!(info["databases"], json!(["tenant_a"]));
+    assert_eq!(info["primary_db"], Value::Null);
+
+    // An admin keeps the pre-existing view of the whole instance.
+    let info = rpc_auth_ok(&app, Some(ADMIN_KEY), "/tenant_a", "info", Value::Null).await;
+    assert_eq!(info["primary_db"], PRIMARY_DB);
+    assert_eq!(
+        info["databases"],
+        json!(["tenant_a", "tenant_b", PRIMARY_DB])
+    );
+}
+
+#[tokio::test]
+async fn test_api_key_rotation_and_revocation() {
+    let app = tenants_app(Arc::new(InMemory::new())).await;
+
+    // Rotating to a caller-supplied key: the new key works, the old one stops
+    // working immediately, and the supplied secret is not echoed back.
+    let rotated = rpc_auth_ok(
+        &app,
+        Some(ADMIN_KEY),
+        "/",
+        "db.set_api_key",
+        json!({"name": "tenant_a", "api_key": "key-a2"}),
+    )
+    .await;
+    assert_eq!(rotated["name"], "tenant_a");
+    assert_eq!(rotated["api_key"], Value::Null);
+    rpc_auth_ok(
+        &app,
+        Some("key-a2"),
+        "/tenant_a",
+        "db.metadata",
+        Value::Null,
+    )
+    .await;
+    assert_unauthorized(&app, Some("key-a"), "/tenant_a", "db.metadata").await;
+
+    // Rotating without a key: the server generates one and returns it once.
+    let rotated = rpc_auth_ok(
+        &app,
+        Some(ADMIN_KEY),
+        "/",
+        "db.set_api_key",
+        json!({"name": "tenant_a"}),
+    )
+    .await;
+    let generated = rotated["api_key"]
+        .as_str()
+        .expect("generated key")
+        .to_string();
+    assert_eq!(generated.len(), 64);
+    rpc_auth_ok(
+        &app,
+        Some(&generated),
+        "/tenant_a",
+        "db.metadata",
+        Value::Null,
+    )
+    .await;
+    assert_unauthorized(&app, Some("key-a2"), "/tenant_a", "db.metadata").await;
+    // The key is not recoverable afterwards: nothing in the API returns it.
+    let info = rpc_auth_ok(
+        &app,
+        Some(ADMIN_KEY),
+        "/tenant_a",
+        "db.metadata",
+        Value::Null,
+    )
+    .await;
+    assert!(
+        !serde_json::to_string(&info).unwrap().contains(&generated),
+        "database metadata leaked the API key"
+    );
+
+    // Revoking returns the database to the admin-key fallback.
+    let removed = rpc_auth_ok(
+        &app,
+        Some(ADMIN_KEY),
+        "/",
+        "db.remove_api_key",
+        json!({"name": "tenant_a"}),
+    )
+    .await;
+    assert_eq!(removed, json!(true));
+    assert_unauthorized(&app, Some(&generated), "/tenant_a", "db.metadata").await;
+    rpc_auth_ok(
+        &app,
+        Some(ADMIN_KEY),
+        "/tenant_a",
+        "db.metadata",
+        Value::Null,
+    )
+    .await;
+    let removed = rpc_auth_ok(
+        &app,
+        Some(ADMIN_KEY),
+        "/",
+        "db.remove_api_key",
+        json!({"name": "tenant_a"}),
+    )
+    .await;
+    assert_eq!(removed, json!(false));
+}
+
+#[tokio::test]
+async fn test_api_key_provisioning_guards() {
+    let app = tenants_app(Arc::new(InMemory::new())).await;
+
+    // The primary database holds the registry and the key hashes themselves,
+    // so it must never be delegated to a per-database key.
+    let (status, resp) = rpc_auth(
+        &app,
+        Some(ADMIN_KEY),
+        "/",
+        "db.set_api_key",
+        json!({"name": PRIMARY_DB, "api_key": "key-p"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "resp: {resp:?}");
+    assert_eq!(resp["error"]["code"], "conflict");
+
+    // An empty key would look enabled while accepting a trivial token.
+    let (status, resp) = rpc_auth(
+        &app,
+        Some(ADMIN_KEY),
+        "/",
+        "db.set_api_key",
+        json!({"name": "tenant_a", "api_key": "  "}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "resp: {resp:?}");
+    assert_eq!(resp["error"]["code"], "invalid_input");
+
+    // Unknown databases are reported as such — only admins get here.
+    let (status, resp) = rpc_auth(
+        &app,
+        Some(ADMIN_KEY),
+        "/",
+        "db.set_api_key",
+        json!({"name": "no_such_db", "api_key": "key-x"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "resp: {resp:?}");
+    assert_eq!(resp["error"]["code"], "not_found");
+}
+
+#[tokio::test]
+async fn test_api_keys_survive_restart() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let app = tenants_app(store.clone()).await;
+    rpc_auth_ok(&app, Some("key-a"), "/tenant_a", "db.metadata", Value::Null).await;
+    drop(app);
+
+    // Only the hash is persisted, yet the binding is still enforced after a
+    // restart — including for a database that was closed and reopened.
+    let state = test_state(store.clone(), Some(ADMIN_KEY.to_string())).await;
+    let app = build_router(state.clone());
+    rpc_auth_ok(&app, Some("key-a"), "/tenant_a", "db.metadata", Value::Null).await;
+    assert_unauthorized(&app, Some("key-b"), "/tenant_a", "db.metadata").await;
+
+    rpc_auth_ok(
+        &app,
+        Some(ADMIN_KEY),
+        "/",
+        "db.close",
+        json!({"name": "tenant_a"}),
+    )
+    .await;
+    rpc_auth_ok(
+        &app,
+        Some(ADMIN_KEY),
+        "/",
+        "db.open",
+        json!({"name": "tenant_a"}),
+    )
+    .await;
+    rpc_auth_ok(&app, Some("key-a"), "/tenant_a", "db.metadata", Value::Null).await;
+    assert_unauthorized(&app, Some("key-b"), "/tenant_a", "db.metadata").await;
+    state.shutdown().await;
+
+    // Restarting without the admin key would silently downgrade every bound
+    // database to "no key at all", so the server refuses to start instead.
+    let err = match AppState::connect(store, test_options(None)).await {
+        Ok(_) => panic!("startup must fail instead of dropping per-database keys"),
+        Err(err) => err,
+    };
+    assert!(
+        err.message.contains("admin API key"),
+        "unexpected error: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn test_legacy_single_key_deployment_is_unchanged() {
+    // Exactly how the server was used before per-database keys existed: one
+    // key, no provisioning. It must still open every database.
+    let app =
+        build_router(test_state(Arc::new(InMemory::new()), Some(ADMIN_KEY.to_string())).await);
+
+    rpc_auth_ok(
+        &app,
+        Some(ADMIN_KEY),
+        "/",
+        "db.create",
+        json!({"name": "tenant_a"}),
+    )
+    .await;
+    rpc_auth_ok(
+        &app,
+        Some(ADMIN_KEY),
+        "/tenant_a",
+        "db.metadata",
+        Value::Null,
+    )
+    .await;
+    rpc_auth_ok(
+        &app,
+        Some(ADMIN_KEY),
+        &format!("/{PRIMARY_DB}"),
+        "db.metadata",
+        Value::Null,
+    )
+    .await;
+
+    // The single key is the admin key, so database-scoped `info` still
+    // enumerates the instance as it always did.
+    let info = rpc_auth_ok(&app, Some(ADMIN_KEY), "/tenant_a", "info", Value::Null).await;
+    assert_eq!(info["primary_db"], PRIMARY_DB);
+    assert_eq!(info["databases"], json!(["tenant_a", PRIMARY_DB]));
+
+    assert_unauthorized(&app, Some("wrong"), "/tenant_a", "db.metadata").await;
+    assert_unauthorized(&app, None, "/tenant_a", "db.metadata").await;
+}
+
+#[tokio::test]
+async fn test_keyless_mode_stays_open_and_refuses_per_database_keys() {
+    let app = test_app().await;
+
+    // No admin key: every scope is open, with or without a bearer token.
+    rpc_ok(&app, "/", "db.list", Value::Null).await;
+    rpc_auth_ok(
+        &app,
+        None,
+        &format!("/{PRIMARY_DB}"),
+        "db.metadata",
+        Value::Null,
+    )
+    .await;
+    rpc_auth_ok(
+        &app,
+        Some("irrelevant"),
+        &format!("/{PRIMARY_DB}"),
+        "db.metadata",
+        Value::Null,
+    )
+    .await;
+
+    // A per-database key here would be enforced against callers who can
+    // simply rotate it away through the open root scope, so it is refused —
+    // before the database is created.
+    let (status, resp) = rpc_auth(
+        &app,
+        None,
+        "/",
+        "db.create",
+        json!({"name": "tenant_a", "api_key": "key-a"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "resp: {resp:?}");
+    assert_eq!(resp["error"]["code"], "conflict");
+    let names = rpc_ok(&app, "/", "db.list", Value::Null).await;
+    assert_eq!(names, json!([PRIMARY_DB]));
+}
+
+#[tokio::test]
+async fn test_corrupt_api_key_map_refuses_start() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let state = test_state(store.clone(), Some(ADMIN_KEY.to_string())).await;
+    let app = build_router(state.clone());
+
+    // Starting with an unreadable key map and then persisting would drop
+    // every binding, downgrading bound databases to the admin-key fallback.
+    rpc_auth_ok(
+        &app,
+        Some(ADMIN_KEY),
+        &format!("/{PRIMARY_DB}"),
+        "db.save_extension",
+        json!({"key": "server:api_keys", "value": "not a map"}),
+    )
+    .await;
+    state.shutdown().await;
+
+    let err = match AppState::connect(store, test_options(Some(ADMIN_KEY.to_string()))).await {
+        Ok(_) => panic!("startup must fail instead of overwriting a corrupt key map"),
+        Err(err) => err,
+    };
+    assert!(
+        err.message.contains("API key"),
+        "unexpected error: {}",
+        err.message
+    );
 }
