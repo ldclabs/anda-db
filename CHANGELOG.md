@@ -185,10 +185,12 @@ Every crate in `rs/` moves to 0.11.0 together, and the Python binding
   `u32` that routes to a shard no operator configured, and newly created
   tables carry `CHECK (shard_id >= 0)`.
 
-### Breaking — object store observable behavior
+### Breaking — object store format and observable behavior
 
-None of these change the on-disk format; they change what `anda_object_store`
-*reports* to callers. Data written by 0.10.0 stays readable.
+Metadata now carries an optional commit timestamp. Data written by 0.10.0 and
+early 0.11 builds stays readable; new encrypted metadata authenticates the
+timestamp, so older binaries cannot verify objects written after this upgrade.
+Do not roll back after writing with 0.11.0.
 
 - **`MetaStore`'s logical ETag is a per-commit CAS token, not a content
   hash** — It is now `base64url(SHA3-256(generation ‖ payload))`, seeded with
@@ -212,14 +214,18 @@ None of these change the on-disk format; they change what `anda_object_store`
 - **`get` / `head` report the committed size** — The authenticated size from
   the metadata commit point, not the backing generation object's length.
 - **`list` / `get` / `head` report one `last_modified`** — All three now
-  derive it from the generation. Previously listings used the `meta/<loc>`
-  object's mtime while `get` / `head` used the payload object's — two
-  different clocks for one logical object, so a listing and a subsequent read
-  could disagree about when the same object was written. Pre-0.10 documents
-  carry no generation and still report the backend's timestamp.
+  read the explicit commit timestamp from the metadata pointer. Previously
+  listings used the `meta/<loc>` object's mtime while `get` / `head` used the
+  payload object's — two different clocks for one logical object, so a listing
+  and a subsequent read could disagree about when the same object was written.
+  Deriving the timestamp from generation creation was also incorrect for long
+  puts and multipart uploads, whose generation exists before commit.
+  Pre-0.10 documents carry no generation or commit timestamp and still report
+  the backend's timestamp; metadata written by early 0.11 builds falls back to
+  its generation timestamp.
 - **Date preconditions are evaluated in-wrapper and stripped** —
   `if_modified_since` / `if_unmodified_since` are answered against the same
-  generation-derived `last_modified` the call reports, and removed before the
+  commit-point `last_modified` the call reports, and removed before the
   request reaches the backend, which would otherwise evaluate them against the
   payload object's own mtime. RFC 9110 §13.2.2 precedence is honoured: an
   `if_match` suppresses `if_unmodified_since` and an `if_none_match`
@@ -307,16 +313,29 @@ None of these change the on-disk format; they change what `anda_object_store`
   `410 gone` for a deleted one, using the engine's own
   `CollectionState::is_recoverable` split. A `_id` B-Tree index, which the
   engine rejects, is also refused as a `400` at definition time.
-- **`anda_cognitive_nexus_server` reclaims capacity from runaway KIP
-  executions** — A timed-out execution was detached with no deadline while
+- **`anda_cognitive_nexus_server` shuts down on runaway KIP executions** —
+  A timed-out execution was detached with no deadline while
   still holding its bounded mutation permit, so `MAX_CONCURRENT_MUTATIONS`
   expensive requests could exhaust capacity for the rest of the process's
   life (every later request answering "server mutation capacity is
   exhausted", and shutdown escalating to an abort). Detached executions now
-  carry a hard deadline of four times the response timeout, after which they
-  are abandoned — crash-equivalent, exactly like the existing shutdown abort
-  path, and far enough above the response deadline that a normal slow request
-  is never affected.
+  carry a hard deadline of four times the response timeout. Reaching it closes
+  admission and initiates process shutdown while continuing to poll the
+  mutation; the existing drain path either lets it finish or terminates at a
+  crash-recoverable point. The server therefore never cancels a database
+  mutation and then continues serving a poisoned collection.
+- **Already-registered databases can reopen at the registry cap** —
+  A database retained in the registry after a transient startup-open failure
+  now reuses its existing slot when `db.open` retries it. Previously a full
+  registry rejected the recovery attempt as if it were a new registration.
+- **Unusable mutation intents are retired after recovery** — Undecodable
+  records and records targeting reserved document id `0` are tracked by path
+  and deleted after the next successful checkpoint instead of being skipped
+  and logged again on every reopen.
+- **Shard-backend notifications remain rolling-upgrade compatible** — 0.11
+  listeners still ignore the removed `read_only` routing flag, but upsert
+  notifications carry `read_only:false` for 0.10 listeners that require the
+  field. Mixed 0.10/0.11 proxy fleets therefore converge on backend moves.
 - **`anda_db_shard_proxy` no longer answers 404 during a routing-cache
   resync** — `reload_backend_cache` cleared the live cache before refilling
   it, so every request during the window (any `PgListener` reconnect,

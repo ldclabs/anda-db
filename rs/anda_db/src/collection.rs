@@ -97,6 +97,10 @@ pub struct Collection {
     /// yet been covered by a successful index/ids checkpoint.  See
     /// [`MutationIntent`].
     pending_mutations: parking_lot::Mutex<BTreeMap<u64, MutationIntent>>,
+    /// Unusable retained intent objects discovered during reopen. Their
+    /// contents cannot drive recovery, but their paths are kept so the next
+    /// successful checkpoint can retire them instead of logging them forever.
+    stale_mutation_intents: parking_lot::Mutex<BTreeSet<String>>,
     /// Serializes concurrent extension writers' unclaimed metadata PUTs.
     /// They hold shared `operation_gate` leases, so without this two of them
     /// could race the same expected object version and one would fail with a
@@ -725,6 +729,7 @@ impl Collection {
             index_hooks: Arc::new(DefaultIndexHooks),
             doc_locks: Self::new_doc_locks(),
             pending_mutations: parking_lot::Mutex::new(BTreeMap::new()),
+            stale_mutation_intents: parking_lot::Mutex::new(BTreeSet::new()),
             extension_write_gate: tokio::sync::Mutex::new(()),
             next_mutation_sequence: AtomicU64::new(unix_ms()),
             durable_alloc_watermark: AtomicU64::new(0),
@@ -806,6 +811,7 @@ impl Collection {
             index_hooks: Arc::new(DefaultIndexHooks),
             doc_locks: Self::new_doc_locks(),
             pending_mutations: parking_lot::Mutex::new(BTreeMap::new()),
+            stale_mutation_intents: parking_lot::Mutex::new(BTreeSet::new()),
             extension_write_gate: tokio::sync::Mutex::new(()),
             next_mutation_sequence: AtomicU64::new(unix_ms()),
             durable_alloc_watermark: AtomicU64::new(alloc_watermark.max(metadata_max_document_id)),
@@ -984,10 +990,22 @@ impl Collection {
     async fn replay_mutation_intents(&self) -> Result<usize, DBError> {
         let mut stream = self
             .storage
-            .list::<MutationIntent>(Some(Self::MUTATION_INTENT_PREFIX), None);
+            .list_meta(Some(Self::MUTATION_INTENT_PREFIX), None);
         let mut intents = BTreeMap::<u64, MutationIntent>::new();
-        while let Some(intent) = stream.next().await {
-            let intent = match intent {
+        let mut stale_paths = BTreeSet::new();
+        while let Some(meta) = stream.next().await {
+            let meta = meta?;
+            let Some(relative) = meta.location.prefix_match(self.storage.base_path()) else {
+                log::warn!(
+                    action = "Collection::replay_mutation_intents",
+                    collection = self.name,
+                    path = meta.location.as_ref();
+                    "Skipping mutation intent outside the collection storage prefix",
+                );
+                continue;
+            };
+            let path = relative.collect::<Path>().to_string();
+            let intent = match self.storage.fetch::<MutationIntent>(&path).await {
                 Ok((intent, _)) => intent,
                 // An intent object that no longer decodes carries no usable
                 // recovery information. Storage-level failures still
@@ -999,6 +1017,7 @@ impl Collection {
                         collection = self.name;
                         "Skipping undecodable mutation intent: {err:?}",
                     );
+                    stale_paths.insert(path);
                     continue;
                 }
                 Err(err) => return Err(err),
@@ -1010,10 +1029,24 @@ impl Collection {
                     sequence = intent.sequence;
                     "Skipping mutation intent with the reserved document id 0",
                 );
+                stale_paths.insert(path);
+                continue;
+            }
+            let expected_path = Self::mutation_intent_path(intent.sequence);
+            if path != expected_path {
+                log::warn!(
+                    action = "Collection::replay_mutation_intents",
+                    collection = self.name,
+                    sequence = intent.sequence,
+                    path;
+                    "Skipping mutation intent whose path does not match its sequence",
+                );
+                stale_paths.insert(path);
                 continue;
             }
             intents.insert(intent.sequence, intent);
         }
+        *self.stale_mutation_intents.lock() = stale_paths;
         if intents.is_empty() {
             return Ok(0);
         }
@@ -1127,6 +1160,15 @@ impl Collection {
             match self.storage.delete(&path).await {
                 Ok(()) | Err(DBError::NotFound { .. }) => {
                     self.pending_mutations.lock().remove(&sequence);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        let stale_paths: Vec<String> = self.stale_mutation_intents.lock().iter().cloned().collect();
+        for path in stale_paths {
+            match self.storage.delete(&path).await {
+                Ok(()) | Err(DBError::NotFound { .. }) => {
+                    self.stale_mutation_intents.lock().remove(&path);
                 }
                 Err(err) => return Err(err),
             }
@@ -1639,7 +1681,10 @@ impl Collection {
         // is needed here: the checkpoint below captures a consistent state
         // and simply retires the intents afterwards. Reconciliation happens
         // only on reopen (`replay_mutation_intents`).
-        let has_pending_mutations = { !self.pending_mutations.lock().is_empty() };
+        let has_pending_mutations = {
+            !self.pending_mutations.lock().is_empty()
+                || !self.stale_mutation_intents.lock().is_empty()
+        };
         let has_pending_indexes = self.has_pending_index_flush();
         // Fast path: no collection metadata update and no index has pending
         // data. `store_metadata` re-checks the version itself; the check is
@@ -8562,13 +8607,29 @@ mod tests {
             .create(&Collection::mutation_intent_path(2), &intent)
             .await?;
 
+        // (c) A decodable intent that targets the reserved document id.
+        let reserved = MutationIntent {
+            sequence: 3,
+            document_id: 0,
+            previous: None,
+            proposed: None,
+        };
+        collection
+            .storage
+            .create(&Collection::mutation_intent_path(3), &reserved)
+            .await?;
+
         db.close().await?;
         drop(db);
 
-        let db = connect_test_db(object_store).await?;
+        let db = connect_test_db(object_store.clone()).await?;
         let collection = db
             .open_collection("test_collection".to_string(), async |_| Ok(()))
             .await?;
+        assert!(
+            collection.stale_mutation_intents.lock().is_empty(),
+            "the successful open checkpoint must retire unusable records"
+        );
         assert_eq!(collection.len(), 1);
         let doc: TestDoc = collection.get_as(id).await?;
         assert_eq!(doc.name, "alice");
@@ -8583,6 +8644,19 @@ mod tests {
         );
 
         db.close().await?;
+        assert!(collection.stale_mutation_intents.lock().is_empty());
+        let mut objects = object_store.list(None);
+        while let Some(meta) = objects.next().await {
+            let meta = meta.map_err(DBError::from)?;
+            assert!(
+                !meta
+                    .location
+                    .as_ref()
+                    .contains(Collection::MUTATION_INTENT_PREFIX),
+                "stale mutation intent survived a successful checkpoint: {}",
+                meta.location
+            );
+        }
         Ok(())
     }
 

@@ -224,44 +224,45 @@ async fn main() -> Result<(), BoxError> {
         }
     });
     let drain_timeout = Duration::from_secs(cli.shutdown_drain_timeout_secs.max(1));
-    let shutdown_deadline;
-    let server_forced_abort;
-    let result = tokio::select! {
-        joined = &mut server_task => {
+    let (server_event, fatal_shutdown) = tokio::select! {
+        joined = &mut server_task => (Some(joined), false),
+        _ = shutdown_signal() => (None, false),
+        _ = admission.cancelled() => {
+            log::error!(
+                "a KIP mutation exceeded its hard execution deadline; starting process shutdown"
+            );
+            (None, true)
+        }
+    };
+    let shutdown_deadline = tokio::time::Instant::now() + drain_timeout;
+    let (server_forced_abort, mut result) = match server_event {
+        Some(joined) => {
             admission.cancel();
             retention_cancel.cancel();
-            shutdown_deadline = tokio::time::Instant::now() + drain_timeout;
             match joined {
-                Ok(result) => {
-                    server_forced_abort = false;
-                    result
-                }
-                Err(err) => {
-                    server_forced_abort = true;
-                    Err(io::Error::other(format!("HTTP server task failed: {err}")))
-                }
+                Ok(result) => (false, result),
+                Err(err) => (
+                    true,
+                    Err(io::Error::other(format!("HTTP server task failed: {err}"))),
+                ),
             }
         }
-        _ = shutdown_signal(admission.clone()) => {
+        None => {
+            admission.cancel();
             retention_cancel.cancel();
             stop_accepting.cancel();
-            shutdown_deadline = tokio::time::Instant::now() + drain_timeout;
             match tokio::time::timeout_at(shutdown_deadline, &mut server_task).await {
-                Ok(joined) => {
-                    match joined {
-                        Ok(result) => {
-                            server_forced_abort = false;
-                            result
-                        }
-                        Err(err) => {
-                            server_forced_abort = true;
-                            Err(io::Error::other(format!("HTTP server task failed: {err}")))
-                        }
-                    }
-                }
+                Ok(joined) => match joined {
+                    Ok(result) => (false, result),
+                    Err(err) => (
+                        true,
+                        Err(io::Error::other(format!("HTTP server task failed: {err}"))),
+                    ),
+                },
                 Err(_) => {
-                    log::error!("HTTP handler drain deadline exceeded; aborting remaining handlers");
-                    server_forced_abort = true;
+                    log::error!(
+                        "HTTP handler drain deadline exceeded; aborting remaining handlers"
+                    );
                     server_task.abort();
                     if tokio::time::timeout(FORCED_ABORT_JOIN_TIMEOUT, &mut server_task)
                         .await
@@ -271,11 +272,18 @@ async fn main() -> Result<(), BoxError> {
                             "aborted HTTP server task did not terminate before cleanup deadline"
                         );
                     }
-                    Ok(())
+                    (true, Ok(()))
                 }
             }
         }
     };
+    if fatal_shutdown && result.is_ok() {
+        // Exit non-zero so supervisors configured with an on-failure restart
+        // policy replace the crash-recoverable process.
+        result = Err(io::Error::other(
+            "KIP mutation exceeded the hard execution deadline",
+        ));
+    }
 
     // No new handler can spawn a mutation after the HTTP server has drained.
     // Stop retention, then drain every detached non-cancel-safe mutation
@@ -407,7 +415,7 @@ fn validate_api_key_policy(
 }
 
 /// Waits for a process termination signal and triggers graceful shutdown.
-pub async fn shutdown_signal(cancel_token: CancellationToken) {
+pub async fn shutdown_signal() {
     let ctrl_c = async {
         signal::ctrl_c()
             .await
@@ -431,7 +439,6 @@ pub async fn shutdown_signal(cancel_token: CancellationToken) {
     }
 
     log::warn!("received termination signal, starting graceful shutdown");
-    cancel_token.cancel();
 }
 
 /// Creates a TCP listener with `SO_REUSEPORT` enabled.

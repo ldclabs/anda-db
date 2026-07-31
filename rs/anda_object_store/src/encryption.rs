@@ -16,7 +16,7 @@ use crate::{
     check_get_preconditions, check_update_version, derive_copy_e_tag,
     sidecar::{
         InFlightGuard, ListingMetaPolicy, SidecarMeta, SidecarStore, logical_last_modified,
-        new_generation,
+        new_commit_timestamp_ms, new_generation,
     },
     validate_ranges,
 };
@@ -221,6 +221,11 @@ pub struct Metadata {
     /// preserved byte-for-byte).
     #[serde(rename = "g", default, skip_serializing_if = "Option::is_none")]
     generation: Option<String>,
+
+    /// Logical commit timestamp in milliseconds since the Unix epoch. Bound
+    /// into the authenticated metadata for new writes.
+    #[serde(rename = "m", default, skip_serializing_if = "Option::is_none")]
+    committed_at_ms: Option<u64>,
 }
 
 impl SidecarMeta for Metadata {
@@ -236,6 +241,10 @@ impl SidecarMeta for Metadata {
 
     fn generation(&self) -> Option<&str> {
         self.generation.as_deref()
+    }
+
+    fn committed_at_ms(&self) -> Option<u64> {
+        self.committed_at_ms
     }
 }
 
@@ -545,6 +554,7 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
                     auth_nonce: None,
                     auth_tag: None,
                     generation: Some(generation.clone()),
+                    committed_at_ms: None,
                 };
 
                 // Write the ciphertext to the fresh immutable generation; the
@@ -558,6 +568,7 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
                     .put_opts(&gen_path, ciphertext, data_opts)
                     .await?;
 
+                meta.committed_at_ms = Some(new_commit_timestamp_ms());
                 self.seal_metadata(location, &mut meta)?;
                 Ok(meta)
             })
@@ -611,7 +622,8 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
             self.verify_metadata(location, &meta)?;
 
             let mut options = options.clone();
-            let last_modified = logical_last_modified(meta.generation.as_deref());
+            let last_modified =
+                logical_last_modified(meta.committed_at_ms, meta.generation.as_deref());
             check_get_preconditions(location, &mut options, meta.e_tag.as_deref(), last_modified)?;
 
             // Resolve the caller-supplied (plaintext) range, defaulting to the
@@ -891,9 +903,13 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
         // Pin the chunk-AAD version explicitly so legacy ciphertext stays
         // readable under the resealed (authenticated) target document.
         ensure_chunk_aad_version(&mut meta)?;
-        self.seal_metadata(to, &mut meta)?;
+        let cipher = self.cipher.clone();
         self.inner
-            .update_meta_with(to, create, async |_| Ok(meta))
+            .update_meta_with(to, create, async |_| {
+                meta.committed_at_ms = Some(new_commit_timestamp_ms());
+                seal_metadata(&cipher, to, &mut meta)?;
+                Ok(meta)
+            })
             .await?;
         Ok(())
     }
@@ -1092,6 +1108,7 @@ impl<T: ObjectStore> MultipartUpload for EncryptedStoreUploader<T> {
                     auth_nonce: None,
                     auth_tag: None,
                     generation: Some(generation.clone()),
+                    committed_at_ms: Some(new_commit_timestamp_ms()),
                 };
                 seal_metadata(&cipher, &location, &mut meta)?;
                 Ok(meta)
@@ -1379,6 +1396,10 @@ fn metadata_auth_aad(location: &Path, meta: &Metadata) -> Vec<u8> {
         aad.extend_from_slice(b".g");
         push_bytes(&mut aad, generation.as_bytes());
     }
+    if let Some(committed_at_ms) = meta.committed_at_ms {
+        aad.extend_from_slice(b".m");
+        aad.extend_from_slice(&committed_at_ms.to_le_bytes());
+    }
     aad
 }
 
@@ -1559,6 +1580,7 @@ mod tests {
             auth_nonce: None,
             auth_tag: None,
             generation: None,
+            committed_at_ms: None,
         };
         let mut buf = Vec::new();
         cbor2::to_writer(&meta, &mut buf).unwrap();
@@ -1604,6 +1626,7 @@ mod tests {
             auth_nonce: None,
             auth_tag: None,
             generation: None,
+            committed_at_ms: None,
         };
         seal_metadata(&cipher, location, &mut meta).unwrap();
         let mut buf = Vec::new();
@@ -2124,6 +2147,38 @@ mod tests {
             .unwrap();
         assert_eq!(storage.head(&location).await.unwrap().size, 3);
         assert!(storage.get(&location).await.unwrap().bytes().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn multipart_last_modified_is_the_authenticated_commit_time() {
+        let storage = EncryptedStoreBuilder::with_secret(InMemory::new(), 100, [0u8; 32]).build();
+        let location = Path::from("multipart-commit-time");
+        let mut upload = storage.put_multipart(&location).await.unwrap();
+        upload
+            .put_part(Bytes::from_static(b"abc").into())
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let after_upload_started = chrono::Utc::now();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        upload.complete().await.unwrap();
+
+        let head = storage.head(&location).await.unwrap();
+        assert!(
+            head.last_modified > after_upload_started,
+            "last_modified must describe the authenticated metadata commit"
+        );
+        storage
+            .get_opts(
+                &location,
+                GetOptions {
+                    if_modified_since: Some(after_upload_started),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("an object committed after the condition date is modified");
     }
 
     #[tokio::test]

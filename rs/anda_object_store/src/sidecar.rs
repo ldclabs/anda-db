@@ -104,6 +104,17 @@ pub(crate) trait SidecarMeta: Serialize + DeserializeOwned + Send + Sync + 'stat
     /// The generation this document points to. `None` means the legacy
     /// (pre-0.10) layout: the payload lives directly at `data/<location>`.
     fn generation(&self) -> Option<&str>;
+
+    /// Millisecond timestamp captured immediately before publishing this
+    /// metadata commit point. Absent on older metadata.
+    fn committed_at_ms(&self) -> Option<u64>;
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Mints a fresh generation identifier: a 16-hex-digit millisecond timestamp
@@ -111,12 +122,15 @@ pub(crate) trait SidecarMeta: Serialize + DeserializeOwned + Send + Sync + 'stat
 /// monotonic (useful for the garbage collector's in-flight guard); the salt
 /// makes collisions between concurrent writers of the same key negligible.
 pub(crate) fn new_generation() -> String {
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    let ms = unix_ms();
     let salt: u32 = rand::rng().random();
     format!("{ms:016x}-{salt:08x}")
+}
+
+/// Captures the logical commit timestamp immediately before the metadata
+/// pointer is published.
+pub(crate) fn new_commit_timestamp_ms() -> u64 {
+    unix_ms()
 }
 
 /// Extracts the millisecond timestamp from a generation identifier minted by
@@ -130,23 +144,27 @@ fn generation_timestamp_ms(generation: &str) -> Option<u64> {
 }
 
 /// The caller-visible `last_modified` of a logical object: the instant its
-/// current generation was minted, decoded from the generation pointer.
+/// metadata commit point was prepared for publication.
 ///
 /// Every API must report the same timestamp for the same logical object —
 /// listings and reads resolve *different* backend objects (`meta/<loc>` and
 /// the payload), whose own timestamps differ by however long the write took,
-/// so neither can serve as the shared basis. The generation pointer can: it
-/// is part of the commit point (and, for `EncryptedStore`, covered by the
-/// metadata authentication tag), which also keeps the timestamp out of reach
-/// of anyone who can only write to the backend.
+/// so neither can serve as the shared basis. The explicit timestamp lives in
+/// the commit point and, for `EncryptedStore`, is covered by the metadata
+/// authentication tag.
 ///
 /// Returns `None` for pre-0.10 documents, which carry no generation (and for
 /// foreign generation identifiers). Callers then fall back to the backend
 /// timestamp of the object they resolved, and leave date preconditions to
-/// the backend so both stay on the same clock.
-pub(crate) fn logical_last_modified(generation: Option<&str>) -> Option<DateTime<Utc>> {
-    generation
-        .and_then(generation_timestamp_ms)
+/// the backend so both stay on the same clock. Metadata written by early
+/// 0.11 builds has a generation but no explicit commit timestamp; it falls
+/// back to the generation timestamp for compatibility.
+pub(crate) fn logical_last_modified(
+    committed_at_ms: Option<u64>,
+    generation: Option<&str>,
+) -> Option<DateTime<Utc>> {
+    committed_at_ms
+        .or_else(|| generation.and_then(generation_timestamp_ms))
         .and_then(|ms| DateTime::from_timestamp_millis(ms as i64))
 }
 
@@ -663,7 +681,8 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
         }
         Ok(Some(ObjectMeta {
             location,
-            last_modified: logical_last_modified(meta.generation()).unwrap_or(obj.last_modified),
+            last_modified: logical_last_modified(meta.committed_at_ms(), meta.generation())
+                .unwrap_or(obj.last_modified),
             size: meta.size(),
             e_tag: meta.e_tag().map(String::from),
             // Versions are not reported; see the crate documentation.

@@ -94,7 +94,7 @@ pub use fault::{FaultHandle, FaultKind, FaultOp, FaultRule, FaultStore};
 
 use sidecar::{
     InFlightGuard, ListingMetaPolicy, SidecarMeta, SidecarStore, logical_last_modified,
-    new_generation,
+    new_commit_timestamp_ms, new_generation,
 };
 
 /// `MetaStore` is a wrapper around an `ObjectStore` implementation that adds metadata capabilities.
@@ -106,6 +106,7 @@ use sidecar::{
 /// - Size of the object
 /// - E-Tag (SHA3-256 over the generation and the content, unique per commit)
 /// - The generation pointer to the immutable payload object
+/// - The logical commit timestamp reported as `last_modified`
 ///
 /// # Example
 /// ```rust,no_run
@@ -173,6 +174,12 @@ struct Metadata {
     /// caller-visible version.
     #[serde(rename = "g", default, skip_serializing_if = "Option::is_none")]
     generation: Option<String>,
+
+    /// Logical commit timestamp in milliseconds since the Unix epoch. It is
+    /// captured after the payload is complete and immediately before the
+    /// metadata pointer is published.
+    #[serde(rename = "m", default, skip_serializing_if = "Option::is_none")]
+    committed_at_ms: Option<u64>,
 }
 
 impl SidecarMeta for Metadata {
@@ -188,6 +195,10 @@ impl SidecarMeta for Metadata {
 
     fn generation(&self) -> Option<&str> {
         self.generation.as_deref()
+    }
+
+    fn committed_at_ms(&self) -> Option<u64> {
+        self.committed_at_ms
     }
 }
 
@@ -324,6 +335,7 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
                     original_tag: None,
                     original_version: None,
                     generation: Some(generation.clone()),
+                    committed_at_ms: Some(new_commit_timestamp_ms()),
                 })
             })
             .await?;
@@ -367,7 +379,8 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
         loop {
             let meta = self.inner.get_meta(location).await?;
             let mut options = options.clone();
-            let last_modified = logical_last_modified(meta.generation.as_deref());
+            let last_modified =
+                logical_last_modified(meta.committed_at_ms, meta.generation.as_deref());
             check_get_preconditions(location, &mut options, meta.e_tag.as_deref(), last_modified)?;
 
             let payload_path = self
@@ -487,6 +500,7 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
                     original_tag: None,
                     original_version: None,
                     generation: Some(generation.clone()),
+                    committed_at_ms: Some(new_commit_timestamp_ms()),
                 })
             })
             .await?;
@@ -583,6 +597,7 @@ impl<T: ObjectStore> MultipartUpload for MetaStoreUploader<T> {
                     original_tag: None,
                     original_version: None,
                     generation: Some(generation.clone()),
+                    committed_at_ms: Some(new_commit_timestamp_ms()),
                 })
             })
             .await?;
@@ -1498,6 +1513,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(storage.head(&location).await.unwrap().size, 3);
+    }
+
+    #[tokio::test]
+    async fn multipart_last_modified_is_the_commit_time() {
+        let storage = MetaStoreBuilder::new(InMemory::new(), 100).build();
+        let location = Path::from("multipart-commit-time");
+        let mut upload = storage.put_multipart(&location).await.unwrap();
+        upload
+            .put_part(Bytes::from_static(b"abc").into())
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let after_upload_started = chrono::Utc::now();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        upload.complete().await.unwrap();
+
+        let head = storage.head(&location).await.unwrap();
+        assert!(
+            head.last_modified > after_upload_started,
+            "last_modified must describe the metadata commit, not multipart creation"
+        );
+        storage
+            .get_opts(
+                &location,
+                GetOptions {
+                    if_modified_since: Some(after_upload_started),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("an object committed after the condition date is modified");
     }
 
     #[tokio::test]

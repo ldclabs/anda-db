@@ -1929,9 +1929,13 @@ async fn test_corrupt_registry_refuses_start() {
 async fn test_failed_reopen_keeps_database_registered() {
     let (fault_store, handle) = FaultStore::wrap(InMemory::new());
     let store: Arc<dyn ObjectStore> = Arc::new(fault_store);
+    let mut options = test_options(None);
+    options.max_databases = 2;
 
     // Register an extra database, then stop the server.
-    let state = test_state(store.clone(), None).await;
+    let state = AppState::connect(store.clone(), options.clone())
+        .await
+        .expect("failed to connect AppState");
     let app = build_router(state.clone());
     rpc_ok(&app, "/", "db.create", json!({"name": "auxdb"})).await;
     state.shutdown().await;
@@ -1945,7 +1949,9 @@ async fn test_failed_reopen_keeps_database_registered() {
         times: u64::MAX,
         kind: FaultKind::Error,
     });
-    let state = test_state(store.clone(), None).await;
+    let state = AppState::connect(store.clone(), options.clone())
+        .await
+        .expect("failed to reconnect AppState");
     let app = build_router(state.clone());
     let names = rpc_ok(&app, "/", "db.list", Value::Null).await;
     let names: Vec<String> = serde_json::from_value(names).unwrap();
@@ -1953,11 +1959,18 @@ async fn test_failed_reopen_keeps_database_registered() {
 
     // Rewrites the registry; auxdb must not be dropped from it.
     rpc_ok(&app, "/", "db.create", json!({"name": "otherdb"})).await;
+
+    // The registry is now exactly at its cap. Once storage recovers, opening
+    // the already-registered auxdb must use its existing slot instead of
+    // being rejected as though it were a new registration.
+    handle.reset();
+    rpc_ok(&app, "/", "db.open", json!({"name": "auxdb"})).await;
     state.shutdown().await;
 
-    // Storage recovers: auxdb is reopened automatically on the next start.
-    handle.reset();
-    let state = test_state(store, None).await;
+    // Both registered databases are reopened automatically on the next start.
+    let state = AppState::connect(store, options)
+        .await
+        .expect("failed to reconnect AppState");
     let app = build_router(state.clone());
     let names = rpc_ok(&app, "/", "db.list", Value::Null).await;
     let names: Vec<String> = serde_json::from_value(names).unwrap();

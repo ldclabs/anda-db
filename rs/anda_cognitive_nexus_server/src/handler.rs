@@ -25,8 +25,8 @@ pub struct AppState {
     /// finishes in the background (see [`run_detached_with_timeout`]).
     pub request_timeout: Duration,
     /// Hard upper bound on a detached KIP execution. It exists only so a
-    /// stuck or pathologically slow execution eventually returns its bounded
-    /// mutation permit; see [`run_detached_with_timeout`].
+    /// stuck or pathologically slow execution eventually initiates process
+    /// shutdown; see [`run_detached_with_timeout`].
     pub execution_timeout: Duration,
     /// Stops new KIP work as soon as graceful shutdown begins.
     pub admission: CancellationToken,
@@ -44,11 +44,9 @@ pub struct AppState {
 /// How a detached execution failed to produce a value before the deadline.
 #[derive(Debug)]
 pub enum DetachedError {
-    /// The response deadline elapsed; the detached task keeps running until
-    /// it finishes or reaches its own hard deadline.
+    /// The response deadline elapsed; the detached task keeps running. Its
+    /// hard deadline initiates process shutdown without cancelling it.
     Timeout,
-    /// The detached task exceeded its hard deadline and was abandoned.
-    Abandoned,
     /// The detached task itself failed (panicked or was aborted).
     Join(tokio::task::JoinError),
     /// Shutdown has closed request admission.
@@ -93,15 +91,14 @@ where
 /// applied). Spawning first means `deadline` only abandons the *response*;
 /// the execution itself keeps running in the background.
 ///
-/// `hard_deadline` bounds that background execution. Without it the bounded
-/// permit lives as long as the execution does, so a batch of expensive
-/// requests that all time out keeps its permits forever and every later
-/// request is refused with "server mutation capacity is exhausted" — until
-/// the process exits, since shutdown then also has to escalate to an abort.
-/// Reaching the hard deadline is deliberately crash-equivalent (exactly what
-/// the shutdown abort path already does): the graph may be left partially
-/// written and recovers on reopen. It must therefore be set well above the
-/// response deadline so a normal slow request is never abandoned.
+/// `hard_deadline` bounds how long the process may keep serving after a
+/// runaway execution. The execution itself is never cancelled here: doing so
+/// would poison the affected AndaDB collection while the process continued to
+/// serve stale state. Instead the deadline closes admission through
+/// `admission`; `main` observes that token, drains the server, and lets the
+/// existing shutdown path either finish the mutation or terminate at a
+/// crash-recoverable point. It must be set well above the response deadline
+/// so a normal slow request never initiates shutdown.
 pub(crate) async fn run_detached_with_timeout<T, F>(
     admission: &CancellationToken,
     tracker: &TaskTracker,
@@ -118,6 +115,7 @@ where
     if admission.is_cancelled() {
         return Err(DetachedError::ShuttingDown);
     }
+    let hard_shutdown = admission.clone();
     let permit = permits
         .try_acquire_owned()
         .map_err(|_| DetachedError::Busy)?;
@@ -130,19 +128,20 @@ where
     }
     let task = tracker.spawn(async move {
         // The permit is released when this task ends, never when the response
-        // waiter gives up, so the hard deadline is what actually reclaims
-        // capacity from a runaway execution.
+        // waiter gives up.
         let _permit = permit;
-        match tokio::time::timeout(hard_deadline, fut).await {
-            Ok(value) => Some(value),
-            Err(_) => {
+        tokio::pin!(fut);
+        tokio::select! {
+            value = &mut fut => value,
+            _ = tokio::time::sleep(hard_deadline) => {
                 log::error!(
                     action = "run_detached_with_timeout",
                     hard_deadline_secs = hard_deadline.as_secs();
-                    "detached execution exceeded its hard deadline and was abandoned; \
-                     the graph may be left partially written and recovers on reopen",
+                    "detached execution exceeded its hard deadline; closing admission \
+                     and initiating process shutdown without cancelling the mutation",
                 );
-                None
+                hard_shutdown.cancel();
+                fut.await
             }
         }
     });
@@ -150,11 +149,10 @@ where
     handles.push(task.abort_handle());
     drop(handles);
     match tokio::time::timeout(deadline, task).await {
-        Ok(Ok(Some(value))) => Ok(value),
-        Ok(Ok(None)) => Err(DetachedError::Abandoned),
+        Ok(Ok(value)) => Ok(value),
         Ok(Err(join_error)) => Err(DetachedError::Join(join_error)),
-        // Dropping the JoinHandle detaches the task: it keeps running until
-        // it finishes or hits `hard_deadline`.
+        // Dropping the JoinHandle detaches the task: it keeps running. The
+        // hard deadline closes admission but does not drop the future.
         Err(_) => Err(DetachedError::Timeout),
     }
 }
@@ -274,21 +272,6 @@ pub async fn post_kip(
                     timeout_error(
                         "request processing exceeded the configured timeout; \
                          the started KIP execution continues on the server",
-                    )
-                }
-                DetachedError::Abandoned => {
-                    log::error!(
-                        action = "post_kip",
-                        method = "execute_kip",
-                        execution_timeout_secs = app.execution_timeout.as_secs();
-                        "KIP execution exceeded the hard execution deadline and was abandoned",
-                    );
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(Response::err(KipError::execution_timeout(
-                            "KIP execution exceeded the maximum execution time and was abandoned"
-                                .to_string(),
-                        ))),
                     )
                 }
                 DetachedError::Join(join_error) => {
@@ -825,15 +808,18 @@ mod tests {
         assert_eq!(result, Err(CancelSafeError::ShuttingDown));
     }
 
-    /// A timed-out execution used to keep its bounded permit until it
-    /// finished — with nothing to stop it, a batch of expensive requests
-    /// exhausted mutation capacity for the rest of the process's life. The
-    /// hard deadline must actually return the permit.
+    /// A hard deadline must stop the process from admitting more mutations,
+    /// but it must not cancel the in-flight database write and poison a live
+    /// collection. The normal shutdown drain owns the eventual completion or
+    /// crash-style abort.
     #[tokio::test(flavor = "multi_thread")]
-    async fn the_hard_deadline_reclaims_a_runaway_executions_permit() {
+    async fn the_hard_deadline_closes_admission_without_cancelling_the_execution() {
         let admission = CancellationToken::new();
         let tracker = TaskTracker::new();
         let permits = Arc::new(Semaphore::new(1));
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed_in_task = completed.clone();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
 
         let result = run_detached_with_timeout(
             &admission,
@@ -842,7 +828,11 @@ mod tests {
             Arc::new(Mutex::new(Vec::new())),
             Duration::from_millis(20),
             Duration::from_millis(100),
-            std::future::pending::<u8>(),
+            async move {
+                let _ = release_rx.await;
+                completed_in_task.store(true, std::sync::atomic::Ordering::SeqCst);
+                1u8
+            },
         )
         .await;
 
@@ -851,50 +841,72 @@ mod tests {
         assert!(matches!(result, Err(DetachedError::Timeout)));
         assert_eq!(permits.available_permits(), 0);
 
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while permits.available_permits() == 0 {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("the hard deadline must return the mutation permit");
+        tokio::time::timeout(Duration::from_secs(5), admission.cancelled())
+            .await
+            .expect("the hard deadline must close admission");
+        assert_eq!(
+            permits.available_permits(),
+            0,
+            "the hard deadline must not cancel the execution or release its permit"
+        );
+        assert!(!completed.load(std::sync::atomic::Ordering::SeqCst));
 
-        // Capacity is genuinely available again instead of answering 503.
-        let admitted = run_detached_with_timeout(
+        let rejected = run_detached_with_timeout(
             &admission,
             &tracker,
-            permits,
+            permits.clone(),
             Arc::new(Mutex::new(Vec::new())),
             Duration::from_secs(5),
             Duration::from_secs(30),
-            async { 1u8 },
+            async { 2u8 },
         )
         .await;
-        assert!(matches!(admitted, Ok(1)));
+        assert!(matches!(rejected, Err(DetachedError::ShuttingDown)));
 
+        release_tx.send(()).unwrap();
         tracker.close();
         tokio::time::timeout(Duration::from_secs(5), tracker.wait())
             .await
-            .expect("abandoned execution must have ended");
+            .expect("shutdown drain must observe the execution finish");
+        assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(permits.available_permits(), 1);
     }
 
-    /// A response whose deadline is shorter than the hard deadline can still
-    /// observe an abandoned execution; it must not be reported as success.
+    /// Even when the hard deadline precedes the response deadline, the helper
+    /// keeps polling the mutation after closing admission.
     #[tokio::test(flavor = "multi_thread")]
-    async fn an_abandoned_execution_is_not_reported_as_success() {
+    async fn a_hard_deadline_waits_for_the_mutation_to_finish() {
         let admission = CancellationToken::new();
         let tracker = TaskTracker::new();
-        let result = run_detached_with_timeout(
-            &admission,
-            &tracker,
-            Arc::new(Semaphore::new(1)),
-            Arc::new(Mutex::new(Vec::new())),
-            Duration::from_secs(5),
-            Duration::from_millis(20),
-            std::future::pending::<u8>(),
-        )
-        .await;
-        assert!(matches!(result, Err(DetachedError::Abandoned)));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn({
+            let admission = admission.clone();
+            let tracker = tracker.clone();
+            async move {
+                run_detached_with_timeout(
+                    &admission,
+                    &tracker,
+                    Arc::new(Semaphore::new(1)),
+                    Arc::new(Mutex::new(Vec::new())),
+                    Duration::from_secs(5),
+                    Duration::from_millis(20),
+                    async move {
+                        let _ = release_rx.await;
+                        7u8
+                    },
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), admission.cancelled())
+            .await
+            .expect("the hard deadline must close admission");
+        assert!(
+            !task.is_finished(),
+            "closing admission must not cancel the mutation"
+        );
+        release_tx.send(()).unwrap();
+        assert!(matches!(task.await.unwrap(), Ok(7)));
         tracker.close();
         tracker.wait().await;
     }

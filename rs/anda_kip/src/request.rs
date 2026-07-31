@@ -314,13 +314,14 @@ impl Request {
     fn validate_placeholder_usage(
         command: &str,
         parameters: &Map<String, Json>,
-    ) -> Result<(), ErrorObject> {
+    ) -> Option<ErrorObject> {
         if parameters.is_empty() {
-            return Ok(());
+            return None;
         }
 
         Self::find_placeholders_in_strings(command, parameters)
-            .map_err(Self::placeholder_usage_error)
+            .err()
+            .map(Self::placeholder_usage_error)
     }
 
     fn validate_request_mode(&self) -> Option<ErrorObject> {
@@ -498,7 +499,7 @@ impl Request {
         if self.is_batch() {
             self.execute_batch(nexus).await
         } else {
-            if let Err(error) = Self::validate_placeholder_usage(&self.command, &self.parameters) {
+            if let Some(error) = Self::validate_placeholder_usage(&self.command, &self.parameters) {
                 return (CommandType::Unknown, Response::err(error));
             }
 
@@ -520,7 +521,7 @@ impl Request {
         let mut command_type = CommandType::Unknown;
 
         for (cmd, params) in self.iter_commands() {
-            if let Err(error) = Self::validate_placeholder_usage(&cmd, &params) {
+            if let Some(error) = Self::validate_placeholder_usage(&cmd, &params) {
                 results.push(Response::err(error));
                 continue;
             }
@@ -664,6 +665,10 @@ impl Response {
 
     /// Consumes the response and converts it into a `Result`, discarding the
     /// pagination cursor and any partial result attached to an error.
+    ///
+    /// Returning [`ErrorObject`] by value is part of the public API. Boxing it
+    /// would silence Clippy's size warning but would break existing callers.
+    #[allow(clippy::result_large_err)]
     pub fn into_result(self) -> Result<Json, ErrorObject> {
         match self {
             Self::Ok { result, .. } => Ok(result),

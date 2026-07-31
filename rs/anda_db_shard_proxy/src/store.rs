@@ -228,7 +228,15 @@ enum DbShardEvent {
 #[serde(tag = "op")]
 enum BackendEvent {
     #[serde(rename = "upsert")]
-    Upsert { shard_id: u32, backend_addr: String },
+    Upsert {
+        shard_id: u32,
+        backend_addr: String,
+        /// Wire-compatibility field for 0.10 listeners. The proxy no longer
+        /// implements backend read-only routing, but old listeners require
+        /// this field to deserialize an upsert notification.
+        #[serde(default)]
+        read_only: bool,
+    },
     #[serde(rename = "delete")]
     Delete { shard_id: u32 },
 }
@@ -626,6 +634,7 @@ impl ShardStore {
             &BackendEvent::Upsert {
                 shard_id: backend.shard_id,
                 backend_addr: backend.backend_addr.clone(),
+                read_only: false,
             },
         )
         .await?;
@@ -707,6 +716,7 @@ impl ShardStore {
             Ok(BackendEvent::Upsert {
                 shard_id,
                 backend_addr,
+                ..
             }) => {
                 if let Err(err) = validate_backend_addr(&backend_addr) {
                     log::error!("ignoring shard_backends event for shard {shard_id}: {err}");
@@ -1196,6 +1206,44 @@ mod tests {
 
         store.apply_backend_event(r#"{"op":"delete","shard_id":7}"#);
         assert!(store.resolve_by_shard(7).await.is_none());
+    }
+
+    #[test]
+    fn backend_upsert_notification_remains_compatible_with_0_10_listeners() {
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "op")]
+        enum LegacyBackendEvent {
+            #[serde(rename = "upsert")]
+            Upsert {
+                shard_id: u32,
+                backend_addr: String,
+                read_only: bool,
+            },
+        }
+
+        let payload = serde_json::to_string(&BackendEvent::Upsert {
+            shard_id: 7,
+            backend_addr: "http://127.0.0.1:7000".to_string(),
+            read_only: false,
+        })
+        .unwrap();
+        let LegacyBackendEvent::Upsert {
+            shard_id,
+            backend_addr,
+            read_only,
+        } = serde_json::from_str(&payload).expect("0.10 listener must accept the payload");
+        assert_eq!(shard_id, 7);
+        assert_eq!(backend_addr, "http://127.0.0.1:7000");
+        assert!(!read_only);
+
+        // New listeners also accept notifications emitted by early 0.11
+        // builds, which omitted the compatibility field.
+        assert!(
+            serde_json::from_str::<BackendEvent>(
+                r#"{"op":"upsert","shard_id":7,"backend_addr":"http://127.0.0.1:7000"}"#
+            )
+            .is_ok()
+        );
     }
 
     /// A row written outside the administrative API (DBA, migration, older

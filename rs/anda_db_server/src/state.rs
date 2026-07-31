@@ -603,9 +603,12 @@ impl AppState {
         // without limit. Checked here (never during startup reopen) so
         // lowering the limit cannot break a restart.
         {
-            let registered = self.inner.registry.read().await.len();
+            let registry = self.inner.registry.read().await;
             let max = self.inner.options.max_databases;
-            if registered >= max {
+            // A name retained after a transient startup-open failure already
+            // owns its registry slot. Reopening it creates the missing live
+            // entry/task; it does not grow the durable registry.
+            if !registry.contains(name) && registry.len() >= max {
                 return Err(ApiError::new(
                     StatusCode::CONFLICT,
                     "limit_exceeded",

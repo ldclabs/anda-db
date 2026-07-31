@@ -103,7 +103,7 @@ re-resolve once, so the reader observes the new committed version.
   ETag and then stripped: once the precondition holds against the current
   commit point, the immutable payload cannot change under the reader.
 - `if_modified_since` / `if_unmodified_since` on reads are evaluated in the
-  wrapper too, against the same generation-derived `last_modified` the call
+  wrapper too, against the same commit-point `last_modified` the call
   reports, and stripped before the request reaches the backend — otherwise
   the backend would answer them against the payload object's own mtime, a
   different clock. RFC 9110 §13.2.2 precedence is honoured: when `if_match`
@@ -243,7 +243,8 @@ let store = MetaStoreBuilder::new(
 
 ### 3.1 What it does
 
-- Tracks a per-object `Metadata { size, e_tag, generation }`.
+- Tracks a per-object
+  `Metadata { size, e_tag, generation, committed_at_ms }`.
 - Computes a per-commit logical ETag
   (`base64url(SHA3-256(generation ‖ payload))`) on every put — see
   [§2.2](#22-conditional-writes) for why the generation is mixed in. This
@@ -251,7 +252,7 @@ let store = MetaStoreBuilder::new(
   `if_match` / `if_none_match` are checked against.
 - Reports the *logical* object on `get` / `head` / `list`: the committed
   (authenticated) size from the metadata document rather than the backing
-  generation object's length, and one generation-derived `last_modified` that
+  generation object's length, and one commit-point `last_modified` that
   is identical across all three calls.
 - Implements the immutable-generation write protocol of §2, so
   `LocalFileSystem` (which has no native CAS) gains the same
@@ -279,10 +280,10 @@ metadata put never leaves a stale entry in front of the on-disk truth.
 | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `put_opts`                  | Writes a fresh generation, then commits the pointer, then reclaims the replaced payload best-effort. Atomic at the commit point.               |
 | `put_multipart`             | Streams parts into a fresh generation; `complete()` materializes it and switches the pointer. An unfinished upload never affects readers.       |
-| `get_opts`                  | Resolves the pointer, evaluates the logical-ETag *and* date preconditions, reads the immutable payload (with one retry on a stale cached pointer). Reports the committed size and the generation-derived `last_modified`. |
+| `get_opts`                  | Resolves the pointer, evaluates the logical-ETag *and* date preconditions, reads the immutable payload (with one retry on a stale cached pointer). Reports the committed size and the commit-point `last_modified`. |
 | `delete_stream`             | Per location: deletes the metadata document (the logical delete), then the payload best-effort. `NotFound` iff no commit point exists.         |
 | `copy_opts` / `rename_opts` | Copies the payload into a fresh generation of the target, then commits the target pointer with a **new** logical ETag (never the source's); rename then deletes the source commit point. |
-| `list*`                     | Enumerates `meta/` (commit points; 8-way concurrent decode). Uncommitted generations and crash leftovers are invisible by construction. Reports the same generation-derived `last_modified` as `get`/`head`. |
+| `list*`                     | Enumerates `meta/` (commit points; 8-way concurrent decode). Uncommitted generations and crash leftovers are invisible by construction. Reports the same commit-point `last_modified` as `get`/`head`. |
 
 ### 3.4 Path mapping helpers
 
