@@ -16,7 +16,7 @@ use anda_db::{
 use anda_db_tfs::QueryType;
 use futures::stream::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use super::collection::{ensure_writable, open};
 use crate::error::ApiError;
@@ -619,12 +619,38 @@ pub async fn search_ids(db: &AndaDB, params: SearchParams) -> Result<Vec<Documen
 /// "no data requested" meaning.
 const MAX_QUERY_IDS: usize = 1_000;
 
-/// `doc.query_ids` — returns document IDs matching a B-Tree filter.
+/// `doc.query_ids` — returns the **smallest** document IDs matching a B-Tree
+/// filter.
 pub async fn query_ids(db: &AndaDB, params: QueryIdsParams) -> Result<Vec<DocumentId>, ApiError> {
+    let (collection, limit) = prepare_query_ids(db, &params, "doc.query_ids").await?;
+    Ok(collection.query_ids(params.filter, Some(limit)).await?)
+}
+
+/// `doc.query_last_ids` — returns the **largest** document IDs matching a
+/// B-Tree filter, for newest-first cursor pagination.
+///
+/// Identical to `doc.query_ids` except for which end of the match set it
+/// keeps; without it a client paginating newest-first has to fetch every
+/// matching ID and sort them itself.
+pub async fn query_last_ids(
+    db: &AndaDB,
+    params: QueryIdsParams,
+) -> Result<Vec<DocumentId>, ApiError> {
+    let (collection, limit) = prepare_query_ids(db, &params, "doc.query_last_ids").await?;
+    Ok(collection
+        .query_last_ids(params.filter, Some(limit))
+        .await?)
+}
+
+async fn prepare_query_ids(
+    db: &AndaDB,
+    params: &QueryIdsParams,
+    method: &str,
+) -> Result<(Arc<Collection>, usize), ApiError> {
     let limit = match params.limit {
         Some(limit) if limit > MAX_QUERY_IDS => {
             return Err(ApiError::invalid_input(format!(
-                "doc.query_ids accepts a limit of at most {MAX_QUERY_IDS}, got {limit}"
+                "{method} accepts a limit of at most {MAX_QUERY_IDS}, got {limit}"
             )));
         }
         Some(limit) => limit,
@@ -637,7 +663,7 @@ pub async fn query_ids(db: &AndaDB, params: QueryIdsParams) -> Result<Vec<Docume
         .validate_complexity()
         .map_err(ApiError::invalid_query)?;
     validate_filter(&collection.metadata(), &params.filter)?;
-    Ok(collection.query_ids(params.filter, Some(limit)).await?)
+    Ok((collection, limit))
 }
 
 #[cfg(test)]

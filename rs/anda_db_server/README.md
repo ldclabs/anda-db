@@ -254,7 +254,8 @@ Admin key, or the key bound to `{db_name}`.
 | `doc.count` | `{collection}` | Number of documents |
 | `doc.search` | `{collection, query}` | Matching documents |
 | `doc.search_ids` | `{collection, query}` | Matching document IDs |
-| `doc.query_ids` | `{collection, filter, limit?}` | IDs matching a B-Tree filter; `limit` defaults to and is capped at 1 000, `0` returns nothing |
+| `doc.query_ids` | `{collection, filter, limit?}` | Smallest IDs matching a B-Tree filter; `limit` defaults to and is capped at 1 000, `0` returns nothing |
+| `doc.query_last_ids` | `{collection, filter, limit?}` | Same, but the largest matching IDs (newest-first pagination); IDs still come back ascending |
 
 ### Creating collections
 

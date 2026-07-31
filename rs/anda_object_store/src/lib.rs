@@ -2417,6 +2417,8 @@ mod tests {
         let bytes = res.bytes().await.unwrap();
         assert_eq!(bytes, Bytes::from_static(b"upgraded"));
 
+        // One range covering the whole object, not a range-valued collection.
+        #[allow(clippy::single_range_in_vec_init)]
         let ranges = ranger.get_ranges(&location, &[0..8]).await.unwrap();
         assert_eq!(ranges[0], Bytes::from_static(b"upgraded"));
 

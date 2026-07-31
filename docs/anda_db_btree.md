@@ -179,7 +179,7 @@ The index is designed to be cloned into `Arc` and shared across tasks.
 | `insert`, `insert_array`                | `mutation_gate` **read** (first, always), then DashMap shard for the posting, then DashMap shard for the bucket; `btree` write lock **only** when a new key is added |
 | `remove`, `remove_array`                | Same as insert; `btree` write lock only when a posting becomes empty                                                    |
 | `query_with`                            | DashMap read shard for the posting                                                                                      |
-| `range_query_with`, `prefix_query_with` | `btree` read lock for the duration of iteration; postings are fetched via DashMap read shards per key                   |
+| `range_query_with`, `range_query_rev_with`, `prefix_query_with` | `btree` read lock for the duration of iteration; postings are fetched via DashMap read shards per key                   |
 | `flush`, `flush_owned_with`             | DashMap read for bucket scan; CBOR is built inside the bucket guard, then released before `await`-ing the user's writer |
 | `compact_buckets`                       | `mutation_gate` **write** (mutations hold it shared), then `btree` write lock and the DashMap shards for the rebuild    |
 
@@ -320,7 +320,8 @@ pub enum RangeQuery<FV> {
 | Method                            | Shape                   | Notes                                              |
 | --------------------------------- | ----------------------- | -------------------------------------------------- |
 | `query_with(&FV, f)`              | exact match             | single DashMap lookup                              |
-| `range_query_with(RangeQuery, f)` | any combinator          | streaming, supports early termination              |
+| `range_query_with(RangeQuery, f)` | any combinator          | streaming, ascending walk, supports early termination |
+| `range_query_rev_with(RangeQuery, f)` | any combinator      | same, walking down from the largest key; results still ascending |
 | `prefix_query_with(&str, f)`      | `FV = String` only      | implemented via `range(prefix..=prefix+char::MAX)` |
 | `keys(cursor, limit)`             | paginated key iteration | ordered, exclusive cursor                          |
 
@@ -446,6 +447,13 @@ pub fn query_with<F, R>(&self, field_value: &FV, f: F) -> Option<R>
     where F: FnOnce(&Vec<PK>) -> Option<R>;
 
 pub fn range_query_with<F, R>(&self, query: RangeQuery<FV>, f: F) -> Vec<R>
+    where F: FnMut(&FV, &Vec<PK>) -> (bool, Vec<R>);
+
+// Same, but walks from the largest matching key down, so a scan that stops
+// early keeps the *last* page of the range instead of the first. Results are
+// returned in ascending key order either way — the direction decides which
+// keys a bounded scan collects, not how they are ordered.
+pub fn range_query_rev_with<F, R>(&self, query: RangeQuery<FV>, f: F) -> Vec<R>
     where F: FnMut(&FV, &Vec<PK>) -> (bool, Vec<R>);
 
 pub fn keys(&self, cursor: Option<FV>, limit: Option<usize>) -> Vec<FV>;

@@ -180,18 +180,22 @@ struct MutationIntent {
     proposed: Option<DocumentOwned>,
 }
 
-/// The direction a filter scan walked the key space before it stopped.
+/// Which end of the matching set a bounded query keeps.
 ///
-/// `Lt`/`Le` range scans walk backwards so they can stop as soon as `limit`
-/// hits are found, which means they keep the *largest* matching keys and an
-/// over-long result has to be trimmed from the head. Every other path collects
-/// from the smallest key upwards and is trimmed from the tail.
+/// This is an **input** chosen by the caller, never inferred from the filter:
+/// [`Collection::query_ids`] asks for the smallest ids, and
+/// [`Collection::query_last_ids`] for the largest. Scans walk in the requested
+/// direction so either end stops early, and results always come back in
+/// ascending id order — the direction decides *which* ids a bounded query
+/// selects, not how they are ordered.
 ///
-/// The scan reports this itself: it cannot be re-derived from the filter AST,
-/// because composite filters (`And`/`Or`/`Not`) evaluate their operands
-/// unbounded and always yield an ascending result even when a `Lt`/`Le` operand
-/// appears inside them. Guessing from the AST used to make logically equivalent
-/// filters (`Between(5, 14)` vs `And(Ge(5), Lt(15))`) return disjoint pages.
+/// Deriving it from the filter instead is what made 0.11.0 return opposite
+/// pages for the same predicate depending on where it sat: a bare
+/// `_id Lt cursor` kept the newest ids (its scan walks backwards), while
+/// `And([user Eq, _id Lt cursor])` kept the oldest (composite filters evaluate
+/// their operands unbounded and collect ascending). Guessing from the AST also
+/// made logically equivalent filters (`Between(5, 14)` vs `And(Ge(5), Lt(15))`)
+/// return disjoint pages, which is why the guess was removed rather than fixed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScanOrder {
     Ascending,
@@ -199,19 +203,12 @@ enum ScanOrder {
 }
 
 impl ScanOrder {
-    /// The direction the range scan for `query` walks the key space.
-    ///
-    /// Only a top-level `Lt`/`Le` walks backwards; composite range queries
-    /// (`And`/`Or`/`Not`) resolve their operands unbounded first and then
-    /// collect ascending.
-    fn of_range_query<T>(query: &RangeQuery<T>) -> Self {
-        match query {
-            RangeQuery::Lt(_) | RangeQuery::Le(_) => ScanOrder::Descending,
-            _ => ScanOrder::Ascending,
-        }
+    /// Whether scans should walk the key space from the largest key down.
+    fn is_descending(self) -> bool {
+        matches!(self, ScanOrder::Descending)
     }
 
-    /// Trims `result` down to `limit`, dropping the ids the scan did not select.
+    /// Trims an ascending `result` down to `limit`, keeping the requested end.
     fn truncate(self, result: &mut Vec<DocumentId>, limit: usize) {
         if limit == 0 || result.len() <= limit {
             return;
@@ -350,11 +347,16 @@ impl BTreeIndexView<'_> {
         self.inner.query_with(field_value, f)
     }
 
-    pub fn try_range_query_ids<F>(&self, query: RangeQuery<Fv>, f: F) -> Result<(), DBError>
+    pub fn try_range_query_ids<F>(
+        &self,
+        query: RangeQuery<Fv>,
+        descending: bool,
+        f: F,
+    ) -> Result<(), DBError>
     where
         F: FnMut(&[DocumentId]) -> bool,
     {
-        self.inner.try_range_query_ids(query, f)
+        self.inner.try_range_query_ids(query, descending, f)
     }
 
     pub fn range_query_with<F, R>(&self, query: RangeQuery<Fv>, f: F) -> Vec<R>
@@ -3757,15 +3759,13 @@ impl Collection {
             }
         }
 
-        // 截断哪一端由扫描自己上报（见 ScanOrder）：混合搜索的结果按相关性
-        // 降序排列，必须保留头部，否则会丢弃最相关的命中，因此带 candidates
-        // 的过滤路径总是上报 Ascending。
-        let mut order = ScanOrder::Ascending;
+        // 过滤路径按 id 升序保留最小的 `limit` 个（与 `query_ids` 一致）；
+        // 混合搜索的结果按相关性降序排列，同样保留头部，否则会丢弃最相关的
+        // 命中。要按 id 取最新的一页，用 `query_last_ids`。
+        let order = ScanOrder::Ascending;
         match query.filter {
             Some(filter) => {
-                let (ids, scan_order) = self.filter_by_field(filter, &candidates, top_k)?;
-                result = ids;
-                order = scan_order;
+                result = self.filter_by_field(filter, &candidates, top_k, order)?;
             }
             None => result = candidates,
         };
@@ -3774,7 +3774,17 @@ impl Collection {
         Ok(result)
     }
 
-    /// Queries document IDs based on a filter condition.
+    /// Queries the **smallest** matching document IDs.
+    ///
+    /// # Page semantics
+    ///
+    /// The result is the first `limit` matching ids in ascending id order, for
+    /// every filter shape. Which end you get is a property of the method you
+    /// call, never of the filter you pass: `_id Lt cursor` and
+    /// `And([user Eq u, _id Lt cursor])` page identically here, and
+    /// [`Collection::query_last_ids`] returns the other end for both. Scans
+    /// walk in the direction the method asks for, so neither end costs more
+    /// than the page it returns.
     ///
     /// # Limit semantics
     ///
@@ -3786,18 +3796,54 @@ impl Collection {
     /// the same zero-is-nothing convention as [`Collection::search_ids`]
     /// instead of overloading it as "unlimited" — the internal scan already
     /// uses `0` for "unbounded", and letting a caller reach that meaning is
-    /// exactly the trap this bound removes.
+    /// exactly the trap this bound removes. [`Collection::query_all_ids`] is
+    /// the unbounded entry point.
     ///
     /// # Arguments
     /// * `filter` - The filter condition to apply
     /// * `limit` - Maximum number of results to return, clamped as above.
     ///
     /// # Returns
-    /// A vector of document IDs matching the filter, or an error if filtering fails.
+    /// Matching document IDs in ascending order, or an error if filtering fails.
     pub async fn query_ids(
         &self,
         filter: Filter,
         limit: Option<usize>,
+    ) -> Result<Vec<DocumentId>, DBError> {
+        self.query_ids_from(filter, limit, ScanOrder::Ascending)
+            .await
+    }
+
+    /// Queries the **largest** matching document IDs — the newest page, for
+    /// collections whose ids grow with time.
+    ///
+    /// Identical to [`Collection::query_ids`] except for which end of the
+    /// match set it keeps: the result is the last `limit` matching ids, still
+    /// returned in ascending id order. This is the entry point for
+    /// newest-first cursor pagination (`And([owner Eq u, _id Lt cursor])`),
+    /// which otherwise has to load every match and sort it in the caller.
+    ///
+    /// # Arguments
+    /// * `filter` - The filter condition to apply
+    /// * `limit` - Maximum number of results to return, clamped as in
+    ///   [`Collection::query_ids`].
+    ///
+    /// # Returns
+    /// Matching document IDs in ascending order, or an error if filtering fails.
+    pub async fn query_last_ids(
+        &self,
+        filter: Filter,
+        limit: Option<usize>,
+    ) -> Result<Vec<DocumentId>, DBError> {
+        self.query_ids_from(filter, limit, ScanOrder::Descending)
+            .await
+    }
+
+    async fn query_ids_from(
+        &self,
+        filter: Filter,
+        limit: Option<usize>,
+        order: ScanOrder,
     ) -> Result<Vec<DocumentId>, DBError> {
         filter
             .validate_complexity()
@@ -3814,7 +3860,7 @@ impl Collection {
             .unwrap_or(Self::MAX_SEARCH_LIMIT)
             .min(Self::MAX_SEARCH_LIMIT);
 
-        let (mut rt, order) = self.filter_by_field(filter, &[], limit)?;
+        let mut rt = self.filter_by_field(filter, &[], limit, order)?;
         order.truncate(&mut rt, limit);
         Ok(rt)
     }
@@ -3834,8 +3880,8 @@ impl Collection {
     /// * `filter` - The filter condition to apply
     ///
     /// # Returns
-    /// All matching document IDs in ascending order (composite filters) or
-    /// index scan order, or an error if filtering fails.
+    /// All matching document IDs in ascending order, or an error if filtering
+    /// fails.
     pub async fn query_all_ids(&self, filter: Filter) -> Result<Vec<DocumentId>, DBError> {
         filter
             .validate_complexity()
@@ -3846,7 +3892,7 @@ impl Collection {
 
         self.search_count.fetch_add(1, Ordering::Relaxed);
         // The internal scan uses `0` for "unbounded".
-        let (rt, _) = self.filter_by_field(filter, &[], 0)?;
+        let rt = self.filter_by_field(filter, &[], 0, ScanOrder::Ascending)?;
         Ok(rt)
     }
 
@@ -3923,16 +3969,16 @@ impl Collection {
         filter: Filter,
         candidates: &[DocumentId],
         limit: usize,
-    ) -> Result<(Vec<DocumentId>, ScanOrder), DBError> {
+        order: ScanOrder,
+    ) -> Result<Vec<DocumentId>, DBError> {
         if candidates.is_empty() {
-            let (mut result, order) = self.filter_by_field_with(filter, None, limit)?;
+            let mut result = self.filter_by_field_with(filter, None, limit, order)?;
             result.sort_unstable();
-            Ok((result, order))
+            Ok(result)
         } else {
             let cand_set: FxHashSet<DocumentId> = candidates.iter().copied().collect();
             let matched: FxHashSet<DocumentId> = self
-                .filter_by_field_with(filter, Some(&cand_set), 0)?
-                .0
+                .filter_by_field_with(filter, Some(&cand_set), 0, order)?
                 .into_iter()
                 .collect();
 
@@ -3944,18 +3990,24 @@ impl Collection {
             }
             // The result follows the caller's candidate order (relevance
             // descending for a hybrid search) and the inner scan ran unbounded,
-            // so an over-long result is always trimmed from the tail.
-            Ok((result, ScanOrder::Ascending))
+            // so an over-long result is always trimmed from the tail by the
+            // caller, regardless of `order`.
+            Ok(result)
         }
     }
 
     /// Inner implementation of `filter_by_field` using a `FxHashSet` for O(1) candidate lookups.
+    ///
+    /// `order` is the end the caller wants; scans walk that way so either end
+    /// stops early. Composite filters evaluate their operands unbounded and
+    /// return the full match set — the caller trims it to `limit`.
     fn filter_by_field_with(
         &self,
         filter: Filter,
         candidates: Option<&FxHashSet<DocumentId>>,
         limit: usize,
-    ) -> Result<(Vec<DocumentId>, ScanOrder), DBError> {
+        order: ScanOrder,
+    ) -> Result<Vec<DocumentId>, DBError> {
         let mut result = Vec::new();
         match filter {
             Filter::Field((index_name, filter)) => {
@@ -3965,13 +4017,10 @@ impl Collection {
                             name: self.name.clone(),
                             source: err,
                         })?;
-                    Ok(self.filter_by_id(filter, candidates, limit))
+                    Ok(self.filter_by_id(filter, candidates, limit, order))
                 } else if let Some(index) =
                     self.btree_indexes.iter().find(|i| i.name() == index_name)
                 {
-                    // The index scan honors `limit`, so the direction it walks
-                    // decides which end of an over-long result is kept.
-                    let order = ScanOrder::of_range_query(&filter);
                     // A range scan visits one posting list per key, and a
                     // non-unique index (array field, or plain duplicates) maps
                     // the same document under several keys. Without de-dup the
@@ -3981,7 +4030,7 @@ impl Collection {
                     // order is preserved, matching the other branches.
                     let mut rt: UniqueVec<DocumentId> =
                         UniqueVec::with_capacity(Self::reserve_hint(limit));
-                    index.try_range_query_ids(filter, |ids| {
+                    index.try_range_query_ids(filter, order.is_descending(), |ids| {
                         for id in ids {
                             if candidates.is_none_or(|s| s.contains(id)) {
                                 rt.push(*id);
@@ -3993,7 +4042,7 @@ impl Collection {
                         true
                     })?;
                     result = rt.into();
-                    Ok((result, order))
+                    Ok(result)
                 } else {
                     Err(DBError::Index {
                         name: self.name.clone(),
@@ -4004,12 +4053,11 @@ impl Collection {
             Filter::Or(queries) => {
                 let mut rt: UniqueVec<u64> = UniqueVec::with_capacity(Self::reserve_hint(limit));
                 // Evaluate every branch unbounded (limit = 0), like `And` and
-                // `Not`: a branch bounded by `limit` collects the wrong ids
-                // when its scan direction is descending (`Lt`/`Le` keep the
-                // largest keys), so the ascending trim below would drop
-                // matches from both ends of the union.
+                // `Not`: a branch bounded by `limit` collects only its own end
+                // of the union, so the trim below would drop matches the union
+                // as a whole should have kept.
                 for query in queries {
-                    let (ids, _) = self.filter_by_field_with(*query, candidates, 0)?;
+                    let ids = self.filter_by_field_with(*query, candidates, 0, order)?;
                     rt.extend(ids);
                 }
 
@@ -4017,42 +4065,47 @@ impl Collection {
                 // Canonical order, so equal boolean sets yield equal results
                 // regardless of branch order; the caller applies `limit`.
                 result.sort_unstable();
-                Ok((result, ScanOrder::Ascending))
+                Ok(result)
             }
             Filter::And(queries) => {
                 let mut iter = queries.into_iter();
                 if let Some(query) = iter.next() {
                     let mut rt: FxHashSet<DocumentId> = self
-                        .filter_by_field_with(*query, candidates, 0)?
-                        .0
+                        .filter_by_field_with(*query, candidates, 0, order)?
                         .into_iter()
                         .collect();
 
                     for query in iter {
                         rt = self
-                            .filter_by_field_with(*query, Some(&rt), 0)?
-                            .0
+                            .filter_by_field_with(*query, Some(&rt), 0, order)?
                             .into_iter()
                             .collect();
                         if rt.is_empty() {
-                            return Ok((vec![], ScanOrder::Ascending));
+                            return Ok(vec![]);
                         }
                     }
 
                     result = rt.into_iter().collect();
                 }
                 // 每个操作数都以 limit = 0 求值，得到的是完整交集，
-                // 由调用方按升序截断长度
-                Ok((result, ScanOrder::Ascending))
+                // 由调用方按 `order` 截断长度
+                Ok(result)
             }
             Filter::Not(query) => {
                 result.reserve_exact(Self::reserve_hint(limit));
                 let exclude: FxHashSet<u64> = self
-                    .filter_by_field_with(*query, None, 0)?
-                    .0
+                    .filter_by_field_with(*query, None, 0, order)?
                     .into_iter()
                     .collect();
-                for id in self.doc_ids_index.read().iter() {
+                let doc_ids_index = self.doc_ids_index.read();
+                // Walk the id space from the end the caller asked for, so a
+                // bounded complement stops early on either side.
+                let ids: Box<dyn Iterator<Item = &DocumentId>> = if order.is_descending() {
+                    Box::new(doc_ids_index.iter().rev())
+                } else {
+                    Box::new(doc_ids_index.iter())
+                };
+                for id in ids {
                     if !exclude.contains(id) && candidates.is_none_or(|s| s.contains(id)) {
                         result.push(*id);
                         if limit > 0 && result.len() >= limit {
@@ -4060,31 +4113,43 @@ impl Collection {
                         }
                     }
                 }
-                Ok((result, ScanOrder::Ascending))
+                drop(doc_ids_index);
+                result.sort_unstable();
+                Ok(result)
             }
         }
     }
 
-    /// Filters documents by ID using a range query.
-    ///
-    /// # Arguments
-    /// * `query` - The range query to apply to document IDs
-    /// * `candidates` - Optional set of document IDs to filter (if None, all documents are considered)
-    /// * `limit` - The number of results to stop retrieving. The returned vector may be shorter or larger than this limit.
-    ///
-    /// # Returns
-    /// A vector of document IDs matching the range query paired with the
-    /// direction the scan walked (see [`ScanOrder`])
     fn filter_by_id(
         &self,
         query: RangeQuery<DocumentId>,
         candidates: Option<&FxHashSet<DocumentId>>,
         limit: usize,
-    ) -> (Vec<DocumentId>, ScanOrder) {
-        // 扫描方向由查询形态决定（只有 Lt/Le 倒序遍历），在此上报，
-        // 调用方不必再从过滤条件反推
-        let order = ScanOrder::of_range_query(&query);
+        order: ScanOrder,
+    ) -> Vec<DocumentId> {
+        // 遍历方向由调用方的 `order` 决定，两端都能提前终止；
+        // 结果始终按 id 升序返回。
+        let descending = order.is_descending();
         let mut result = Vec::new();
+        // Collects ids from `iter` (already in the requested walk direction),
+        // stopping at `limit`, and returns them ascending.
+        macro_rules! walk {
+            ($iter:expr) => {{
+                let mut tmp = Vec::with_capacity(Self::reserve_hint(limit));
+                for id in $iter {
+                    if candidates.is_none_or(|s| s.contains(id)) {
+                        tmp.push(*id);
+                        if limit > 0 && tmp.len() >= limit {
+                            break;
+                        }
+                    }
+                }
+                if descending {
+                    tmp.reverse();
+                }
+                result = tmp;
+            }};
+        }
         match query {
             RangeQuery::Eq(id) => {
                 if self.doc_ids_index.read().contains(&id)
@@ -4094,120 +4159,99 @@ impl Collection {
                 }
             }
             RangeQuery::Gt(start_key) => {
-                result.reserve_exact(Self::reserve_hint(limit));
-                for id in self.doc_ids_index.read().range((
+                let doc_ids_index = self.doc_ids_index.read();
+                let range = doc_ids_index.range((
                     std::ops::Bound::Excluded(start_key),
                     std::ops::Bound::Unbounded,
-                )) {
-                    if candidates.is_none_or(|s| s.contains(id)) {
-                        result.push(*id);
-                        if limit > 0 && result.len() >= limit {
-                            return (result, order);
-                        }
-                    }
+                ));
+                if descending {
+                    walk!(range.rev())
+                } else {
+                    walk!(range)
                 }
             }
             RangeQuery::Ge(start_key) => {
-                result.reserve_exact(Self::reserve_hint(limit));
-                for id in self
-                    .doc_ids_index
-                    .read()
-                    .range(std::ops::RangeFrom { start: start_key })
-                {
-                    if candidates.is_none_or(|s| s.contains(id)) {
-                        result.push(*id);
-                        if limit > 0 && result.len() >= limit {
-                            return (result, order);
-                        }
-                    }
+                let doc_ids_index = self.doc_ids_index.read();
+                let range = doc_ids_index.range(std::ops::RangeFrom { start: start_key });
+                if descending {
+                    walk!(range.rev())
+                } else {
+                    walk!(range)
                 }
             }
             RangeQuery::Lt(end_key) => {
-                // 倒序遍历以便在有上限时尽快终止，最终结果按正序返回
-                let mut tmp = Vec::with_capacity(Self::reserve_hint(limit));
-                for id in self
-                    .doc_ids_index
-                    .read()
-                    .range(std::ops::RangeTo { end: end_key })
-                    .rev()
-                {
-                    if candidates.is_none_or(|s| s.contains(id)) {
-                        tmp.push(*id);
-                        if limit > 0 && tmp.len() >= limit {
-                            break;
-                        }
-                    }
+                let doc_ids_index = self.doc_ids_index.read();
+                let range = doc_ids_index.range(std::ops::RangeTo { end: end_key });
+                if descending {
+                    walk!(range.rev())
+                } else {
+                    walk!(range)
                 }
-                tmp.reverse();
-                result.extend(tmp);
             }
             RangeQuery::Le(end_key) => {
-                // 倒序遍历以便在有上限时尽快终止，最终结果按正序返回
-                let mut tmp = Vec::with_capacity(Self::reserve_hint(limit));
-                for id in self
-                    .doc_ids_index
-                    .read()
-                    .range(std::ops::RangeToInclusive { end: end_key })
-                    .rev()
-                {
-                    if candidates.is_none_or(|s| s.contains(id)) {
-                        tmp.push(*id);
-                        if limit > 0 && tmp.len() >= limit {
-                            break;
-                        }
-                    }
+                let doc_ids_index = self.doc_ids_index.read();
+                let range = doc_ids_index.range(std::ops::RangeToInclusive { end: end_key });
+                if descending {
+                    walk!(range.rev())
+                } else {
+                    walk!(range)
                 }
-                tmp.reverse();
-                result.extend(tmp);
             }
             RangeQuery::Between(start_key, end_key) => {
                 if start_key > end_key {
                     // 与 anda_db_btree 的语义一致：区间反转匹配空集，
                     // 而不是让 BTreeSet::range 直接 panic
-                    return (result, order);
+                    return result;
                 }
 
-                result.reserve_exact(Self::reserve_hint(
-                    limit.min(end_key.saturating_sub(start_key).saturating_add(1) as usize),
-                ));
-                for id in self.doc_ids_index.read().range(start_key..=end_key) {
-                    if candidates.is_none_or(|s| s.contains(id)) {
-                        result.push(*id);
-                        if limit > 0 && result.len() >= limit {
-                            return (result, order);
-                        }
-                    }
+                let doc_ids_index = self.doc_ids_index.read();
+                let range = doc_ids_index.range(start_key..=end_key);
+                if descending {
+                    walk!(range.rev())
+                } else {
+                    walk!(range)
                 }
             }
             RangeQuery::Include(ids) => {
                 // 与 anda_db_btree 的 Include 一致：重复的 key 只产出一次
                 // （那边用 BTreeSet 去重）。否则调用方传入的重复 id 会让同一个
-                // 文档重复出现，并且提前占满 limit。这里保留首次出现的顺序。
-                let mut rt: UniqueVec<DocumentId> =
-                    UniqueVec::with_capacity(limit.min(ids.len()).min(Self::MAX_RESERVE_HINT));
+                // 文档重复出现，并且提前占满 limit。
+                let mut ids: Vec<DocumentId> = ids;
+                ids.sort_unstable();
+                ids.dedup();
                 let doc_ids_index = self.doc_ids_index.read();
-                for id in ids.into_iter() {
+                let mut tmp = Vec::with_capacity(limit.min(ids.len()).min(Self::MAX_RESERVE_HINT));
+                let iter: Box<dyn Iterator<Item = DocumentId>> = if descending {
+                    Box::new(ids.into_iter().rev())
+                } else {
+                    Box::new(ids.into_iter())
+                };
+                for id in iter {
                     if doc_ids_index.contains(&id) && candidates.is_none_or(|s| s.contains(&id)) {
-                        rt.push(id);
-                        if limit > 0 && rt.len() >= limit {
+                        tmp.push(id);
+                        if limit > 0 && tmp.len() >= limit {
                             break;
                         }
                     }
                 }
                 drop(doc_ids_index);
-                result = rt.into();
+                if descending {
+                    tmp.reverse();
+                }
+                result = tmp;
             }
             RangeQuery::And(queries) => {
                 let mut iter = queries.into_iter();
                 if let Some(query) = iter.next() {
-                    let mut rt: UniqueVec<u64> = self.filter_by_id(*query, candidates, 0).0.into();
+                    let mut rt: UniqueVec<u64> =
+                        self.filter_by_id(*query, candidates, 0, order).into();
 
                     for query in iter {
                         let keys: UniqueVec<u64> =
-                            self.filter_by_id(*query, candidates, 0).0.into();
+                            self.filter_by_id(*query, candidates, 0, order).into();
                         rt.intersect_with(&keys);
                         if rt.is_empty() {
-                            return (vec![], order);
+                            return vec![];
                         }
                     }
 
@@ -4222,29 +4266,42 @@ impl Collection {
                 // break——提前停止会让分页结果依赖操作数顺序），
                 // 由调用方按 order 截断长度
                 for query in queries {
-                    let (keys, _) = self.filter_by_id(*query, candidates, 0);
+                    let keys = self.filter_by_id(*query, candidates, 0, order);
                     rt.extend(keys);
                 }
 
                 result = rt.into();
             }
             RangeQuery::Not(query) => {
-                result.reserve_exact(Self::reserve_hint(limit));
-                // 先收集要排除的 key，再遍历全集差集
-                let exclude: FxHashSet<u64> =
-                    self.filter_by_id(*query, None, 0).0.into_iter().collect();
-                for id in self.doc_ids_index.read().iter() {
+                // 先收集要排除的 key，再按调用方要求的方向遍历全集差集
+                let exclude: FxHashSet<u64> = self
+                    .filter_by_id(*query, None, 0, order)
+                    .into_iter()
+                    .collect();
+                let doc_ids_index = self.doc_ids_index.read();
+                let mut tmp = Vec::with_capacity(Self::reserve_hint(limit));
+                let iter: Box<dyn Iterator<Item = &DocumentId>> = if descending {
+                    Box::new(doc_ids_index.iter().rev())
+                } else {
+                    Box::new(doc_ids_index.iter())
+                };
+                for id in iter {
                     if !exclude.contains(id) && candidates.is_none_or(|s| s.contains(id)) {
-                        result.push(*id);
-                        if limit > 0 && result.len() >= limit {
-                            return (result, order);
+                        tmp.push(*id);
+                        if limit > 0 && tmp.len() >= limit {
+                            break;
                         }
                     }
                 }
+                drop(doc_ids_index);
+                if descending {
+                    tmp.reverse();
+                }
+                result = tmp;
             }
         }
 
-        (result, order)
+        result
     }
 
     /// Updates the collection metadata with the provided function.
@@ -6006,18 +6063,18 @@ mod tests {
             collection.add_from(&doc).await?;
         }
 
-        // candidates 为空：结果应为正序
+        // candidates 为空：两个方向的结果都按 id 正序返回
         let filter_all = Filter::Field((Schema::ID_KEY.to_string(), RangeQuery::Gt(Fv::U64(0))));
-        let (ids, order) = collection.filter_by_field(filter_all, &[], 0)?;
+        let ids = collection.filter_by_field(filter_all.clone(), &[], 0, ScanOrder::Ascending)?;
         assert_eq!(ids, vec![1, 2, 3]);
-        assert_eq!(order, ScanOrder::Ascending);
+        let ids = collection.filter_by_field(filter_all, &[], 0, ScanOrder::Descending)?;
+        assert_eq!(ids, vec![1, 2, 3]);
 
-        // candidates 非空：结果顺序应遵循 candidates 顺序
+        // candidates 非空：结果顺序应遵循 candidates 顺序（相关性），
+        // 与请求的 id 方向无关
         let filter_subset = Filter::Field((Schema::ID_KEY.to_string(), RangeQuery::Ge(Fv::U64(2))));
-        let (ids, order) = collection.filter_by_field(filter_subset, &[3, 1, 2], 0)?;
+        let ids = collection.filter_by_field(filter_subset, &[3, 1, 2], 0, ScanOrder::Ascending)?;
         assert_eq!(ids, vec![3, 2]);
-        // 候选集按相关性排序，只能从尾部截断
-        assert_eq!(order, ScanOrder::Ascending);
 
         db.close().await?;
         Ok(())
@@ -6542,7 +6599,8 @@ mod tests {
             .await?;
         assert_eq!(ids, vec![1, 2]);
 
-        // Pure filter queries with Lt keep the tail (largest ids), unchanged.
+        // Pure filter queries keep the smallest ids, like `query_ids`: the end
+        // is the method's contract, not something `Lt` decides.
         let ids = collection
             .search_ids(Query {
                 filter: Some(Filter::Field((
@@ -6552,6 +6610,15 @@ mod tests {
                 limit: Some(2),
                 ..Default::default()
             })
+            .await?;
+        assert_eq!(ids, vec![1, 2]);
+
+        // The largest ids are reached by asking for them.
+        let ids = collection
+            .query_last_ids(
+                Filter::Field((Schema::ID_KEY.to_string(), RangeQuery::Lt(Fv::U64(100)))),
+                Some(2),
+            )
             .await?;
         assert_eq!(ids, vec![3, 4]);
 
@@ -8852,6 +8919,98 @@ mod tests {
                 meta.location
             );
         }
+        Ok(())
+    }
+
+    /// Which end of the match set a page keeps must depend only on the method
+    /// called, never on the filter's shape. 0.11.0 derived it from the scan
+    /// direction, so `_id Lt cursor` returned the newest ids while the same
+    /// predicate inside an `And` returned the oldest — cursor pagination built
+    /// on the bare form silently walked backwards off the first page as soon
+    /// as a second condition was added.
+    #[tokio::test]
+    async fn test_page_end_is_the_methods_contract_not_the_filters_shape() -> Result<(), DBError> {
+        let db = setup_test_db().await?;
+        let collection = create_test_collection(&db, async |c| {
+            c.create_btree_index_nx(&["name"]).await?;
+            c.create_btree_index_nx(&["age"]).await?;
+            Ok(())
+        })
+        .await?;
+
+        // ids 1..=10, all sharing one `name` so the composite filter matches
+        // exactly what the bare `_id` filter matches.
+        for i in 1..=10u64 {
+            let doc = create_test_doc(0, "alice", 20 + i as u32, vec!["x"]);
+            assert_eq!(collection.add_from(&doc).await?, i);
+        }
+
+        let bare = Filter::Field((Schema::ID_KEY.to_string(), RangeQuery::Lt(Fv::U64(100))));
+        let composite = Filter::And(vec![
+            Box::new(Filter::Field((
+                "name".to_string(),
+                RangeQuery::Eq(Fv::Text("alice".to_string())),
+            ))),
+            Box::new(bare.clone()),
+        ]);
+
+        // Same predicate, two shapes, same page — in both directions.
+        for filter in [bare.clone(), composite.clone()] {
+            assert_eq!(
+                collection.query_ids(filter.clone(), Some(3)).await?,
+                vec![1, 2, 3],
+                "query_ids must keep the smallest ids for {filter:?}"
+            );
+            assert_eq!(
+                collection.query_last_ids(filter.clone(), Some(3)).await?,
+                vec![8, 9, 10],
+                "query_last_ids must keep the largest ids for {filter:?}"
+            );
+        }
+
+        // Newest-first cursor pagination walks the whole set without gaps or
+        // repeats, which is what the shape-dependent end broke downstream.
+        let mut seen = Vec::new();
+        let mut cursor = collection.max_document_id() + 1;
+        loop {
+            let page = collection
+                .query_last_ids(
+                    Filter::And(vec![
+                        Box::new(Filter::Field((
+                            "name".to_string(),
+                            RangeQuery::Eq(Fv::Text("alice".to_string())),
+                        ))),
+                        Box::new(Filter::Field((
+                            Schema::ID_KEY.to_string(),
+                            RangeQuery::Lt(Fv::U64(cursor)),
+                        ))),
+                    ]),
+                    Some(4),
+                )
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            cursor = page[0];
+            seen.extend(page.iter().rev().copied());
+        }
+        assert_eq!(seen, vec![10, 9, 8, 7, 6, 5, 4, 3, 2, 1]);
+
+        // A bounded `Not` also honors the requested end.
+        let complement = Filter::Not(Box::new(Filter::Field((
+            "age".to_string(),
+            RangeQuery::Between(Fv::U64(21), Fv::U64(28)),
+        ))));
+        assert_eq!(
+            collection.query_ids(complement.clone(), Some(1)).await?,
+            vec![9]
+        );
+        assert_eq!(
+            collection.query_last_ids(complement, Some(1)).await?,
+            vec![10]
+        );
+
+        db.close().await?;
         Ok(())
     }
 

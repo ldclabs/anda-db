@@ -119,9 +119,15 @@ Important methods:
 - `update`
 - `remove`
 - `search` and `search_as`
-- `search_ids` and `query_ids` (results clamped to `MAX_SEARCH_LIMIT`)
+- `search_ids` and `query_ids` (smallest matching IDs, clamped to
+  `MAX_SEARCH_LIMIT`)
+- `query_last_ids` (largest matching IDs — newest-first cursor pagination)
 - `query_all_ids` (unbounded; for in-process callers whose correctness
   depends on the complete result set)
+
+Which end of the match set a bounded query keeps is decided by the method you
+call, never by the filter's shape: `_id < cursor` alone and
+`AND(user == u, _id < cursor)` page identically.
 - `create_btree_index`, `create_bm25_index`, `create_hnsw_index`
 - `compact_btree_index`, `compact_bm25_index`
 - `flush` and `close`

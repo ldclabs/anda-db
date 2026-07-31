@@ -1889,7 +1889,34 @@ where
     /// instead, validate the depth up-front: [`RangeQuery::try_convert_from`]
     /// returns an `Err` for over-deep queries, and [`RangeQuery::depth`] lets
     /// you check the cap explicitly before calling this method.
-    pub fn range_query_with<F, R>(&self, query: RangeQuery<FV>, mut f: F) -> Vec<R>
+    pub fn range_query_with<F, R>(&self, query: RangeQuery<FV>, f: F) -> Vec<R>
+    where
+        F: FnMut(&FV, &Vec<PK>) -> (bool, Vec<R>),
+    {
+        self.range_query_inner(query, false, f)
+    }
+
+    /// Like [`range_query_with`](Self::range_query_with), but walks the key
+    /// space from the **largest** matching key downwards.
+    ///
+    /// Both directions stop as soon as `f` returns `false`, so a caller that
+    /// wants the *last* page of a range pays for that page only. The results
+    /// are returned in ascending key order either way — the direction decides
+    /// **which** keys a bounded scan collects, never how they are ordered.
+    ///
+    /// Scan direction is the caller's choice precisely because it cannot be
+    /// derived from the query shape: `Lt(x)` bounded by a limit means "the
+    /// smallest matches below x" to one caller and "the largest" to another,
+    /// and silently picking one made the same predicate return opposite ends
+    /// depending on where it appeared in a composite filter.
+    pub fn range_query_rev_with<F, R>(&self, query: RangeQuery<FV>, f: F) -> Vec<R>
+    where
+        F: FnMut(&FV, &Vec<PK>) -> (bool, Vec<R>),
+    {
+        self.range_query_inner(query, true, f)
+    }
+
+    fn range_query_inner<F, R>(&self, query: RangeQuery<FV>, descending: bool, mut f: F) -> Vec<R>
     where
         F: FnMut(&FV, &Vec<PK>) -> (bool, Vec<R>),
     {
@@ -1915,156 +1942,93 @@ where
 
         self.query_count.fetch_add(1, Ordering::Relaxed);
 
+        // One walk for every arm: `descending` decides which keys a bounded
+        // scan collects, never how they are ordered on the way out. Both
+        // directions stop as soon as `f` says so, so either end of a range is
+        // equally cheap to page.
+        macro_rules! walk {
+            ($keys:expr) => {{
+                let keys = $keys;
+                if descending {
+                    let mut groups: Vec<Vec<R>> = Vec::new();
+                    for k in keys.rev() {
+                        if let Some(posting) = self.postings.get(k) {
+                            let (conti, rt) = f(k, &posting.2);
+                            if !rt.is_empty() {
+                                groups.push(rt);
+                            }
+                            if !conti {
+                                break;
+                            }
+                        }
+                    }
+                    // Group-level reversal: keys ascend again while each key's
+                    // own posting order stays as the callback produced it.
+                    return groups.into_iter().rev().flatten().collect();
+                }
+                for k in keys {
+                    if let Some(posting) = self.postings.get(k) {
+                        let (conti, rt) = f(k, &posting.2);
+                        results.extend(rt);
+                        if !conti {
+                            return results;
+                        }
+                    }
+                }
+            }};
+        }
+
         match query {
             RangeQuery::Eq(key) => {
                 if let Some(posting) = self.postings.get(&key) {
-                    let (conti, rt) = f(&key, &posting.2);
+                    let (_, rt) = f(&key, &posting.2);
                     results.extend(rt);
-                    if !conti {
-                        return results;
-                    }
                 }
             }
             RangeQuery::Gt(start_key) => {
-                for k in self.btree.read().range((
+                let btree = self.btree.read();
+                walk!(btree.range((
                     std::ops::Bound::Excluded(start_key),
                     std::ops::Bound::Unbounded,
-                )) {
-                    if let Some(posting) = self.postings.get(k) {
-                        let (conti, rt) = f(k, &posting.2);
-                        results.extend(rt);
-                        if !conti {
-                            return results;
-                        }
-                    }
-                }
+                )))
             }
             RangeQuery::Ge(start_key) => {
-                for k in self
-                    .btree
-                    .read()
-                    .range(std::ops::RangeFrom { start: start_key })
-                {
-                    if let Some(posting) = self.postings.get(k) {
-                        let (conti, rt) = f(k, &posting.2);
-                        results.extend(rt);
-                        if !conti {
-                            return results;
-                        }
-                    }
-                }
+                let btree = self.btree.read();
+                walk!(btree.range(std::ops::RangeFrom { start: start_key }))
             }
             RangeQuery::Lt(end_key) => {
-                // 倒序遍历以支持 limit 提前终止，但最终结果按正序返回
-                let mut groups: Vec<Vec<R>> = Vec::new();
-                for k in self
-                    .btree
-                    .read()
-                    .range(std::ops::RangeTo { end: end_key })
-                    .rev()
-                {
-                    if let Some(posting) = self.postings.get(k) {
-                        let (conti, rt) = f(k, &posting.2);
-                        if !rt.is_empty() {
-                            groups.push(rt);
-                        }
-                        if !conti {
-                            break;
-                        }
-                    }
-                }
-                // 组级反转，保持每个 key 内部顺序不变，整体 key 正序
-                return groups.into_iter().rev().flatten().collect();
+                let btree = self.btree.read();
+                walk!(btree.range(std::ops::RangeTo { end: end_key }))
             }
             RangeQuery::Le(end_key) => {
-                let mut groups: Vec<Vec<R>> = Vec::new();
-                for k in self
-                    .btree
-                    .read()
-                    .range(std::ops::RangeToInclusive { end: end_key })
-                    .rev()
-                {
-                    if let Some(posting) = self.postings.get(k) {
-                        let (conti, rt) = f(k, &posting.2);
-                        if !rt.is_empty() {
-                            groups.push(rt);
-                        }
-                        if !conti {
-                            break;
-                        }
-                    }
-                }
-
-                // 组级反转，保持每个 key 内部顺序不变，整体 key 正序
-                return groups.into_iter().rev().flatten().collect();
+                let btree = self.btree.read();
+                walk!(btree.range(std::ops::RangeToInclusive { end: end_key }))
             }
             RangeQuery::Between(start_key, end_key) => {
                 if start_key > end_key {
                     return results; // empty result for invalid range
                 }
-                for k in self.btree.read().range(start_key..=end_key) {
-                    if let Some(posting) = self.postings.get(k) {
-                        let (conti, rt) = f(k, &posting.2);
-                        results.extend(rt);
-                        if !conti {
-                            return results;
-                        }
-                    }
-                }
+                let btree = self.btree.read();
+                walk!(btree.range(start_key..=end_key))
             }
             RangeQuery::Include(keys) => {
                 let keys = BTreeSet::from_iter(keys);
-                for k in keys.into_iter() {
-                    if let Some(posting) = self.postings.get(&k) {
-                        let (conti, rt) = f(&k, &posting.2);
-                        results.extend(rt);
-                        if !conti {
-                            return results;
-                        }
-                    }
-                }
+                walk!(keys.iter())
             }
             RangeQuery::And(queries) => {
                 // 先找出最小结果集的子查询，减少交集计算量
                 let keys = self.range_keys(RangeQuery::And(queries));
-                for k in keys {
-                    if let Some(posting) = self.postings.get(&k) {
-                        let (conti, rt) = f(&k, &posting.2);
-                        results.extend(rt);
-                        if !conti {
-                            return results;
-                        }
-                    }
-                }
+                walk!(keys.iter())
             }
             RangeQuery::Or(queries) => {
                 let keys = self.range_keys(RangeQuery::Or(queries));
-                for k in keys {
-                    if let Some(posting) = self.postings.get(&k) {
-                        let (conti, rt) = f(&k, &posting.2);
-                        results.extend(rt);
-                        if !conti {
-                            return results;
-                        }
-                    }
-                }
+                walk!(keys.iter())
             }
             RangeQuery::Not(query) => {
                 // 先收集要排除的 key，再遍历全集差集
                 let exclude: FxHashSet<FV> = self.range_keys(*query).into_iter().collect();
-
-                for k in self.btree.read().iter() {
-                    if exclude.contains(k) {
-                        continue;
-                    }
-                    if let Some(posting) = self.postings.get(k) {
-                        let (conti, rt) = f(k, &posting.2);
-                        results.extend(rt);
-                        if !conti {
-                            return results;
-                        }
-                    }
-                }
+                let btree = self.btree.read();
+                walk!(btree.iter().filter(|k| !exclude.contains(*k)))
             }
         }
 
@@ -3456,27 +3420,63 @@ mod tests {
     #[test]
     fn test_range_query_lt_le_with_early_stop_limit_semantics() {
         let index = create_populated_index();
-        // 目标：模拟“小于 date 的 2 条数据”，即距离 date 最近的 2 个 key，且最终为正序
+        // 方向由调用方选择，而不是由查询形态推断：同一个 Lt/Le 查询配同一个
+        // 上限，正向扫描取最小的若干个 key，反向扫描取最大的若干个，两者的
+        // 输出都是正序。
 
-        // Lt(date): 倒序遍历是 cherry, banana, apple，截断 2 个 => [cherry, banana]，最终正序 [banana, cherry]
+        // 反向：Lt(date) 倒序遍历 cherry, banana, apple，截断 2 个
+        // => [cherry, banana]，最终正序 [banana, cherry]
         let mut count = 0usize;
-        let results = index.range_query_with(RangeQuery::Lt("date".to_string()), |k, _| {
+        let results = index.range_query_rev_with(RangeQuery::Lt("date".to_string()), |k, _| {
             count += 1;
             (count < 2, vec![k.clone()])
         });
         assert_eq!(results, vec!["banana", "cherry"]);
 
-        // Le(date): 倒序遍历是 date, cherry, banana, apple，截断 2 个 => [date, cherry]，最终正序 [cherry, date]
+        // 正向：同样的 Lt(date) 从最小 key 开始，截断 2 个 => [apple, banana]
         let mut count = 0usize;
-        let results = index.range_query_with(RangeQuery::Le("date".to_string()), |k, _| {
+        let results = index.range_query_with(RangeQuery::Lt("date".to_string()), |k, _| {
+            count += 1;
+            (count < 2, vec![k.clone()])
+        });
+        assert_eq!(results, vec!["apple", "banana"]);
+
+        // 反向：Le(date) 倒序遍历 date, cherry, banana, apple，截断 2 个
+        // => [date, cherry]，最终正序 [cherry, date]
+        let mut count = 0usize;
+        let results = index.range_query_rev_with(RangeQuery::Le("date".to_string()), |k, _| {
             count += 1;
             (count < 2, vec![k.clone()])
         });
         assert_eq!(results, vec!["cherry", "date"]);
 
-        // 再测试当“上限”大于可返回数量时，返回全部（正序）
+        // 正向：Le(date) 截断 2 个 => [apple, banana]
+        let mut count = 0usize;
+        let results = index.range_query_with(RangeQuery::Le("date".to_string()), |k, _| {
+            count += 1;
+            (count < 2, vec![k.clone()])
+        });
+        assert_eq!(results, vec!["apple", "banana"]);
+
+        // 反向扫描同样适用于 Gt/Ge/Between：Ge(banana) 取最大的 2 个
+        // （banana, cherry, date, eggplant 中最大的两个）
+        let mut count = 0usize;
+        let results = index.range_query_rev_with(RangeQuery::Ge("banana".to_string()), |k, _| {
+            count += 1;
+            (count < 2, vec![k.clone()])
+        });
+        assert_eq!(results, vec!["date", "eggplant"]);
+
+        // 再测试当“上限”大于可返回数量时，两个方向都返回全部（正序）
         let mut count = 0usize;
         let results = index.range_query_with(RangeQuery::Lt("banana".to_string()), |k, _| {
+            count += 1;
+            (count < 10, vec![k.clone()])
+        });
+        assert_eq!(results, vec!["apple"]);
+
+        let mut count = 0usize;
+        let results = index.range_query_rev_with(RangeQuery::Lt("banana".to_string()), |k, _| {
             count += 1;
             (count < 10, vec![k.clone()])
         });
@@ -3486,12 +3486,12 @@ mod tests {
     #[test]
     fn test_range_query_lt_le_group_order_preserved() {
         let index = create_populated_index();
-        // 让每个 key 返回多个结果，验证倒序遍历后“组内顺序”保持，并最终整体正序
-        // 取 Lt(date) 最近 2 个 key：banana, cherry，最终顺序应为：
+        // 反向遍历后“组内顺序”保持，并最终整体正序。
+        // 取 Lt(date) 最大的 2 个 key：banana, cherry，最终顺序应为：
         // banana-1, banana-2, cherry-1, cherry-2
 
         let mut count = 0usize;
-        let results = index.range_query_with(RangeQuery::Lt("date".to_string()), |k, _| {
+        let results = index.range_query_rev_with(RangeQuery::Lt("date".to_string()), |k, _| {
             count += 1;
             let v = vec![format!("{k}-1"), format!("{k}-2")];
             (count < 2, v)
@@ -3506,10 +3506,10 @@ mod tests {
             ]
         );
 
-        // Le(date) 最近 2 个：cherry, date，组内顺序保持：
+        // Le(date) 最大的 2 个：cherry, date，组内顺序保持：
         // cherry-1, cherry-2, date-1, date-2
         let mut count = 0usize;
-        let results = index.range_query_with(RangeQuery::Le("date".to_string()), |k, _| {
+        let results = index.range_query_rev_with(RangeQuery::Le("date".to_string()), |k, _| {
             count += 1;
             let v = vec![format!("{k}-1"), format!("{k}-2")];
             (count < 2, v)
@@ -3521,6 +3521,23 @@ mod tests {
                 "cherry-2".to_string(),
                 "date-1".to_string(),
                 "date-2".to_string()
+            ]
+        );
+
+        // 正向遍历取最小的 2 个 key，组内顺序同样保持
+        let mut count = 0usize;
+        let results = index.range_query_with(RangeQuery::Le("date".to_string()), |k, _| {
+            count += 1;
+            let v = vec![format!("{k}-1"), format!("{k}-2")];
+            (count < 2, v)
+        });
+        assert_eq!(
+            results,
+            vec![
+                "apple-1".to_string(),
+                "apple-2".to_string(),
+                "banana-1".to_string(),
+                "banana-2".to_string()
             ]
         );
     }

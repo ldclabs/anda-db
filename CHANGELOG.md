@@ -2,6 +2,26 @@
 
 All notable changes to this workspace are documented in this file.
 
+## [0.11.1] — 2026-07-31
+
+### Fixed
+
+- **Which end of a page you get is now the method's contract, not the
+  filter's shape** — A bounded filter query used to keep whichever end its
+  scan happened to reach: a bare `_id Lt cursor` walks backwards and returned
+  the **newest** ids, while the same predicate inside `And([user Eq u, _id Lt
+  cursor])` evaluates unbounded and returned the **oldest**. Newest-first
+  cursor pagination therefore broke the moment a second condition was added —
+  the first page came back as the oldest rows and the next cursor pointed
+  below them, ending the walk after one page. `Collection::query_ids` (and
+  the filter-only path of `search_ids` / `search` / `search_as`) now returns
+  the **smallest** matching ids for every filter shape, and the new
+  `Collection::query_last_ids` returns the **largest** — exposed over HTTP as
+  `doc.query_last_ids`. Scans walk in the requested direction, so both ends
+  still stop as soon as the page is full (`BTreeIndex::range_query_rev_with`
+  is the new reverse-walking primitive). Callers who relied on a bare
+  `Lt`/`Le` filter returning the newest page must switch to `query_last_ids`.
+
 ## [0.11.0] — 2026-07-31
 
 Workspace-wide audit pass. Shipped as a minor bump rather than a patch: it

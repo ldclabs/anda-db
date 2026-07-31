@@ -430,15 +430,29 @@ async fn collection_public_error_paths_and_id_filters() -> Result<(), DBError> {
             .await?,
         vec![4, 5]
     );
+    // `query_ids` keeps the smallest ids for every filter shape; the largest
+    // ones are reached through `query_last_ids`, never by the range's shape.
     assert_eq!(
         collection
             .query_ids(id_filter(RangeQuery::Lt(Fv::U64(4))), Some(2))
+            .await?,
+        vec![1, 2]
+    );
+    assert_eq!(
+        collection
+            .query_last_ids(id_filter(RangeQuery::Lt(Fv::U64(4))), Some(2))
             .await?,
         vec![2, 3]
     );
     assert_eq!(
         collection
             .query_ids(id_filter(RangeQuery::Le(Fv::U64(3))), Some(2))
+            .await?,
+        vec![1, 2]
+    );
+    assert_eq!(
+        collection
+            .query_last_ids(id_filter(RangeQuery::Le(Fv::U64(3))), Some(2))
             .await?,
         vec![2, 3]
     );

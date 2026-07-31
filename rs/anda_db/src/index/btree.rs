@@ -669,7 +669,19 @@ impl BTree {
     ///   mistyped filter is distinguishable from "no match";
     /// - does not materialize an owned key per hit (Text/Bytes keys are not
     ///   cloned), which matters on large range scans.
-    pub fn try_range_query_ids<F>(&self, query: RangeQuery<Fv>, mut f: F) -> Result<(), DBError>
+    ///
+    /// `descending` picks which end of the matching range a scan that stops
+    /// early keeps: `false` walks up from the smallest matching key, `true`
+    /// walks down from the largest. Ids are delivered in ascending key order
+    /// either way. The caller owns this choice — it cannot be inferred from
+    /// the query shape without making the same predicate mean opposite things
+    /// in different filter positions.
+    pub fn try_range_query_ids<F>(
+        &self,
+        query: RangeQuery<Fv>,
+        descending: bool,
+        mut f: F,
+    ) -> Result<(), DBError>
     where
         F: FnMut(&[DocumentId]) -> bool,
     {
@@ -677,30 +689,32 @@ impl BTree {
             name: self.name().to_string(),
             source,
         };
+        macro_rules! scan {
+            ($index:expr, $q:expr) => {{
+                let cb = |_: &_, pks: &Vec<DocumentId>| (f(pks), Vec::<()>::new());
+                if descending {
+                    $index.range_query_rev_with($q, cb);
+                } else {
+                    $index.range_query_with($q, cb);
+                }
+            }};
+        }
         match self {
             BTree::I64(btree) => {
                 let q = RangeQuery::<i64>::try_convert_from(query).map_err(type_error)?;
-                btree
-                    .index
-                    .range_query_with(q, |_, pks| (f(pks), Vec::<()>::new()));
+                scan!(btree.index, q);
             }
             BTree::U64(btree) => {
                 let q = RangeQuery::<u64>::try_convert_from(query).map_err(type_error)?;
-                btree
-                    .index
-                    .range_query_with(q, |_, pks| (f(pks), Vec::<()>::new()));
+                scan!(btree.index, q);
             }
             BTree::String(btree) => {
                 let q = RangeQuery::<String>::try_convert_from(query).map_err(type_error)?;
-                btree
-                    .index
-                    .range_query_with(q, |_, pks| (f(pks), Vec::<()>::new()));
+                scan!(btree.index, q);
             }
             BTree::Bytes(btree) => {
                 let q = RangeQuery::<Vec<u8>>::try_convert_from(query).map_err(type_error)?;
-                btree
-                    .index
-                    .range_query_with(q, |_, pks| (f(pks), Vec::<()>::new()));
+                scan!(btree.index, q);
             }
         }
         Ok(())

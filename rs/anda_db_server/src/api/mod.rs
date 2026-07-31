@@ -264,6 +264,7 @@ enum DbMethod {
     DocSearch,
     DocSearchIds,
     DocQueryIds,
+    DocQueryLastIds,
 }
 
 impl DbMethod {
@@ -308,6 +309,7 @@ impl DbMethod {
             "doc.search" => (Self::DocSearch, Read),
             "doc.search_ids" => (Self::DocSearchIds, Read),
             "doc.query_ids" => (Self::DocQueryIds, Read),
+            "doc.query_last_ids" => (Self::DocQueryLastIds, Read),
 
             _ => return None,
         })
@@ -521,6 +523,9 @@ async fn dispatch_db(
         DbMethod::DocSearch => enc.reply(&document::search(&db, params.decode()?).await?),
         DbMethod::DocSearchIds => enc.reply(&document::search_ids(&db, params.decode()?).await?),
         DbMethod::DocQueryIds => enc.reply(&document::query_ids(&db, params.decode()?).await?),
+        DbMethod::DocQueryLastIds => {
+            enc.reply(&document::query_last_ids(&db, params.decode()?).await?)
+        }
     };
     Ok(resp)
 }
