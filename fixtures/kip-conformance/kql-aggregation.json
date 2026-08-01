@@ -1,0 +1,65 @@
+{
+  "name": "kql-aggregation",
+  "description": "Global aggregation: COUNT, COUNT DISTINCT, and SUM / AVG / MIN / MAX. SUM, MIN and MAX keep integer typing for integer inputs while AVG is a float.",
+  "setup": [
+    "UPSERT { CONCEPT ?drug_type { {type: \"$ConceptType\", name: \"Drug\"} SET ATTRIBUTES { \"description\": \"Pharmaceutical drug concept type\" } } WITH METADATA { \"source\": \"test_setup\", \"confidence\": 1.0 } }",
+    "UPSERT { CONCEPT ?symptom_type { {type: \"$ConceptType\", name: \"Symptom\"} SET ATTRIBUTES { \"description\": \"Medical symptom concept type\" } } WITH METADATA { \"source\": \"test_setup\", \"confidence\": 1.0 } }",
+    "UPSERT { CONCEPT ?treats_pred { {type: \"$PropositionType\", name: \"treats\"} SET ATTRIBUTES { \"description\": \"Treatment relationship\" } } WITH METADATA { \"source\": \"test_setup\", \"confidence\": 1.0 } }",
+    "UPSERT { CONCEPT ?headache { {type: \"Symptom\", name: \"Headache\"} SET ATTRIBUTES { \"severity\": \"moderate\", \"duration\": \"2-4 hours\" } } WITH METADATA { \"source\": \"test_data\", \"confidence\": 1.0 } }",
+    "UPSERT { CONCEPT ?fever { {type: \"Symptom\", name: \"Fever\"} SET ATTRIBUTES { \"temperature_range\": \"38-40°C\", \"common\": true } } WITH METADATA { \"source\": \"test_data\", \"confidence\": 0.9 } }",
+    "UPSERT { CONCEPT ?aspirin { {type: \"Drug\", name: \"Aspirin\"} SET ATTRIBUTES { \"molecular_formula\": \"C9H8O4\", \"risk_level\": 2, \"dosage\": \"325mg\" } SET PROPOSITIONS { (\"treats\", {type: \"Symptom\", name: \"Headache\"}) (\"treats\", {type: \"Symptom\", name: \"Fever\"}) } } } WITH METADATA { \"source\": \"test_data\", \"confidence\": 0.95 }"
+  ],
+  "cases": [
+    {
+      "name": "a lone COUNT projects a scalar",
+      "command": "FIND(COUNT(?drug)) WHERE { ?drug {type: \"Drug\"} }",
+      "expect": {
+        "result": 1
+      }
+    },
+    {
+      "name": "two aggregates over disconnected variables",
+      "command": "FIND(COUNT(?drug), COUNT(DISTINCT ?symptom)) WHERE { ?drug {type: \"Drug\"} ?symptom {type: \"Symptom\"} }",
+      "expect": {
+        "result": [
+          1,
+          2
+        ]
+      }
+    },
+    {
+      "name": "SUM / AVG / MIN / MAX beside a plain column",
+      "command": "FIND(?drug.name, SUM(?drug.attributes.risk_level), AVG(?drug.attributes.risk_level), MIN(?drug.attributes.risk_level), MAX(?drug.attributes.risk_level)) WHERE { ?drug {type: \"Drug\"} }",
+      "expect": {
+        "result": [
+          [
+            "Aspirin"
+          ],
+          2,
+          2.0,
+          2,
+          2
+        ]
+      },
+      "skip": {
+        "ts": "grouped aggregation — a plain column beside an aggregate — is not implemented; the engine reports KIP_3001 rather than answering wrongly. See \"Coverage\" in js/kip-do/README.md."
+      }
+    },
+    {
+      "name": "COUNT over a variable bound inside OPTIONAL",
+      "command": "FIND(?symptom.name, COUNT(?link)) WHERE { ?symptom {type: \"Symptom\"} OPTIONAL { ?link (?drug, \"treats\", ?symptom) } }",
+      "expect": {
+        "result": [
+          [
+            "Headache",
+            "Fever"
+          ],
+          2
+        ]
+      },
+      "skip": {
+        "ts": "grouped aggregation — a plain column beside an aggregate — is not implemented; the engine reports KIP_3001 rather than answering wrongly. See \"Coverage\" in js/kip-do/README.md."
+      }
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "name": "kml-merge-provenance",
+  "description": "MERGE provenance survives chained merges: the source's own `_merged_from` entries ride along, deduplicated, and a replayed merge self-diagnoses as already merged (KIP §4.4). The two merges run in setup.",
+  "setup": [
+    "UPSERT { CONCEPT ?cat_type { {type: \"$ConceptType\", name: \"Category\"} } CONCEPT ?a { {type: \"Category\", name: \"CatA\"} } CONCEPT ?b { {type: \"Category\", name: \"CatB\"} } CONCEPT ?c { {type: \"Category\", name: \"CatC\"} } }",
+    "MERGE CONCEPT ?dup INTO ?canonical WHERE { ?dup {type: \"Category\", name: \"CatA\"} ?canonical {type: \"Category\", name: \"CatB\"} }",
+    "MERGE CONCEPT ?dup INTO ?canonical WHERE { ?dup {type: \"Category\", name: \"CatB\"} ?canonical {type: \"Category\", name: \"CatC\"} }"
+  ],
+  "cases": [
+    {
+      "name": "the first source's trail rode along with the second merge",
+      "command": "FIND(?c.metadata._merged_from) WHERE { ?c {type: \"Category\", name: \"CatC\"} }",
+      "expect": { "result": [["Category:CatA", "Category:CatB"]] }
+    },
+    {
+      "name": "only the surviving node remains",
+      "command": "FIND(?c.name) WHERE { ?c {type: \"Category\"} }",
+      "expect": { "result": ["CatC"] }
+    },
+    {
+      "name": "replaying the merge reports not found with an already-merged hint",
+      "command": "MERGE CONCEPT ?dup INTO ?canonical WHERE { ?dup {type: \"Category\", name: \"CatB\"} ?canonical {type: \"Category\", name: \"CatC\"} }",
+      "expect": { "error": { "code": "KIP_3002", "message": "already" } }
+    }
+  ]
+}

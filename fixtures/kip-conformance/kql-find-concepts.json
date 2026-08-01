@@ -1,0 +1,94 @@
+{
+  "name": "kql-find-concepts",
+  "description": "Concept matching and projection: scalar dot-paths, whole concept nodes, grounding errors for dangling ids, and the columnar result model for disconnected variables.",
+  "setup": [
+    "UPSERT { CONCEPT ?drug_type { {type: \"$ConceptType\", name: \"Drug\"} SET ATTRIBUTES { \"description\": \"Pharmaceutical drug concept type\" } } WITH METADATA { \"source\": \"test_setup\", \"confidence\": 1.0 } }",
+    "UPSERT { CONCEPT ?symptom_type { {type: \"$ConceptType\", name: \"Symptom\"} SET ATTRIBUTES { \"description\": \"Medical symptom concept type\" } } WITH METADATA { \"source\": \"test_setup\", \"confidence\": 1.0 } }",
+    "UPSERT { CONCEPT ?treats_pred { {type: \"$PropositionType\", name: \"treats\"} SET ATTRIBUTES { \"description\": \"Treatment relationship\" } } WITH METADATA { \"source\": \"test_setup\", \"confidence\": 1.0 } }",
+    "UPSERT { CONCEPT ?headache { {type: \"Symptom\", name: \"Headache\"} SET ATTRIBUTES { \"severity\": \"moderate\", \"duration\": \"2-4 hours\" } } WITH METADATA { \"source\": \"test_data\", \"confidence\": 1.0 } }",
+    "UPSERT { CONCEPT ?fever { {type: \"Symptom\", name: \"Fever\"} SET ATTRIBUTES { \"temperature_range\": \"38-40°C\", \"common\": true } } WITH METADATA { \"source\": \"test_data\", \"confidence\": 0.9 } }",
+    "UPSERT { CONCEPT ?aspirin { {type: \"Drug\", name: \"Aspirin\"} SET ATTRIBUTES { \"molecular_formula\": \"C9H8O4\", \"risk_level\": 2, \"dosage\": \"325mg\" } SET PROPOSITIONS { (\"treats\", {type: \"Symptom\", name: \"Headache\"}) (\"treats\", {type: \"Symptom\", name: \"Fever\"}) } } } WITH METADATA { \"source\": \"test_data\", \"confidence\": 0.95 }"
+  ],
+  "cases": [
+    {
+      "name": "two dot-paths on one variable project one row per binding",
+      "command": "FIND(?drug.name, ?drug.attributes.risk_level) WHERE { ?drug {type: \"Drug\"} }",
+      "expect": { "result": [["Aspirin", 2]] }
+    },
+    {
+      "name": "a bare variable projects the whole concept node",
+      "command": "FIND(?drug) WHERE { ?drug {type: \"Drug\"} }",
+      "expect": {
+        "result": [
+          {
+            "_type": "ConceptNode",
+            "id": "C:<1>",
+            "type": "Drug",
+            "name": "Aspirin",
+            "attributes": {
+              "dosage": "325mg",
+              "molecular_formula": "C9H8O4",
+              "risk_level": 2
+            },
+            "metadata": {
+              "source": "test_data",
+              "confidence": 0.95,
+              "_version": 1
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "upserted attributes are readable through dot-paths",
+      "command": "FIND(?d.attributes.molecular_formula, ?d.attributes.risk_level) WHERE { ?d {type: \"Drug\", name: \"Aspirin\"} }",
+      "expect": { "result": [["C9H8O4", 2]] }
+    },
+    {
+      "name": "REGEX filter on a projected field",
+      "command": "FIND(?drug.name) WHERE { ?drug {type: \"Drug\"} FILTER(REGEX(?drug.name, \"^Asp.*\")) }",
+      "expect": { "result": ["Aspirin"] }
+    },
+    {
+      "name": "two type clauses on one variable are conjunctive and yield no solution",
+      "command": "FIND(?concept.name) WHERE { ?concept {type: \"Drug\"} ?concept {type: \"Symptom\"} }",
+      "expect": { "result": [] }
+    },
+    {
+      "name": "engine-maintained _version reads like ordinary metadata",
+      "command": "FIND(?c.metadata._version) WHERE { ?c {type: \"Drug\", name: \"Aspirin\"} }",
+      "expect": { "result": [1] }
+    },
+    {
+      "name": "projecting a variable no clause binds is a reference error",
+      "command": "FIND(?unbound) WHERE { ?drug {type: \"Drug\"} }",
+      "expect": { "error": { "code": "KIP_3001", "message": "Unbound variable" } }
+    },
+    {
+      "name": "a dangling {id:} concept matcher reports not found",
+      "command": "FIND(?c.name) WHERE { ?c {id: \"C:999999\"} }",
+      "expect": { "error": { "code": "KIP_3002" } }
+    },
+    {
+      "name": "a dangling (id:) proposition matcher reports not found",
+      "command": "FIND(?l.predicate) WHERE { ?l (id: \"P:999999:none\") }",
+      "expect": { "error": { "code": "KIP_3002" } }
+    },
+    {
+      "name": "a self-loop pattern constrains both endpoints and yields empty",
+      "command": "FIND(?x.name) WHERE { (?x, \"treats\", ?x) }",
+      "expect": { "result": [] }
+    },
+    {
+      "name": "disconnected variables form the cartesian product with aligned columns",
+      "command": "FIND(?drug.name, ?symptom.name) WHERE { ?drug {type: \"Drug\"} ?symptom {type: \"Symptom\"} } ORDER BY ?symptom.name ASC",
+      "ordered": true,
+      "expect": { "result": [["Aspirin", "Aspirin"], ["Fever", "Headache"]] }
+    },
+    {
+      "name": "an unparseable CURSOR is rejected instead of replaying page one",
+      "command": "FIND(?c.name) WHERE { ?c {type: \"Drug\"} } LIMIT 1 CURSOR \"!!!not-a-cursor!!!\"",
+      "expect": { "error": { "code": "KIP_1001" } }
+    }
+  ]
+}

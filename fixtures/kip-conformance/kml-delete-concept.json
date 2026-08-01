@@ -1,0 +1,41 @@
+{
+  "name": "kml-delete-concept",
+  "description": "DELETE CONCEPT ... DETACH cascades transitively: the concept's own links go, and so do the higher-order propositions that referenced those links. The DELETE runs in setup; the cases assert the resulting graph.",
+  "setup": [
+    "UPSERT { CONCEPT ?drug_type { {type: \"$ConceptType\", name: \"Drug\"} SET ATTRIBUTES { \"description\": \"Pharmaceutical drug concept type\" } } WITH METADATA { \"source\": \"test_setup\", \"confidence\": 1.0 } }",
+    "UPSERT { CONCEPT ?symptom_type { {type: \"$ConceptType\", name: \"Symptom\"} SET ATTRIBUTES { \"description\": \"Medical symptom concept type\" } } WITH METADATA { \"source\": \"test_setup\", \"confidence\": 1.0 } }",
+    "UPSERT { CONCEPT ?treats_pred { {type: \"$PropositionType\", name: \"treats\"} SET ATTRIBUTES { \"description\": \"Treatment relationship\" } } WITH METADATA { \"source\": \"test_setup\", \"confidence\": 1.0 } }",
+    "UPSERT { CONCEPT ?headache { {type: \"Symptom\", name: \"Headache\"} SET ATTRIBUTES { \"severity\": \"moderate\", \"duration\": \"2-4 hours\" } } WITH METADATA { \"source\": \"test_data\", \"confidence\": 1.0 } }",
+    "UPSERT { CONCEPT ?fever { {type: \"Symptom\", name: \"Fever\"} SET ATTRIBUTES { \"temperature_range\": \"38-40°C\", \"common\": true } } WITH METADATA { \"source\": \"test_data\", \"confidence\": 0.9 } }",
+    "UPSERT { CONCEPT ?aspirin { {type: \"Drug\", name: \"Aspirin\"} SET ATTRIBUTES { \"molecular_formula\": \"C9H8O4\", \"risk_level\": 2, \"dosage\": \"325mg\" } SET PROPOSITIONS { (\"treats\", {type: \"Symptom\", name: \"Headache\"}) (\"treats\", {type: \"Symptom\", name: \"Fever\"}) } } } WITH METADATA { \"source\": \"test_data\", \"confidence\": 0.95 }",
+    "UPSERT { CONCEPT ?actor_type { {type: \"$ConceptType\", name: \"Actor\"} SET ATTRIBUTES { description: \"Test actor type\" } } CONCEPT ?stated_type { {type: \"$PropositionType\", name: \"stated\"} SET ATTRIBUTES { description: \"Higher-order: an actor stated a proposition\" } } CONCEPT ?actor { {type: \"Actor\", name: \"TestActor\"} } PROPOSITION ?claim { ({type: \"Actor\", name: \"TestActor\"}, \"stated\", ({type: \"Drug\", name: \"Aspirin\"}, \"treats\", {type: \"Symptom\", name: \"Headache\"})) } }",
+    "DELETE CONCEPT ?d DETACH WHERE { ?d {type: \"Drug\", name: \"Aspirin\"} }"
+  ],
+  "cases": [
+    {
+      "name": "the deleted concept is gone",
+      "command": "FIND(?d.name) WHERE { ?d {type: \"Drug\", name: \"Aspirin\"} }",
+      "expect": { "error": { "code": "KIP_3002" } }
+    },
+    {
+      "name": "its first-order links are gone",
+      "command": "FIND(?l.predicate) WHERE { ?l (?s, \"treats\", ?o) }",
+      "expect": { "result": [] }
+    },
+    {
+      "name": "the higher-order proposition that referenced them is gone too",
+      "command": "FIND(?st) WHERE { ?st (?who, \"stated\", ?what) }",
+      "expect": { "result": [] }
+    },
+    {
+      "name": "unrelated concepts survive the cascade",
+      "command": "FIND(?a.name) WHERE { ?a {type: \"Actor\"} }",
+      "expect": { "result": ["TestActor"] }
+    },
+    {
+      "name": "the endpoints of the cascaded links survive",
+      "command": "FIND(?s.name) WHERE { ?s {type: \"Symptom\"} }",
+      "expect": { "result": ["Headache", "Fever"] }
+    }
+  ]
+}

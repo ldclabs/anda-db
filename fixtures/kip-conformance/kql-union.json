@@ -1,0 +1,149 @@
+{
+  "name": "kql-union",
+  "description": "UNION is a row-wise union of independent solution branches (KIP §3.4.7.3): branches are deduplicated, an empty conjunctive main branch does not erase them, a branch's own patterns equi-join, and a FILTER placed after the UNION applies to the merged set. ORDER BY is added only to fix row order.",
+  "setup": [
+    "UPSERT { CONCEPT ?t { {type: \"$ConceptType\", name: \"PairNode\"} } CONCEPT ?p1 { {type: \"$PropositionType\", name: \"p1\"} } CONCEPT ?p2 { {type: \"$PropositionType\", name: \"p2\"} } CONCEPT ?a1 { {type: \"PairNode\", name: \"A1\"} } CONCEPT ?a2 { {type: \"PairNode\", name: \"A2\"} } CONCEPT ?b1 { {type: \"PairNode\", name: \"B1\"} } CONCEPT ?b2 { {type: \"PairNode\", name: \"B2\"} } PROPOSITION ?l1 { (?a1, \"p1\", ?b1) } PROPOSITION ?l2 { (?a2, \"p1\", ?b2) } PROPOSITION ?l3 { (?a1, \"p2\", ?b2) } PROPOSITION ?l4 { (?a2, \"p2\", ?b2) } }"
+  ],
+  "cases": [
+    {
+      "name": "both branches bind the same pair, and shared rows are deduplicated",
+      "command": "FIND(?a.name, ?b.name) WHERE { (?a, \"p1\", ?b) UNION { (?a, \"p2\", ?b) } } ORDER BY ?a.name ASC, ?b.name ASC",
+      "ordered": true,
+      "expect": {
+        "result": [
+          [
+            "A1",
+            "A1",
+            "A2"
+          ],
+          [
+            "B1",
+            "B2",
+            "B2"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "a concept-only branch stays an independent row padded with null",
+      "command": "FIND(?a.name, ?b.name) WHERE { (?a, \"p1\", ?b) UNION { ?a {type: \"PairNode\", name: \"A1\"} } }",
+      "expect": {
+        "result": [
+          [
+            "A1",
+            "A2",
+            "A1"
+          ],
+          [
+            "B1",
+            "B2",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "UNION rows survive an empty conjunctive main branch",
+      "command": "FIND(?a.name, ?b.name) WHERE { (?a, \"p1\", ?b) (?b, \"p1\", ?a) UNION { (?a, \"p2\", ?b) } } ORDER BY ?a.name ASC",
+      "ordered": true,
+      "expect": {
+        "result": [
+          [
+            "A1",
+            "A2"
+          ],
+          [
+            "B2",
+            "B2"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "a redundant sibling pattern binding an extra variable does not drop branch rows",
+      "command": "FIND(?a.name, ?b.name) WHERE { (?a, \"p1\", ?b) ?link (?a, \"p1\", ?b) UNION { (?a, \"p2\", ?b) } } ORDER BY ?a.name ASC, ?b.name ASC",
+      "ordered": true,
+      "expect": {
+        "result": [
+          [
+            "A1",
+            "A1",
+            "A2"
+          ],
+          [
+            "B1",
+            "B2",
+            "B2"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "a branch's own patterns equi-join before the union",
+      "command": "FIND(?a.name, ?b.name) WHERE { ?a {type: \"PairNode\", name: \"B1\"} UNION { (?a, \"p1\", ?b) (?a, \"p2\", ?b) } } ORDER BY ?a.name ASC",
+      "ordered": true,
+      "expect": {
+        "result": [
+          [
+            "A2",
+            "B1"
+          ],
+          [
+            "B2",
+            null
+          ]
+        ]
+      }
+    },
+    {
+      "name": "a FILTER after UNION also drops main-branch rows",
+      "command": "FIND(?a.name, ?b.name) WHERE { (?a, \"p1\", ?b) UNION { (?a, \"p2\", ?b) } FILTER(?b.name != \"B1\") } ORDER BY ?a.name ASC",
+      "ordered": true,
+      "expect": {
+        "result": [
+          [
+            "A1",
+            "A2"
+          ],
+          [
+            "B2",
+            "B2"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "a FILTER after UNION drops rows from every branch",
+      "command": "FIND(?a.name, ?b.name) WHERE { (?a, \"p1\", ?b) UNION { (?a, \"p2\", ?b) } FILTER(?a.name != \"A1\") }",
+      "expect": {
+        "result": [
+          [
+            "A2"
+          ],
+          [
+            "B2"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "NOT does not erase bindings still used by another branch",
+      "command": "FIND(?b.name, COUNT(?a)) WHERE { (?a, \"p1\", ?b) UNION { ?link (?a, \"p2\", ?b) } NOT { ?link (?a, \"p2\", ?b) } }",
+      "expect": {
+        "result": [
+          [
+            "B1",
+            "B2"
+          ],
+          [
+            1,
+            1
+          ]
+        ]
+      },
+      "skip": {
+        "ts": "grouped aggregation — a plain column beside an aggregate — is not implemented; the engine reports KIP_3001 rather than answering wrongly. See \"Coverage\" in js/kip-do/README.md."
+      }
+    }
+  ]
+}
