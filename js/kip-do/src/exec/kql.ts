@@ -45,8 +45,10 @@ import {
   type BindingValue,
   SolutionContext,
   SolutionTable,
+  bindingKey,
   entityBinding,
   predicateBinding,
+  rowKeyOf,
 } from './solution.js'
 
 /** Engine cap on multi-hop traversal depth (`matching.rs:14`). */
@@ -303,22 +305,35 @@ export class KqlExecutor {
     let direction: 'forward' | 'backward'
     let boundVar: string | null
     let freeVar: string | null
+    /** Far endpoint, when it names a concrete set rather than a variable. */
+    let targets: EntityID[] | null
 
     if (subjectSlot.ids) {
       start = subjectSlot.ids
       direction = 'forward'
       boundVar = subjectSlot.variable
       freeVar = objectSlot.variable
+      targets = objectSlot.variable === null ? objectSlot.ids : null
     } else if (objectSlot.ids) {
       start = objectSlot.ids
       direction = 'backward'
       boundVar = objectSlot.variable
       freeVar = subjectSlot.variable
+      targets = subjectSlot.variable === null ? subjectSlot.ids : null
     } else {
       throw invalidSyntax(
         'The subject or object cannot both be variables in multi-hop matching',
       )
     }
+
+    // A grounded far endpoint constrains which reached nodes count, exactly as
+    // `path_matches_targets` does in the Rust engine (`matching.rs:110-139`).
+    // Without it `(?s, "isa"{1,3}, {name: "X"})` degenerates into "?s reaches
+    // anything" and the named endpoint is silently ignored. A far endpoint
+    // that is a *variable* is left alone: the correlation it carries is
+    // enforced by the natural join on that variable below.
+    const targetKeys =
+      targets === null ? null : new Set(targets.map(formatEntityID))
 
     // Traverse per start node so the reached set stays attributable to the
     // endpoint it came from — a single combined traversal would lose which
@@ -328,6 +343,7 @@ export class KqlExecutor {
     if (freeVar && !vars.includes(freeVar)) vars.push(freeVar)
 
     const rows: BindingValue[][] = []
+    let matched = 0
     for (const origin of start) {
       const reached = this.store.reachable(
         [origin],
@@ -337,6 +353,7 @@ export class KqlExecutor {
         direction,
       )
       for (const hit of reached) {
+        if (targetKeys && !targetKeys.has(formatEntityID(hit.node))) continue
         const cells = new Map<string, BindingValue>()
         if (boundVar) cells.set(boundVar, entityBinding(origin))
         if (freeVar) {
@@ -345,8 +362,9 @@ export class KqlExecutor {
           if (existing && bindingsDiffer(existing, value)) continue
           cells.set(freeVar, value)
         }
+        matched++
         if (vars.length > 0) {
-          rows.push(vars.map((v) => cells.get(v) ?? { kind: 'null' }))
+          rows.push(vars.map((v) => cells.get(v)!))
         }
         if (rows.length > MAX_SOLUTION_ROWS) {
           throw queryTooComplex(
@@ -358,7 +376,12 @@ export class KqlExecutor {
       }
     }
 
-    if (vars.length === 0) return
+    if (vars.length === 0) {
+      // Both endpoints ground: the pattern either holds or falsifies the
+      // conjunction, the same contract `executePropositionClause` honours.
+      if (matched === 0) ctx.mergeTable(SolutionTable.empty([]))
+      return
+    }
     ctx.mergeTable(new SolutionTable(vars, rows))
   }
 
@@ -418,6 +441,15 @@ export class KqlExecutor {
       objectSlot.ids,
       names,
     )
+    // The same cap the top-level pattern applies: an endpoint pattern with a
+    // free predicate and free endpoints scans the whole edge table, and this
+    // engine materializes the result inside a 128 MB isolate.
+    if (rowIds.length > MAX_ROW_MATCHES) {
+      throw queryTooComplex(
+        `nested proposition endpoint matches ${rowIds.length} rows, over the ` +
+          `engine cap of ${MAX_ROW_MATCHES}; constrain an endpoint or the predicate`,
+      )
+    }
     const rows = this.store.getPropositions(rowIds)
     const out: EntityID[] = []
     for (const id of rowIds) {
@@ -426,6 +458,12 @@ export class KqlExecutor {
       for (const [name] of row.links) {
         if (names && !names.includes(name)) continue
         out.push(propositionID(row.id, name))
+        if (out.length > MAX_ROW_MATCHES) {
+          throw queryTooComplex(
+            `nested proposition endpoint produces more than ` +
+              `${MAX_ROW_MATCHES} links`,
+          )
+        }
       }
     }
     return out
@@ -465,7 +503,7 @@ export class KqlExecutor {
         const col = table.column(v)
         if (col !== null) env.set(v, row[col]!)
       }
-      const key = [...vars].map((v) => bindingCacheKey(env.get(v))).join('|')
+      const key = rowKeyOf([...vars].map((v) => env.get(v)))
       let verdict = memo.get(key)
       if (verdict === undefined) {
         verdict = this.evalFilter(expr, env)
@@ -517,6 +555,13 @@ export class KqlExecutor {
 
     this.executeBlockDegrading(block, child)
 
+    // The block's clauses are conjunctive, so a single empty table means the
+    // whole block pattern is unsatisfiable and therefore excludes nothing —
+    // even when a *different*, disconnected table inside it did match
+    // (`kql.rs:400-403`). Without this the surviving table's rows would read
+    // as exclusions the block never actually produced.
+    if (child.isUnsatisfiable) return
+
     if (shared.length === 0) {
       // Uncorrelated NOT: the block either matches something (falsifying
       // everything) or nothing (a no-op).
@@ -525,28 +570,34 @@ export class KqlExecutor {
       return
     }
 
+    /** The shared tuple of one row, or `null` when a position is unbound. */
+    const tuple = (
+      table: SolutionTable,
+      row: readonly BindingValue[],
+    ): string | null => {
+      const cells: BindingValue[] = []
+      for (const v of shared) {
+        const col = table.column(v)
+        // A padded or absent position carries no identity, so it neither
+        // contributes an exclusion nor can be excluded (`kql.rs:417-421`).
+        if (col === null || row[col]!.kind === 'null') return null
+        cells.push(row[col]!)
+      }
+      return rowKeyOf(cells)
+    }
+
     const excluded = new Set<string>()
     const joined = child.joinCovering(shared)
     for (const row of joined.rows) {
-      excluded.add(
-        shared
-          .map((v) => {
-            const col = joined.column(v)
-            return col === null ? ' ' : bindingCacheKey(row[col]!)
-          })
-          .join('|'),
-      )
+      const key = tuple(joined, row)
+      if (key !== null) excluded.add(key)
     }
+    if (excluded.size === 0) return
 
     const outer = ctx.joinCovering(shared)
     outer.retain((row) => {
-      const key = shared
-        .map((v) => {
-          const col = outer.column(v)
-          return col === null ? ' ' : bindingCacheKey(row[col]!)
-        })
-        .join('|')
-      return !excluded.has(key)
+      const key = tuple(outer, row)
+      return key === null || !excluded.has(key)
     })
   }
 
@@ -737,19 +788,7 @@ const MAX_ROW_MATCHES = 65_536
 const MAX_SOLUTION_ROWS = 65_536
 
 function bindingsDiffer(a: BindingValue, b: BindingValue): boolean {
-  return bindingCacheKey(a) !== bindingCacheKey(b)
-}
-
-function bindingCacheKey(value: BindingValue | undefined): string {
-  if (!value) return ' '
-  switch (value.kind) {
-    case 'entity':
-      return `e:${formatEntityID(value.id)}`
-    case 'predicate':
-      return `p:${value.name}`
-    case 'null':
-      return ' '
-  }
+  return bindingKey(a) !== bindingKey(b)
 }
 
 function predicateCandidates(predicate: PredTerm): string[] | null {

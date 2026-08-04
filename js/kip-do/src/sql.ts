@@ -38,14 +38,15 @@ export const MAX_VALUE_BYTES = 2 * 1024 * 1024
  */
 export function idSet(ids: Iterable<number | string>): string {
   const array = Array.isArray(ids) ? ids : Array.from(ids)
-  const json = JSON.stringify(array)
-  if (json.length > MAX_VALUE_BYTES) {
-    throw resourceExhausted(
-      `id set of ${array.length} entries exceeds the ${MAX_VALUE_BYTES}-byte ` +
-        `bound-parameter limit; page the query with LIMIT and CURSOR`,
-    )
-  }
-  return json
+  // Measured through `checkValueSize` rather than against `json.length`: a
+  // JS string counts UTF-16 code units and SQLite counts UTF-8 bytes, so a
+  // set of proposition addresses with multi-byte predicates would slip past a
+  // length check and surface as an opaque SQLITE_TOOBIG instead.
+  return checkValueSize(
+    JSON.stringify(array),
+    `the id set of ${array.length} entries (page the query with LIMIT and ` +
+      `CURSOR to shrink it)`,
+  )
 }
 
 /**

@@ -41,7 +41,11 @@ import {
 import { KipError, internalError, notFound, referenceError } from './errors.js'
 import { KmlExecutor, conceptTokenKey, type TokenMap } from './exec/kml.js'
 import { KqlExecutor, collectClauseVars } from './exec/kql.js'
-import { SolutionContext, type BindingValue } from './exec/solution.js'
+import {
+  SolutionContext,
+  type BindingValue,
+  rowKeyOf,
+} from './exec/solution.js'
 import { BUNDLED_CAPSULES, capsuleHash } from './capsules.js'
 import { applySchema, metaGet, metaSet } from './schema.js'
 import { Store } from './store.js'
@@ -145,7 +149,19 @@ export class CognitiveNexus {
     }
   }
 
-  async executeCommand(command: Command): Promise<KipResponse> {
+  /**
+   * Runs an already-parsed command.
+   *
+   * `searchTokens` carries the one piece of async state a command may need —
+   * a tokenized SEARCH term — as an argument rather than as engine state. It
+   * has to travel with the command: `prime` awaits the tokenizer, which opens
+   * the Durable Object's input gate, so a field would be readable (and
+   * overwritable) by a concurrently arriving request.
+   */
+  async executeCommand(
+    command: Command,
+    searchTokens: string[] | null = null,
+  ): Promise<KipResponse> {
     try {
       if ('Kql' in command) {
         const { result, cursor } = this.executeKql(command.Kql)
@@ -155,7 +171,7 @@ export class CognitiveNexus {
         return { result: await this.executeKml(command) }
       }
       if ('Meta' in command) {
-        const { result, cursor } = this.executeMeta(command.Meta)
+        const { result, cursor } = this.executeMeta(command.Meta, searchTokens)
         return { result, next_cursor: cursor }
       }
       throw internalError(
@@ -253,7 +269,7 @@ export class CognitiveNexus {
         const col = table.column(item.var)
         return col === null ? ({ kind: 'null' } as BindingValue) : row[col]!
       })
-      const key = cells.map((c) => bindingDedupKey(c)).join('\u0000')
+      const key = rowKeyOf(cells)
       if (seen.has(key)) continue
       seen.add(key)
 
@@ -461,7 +477,10 @@ export class CognitiveNexus {
   // META
   // -------------------------------------------------------------------
 
-  private executeMeta(command: MetaCommand): {
+  private executeMeta(
+    command: MetaCommand,
+    searchTokens: string[] | null,
+  ): {
     result: Json
     cursor: string | null
   } {
@@ -469,7 +488,7 @@ export class CognitiveNexus {
       return { result: this.describe(command.Describe), cursor: null }
     }
     if ('Search' in command) {
-      return { result: this.search(command.Search), cursor: null }
+      return { result: this.search(command.Search, searchTokens), cursor: null }
     }
     if ('Export' in command) {
       throw internalError(
@@ -481,21 +500,31 @@ export class CognitiveNexus {
     )
   }
 
+  /**
+   * Every concept of one type, in id order.
+   *
+   * Batched through `getConcepts` rather than looked up one id at a time: a
+   * `DESCRIBE PRIMER` covers three whole categories, and the Durable Object
+   * serves them on its single thread.
+   */
+  private conceptsOfType(type: string) {
+    const ids = this.store.conceptIdsByType(type)
+    const byId = this.store.getConcepts(ids)
+    return ids
+      .map((id) => byId.get(id))
+      .filter((c): c is NonNullable<typeof c> => !!c)
+  }
+
   private describe(target: DescribeTarget): Json {
     if (target === 'Primer') {
-      const conceptTypes = this.store
-        .conceptIdsByType('$ConceptType')
-        .map((id) => this.store.getConcept(id)?.name)
-        .filter((n): n is string => !!n)
-      const propositionTypes = this.store
-        .conceptIdsByType('$PropositionType')
-        .map((id) => this.store.getConcept(id)?.name)
-        .filter((n): n is string => !!n)
-      const domains = this.store
-        .conceptIdsByType('Domain')
-        .map((id) => this.store.getConcept(id))
-        .filter((c): c is NonNullable<typeof c> => !!c)
-        .map((c) => ({ name: c.name, attributes: c.attributes as Json }))
+      const conceptTypes = this.conceptsOfType('$ConceptType').map((c) => c.name)
+      const propositionTypes = this.conceptsOfType('$PropositionType').map(
+        (c) => c.name,
+      )
+      const domains = this.conceptsOfType('Domain').map((c) => ({
+        name: c.name,
+        attributes: c.attributes as Json,
+      }))
 
       return {
         engine: '@ldclabs/kip-do',
@@ -510,11 +539,7 @@ export class CognitiveNexus {
       }
     }
     if (target === 'Domains') {
-      return this.store
-        .conceptIdsByType('Domain')
-        .map((id) => this.store.getConcept(id))
-        .filter((c): c is NonNullable<typeof c> => !!c)
-        .map((c) => conceptNode(c)) as Json
+      return this.conceptsOfType('Domain').map((c) => conceptNode(c)) as Json
     }
     if (typeof target === 'object') {
       if ('ConceptTypes' in target) {
@@ -537,10 +562,8 @@ export class CognitiveNexus {
     metaType: string,
     page: { limit: number | null; cursor: string | null },
   ): Json {
-    const names = this.store
-      .conceptIdsByType(metaType)
-      .map((id) => this.store.getConcept(id)?.name)
-      .filter((n): n is string => !!n)
+    const names = this.conceptsOfType(metaType)
+      .map((c) => c.name)
       .sort()
     const offset = parseOffsetCursor(page.cursor)
     const limit = page.limit ?? names.length
@@ -571,10 +594,9 @@ export class CognitiveNexus {
    * the whole point of the external service: a query tokenized differently
    * from the index cannot match it, and the failure is silent (empty results,
    * no error). Because tokenization is async and this method is sync, the
-   * caller must have primed `searchTokens`; see `executeSearch`.
+   * caller must have resolved the tokens first; see `run`.
    */
-  private search(command: SearchCommand): Json {
-    const tokens = this.pendingSearchTokens
+  private search(command: SearchCommand, tokens: string[] | null): Json {
     if (!tokens) {
       throw internalError(
         'SEARCH tokens were not resolved before execution; call execute() rather than executeCommand()',
@@ -630,21 +652,18 @@ export class CognitiveNexus {
     return out
   }
 
-  /** Tokens for the in-flight SEARCH, primed by `execute`. */
-  private pendingSearchTokens: string[] | null = null
-
   /**
-   * Entry point that handles the async work a command needs before its
-   * synchronous execution: tokenizing a SEARCH term, and resolving KML
-   * tokens. Everything else runs straight through.
+   * Resolves the async state a command needs before its synchronous
+   * execution: today that is only a tokenized SEARCH term. The result is
+   * returned rather than stored, so two commands in flight over the same
+   * object cannot see each other's tokens.
    */
-  private async prime(command: Command): Promise<void> {
+  private async prime(command: Command): Promise<string[] | null> {
     if ('Meta' in command && 'Search' in command.Meta) {
       const result = await this.tokenizer.tokenize([command.Meta.Search.term])
-      this.pendingSearchTokens = result.tokens[0] ?? []
-    } else {
-      this.pendingSearchTokens = null
+      return result.tokens[0] ?? []
     }
+    return null
   }
 
   /** Tokenizer version the index was last built with. */
@@ -731,12 +750,13 @@ export class CognitiveNexus {
 
   /** Public wrapper that primes async state before synchronous execution. */
   async run(command: Command): Promise<KipResponse> {
+    let searchTokens: string[] | null
     try {
-      await this.prime(command)
+      searchTokens = await this.prime(command)
     } catch (err) {
       return { error: KipError.from(err).toJSON() }
     }
-    return this.executeCommand(command)
+    return this.executeCommand(command, searchTokens)
   }
 }
 
@@ -779,7 +799,6 @@ function toNumber(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0
 }
 
-/** Stable key for solution-row dedup. */
 /**
  * Splits capsule source into individual KIP statements.
  *
@@ -806,18 +825,6 @@ function splitStatements(source: string): string[] {
   }
   if (current.length > 0) out.push(current.join('\n'))
   return out.filter((s) => /\S/.test(s.replace(/\/\/.*$/gm, '')))
-}
-
-/** Stable key for solution-row dedup. */
-function bindingDedupKey(value: BindingValue): string {
-  switch (value.kind) {
-    case 'entity':
-      return `e:${formatEntityID(value.id)}`
-    case 'predicate':
-      return `p:${value.name}`
-    case 'null':
-      return ' '
-  }
 }
 
 function compareSortKeys(a: unknown, b: unknown): number {

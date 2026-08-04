@@ -165,11 +165,15 @@ export class Store {
 
   deleteConcepts(ids: readonly number[]): number {
     if (ids.length === 0) return 0
+    const set = idSet(ids)
     const cursor = this.sql.exec(
       `DELETE FROM concepts WHERE id IN (SELECT value FROM json_each(?))`,
-      idSet(ids),
+      set,
     )
-    for (const id of ids) this.clearConceptFts(id)
+    this.sql.exec(
+      'DELETE FROM concepts_fts WHERE rowid IN (SELECT value FROM json_each(?))',
+      set,
+    )
     return cursor.rowsWritten
   }
 
@@ -327,11 +331,15 @@ export class Store {
 
   deletePropositionRows(ids: readonly number[]): number {
     if (ids.length === 0) return 0
+    const set = idSet(ids)
     const cursor = this.sql.exec(
       'DELETE FROM propositions WHERE id IN (SELECT value FROM json_each(?))',
-      idSet(ids),
+      set,
     )
-    for (const id of ids) this.clearPropositionFts(id)
+    this.sql.exec(
+      'DELETE FROM propositions_fts WHERE rowid IN (SELECT value FROM json_each(?))',
+      set,
+    )
     return cursor.rowsWritten
   }
 
@@ -399,10 +407,15 @@ export class Store {
    * storage round-trip per frontier node (`matching.rs:594-605`). A recursive
    * CTE pushes the entire traversal into SQLite as a single statement.
    *
-   * `visited` is keyed on the node alone rather than `(node, depth)`: this
-   * returns reachable *nodes* with their minimum hop count, not the set of
-   * distinct paths. That is a deliberate difference from the Rust engine —
-   * see the note in README.md under "Known divergences".
+   * The result is keyed on the node alone rather than `(node, depth)`: this
+   * returns reachable *nodes* with their minimum qualifying hop count, not the
+   * set of distinct paths. That is a deliberate difference from the Rust
+   * engine — see the note in README.md under "Known divergences".
+   *
+   * `minHops` is applied to the individual rows *before* the grouping, not to
+   * the group's minimum. A node reachable both in one hop and in three must
+   * still satisfy `{3,3}`; filtering on `MIN(hops)` would drop it entirely,
+   * which is a stronger divergence than the documented one.
    *
    * `direction` picks which endpoint advances, so the same query serves
    * `(?start, "p"{1,3}, ?end)` and its reverse.
@@ -431,8 +444,8 @@ export class Store {
          )
          SELECT node, MIN(hops) AS hops
            FROM reach
+          WHERE hops >= ?4
           GROUP BY node
-         HAVING MIN(hops) >= ?4
           ORDER BY node`,
         idSet(start.map(formatEntityID)),
         predicate,
@@ -508,14 +521,6 @@ export class Store {
       tokens.join(' '),
     )
     this.sql.exec('UPDATE propositions SET tok_ver = ? WHERE id = ?', tokVer, id)
-  }
-
-  clearConceptFts(id: number): void {
-    this.sql.exec('DELETE FROM concepts_fts WHERE rowid = ?', id)
-  }
-
-  clearPropositionFts(id: number): void {
-    this.sql.exec('DELETE FROM propositions_fts WHERE rowid = ?', id)
   }
 
   /**

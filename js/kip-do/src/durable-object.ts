@@ -29,20 +29,22 @@ export class KipDatabase<
   Env extends KipDatabaseEnv = KipDatabaseEnv,
 > extends DurableObject<Env> {
   protected readonly nexus: CognitiveNexus
+  #tokenizer?: Tokenizer
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env)
 
-    // Schema creation must complete before any request is served, and it is
-    // the one place `blockConcurrencyWhile` is the right tool: it runs once
-    // per object lifetime, not per request.
     this.nexus = new CognitiveNexus(
       ctx.storage.sql,
       // `transactionSync` gives the engine real atomicity: a KML statement
       // either commits whole or rolls back. This is the capability the Rust
       // engine lacks, and it is why the port needs no preflight pass.
       (fn) => ctx.storage.transactionSync(fn),
-      { tokenizer: this.createTokenizer(env) },
+      // Resolved on first use, not here. `createTokenizer` is meant to be
+      // overridden, and a subclass's own field initializers do not run until
+      // after this constructor returns — calling it now would hand the
+      // override a half-built instance.
+      { tokenizer: { tokenize: (texts) => this.tokenizer().tokenize(texts) } },
     )
 
     // Schema and base capsules must be in place before any request is served:
@@ -55,11 +57,21 @@ export class KipDatabase<
     })
   }
 
-  /** Override to supply a different segmentation authority. */
+  /**
+   * Override to supply a different segmentation authority.
+   *
+   * Called lazily on the first tokenization, so an override may safely read
+   * the subclass's own fields.
+   */
   protected createTokenizer(env: Env): Tokenizer {
     return env.TOKENIZER
       ? new AlinkTokenizer(env.TOKENIZER)
       : new SimpleTokenizer()
+  }
+
+  /** Memoized `createTokenizer(env)`. */
+  private tokenizer(): Tokenizer {
+    return (this.#tokenizer ??= this.createTokenizer(this.env))
   }
 
   /**

@@ -10,41 +10,47 @@
  *
  * Run after `build:wasm`, and commit the output.
  */
-import { writeFileSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
-import { execFileSync, } from 'node:child_process'
-import { mkdtempSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const pkgRoot = dirname(here)
 const crateDir = join(pkgRoot, '..', '..', 'rs', 'anda_kip_wasm')
 
-// The vendored module targets `bundler`, which Node cannot import directly.
-// Build a throwaway `nodejs` copy purely to read the catalog out of it.
+// The vendored module targets `web` (see scripts/build-wasm.sh), whose
+// `initSync` entry point Node cannot import directly. Build a throwaway
+// `nodejs` copy purely to read the catalog out of it, then delete it.
 const scratch = mkdtempSync(join(tmpdir(), 'kip-errors-'))
-execFileSync(
-  'wasm-pack',
-  [
-    'build',
-    crateDir,
-    '--target',
-    'nodejs',
-    '--release',
-    '--out-dir',
-    scratch,
-    '--out-name',
-    'anda_kip_wasm',
-  ],
-  { stdio: 'inherit' },
-)
+let catalog
+let version
+try {
+  execFileSync(
+    'wasm-pack',
+    [
+      'build',
+      crateDir,
+      '--target',
+      'nodejs',
+      '--release',
+      '--out-dir',
+      scratch,
+      '--out-name',
+      'anda_kip_wasm',
+    ],
+    { stdio: 'inherit' },
+  )
 
-const require = createRequire(import.meta.url)
-const wasm = require(join(scratch, 'anda_kip_wasm.js'))
-const catalog = JSON.parse(wasm.error_catalog())
-const version = wasm.parser_version()
+  const require = createRequire(import.meta.url)
+  const wasm = require(join(scratch, 'anda_kip_wasm.js'))
+  catalog = JSON.parse(wasm.error_catalog())
+  version = wasm.parser_version()
+} finally {
+  rmSync(scratch, { recursive: true, force: true })
+}
 
 const codes = catalog.map((e) => e.code)
 const lit = (s) => JSON.stringify(s)
