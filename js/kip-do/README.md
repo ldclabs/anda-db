@@ -6,20 +6,36 @@ Object.
 
 This is a sibling of the Rust reference engine
 [`anda_cognitive_nexus`](../../rs/anda_cognitive_nexus), not a binding to it.
-The storage engine is SQLite instead of `anda_db`; the **grammar is literally
-the same code**, compiled to WebAssembly from `rs/anda_kip`.
+The storage engine is SQLite instead of `anda_db`, and the grammar is
+[`@ldclabs/kip-lang`](https://github.com/ldclabs/KIP/tree/main/packages/kip-lang)
+— a native TypeScript implementation of the same KIP revision, held to the Rust
+grammar's behaviour by a differential test.
 
 ```bash
 npm install @ldclabs/kip-do
 ```
 
-## Why the parser is WASM and the engine is TypeScript
+## How the two engines are kept in step
 
-`rs/anda_kip` — the KQL/KML/META grammar, the AST, and the error taxonomy — is
-~13,700 lines of pure computation with no I/O. It compiles to
-`wasm32-unknown-unknown` unchanged, so this package reuses it verbatim (344 KB,
-well under the 10 MB Worker bundle limit). A KIP command either parses
-identically in both engines, or in neither.
+Two implementations of one language drift unless something makes them agree.
+Here that something is a test, not a shared binary.
+
+`@ldclabs/kip-lang` parses to a syntax tree and then **lowers** it to the
+executable AST — the same wire shape `anda_kip`'s Rust AST serializes to. So
+`test/parser-oracle.test.ts` can compare them field for field: for every
+command in a corpus harvested from the conformance fixtures, the Rust parser's
+own tests and the bundled capsules, `parseKip(src)` must produce exactly what
+the Rust grammar produces, or both must reject it. `rs/anda_kip` compiled to
+WebAssembly is that oracle. It is a test dependency in `vendor/`, not part of
+the shipped package.
+
+A failure there is a divergence between the two KIP engines, which is the most
+expensive kind of bug this project can have: the same command would succeed on
+one deployment and fail on the other, or mean two different things.
+
+Dropping the WASM module from the runtime buys a ~141 KB smaller gzipped
+bundle, no `wasm-pack` in the release path, real source positions in syntax
+errors, and no Rust toolchain for a JavaScript contributor.
 
 The executor is TypeScript because it is the part that must change: it is
 written against SQL and `ctx.storage.sql`, not against `anda_db`'s B-Tree,
@@ -29,7 +45,8 @@ The error taxonomy is **generated** from the Rust source
 (`scripts/codegen-errors.mjs` → `src/errors.generated.ts`). Hand-copying 13
 codes, names and agent-facing recovery hints produces a table that compiles,
 passes tests, and is quietly wrong — and a mismatched `hint` breaks an agent's
-self-correction loop with nothing to detect it.
+self-correction loop with nothing to detect it. The oracle test also checks the
+generated table against the catalog the reference grammar reports at runtime.
 
 ## Quick start
 
@@ -258,9 +275,10 @@ throughput ceiling, and Durable Objects have no read replicas.
 
 ```bash
 pnpm install
-pnpm run build:wasm      # rebuild the grammar from rs/anda_kip (needs wasm-pack)
-node scripts/codegen-errors.mjs   # regenerate the error taxonomy
-pnpm test                # runs inside workerd via @cloudflare/vitest-pool-workers
+pnpm run codegen:errors          # regenerate the error taxonomy from error.rs
+pnpm run codegen:oracle-corpus   # re-harvest the differential corpus
+pnpm run build:oracle-wasm       # rebuild the oracle from rs/anda_kip (needs wasm-pack)
+pnpm test                        # runs inside workerd via @cloudflare/vitest-pool-workers
 pnpm run build
 ```
 
@@ -268,9 +286,10 @@ Tests run in **workerd**, not Node. The engine's contract is the platform's —
 `transactionSync`, FTS5, the 100-parameter ceiling — and none of it is
 reproducible against a Node SQLite shim.
 
-`vendor/anda_kip_wasm/` is committed and shipped in the tarball so consumers
-never need a Rust toolchain. Rebuild and commit it whenever the grammar
-changes.
+`vendor/anda_kip_wasm/` is committed but **not** shipped: it is the oracle
+`test/parser-oracle.test.ts` compares against. Rebuild and commit it whenever
+the Rust grammar changes, together with `pnpm run codegen:oracle-corpus` —
+that is the moment a divergence is meant to surface.
 
 ## License
 

@@ -1,25 +1,27 @@
 //! WebAssembly bindings for the `anda_kip` parser.
 //!
-//! The Durable-Object engine (`@ldclabs/kip-do`) reuses the Rust grammar
-//! verbatim rather than reimplementing it in TypeScript: the KQL/KML/META
-//! grammar, the `Command` AST and the KIP error taxonomy are the part of the
-//! protocol that is most expensive to re-derive and most damaging to get
-//! subtly wrong. `anda_kip` is pure computation with no I/O, so it compiles to
-//! `wasm32-unknown-unknown` unchanged.
+//! These exist to be the **oracle** in a differential test. The JavaScript KIP
+//! engine (`@ldclabs/kip-do`) parses with `@ldclabs/kip-lang`, a native
+//! TypeScript implementation; nothing structural forces the two grammars to
+//! agree on what a command means, so `js/kip-do/test/parser-oracle.test.ts`
+//! compares them field for field over a corpus harvested from the conformance
+//! fixtures and this crate's own tests. `anda_kip` is pure computation with no
+//! I/O, so it compiles to `wasm32-unknown-unknown` unchanged and can serve as
+//! the reference answer.
+//!
+//! Nothing ships this module: it is a test dependency of the JavaScript
+//! package, not part of its published tarball.
 //!
 //! The boundary is deliberately narrow — one string in, one JSON string out.
-//! Everything downstream (execution, storage, projection) lives in TypeScript.
 //! Passing the AST as JSON rather than through `serde-wasm-bindgen` keeps the
 //! ABI stable across wasm-bindgen versions and makes the payload trivially
-//! inspectable when a conformance test disagrees.
+//! inspectable when the two parsers disagree.
 
 use anda_kip::{Command, KipError, KipErrorCode, parse_kip};
 use wasm_bindgen::prelude::*;
 
-/// Semantic version of the bundled grammar. Mirrored into
-/// `PARSER_VERSION` on the TypeScript side and stamped into the engine
-/// manifest, so a grammar bump is visible in `DESCRIBE PRIMER` output
-/// instead of silently changing what a stored command means.
+/// Semantic version of this grammar, reported so a differential run can say
+/// which revision it compared against.
 const PARSER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Renders a `KipError` as the same JSON envelope the engine uses on the

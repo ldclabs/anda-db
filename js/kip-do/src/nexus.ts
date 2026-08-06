@@ -28,7 +28,12 @@ import type {
   UpsertBlock,
   WhereClause,
 } from './kip/ast.js'
-import { parseKip, parserVersion } from './kip/parser.js'
+import {
+  parseKip,
+  parseKipAll,
+  parserVersion,
+  specRevision,
+} from './kip/parser.js'
 import {
   type EntityID,
   type JsonMap,
@@ -122,8 +127,10 @@ export class CognitiveNexus {
       // that throws cannot leave the engine permissive.
       this.kml.privileged = true
       try {
-        for (const source of splitStatements(capsule.source)) {
-          const command = parseKip(source)
+        // A capsule is a sequence of UPSERT blocks, which the grammar reads as
+        // one command; `parseKipAll` splits only where a genuinely new command
+        // starts, so a `{` inside a string can no longer cut a block in half.
+        for (const command of parseKipAll(capsule.source)) {
           if (!('Kml' in command)) {
             throw internalError(
               `capsule ${capsule.name} contains a non-KML statement`,
@@ -529,6 +536,7 @@ export class CognitiveNexus {
       return {
         engine: '@ldclabs/kip-do',
         parser_version: parserVersion(),
+        spec_revision: specRevision(),
         concept_types: conceptTypes,
         proposition_types: propositionTypes,
         domains,
@@ -799,33 +807,6 @@ function toNumber(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0
 }
 
-/**
- * Splits capsule source into individual KIP statements.
- *
- * A capsule is several top-level `UPSERT { ... }` blocks separated by blank
- * lines and comments. The grammar parses one command at a time, so they are
- * split on top-level `UPSERT` boundaries rather than concatenated — a
- * concatenated parse would fail on the second block.
- */
-function splitStatements(source: string): string[] {
-  const out: string[] = []
-  let current: string[] = []
-  let depth = 0
-  for (const line of source.split('\n')) {
-    const code = line.replace(/\/\/.*$/, '')
-    if (depth === 0 && /^\s*UPSERT\b/.test(code) && current.length > 0) {
-      out.push(current.join('\n'))
-      current = []
-    }
-    current.push(line)
-    for (const ch of code) {
-      if (ch === '{') depth++
-      else if (ch === '}') depth--
-    }
-  }
-  if (current.length > 0) out.push(current.join('\n'))
-  return out.filter((s) => /\S/.test(s.replace(/\/\/.*$/gm, '')))
-}
 
 function compareSortKeys(a: unknown, b: unknown): number {
   if (a === null || a === undefined) return b === null || b === undefined ? 0 : -1

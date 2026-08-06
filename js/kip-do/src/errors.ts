@@ -47,11 +47,6 @@ export class KipError extends Error {
     }
   }
 
-  /** Rebuilds a `KipError` from the envelope the WASM parser returns. */
-  static fromJSON(json: KipErrorJSON): KipError {
-    return new KipError(json.code, json.message, json.hint)
-  }
-
   /**
    * Normalizes an arbitrary thrown value into a `KipError`.
    *

@@ -26,8 +26,10 @@ export {
 
 export {
   parseKip,
+  parseKipAll,
   parseKipBatch,
   parserVersion,
+  specRevision,
 } from './kip/parser.js'
 export type * from './kip/ast.js'
 

@@ -579,9 +579,49 @@ describe('error taxonomy', () => {
     const error = await expectError(stub, 'FIND ?x WHERE {{{')
     expect(error.code).toBe('KIP_1001')
     expect(error.name).toBe('InvalidSyntax')
-    // The hint is what an agent uses to self-correct; it comes straight from
-    // the Rust taxonomy through WASM.
+    // The hint is what an agent uses to self-correct; it is generated from the
+    // Rust taxonomy, so both engines send the same recovery text for a code.
     expect(error.hint).toContain('parenthesis matching')
+    // Source position is what the WASM parser could not give: its errors
+    // carried a nom context breadcrumb, not a line and column.
+    expect(error.message).toMatch(/line \d+, column \d+/)
+  })
+
+  it('refuses a command past the parser budget instead of overflowing', async () => {
+    const stub = await freshStub()
+    // Recursive descent: without a depth ceiling this recurses until the
+    // JavaScript stack overflows, and a Worker isolate does not survive that
+    // — the whole runtime goes, not just this request.
+    const deep = `FIND(?x) WHERE { ?x {type: "T"} FILTER(?x.n == ${'['.repeat(2000)}) }`
+    const error = await expectError(stub, deep)
+    expect(error.code).toBe('KIP_4002')
+
+    // The isolate is still serving.
+    await expectOk(stub, 'DESCRIBE PRIMER')
+  })
+
+  it('refuses a command past the input-length ceiling', async () => {
+    const stub = await freshStub()
+    const huge = `FIND(?x) WHERE { ?x {name: "${'a'.repeat(300_000)}"} }`
+    const error = await expectError(stub, huge)
+    expect(error.code).toBe('KIP_4002')
+  })
+
+  it('rejects what the syntax allows but the language does not', async () => {
+    const stub = await freshStub()
+    for (const command of [
+      // A matcher that identifies no single node.
+      'UPSERT { CONCEPT ?c { {type: "T"} } }',
+      // A filter function outside the closed set.
+      'FIND(?x) WHERE { ?x {type: "T"} FILTER(MEDIAN(?x.n) == 1) }',
+      // An UPDATE expression reading a variable other than its target.
+      'UPDATE ?a SET ATTRIBUTES { n: ADD(?b.attributes.n, 1) } WHERE { ?a {type: "T"} (?a, "p", ?b) }',
+      // `LIMIT 0` is the engine's "no limit" sentinel, so it may not be written.
+      'FIND(?x) WHERE { ?x {type: "T"} } LIMIT 0',
+    ]) {
+      const error = await expectError(stub, command)
+      expect(error.code, command).toBe('KIP_1001')
+    }
   })
 
   it('reports an unbound FILTER variable as a ReferenceError', async () => {

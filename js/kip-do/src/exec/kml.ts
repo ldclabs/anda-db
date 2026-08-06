@@ -25,7 +25,6 @@ import type {
   PropositionBlock,
   TargetTerm,
   UpdateExpr,
-  UpdateOperand,
   UpdateStatement,
   UpdateValue,
   UpsertBlock,
@@ -1125,7 +1124,7 @@ function evalUpdateValue(
 }
 
 function evalUpdateOperand(
-  operand: UpdateOperand | UpdateExpr,
+  operand: UpdateExpr,
   root: { attributes: JsonMap; metadata: JsonMap },
 ): Json {
   if ('Number' in operand) return operand.Number

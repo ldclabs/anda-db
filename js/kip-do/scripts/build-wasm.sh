@@ -3,11 +3,11 @@
 # Rebuilds the KIP grammar WASM module from `rs/anda_kip_wasm` into
 # `vendor/anda_kip_wasm/`.
 #
-# The build output is committed to the repository and shipped inside the npm
-# tarball on purpose: consumers install this package into a Cloudflare Worker
-# and must not need a Rust toolchain. Run this script whenever the `anda_kip`
-# grammar changes, and commit the result together with the Rust change so the
-# two never drift.
+# The output is committed but NOT shipped: it is the oracle
+# `test/parser-oracle.test.ts` compares this engine's TypeScript parser
+# against. Run this whenever the `anda_kip` grammar changes and commit the
+# result with the Rust change — that run is where a divergence between the two
+# KIP engines is meant to surface.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -33,7 +33,7 @@ wasm-pack build "$crate_dir" \
   --out-name anda_kip_wasm
 
 # wasm-pack writes a package.json and .gitignore describing a standalone npm
-# package. Neither is wanted here: this directory is vendored *inside* an
+# package. Neither is wanted here: this directory is a test fixture inside an
 # existing package, and the .gitignore would exclude the very artifact we
 # need to commit.
 rm -f "$out_dir/package.json" "$out_dir/.gitignore" "$out_dir/README.md"

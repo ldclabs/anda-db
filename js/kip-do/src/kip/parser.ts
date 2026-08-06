@@ -1,98 +1,124 @@
 /**
- * Bridge to the KIP grammar compiled to WebAssembly.
+ * Bridge to the KIP grammar.
  *
- * The grammar is not reimplemented in TypeScript. `rs/anda_kip` is pure
- * computation with no I/O and compiles to `wasm32-unknown-unknown` unchanged,
- * so the Durable Object engine reuses the exact parser, AST and error
- * taxonomy that the Rust engine uses. That removes the single largest source
- * of divergence between the two implementations: a KIP command either parses
- * identically in both, or in neither.
+ * The grammar is not reimplemented here. `@ldclabs/kip-lang` owns the lexer,
+ * the parser and — the part that matters to an engine — `lower`, which turns
+ * the syntax tree into the executable AST and rejects everything the syntax
+ * admits but the language does not: an unknown filter function, `{type: "T"}`
+ * where an identity is required, an UPDATE expression reading a foreign
+ * variable. What reaches `src/exec/` is already normalized.
  *
- * The module is imported statically. Workers instantiate WASM at isolate
- * startup rather than at first call, so there is no async init to await and
- * no cold-start cost on the request path.
+ * That AST is byte-for-byte the wire form of `anda_kip`'s Rust AST, and
+ * `test/parser-oracle.test.ts` asserts it: for a corpus drawn from the
+ * conformance fixtures, the Rust parser's own tests and the bundled capsules,
+ * `lower(parse(src))` must deep-equal what the Rust grammar compiled to WASM
+ * produces, or both must reject. The two engines agreeing on what a command
+ * means is enforced there rather than assumed here.
  */
 
 import {
-  initSync,
-  parse as wasmParse,
-  parse_batch as wasmParseBatch,
-  parser_version as wasmParserVersion,
-} from '../../vendor/anda_kip_wasm/anda_kip_wasm.js'
-// Wrangler and miniflare compile a `.wasm` import into a `WebAssembly.Module`
-// at deploy time — no network fetch, no async instantiation on the request
-// path. This is the only import form Workers support for WASM.
-import wasmModule from '../../vendor/anda_kip_wasm/anda_kip_wasm_bg.wasm'
-import { KipError, type KipErrorJSON, internalError } from '../errors.js'
+  KIP_SPEC_REVISION,
+  KipSyntaxError,
+  checkBatchBudget,
+  checkBudget,
+  lower,
+  lowerAll,
+  parse,
+  PARSER_VERSION,
+} from '@ldclabs/kip-lang'
+import type { Program } from '@ldclabs/kip-lang'
+import { KipError, internalError } from '../errors.js'
 import type { Command } from './ast.js'
 
-// Instantiate at module scope, i.e. at isolate startup rather than on the
-// first query. `initSync` is idempotent: it returns early if the module is
-// already live, so re-entry from another import path is harmless.
-initSync({ module: wasmModule as WebAssembly.Module })
-
-/** Envelope returned by the WASM `parse` / `parse_batch` entry points. */
-type ParseEnvelope = { ok: Command } | { error: KipErrorJSON }
-
-function unwrap(raw: string): Command {
-  let envelope: ParseEnvelope
-  try {
-    envelope = JSON.parse(raw) as ParseEnvelope
-  } catch (err) {
-    throw internalError(
-      `the KIP parser returned malformed JSON: ${(err as Error).message}`,
-    )
+/**
+ * Turns whatever kip-lang reports into a `KipError`.
+ *
+ * `parse` accumulates diagnostics so an editor can keep showing a tree after a
+ * mistake; an engine wants the opposite — the first thing that makes the
+ * command unexecutable, with a code it can put on the wire. The `hint` comes
+ * from this package's own generated taxonomy, so the agent-facing recovery
+ * text is identical to what the Rust engine sends for the same code.
+ */
+function toKipError(err: unknown): KipError {
+  if (err instanceof KipSyntaxError) {
+    return new KipError(err.code, err.message)
   }
-  if ('error' in envelope) throw KipError.fromJSON(envelope.error)
-  return envelope.ok
+  // A diagnostic raised by `parseProgram` is already a `KipError`; re-wrapping
+  // it would turn a syntax error into an InternalError and strip the code the
+  // agent recovers from.
+  if (err instanceof KipError) return err
+  if (err instanceof Error) return internalError(err.message)
+  return internalError(String(err))
+}
+
+/** Parses to a syntax tree, raising the first error diagnostic. */
+function parseProgram(source: string): Program {
+  checkBudget(source)
+  const { ast, diagnostics } = parse(source)
+  const fatal = diagnostics.find((d) => d.severity === 'error')
+  if (fatal) {
+    const where = ` (line ${fatal.range.start.line + 1}, column ${
+      fatal.range.start.column + 1
+    })`
+    throw new KipError('KIP_1001', fatal.message + where)
+  }
+  return ast
 }
 
 /**
  * Parses one KIP command (KQL, KML or META).
  *
- * @throws {KipError} with the grammar's own code, name, message and recovery
- * hint — identical to what the Rust engine would produce for the same input.
+ * @throws {KipError} carrying the grammar's own code, name, message and
+ * recovery hint — the same envelope the Rust engine produces for the same
+ * input.
  */
 export function parseKip(source: string): Command {
-  return unwrap(wasmParse(source))
+  try {
+    return lower(parseProgram(source))
+  } catch (err) {
+    throw toKipError(err)
+  }
 }
 
 /**
- * Parses several commands in one crossing of the WASM boundary.
+ * Parses several commands.
  *
- * A KIP request may carry a `commands` array, and each crossing costs a
- * string copy in both directions. Results are positionally aligned with the
- * input; a failure is returned in place rather than thrown, so one bad
+ * A KIP request may carry a `commands` array. Results are positionally aligned
+ * with the input; a failure is returned in place rather than thrown, so one bad
  * statement does not discard the rest of the batch.
  */
 export function parseKipBatch(
   sources: string[],
 ): ({ ok: Command } | { error: KipError })[] {
   if (sources.length === 0) return []
-
-  const raw = wasmParseBatch(JSON.stringify(sources))
-  let parsed: unknown
   try {
-    parsed = JSON.parse(raw)
+    checkBatchBudget(sources.length)
   } catch (err) {
-    throw internalError(
-      `the KIP parser returned malformed JSON: ${(err as Error).message}`,
-    )
+    throw toKipError(err)
   }
 
-  // A non-array result means the batch itself was rejected (malformed input
-  // JSON), which the WASM side reports with the single-error envelope.
-  if (!Array.isArray(parsed)) {
-    const envelope = parsed as ParseEnvelope
-    if ('error' in envelope) throw KipError.fromJSON(envelope.error)
-    throw internalError('the KIP parser returned an unexpected batch shape')
-  }
+  return sources.map((source) => {
+    try {
+      return { ok: parseKip(source) }
+    } catch (err) {
+      return { error: KipError.from(err) }
+    }
+  })
+}
 
-  return (parsed as ParseEnvelope[]).map((envelope) =>
-    'error' in envelope
-      ? { error: KipError.fromJSON(envelope.error) }
-      : { ok: envelope.ok },
-  )
+/**
+ * Parses source text that is a sequence of commands, such as a schema capsule.
+ *
+ * Unlike {@link parseKip} this accepts more than one statement. Consecutive
+ * `UPSERT` blocks still fold into a single command, which is what a capsule
+ * relies on to apply as a unit.
+ */
+export function parseKipAll(source: string): Command[] {
+  try {
+    return lowerAll(parseProgram(source))
+  } catch (err) {
+    throw toKipError(err)
+  }
 }
 
 /**
@@ -102,5 +128,16 @@ export function parseKipBatch(
  * rather than silently changing what a stored command means.
  */
 export function parserVersion(): string {
-  return wasmParserVersion()
+  return PARSER_VERSION
+}
+
+/**
+ * KIP specification revision the bundled grammar targets.
+ *
+ * `parserVersion` moves whenever the implementation ships a fix; this moves
+ * only when the language does, which is the thing an agent — or another
+ * engine — actually needs to compare against.
+ */
+export function specRevision(): string {
+  return KIP_SPEC_REVISION
 }

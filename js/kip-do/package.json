@@ -1,6 +1,6 @@
 {
   "name": "@ldclabs/kip-do",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "description": "KIP (Knowledge Interaction Protocol) knowledge graph engine on SQLite-backed Cloudflare Durable Objects \u2014 one KIP database per Durable Object.",
   "keywords": [
     "kip",
@@ -33,28 +33,33 @@
   },
   "files": [
     "dist",
-    "vendor",
     "README.md"
   ],
   "scripts": {
-    "build:wasm": "bash scripts/build-wasm.sh",
     "build": "tsc -p tsconfig.build.json",
+    "build:oracle-wasm": "bash scripts/build-wasm.sh",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "prepublishOnly": "pnpm run build:wasm && pnpm run codegen:errors && pnpm run codegen:capsules && pnpm run build",
-    "codegen:errors": "node scripts/codegen-errors.mjs",
     "test:conformance": "vitest run conformance",
-    "codegen:capsules": "node scripts/codegen-capsules.mjs"
+    "test:oracle": "vitest run parser-oracle",
+    "codegen:errors": "node scripts/codegen-errors.mjs",
+    "codegen:capsules": "node scripts/codegen-capsules.mjs",
+    "codegen:oracle-corpus": "node scripts/codegen-oracle-corpus.mjs",
+    "prepublishOnly": "pnpm run codegen:errors && pnpm run codegen:capsules && pnpm run build",
+    "ncu": "npx npm-check-updates -u"
   },
   "devDependencies": {
-    "@cloudflare/vitest-pool-workers": "^0.9.0",
-    "@cloudflare/workers-types": "^4.20250109.0",
-    "typescript": "^5.7.0",
-    "vitest": "~3.0.0",
-    "wrangler": "^4.0.0"
+    "@cloudflare/vitest-pool-workers": "^0.20.2",
+    "@cloudflare/workers-types": "^5.20260804.1",
+    "typescript": "^7.0.2",
+    "vitest": "~4.1.10",
+    "wrangler": "^4.119.0"
   },
   "engines": {
     "node": ">=20"
+  },
+  "dependencies": {
+    "@ldclabs/kip-lang": "^0.4.0"
   }
 }
