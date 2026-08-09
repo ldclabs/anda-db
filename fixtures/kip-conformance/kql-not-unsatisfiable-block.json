@@ -1,0 +1,20 @@
+{
+  "name": "kql-not-unsatisfiable-block",
+  "description": "A NOT block whose clauses are conjunctive but disconnected: one sub-pattern matches, another matches nothing. The block as a whole has no solution, so it must exclude nothing — an engine that reads the matching sub-pattern's rows as exclusions drops rows the query asked for.",
+  "setup": [
+    "UPSERT { CONCEPT ?t { {type: \"$ConceptType\", name: \"Node\"} SET ATTRIBUTES { \"description\": \"Graph node\" } } CONCEPT ?u { {type: \"$ConceptType\", name: \"Tag\"} SET ATTRIBUTES { \"description\": \"Never instantiated\" } } CONCEPT ?p { {type: \"$PropositionType\", name: \"links_to\"} SET ATTRIBUTES { \"description\": \"Directed edge\" } } }",
+    "UPSERT { CONCEPT ?d { {type: \"Node\", name: \"D\"} } CONCEPT ?c { {type: \"Node\", name: \"C\"} SET PROPOSITIONS { (\"links_to\", ?d) } } CONCEPT ?b { {type: \"Node\", name: \"B\"} SET PROPOSITIONS { (\"links_to\", ?c) } } CONCEPT ?a { {type: \"Node\", name: \"A\"} SET PROPOSITIONS { (\"links_to\", ?b) } } CONCEPT ?x { {type: \"Node\", name: \"X\"} } }"
+  ],
+  "cases": [
+    {
+      "name": "a satisfiable NOT block excludes the rows it matches",
+      "command": "FIND(?n.name) WHERE { ?n {type: \"Node\"} NOT { (?n, \"links_to\", ?o) } }",
+      "expect": { "result": ["D", "X"] }
+    },
+    {
+      "name": "a NOT block with an unmatchable disconnected clause excludes nothing",
+      "command": "FIND(?n.name) WHERE { ?n {type: \"Node\"} NOT { (?n, \"links_to\", ?o) ?g {type: \"Tag\"} } }",
+      "expect": { "result": ["A", "B", "C", "D", "X"] }
+    }
+  ]
+}

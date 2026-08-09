@@ -1,0 +1,44 @@
+[package]
+name = "anda_kip_wasm"
+version = "0.11.0"
+description = "WebAssembly bindings for the anda_kip parser, consumed by the @ldclabs/kip-do npm package."
+repository = "https://github.com/ldclabs/anda-db/tree/main/rs/anda_kip_wasm"
+publish = false
+edition = "2024"
+license = "MIT"
+
+# Detached from the root workspace on purpose: this crate builds a `cdylib` for
+# `wasm32-unknown-unknown` via wasm-pack, and a cdylib target makes
+# `cargo test --workspace` on the host link a dynamic library for no reason.
+# The Python binding is excluded from the workspace for the same class of
+# reason; see the root Cargo.toml.
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+anda_kip = { path = "../anda_kip" }
+serde_json = "1"
+wasm-bindgen = "0.2"
+
+# `getrandom` is pulled in transitively; wasm32-unknown-unknown has no default
+# entropy source, so point it at the JS crypto shim.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
+
+# Recent rustc emits bulk-memory and non-trapping float-to-int ops for
+# wasm32 by default, but the wasm-opt that ships with wasm-pack still
+# validates against the 2019 MVP feature set and rejects them. Both features
+# are supported by workerd, so enable them rather than degrading codegen.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-Os", "--enable-bulk-memory", "--enable-nontrapping-float-to-int"]
+
+[profile.release]
+# The parser is the whole payload; optimize it for size, not for the last few
+# percent of throughput. Measured output is well under the Workers bundle cap.
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

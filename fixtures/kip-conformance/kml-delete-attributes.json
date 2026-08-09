@@ -1,0 +1,49 @@
+{
+  "name": "kml-delete-attributes",
+  "description": "DELETE ATTRIBUTES / DELETE METADATA on concepts and on proposition links: the {updated_concepts, updated_propositions} report, tolerance of keys that are not present, and the reference error for a target no WHERE clause binds.",
+  "setup": [
+    "UPSERT { CONCEPT ?person_type { {type: \"$ConceptType\", name: \"DeletePerson\"} } CONCEPT ?knows_type { {type: \"$PropositionType\", name: \"delete_knows\"} } CONCEPT ?alice { {type: \"DeletePerson\", name: \"Alice\"} SET ATTRIBUTES { \"role\": \"researcher\", \"drop_attr\": true } } WITH METADATA { \"source\": \"unit\", \"drop_meta\": true } CONCEPT ?bob { {type: \"DeletePerson\", name: \"Bob\"} } PROPOSITION ?link { (?alice, \"delete_knows\", ?bob) SET ATTRIBUTES { \"since\": 2024, \"drop_attr\": true } } WITH METADATA { \"source\": \"unit\", \"drop_meta\": true } }"
+  ],
+  "cases": [
+    {
+      "name": "an unbound FROM target is a reference error",
+      "command": "DELETE ATTRIBUTES {\"drop_attr\"} FROM ?missing WHERE { ?person {type: \"DeletePerson\", name: \"Alice\"} }",
+      "expect": { "error": { "code": "KIP_3001" } }
+    },
+    {
+      "name": "deleting concept attributes ignores keys that are absent",
+      "command": "DELETE ATTRIBUTES {\"drop_attr\", \"missing\"} FROM ?person WHERE { ?person {type: \"DeletePerson\", name: \"Alice\"} }",
+      "expect": { "result": { "updated_concepts": 1, "updated_propositions": 0 } }
+    },
+    {
+      "name": "only the named attribute is gone",
+      "command": "FIND(?p.attributes.role, ?p.attributes.drop_attr) WHERE { ?p {type: \"DeletePerson\", name: \"Alice\"} }",
+      "expect": { "result": [["researcher", null]] }
+    },
+    {
+      "name": "deleting concept metadata",
+      "command": "DELETE METADATA {\"drop_meta\"} FROM ?person WHERE { ?person {type: \"DeletePerson\", name: \"Alice\"} }",
+      "expect": { "result": { "updated_concepts": 1, "updated_propositions": 0 } }
+    },
+    {
+      "name": "only the named metadata key is gone",
+      "command": "FIND(?p.metadata.source, ?p.metadata.drop_meta) WHERE { ?p {type: \"DeletePerson\", name: \"Alice\"} }",
+      "expect": { "result": [["unit", null]] }
+    },
+    {
+      "name": "deleting link attributes reports updated_propositions",
+      "command": "DELETE ATTRIBUTES {\"drop_attr\"} FROM ?link WHERE { ?link ({type: \"DeletePerson\", name: \"Alice\"}, \"delete_knows\", {type: \"DeletePerson\", name: \"Bob\"}) }",
+      "expect": { "result": { "updated_concepts": 0, "updated_propositions": 1 } }
+    },
+    {
+      "name": "deleting link metadata reports updated_propositions",
+      "command": "DELETE METADATA {\"drop_meta\"} FROM ?link WHERE { ?link ({type: \"DeletePerson\", name: \"Alice\"}, \"delete_knows\", {type: \"DeletePerson\", name: \"Bob\"}) }",
+      "expect": { "result": { "updated_concepts": 0, "updated_propositions": 1 } }
+    },
+    {
+      "name": "the link kept everything that was not named",
+      "command": "FIND(?link.attributes.since, ?link.attributes.drop_attr, ?link.metadata.source, ?link.metadata.drop_meta) WHERE { ?link ({type: \"DeletePerson\", name: \"Alice\"}, \"delete_knows\", {type: \"DeletePerson\", name: \"Bob\"}) }",
+      "expect": { "result": [[2024, null, "unit", null]] }
+    }
+  ]
+}

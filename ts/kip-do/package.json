@@ -1,0 +1,65 @@
+{
+  "name": "@ldclabs/kip-do",
+  "version": "0.12.0",
+  "description": "KIP (Knowledge Interaction Protocol) knowledge graph engine on SQLite-backed Cloudflare Durable Objects \u2014 one KIP database per Durable Object.",
+  "keywords": [
+    "kip",
+    "knowledge-graph",
+    "durable-objects",
+    "cloudflare",
+    "sqlite",
+    "ai-agent",
+    "memory"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ldclabs/anda-db.git",
+    "directory": "js/kip-do"
+  },
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./schema": {
+      "types": "./dist/schema.d.ts",
+      "default": "./dist/schema.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "build:oracle-wasm": "bash scripts/build-wasm.sh",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:conformance": "vitest run conformance",
+    "test:oracle": "vitest run parser-oracle",
+    "codegen:errors": "node scripts/codegen-errors.mjs",
+    "codegen:capsules": "node scripts/codegen-capsules.mjs",
+    "codegen:oracle-corpus": "node scripts/codegen-oracle-corpus.mjs",
+    "prepublishOnly": "pnpm run codegen:errors && pnpm run codegen:capsules && pnpm run build",
+    "ncu": "npx npm-check-updates -u"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.20.2",
+    "@cloudflare/workers-types": "^5.20260804.1",
+    "typescript": "^7.0.2",
+    "vitest": "~4.1.10",
+    "wrangler": "^4.119.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@ldclabs/kip-lang": "^0.4.0"
+  }
+}

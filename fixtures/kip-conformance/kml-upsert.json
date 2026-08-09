@@ -1,0 +1,125 @@
+{
+  "name": "kml-upsert",
+  "description": "UPSERT: shallow-merge of attributes and metadata onto an existing link, engine-maintained _version, the schema preflight that prevents partial writes, id-matcher error paths, the self-loop guard, and the refusal to write reserved `_` metadata.",
+  "setup": [
+    "UPSERT { CONCEPT ?drug_type { {type: \"$ConceptType\", name: \"Drug\"} SET ATTRIBUTES { \"description\": \"Pharmaceutical drug concept type\" } } WITH METADATA { \"source\": \"test_setup\", \"confidence\": 1.0 } }",
+    "UPSERT { CONCEPT ?symptom_type { {type: \"$ConceptType\", name: \"Symptom\"} SET ATTRIBUTES { \"description\": \"Medical symptom concept type\" } } WITH METADATA { \"source\": \"test_setup\", \"confidence\": 1.0 } }",
+    "UPSERT { CONCEPT ?treats_pred { {type: \"$PropositionType\", name: \"treats\"} SET ATTRIBUTES { \"description\": \"Treatment relationship\" } } WITH METADATA { \"source\": \"test_setup\", \"confidence\": 1.0 } }",
+    "UPSERT { CONCEPT ?headache { {type: \"Symptom\", name: \"Headache\"} SET ATTRIBUTES { \"severity\": \"moderate\", \"duration\": \"2-4 hours\" } } WITH METADATA { \"source\": \"test_data\", \"confidence\": 1.0 } }",
+    "UPSERT { CONCEPT ?fever { {type: \"Symptom\", name: \"Fever\"} SET ATTRIBUTES { \"temperature_range\": \"38-40°C\", \"common\": true } } WITH METADATA { \"source\": \"test_data\", \"confidence\": 0.9 } }",
+    "UPSERT { CONCEPT ?aspirin { {type: \"Drug\", name: \"Aspirin\"} SET ATTRIBUTES { \"molecular_formula\": \"C9H8O4\", \"risk_level\": 2, \"dosage\": \"325mg\" } SET PROPOSITIONS { (\"treats\", {type: \"Symptom\", name: \"Headache\"}) (\"treats\", {type: \"Symptom\", name: \"Fever\"}) } } } WITH METADATA { \"source\": \"test_data\", \"confidence\": 0.95 }"
+  ],
+  "cases": [
+    {
+      "name": "SET ATTRIBUTES from the setup are readable",
+      "command": "FIND(?d.attributes.molecular_formula, ?d.attributes.risk_level) WHERE { ?d {type: \"Drug\", name: \"Aspirin\"} }",
+      "expect": { "result": [["C9H8O4", 2]] }
+    },
+    {
+      "name": "SET PROPOSITIONS links inherit the statement metadata and start at version 1",
+      "command": "FIND(?link.metadata.source, ?link.metadata.confidence, ?link.metadata._version) WHERE { ?link ({type: \"Drug\", name: \"Aspirin\"}, \"treats\", {type: \"Symptom\", name: \"Headache\"}) }",
+      "expect": { "result": [["test_data", 0.95, 1]] }
+    },
+    {
+      "name": "upserting an existing proposition returns its link id",
+      "command": "UPSERT { PROPOSITION ?treatment { ({type: \"Drug\", name: \"Aspirin\"}, \"treats\", {type: \"Symptom\", name: \"Headache\"}) SET ATTRIBUTES { \"effectiveness\": 0.85, \"onset_time\": \"30 minutes\" } } WITH METADATA { \"source\": \"clinical_trial\", \"study_id\": \"CT-2024-001\" } }",
+      "expect": {
+        "result": {
+          "blocks": 1,
+          "upsert_concept_nodes": [],
+          "upsert_proposition_links": ["P:<1>:treats"]
+        }
+      }
+    },
+    {
+      "name": "the second upsert shallow-merges metadata and advances _version",
+      "command": "FIND(?link.attributes.effectiveness, ?link.attributes.onset_time, ?link.metadata.source, ?link.metadata.confidence, ?link.metadata.study_id, ?link.metadata._version) WHERE { ?link ({type: \"Drug\", name: \"Aspirin\"}, \"treats\", {type: \"Symptom\", name: \"Headache\"}) }",
+      "expect": {
+        "result": [[0.85, "30 minutes", "clinical_trial", 0.95, "CT-2024-001", 2]]
+      }
+    },
+    {
+      "name": "an unregistered predicate in SET PROPOSITIONS is a type mismatch",
+      "command": "UPSERT { CONCEPT ?bad_drug { {type: \"Drug\", name: \"BadDrug\"} SET PROPOSITIONS { (\"not_registered\", {type: \"Symptom\", name: \"Headache\"}) } } }",
+      "expect": { "error": { "code": "KIP_2001" } }
+    },
+    {
+      "name": "the rejected statement created no concept",
+      "command": "FIND(?d.name) WHERE { ?d {type: \"Drug\", name: \"BadDrug\"} }",
+      "expect": { "error": { "code": "KIP_3002" } }
+    },
+    {
+      "name": "the preflight rejects a statement whose later block is invalid",
+      "command": "UPSERT { CONCEPT ?partial { {type: \"Drug\", name: \"PartialDrug\"} } PROPOSITION ?bad_fact { (?partial, \"not_registered\", {type: \"Symptom\", name: \"Headache\"}) } }",
+      "expect": { "error": { "code": "KIP_2001" } }
+    },
+    {
+      "name": "the earlier block of the rejected statement was not applied",
+      "command": "FIND(?d.name) WHERE { ?d {type: \"Drug\", name: \"PartialDrug\"} }",
+      "expect": { "error": { "code": "KIP_3002" } }
+    },
+    {
+      "name": "a concept {id:} matcher for a missing node reports not found",
+      "command": "UPSERT { CONCEPT ?missing { {id: \"C:18446744073709551615\"} SET ATTRIBUTES { \"risk_level\": 1 } } }",
+      "expect": { "error": { "code": "KIP_3002" } }
+    },
+    {
+      "name": "a proposition (id:) matcher rejects a concept id",
+      "command": "UPSERT { PROPOSITION ?link { (id: \"C:1\") } }",
+      "expect": { "error": { "code": "KIP_1001", "message": "must be a Proposition ID" } }
+    },
+    {
+      "name": "a proposition (id:) matcher for a missing link reports not found",
+      "command": "UPSERT { PROPOSITION ?link { (id: \"P:18446744073709551615:treats\") } }",
+      "expect": { "error": { "code": "KIP_3002" } }
+    },
+    {
+      "name": "subject and object of a proposition must differ",
+      "command": "UPSERT { PROPOSITION ?link { ({type: \"Drug\", name: \"Aspirin\"}, \"treats\", {type: \"Drug\", name: \"Aspirin\"}) } }",
+      "expect": {
+        "error": { "code": "KIP_1001", "message": "Subject and object cannot be the same" }
+      }
+    },
+    {
+      "name": "a SET PROPOSITIONS self-loop is rejected by the preflight",
+      "command": "UPSERT { CONCEPT ?x { {type: \"Drug\", name: \"Aspirin\"} SET ATTRIBUTES { \"poisoned\": true } SET PROPOSITIONS { (\"treats\", {type: \"Drug\", name: \"Aspirin\"}) } } }",
+      "expect": { "error": { "code": "KIP_1001", "message": "self-loop" } }
+    },
+    {
+      "name": "the rejected self-loop statement left no partial attribute write",
+      "command": "FIND(?c.attributes.poisoned) WHERE { ?c {type: \"Drug\", name: \"Aspirin\"} }",
+      "expect": { "result": [null] }
+    },
+    {
+      "name": "reserved _version cannot be written from block metadata",
+      "command": "UPSERT { CONCEPT ?c { {type: \"Drug\", name: \"Aspirin\"} } WITH METADATA { \"_version\": 9 } }",
+      "expect": { "error": { "code": "KIP_2002" } }
+    },
+    {
+      "name": "reserved _score cannot be written either",
+      "command": "UPSERT { CONCEPT ?c { {type: \"Drug\", name: \"Aspirin\"} } WITH METADATA { \"_score\": 1.0 } }",
+      "expect": { "error": { "code": "KIP_2002" } }
+    },
+    {
+      "name": "reserved _updated_at cannot be written on a proposition",
+      "command": "UPSERT { PROPOSITION ?p { ({type: \"Drug\", name: \"Aspirin\"}, \"treats\", {type: \"Symptom\", name: \"Headache\"}) } WITH METADATA { \"_updated_at\": \"2026-01-01T00:00:00Z\" } }",
+      "expect": { "error": { "code": "KIP_2002" } }
+    },
+    {
+      "name": "a successful upsert of an existing concept returns its id",
+      "command": "UPSERT { CONCEPT ?c { {type: \"Drug\", name: \"Aspirin\"} SET ATTRIBUTES { \"risk_level\": 3 } } }",
+      "expect": {
+        "result": {
+          "blocks": 1,
+          "upsert_concept_nodes": ["C:<1>"],
+          "upsert_proposition_links": []
+        }
+      }
+    },
+    {
+      "name": "the mutation advanced the concept _version from 1 to 2",
+      "command": "FIND(?c.metadata._version) WHERE { ?c {type: \"Drug\", name: \"Aspirin\"} }",
+      "expect": { "result": [2] }
+    }
+  ]
+}
