@@ -97,9 +97,9 @@ export const SCHEMA_STATEMENTS: readonly string[] = [
   // `ascii` tokenizer then does no linguistic work of its own — it splits on
   // ASCII punctuation/space and treats every byte >= 0x80 as a token
   // character, so a pre-segmented CJK token survives intact. Choosing
-  // `unicode61` instead would re-apply Unicode case folding on top of the
-  // service's normalization, letting write-path and read-path tokens diverge
-  // for exactly the inputs where it matters.
+  // `unicode61` instead would apply another Unicode normalization and folding
+  // policy, so the stored vocabulary would no longer be exactly the external
+  // service's versioned output.
   //
   // These are ordinary (not contentless) FTS5 tables. A contentless table
   // cannot be deleted from without replaying the original text, and

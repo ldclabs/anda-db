@@ -14,10 +14,11 @@ import { AlinkTokenizer, SimpleTokenizer, type Tokenizer } from './tokenizer.js'
 
 export interface KipDatabaseEnv {
   /**
-   * Binding for `alink-tokenizer`. A Container binding, a service binding, or
+   * Binding for `cf-tokenizer`. A Container binding, a service binding, or
    * anything else exposing `fetch`. When absent the database falls back to
-   * `SimpleTokenizer`, which is adequate for ASCII-only corpora and useless
-   * for Chinese — so a production deployment should always bind it.
+   * `SimpleTokenizer`, which is adequate for basic ASCII-oriented corpora but
+   * has no dictionary-based Chinese segmentation — so multilingual production
+   * deployments should bind the service.
    */
   TOKENIZER?: { fetch(input: RequestInfo, init?: RequestInit): Promise<Response> }
 }

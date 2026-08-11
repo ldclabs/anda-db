@@ -80,7 +80,9 @@ export default {
   },
   // `new_sqlite_classes` is required — the KV-backed backend has no SQL API.
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["MyKipDatabase"] }],
-  "services": [{ "binding": "TOKENIZER", "service": "alink-tokenizer" }]
+  // `cf-tokenizer` is deployed as a separate, service-bound Worker backed by
+  // a stateless Cloudflare Container.
+  "services": [{ "binding": "TOKENIZER", "service": "cf-tokenizer" }]
 }
 ```
 
@@ -111,36 +113,48 @@ await db.executeKip(`
 `)
 ```
 
-## Chinese text and the tokenizer service
+## Multilingual text and the tokenizer service
 
 Durable Object SQLite ships FTS5 with only the built-in tokenizers (`ascii`,
 `unicode61`, `porter`, `trigram`), and a Worker cannot load a C extension, so
 jieba is unavailable inside SQLite. Under `unicode61` a whole Han run collapses
 into a single token and realistic Chinese queries return nothing.
 
-This engine therefore treats
-[`alink-tokenizer`](https://github.com/ldclabs/alink/tree/main/alink-tokenizer)
-as the **sole segmentation authority**, called on both the write path and the
-read path:
+This engine therefore treats the public
+[`cf-tokenizer`](../../rs/cf-tokenizer) service as the **sole segmentation
+authority**, called on both the write path and the read path. It applies NFKC,
+lowercasing, script-aware segmentation (jieba search mode for Han, Unicode UAX
+#29 word boundaries for other scripts), and targeted Russian and Arabic search
+folding:
 
 - FTS5 columns use `tokenize = 'ascii'` so SQLite does *no* linguistic work of
   its own — it splits on ASCII punctuation and treats every byte ≥ 0x80 as a
   token character, so a pre-segmented CJK token survives intact. `unicode61`
-  would re-apply Unicode case folding on top of the service's NFKC +
-  lowercasing, letting the two paths diverge for exactly the inputs where it
-  matters.
-- Every response's `X-Tokenizer-Version` is persisted per row in `tok_ver`. A
-  `TOKENIZER_VERSION` bump makes previously indexed rows' vocabulary
-  incomparable, so `reindexStale()` finds and rebuilds them; an alarm drives
-  this off the request path.
+  would apply a second Unicode normalization and folding policy, so the
+  vocabulary actually stored would no longer be exactly the service's
+  versioned output.
+- Every successful tokenization response's `X-Tokenizer-Version` is persisted
+  per row in `tok_ver`. A `TOKENIZER_VERSION` bump makes previously indexed
+  rows' vocabulary incomparable, so `reindexStale()` finds and rebuilds them;
+  an alarm drives this off the request path.
 - If the service is unreachable, writes **fail**. There is no fallback to local
   segmentation on purpose: degrading silently would write tokens that disagree
   with everything indexed before and after, and the damage would only surface
   as queries quietly returning nothing.
 
-Without a `TOKENIZER` binding the package falls back to `SimpleTokenizer`,
-which is fine for ASCII corpora and useless for Chinese. Bind the service in
-production.
+Without a `TOKENIZER` binding the package falls back to `SimpleTokenizer`.
+That is useful for tests and basic ASCII-oriented deployments, but it emits one
+token per Han code point and cannot provide dictionary-based Chinese search.
+Bind `cf-tokenizer` in production whenever the corpus is multilingual.
+
+`cf-tokenizer` is a container image, not a Worker binding by itself. Deploy it
+behind a small Cloudflare Container Worker, then add that Worker's service
+binding as `TOKENIZER`, as shown in Quick start. The tokenizer's
+[deployment guide](../../rs/cf-tokenizer/README.md#deploy-on-cloudflare) includes
+the Container class, Wrangler configuration, registry workflow, health check,
+limits, and version-rollout checklist. A service binding is preferred because
+the tokenizer HTTP server does not implement authentication and need not be
+publicly reachable.
 
 ## Where this engine is stronger than the Rust one
 

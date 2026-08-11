@@ -6,12 +6,9 @@ on:
         description: "Docker image tag"
         required: true
         type: string
-  # push:
-  #   tags:
-  #     - 'v*'
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ldclabs/anda_cognitive_nexus_server
+  IMAGE_NAME: ldclabs/cf-tokenizer
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -20,8 +17,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build the Docker image
         run: |
+          cd rs/cf-tokenizer
           docker login --username ${{ github.actor }} --password ${{ secrets.GITHUB_TOKEN }} ${{ env.REGISTRY }}
           IMAGE_TAG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}_amd64:${{ inputs.build_tag }}"
           LATEST_TAG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}_amd64:latest"
           TAGS="-t ${IMAGE_TAG} -t ${LATEST_TAG}"
-          docker build -f rs/anda_cognitive_nexus_server/Dockerfile $TAGS --push .
+          docker build -f ./Dockerfile $TAGS --push .

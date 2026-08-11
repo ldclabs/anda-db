@@ -22,8 +22,10 @@ target/
 #.idea/
 
 Cargo.lock
+# Standalone deployed binary: its Docker build uses `cargo --locked`.
+!rs/cf-tokenizer/Cargo.lock
 
-# JavaScript workspaces (js/kip-do). Tool caches such as vitest's also land in
+# JavaScript workspaces (ts/kip-do). Tool caches such as vitest's also land in
 # a root-level node_modules, so this is not scoped to js/.
 node_modules/
 .vite/

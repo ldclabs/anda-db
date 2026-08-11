@@ -8,7 +8,7 @@
  * nothing for realistic queries.
  *
  * The engine therefore treats an external service as the sole segmentation
- * authority — `alink-tokenizer`, which wraps jieba-rs behind
+ * authority — `cf-tokenizer`, which wraps jieba-rs behind
  * `POST /tokenize`. Both the write path (indexing) and the read path
  * (`SEARCH`) call the same service, which is what prevents the write/read
  * asymmetry that a "tokenize on write, approximate on read" design produces.
@@ -46,7 +46,7 @@ export interface Tokenizer {
  * A binding that can service a `fetch`.
  *
  * Typed structurally so the same client works against a Container binding, a
- * service binding, or a plain origin — the three ways `alink-tokenizer` is
+ * service binding, or a plain origin — the three ways `cf-tokenizer` is
  * reachable from a Worker.
  */
 export interface FetcherLike {
@@ -65,11 +65,12 @@ export interface AlinkTokenizerOptions {
 }
 
 /**
- * Client for `alink-tokenizer`.
+ * Client for `cf-tokenizer`.
  *
- * Contract (see `alink-tokenizer/README.md`):
+ * The class keeps its historical name for API compatibility. Contract (see
+ * `rs/cf-tokenizer/README.md`):
  *   `POST /tokenize  { texts: string[], mode: "search" } -> { tokens: string[][] }`
- *   every response carries `X-Tokenizer-Version`.
+ *   every successful response carries `X-Tokenizer-Version`.
  */
 export class AlinkTokenizer implements Tokenizer {
   readonly #fetcher: FetcherLike

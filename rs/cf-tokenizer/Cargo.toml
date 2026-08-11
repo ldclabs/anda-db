@@ -1,0 +1,28 @@
+[package]
+name = "cf-tokenizer"
+version = "1.0.0"
+edition = "2021"
+publish = false
+
+# Discovery-plane tokenizer service:
+# stateless jieba-rs segmentation behind a batch HTTP contract, deployed on
+# Cloudflare Containers.
+
+[dependencies]
+axum = "0.8"
+jieba-rs = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+unicode-normalization = "0.1"
+unicode-segmentation = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+# This service owns its lockfile and Docker build context. Declaring a nested
+# workspace keeps Cargo from trying to attach it to AndaDB's root workspace,
+# where it is intentionally not a member.
+[workspace]

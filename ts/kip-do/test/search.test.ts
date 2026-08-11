@@ -30,7 +30,7 @@ async function expectOk(
 }
 
 /**
- * Stand-in for `alink-tokenizer`, speaking the same HTTP contract:
+ * Stand-in for `cf-tokenizer`, speaking the same HTTP contract:
  * `POST /tokenize {texts, mode:"search"} -> {tokens}` with
  * `X-Tokenizer-Version` on every response.
  *
