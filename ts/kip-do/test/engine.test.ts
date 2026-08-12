@@ -1,5 +1,8 @@
-import { env, runInDurableObject } from 'cloudflare:test'
+import { env, evictDurableObject, runInDurableObject } from 'cloudflare:test'
 import { describe, expect, it } from 'vitest'
+import { BOOTSTRAP_VERSION_KEY } from '../src/durable-object.js'
+import { BOOTSTRAP_VERSION } from '../src/nexus.js'
+import { SCHEMA_VERSION } from '../src/schema.js'
 import type { TestKipDatabase } from './worker.js'
 
 /**
@@ -82,10 +85,10 @@ async function declareSchema(
 }
 
 describe('schema', () => {
-  it('creates its tables and is idempotent across constructions', async () => {
+  it('creates its tables and skips full bootstrap after eviction', async () => {
     const stub = await freshStub()
     await expectOk(stub, 'DESCRIBE PRIMER')
-    await runInDurableObject(stub, (_instance, state) => {
+    await runInDurableObject(stub, async (_instance, state) => {
       const tables = state.storage.sql
         .exec<{ name: string }>(
           "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
@@ -97,6 +100,77 @@ describe('schema', () => {
       expect(tables).toContain('proposition_links')
       expect(tables).toContain('concepts_fts')
       expect(tables).toContain('kip_meta')
+
+      expect(await state.storage.get(BOOTSTRAP_VERSION_KEY)).toBe(
+        BOOTSTRAP_VERSION,
+      )
+      state.storage.sql.exec(
+        "UPDATE kip_meta SET v = 'test-stale' WHERE k LIKE 'capsule_hash:%'",
+      )
+      state.storage.sql.exec(
+        "UPDATE kip_meta SET v = 'test-stale' WHERE k = 'schema_version'",
+      )
+    })
+
+    await evictDurableObject(stub)
+    await expectOk(stub, 'DESCRIBE PRIMER')
+
+    await runInDurableObject(stub, (_instance, state) => {
+      const stale = state.storage.sql
+        .exec<{ count: number }>(
+          `SELECT count(*) AS count FROM kip_meta
+             WHERE k LIKE 'capsule_hash:%' AND v = 'test-stale'`,
+        )
+        .toArray()[0]
+      // The deliberately stale per-capsule markers prove that neither DDL nor
+      // the capsule loop ran merely because the object was constructed again.
+      expect(stale?.count).toBeGreaterThan(0)
+      const schemaVersion = state.storage.sql
+        .exec<{ v: string }>(
+          "SELECT v FROM kip_meta WHERE k = 'schema_version'",
+        )
+        .toArray()[0]
+      expect(schemaVersion?.v).toBe('test-stale')
+
+      const foreignKeys = state.storage.sql
+        .exec<{ foreign_keys: number }>('PRAGMA foreign_keys')
+        .toArray()[0]
+      expect(foreignKeys?.foreign_keys).toBe(1)
+    })
+  })
+
+  it('re-runs bootstrap when its persistent version is stale', async () => {
+    const stub = await freshStub()
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec(
+        "UPDATE kip_meta SET v = 'test-stale' WHERE k LIKE 'capsule_hash:%'",
+      )
+      state.storage.sql.exec(
+        "UPDATE kip_meta SET v = 'test-stale' WHERE k = 'schema_version'",
+      )
+      await state.storage.put(BOOTSTRAP_VERSION_KEY, 'previous-version')
+    })
+
+    await evictDurableObject(stub)
+    await expectOk(stub, 'DESCRIBE PRIMER')
+
+    await runInDurableObject(stub, async (_instance, state) => {
+      expect(await state.storage.get(BOOTSTRAP_VERSION_KEY)).toBe(
+        BOOTSTRAP_VERSION,
+      )
+      const stale = state.storage.sql
+        .exec<{ count: number }>(
+          `SELECT count(*) AS count FROM kip_meta
+             WHERE k LIKE 'capsule_hash:%' AND v = 'test-stale'`,
+        )
+        .toArray()[0]
+      expect(stale?.count).toBe(0)
+      const schemaVersion = state.storage.sql
+        .exec<{ v: string }>(
+          "SELECT v FROM kip_meta WHERE k = 'schema_version'",
+        )
+        .toArray()[0]
+      expect(schemaVersion?.v).toBe(String(SCHEMA_VERSION))
     })
   })
 

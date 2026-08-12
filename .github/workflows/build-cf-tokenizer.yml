@@ -1,4 +1,4 @@
-name: Dockers
+name: CF Tokenizer
 on:
   workflow_dispatch:
     inputs:

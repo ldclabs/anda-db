@@ -1,6 +1,6 @@
 {
   "name": "@ldclabs/kip-do",
-  "version": "0.12.0",
+  "version": "0.12.1",
   "description": "KIP (Knowledge Interaction Protocol) knowledge graph engine on SQLite-backed Cloudflare Durable Objects \u2014 one KIP database per Durable Object.",
   "keywords": [
     "kip",

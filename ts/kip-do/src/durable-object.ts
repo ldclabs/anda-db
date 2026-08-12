@@ -7,9 +7,14 @@
  */
 
 import { DurableObject } from 'cloudflare:workers'
-import { CognitiveNexus, type KipResponse } from './nexus.js'
+import {
+  BOOTSTRAP_VERSION,
+  CognitiveNexus,
+  type KipResponse,
+} from './nexus.js'
 import { KipError } from './errors.js'
 import { parseKipBatch } from './kip/parser.js'
+import { configureSql } from './schema.js'
 import { AlinkTokenizer, SimpleTokenizer, type Tokenizer } from './tokenizer.js'
 
 export interface KipDatabaseEnv {
@@ -25,6 +30,9 @@ export interface KipDatabaseEnv {
 
 /** How often the re-index alarm runs while work remains. */
 const REINDEX_INTERVAL_MS = 30_000
+
+/** Durable marker written only after schema and capsule bootstrap succeeds. */
+export const BOOTSTRAP_VERSION_KEY = '__kip_bootstrap_version'
 
 export class KipDatabase<
   Env extends KipDatabaseEnv = KipDatabaseEnv,
@@ -48,14 +56,25 @@ export class KipDatabase<
       { tokenizer: { tokenize: (texts) => this.tokenizer().tokenize(texts) } },
     )
 
-    // Schema and base capsules must be in place before any request is served:
-    // KIP is schema-first, so a write against an unbootstrapped database is
-    // rejected outright. This is the one legitimate use of
-    // `blockConcurrencyWhile` — once per object lifetime, not per request.
-    ctx.blockConcurrencyWhile(async () => {
-      CognitiveNexus.bootstrap(ctx.storage.sql)
-      this.nexus.applyBundledCapsules()
-    })
+    // Connection-local settings must be applied before the first storage
+    // access: `PRAGMA foreign_keys` is a no-op once a transaction has begun.
+    configureSql(ctx.storage.sql)
+
+    const currentVersion = ctx.storage.kv.get<string>(
+      BOOTSTRAP_VERSION_KEY,
+    )
+    if (currentVersion === BOOTSTRAP_VERSION) {
+      return
+    }
+
+    // Schema and base capsules must be in place before any request is served.
+    // A Durable Object may be constructed again after every eviction, so the
+    // durable version marker avoids replaying all DDL and capsule checks on
+    // each wake-up. It is written last: an interrupted bootstrap leaves the
+    // old marker in place and is therefore retried safely next time.
+    CognitiveNexus.bootstrap(ctx.storage.sql)
+    this.nexus.applyBundledCapsules()
+    ctx.storage.kv.put(BOOTSTRAP_VERSION_KEY, BOOTSTRAP_VERSION)
   }
 
   /**

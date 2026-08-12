@@ -32,8 +32,8 @@
 export const SCHEMA_VERSION = 1
 
 /**
- * Statements run once, in order, inside `blockConcurrencyWhile` at Durable
- * Object construction. Every statement is idempotent so a re-run after a
+ * Statements run synchronously during Durable Object construction, once for
+ * each schema version. Every statement is idempotent so a re-run after a
  * partially applied migration is safe.
  */
 export const SCHEMA_STATEMENTS: readonly string[] = [
@@ -122,13 +122,19 @@ export const SCHEMA_STATEMENTS: readonly string[] = [
 ]
 
 /**
- * Applies the schema. Safe to call on every construction.
+ * Enables connection-local SQLite settings.
  *
  * Foreign keys are enabled per connection, not persisted with the schema, so
- * the PRAGMA has to run here rather than in the DDL.
+ * this still has to run whenever a Durable Object instance is constructed even
+ * when the schema itself is already current.
  */
-export function applySchema(sql: SqlStorage): void {
+export function configureSql(sql: SqlStorage): void {
   sql.exec('PRAGMA foreign_keys = ON')
+}
+
+/** Applies the current schema. Safe to retry after an interrupted migration. */
+export function applySchema(sql: SqlStorage): void {
+  configureSql(sql)
   for (const statement of SCHEMA_STATEMENTS) {
     sql.exec(statement)
   }

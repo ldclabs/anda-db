@@ -52,7 +52,7 @@ import {
   rowKeyOf,
 } from './exec/solution.js'
 import { BUNDLED_CAPSULES, capsuleHash } from './capsules.js'
-import { applySchema, metaGet, metaSet } from './schema.js'
+import { SCHEMA_VERSION, applySchema, metaGet, metaSet } from './schema.js'
 import { Store } from './store.js'
 import { ftsQuote } from './sql.js'
 import {
@@ -72,6 +72,21 @@ export interface NexusOptions {
   /** Injectable clock, for deterministic tests. */
   now?: () => number
 }
+
+/**
+ * Version of all persistent state owned by the engine bootstrap.
+ *
+ * Capsule hashes make content changes self-versioning, so updating a bundled
+ * `.kip` file cannot accidentally leave an existing Durable Object on the old
+ * definitions. Capsule order is included because later capsules may depend on
+ * earlier ones.
+ */
+export const BOOTSTRAP_VERSION = [
+  `schema:${SCHEMA_VERSION}`,
+  ...BUNDLED_CAPSULES.map(
+    (capsule) => `capsule:${capsule.name}:${capsuleHash(capsule.source)}`,
+  ),
+].join('|')
 
 /** Transaction runner — `ctx.storage.transactionSync` in production. */
 export type TransactionRunner = <T>(fn: () => T) => T
@@ -97,7 +112,7 @@ export class CognitiveNexus {
     this.kml = new KmlExecutor(this.store, options.now ?? (() => Date.now()))
   }
 
-  /** Creates tables and indexes. Idempotent; safe on every construction. */
+  /** Creates tables and indexes. Idempotent; safe to retry after interruption. */
   static bootstrap(sql: SqlStorage): void {
     applySchema(sql)
   }
