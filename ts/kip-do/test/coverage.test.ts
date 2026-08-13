@@ -1,6 +1,6 @@
 import { env } from 'cloudflare:test'
 import { describe, expect, it } from 'vitest'
-import type { TestKipDatabase } from './worker.js'
+import { executeTestKip, type TestKipDatabase } from './worker.js'
 
 /**
  * Exercises the KIP surface the README claims to support, so "implemented"
@@ -18,7 +18,7 @@ async function run(
   stub: DurableObjectStub<TestKipDatabase>,
   command: string,
 ): Promise<any> {
-  return stub.executeKip(command)
+  return executeTestKip(stub, command)
 }
 
 async function ok(
@@ -85,7 +85,7 @@ async function declareSchema(
       (p) => `CONCEPT ?p_${p} { {type: "$PropositionType", name: "${p}"} }`,
     ),
   ].join('\n')
-  const response = await stub.executeKip(`UPSERT {\n${blocks}\n}`)
+  const response = await executeTestKip(stub, `UPSERT {\n${blocks}\n}`)
   if ('error' in (response as any)) {
     throw new Error(
       `schema declaration failed: ${(response as any).error.message}`,
@@ -315,8 +315,16 @@ describe('META surface', () => {
     expect(all).toContain('Drug')
     expect(all).toContain('Symptom')
     expect([...all]).toEqual([...all].sort())
-    const first = await ok(stub, 'DESCRIBE CONCEPT TYPES LIMIT 1')
-    expect(first).toEqual([all[0]])
+    const first = await run(stub, 'DESCRIBE CONCEPT TYPES LIMIT 1')
+    expect(first.result).toEqual([all[0]])
+    expect(first.next_cursor).toBe('1')
+
+    const second = await run(
+      stub,
+      `DESCRIBE CONCEPT TYPES LIMIT 1 CURSOR "${first.next_cursor}"`,
+    )
+    expect(second.result).toEqual([all[1]])
+    expect(second.next_cursor).toBe('2')
   })
 
   it('reports EXPORT as unimplemented rather than answering wrongly', async () => {

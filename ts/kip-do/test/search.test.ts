@@ -1,7 +1,7 @@
 import { env, runInDurableObject } from 'cloudflare:test'
 import { describe, expect, it } from 'vitest'
 import { AlinkTokenizer, SimpleTokenizer, extractJsonText } from '../src/index.js'
-import type { TestKipDatabase } from './worker.js'
+import { executeTestKip, type TestKipDatabase } from './worker.js'
 
 /**
  * Full-text search, including the path that only exists because Durable Object
@@ -20,7 +20,7 @@ async function expectOk(
   stub: DurableObjectStub<TestKipDatabase>,
   command: string,
 ): Promise<any> {
-  const response = await stub.executeKip(command)
+  const response = await executeTestKip(stub, command)
   if ('error' in (response as any)) {
     throw new Error(
       `expected success but got ${(response as any).error.code}: ${(response as any).error.message}`,
@@ -104,7 +104,7 @@ async function declareSchema(
       (p) => `CONCEPT ?p_${p} { {type: "$PropositionType", name: "${p}"} }`,
     ),
   ].join('\n')
-  const response = await stub.executeKip(`UPSERT {\n${blocks}\n}`)
+  const response = await executeTestKip(stub, `UPSERT {\n${blocks}\n}`)
   if ('error' in (response as any)) {
     throw new Error(
       `schema declaration failed: ${(response as any).error.message}`,
@@ -198,6 +198,64 @@ describe('SEARCH', () => {
     expect(hits[0].metadata._score).toBeLessThan(1)
   })
 
+  it('indexes user metadata as searchable concept text', async () => {
+    const stub = await freshStub()
+    await expectOk(
+      stub,
+      `UPSERT {
+         CONCEPT ?a { {type: "Drug", name: "Aspirin"} }
+       }
+       WITH METADATA {source: "clinicaltrialmarker"}`,
+    )
+
+    const hits = await expectOk(
+      stub,
+      'SEARCH CONCEPT "clinicaltrialmarker" LIMIT 10',
+    )
+    expect(hits.map((hit: any) => hit.name)).toEqual(['Aspirin'])
+  })
+
+  it('returns only the matching proposition link and honors WITH TYPE', async () => {
+    const stub = await freshStub()
+    await expectOk(
+      stub,
+      `UPSERT {
+         CONCEPT ?a { {type: "T", name: "A"} }
+         CONCEPT ?b { {type: "T", name: "B"} }
+         PROPOSITION ?p {
+           (?a, "p", ?b)
+           SET ATTRIBUTES {note: "clinicalmarker"}
+         }
+         PROPOSITION ?q {
+           (?a, "q", ?b)
+           SET ATTRIBUTES {note: "regulatorymarker"}
+         }
+       }`,
+    )
+    await runInDurableObject(stub, async (instance) => {
+      const nexus = (instance as unknown as { nexus: any }).nexus
+      await nexus.reindexStale('simple-1')
+    })
+
+    const matching = await expectOk(
+      stub,
+      'SEARCH PROPOSITION "clinicalmarker" LIMIT 10',
+    )
+    expect(matching.map((hit: any) => hit.predicate)).toEqual(['p'])
+
+    const wrongType = await expectOk(
+      stub,
+      'SEARCH PROPOSITION "clinicalmarker" WITH TYPE "q" LIMIT 10',
+    )
+    expect(wrongType).toEqual([])
+
+    const matchingType = await expectOk(
+      stub,
+      'SEARCH PROPOSITION "regulatorymarker" WITH TYPE "q" LIMIT 10',
+    )
+    expect(matchingType.map((hit: any) => hit.predicate)).toEqual(['q'])
+  })
+
   it('filters by type after scoring', async () => {
     const stub = await freshStub()
     await expectOk(
@@ -268,7 +326,7 @@ describe('SEARCH', () => {
     expect(other.map((h: any) => h.name)).toEqual(['药物'])
   })
 
-  it('re-indexes rows stamped with a stale tokenizer version', async () => {
+  it('detects a tokenizer upgrade during an alarm without an intervening write', async () => {
     const stub = env.KIP_DB.getByName(`search-reindex-${counter++}`)
     await declareSchema(stub)
     await runInDurableObject(stub, async (instance) => {
@@ -282,11 +340,15 @@ describe('SEARCH', () => {
 
     await runInDurableObject(stub, async (instance) => {
       const nexus = (instance as unknown as { nexus: any }).nexus
-      // A version bump makes every previously indexed row's vocabulary
-      // incomparable, so the rows must be found and rebuilt.
+      while ((await nexus.reindexStale('v1')) > 0) {
+        // Drain the bounded re-index batches so the stored version is exactly
+        // v1 before the tokenizer changes with no intervening database write.
+      }
+      expect(nexus.tokenizerVersion()).toBe('v1')
+
       nexus.tokenizer = new AlinkTokenizer(stubTokenizerFetcher('v2'))
-      const rebuilt = await nexus.reindexStale('v2')
-      expect(rebuilt).toBeGreaterThan(0)
+      await instance.alarm()
+      expect(nexus.tokenizerVersion()).toBe('v2')
     })
 
     const hits = await expectOk(stub, 'SEARCH CONCEPT "头痛" LIMIT 10')

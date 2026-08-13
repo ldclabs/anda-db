@@ -14,7 +14,7 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/ldclabs/anda-db.git",
-    "directory": "js/kip-do"
+    "directory": "ts/kip-do"
   },
   "license": "MIT",
   "type": "module",

@@ -1,4 +1,4 @@
 # wasm-pack scratch output. The build artifact that ships is the vendored copy
-# at js/kip-do/vendor/anda_kip_wasm/, produced by that package's build:wasm
+# at ts/kip-do/vendor/anda_kip_wasm/, produced by that package's build:wasm
 # script; anything emitted here is intermediate.
 /pkg

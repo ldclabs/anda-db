@@ -337,7 +337,7 @@ export class Store {
       set,
     )
     this.sql.exec(
-      'DELETE FROM propositions_fts WHERE rowid IN (SELECT value FROM json_each(?))',
+      'DELETE FROM propositions_fts WHERE prop_id IN (SELECT value FROM json_each(?))',
       set,
     )
     return cursor.rowsWritten
@@ -511,15 +511,19 @@ export class Store {
 
   setPropositionFts(
     id: number,
-    tokens: readonly string[],
+    links: readonly { predicate: string; tokens: readonly string[] }[],
     tokVer: string,
   ): void {
-    this.sql.exec('DELETE FROM propositions_fts WHERE rowid = ?', id)
-    this.sql.exec(
-      'INSERT INTO propositions_fts (rowid, tokens) VALUES (?, ?)',
-      id,
-      tokens.join(' '),
-    )
+    this.sql.exec('DELETE FROM propositions_fts WHERE prop_id = ?', id)
+    for (const link of links) {
+      this.sql.exec(
+        `INSERT INTO propositions_fts (prop_id, predicate, tokens)
+           VALUES (?, ?, ?)`,
+        id,
+        link.predicate,
+        link.tokens.join(' '),
+      )
+    }
     this.sql.exec('UPDATE propositions SET tok_ver = ? WHERE id = ?', tokVer, id)
   }
 
@@ -550,10 +554,27 @@ export class Store {
   searchPropositions(
     ftsQuery: string,
     topK: number,
-  ): { id: number; score: number }[] {
+    predicate?: string,
+  ): { id: number; predicate: string; score: number }[] {
+    if (predicate !== undefined) {
+      return this.sql
+        .exec<{ id: number; predicate: string; score: number }>(
+          `SELECT prop_id AS id, predicate,
+                  -bm25(propositions_fts) AS score
+             FROM propositions_fts
+            WHERE propositions_fts MATCH ? AND predicate = ?
+            ORDER BY score DESC
+            LIMIT ?`,
+          ftsQuery,
+          predicate,
+          topK,
+        )
+        .toArray()
+    }
     return this.sql
-      .exec<{ id: number; score: number }>(
-        `SELECT rowid AS id, -bm25(propositions_fts) AS score
+      .exec<{ id: number; predicate: string; score: number }>(
+        `SELECT prop_id AS id, predicate,
+                -bm25(propositions_fts) AS score
            FROM propositions_fts
           WHERE propositions_fts MATCH ?
           ORDER BY score DESC

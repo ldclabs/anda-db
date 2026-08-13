@@ -9,14 +9,10 @@ declare global {
    * its bindings are. Declaring it here is what makes `env.KIP_DB` a typed
    * Durable Object namespace rather than an error.
    *
-   * Known gap: `tsc` reports TS2589 ("type instantiation is excessively deep")
-   * at each `getByName` call. The RPC mapped type behind
-   * `DurableObjectStub<TestKipDatabase>` expands over the engine's whole
-   * method surface and exceeds the compiler's depth limit under TypeScript 7
-   * and `@cloudflare/workers-types` 5. Narrowing the binding to the one method
-   * the tests call silences it, at the cost of the stub no longer being the
-   * type it actually is — not worth it. `vitest` type-strips rather than
-   * type-checks, so the suite runs unaffected.
+   * Test calls go through a shallow `executeTestKip` helper. That keeps this
+   * binding faithful to the real Durable Object while avoiding expansion of
+   * Cloudflare's recursive RPC mapped type over the engine's whole method
+   * surface at every call site.
    */
   namespace Cloudflare {
     interface Env {

@@ -29,7 +29,10 @@
  */
 
 /** Bumped whenever the DDL below changes in a way that needs a migration. */
-export const SCHEMA_VERSION = 1
+export const SCHEMA_VERSION = 2
+
+const PROPOSITIONS_FTS_STATEMENT = `CREATE VIRTUAL TABLE IF NOT EXISTS propositions_fts
+     USING fts5(prop_id UNINDEXED, predicate UNINDEXED, tokens, tokenize = 'ascii')`
 
 /**
  * Statements run synchronously during Durable Object construction, once for
@@ -108,8 +111,7 @@ export const SCHEMA_STATEMENTS: readonly string[] = [
   // tokens per document by the tokenizer service.
   `CREATE VIRTUAL TABLE IF NOT EXISTS concepts_fts
      USING fts5(tokens, tokenize = 'ascii')`,
-  `CREATE VIRTUAL TABLE IF NOT EXISTS propositions_fts
-     USING fts5(tokens, tokenize = 'ascii')`,
+  PROPOSITIONS_FTS_STATEMENT,
 
   // --- engine key/value sidecar -----------------------------------------
   //
@@ -137,6 +139,23 @@ export function applySchema(sql: SqlStorage): void {
   configureSql(sql)
   for (const statement of SCHEMA_STATEMENTS) {
     sql.exec(statement)
+  }
+
+  const persistedVersion = metaGet(sql, 'schema_version')
+  const previousVersion =
+    persistedVersion === null ? null : Number(persistedVersion)
+  if (
+    previousVersion !== null &&
+    Number.isFinite(previousVersion) &&
+    previousVersion < 2
+  ) {
+    // Schema v1 stored one combined FTS row per proposition row. That loses
+    // which predicate actually matched and makes a hit leak every sibling
+    // link. Recreate the derived index with one row per link and mark all
+    // proposition rows stale so the alarm repopulates it from source.
+    sql.exec('DROP TABLE IF EXISTS propositions_fts')
+    sql.exec(PROPOSITIONS_FTS_STATEMENT)
+    sql.exec('UPDATE propositions SET tok_ver = NULL')
   }
   sql.exec(
     `INSERT INTO kip_meta (k, v) VALUES ('schema_version', ?)

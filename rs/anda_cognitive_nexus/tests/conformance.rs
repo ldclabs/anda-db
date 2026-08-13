@@ -2,7 +2,7 @@
 //!
 //! Runs the fixtures in `fixtures/kip-conformance/` against this engine. The
 //! same files drive the TypeScript engine's suite in
-//! `js/kip-do/test/conformance.test.ts`; a case that passes in one and fails
+//! `ts/kip-do/test/conformance.test.ts`; a case that passes in one and fails
 //! in the other is a divergence between two implementations of the same
 //! protocol, which is what the suite exists to surface.
 //!
@@ -22,7 +22,7 @@ use object_store::memory::InMemory;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 // ---------------------------------------------------------------------------
-// Fixture schema — mirrors `js/kip-do/test/conformance/normalize.ts`.
+// Fixture schema — mirrors `ts/kip-do/test/conformance/normalize.ts`.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
@@ -200,10 +200,10 @@ fn load_fixtures() -> Vec<(String, Fixture)> {
     entries.sort();
 
     for path in entries {
-        let raw = fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        let fixture: Fixture = serde_json::from_str(&raw)
-            .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+        let raw =
+            fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let fixture: Fixture =
+            serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
         out.push((path.display().to_string(), fixture));
     }
     out

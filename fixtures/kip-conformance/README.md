@@ -6,7 +6,7 @@ by **both** implementations in this repository:
 | Engine | Runner |
 |---|---|
 | `anda_cognitive_nexus` (Rust, `anda_db`) | `rs/anda_cognitive_nexus/tests/conformance.rs` |
-| `@ldclabs/kip-do` (TypeScript, Durable Object SQLite) | `js/kip-do/test/conformance.test.ts` |
+| `@ldclabs/kip-do` (TypeScript, Durable Object SQLite) | `ts/kip-do/test/conformance.test.ts` |
 
 The fixtures describe **KIP semantics**, not either implementation. That is the
 whole point: a case that passes in one engine and fails in the other is a
@@ -121,11 +121,11 @@ which is what KIP actually specifies.
 2. Run both suites:
    ```bash
    cargo test -p anda_cognitive_nexus --test conformance
-   cd js/kip-do && pnpm test
+   cd ts/kip-do && pnpm test
    ```
 3. If they disagree, that is the finding. Either fix the engine, or add `skip`
    with a reason and record it under "Known divergences" in
-   `js/kip-do/README.md`.
+   `ts/kip-do/README.md`.
 
 Never adjust an expectation so that whichever engine you are working on turns
 green. The fixture is the specification.

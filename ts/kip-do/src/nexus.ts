@@ -459,8 +459,14 @@ export class CognitiveNexus {
   private async resolveTokens(
     statement: Extract<Command, { Kml: unknown }>['Kml'],
   ): Promise<{ tokens: TokenMap; version: string }> {
-    const texts: string[] = []
-    const keys: string[] = []
+    const pending = new Map<
+      string,
+      {
+        name: string
+        attributes: Record<string, unknown>
+        metadata: Record<string, unknown>
+      }
+    >()
 
     if ('Upsert' in statement) {
       for (const block of statement.Upsert as UpsertBlock[]) {
@@ -469,24 +475,44 @@ export class CognitiveNexus {
           const matcher = item.Concept.concept
           if (!('Object' in matcher)) continue
           const { type, name } = matcher.Object
-          const existingId = this.store.findConceptByTypeName(type, name)
-          const existing = existingId ? this.store.getConcept(existingId) : null
-          const attributes = {
-            ...(existing?.attributes ?? {}),
+          const key = conceptTokenKey(type, name)
+          let projected = pending.get(key)
+          if (!projected) {
+            const existingId = this.store.findConceptByTypeName(type, name)
+            const existing =
+              existingId === null ? null : this.store.getConcept(existingId)
+            projected = {
+              name,
+              attributes: { ...(existing?.attributes ?? {}) },
+              metadata: { ...(existing?.metadata ?? {}) },
+            }
+            pending.set(key, projected)
+          }
+          projected.attributes = {
+            ...projected.attributes,
             ...(item.Concept.set_attributes ?? {}),
           }
-          // Key on (type, name) rather than id: the concept may not exist
-          // yet, and the id is only known after the insert.
-          keys.push(conceptTokenKey(type, name))
-          texts.push([name, ...extractJsonText(attributes)].join(' '))
+          projected.metadata = {
+            ...projected.metadata,
+            ...(block.metadata ?? {}),
+            ...(item.Concept.metadata ?? {}),
+          }
         }
       }
     }
 
-    if (texts.length === 0) {
+    if (pending.size === 0) {
       return { tokens: new Map(), version: this.tokenizerVersion() }
     }
 
+    const keys = [...pending.keys()]
+    const texts = [...pending.values()].map((projected) =>
+      [
+        projected.name,
+        ...extractJsonText(projected.attributes),
+        ...extractJsonText(projected.metadata),
+      ].join(' '),
+    )
     const result: TokenizeResult = await this.tokenizer.tokenize(texts)
     const tokens: TokenMap = new Map()
     for (let i = 0; i < keys.length; i++) {
@@ -507,7 +533,7 @@ export class CognitiveNexus {
     cursor: string | null
   } {
     if ('Describe' in command) {
-      return { result: this.describe(command.Describe), cursor: null }
+      return this.describe(command.Describe)
     }
     if ('Search' in command) {
       return { result: this.search(command.Search, searchTokens), cursor: null }
@@ -537,7 +563,10 @@ export class CognitiveNexus {
       .filter((c): c is NonNullable<typeof c> => !!c)
   }
 
-  private describe(target: DescribeTarget): Json {
+  private describe(target: DescribeTarget): {
+    result: Json
+    cursor: string | null
+  } {
     if (target === 'Primer') {
       const conceptTypes = this.conceptsOfType('$ConceptType').map((c) => c.name)
       const propositionTypes = this.conceptsOfType('$PropositionType').map(
@@ -549,20 +578,26 @@ export class CognitiveNexus {
       }))
 
       return {
-        engine: '@ldclabs/kip-do',
-        parser_version: parserVersion(),
-        spec_revision: specRevision(),
-        concept_types: conceptTypes,
-        proposition_types: propositionTypes,
-        domains,
-        // Out-of-band capability advert (KIP §5.2.1). This engine has no
-        // embedding store, so SEARCH degrades semantic/hybrid to keyword —
-        // the same posture the Rust engine advertises.
-        search_modes: ['keyword'],
+        result: {
+          engine: '@ldclabs/kip-do',
+          parser_version: parserVersion(),
+          spec_revision: specRevision(),
+          concept_types: conceptTypes,
+          proposition_types: propositionTypes,
+          domains,
+          // Out-of-band capability advert (KIP §5.2.1). This engine has no
+          // embedding store, so SEARCH degrades semantic/hybrid to keyword —
+          // the same posture the Rust engine advertises.
+          search_modes: ['keyword'],
+        },
+        cursor: null,
       }
     }
     if (target === 'Domains') {
-      return this.conceptsOfType('Domain').map((c) => conceptNode(c)) as Json
+      return {
+        result: this.conceptsOfType('Domain').map((c) => conceptNode(c)) as Json,
+        cursor: null,
+      }
     }
     if (typeof target === 'object') {
       if ('ConceptTypes' in target) {
@@ -572,10 +607,16 @@ export class CognitiveNexus {
         return this.typeNames('$PropositionType', target.PropositionTypes)
       }
       if ('ConceptType' in target) {
-        return this.typeDefinition('$ConceptType', target.ConceptType)
+        return {
+          result: this.typeDefinition('$ConceptType', target.ConceptType),
+          cursor: null,
+        }
       }
       if ('PropositionType' in target) {
-        return this.typeDefinition('$PropositionType', target.PropositionType)
+        return {
+          result: this.typeDefinition('$PropositionType', target.PropositionType),
+          cursor: null,
+        }
       }
     }
     throw internalError(`unhandled DESCRIBE target: ${JSON.stringify(target)}`)
@@ -584,13 +625,19 @@ export class CognitiveNexus {
   private typeNames(
     metaType: string,
     page: { limit: number | null; cursor: string | null },
-  ): Json {
+  ): { result: Json; cursor: string | null } {
     const names = this.conceptsOfType(metaType)
       .map((c) => c.name)
       .sort()
     const offset = parseOffsetCursor(page.cursor)
     const limit = page.limit ?? names.length
-    return names.slice(offset, offset + limit)
+    const result = names.slice(offset, offset + limit)
+    const nextOffset = offset + result.length
+    return {
+      result,
+      cursor:
+        limit > 0 && nextOffset < names.length ? String(nextOffset) : null,
+    }
   }
 
   /**
@@ -654,23 +701,25 @@ export class CognitiveNexus {
       return out
     }
 
-    const hits = this.store.searchPropositions(query, topK)
+    const hits = this.store.searchPropositions(
+      query,
+      topK,
+      command.in_type ?? undefined,
+    )
     const out: Json[] = []
     for (const hit of hits) {
       const row = this.store.getProposition(hit.id)
       if (!row) continue
-      for (const [predicate] of row.links) {
-        const link = propositionLink(row, predicate)
-        if (!link) continue
-        const score = normalizeScore(hit.score)
-        if (score < threshold) continue
-        ;(link.metadata as JsonMap) = {
-          ...(link.metadata as JsonMap),
-          _score: score,
-        }
-        out.push(link as Json)
-        if (out.length >= limit) return out
+      const link = propositionLink(row, hit.predicate)
+      if (!link) continue
+      const score = normalizeScore(hit.score)
+      if (score < threshold) continue
+      ;(link.metadata as JsonMap) = {
+        ...(link.metadata as JsonMap),
+        _score: score,
       }
+      out.push(link as Json)
+      if (out.length >= limit) return out
     }
     return out
   }
@@ -692,6 +741,12 @@ export class CognitiveNexus {
   /** Tokenizer version the index was last built with. */
   tokenizerVersion(): string {
     return metaGet(this.sql, 'tokenizer_version') ?? 'unknown'
+  }
+
+  /** Version reported by the tokenizer service that would handle a request now. */
+  async liveTokenizerVersion(): Promise<string> {
+    const result = await this.tokenizer.tokenize([''])
+    return result.version
   }
 
   /**
@@ -719,7 +774,11 @@ export class CognitiveNexus {
         if (!concept) continue
         order.push(id)
         texts.push(
-          [concept.name, ...extractJsonText(concept.attributes)].join(' '),
+          [
+            concept.name,
+            ...extractJsonText(concept.attributes),
+            ...extractJsonText(concept.metadata),
+          ].join(' '),
         )
       }
       const result = await this.tokenizer.tokenize(texts)
@@ -742,30 +801,44 @@ export class CognitiveNexus {
     const propIds = this.store.stalePropositionIds(currentVersion, remaining)
     if (propIds.length > 0) {
       const rows = this.store.getPropositions(propIds)
-      const order: number[] = []
+      const links: { id: number; predicate: string }[] = []
       const texts: string[] = []
       for (const id of propIds) {
         const row = rows.get(id)
         if (!row) continue
-        order.push(id)
-        const fragments: string[] = []
         for (const [predicate, props] of row.links) {
-          fragments.push(predicate, ...extractJsonText(props.attributes))
+          links.push({ id, predicate })
+          texts.push(
+            [
+              predicate,
+              ...extractJsonText(props.attributes),
+              ...extractJsonText(props.metadata),
+            ].join(' '),
+          )
         }
-        texts.push(fragments.join(' '))
       }
       const result = await this.tokenizer.tokenize(texts)
       this.transact(() => {
-        for (let i = 0; i < order.length; i++) {
-          this.store.setPropositionFts(
-            order[i]!,
-            result.tokens[i] ?? [],
-            result.version,
-          )
+        const byRow = new Map<
+          number,
+          { predicate: string; tokens: readonly string[] }[]
+        >()
+        for (let i = 0; i < links.length; i++) {
+          const link = links[i]!
+          const entries = byRow.get(link.id)
+          const entry = {
+            predicate: link.predicate,
+            tokens: result.tokens[i] ?? [],
+          }
+          if (entries) entries.push(entry)
+          else byRow.set(link.id, [entry])
+        }
+        for (const [id, entries] of byRow) {
+          this.store.setPropositionFts(id, entries, result.version)
         }
       })
       metaSet(this.sql, 'tokenizer_version', result.version)
-      done += order.length
+      done += new Set(links.map((link) => link.id)).size
     }
 
     return done

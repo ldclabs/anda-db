@@ -3,7 +3,7 @@
 //! These exist to be the **oracle** in a differential test. The JavaScript KIP
 //! engine (`@ldclabs/kip-do`) parses with `@ldclabs/kip-lang`, a native
 //! TypeScript implementation; nothing structural forces the two grammars to
-//! agree on what a command means, so `js/kip-do/test/parser-oracle.test.ts`
+//! agree on what a command means, so `ts/kip-do/test/parser-oracle.test.ts`
 //! compares them field for field over a corpus harvested from the conformance
 //! fixtures and this crate's own tests. `anda_kip` is pure computation with no
 //! I/O, so it compiles to `wasm32-unknown-unknown` unchanged and can serve as

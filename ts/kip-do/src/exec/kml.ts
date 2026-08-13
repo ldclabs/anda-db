@@ -401,6 +401,43 @@ export class KmlExecutor {
   ): string {
     if ('ID' in block.proposition) {
       const link = this.kql.requireLink(block.proposition.ID)
+      if (link.kind !== 'proposition') {
+        throw internalError(
+          `expected proposition link, got ${formatEntityID(link)}`,
+        )
+      }
+      const row = this.store.requireProposition(link.id)
+      const existing = row.links.get(link.predicate)!
+      if (block.expect_version != null) {
+        const current = this.store.linkVersion(link.id, link.predicate)
+        if (current !== block.expect_version) {
+          throw versionConflict(
+            `Proposition ${formatEntityID(link)} EXPECT VERSION ` +
+              `${block.expect_version} does not match current _version ` +
+              `${current}; the UPSERT was aborted`,
+          )
+        }
+      }
+
+      const attributes = {
+        ...existing.attributes,
+        ...sanitize(block.set_attributes ?? {}, 'attributes'),
+      }
+      const metadata = {
+        ...existing.metadata,
+        ...sanitize(
+          { ...blockMetadata, ...(block.metadata ?? {}) },
+          'metadata',
+        ),
+      }
+      bumpVersion(metadata, this.nowMs())
+      this.store.upsertLink(
+        link.id,
+        link.predicate,
+        attributes,
+        metadata,
+      )
+      this.indexProposition(link.id, tokens, tokVer)
       if (block.handle) handles.set(block.handle, link)
       return formatEntityID(link)
     }

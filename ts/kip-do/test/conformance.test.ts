@@ -8,7 +8,7 @@ import {
   normalize,
   validateFixture,
 } from './conformance/normalize.js'
-import type { TestKipDatabase } from './worker.js'
+import { executeTestKip, type TestKipDatabase } from './worker.js'
 
 /**
  * Runs the cross-engine conformance fixtures from `fixtures/kip-conformance/`.
@@ -27,7 +27,7 @@ async function execute(
   stub: DurableObjectStub<TestKipDatabase>,
   command: string,
 ): Promise<{ result?: Json; next_cursor?: string | null; error?: any }> {
-  return (await stub.executeKip(command)) as any
+  return (await executeTestKip(stub, command)) as any
 }
 
 describe.each(fixtures)('$name', (raw) => {

@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest'
 import { BOOTSTRAP_VERSION_KEY } from '../src/durable-object.js'
 import { BOOTSTRAP_VERSION } from '../src/nexus.js'
 import { SCHEMA_VERSION } from '../src/schema.js'
-import type { TestKipDatabase } from './worker.js'
+import { executeTestKip, type TestKipDatabase } from './worker.js'
 
 /**
  * These run inside workerd against a real SQLite-backed Durable Object, not a
@@ -24,7 +24,7 @@ async function exec(
   stub: DurableObjectStub<TestKipDatabase>,
   command: string,
 ): Promise<any> {
-  const response = await stub.executeKip(command)
+  const response = await executeTestKip(stub, command)
   return response
 }
 
@@ -76,7 +76,7 @@ async function declareSchema(
       (p) => `CONCEPT ?p_${p} { {type: "$PropositionType", name: "${p}"} }`,
     ),
   ].join('\n')
-  const response = await stub.executeKip(`UPSERT {\n${blocks}\n}`)
+  const response = await executeTestKip(stub, `UPSERT {\n${blocks}\n}`)
   if ('error' in (response as any)) {
     throw new Error(
       `schema declaration failed: ${(response as any).error.message}`,
@@ -171,6 +171,32 @@ describe('schema', () => {
         )
         .toArray()[0]
       expect(schemaVersion?.v).toBe(String(SCHEMA_VERSION))
+    })
+  })
+
+  it('migrates the proposition search index from schema v1', async () => {
+    const stub = await freshStub()
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec('DROP TABLE propositions_fts')
+      state.storage.sql.exec(
+        `CREATE VIRTUAL TABLE propositions_fts
+           USING fts5(tokens, tokenize = 'ascii')`,
+      )
+      state.storage.sql.exec(
+        "UPDATE kip_meta SET v = '1' WHERE k = 'schema_version'",
+      )
+      await state.storage.put(BOOTSTRAP_VERSION_KEY, 'schema-v1')
+    })
+
+    await evictDurableObject(stub)
+    await expectOk(stub, 'DESCRIBE PRIMER')
+
+    await runInDurableObject(stub, (_instance, state) => {
+      const columns = state.storage.sql
+        .exec<{ name: string }>('PRAGMA table_info(propositions_fts)')
+        .toArray()
+        .map((column) => column.name)
+      expect(columns).toEqual(['prop_id', 'predicate', 'tokens'])
     })
   })
 
@@ -327,6 +353,64 @@ describe('KML: EXPECT VERSION', () => {
          }
        }`,
     )
+  })
+
+  it('updates a proposition addressed by id and enforces its version', async () => {
+    const stub = await freshStub()
+    await expectOk(
+      stub,
+      `UPSERT {
+         CONCEPT ?a { {type: "T", name: "A"} }
+         CONCEPT ?b { {type: "T", name: "B"} }
+         PROPOSITION ?p {
+           (?a, "rel", ?b)
+           SET ATTRIBUTES {old: 1}
+         }
+         WITH METADATA {source: "original"}
+       }`,
+    )
+    const [created] = await expectOk(
+      stub,
+      'FIND(?p) WHERE { ?p (?a, "rel", ?b) }',
+    )
+
+    await expectOk(
+      stub,
+      `UPSERT {
+         PROPOSITION ?p {
+           (id: "${created.id}")
+           EXPECT VERSION 1
+           SET ATTRIBUTES {new: 2}
+         }
+         WITH METADATA {source: "id-update"}
+       }`,
+    )
+    const [updated] = await expectOk(
+      stub,
+      'FIND(?p) WHERE { ?p (?a, "rel", ?b) }',
+    )
+    expect(updated.attributes).toEqual({ old: 1, new: 2 })
+    expect(updated.metadata.source).toBe('id-update')
+    expect(updated.metadata._version).toBe(2)
+
+    const conflict = await expectError(
+      stub,
+      `UPSERT {
+         PROPOSITION ?p {
+           (id: "${created.id}")
+           EXPECT VERSION 1
+           SET ATTRIBUTES {new: 3}
+         }
+       }`,
+    )
+    expect(conflict.code).toBe('KIP_3005')
+
+    const [unchanged] = await expectOk(
+      stub,
+      'FIND(?p) WHERE { ?p (?a, "rel", ?b) }',
+    )
+    expect(unchanged.attributes.new).toBe(2)
+    expect(unchanged.metadata._version).toBe(2)
   })
 })
 
@@ -488,13 +572,15 @@ describe('KQL', () => {
   it('orders and paginates with a cursor', async () => {
     const stub = await freshStub()
     await seed(stub)
-    const first = await stub.executeKip(
+    const first = await executeTestKip(
+      stub,
       'FIND(?d.name) WHERE { ?d {type: "Drug"} } ORDER BY ?d.name ASC LIMIT 1',
     )
     expect((first as any).result).toEqual(['Aspirin'])
     expect((first as any).next_cursor).toBe('1')
 
-    const second = await stub.executeKip(
+    const second = await executeTestKip(
+      stub,
       `FIND(?d.name) WHERE { ?d {type: "Drug"} } ORDER BY ?d.name ASC LIMIT 1 CURSOR "1"`,
     )
     expect((second as any).result).toEqual(['Warfarin'])

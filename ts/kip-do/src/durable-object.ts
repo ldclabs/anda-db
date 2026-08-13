@@ -177,7 +177,7 @@ export class KipDatabase<
    * put every writer behind the tokenizer's latency.
    */
   override async alarm(): Promise<void> {
-    const version = this.nexus.tokenizerVersion()
+    const version = await this.nexus.liveTokenizerVersion()
     const done = await this.nexus.reindexStale(version)
     // Reschedule while work remains; stop cleanly when the index is current
     // so an idle object can hibernate.
