@@ -43,6 +43,7 @@ import {
 import type { Store } from '../store.js'
 import {
   type BindingValue,
+  NULL_BINDING,
   SolutionContext,
   SolutionTable,
   bindingKey,
@@ -62,20 +63,12 @@ export class KqlExecutor {
   // -------------------------------------------------------------------
 
   executeWhere(clauses: readonly WhereClause[], ctx: SolutionContext): void {
-    for (let i = 0; i < clauses.length; i++) {
-      this.executeClause(clauses[i]!, ctx)
-      if (!ctx.isUnsatisfiable) continue
-
-      // The conjunction is unsatisfiable, so no further *constraint* can
-      // change that. UNION is not a constraint though — it offers an
-      // alternative, and its rows survive an empty main branch. Skipping it
-      // here would silently drop them.
-      for (let j = i + 1; j < clauses.length; j++) {
-        const rest = clauses[j]!
-        if ('Union' in rest) this.executeClause(rest, ctx)
-      }
-      return
-    }
+    // Every clause runs unconditionally, mirroring the Rust engine
+    // (`db/mod.rs:715-717`). FIND projects per covering table, so a clause
+    // whose variables are disjoint from an already-empty group still has to
+    // contribute its bindings — skipping it would make the result depend on
+    // clause order.
+    for (const clause of clauses) this.executeClause(clause, ctx)
   }
 
   private executeClause(clause: WhereClause, ctx: SolutionContext): void {
@@ -106,12 +99,31 @@ export class KqlExecutor {
     }
   }
 
+  /**
+   * Runs a grounding resolution, degrading `KIP_3002` to an empty match in a
+   * lenient (NOT / OPTIONAL / UNION) scope. Mirrors `lenient_grounding` in
+   * the Rust engine: only the precise dangling-id error degrades, and the
+   * variable columns survive so the parent block can null-pad them.
+   */
+  private groundLenient<T>(ctx: SolutionContext, resolve: () => T[]): T[] {
+    try {
+      return resolve()
+    } catch (err) {
+      if (ctx.lenient && err instanceof KipError && err.code === 'KIP_3002') {
+        return []
+      }
+      throw err
+    }
+  }
+
   private executeConceptClause(
     variable: string,
     matcher: ConceptMatcher,
     ctx: SolutionContext,
   ): void {
-    const ids = this.resolveConceptMatcher(matcher)
+    const ids = this.groundLenient(ctx, () =>
+      this.resolveConceptMatcher(matcher),
+    )
     const existing = ctx.find(variable)
     if (existing) {
       // Semi-join: constrain the existing binding rather than re-introducing
@@ -195,9 +207,13 @@ export class KqlExecutor {
     ctx: SolutionContext,
   ): void {
     if ('ID' in matcher) {
-      const entity = this.requireLink(matcher.ID)
+      const entities = this.groundLenient(ctx, () => [
+        this.requireLink(matcher.ID),
+      ])
       if (variable) {
-        ctx.mergeTable(SolutionTable.single(variable, [entityBinding(entity)]))
+        ctx.mergeTable(
+          SolutionTable.single(variable, entities.map(entityBinding)),
+        )
       }
       return
     }
@@ -244,21 +260,31 @@ export class KqlExecutor {
       if (!row) continue
       for (const [name] of row.links) {
         if (predicateNames && !predicateNames.includes(name)) continue
+        // A variable naming several positions degenerates to an equality
+        // filter on the row rather than independent bindings — for every
+        // position, not just the subject/object pair (`matching.rs:744-786`).
         const cells = new Map<string, BindingValue>()
+        const bind = (varName: string, value: BindingValue): boolean => {
+          const existing = cells.get(varName)
+          if (existing && bindingsDiffer(existing, value)) return false
+          cells.set(varName, value)
+          return true
+        }
         if (subjectSlot.variable) {
-          cells.set(subjectSlot.variable, entityBinding(row.subject))
+          bind(subjectSlot.variable, entityBinding(row.subject))
         }
-        if (predVar) cells.set(predVar, predicateBinding(name))
-        if (objectSlot.variable) {
-          // A variable naming both endpoints degenerates to an equality
-          // filter on the row rather than two independent bindings.
-          const existing = cells.get(objectSlot.variable)
-          const value = entityBinding(row.object)
-          if (existing && bindingsDiffer(existing, value)) continue
-          cells.set(objectSlot.variable, value)
+        if (predVar && !bind(predVar, predicateBinding(name))) continue
+        if (
+          objectSlot.variable &&
+          !bind(objectSlot.variable, entityBinding(row.object))
+        ) {
+          continue
         }
-        if (variable) {
-          cells.set(variable, entityBinding(propositionID(row.id, name)))
+        if (
+          variable &&
+          !bind(variable, entityBinding(propositionID(row.id, name)))
+        ) {
+          continue
         }
         solutionRows.push(vars.map((v) => cells.get(v) ?? { kind: 'null' }))
         if (solutionRows.length > MAX_ROW_MATCHES) {
@@ -401,14 +427,21 @@ export class KqlExecutor {
     }
     if ('Concept' in term) {
       return {
-        ids: this.resolveConceptMatcher(term.Concept).map(conceptID),
+        ids: this.groundLenient(ctx, () =>
+          this.resolveConceptMatcher(term.Concept).map(conceptID),
+        ),
         variable: null,
       }
     }
     if ('Proposition' in term) {
       // Meta-statement endpoint: resolve the nested pattern to the links it
       // matches, each addressed as `P:{id}:{predicate}`.
-      return { ids: this.resolveNestedProposition(term.Proposition, ctx), variable: null }
+      return {
+        ids: this.groundLenient(ctx, () =>
+          this.resolveNestedProposition(term.Proposition, ctx),
+        ),
+        variable: null,
+      }
     }
     throw internalError(
       `unhandled target term: ${Object.keys(term).join(', ')}`,
@@ -478,9 +511,12 @@ export class KqlExecutor {
     collectFilterVars(expr, vars)
 
     if (vars.size === 0) {
-      // Constant expression: true is a no-op, false falsifies everything.
+      // Constant expression: true is a no-op, false discards every solution.
+      // Rows are cleared in place so the columns stay bound — replacing the
+      // forest would let a later clause silently rebuild the domains
+      // (`kql.rs` `execute_filter_clause_inner`).
       if (!this.evalFilter(expr, new Map())) {
-        ctx.tables = [SolutionTable.empty([])]
+        for (const table of ctx.tables) table.rows.length = 0
       }
       return
     }
@@ -513,34 +549,17 @@ export class KqlExecutor {
     })
   }
 
-  /**
-   * Runs a sub-block, degrading NotFound to "no solutions".
-   *
-   * OPTIONAL / NOT / UNION exist to tolerate absence, so a dangling id inside
-   * one describes an alternative that does not hold rather than a broken
-   * query. Only mandatory patterns propagate KIP_3002.
-   */
-  private executeBlockDegrading(
-    block: readonly WhereClause[],
-    child: SolutionContext,
-  ): boolean {
-    try {
-      this.executeWhere(block, child)
-      return true
-    } catch (err) {
-      if (err instanceof KipError && err.code === 'KIP_3002') {
-        child.tables = [SolutionTable.empty([])]
-        return false
-      }
-      throw err
-    }
-  }
-
   private executeNot(block: WhereClause[], ctx: SolutionContext): void {
+    // Grounding is lenient inside the block (KIP §3.4.7.1): a dangling id
+    // makes the NOT pattern unmatchable, i.e. the clause succeeds and
+    // excludes nothing — it must not abort the query.
     const child = new SolutionContext()
+    child.lenient = true
     // Seed the child with the *domains* of shared variables, not their
     // correlations: NOT tests existence of the pattern, and carrying the
     // outer row structure in would make it test the joined shape instead.
+    // `distinctValues` keeps predicate bindings visible, so a NOT block
+    // correlated on a predicate variable can still exclude.
     const outerVars = ctx.boundVars()
     const blockVars = new Set<string>()
     collectClauseVars(block, blockVars)
@@ -548,12 +567,14 @@ export class KqlExecutor {
 
     for (const v of shared) {
       const table = ctx.find(v)!
-      child.mergeTable(
-        SolutionTable.single(v, table.entityDomain(v).map(entityBinding)),
-      )
+      child.mergeTable(SolutionTable.single(v, table.distinctValues(v)))
     }
 
-    this.executeBlockDegrading(block, child)
+    this.executeWhere(block, child)
+
+    // NOT is a pure filter: with no outer-bound variable referenced it
+    // cannot exclude anything (`kql.rs:396-398`).
+    if (shared.length === 0) return
 
     // The block's clauses are conjunctive, so a single empty table means the
     // whole block pattern is unsatisfiable and therefore excludes nothing —
@@ -561,14 +582,6 @@ export class KqlExecutor {
     // (`kql.rs:400-403`). Without this the surviving table's rows would read
     // as exclusions the block never actually produced.
     if (child.isUnsatisfiable) return
-
-    if (shared.length === 0) {
-      // Uncorrelated NOT: the block either matches something (falsifying
-      // everything) or nothing (a no-op).
-      const any = child.tables.some((t) => !t.isEmpty)
-      if (any) ctx.tables = [SolutionTable.empty([])]
-      return
-    }
 
     /** The shared tuple of one row, or `null` when a position is unbound. */
     const tuple = (
@@ -602,26 +615,37 @@ export class KqlExecutor {
   }
 
   private executeOptional(block: WhereClause[], ctx: SolutionContext): void {
+    // Grounding is lenient inside the block (KIP §3.4.7.2): a dangling id
+    // makes the optional pattern unmatchable — the outer solutions are kept
+    // and the block's variables project `null`.
     const child = new SolutionContext()
+    child.lenient = true
     const outerVars = ctx.boundVars()
     const blockVars = new Set<string>()
     collectClauseVars(block, blockVars)
-    const shared = [...blockVars].filter((v) => outerVars.has(v))
+    const seed = [...blockVars].filter((v) => outerVars.has(v))
 
-    for (const v of shared) {
+    for (const v of seed) {
       const table = ctx.find(v)!
-      child.mergeTable(
-        SolutionTable.single(v, table.entityDomain(v).map(entityBinding)),
-      )
+      child.mergeTable(SolutionTable.single(v, table.distinctValues(v)))
     }
-    this.executeBlockDegrading(block, child)
+    this.executeWhere(block, child)
 
-    const blockTable =
-      child.tables.length === 0
-        ? SolutionTable.empty([])
-        : child.joinCovering([...blockVars])
+    // A block that bound nothing at all extends nothing (`kql.rs:600-604`).
+    if (child.tables.length === 0) return
+    const blockTable = child.joinCovering([...blockVars])
+    if (blockTable.vars.length === 0) return
 
+    // Shared variables are re-derived from the *materialized* block: a
+    // seeded variable whose column survived is the join anchor.
+    const shared = blockTable.vars.filter((v) => outerVars.has(v))
     if (shared.length === 0) {
+      // No outer anchor: new bindings extend every outer solution. With no
+      // block solution the new variables project `null` for every outer row
+      // rather than annihilating them (`kql.rs:612-618`).
+      if (blockTable.rows.length === 0) {
+        blockTable.rows.push(blockTable.vars.map(() => NULL_BINDING))
+      }
       ctx.mergeTable(blockTable)
       return
     }
@@ -632,9 +656,12 @@ export class KqlExecutor {
 
   private executeUnion(block: WhereClause[], ctx: SolutionContext): void {
     // A UNION branch runs in a fresh scope: outer bindings are deliberately
-    // invisible so the branch describes an independent alternative.
+    // invisible so the branch describes an independent alternative. Grounding
+    // is lenient (KIP §3.4.7.3): a dangling id makes the branch contribute
+    // nothing instead of failing the query.
     const child = new SolutionContext()
-    this.executeBlockDegrading(block, child)
+    child.lenient = true
+    this.executeWhere(block, child)
     const branchVars = new Set<string>()
     collectClauseVars(block, branchVars)
     const branch =

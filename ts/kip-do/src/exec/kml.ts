@@ -299,7 +299,14 @@ export class KmlExecutor {
       const meta = { ...metadata }
       initVersion(meta, this.nowMs())
       id = this.store.insertConcept(type, name, attributes, meta)
-    } else {
+      this.indexConcept(id, tokens, tokVer)
+    } else if (
+      Object.keys(attributes).length > 0 ||
+      Object.keys(metadata).length > 0
+    ) {
+      // `core_directives` of an existing system actor stay immutable even
+      // though its other attributes are writable (`kml.rs:2083-2101`).
+      if ('core_directives' in attributes) this.guardCoreDirectives(type, name)
       const existing = this.store.requireConcept(id)
       // Attributes are shallow-merged, never replaced: UPSERT is additive by
       // definition, and replacing would make a partial write destructive.
@@ -307,10 +314,13 @@ export class KmlExecutor {
       const mergedMeta = { ...existing.metadata, ...metadata }
       bumpVersion(mergedMeta, this.nowMs())
       this.store.updateConceptFields(id, merged, mergedMeta)
+      this.indexConcept(id, tokens, tokVer)
     }
+    // A bare re-declaration writes nothing: `_version` must not advance
+    // (`kml.rs:1896-1899`), which is also what makes capsule re-application
+    // a true no-op for unchanged nodes.
 
     if (block.handle) handles.set(block.handle, conceptID(id))
-    this.indexConcept(id, tokens, tokVer)
 
     for (const set of block.set_propositions ?? []) {
       const object = this.resolveTarget(set.object, handles)
@@ -327,13 +337,44 @@ export class KmlExecutor {
     return formatEntityID(conceptID(id))
   }
 
-  /** Refuses a mutation that targets system-protected schema. */
+  /**
+   * Refuses a mutation that targets system-protected *schema*.
+   *
+   * System actors (`Person:$self` / `$system`) deliberately pass: their
+   * ordinary attributes and links are the agent's own memory and stay
+   * writable — only `core_directives` is locked, via
+   * `guardCoreDirectives`. Full immutability (schema + actors) applies to
+   * DELETE CONCEPT and MERGE only, mirroring the Rust engine's
+   * `is_protected_schema_concept` / `is_protected_concept` split.
+   */
   private guardProtected(type: string, name: string): void {
+    if (this.privileged) return
+    if (isProtectedSchemaConcept(type, name)) {
+      throw immutableTarget(
+        `Concept {type: ${JSON.stringify(type)}, name: ${JSON.stringify(name)}} ` +
+          `is system-protected and cannot be modified`,
+      )
+    }
+  }
+
+  /** Refuses destroying a protected schema node *or* a system actor. */
+  private guardProtectedFull(type: string, name: string): void {
     if (this.privileged) return
     if (isProtectedConcept(type, name)) {
       throw immutableTarget(
         `Concept {type: ${JSON.stringify(type)}, name: ${JSON.stringify(name)}} ` +
           `is system-protected and cannot be modified`,
+      )
+    }
+  }
+
+  /** Refuses writing or deleting `core_directives` on a system actor. */
+  private guardCoreDirectives(type: string, name: string): void {
+    if (this.privileged) return
+    if (isSystemActor(type, name)) {
+      throw immutableTarget(
+        `Concept {type: ${JSON.stringify(type)}, name: ${JSON.stringify(name)}} ` +
+          `core_directives are system-protected and cannot be modified`,
       )
     }
   }
@@ -365,18 +406,25 @@ export class KmlExecutor {
       }
     }
 
-    const attributes = {
-      ...existing.attributes,
-      ...sanitize(block.set_attributes ?? {}, 'attributes'),
+    const setAttributes = sanitize(block.set_attributes ?? {}, 'attributes')
+    const setMetadata = sanitize(
+      { ...blockMetadata, ...(block.metadata ?? {}) },
+      'metadata',
+    )
+    if (
+      Object.keys(setAttributes).length > 0 ||
+      Object.keys(setMetadata).length > 0
+    ) {
+      if ('core_directives' in setAttributes) {
+        this.guardCoreDirectives(existing.type, existing.name)
+      }
+      const attributes = { ...existing.attributes, ...setAttributes }
+      const metadata = { ...existing.metadata, ...setMetadata }
+      bumpVersion(metadata, this.nowMs())
+      this.store.updateConceptFields(entity.id, attributes, metadata)
+      this.indexConcept(entity.id, tokens, tokVer)
     }
-    const metadata = {
-      ...existing.metadata,
-      ...sanitize({ ...blockMetadata, ...(block.metadata ?? {}) }, 'metadata'),
-    }
-    bumpVersion(metadata, this.nowMs())
-    this.store.updateConceptFields(entity.id, attributes, metadata)
     if (block.handle) handles.set(block.handle, conceptID(entity.id))
-    this.indexConcept(entity.id, tokens, tokVer)
 
     for (const set of block.set_propositions ?? []) {
       this.writeLink(
@@ -419,25 +467,21 @@ export class KmlExecutor {
         }
       }
 
-      const attributes = {
-        ...existing.attributes,
-        ...sanitize(block.set_attributes ?? {}, 'attributes'),
-      }
-      const metadata = {
-        ...existing.metadata,
-        ...sanitize(
-          { ...blockMetadata, ...(block.metadata ?? {}) },
-          'metadata',
-        ),
-      }
-      bumpVersion(metadata, this.nowMs())
-      this.store.upsertLink(
-        link.id,
-        link.predicate,
-        attributes,
-        metadata,
+      const setAttributes = sanitize(block.set_attributes ?? {}, 'attributes')
+      const setMetadata = sanitize(
+        { ...blockMetadata, ...(block.metadata ?? {}) },
+        'metadata',
       )
-      this.indexProposition(link.id, tokens, tokVer)
+      if (
+        Object.keys(setAttributes).length > 0 ||
+        Object.keys(setMetadata).length > 0
+      ) {
+        const attributes = { ...existing.attributes, ...setAttributes }
+        const metadata = { ...existing.metadata, ...setMetadata }
+        bumpVersion(metadata, this.nowMs())
+        this.store.upsertLink(link.id, link.predicate, attributes, metadata)
+        this.indexProposition(link.id, tokens, tokVer)
+      }
       if (block.handle) handles.set(block.handle, link)
       return formatEntityID(link)
     }
@@ -507,6 +551,15 @@ export class KmlExecutor {
     if (rowId === null) rowId = this.store.insertPropositionRow(subject, object)
 
     const existing = this.store.getProposition(rowId)?.links.get(predicate)
+    if (
+      existing &&
+      Object.keys(attributes).length === 0 &&
+      Object.keys(metadata).length === 0
+    ) {
+      // Bare re-declaration of an existing link: `_version` must not
+      // advance (`kml.rs:1944-1951`).
+      return rowId
+    }
     const mergedAttributes = { ...(existing?.attributes ?? {}), ...attributes }
     const mergedMetadata = { ...(existing?.metadata ?? {}), ...metadata }
     if (existing) bumpVersion(mergedMetadata, this.nowMs())
@@ -601,7 +654,9 @@ export class KmlExecutor {
             `concept ${formatEntityID(entity)} is a protected system node`,
           )
         }
-        this.guardProtected(concept.type, concept.name)
+        // DELETE CONCEPT destroys the node, so system actors are protected
+        // here too (`kml.rs:903`), unlike attribute-level writes.
+        this.guardProtectedFull(concept.type, concept.name)
         conceptIds.push(entity.id)
       }
       // The closure must be computed before the concepts go: it is derived by
@@ -635,11 +690,16 @@ export class KmlExecutor {
         if (!rowGone) this.indexProposition(entity.id, tokens, tokVer)
       }
       const cascade = this.store.propositionClosure(orphaned)
-      this.store.deletePropositionRows(cascade)
       // Cascaded higher-order statements count as deleted propositions: they
       // are propositions, and reporting them separately would understate what
-      // the statement removed.
-      return { deleted_propositions: removed + cascade.length }
+      // the statement removed. A proposition is a *link*, so a cascaded row
+      // carrying several predicates counts once per link (`kml.rs:1747`).
+      let cascadeLinks = 0
+      for (const row of this.store.getPropositions(cascade).values()) {
+        cascadeLinks += row.links.size
+      }
+      this.store.deletePropositionRows(cascade)
+      return { deleted_propositions: removed + cascadeLinks }
     }
 
     if ('DeleteAttributes' in statement) {
@@ -694,6 +754,11 @@ export class KmlExecutor {
         const concept = this.store.getConcept(entity.id)
         if (!concept) continue
         this.guardProtected(concept.type, concept.name)
+        // Deleting `core_directives` from a system actor is refused just
+        // like writing it (`kml.rs:513-519`).
+        if (field === 'attributes' && keys.includes('core_directives')) {
+          this.guardCoreDirectives(concept.type, concept.name)
+        }
         const map = { ...concept[field] }
         let changed = false
         for (const key of keys) {
@@ -759,6 +824,13 @@ export class KmlExecutor {
         const concept = this.store.getConcept(entity.id)
         if (!concept) continue
         this.guardProtected(concept.type, concept.name)
+        if (
+          (statement.set_attributes ?? []).some(
+            ([key]) => key === 'core_directives',
+          )
+        ) {
+          this.guardCoreDirectives(concept.type, concept.name)
+        }
         const root = {
           attributes: concept.attributes,
           metadata: concept.metadata,
@@ -773,8 +845,11 @@ export class KmlExecutor {
           statement.set_metadata,
           root,
         )
-        bumpVersion(metadata, this.nowMs())
-        this.store.updateConceptFields(entity.id, attributes, metadata)
+        // Every key skipped for this element: no write, no version bump, not
+        // counted as updated (`kml.rs:1134-1136`).
+        if (attributes.applied === 0 && metadata.applied === 0) continue
+        bumpVersion(metadata.map, this.nowMs())
+        this.store.updateConceptFields(entity.id, attributes.map, metadata.map)
         this.indexConcept(entity.id, tokens, tokVer)
         updated++
       } else {
@@ -792,8 +867,14 @@ export class KmlExecutor {
           statement.set_metadata,
           root,
         )
-        bumpVersion(metadata, this.nowMs())
-        this.store.upsertLink(row.id, entity.predicate, attributes, metadata)
+        if (attributes.applied === 0 && metadata.applied === 0) continue
+        bumpVersion(metadata.map, this.nowMs())
+        this.store.upsertLink(
+          row.id,
+          entity.predicate,
+          attributes.map,
+          metadata.map,
+        )
         this.indexProposition(row.id, tokens, tokVer)
         updated++
       }
@@ -839,8 +920,10 @@ export class KmlExecutor {
         `cannot merge ${sourceConcept.type} into ${targetConcept.type}: types differ`,
       )
     }
-    this.guardProtected(sourceConcept.type, sourceConcept.name)
-    this.guardProtected(targetConcept.type, targetConcept.name)
+    // MERGE destroys the source and rewrites the target's identity map, so
+    // system actors are protected here too (`kml.rs:1297`).
+    this.guardProtectedFull(sourceConcept.type, sourceConcept.name)
+    this.guardProtectedFull(targetConcept.type, targetConcept.name)
     if (PROTECTED_TYPES.has(sourceConcept.type)) {
       throw immutableTarget(
         `concept type ${sourceConcept.type} is protected and cannot be merged`,
@@ -871,10 +954,14 @@ export class KmlExecutor {
     // identity is what someone searching for the old name will look up. The
     // source's own trail rides along, so a chain of merges stays traceable.
     const metadata = { ...targetConcept.metadata }
+    // Duplicates are dropped so chained or replayed merges do not grow the
+    // trail (`kml.rs:1362-1379`); insertion order is preserved.
     metadata._merged_from = [
-      ...toStringArray(metadata._merged_from),
-      ...toStringArray(sourceConcept.metadata._merged_from),
-      `${sourceConcept.type}:${sourceConcept.name}`,
+      ...new Set([
+        ...toStringArray(metadata._merged_from),
+        ...toStringArray(sourceConcept.metadata._merged_from),
+        `${sourceConcept.type}:${sourceConcept.name}`,
+      ]),
     ]
     bumpVersion(metadata, this.nowMs())
 
@@ -925,15 +1012,19 @@ export class KmlExecutor {
           formatEntityID(row.object) === oldStr ? newRef : row.object
 
         // Repointing collapsed the edge into a self-loop; it carries no
-        // meaning, so drop it along with anything that referenced it.
+        // meaning, so drop it along with anything that referenced it. The
+        // dropped links (and their cascade) count as deduplicated — they
+        // vanished because of the merge (`kml.rs:1562-1577`).
         if (formatEntityID(subject) === formatEntityID(object)) {
+          deduplicated += row.links.size
           const orphans = [...row.links.keys()].map((p) =>
             propositionID(row.id, p),
           )
-          this.store.deletePropositionRows([
-            row.id,
-            ...this.store.propositionClosure(orphans),
-          ])
+          const cascade = this.store.propositionClosure(orphans)
+          for (const dropped of this.store.getPropositions(cascade).values()) {
+            deduplicated += dropped.links.size
+          }
+          this.store.deletePropositionRows([row.id, ...cascade])
           continue
         }
 
@@ -941,30 +1032,57 @@ export class KmlExecutor {
         if (collision === null || collision === row.id) {
           // No collision: move the endpoints in place. The row id survives,
           // so higher-order propositions referencing this row's links stay
-          // valid and need no repointing.
+          // valid and need no repointing. Endpoint repointing is a mutation
+          // of each link element, so versions advance (`kml.rs:1600-1603`).
           this.store.relocateProposition(row.id, subject, object)
+          for (const [predicate, props] of row.links) {
+            const metadata = { ...props.metadata }
+            bumpVersion(metadata, this.nowMs())
+            this.store.upsertLink(row.id, predicate, props.attributes, metadata)
+          }
           this.indexProposition(row.id, tokens, tokVer)
           repointed += row.links.size
           continue
         }
 
         // Fold this row's links into the surviving row, then retire it.
+        const collisionRow = this.store.getProposition(collision)
         for (const [predicate, props] of row.links) {
-          const existing = this.store.getProposition(collision)?.links.get(predicate)
+          const existing = collisionRow?.links.get(predicate)
           if (existing) {
             // The surviving row already carries this predicate, so the two
             // links collapse into one; keys it lacks are filled from the
-            // source rather than dropped.
+            // source — except reserved `_` bookkeeping, which describes the
+            // source link, not the survivor (`kml.rs:1633-1649`).
+            const attributes = { ...existing.attributes }
+            const metadata = { ...existing.metadata }
+            let changed = false
+            for (const [key, value] of Object.entries(props.attributes)) {
+              if (key in attributes) continue
+              attributes[key] = value
+              changed = true
+            }
+            for (const [key, value] of Object.entries(props.metadata)) {
+              if (key.startsWith(RESERVED_PREFIX) || key in metadata) continue
+              metadata[key] = value
+              changed = true
+            }
+            if (changed) bumpVersion(metadata, this.nowMs())
+            this.store.upsertLink(collision, predicate, attributes, metadata)
             deduplicated++
           } else {
+            // Move the link onto the surviving row. Its id changes, which is
+            // a mutation of the link element (`kml.rs:1652-1658`).
+            const metadata = { ...props.metadata }
+            bumpVersion(metadata, this.nowMs())
+            this.store.upsertLink(
+              collision,
+              predicate,
+              props.attributes,
+              metadata,
+            )
             repointed++
           }
-          this.store.upsertLink(
-            collision,
-            predicate,
-            { ...props.attributes, ...(existing?.attributes ?? {}) },
-            { ...props.metadata, ...(existing?.metadata ?? {}) },
-          )
           worklist.push([
             propositionID(row.id, predicate),
             propositionID(collision, predicate),
@@ -1131,22 +1249,25 @@ function applyUpdates(
   current: JsonMap,
   updates: readonly [string, UpdateValue][] | null,
   root: { attributes: JsonMap; metadata: JsonMap },
-): JsonMap {
-  if (!updates) return { ...current }
+): { map: JsonMap; applied: number } {
   const out = { ...current }
-  for (const [key, expr] of updates) {
+  let applied = 0
+  for (const [key, expr] of updates ?? []) {
     if (key.startsWith(RESERVED_PREFIX)) {
       throw constraintViolation(
         `cannot assign to engine-reserved key ${JSON.stringify(key)}`,
       )
     }
     const value = evalUpdateValue(expr, root)
-    // A null result skips the key for this element rather than writing null,
-    // so a COALESCE with no fallback leaves the existing value alone.
-    if (value === null) continue
+    // A null *expression* result skips the key for this element rather than
+    // writing null, so a COALESCE with no fallback leaves the existing value
+    // alone. A literal `null` is an explicit write and goes through
+    // (`kml.rs:1214-1226`).
+    if (value === null && !('Json' in expr)) continue
     out[key] = value
+    applied++
   }
-  return out
+  return { map: out, applied }
 }
 
 function evalUpdateValue(

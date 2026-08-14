@@ -177,11 +177,20 @@ export class KipDatabase<
    * put every writer behind the tokenizer's latency.
    */
   override async alarm(): Promise<void> {
-    const version = await this.nexus.liveTokenizerVersion()
-    const done = await this.nexus.reindexStale(version)
-    // Reschedule while work remains; stop cleanly when the index is current
-    // so an idle object can hibernate.
-    if (done > 0) {
+    try {
+      const version = await this.nexus.liveTokenizerVersion()
+      const done = await this.nexus.reindexStale(version)
+      // Reschedule while work remains; stop cleanly when the index is current
+      // so an idle object can hibernate.
+      if (done > 0) {
+        await this.ctx.storage.setAlarm(Date.now() + REINDEX_INTERVAL_MS)
+      }
+    } catch {
+      // A tokenizer outage must not end the retry loop: workerd retries a
+      // throwing alarm only a bounded number of times, and on a quiet object
+      // nothing else would ever re-arm it — stale rows would stay
+      // unsearchable until the next write. Re-arm explicitly and let the
+      // next run resume where this one stopped.
       await this.ctx.storage.setAlarm(Date.now() + REINDEX_INTERVAL_MS)
     }
   }

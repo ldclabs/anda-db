@@ -112,49 +112,77 @@ export class AlinkTokenizer implements Tokenizer {
   }
 
   async #post(texts: string[]): Promise<TokenizeResult> {
+    // The deadline covers the *whole* exchange, body included: the signal is
+    // cleared only after the payload is consumed. Clearing it when the
+    // headers arrive would let a stalled body read hang forever — and every
+    // KML write queues behind this call, so a hang wedges the object.
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), this.#timeoutMs)
-    let response: Response
     try {
-      response = await this.#fetcher.fetch(`${this.#baseUrl}/tokenize`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ texts, mode: 'search' }),
-        signal: controller.signal,
-      })
-    } catch (err) {
-      throw executionTimeout(
-        `tokenizer request failed: ${(err as Error).message}`,
-      )
+      let response: Response
+      try {
+        response = await this.#fetcher.fetch(`${this.#baseUrl}/tokenize`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ texts, mode: 'search' }),
+          signal: controller.signal,
+        })
+      } catch (err) {
+        // Only the deadline is a timeout; DNS, refused connections and reset
+        // streams are service failures and must not masquerade as one.
+        if (controller.signal.aborted) {
+          throw executionTimeout(
+            `tokenizer request timed out after ${this.#timeoutMs}ms`,
+          )
+        }
+        throw internalError(
+          `tokenizer request failed: ${(err as Error).message}`,
+        )
+      }
+
+      if (!response.ok) {
+        const body = await response.text().catch(() => '')
+        throw internalError(
+          `tokenizer returned ${response.status}: ${body.slice(0, 200)}`,
+        )
+      }
+
+      const version = response.headers.get('x-tokenizer-version')
+      if (!version) {
+        // Without a version there is no way to detect stale index rows later,
+        // so an unversioned response is treated as a broken deployment rather
+        // than silently accepted.
+        throw internalError(
+          'tokenizer response is missing the X-Tokenizer-Version header',
+        )
+      }
+
+      let payload: { tokens?: string[][] }
+      try {
+        payload = (await response.json()) as typeof payload
+      } catch (err) {
+        if (controller.signal.aborted) {
+          throw executionTimeout(
+            `tokenizer response body timed out after ${this.#timeoutMs}ms`,
+          )
+        }
+        throw internalError(
+          `tokenizer response is not valid JSON: ${(err as Error).message}`,
+        )
+      }
+      if (
+        !Array.isArray(payload.tokens) ||
+        payload.tokens.length !== texts.length
+      ) {
+        throw internalError(
+          `tokenizer returned ${payload.tokens?.length ?? 0} token lists for ` +
+            `${texts.length} texts`,
+        )
+      }
+      return { tokens: payload.tokens, version }
     } finally {
       clearTimeout(timer)
     }
-
-    if (!response.ok) {
-      const body = await response.text().catch(() => '')
-      throw internalError(
-        `tokenizer returned ${response.status}: ${body.slice(0, 200)}`,
-      )
-    }
-
-    const version = response.headers.get('x-tokenizer-version')
-    if (!version) {
-      // Without a version there is no way to detect stale index rows later,
-      // so an unversioned response is treated as a broken deployment rather
-      // than silently accepted.
-      throw internalError(
-        'tokenizer response is missing the X-Tokenizer-Version header',
-      )
-    }
-
-    const payload = (await response.json()) as { tokens?: string[][] }
-    if (!Array.isArray(payload.tokens) || payload.tokens.length !== texts.length) {
-      throw internalError(
-        `tokenizer returned ${payload.tokens?.length ?? 0} token lists for ` +
-          `${texts.length} texts`,
-      )
-    }
-    return { tokens: payload.tokens, version }
   }
 }
 

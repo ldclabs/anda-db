@@ -794,3 +794,220 @@ describe('error taxonomy', () => {
     expect(error.code).toBe('KIP_3001')
   })
 })
+
+describe('cross-engine semantics pinned by the 2026-08 review', () => {
+  it('runs clauses after an empty disjoint group', async () => {
+    const stub = await freshStub()
+    await expectOk(
+      stub,
+      'UPSERT { CONCEPT ?h { {type: "Symptom", name: "Headache"} } }',
+    )
+    // "N" is declared but has no instances. Its empty group must not
+    // suppress the later ?s clause: every WHERE clause executes and FIND
+    // projects per covering table (`db/mod.rs:715-717`).
+    const found = await expectOk(
+      stub,
+      'FIND(?s.name) WHERE { ?x {type: "N"} ?s {type: "Symptom"} }',
+    )
+    expect(found).toEqual(['Headache'])
+  })
+
+  it('treats an uncorrelated NOT as a no-op', async () => {
+    const stub = await freshStub()
+    await expectOk(
+      stub,
+      `UPSERT {
+         CONCEPT ?d { {type: "Drug", name: "Aspirin"} }
+         CONCEPT ?s { {type: "Symptom", name: "Headache"} }
+       }`,
+    )
+    // The block matches (a Symptom exists) but shares no variable with the
+    // outer scope, so it cannot exclude anything (`kql.rs:396-398`).
+    const found = await expectOk(
+      stub,
+      'FIND(?d.name) WHERE { ?d {type: "Drug"} NOT { ?s {type: "Symptom"} } }',
+    )
+    expect(found).toEqual(['Aspirin'])
+  })
+
+  it('null-pads an OPTIONAL block that shares no variable and matched nothing', async () => {
+    const stub = await freshStub()
+    await expectOk(stub, 'UPSERT { CONCEPT ?d { {type: "Drug", name: "Aspirin"} } }')
+    const found = await expectOk(
+      stub,
+      'FIND(?d.name, ?e) WHERE { ?d {type: "Drug"} OPTIONAL { ?e {type: "N"} } }',
+    )
+    // Column-major projection: the drug survives with ?e projected null.
+    expect(found).toEqual([['Aspirin'], [null]])
+  })
+
+  it('keeps OPTIONAL variables bound when a dangling id degrades the block', async () => {
+    const stub = await freshStub()
+    await expectOk(
+      stub,
+      `UPSERT {
+         CONCEPT ?s { {type: "Symptom", name: "Headache"} }
+         CONCEPT ?d { {type: "Drug", name: "Aspirin"} SET PROPOSITIONS { ("treats", ?s) } }
+       }`,
+    )
+    // The dangling {id:} degrades to an empty match inside OPTIONAL, but ?x
+    // stays a bound column and pads null instead of erroring as unbound.
+    const found = await expectOk(
+      stub,
+      'FIND(?d.name, ?x) WHERE { ?d {type: "Drug"} OPTIONAL { (?d, "treats", ?x) ?x {id: "C:99999"} } }',
+    )
+    expect(found).toEqual([['Aspirin'], [null]])
+  })
+
+  it('discards every solution on a constant false FILTER without unbinding', async () => {
+    const stub = await freshStub()
+    await expectOk(stub, 'UPSERT { CONCEPT ?d { {type: "Drug", name: "Aspirin"} } }')
+    // Rows are cleared in place; the later re-declaration of ?d semi-joins
+    // the emptied table rather than rebuilding the domain from scratch.
+    const found = await expectOk(
+      stub,
+      'FIND(?d.name) WHERE { ?d {type: "Drug"} FILTER(1 > 2) ?d {type: "Drug"} }',
+    )
+    expect(found).toEqual([])
+  })
+
+  it('enforces equality when one variable names several pattern positions', async () => {
+    const stub = await freshStub()
+    await expectOk(
+      stub,
+      `UPSERT {
+         CONCEPT ?a { {type: "T", name: "A"} }
+         CONCEPT ?b { {type: "T", name: "B"} SET PROPOSITIONS { ("rel", ?a) } }
+       }`,
+    )
+    // An entity binding can never equal a predicate binding...
+    const viaPredicate = await expectOk(stub, 'FIND(?o) WHERE { (?x, ?x, ?o) }')
+    expect(viaPredicate).toEqual([])
+    // ...nor a link id its own subject.
+    const viaLink = await expectOk(
+      stub,
+      'FIND(?o.name) WHERE { ?l (?l, "rel", ?o) }',
+    )
+    expect(viaLink).toEqual([])
+  })
+
+  it('does not bump _version on a bare re-declaration', async () => {
+    const stub = await freshStub()
+    await expectOk(
+      stub,
+      'UPSERT { CONCEPT ?d { {type: "T", name: "A"} SET ATTRIBUTES {a: 1} } }',
+    )
+    await expectOk(stub, 'UPSERT { CONCEPT ?d { {type: "T", name: "A"} } }')
+    const found = await expectOk(stub, 'FIND(?d) WHERE { ?d {type: "T", name: "A"} }')
+    expect(found[0].metadata._version).toBe(1)
+  })
+
+  it('does not bump a link version on a bare proposition re-declaration', async () => {
+    const stub = await freshStub()
+    await expectOk(
+      stub,
+      `UPSERT {
+         CONCEPT ?a { {type: "T", name: "A"} }
+         CONCEPT ?b { {type: "T", name: "B"} }
+         PROPOSITION ?p { (?a, "rel", ?b) }
+       }`,
+    )
+    await expectOk(
+      stub,
+      `UPSERT {
+         PROPOSITION ?p { ({type: "T", name: "A"}, "rel", {type: "T", name: "B"}) }
+       }`,
+    )
+    const links = await expectOk(stub, 'FIND(?p) WHERE { ?p (?a, "rel", ?b) }')
+    expect(links[0].metadata._version).toBe(1)
+  })
+
+  it('UPDATE writes an explicit null attribute', async () => {
+    const stub = await freshStub()
+    await expectOk(
+      stub,
+      'UPSERT { CONCEPT ?d { {type: "T", name: "A"} SET ATTRIBUTES {x: 5} } }',
+    )
+    const result = await expectOk(
+      stub,
+      'UPDATE ?d SET ATTRIBUTES { x: null } WHERE { ?d {type: "T", name: "A"} }',
+    )
+    expect(result.updated).toBe(1)
+    const found = await expectOk(stub, 'FIND(?d) WHERE { ?d {type: "T", name: "A"} }')
+    expect(found[0].attributes.x).toBeNull()
+  })
+
+  it('counts cascaded higher-order deletions per link', async () => {
+    const stub = await freshStub()
+    await expectOk(
+      stub,
+      `UPSERT {
+         CONCEPT ?a { {type: "T", name: "A"} }
+         CONCEPT ?b { {type: "T", name: "B"} }
+         CONCEPT ?s { {type: "Source", name: "S"} }
+         PROPOSITION ?base { (?a, "rel", ?b) }
+         PROPOSITION ?h1 { (?base, "cited_by", ?s) }
+         PROPOSITION ?h2 { (?base, "made_by", ?s) }
+       }`,
+    )
+    // Deleting the base link orphans one higher-order row carrying two
+    // predicates: 1 target + 2 cascaded links (`kml.rs:1747`).
+    const result = await expectOk(
+      stub,
+      'DELETE PROPOSITIONS ?p WHERE { ?p (?a, "rel", ?b) }',
+    )
+    expect(result.deleted_propositions).toBe(3)
+  })
+
+  it('MERGE bumps repointed link versions and dedups provenance', async () => {
+    const stub = await freshStub()
+    await expectOk(
+      stub,
+      `UPSERT {
+         CONCEPT ?a { {type: "T", name: "A"} }
+         CONCEPT ?b { {type: "T", name: "B"} }
+         CONCEPT ?c { {type: "T", name: "C"} SET PROPOSITIONS { ("rel", ?a) } }
+       }`,
+    )
+    const result = await expectOk(
+      stub,
+      'MERGE CONCEPT ?src INTO ?dst WHERE { ?src {type: "T", name: "A"} ?dst {type: "T", name: "B"} }',
+    )
+    expect(result.links_repointed).toBe(1)
+
+    // Repointing is a mutation of the link element, so its version advances.
+    const links = await expectOk(stub, 'FIND(?p) WHERE { ?p (?c, "rel", ?b) }')
+    expect(links[0].metadata._version).toBe(2)
+
+    const target = await expectOk(stub, 'FIND(?d) WHERE { ?d {type: "T", name: "B"} }')
+    expect(target[0].metadata._merged_from).toEqual(['T:A'])
+  })
+
+  it('allows updating $self attributes but locks core_directives', async () => {
+    const stub = await freshStub()
+    // `persons/self.kip` is deliberately not bundled; applications create the
+    // actor themselves. Creation may set core_directives — only later
+    // modification is locked (`kml.rs:2083-2101`).
+    await expectOk(
+      stub,
+      'UPSERT { CONCEPT ?s { {type: "Person", name: "$self"} SET ATTRIBUTES { person_class: "AI", core_directives: [{name: "root", description: "be kind"}] } } }',
+    )
+    const updated = await expectOk(
+      stub,
+      'UPDATE ?s SET ATTRIBUTES { mood: "curious" } WHERE { ?s {type: "Person", name: "$self"} }',
+    )
+    expect(updated.updated).toBe(1)
+
+    const locked = await expectError(
+      stub,
+      'UPDATE ?s SET ATTRIBUTES { core_directives: "obey" } WHERE { ?s {type: "Person", name: "$self"} }',
+    )
+    expect(locked.code).toBe('KIP_3004')
+
+    const destroy = await expectError(
+      stub,
+      'DELETE CONCEPT ?s DETACH WHERE { ?s {type: "Person", name: "$self"} }',
+    )
+    expect(destroy.code).toBe('KIP_3004')
+  })
+})

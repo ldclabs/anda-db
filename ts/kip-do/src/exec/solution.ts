@@ -188,7 +188,9 @@ export class SolutionTable {
 
   /**
    * Left join for OPTIONAL: every left row survives, padded with `null` when
-   * the right side has no match.
+   * the right side has no match. Hash-partitioned on the shared columns like
+   * `join`, with null-carrying rows probed as wildcards, so the cost is
+   * proportional to the matches rather than |left| x |right|.
    */
   leftJoin(other: SolutionTable): SolutionTable {
     const shared = this.vars.filter((v) => other.vars.includes(v))
@@ -198,10 +200,28 @@ export class SolutionTable {
     const leftCols = shared.map((v) => this.column(v)!)
     const rightCols = shared.map((v) => other.column(v)!)
 
+    const index = new Map<string, BindingValue[][]>()
+    const wild: BindingValue[][] = []
+    for (const row of other.rows) {
+      if (rightCols.some((c) => row[c]!.kind === 'null')) {
+        wild.push(row)
+        continue
+      }
+      const key = rowKey(row, rightCols)
+      const bucket = index.get(key)
+      if (bucket) bucket.push(row)
+      else index.set(key, [row])
+    }
+
     const out: BindingValue[][] = []
     for (const left of this.rows) {
+      const leftWild = leftCols.some((c) => left[c]!.kind === 'null')
+      const candidates = leftWild
+        ? other.rows
+        : [...(index.get(rowKey(left, leftCols)) ?? []), ...wild]
+
       let matched = false
-      for (const right of other.rows) {
+      for (const right of candidates) {
         if (!compatible(left, leftCols, right, rightCols)) continue
         matched = true
         out.push([...left, ...rightOnlyCols.map((c) => right[c]!)])
@@ -256,6 +276,28 @@ export class SolutionTable {
     const kept = this.rows.filter(predicate)
     this.rows.length = 0
     this.rows.push(...kept)
+  }
+
+  /**
+   * Distinct non-null bindings of one variable, in row order — entity and
+   * predicate bindings alike (`types.rs` `distinct_values`). This is the seed
+   * for NOT / OPTIONAL child scopes, where a predicate-bound variable must
+   * stay visible.
+   */
+  distinctValues(varName: string): BindingValue[] {
+    const col = this.column(varName)
+    if (col === null) return []
+    const seen = new Set<string>()
+    const out: BindingValue[] = []
+    for (const row of this.rows) {
+      const cell = row[col]!
+      if (cell.kind === 'null') continue
+      const key = bindingKey(cell)
+      if (seen.has(key)) continue
+      seen.add(key)
+      out.push(cell)
+    }
+    return out
   }
 
   /** Distinct entity bindings of one variable, in ascending id order. */
@@ -326,6 +368,15 @@ function crossProduct(
  */
 export class SolutionContext {
   tables: SolutionTable[] = []
+
+  /**
+   * When true, "dangling id" grounding failures (`KIP_3002`) degrade to an
+   * empty match instead of failing the whole query. Set for NOT / OPTIONAL /
+   * UNION child scopes (KIP §3.4.7), mirroring `lenient_grounding` in the
+   * Rust engine: a sub-pattern that cannot match makes the NOT succeed, the
+   * OPTIONAL pad with null, or the UNION branch contribute nothing.
+   */
+  lenient = false
 
   mergeTable(table: SolutionTable): void {
     let acc = table

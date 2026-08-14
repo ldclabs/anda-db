@@ -1,0 +1,28 @@
+{
+  "name": "kql-clause-independence",
+  "description": "WHERE clauses execute independently of earlier unsatisfiable groups: an empty disjoint group does not suppress later clauses, and an uncorrelated NOT cannot falsify the query.",
+  "setup": [
+    "UPSERT { CONCEPT ?drug_type { {type: \"$ConceptType\", name: \"Drug\"} SET ATTRIBUTES { \"description\": \"Pharmaceutical drug concept type\" } } }",
+    "UPSERT { CONCEPT ?symptom_type { {type: \"$ConceptType\", name: \"Symptom\"} SET ATTRIBUTES { \"description\": \"Medical symptom concept type\" } } }",
+    "UPSERT { CONCEPT ?herb_type { {type: \"$ConceptType\", name: \"Herb\"} SET ATTRIBUTES { \"description\": \"Declared but never instantiated\" } } }",
+    "UPSERT { CONCEPT ?headache { {type: \"Symptom\", name: \"Headache\"} } }",
+    "UPSERT { CONCEPT ?aspirin { {type: \"Drug\", name: \"Aspirin\"} } }"
+  ],
+  "cases": [
+    {
+      "name": "a clause after an empty disjoint group still binds its variable",
+      "command": "FIND(?s.name) WHERE { ?x {type: \"Herb\"} ?s {type: \"Symptom\"} }",
+      "expect": { "result": ["Headache"] }
+    },
+    {
+      "name": "an uncorrelated NOT whose block matches is a no-op",
+      "command": "FIND(?d.name) WHERE { ?d {type: \"Drug\"} NOT { ?s {type: \"Symptom\"} } }",
+      "expect": { "result": ["Aspirin"] }
+    },
+    {
+      "name": "an uncorrelated NOT whose block matches nothing is a no-op",
+      "command": "FIND(?d.name) WHERE { ?d {type: \"Drug\"} NOT { ?h {type: \"Herb\"} } }",
+      "expect": { "result": ["Aspirin"] }
+    }
+  ]
+}

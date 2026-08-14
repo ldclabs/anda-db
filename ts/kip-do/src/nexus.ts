@@ -683,9 +683,12 @@ export class CognitiveNexus {
 
     if (command.target === 'Concept') {
       const hits = this.store.searchConcepts(query, topK)
+      // One batched load: with the x100 widening above, per-hit point
+      // lookups would be thousands of SELECTs on the object's single thread.
+      const byId = this.store.getConcepts(hits.map((hit) => hit.id))
       const out: Json[] = []
       for (const hit of hits) {
-        const concept = this.store.getConcept(hit.id)
+        const concept = byId.get(hit.id)
         if (!concept) continue
         if (command.in_type && concept.type !== command.in_type) continue
         const score = normalizeScore(hit.score)
@@ -706,9 +709,12 @@ export class CognitiveNexus {
       topK,
       command.in_type ?? undefined,
     )
+    const byId = this.store.getPropositions([
+      ...new Set(hits.map((hit) => hit.id)),
+    ])
     const out: Json[] = []
     for (const hit of hits) {
-      const row = this.store.getProposition(hit.id)
+      const row = byId.get(hit.id)
       if (!row) continue
       const link = propositionLink(row, hit.predicate)
       if (!link) continue
@@ -762,6 +768,20 @@ export class CognitiveNexus {
    * the object's single thread for long.
    */
   async reindexStale(currentVersion: string, batch = 128): Promise<number> {
+    // Queued on the same chain as KML writes: the read → tokenize → write
+    // sequence crosses an `await`, and a mutation landing in that window
+    // would be clobbered by FTS tokens computed from its pre-write text —
+    // stamped with the current version, so the row would never self-heal.
+    const run = () => this.reindexStaleInner(currentVersion, batch)
+    const queued = this.writeChain.then(run, run)
+    this.writeChain = queued.catch(() => undefined)
+    return queued
+  }
+
+  private async reindexStaleInner(
+    currentVersion: string,
+    batch: number,
+  ): Promise<number> {
     let done = 0
 
     const conceptIds = this.store.staleConceptIds(currentVersion, batch)
