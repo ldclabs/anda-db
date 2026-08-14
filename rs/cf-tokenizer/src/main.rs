@@ -57,6 +57,15 @@ fn bad_request(error: String) -> Response {
         .into_response()
 }
 
+fn internal_error(error: String) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        [version_header()],
+        Json(ErrorResponse { error }),
+    )
+        .into_response()
+}
+
 async fn healthz() -> Response {
     ([version_header()], "ok").into_response()
 }
@@ -71,12 +80,22 @@ async fn tokenize(Json(request): Json<TokenizeRequest>) -> Response {
     if request.texts.len() > MAX_TEXTS_PER_BATCH {
         return bad_request(format!("batch too large (max {MAX_TEXTS_PER_BATCH} texts)"));
     }
-    let tokens = request
-        .texts
-        .iter()
-        .map(|text| tokenize_for_search(text))
-        .collect();
-    ([version_header()], Json(TokenizeResponse { tokens })).into_response()
+    // Segmentation is pure CPU — hundreds of ms for a full CJK batch — so it
+    // runs on the blocking pool. Inline on the async workers it would stall
+    // every concurrent request including `/healthz`, and a failed health
+    // check restarts the container mid-batch.
+    let result = tokio::task::spawn_blocking(move || {
+        request
+            .texts
+            .iter()
+            .map(|text| tokenize_for_search(text))
+            .collect::<Vec<_>>()
+    })
+    .await;
+    match result {
+        Ok(tokens) => ([version_header()], Json(TokenizeResponse { tokens })).into_response(),
+        Err(err) => internal_error(format!("tokenization task failed: {err}")),
+    }
 }
 
 #[tokio::main]

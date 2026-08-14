@@ -24,7 +24,7 @@ service binding or add authentication in the Worker that fronts the container.
 Returns `200 OK` with body `ok` and the current tokenizer version:
 
 ```http
-X-Tokenizer-Version: 1
+X-Tokenizer-Version: cf-1
 ```
 
 ### `POST /tokenize`

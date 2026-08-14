@@ -16,7 +16,12 @@ use unicode_segmentation::UnicodeSegmentation;
 /// Persisted with every index row by consumers. Bump on ANY behavior change
 /// (normalization rules, jieba-rs upgrade, dictionary change): a mismatch
 /// means "rebuild the search index", not "hope the vocabularies overlap".
-pub const TOKENIZER_VERSION: &str = "1";
+///
+/// Namespaced with the service name: staleness detection compares raw
+/// strings, and this service replaces a predecessor with its own pipeline
+/// and dictionary — a bare number the predecessor may also have used would
+/// make the swap invisible and strand rows in an incomparable vocabulary.
+pub const TOKENIZER_VERSION: &str = "cf-1";
 
 /// Per-text token cap. Search-mode jieba emits overlapping n-grams for CJK, so
 /// this must be large enough for normal title-and-summary documents; a

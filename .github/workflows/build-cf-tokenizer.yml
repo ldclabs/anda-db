@@ -12,13 +12,19 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # The push uses the workflow's own GITHUB_TOKEN, which is read-only under
+    # the restrictive default policy unless packages: write is declared.
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v7
-      - uses: Swatinem/rust-cache@v2
+      # No rust-cache here: all compilation happens inside `docker build`, so
+      # a host-side cargo cache never enters the build context.
       - name: Build the Docker image
         run: |
           cd rs/cf-tokenizer
-          docker login --username ${{ github.actor }} --password ${{ secrets.GITHUB_TOKEN }} ${{ env.REGISTRY }}
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login --username ${{ github.actor }} --password-stdin ${{ env.REGISTRY }}
           IMAGE_TAG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}_amd64:${{ inputs.build_tag }}"
           LATEST_TAG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}_amd64:latest"
           TAGS="-t ${IMAGE_TAG} -t ${LATEST_TAG}"
