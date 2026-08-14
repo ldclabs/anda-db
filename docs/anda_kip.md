@@ -7,11 +7,11 @@
 |                       |                                                                                                                                                                    |
 | :-------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Crate                 | [`anda_kip`](../rs/anda_kip/)                                                                                                                                      |
-| Version               | `0.10.x`                                                                                                                                                           |
-| Spec                  | KIP **v1.0-RC10** ([SPECIFICATION.md](../rs/anda_kip/SPECIFICATION.md))                                                                                            |
+| Version               | `0.11.x`                                                                                                                                                           |
+| Spec                  | KIP **v1.0-RC11** ([SPECIFICATION.md](../rs/anda_kip/SPECIFICATION.md))                                                                                            |
 | Reference executor    | [`anda_cognitive_nexus`](../rs/anda_cognitive_nexus/) (graph store backed by [Anda DB](../rs/anda_db/))                                                            |
 | Other implementations | [`anda_cognitive_nexus_server`](../rs/anda_cognitive_nexus_server/) (HTTP/JSON-RPC), [`anda_cognitive_nexus_py`](../py/anda_cognitive_nexus_py/) (Python bindings) |
-| Status                | Library is feature-complete for KIP v1.0-RC10 (parser + AST + request/response + executor trait). Bundled `kip_cli` provides an interactive REPL.                  |
+| Status                | Library is feature-complete for KIP v1.0-RC11 (parser + AST + request/response + executor trait). Bundled `kip_cli` provides an interactive REPL.                  |
 
 ---
 
@@ -51,7 +51,7 @@
   - [9. Genesis capsules (`anda_kip::capsule`)](#9-genesis-capsules-anda_kipcapsule)
   - [10. Entity types (`anda_kip::types`)](#10-entity-types-anda_kiptypes)
   - [11. Function-calling integration](#11-function-calling-integration)
-  - [12. Executor implementer's checklist (RC10 semantics)](#12-executor-implementers-checklist-rc10-semantics)
+  - [12. Executor implementer's checklist (RC11 semantics)](#12-executor-implementers-checklist-rc11-semantics)
   - [13. Cookbook](#13-cookbook)
     - [13.1 Parse and inspect](#131-parse-and-inspect)
     - [13.2 Single command via `execute_kip`](#132-single-command-via-execute_kip)
@@ -94,7 +94,7 @@ KIP defines three instruction families:
 
 `anda_kip` is the **protocol-only** layer (no storage, no I/O):
 
-- A complete, RC10-compliant **parser** (`nom` + `nom-language`, no regex).
+- A complete, RC11-compliant **parser** (`nom` + `nom-language`, no regex).
 - A strongly-typed **AST** for every KIP construct.
 - A small **`Executor` trait** (`async fn execute(Command, dry_run) -> Response`)
   that any backend can implement.
@@ -103,7 +103,8 @@ KIP defines three instruction families:
 - KIP **standard error codes** (`KIP_1xxx`–`KIP_4xxx`) with recovery hints.
 - The canonical **Genesis capsules** (`$ConceptType`, `$PropositionType`,
   `Domain`, `Person`, `Event`, `Insight`, `Preference`, `Commitment`,
-  `SleepTask`, `$self`, `$system`).
+  `SleepTask`, `$self`, `$system`) plus RC11's Experience-learning profile
+  (`Experience`, `ExperienceStep`, `Skill` and their predicates).
 - LLM-facing **function-calling JSON schemas** for `execute_kip` and
   `execute_kip_readonly`.
 - An interactive REPL: `kip_cli` (built from the bundled `bin/kip_cli.rs`).
@@ -207,7 +208,7 @@ CURSOR "<opaque-token>"
 | Pagination                            | `LIMIT n` (cap row count) and `CURSOR "<token>"` (resumable).                                                                 |
 | `ORDER BY`                            | One or more sort keys (dot-paths or aggregation expressions), each `ASC`/`DESC` — multi-key since RC9.                        |
 | Aggregation                           | When `FIND` mixes plain variables with aggregates, the plain variables form an **implicit `GROUP BY`** key.                   |
-| Result shape                          | **Columnar** (RC10 §6.2.2): one array per `FIND` expression; a single-expression `FIND` unwraps to the bare column. Duplicate solutions collapse (set semantics, RC10 §3.3). |
+| Result shape                          | **Columnar** (RC11 §6.2.2): one array per `FIND` expression; a single-expression `FIND` unwraps to the bare column. Duplicate solutions collapse (set semantics, RC11 §3.3). |
 | Path operator zero-hop                | `"p"{0,n}` includes the reflexive case `?s == ?o`.                                                                            |
 
 ### 3.2 KML — Knowledge Manipulation Language
@@ -319,11 +320,11 @@ Every node implements `Clone + Debug + Serialize + Deserialize + PartialEq`.
   `Proposition(Box<PropositionMatcher>)`.
 - `PredTerm` —
   - `Literal(String)`,
-  - `Variable(String)` (predicate variable — binds the predicate name, RC10 §3.4.2),
+  - `Variable(String)` (predicate variable — binds the predicate name, RC11 §3.4.2),
   - `Alternative(Vec<String>)` (`pred1 | pred2`),
   - `MultiHop { predicate, min: u16, max: Option<u16> }` (`None` = unbounded,
     engine-capped). Zero-hop is encoded as `min == 0` and is bound by the
-    executor (RC10 §3.4.2).
+    executor (RC11 §3.4.2).
 - `FilterExpression`, `FilterOperand`, `ComparisonOperator`, `LogicalOperator`,
   `FilterFunction` (`Contains | StartsWith | EndsWith | Regex | In | IsNull | IsNotNull`).
 - `OrderByCondition { variable, direction, aggregation }` (one per sort key),
@@ -335,17 +336,17 @@ Every node implements `Clone + Debug + Serialize + Deserialize + PartialEq`.
 - `UpsertItem::Concept(ConceptBlock)` / `::Proposition(PropositionBlock)`.
 - `ConceptBlock { handle, concept, expect_version, set_attributes, set_propositions, metadata }`.
 - `PropositionBlock { handle, proposition, expect_version, set_attributes, metadata }`.
-  `expect_version` is the optional `EXPECT VERSION <n>` guard (RC10 §2.11.2);
+  `expect_version` is the optional `EXPECT VERSION <n>` guard (RC11 §2.11.2);
   on mismatch the whole statement aborts with `KIP_3005`.
 - `UpdateStatement { target, set_attributes, set_metadata, where_clauses, limit }` —
   values are plain JSON or `UpdateExpr`s built from
-  `UpdateFunction::{Add, Mul, Clamp, Coalesce}` (RC10 §4.3).
-- `MergeStatement { source, target, where_clauses }` (RC10 §4.4).
+  `UpdateFunction::{Add, Mul, Clamp, Coalesce}` (RC11 §4.3).
+- `MergeStatement { source, target, where_clauses }` (RC11 §4.4).
 - `DeleteStatement` —
   - `DeleteAttributes { attributes, target, where_clauses }`,
   - `DeleteMetadata { keys, target, where_clauses }`,
   - `DeletePropositions { target, where_clauses }`,
-  - `DeleteConcept { target, where_clauses }` (RC10 mandates `DETACH`).
+  - `DeleteConcept { target, where_clauses }` (RC11 mandates `DETACH`).
 
 ### 4.4 META nodes
 
@@ -353,10 +354,10 @@ Every node implements `Clone + Debug + Serialize + Deserialize + PartialEq`.
   | ConceptType(String) | PropositionTypes { limit, cursor } | PropositionType(String)`.
 - `SearchCommand { target: SearchTarget, term, in_type, mode, threshold, limit }`
   where `SearchTarget = Concept | Proposition` and
-  `SearchMode = Keyword | Semantic | Hybrid` (RC10 §5.2).
+  `SearchMode = Keyword | Semantic | Hybrid` (RC11 §5.2).
 - `ExportCommand { target, where_clauses, limit, cursor }` — serializes the
   matched subgraph as an idempotent `UPSERT` capsule, resumable via `CURSOR`
-  (RC10 §5.3).
+  (RC11 §5.3).
 
 ### 4.5 Value / `Json` aliases
 
@@ -491,7 +492,7 @@ For a production-quality implementation, see
   short-circuiting `FILTER` evaluation, regex caching, and BTree-backed
   `CURSOR` pagination;
 - runs KML under a single `RwLock` write guard (KQL/META take the read
-  guard) and enforces RC10 protected-scope and transitive-cascade rules;
+  guard) and enforces RC11 protected-scope and transitive-cascade rules;
 - runs META through BM25 (CJK-aware via `jieba_tokenizer`) and BTree-backed
   type listings.
 
@@ -554,7 +555,7 @@ Batch path (`commands` non-empty):
 4. **Stop-on-write-error**: the first KML failure stops the batch; the
    partial array is wrapped in `Response::ok(json!(results))` so the caller
    knows what *did* execute.
-5. KQL / META / parse errors do **not** stop the batch (RC10 §6.2.3).
+5. KQL / META / parse errors do **not** stop the batch (RC11 §6.2.3).
 
 ### 7.3 `Response`
 
@@ -647,7 +648,7 @@ preserving the context stack and the offending source slice.
 ## 9. Genesis capsules (`anda_kip::capsule`)
 
 The capsule module exposes the canonical bootstrap KIP source as `&'static
-str` constants plus the reserved-name sigils used by RC10's protected-scope
+str` constants plus the reserved-name sigils used by RC11's protected-scope
 guard.
 
 | Constant                                                                          | Purpose                                                               |
@@ -658,9 +659,15 @@ guard.
 | `META_SYSTEM_NAME`                                                                | `"$system"` — the agent's sleeping/maintenance persona                |
 | `DOMAIN_TYPE`                                                                     | `"Domain"`                                                            |
 | `EVENT_TYPE`, `INSIGHT_TYPE`, `PERSON_TYPE`, `PREFERENCE_TYPE`, `COMMITMENT_TYPE`, `SLEEP_TASK_TYPE` | standard concept types defined in the bundled capsules                |
+| `EXPERIENCE_TYPE`, `EXPERIENCE_STEP_TYPE`, `SKILL_TYPE`                           | the Experience-learning concept types added by RC11's cognitive memory profile |
 | `BELONGS_TO_DOMAIN_TYPE`                                                          | `"belongs_to_domain"` — predicate used by all CoreSchema entries      |
+| `INVOLVES_TYPE`, `MENTIONS_TYPE`, `CONSOLIDATED_TO_TYPE`, `DERIVED_FROM_TYPE`     | the shared episodic/provenance predicates, spanning `Event` and `Experience` |
+| `HAS_STEP_TYPE`, `CAUSED_BY_TYPE`, `DERIVED_INSIGHT_TYPE`, `COMPILED_TO_TYPE`     | the Experience-specific predicates (trajectory, causality, consolidation) |
 | `GENESIS_KIP`                                                                     | bootstraps `$ConceptType`, `$PropositionType`, `Domain`, and the core domains (`CoreSchema`, `Unsorted`, `Archived`, `System` — the latter added in RC10) |
 | `EVENT_KIP`, `INSIGHT_KIP`, `PERSON_KIP`, `PREFERENCE_KIP`, `COMMITMENT_KIP`, `SLEEP_TASK_KIP` | standard concept-type definitions                                     |
+| `EXPERIENCE_KIP`, `EXPERIENCE_STEP_KIP`, `SKILL_KIP`                              | the RC11 Experience-learning concept-type definitions                 |
+| `INVOLVES_PROP_KIP`, `MENTIONS_PROP_KIP`, `CONSOLIDATED_TO_PROP_KIP`, `DERIVED_FROM_PROP_KIP` | the shared predicate definitions — standalone capsules since RC11 pulled them out of `Event.kip` |
+| `HAS_STEP_PROP_KIP`, `CAUSED_BY_PROP_KIP`, `DERIVED_INSIGHT_PROP_KIP`, `COMPILED_TO_PROP_KIP` | the Experience-specific predicate definitions                         |
 | `PERSON_SELF_KIP`, `PERSON_SYSTEM_KIP`                                            | the `$self` and `$system` actor instances                             |
 
 A typical bootstrap loop is therefore:
@@ -669,8 +676,14 @@ A typical bootstrap loop is therefore:
 nexus.execute_kml(parse_kml(GENESIS_KIP)?, false).await?;
 nexus.execute_kml(parse_kml(PERSON_KIP)?, false).await?;
 nexus.execute_kml(parse_kml(EVENT_KIP)?,  false).await?;
+// …concept types first, then the predicate capsules that reference them
+nexus.execute_kml(parse_kml(INVOLVES_PROP_KIP)?, false).await?;
 // …etc
 ```
+
+The predicate capsules are ordered last on purpose: their `subject_types` /
+`object_types` name the concept types, so loading them first would declare
+predicates against types that do not exist yet.
 
 ---
 
@@ -706,7 +719,7 @@ contexts (e.g. cache keys, error builders) where the full payload is not
 needed.
 
 `UpsertResult { blocks, upsert_concept_nodes, upsert_proposition_links }` is
-the canonical `UPSERT` response payload (RC10 §6.2.2) that executors are
+the canonical `UPSERT` response payload (RC11 §6.2.2) that executors are
 expected to serialize.
 
 ---
@@ -746,9 +759,9 @@ let system = format!(
 
 ---
 
-## 12. Executor implementer's checklist (RC10 semantics)
+## 12. Executor implementer's checklist (RC11 semantics)
 
-When writing a new backend (or porting an old one to RC10), these are the
+When writing a new backend (or porting an old one to RC11), these are the
 points the parser does **not** enforce — they are the executor's contract:
 
 **KQL**
@@ -924,7 +937,7 @@ capsules.
   bindings (e.g. the Python module under `py/anda_cognitive_nexus_py`) rely
   on this.
 - **Spec drift**: the parser, AST, and request/response surface are aligned
-  with KIP **v1.0-RC10** (2026-07-04). When the spec advances, breaking
+  with KIP **v1.0-RC11** (2026-08-13). When the spec advances, breaking
   parser/AST changes will be released as a minor version bump and the
   `Compatibility notes` section will track the diff.
 - **Performance posture**: the parser is allocation-light (combinator-based,
@@ -935,4 +948,4 @@ capsules.
 
 ---
 
-*Last updated: KIP v1.0-RC10 (2026-07-04), `anda_kip` 0.10.0.*
+*Last updated: KIP v1.0-RC11 (2026-08-13), `anda_kip` 0.11.0.*

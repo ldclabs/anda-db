@@ -7,11 +7,11 @@
 |                       |                                                                                                                                                       |
 | :-------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Crate                 | [`anda_cognitive_nexus`](../rs/anda_cognitive_nexus/)                                                                                                 |
-| Version               | `0.10.x`                                                                                                                                              |
-| Implements            | KIP **v1.0-RC10** [`Executor`](../rs/anda_kip/src/executor.rs) ([SPECIFICATION.md](../rs/anda_kip/SPECIFICATION.md))                                  |
+| Version               | `0.11.x`                                                                                                                                              |
+| Implements            | KIP **v1.0-RC11** [`Executor`](../rs/anda_kip/src/executor.rs) ([SPECIFICATION.md](../rs/anda_kip/SPECIFICATION.md))                                  |
 | Storage backend       | [Anda DB](../rs/anda_db/) — embedded document store with B-Tree + BM25 + HNSW indexes                                                                 |
 | Other implementations | [`anda_cognitive_nexus_server`](../rs/anda_cognitive_nexus_server/) (HTTP/JSON-RPC), [`anda_cognitive_nexus_py`](../py/anda_cognitive_nexus_py/) (Py) |
-| Status                | KIP v1.0-RC10 conformant: full KQL/KML/META incl. `UPDATE`/`MERGE`/`EXPORT`, `EXPECT VERSION`, reserved `_` metadata, protected-scope enforcement.    |
+| Status                | KIP v1.0-RC11 conformant: full KQL/KML/META incl. `UPDATE`/`MERGE`/`EXPORT`, `EXPECT VERSION`, reserved `_` metadata, protected-scope enforcement.    |
 
 ---
 
@@ -101,7 +101,7 @@ mutate through KQL/KML/META instructions.
   handle that owns the `concepts` and `propositions` collections plus
   the KML lock.
 - An `impl Executor for CognitiveNexus` covering **all** of KIP
-  v1.0-RC10:
+  v1.0-RC11:
   - **KQL** with multi-hop graph traversal, optional zero-hop
     (`{0,n}`), filters with `IN`/`IS_NULL`/`IS_NOT_NULL`, `OPTIONAL` /
     `NOT` / `UNION` scopes, implicit `GROUP BY`, regex caching, and
@@ -376,19 +376,42 @@ against an existing database is safe:
    schemas described in §3.1.
 2. Register the BTree and BM25 indexes from §3.2 and install the jieba
    tokenizer.
-3. Synchronize the bundled system capsules (`BUNDLED_CAPSULES`, in
-   dependency order: `GENESIS_KIP` → `PERSON_KIP` → `PREFERENCE_KIP` →
-   `EVENT_KIP` → `SLEEP_TASK_KIP` → `INSIGHT_KIP` → `COMMITMENT_KIP`).
+3. Synchronize the bundled system capsules (`BUNDLED_CAPSULES`), in
+   dependency order — Genesis first, then the concept types, then the
+   predicate capsules that name those types in their `subject_types` /
+   `object_types`:
+
+   ```text
+   GENESIS_KIP
+     → PERSON_KIP → PREFERENCE_KIP → EVENT_KIP → SLEEP_TASK_KIP
+     → INSIGHT_KIP → COMMITMENT_KIP
+     → EXPERIENCE_KIP → EXPERIENCE_STEP_KIP → SKILL_KIP
+     → INVOLVES_PROP_KIP → MENTIONS_PROP_KIP → CONSOLIDATED_TO_PROP_KIP
+     → DERIVED_FROM_PROP_KIP → HAS_STEP_PROP_KIP → CAUSED_BY_PROP_KIP
+     → DERIVED_INSIGHT_PROP_KIP → COMPILED_TO_PROP_KIP
+   ```
+
    For each capsule the engine stores a hex-encoded SHA3-256 of its
    source as the `capsule_hash:<name>` collection extension. A capsule
    is (re-)applied when the stored hash differs from the bundled source
-   — i.e. when a crate upgrade ships a revised `.kip` file — or when
-   its anchor `$ConceptType` definition is missing (self-healing).
+   — i.e. when a crate upgrade ships a revised `.kip` file — or when the
+   definition it anchors is missing (self-healing). The anchor is a
+   `$ConceptType` for type capsules and a `$PropositionType` for
+   predicate capsules; both meta-types are checked, so a predicate
+   capsule is not treated as permanently missing.
    Capsules are idempotent `UPSERT` scripts: re-applying shallow-merges
    the revised definitions into existing instances without touching
    user data (schema nodes get a regular `_version` bump). A failed
    apply leaves the stored hash untouched, so the next `connect`
    retries.
+
+   The last eight capsules arrived with KIP v1.0-RC11: `involves` /
+   `mentions` / `consolidated_to` / `derived_from` moved out of
+   `Event.kip` into standalone capsules (widened to span `Event` and
+   `Experience`), joined by the Experience-specific `has_step`,
+   `caused_by`, `derived_insight` and `compiled_to`. Existing databases
+   pick all of this up on the next `connect`, since `Event.kip`'s hash
+   changed and the new capsules have no recorded hash at all.
 4. Call the user-supplied initialiser closure (typically used to seed
    application-specific concept types or to register `$self` /
    `$system`).
@@ -463,7 +486,7 @@ pub struct QueryCache {
 Each `SolutionTable` holds the surviving variable bindings of one connected
 pattern group; clauses that share a variable natural-join their tables, so
 multi-variable `FIND` results stay index-aligned by construction
-(RC10 §6.2.2).
+(RC11 §6.2.2).
 
 `QueryCache` is small but critical: a single KIP command may touch the
 same row many times (multi-hop traversals, NOT scopes, FILTER
@@ -498,11 +521,11 @@ parse_kql() ──► KqlQuery {
 
 WHERE clauses build solution tables in `ctx.tables` (natural-joined on
 shared variables — see §7). FIND projects columns from the joined
-tables, deduplicates identical solutions (set semantics, RC10 §3.3),
+tables, deduplicates identical solutions (set semantics, RC11 §3.3),
 applies `ORDER BY`, then paginates. When the `FIND` list contains a
 single expression the response payload is the expression's value
 directly; otherwise it is a JSON array of column arrays, preserving
-alignment across rows (RC10 §6.2.2).
+alignment across rows (RC11 §6.2.2).
 
 ### 8.2 WHERE clause executors
 
@@ -527,7 +550,7 @@ blocks contribute independent solutions (left-join padding for
 A proposition pattern with a `{m,n}` repetition compiles to a BFS over
 the `subject`-keyed BTree index, using `EntityID::to_string()` as the
 seed. The BFS skips zero-hop unless the user explicitly wrote `{0,n}`
-(RC10 §3.4.2). It enumerates *paths* (`bfs_multi_hop`):
+(RC11 §3.4.2). It enumerates *paths* (`bfs_multi_hop`):
 each queue entry is a path whose end node is extended one hop at a
 time, a `(node, depth)` visited set prevents re-expanding the same
 state, and every path whose length falls inside `[m, n]` (engine cap:
@@ -546,7 +569,7 @@ costs sub-linear in graph fan-out.
 ### 8.4 Filter semantics
 
 `FILTER(...)` accepts arbitrary boolean expressions over bound
-variables. The interesting RC10 features are:
+variables. The interesting RC11 features are:
 
 - **`IN [a, b, c]`** — set membership, evaluated in O(log n) when the
   comparison field is indexed.
@@ -572,7 +595,7 @@ variables. The interesting RC10 features are:
   `MIN` / `MAX`).
 
 When at least one expression is an aggregate, the executor implicitly
-groups by all *non-aggregate* expressions in the FIND list (RC10 §3.3).
+groups by all *non-aggregate* expressions in the FIND list (RC11 §3.3).
 Counting aggregates avoid IO entirely when the underlying binding is
 already known; grouped aggregation is keyed by the `(group_var,
 member_var)` pairs recorded in `ctx.group_pairs`.
@@ -591,10 +614,10 @@ types, handles and reserved metadata keys), then walks each
 `UpsertBlock` (concept or proposition) in declaration order, building a
 *handle table* (`?h → resolved id`). The block-level `WITH METADATA`
 map is the per-item default: each item's own metadata shallow-merges
-over it (RC10 §4.1), and `_`-prefixed keys are rejected with `KIP_2002`.
+over it (RC11 §4.1), and `_`-prefixed keys are rejected with `KIP_2002`.
 An `EXPECT VERSION` guard is checked against the element's
 `metadata._version`; any mismatch aborts the whole statement atomically
-with `KIP_3005` (RC10 §2.11.2). Concept blocks resolve via
+with `KIP_3005` (RC11 §2.11.2). Concept blocks resolve via
 `get_or_init_concept`; proposition blocks resolve subject and object
 through `PropositionPK::try_from`, which rejects unbound
 `Variable("...")` in nested position (the higher-order caveat from §4.5).
@@ -602,7 +625,7 @@ through `PropositionPK::try_from`, which rejects unbound
 The result is an `UpsertResult` JSON payload —
 `{"blocks": <n>, "upsert_concept_nodes": ["C:…", …],
 "upsert_proposition_links": ["P:…", …]}` — listing every top-level
-block's element ID in execution order (RC10 §6.2.2).
+block's element ID in execution order (RC11 §6.2.2).
 
 ### 9.2 `DELETE ATTRIBUTES` / `DELETE METADATA`
 
@@ -610,14 +633,14 @@ Both operate on a `target` clause that resolves to a `TargetEntities`
 set of concept and/or proposition ids. The executor walks each id,
 loads the row through the per-query cache, removes the requested keys,
 and writes back, returning `{"updated_concepts": <n>,
-"updated_propositions": <m>}` (RC10 §6.2.2). **After every successful
+"updated_propositions": <m>}` (RC11 §6.2.2). **After every successful
 `update` it invalidates the cached row** — see §12 for why.
 
 ### 9.3 `DELETE PROPOSITIONS`
 
-Per RC10 §4.2.3 the unit of deletion is the `(subject, predicate,
+Per RC11 §4.2.3 the unit of deletion is the `(subject, predicate,
 object)` triple, not the underlying row. The result is
-`{"deleted_propositions": <n>}` (RC10 §6.2.2). The executor:
+`{"deleted_propositions": <n>}` (RC11 §6.2.2). The executor:
 
 1. Resolves the target propositions.
 2. For each row, removes the matching predicate key from the
@@ -630,7 +653,7 @@ object)` triple, not the underlying row. The result is
 ### 9.4 `DELETE CONCEPT` and the protected scope
 
 `is_protected_concept` rejects deletions that would damage the agent's
-identity or the type system itself, returning `KIP_3004` (`KIP v1.0-RC10
+identity or the type system itself, returning `KIP_3004` (`KIP v1.0-RC11
 §4.2.4`). The protected set is:
 
 - `{type: "$ConceptType", name: "$ConceptType"}`
@@ -647,26 +670,26 @@ cascade: every concept id is BFS-expanded via the `subject` and
 proposition referring to *it* is also collected), and the resulting
 sets of concept and proposition ids are deleted in one Anda DB
 transaction. The result is `{"deleted_concepts": <n>,
-"deleted_propositions": <m>}` (RC10 §6.2.2).
+"deleted_propositions": <m>}` (RC11 §6.2.2).
 
 ### 9.5 `UPDATE` and `MERGE`
 
-`execute_update` (RC10 §4.3) resolves the target pattern, pre-flights
+`execute_update` (RC11 §4.3) resolves the target pattern, pre-flights
 the protected scope, then applies `SET ATTRIBUTES` / `SET METADATA` to
 each matched element. Update expressions (`ADD` / `MUL` / `CLAMP` /
 `COALESCE`) evaluate against the element's *current* values; a `null`
 or non-numeric operand skips that key for that element, which is why
 the result `{"updated": <n>, "matched": <m>}` may report
-`updated < matched` (RC10 §6.2.2).
+`updated < matched` (RC11 §6.2.2).
 
-`execute_merge` (RC10 §4.4) requires `?source` and `?target` to each
+`execute_merge` (RC11 §4.4) requires `?source` and `?target` to each
 bind exactly one concept of the same type, repoints and deduplicates
 every link, fills missing attributes (target wins; `aliases` unioned,
 the source name appended), deletes the source, and appends
 `"<Type>:<name>"` to the target's `metadata._merged_from` — carrying
 any `_merged_from` entries of the source forward so provenance survives
 chained merges. The result is `{"merged": true, "links_repointed": <n>,
-"links_deduplicated": <m>, "attributes_filled": <k>}` (RC10 §6.2.2).
+"links_deduplicated": <m>, "attributes_filled": <k>}` (RC11 §6.2.2).
 Replaying a completed merge surfaces `KIP_3002` with a self-diagnosing
 "already merged" hint.
 
@@ -774,7 +797,7 @@ which is gated behind a feature flag in this workspace.
 
 | Component         | Version pinned                                                                       |
 | :---------------- | :----------------------------------------------------------------------------------- |
-| KIP specification | `v1.0-RC10` (2026-07-04, see [SPECIFICATION.md](../rs/anda_kip/SPECIFICATION.md))    |
+| KIP specification | `v1.0-RC11` (2026-08-13, see [SPECIFICATION.md](../rs/anda_kip/SPECIFICATION.md))    |
 | `anda_kip` crate  | `0.10.x`                                                                             |
 | `anda_db` crate   | `0.10.x`                                                                             |
 | Rust edition      | 2024 (workspace-default; `async fn` in traits, `let-else`, …)                      |

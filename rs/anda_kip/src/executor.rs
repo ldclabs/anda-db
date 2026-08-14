@@ -194,7 +194,7 @@ pub async fn execute_readonly(
                 // by hand so the hint points at the right recovery action
                 // instead of the generic "check parentheses" syntax hint.
                 // (The code stays KIP_1001 until the spec defines a
-                // permission-denied code, proposed for RC11 as KIP_4004.)
+                // permission-denied code; RC11 still has none.)
                 return (
                     CommandType::Kml,
                     Response::Err {

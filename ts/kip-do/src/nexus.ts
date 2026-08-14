@@ -134,7 +134,10 @@ export class CognitiveNexus {
       const key = `capsule_hash:${capsule.name}`
       const hash = capsuleHash(capsule.source)
       const anchorPresent =
-        this.store.findConceptByTypeName('$ConceptType', capsule.anchor) !== null
+        this.store.findConceptByTypeName(
+          capsule.anchorType,
+          capsule.anchorName,
+        ) !== null
       if (metaGet(this.sql, key) === hash && anchorPresent) continue
 
       // Capsules create the very nodes the protected-scope guard defends, so

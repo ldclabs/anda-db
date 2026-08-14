@@ -210,22 +210,106 @@ impl Executor for CognitiveNexus {
 
 /// The system capsules bundled with this crate, applied by
 /// [`CognitiveNexus::connect`] in dependency order (Genesis first). Each
-/// entry is `(name, source, anchor)`: `name` keys the persisted content hash
-/// (`capsule_hash:<name>`), and `anchor` is the `$ConceptType` definition the
-/// capsule owns — used as a self-healing existence check besides the hash.
+/// entry is `(name, source, anchor_type, anchor_name)`: `name` keys the
+/// persisted content hash (`capsule_hash:<name>`), and the anchor pair names
+/// the meta-definition the capsule owns (a `$ConceptType` for type capsules,
+/// a `$PropositionType` for predicate capsules) — used as a self-healing
+/// existence check besides the hash.
+///
+/// The predicate capsules trail the concept types they reference: KIP
+/// v1.0-RC11 pulled `involves` / `mentions` / `consolidated_to` /
+/// `derived_from` out of `Event.kip` into standalone capsules (widened to
+/// span `Event` and `Experience`) and added the Experience-specific
+/// `has_step` / `caused_by` / `derived_insight` / `compiled_to`.
 ///
 /// `persons/self.kip` / `persons/system.kip` are deliberately **not**
 /// bundled: `$self` attributes evolve with the agent and must never be reset
 /// to the template by a re-applied capsule. Applications apply those
 /// capsules themselves.
-const BUNDLED_CAPSULES: &[(&str, &str, &str)] = &[
-    ("genesis", GENESIS_KIP, META_CONCEPT_TYPE),
-    ("person", PERSON_KIP, PERSON_TYPE),
-    ("preference", PREFERENCE_KIP, PREFERENCE_TYPE),
-    ("event", EVENT_KIP, EVENT_TYPE),
-    ("sleep_task", SLEEP_TASK_KIP, SLEEP_TASK_TYPE),
-    ("insight", INSIGHT_KIP, INSIGHT_TYPE),
-    ("commitment", COMMITMENT_KIP, COMMITMENT_TYPE),
+const BUNDLED_CAPSULES: &[(&str, &str, &str, &str)] = &[
+    ("genesis", GENESIS_KIP, META_CONCEPT_TYPE, META_CONCEPT_TYPE),
+    ("person", PERSON_KIP, META_CONCEPT_TYPE, PERSON_TYPE),
+    (
+        "preference",
+        PREFERENCE_KIP,
+        META_CONCEPT_TYPE,
+        PREFERENCE_TYPE,
+    ),
+    ("event", EVENT_KIP, META_CONCEPT_TYPE, EVENT_TYPE),
+    (
+        "sleep_task",
+        SLEEP_TASK_KIP,
+        META_CONCEPT_TYPE,
+        SLEEP_TASK_TYPE,
+    ),
+    ("insight", INSIGHT_KIP, META_CONCEPT_TYPE, INSIGHT_TYPE),
+    (
+        "commitment",
+        COMMITMENT_KIP,
+        META_CONCEPT_TYPE,
+        COMMITMENT_TYPE,
+    ),
+    (
+        "experience",
+        EXPERIENCE_KIP,
+        META_CONCEPT_TYPE,
+        EXPERIENCE_TYPE,
+    ),
+    (
+        "experience_step",
+        EXPERIENCE_STEP_KIP,
+        META_CONCEPT_TYPE,
+        EXPERIENCE_STEP_TYPE,
+    ),
+    ("skill", SKILL_KIP, META_CONCEPT_TYPE, SKILL_TYPE),
+    (
+        "involves",
+        INVOLVES_PROP_KIP,
+        META_PROPOSITION_TYPE,
+        INVOLVES_TYPE,
+    ),
+    (
+        "mentions",
+        MENTIONS_PROP_KIP,
+        META_PROPOSITION_TYPE,
+        MENTIONS_TYPE,
+    ),
+    (
+        "consolidated_to",
+        CONSOLIDATED_TO_PROP_KIP,
+        META_PROPOSITION_TYPE,
+        CONSOLIDATED_TO_TYPE,
+    ),
+    (
+        "derived_from",
+        DERIVED_FROM_PROP_KIP,
+        META_PROPOSITION_TYPE,
+        DERIVED_FROM_TYPE,
+    ),
+    (
+        "has_step",
+        HAS_STEP_PROP_KIP,
+        META_PROPOSITION_TYPE,
+        HAS_STEP_TYPE,
+    ),
+    (
+        "caused_by",
+        CAUSED_BY_PROP_KIP,
+        META_PROPOSITION_TYPE,
+        CAUSED_BY_TYPE,
+    ),
+    (
+        "derived_insight",
+        DERIVED_INSIGHT_PROP_KIP,
+        META_PROPOSITION_TYPE,
+        DERIVED_INSIGHT_TYPE,
+    ),
+    (
+        "compiled_to",
+        COMPILED_TO_PROP_KIP,
+        META_PROPOSITION_TYPE,
+        COMPILED_TO_TYPE,
+    ),
 ];
 
 /// Content hash of a bundled capsule source (hex-encoded SHA3-256). A
@@ -337,7 +421,8 @@ impl CognitiveNexus {
     /// Applies every bundled capsule whose recorded content hash
     /// (`capsule_hash:<name>` extension on the `concepts` collection)
     /// differs from the source shipped with this crate, or whose anchor
-    /// `$ConceptType` definition node is missing (self-healing).
+    /// `$ConceptType` / `$PropositionType` definition node is missing
+    /// (self-healing).
     ///
     /// Bundled capsules are idempotent `UPSERT` scripts, so re-applying one
     /// after a crate upgrade shallow-merges the revised definitions into an
@@ -345,15 +430,15 @@ impl CognitiveNexus {
     /// regular `_version` bump). A failed apply leaves the stored hash
     /// untouched, so the next [`connect`](Self::connect) retries it.
     async fn sync_bundled_capsules(&self) -> Result<(), KipError> {
-        for (name, source, anchor) in BUNDLED_CAPSULES {
+        for (name, source, anchor_type, anchor_name) in BUNDLED_CAPSULES {
             let key = format!("capsule_hash:{name}");
             let current = capsule_hash(source);
             let stored: Option<String> = self.concepts().get_extension_as(&key);
             let hash_current = stored.as_deref() == Some(current.as_str());
             let anchor_missing = !self
                 .has_concept(&ConceptPK::Object {
-                    r#type: META_CONCEPT_TYPE.to_string(),
-                    name: anchor.to_string(),
+                    r#type: anchor_type.to_string(),
+                    name: anchor_name.to_string(),
                 })
                 .await;
             if hash_current && !anchor_missing {

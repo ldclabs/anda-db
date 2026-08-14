@@ -104,7 +104,7 @@ async fn test_connect_syncs_bundled_capsules_by_content_hash() {
     let first = CognitiveNexus::connect(Arc::clone(&db), async |_| Ok(()))
         .await
         .unwrap();
-    for (name, source, _) in BUNDLED_CAPSULES {
+    for (name, source, _, _) in BUNDLED_CAPSULES {
         assert_eq!(
             first
                 .concepts()
@@ -163,39 +163,55 @@ async fn test_connect_syncs_bundled_capsules_by_content_hash() {
     );
 
     // Self-healing: deleting an anchor definition (hash still current)
-    // re-applies that capsule on the next connect.
-    second
-        .execute_kml(
-            parse_kml(
-                r#"DELETE CONCEPT ?c DETACH
-                    WHERE { ?c {type: "$ConceptType", name: "Insight"} }"#,
-            )
-            .unwrap(),
-            false,
-        )
-        .await
-        .unwrap();
-    assert!(
-        !second
-            .has_concept(&ConceptPK::Object {
-                r#type: META_CONCEPT_TYPE.to_string(),
-                name: INSIGHT_TYPE.to_string(),
-            })
+    // re-applies that capsule on the next connect. `has_step` covers the
+    // predicate capsules, whose anchor is a `$PropositionType` rather than a
+    // `$ConceptType` — a check keyed to the wrong meta-type would consider
+    // every predicate capsule permanently missing and re-apply it on every
+    // connect.
+    for statement in [
+        r#"DELETE CONCEPT ?c DETACH
+            WHERE { ?c {type: "$ConceptType", name: "Insight"} }"#,
+        r#"DELETE CONCEPT ?p DETACH
+            WHERE { ?p {type: "$PropositionType", name: "has_step"} }"#,
+    ] {
+        second
+            .execute_kml(parse_kml(statement).unwrap(), false)
             .await
-    );
+            .unwrap();
+    }
+    for (r#type, name) in [
+        (META_CONCEPT_TYPE, INSIGHT_TYPE),
+        (META_PROPOSITION_TYPE, HAS_STEP_TYPE),
+    ] {
+        assert!(
+            !second
+                .has_concept(&ConceptPK::Object {
+                    r#type: r#type.to_string(),
+                    name: name.to_string(),
+                })
+                .await,
+            "{name} should have been deleted"
+        );
+    }
     drop(second);
 
     let third = CognitiveNexus::connect(Arc::clone(&db), async |_| Ok(()))
         .await
         .unwrap();
-    assert!(
-        third
-            .has_concept(&ConceptPK::Object {
-                r#type: META_CONCEPT_TYPE.to_string(),
-                name: INSIGHT_TYPE.to_string(),
-            })
-            .await
-    );
+    for (r#type, name) in [
+        (META_CONCEPT_TYPE, INSIGHT_TYPE),
+        (META_PROPOSITION_TYPE, HAS_STEP_TYPE),
+    ] {
+        assert!(
+            third
+                .has_concept(&ConceptPK::Object {
+                    r#type: r#type.to_string(),
+                    name: name.to_string(),
+                })
+                .await,
+            "{name} should have been restored"
+        );
+    }
 }
 
 async fn setup_test_data(nexus: &CognitiveNexus) -> Result<(), KipError> {
@@ -2414,8 +2430,15 @@ async fn test_meta_search() {
         .await
         .unwrap();
     let result = result.as_array().unwrap();
-    // println!("{:#?}", result);
-    assert_eq!(result.len(), 6);
+    // Every fixture concept carries `source: "test_data"` in its metadata, so
+    // all six must come back. The total is deliberately not asserted: BM25
+    // splits the query into `test` + `data`, and bundled-capsule prose
+    // ("testable", "raw_data_ref", …) scores incidental hits that shift
+    // whenever a capsule is revised.
+    let names: Vec<&str> = result.iter().filter_map(|r| r["name"].as_str()).collect();
+    for expected in ["Headache", "Fever", "Aspirin", "treats", "Drug", "Symptom"] {
+        assert!(names.contains(&expected), "missing {expected} in {names:?}");
+    }
 
     let (result, _) = nexus
         .execute_meta(parse_meta(r#"SEARCH CONCEPT "test_data" LIMIT 5"#).unwrap())
@@ -5136,9 +5159,12 @@ async fn test_kql_filter_on_predicate_variable() {
     assert!(neighbors.contains(&json!("Fever")));
 }
 
-/// The RC10 sleep-cycle confidence-decay UPDATE: fully unconstrained
+/// The spec's sleep-cycle decay `UPDATE`: fully unconstrained
 /// `(?s, ?p, ?o)` exploration plus predicate-variable FILTER plus update
-/// expressions, in one statement.
+/// expressions, in one statement. RC11 retargets the canonical sweep from
+/// `confidence` to `memory_strength` (time-based disuse must not erode
+/// epistemic support), but the engine mechanics under test are the same and
+/// the fixtures carry `confidence`, so the sweep is kept in that form here.
 #[tokio::test]
 async fn test_kml_update_decay_with_full_scan_pattern() {
     let nexus = setup_test_db(async |_| Ok(())).await.unwrap();

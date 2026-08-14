@@ -8,7 +8,7 @@ UPSERT {
                 "target_type": {
                     "type": "string",
                     "is_required": true,
-                    "description": "Type of the target concept (e.g., 'Event', 'Preference', 'Person')."
+                    "description": "Type of the target concept (e.g., 'Event', 'Experience', 'Skill', 'Preference', 'Person')."
                 },
                 "target_name": {
                     "type": "string",
@@ -20,13 +20,14 @@ UPSERT {
                     "is_required": true,
                     "enum": [
                         "consolidate_to_semantic",
+                        "compile_to_skill",
                         "archive",
                         "merge_duplicates",
                         "reclassify",
                         "review",
                         "resolve_contradiction"
                     ],
-                    "description": "The maintenance action to perform. 'resolve_contradiction' is used when Formation detects conflicting facts that require deeper analysis."
+                    "description": "The maintenance action to perform. 'consolidate_to_semantic' extracts durable Knowledge or Insight; 'compile_to_skill' performs procedural consolidation over one or more Experiences; 'resolve_contradiction' handles conflicting facts or policies that require deeper analysis."
                 },
                 "reason": {
                     "type": "string",
@@ -41,7 +42,7 @@ UPSERT {
                 },
                 "priority": {
                     "type": "number",
-                    "description": "Higher = more urgent. Guidelines: 3+ = user correction or contradiction, 2 = ambiguous pattern, 1 = routine consolidation.",
+                    "description": "Higher = more urgent. Guidelines: 4 = safety-critical failure, severe repeated error, or user correction with behavioral consequence; 3 = strong reusable success/failure contrast or explicit contradiction; 2 = ambiguous cross-experience pattern; 1 = routine consolidation.",
                     "default_value": 1
                 },
                 "result": {

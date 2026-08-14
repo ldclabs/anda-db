@@ -300,6 +300,30 @@ describe('META surface', () => {
     expect(primer.parser_version).toMatch(/^\d+\.\d+\.\d+$/)
   })
 
+  it('bootstraps the whole RC11 cognitive-memory vocabulary', async () => {
+    // Each bundled capsule owns one definition, and the bootstrap loop skips a
+    // capsule whose anchor already resolves — so a wrong anchor meta-type is
+    // invisible until a type or predicate silently goes missing from a fresh
+    // database. Assert both listings instead.
+    const stub = await freshStub()
+    const conceptTypes = await ok(stub, 'DESCRIBE CONCEPT TYPES')
+    for (const name of [
+      'Person', 'Event', 'Preference', 'Insight', 'Commitment', 'SleepTask',
+      'Experience', 'ExperienceStep', 'Skill',
+    ]) {
+      expect(conceptTypes, name).toContain(name)
+    }
+
+    const propositionTypes = await ok(stub, 'DESCRIBE PROPOSITION TYPES')
+    for (const name of [
+      'belongs_to_domain', 'involves', 'mentions', 'consolidated_to',
+      'derived_from', 'prefers', 'learned', 'committed_to', 'owed_to',
+      'assigned_to', 'has_step', 'caused_by', 'derived_insight', 'compiled_to',
+    ]) {
+      expect(propositionTypes, name).toContain(name)
+    }
+  })
+
   it('DESCRIBE type listings paginate', async () => {
     const stub = await freshStub()
     await ok(

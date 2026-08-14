@@ -2,6 +2,77 @@
 
 All notable changes to this workspace are documented in this file.
 
+## [KIP v1.0-RC11] — 2026-08-14
+
+`anda_kip` 0.11.1 · `anda_cognitive_nexus` 0.11.1 · `@ldclabs/kip-do` 0.12.2.
+
+Titled by protocol revision rather than by a workspace version: `0.11.1` was
+already used on 2026-07-31 for `anda_db` / `anda_db_btree` / `anda_db_server`,
+and the two KIP crates are only now catching up to that number. No other crate
+changes, and the inter-crate requirements (`anda_kip = "0.11"`) are unaffected.
+
+### Added
+
+- **KIP v1.0-RC11 — the Experience Learning cognitive profile** — RC11 adds no
+  KQL/KML syntax; it extends the recommended cognitive memory profile and the
+  metadata catalog, and both engines pick that up through their bundled
+  capsules. `anda_kip` now bundles three new concept types — `Experience` (a
+  goal-directed state/action/observation trajectory), `ExperienceStep` (one
+  ordered unit of it) and `Skill` (procedural memory compiled from
+  Experiences) — plus eight standalone predicate capsules. Four of those are
+  not new predicates but a **relocation**: `involves`, `mentions`,
+  `consolidated_to` and `derived_from` used to be declared inside
+  `Event.kip` and now ship as their own capsules, widened so `Event` **and**
+  `Experience` are legal subjects (`derived_from` gains `Experience` as a
+  legal object). The other four are Experience-specific: `has_step`,
+  `caused_by` (effect → cause, and only with evidence beyond temporal
+  adjacency), `derived_insight` and `compiled_to`. New `anda_kip` constants:
+  `EXPERIENCE_TYPE` / `EXPERIENCE_STEP_TYPE` / `SKILL_TYPE`, the eight
+  `*_TYPE` predicate names, and the matching `EXPERIENCE_KIP` /
+  `EXPERIENCE_STEP_KIP` / `SKILL_KIP` / `*_PROP_KIP` capsule sources.
+- **`memory_strength` as an orthogonal memory axis** — Appendix 1 of the spec
+  now separates mnemonic accessibility (`memory_strength`, raised by
+  reinforcement and lowered by disuse) from epistemic support (`confidence`,
+  which changes on evidence, contradiction or retraction — never on the mere
+  passage of time). The canonical sleep-cycle decay sweep in §4.3 was
+  retargeted accordingly. This is a guidance change: no engine field is
+  reserved or enforced, and both metadata keys remain ordinary user metadata.
+
+### Changed
+
+- **Bundled-capsule anchors carry their meta-type** — The self-healing
+  existence check that runs beside each capsule's content hash used to look
+  the anchor up as a `$ConceptType` unconditionally, which cannot express a
+  capsule that owns a predicate. `anda_cognitive_nexus`'s `BUNDLED_CAPSULES`
+  entries and `kip-do`'s generated `Capsule` records now carry the anchor's
+  meta-type (`$ConceptType` or `$PropositionType`) beside its name, so
+  `kip-do`'s `Capsule.anchor` becomes `anchorType` + `anchorName`. Both are
+  internal — neither `BUNDLED_CAPSULES` nor `Capsule` is re-exported from
+  `@ldclabs/kip-do`'s entry point — so no published API changes.
+- **Existing databases upgrade on the next connect** — `Event.kip`,
+  `Genesis.kip`, `Insight.kip`, `Preference.kip` and `SleepTask.kip` all
+  changed content, and the ten new capsules have no recorded hash, so
+  `CognitiveNexus::connect` (and the Durable Object's bootstrap-version
+  check) re-applies exactly the affected capsules. Capsules are idempotent
+  `UPSERT` scripts, so no user data is touched. `Preference` gains a
+  `source_memory` attribute (`source_event` is kept and documented as legacy),
+  and `SleepTask.requested_action` gains `compile_to_skill`.
+
+### Documentation
+
+- `docs/anda_kip.md` and `docs/anda_cognitive_nexus.md` synced to KIP
+  v1.0-RC11, including the expanded capsule constant table and the capsule
+  dependency order (concept types before the predicates that reference them);
+  `SPECIFICATION.md`, `KIPSyntax.md`, `SystemInstructions.md` and
+  `SelfInstructions.md` mirrored from the RC11 upstream.
+
+### Known gap
+
+- `kip-do`'s `DESCRIBE PRIMER` still reports `spec_revision: "v1.0-RC10"`. The
+  value comes from `KIP_SPEC_REVISION` in the upstream `@ldclabs/kip-lang`
+  package (0.4.0), which has not been republished for RC11; it will correct
+  itself when that dependency is bumped.
+
 ## [0.11.1] — 2026-07-31
 
 ### Fixed
