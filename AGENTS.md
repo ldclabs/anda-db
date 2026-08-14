@@ -26,10 +26,18 @@ rs/
 ├── anda_cognitive_nexus/         # Reference KIP memory graph runtime
 ├── anda_db_server/               # HTTP server for core database APIs
 ├── anda_cognitive_nexus_server/  # HTTP/JSON-RPC server for Cognitive Nexus
-└── anda_db_shard_proxy/          # Shard proxy for multi-tenant deployments
+├── anda_db_shard_proxy/          # Shard proxy for multi-tenant deployments
+├── anda_kip_wasm/                # WASM wrapper of the KIP parser, test oracle for ts/kip-do
+└── cf-tokenizer/                 # Stateless jieba segmentation HTTP service (own nested workspace)
+
+ts/
+└── kip-do/                       # @ldclabs/kip-do: KIP engine on SQLite-backed Durable Objects
 
 py/
 └── anda_cognitive_nexus_py/      # Python binding crate, excluded from workspace by default
+
+fixtures/
+└── kip-conformance/              # Cross-engine KIP conformance fixtures (Rust + TS both run them)
 ```
 
 ## Working with AndaDB

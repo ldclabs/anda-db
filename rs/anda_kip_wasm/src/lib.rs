@@ -72,15 +72,19 @@ pub fn parse(input: &str) -> String {
 /// than to the number of statements.
 ///
 /// Input is a JSON array of strings; output is a JSON array of the same
-/// envelopes [`parse`] returns, positionally aligned with the input.
+/// envelopes [`parse`] returns, positionally aligned with the input. A
+/// payload that does not decode as an array of strings yields a one-element
+/// array carrying the decode error, so the output is an array in every case
+/// and a consumer's `.map` never explodes on a bare object.
 #[wasm_bindgen]
 pub fn parse_batch(inputs_json: &str) -> String {
     let inputs: Vec<String> = match serde_json::from_str(inputs_json) {
         Ok(inputs) => inputs,
         Err(err) => {
-            return error_json(&KipError::invalid_syntax(format!(
+            let envelope = error_json(&KipError::invalid_syntax(format!(
                 "expected a JSON array of command strings: {err}"
             )));
+            return format!("[{envelope}]");
         }
     };
 
