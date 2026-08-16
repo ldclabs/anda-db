@@ -398,14 +398,41 @@ pub struct SpaceRow {
     pub description: String,
     /// The Principal that owns the Space — an authenticated identity, not a
     /// semantic `$self` Concept (§6 of the migration guide).
+    ///
+    /// The first owner. [`owners`](Self::owners) is the full set; this column
+    /// stays because it is what every existing row carries and because a Space
+    /// with no owner at all is a Space nobody can administer.
     pub owner_principal: String,
+    /// Every owning Principal (Governance §20, §23).
+    ///
+    /// Ownership is Governance state. It is not derived from a semantic
+    /// ownership Proposition, from the Space's name, or from who happened to
+    /// write the most into it.
+    pub owners: Vec<String>,
+    /// `active`, `suspended` or `archived`.
+    pub status: String,
+    /// The Governance Policy this Space is evaluated under; empty for none.
+    pub default_policy_id: String,
+    /// The epistemic trust policy bound to this Space; empty for none.
+    ///
+    /// Kept apart from `default_policy_id` because trust and access are
+    /// different questions: what this Brain believes and what a caller may see
+    /// are decided by different state under different authority (§111, §116).
+    pub trust_policy_id: String,
+    /// The classification an element gets when nothing else assigns one.
+    ///
+    /// Never `public` by default: §95 forbids reading an absent classification
+    /// as freely disclosable.
+    pub default_classification: String,
+    /// How much of what happens here is written to the Governance audit.
+    pub audit_mode: String,
     /// When the Space was created.
     pub created_at: String,
     /// The Space's current sequence coordinate; every commit advances it.
     pub seq: u64,
     /// The active Schema Environment version.
     pub schema_environment_version: u64,
-    /// The Governance policies bound to this Space.
+    /// Space-local Governance settings that have no column of their own.
     pub policies: Json,
 }
 

@@ -46,6 +46,18 @@ pub struct SpaceDraft {
     pub description: String,
     /// The owning Principal.
     pub owner_principal: String,
+    /// Any further owning Principals beyond the first.
+    pub owners: Vec<String>,
+    /// The Governance Policy to evaluate this Space under; empty for none.
+    pub default_policy_id: String,
+    /// The classification an element gets when nothing else assigns one.
+    ///
+    /// Empty falls back to [`classification::DEFAULT`], which is deliberately
+    /// not `public`: a Space that says nothing about sensitivity has not
+    /// thereby declared its contents disclosable (§95).
+    ///
+    /// [`classification::DEFAULT`]: crate::governance::classification::DEFAULT
+    pub default_classification: String,
 }
 
 impl Store {
@@ -57,6 +69,10 @@ impl Store {
         if let Some(existing) = self.find_space(&draft.space_id).await? {
             return Ok(existing);
         }
+        let mut owners = draft.owners;
+        if !draft.owner_principal.is_empty() && !owners.contains(&draft.owner_principal) {
+            owners.insert(0, draft.owner_principal.clone());
+        }
         let row = SpaceRow {
             _id: 0,
             space_id: draft.space_id,
@@ -64,6 +80,16 @@ impl Store {
             name: draft.name,
             description: draft.description,
             owner_principal: draft.owner_principal,
+            owners,
+            status: "active".to_string(),
+            default_policy_id: draft.default_policy_id,
+            trust_policy_id: String::new(),
+            default_classification: if draft.default_classification.is_empty() {
+                crate::governance::classification::DEFAULT.to_string()
+            } else {
+                draft.default_classification
+            },
+            audit_mode: "standard".to_string(),
             created_at: time::now(),
             // Sequence 0 is "nothing has happened here yet", so the first
             // commit is sequence 1 and no element ever carries `space_seq: 0`.
@@ -86,6 +112,72 @@ impl Store {
             None => Ok(None),
             Some(id) => Ok(Some(spaces.get_as(*id).await.map_err(db_error)?)),
         }
+    }
+
+    /// Gives every ownerless Space to the system Principal.
+    ///
+    /// A Space written before this Nexus had a Governance plane carries no
+    /// owner, and under default deny (§41) an unowned Space is one nobody can
+    /// administer — including to give it an owner. Adopting it here preserves
+    /// exactly the authority such a database already had (the host process owned
+    /// it outright) rather than granting anything new, and it happens on open so
+    /// that no read or write ever observes the ownerless state.
+    ///
+    /// A Space that already names an owner is left alone. This is a bootstrap,
+    /// not a claim.
+    pub async fn adopt_unowned_spaces(&self, principal: &str) -> Result<usize, KipError> {
+        let spaces = self.spaces();
+        // Ranged over `space_id` rather than filtered on `owner_principal`:
+        // ownership is not an indexed column, and a Nexus holds few enough
+        // Spaces that enumerating them on open costs nothing worth an index.
+        let ids = spaces
+            .query_all_ids(anda_db::query::Filter::Field((
+                "space_id".to_string(),
+                anda_db::query::RangeQuery::Gt(Fv::Text(String::new())),
+            )))
+            .await
+            .map_err(db_error)?;
+        let mut adopted = 0;
+        for id in ids {
+            let row: SpaceRow = spaces.get_as(id).await.map_err(db_error)?;
+            if !row.owner_principal.is_empty() {
+                continue;
+            }
+            let mut owners = row.owners.clone();
+            if !owners.iter().any(|owner| owner == principal) {
+                owners.insert(0, principal.to_string());
+            }
+            self.put_space(&SpaceRow {
+                owner_principal: principal.to_string(),
+                owners,
+                default_classification: if row.default_classification.is_empty() {
+                    crate::governance::classification::DEFAULT.to_string()
+                } else {
+                    row.default_classification.clone()
+                },
+                status: if row.status.is_empty() {
+                    "active".to_string()
+                } else {
+                    row.status.clone()
+                },
+                ..row
+            })
+            .await?;
+            adopted += 1;
+        }
+        Ok(adopted)
+    }
+
+    /// Writes a Space record back as given.
+    ///
+    /// The Governance members are the only thing that changes through here; the
+    /// sequence advances through [`Store::begin_transaction`] instead, so a
+    /// Governance edit can never move a Space's history coordinate.
+    pub async fn put_space(&self, row: &SpaceRow) -> Result<(), KipError> {
+        let spaces = self.spaces();
+        let fields = super::full_row_fields(spaces.schema(), row)?;
+        spaces.update(row._id, fields).await.map_err(db_error)?;
+        Ok(())
     }
 
     /// Looks a Space up, failing when it does not exist.

@@ -25,6 +25,9 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+use crate::governance::SYSTEM_PRINCIPAL;
+use crate::governance::rows::principal_class;
+use crate::governance::store::PrincipalDraft;
 use crate::schema::{SchemaEnvironment, SchemaPackage};
 use crate::store::Store;
 use crate::store::space::SpaceDraft;
@@ -61,13 +64,25 @@ impl CognitiveNexus {
         store.sweep_pending().await?;
         store.install_core_package().await?;
         store
+            .governance
+            .ensure_principal(PrincipalDraft {
+                principal_id: SYSTEM_PRINCIPAL.to_string(),
+                principal_class: principal_class::SYSTEM.to_string(),
+                display_name: "The Nexus itself".to_string(),
+                auth_provider: "engine".to_string(),
+                auth_subject: SYSTEM_PRINCIPAL.to_string(),
+            })
+            .await?;
+        store
             .open_or_create_space(SpaceDraft {
                 space_id: DEFAULT_SPACE.to_string(),
                 name: "Default MemorySpace".to_string(),
                 description: "The Space a request runs against when it names none.".to_string(),
+                owner_principal: SYSTEM_PRINCIPAL.to_string(),
                 ..Default::default()
             })
             .await?;
+        store.adopt_unowned_spaces(SYSTEM_PRINCIPAL).await?;
         Ok(Self {
             store,
             default_space: DEFAULT_SPACE.to_string(),
@@ -85,6 +100,21 @@ impl CognitiveNexus {
             default_space: DEFAULT_SPACE.to_string(),
             lock: Arc::new(RwLock::new(())),
         }
+    }
+
+    /// The Governance Control Plane.
+    ///
+    /// A **host** handle, and deliberately not an authorized one: whoever holds
+    /// a `&CognitiveNexus` is the process that opened the database, and asking
+    /// that process to prove to itself that it may configure its own Space
+    /// would be theatre. Authorization is what happens to *callers*, and a
+    /// caller reaches the engine through a session, never through this.
+    ///
+    /// Which is also why Governance mutation lives here rather than in KML: a
+    /// language a model writes must not be a language that can change who
+    /// controls the Space (§264).
+    pub fn governance(&self) -> &crate::governance::store::GovernanceStore {
+        &self.store.governance
     }
 
     /// Installs a Schema Package artifact. Installing does not activate it.

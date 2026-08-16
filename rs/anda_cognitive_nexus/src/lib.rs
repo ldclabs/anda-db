@@ -89,6 +89,7 @@
 
 pub mod capsule;
 pub mod error;
+pub mod governance;
 pub mod id;
 pub mod kml;
 pub mod kql;

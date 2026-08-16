@@ -1,8 +1,12 @@
 //! # The storage layer
 //!
-//! Nine `anda_db` collections: one per Core element kind (Spec §6.1), plus the
-//! MemorySpace registry, the transaction journal, and the Schema Package and
-//! Schema Environment registries.
+//! Ten `anda_db` collections: one per Core element kind (Spec §6.1), plus the
+//! MemorySpace registry, the transaction journal, the Schema Package and Schema
+//! Environment registries, and the element version log. The Governance Control
+//! Plane's eight collections live beside them under
+//! [`governance`](crate::governance::store), in the same database and behind
+//! the same flush — but semantically a different plane, and reachable from no
+//! cognitive write path.
 //!
 //! ## Why the element kinds do not share a collection
 //!
@@ -80,18 +84,18 @@ pub const ELEMENT_VERSIONS: &str = "element_versions";
 
 /// A collection handle that survives poisoning.
 #[derive(Clone, Debug)]
-struct Slot(Arc<parking_lot::RwLock<Arc<Collection>>>);
+pub(crate) struct Slot(Arc<parking_lot::RwLock<Arc<Collection>>>);
 
 impl Slot {
-    fn new(collection: Arc<Collection>) -> Self {
+    pub(crate) fn new(collection: Arc<Collection>) -> Self {
         Self(Arc::new(parking_lot::RwLock::new(collection)))
     }
 
-    fn get(&self) -> Arc<Collection> {
+    pub(crate) fn get(&self) -> Arc<Collection> {
         self.0.read().clone()
     }
 
-    fn set(&self, collection: Arc<Collection>) {
+    pub(crate) fn set(&self, collection: Arc<Collection>) {
         *self.0.write() = collection;
     }
 }
@@ -101,6 +105,12 @@ impl Slot {
 pub struct Store {
     /// The underlying database, shared with whatever else the host registered.
     pub db: Arc<AndaDB>,
+    /// The Governance Control Plane's own collections.
+    ///
+    /// Reached from here so that the two planes share one database handle, one
+    /// flush and one poison recovery — and from nowhere in [`kml`](crate::kml),
+    /// which is what keeps an ordinary cognitive write off the control plane.
+    pub governance: crate::governance::store::GovernanceStore,
     concepts: Slot,
     propositions: Slot,
     assertions: Slot,
@@ -342,8 +352,11 @@ impl Store {
             .await
             .map_err(db_error)?;
 
+        let governance = crate::governance::store::GovernanceStore::open(db.clone()).await?;
+
         Ok(Self {
             db,
+            governance,
             concepts: Slot::new(concepts),
             propositions: Slot::new(propositions),
             assertions: Slot::new(assertions),
@@ -434,6 +447,7 @@ impl Store {
         ]
         .iter()
         .any(|c| c.is_poisoned())
+            || self.governance.has_poisoned_handle()
     }
 
     /// Reloads every collection handle from storage.
@@ -462,6 +476,7 @@ impl Store {
             .set(self.reload(SCHEMA_ENVS, init_schema_envs).await?);
         self.element_versions
             .set(self.reload(ELEMENT_VERSIONS, init_element_versions).await?);
+        self.governance.reopen().await?;
         Ok(())
     }
 
@@ -499,6 +514,7 @@ impl Store {
         ] {
             collection.flush(now_ms).await.map_err(db_error)?;
         }
+        self.governance.flush(now_ms).await?;
         Ok(())
     }
 
@@ -536,6 +552,30 @@ impl Store {
     pub async fn contains(&self, id: ElementId) -> bool {
         self.elements(id.kind).contains(id.seq)
     }
+}
+
+/// The full-row assignment map an `anda_db` update takes.
+///
+/// Whole rows rather than a computed delta, for the same reason
+/// [`Store::update`](write) rewrites everything: a delta is a second place
+/// where the column list is enumerated, and a column missing from it stops
+/// being persisted without anything failing.
+pub(crate) fn full_row_fields<T: serde::Serialize>(
+    schema: Arc<anda_db_schema::Schema>,
+    row: &T,
+) -> Result<std::collections::BTreeMap<String, Fv>, KipError> {
+    let document = anda_db_schema::Document::try_from(schema.clone(), row).map_err(schema_error)?;
+    let mut fields = std::collections::BTreeMap::new();
+    for entry in schema.iter() {
+        // `_id` is the update's target, not one of its assignments.
+        if entry.name() == "_id" {
+            continue;
+        }
+        if let Some(value) = document.get_field(entry.name()) {
+            fields.insert(entry.name().to_string(), value.clone());
+        }
+    }
+    Ok(fields)
 }
 
 fn collection_config(name: &str, description: &str) -> CollectionConfig {
