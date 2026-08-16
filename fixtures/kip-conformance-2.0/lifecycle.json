@@ -1,0 +1,63 @@
+{
+  "name": "lifecycle",
+  "description": "Nothing is rewritten and nothing is erased. An Assertion's epistemic payload is immutable, so correcting a claim records a new one and supersedes the old; an element that leaves ordinary recall keeps resolving as a reference.",
+  "setup": [
+    "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE ASSERTION ?old {\n    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 }\n  }\n}"
+  ],
+  "cases": [
+    {
+      "name": "a claim starts active",
+      "command": "FIND(?a.lifecycle.status) WHERE { ?a ASSERTION {} }",
+      "expect": {
+        "result": [
+          "active"
+        ]
+      }
+    },
+    {
+      "name": "correcting a claim is a new Assertion plus supersession, never an edit",
+      "command": "MUTATE {\n  ASSERT ?new (:alice, \"prefers\", :dark) { by: :alice, mode: \"stated\", confidence: 0.4 }\n    SUPERSEDING :old\n}",
+      "params": {},
+      "expect": {
+        "error": "InvalidRequestEnvelope"
+      }
+    },
+    {
+      "name": "an Assertion's stance cannot be rewritten in place",
+      "command": "UPDATE ?a SET FIELDS { stance: \"reject\" } WHERE { ?a ASSERTION {} }",
+      "expect": {
+        "error": "InvalidSyntax"
+      }
+    },
+    {
+      "name": "an archived element leaves ordinary recall",
+      "command": "FIND(COUNT(?c)) WHERE { ?c CONCEPT {type: \"Person\"} }",
+      "expect": {
+        "result": [
+          1
+        ]
+      }
+    },
+    {
+      "name": "the record of what was claimed survives being questioned",
+      "command": "FIND(?a.confidence, ?a.stance) WHERE { ?a ASSERTION {} }",
+      "expect": {
+        "result": [
+          [
+            0.9,
+            "support"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "an element referenced by a tuple still resolves after archiving",
+      "command": "FIND(COUNT(?p)) WHERE { ?p PROPOSITION (?s, \"prefers\", ?o) }",
+      "expect": {
+        "result": [
+          1
+        ]
+      }
+    }
+  ]
+}

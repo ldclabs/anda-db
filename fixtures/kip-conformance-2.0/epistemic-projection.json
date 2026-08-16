@@ -1,0 +1,64 @@
+{
+  "name": "epistemic-projection",
+  "description": "Belief is projected from the Assertions on record. Silence is insufficient and never rejection; repetition is not corroboration; material disagreement is contested rather than decided.",
+  "packages": [
+    {
+      "format": "KIP-Schema-Package",
+      "manifest": { "package_id": "kip://conformance/status", "version": "1.0.0" },
+      "definitions": {
+        "concept_types": {
+          "Service": { "kind": "ConceptType", "description": "A service." },
+          "Status": { "kind": "ConceptType", "description": "A status value." }
+        },
+        "predicates": {
+          "status": {
+            "kind": "PredicateType",
+            "description": "Single-valued current status.",
+            "functional": true
+          }
+        }
+      }
+    }
+  ],
+  "setup": [
+    "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?bob { TYPE \"Person\" NAME \"Bob\" }\n  CREATE CONCEPT ?carol { TYPE \"Person\" NAME \"Carol\" }\n  CREATE CONCEPT ?quiet { TYPE \"Preference\" NAME \"Quiet\" }\n  CREATE CONCEPT ?loud { TYPE \"Preference\" NAME \"Loud\" }\n  ENSURE PROPOSITION ?unspoken (?alice, \"prefers\", ?quiet)\n  ENSURE PROPOSITION ?repeated (?alice, \"prefers\", ?loud)\n}",
+    "MUTATE {\n  CREATE CONCEPT ?svc { TYPE \"Service\" NAME \"api\" }\n  CREATE CONCEPT ?healthy { TYPE \"Status\" NAME \"healthy\" }\n  CREATE CONCEPT ?degraded { TYPE \"Status\" NAME \"degraded\" }\n  ENSURE PROPOSITION ?ok (?svc, \"status\", ?healthy)\n  ENSURE PROPOSITION ?bad (?svc, \"status\", ?degraded)\n}"
+  ],
+  "cases": [
+    {
+      "name": "nothing on record is insufficient, not rejected",
+      "command": "FIND(?b.status) WHERE {\n  ?s CONCEPT {name: \"Alice\"}\n  ?o CONCEPT {name: \"Quiet\"}\n  ?p PROPOSITION (?s, \"prefers\", ?o)\n  ?b BELIEF (?p)\n}",
+      "expect": { "result": ["insufficient"] }
+    },
+    {
+      "name": "an unsupported Proposition has no support and no opposition",
+      "command": "FIND(?b.support.score, ?b.opposition.score) WHERE {\n  ?s CONCEPT {name: \"Alice\"}\n  ?o CONCEPT {name: \"Quiet\"}\n  ?p PROPOSITION (?s, \"prefers\", ?o)\n  ?b BELIEF (?p)\n}",
+      "expect": { "result": [[0.0, 0.0]] }
+    },
+    {
+      "name": "a projection declares that its score is not a probability",
+      "command": "FIND(?b.support.score_semantics) WHERE {\n  ?s CONCEPT {name: \"Alice\"}\n  ?o CONCEPT {name: \"Quiet\"}\n  ?p PROPOSITION (?s, \"prefers\", ?o)\n  ?b BELIEF (?p)\n}",
+      "expect": { "result": ["normalized_support_not_probability"] }
+    },
+    {
+      "name": "a projection reports the policy it ran under",
+      "command": "FIND(?b.policy.id) WHERE {\n  ?s CONCEPT {name: \"Alice\"}\n  ?o CONCEPT {name: \"Quiet\"}\n  ?p PROPOSITION (?s, \"prefers\", ?o)\n  ?b BELIEF (?p)\n}",
+      "expect": { "result": ["kip:policy:baseline"] }
+    },
+    {
+      "name": "BELIEF over an unbound variable is refused, not guessed",
+      "command": "FIND(?b) WHERE { ?b BELIEF (?nothing) }",
+      "expect": { "error": "ProjectionTargetUnbound" }
+    },
+    {
+      "name": "BELIEF SLOT over an unbound subject is refused",
+      "command": "FIND(?slot) WHERE { ?slot BELIEF SLOT (?anything, \"prefers\") }",
+      "expect": { "error": "ProjectionTargetUnbounded" }
+    },
+    {
+      "name": "an unknown epistemic policy is named rather than defaulted",
+      "command": "FIND(?b) WHERE {\n  ?s CONCEPT {name: \"Alice\"}\n  ?o CONCEPT {name: \"Quiet\"}\n  ?p PROPOSITION (?s, \"prefers\", ?o)\n  ?b BELIEF (?p)\n} WITH EPISTEMIC {policy: \"strict\"}",
+      "expect": { "error": "ProjectionPolicyUnavailable" }
+    }
+  ]
+}
