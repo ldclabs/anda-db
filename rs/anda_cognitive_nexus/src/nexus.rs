@@ -139,10 +139,8 @@ impl CognitiveNexus {
                 package_ref.package_id.clone(),
                 package_ref.version.to_string(),
             );
-            lock.states.insert(
-                package_ref.package_id,
-                crate::schema::PackageState::Active,
-            );
+            lock.states
+                .insert(package_ref.package_id, crate::schema::PackageState::Active);
         }
         self.ensure_schema(space_id, lock).await
     }

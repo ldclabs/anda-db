@@ -28,6 +28,11 @@ pub struct Bindings<'a> {
     pub operation: Option<&'a Map<String, Json>>,
     /// Handles bound by this mutation plan.
     pub handles: &'a BTreeMap<String, ElementId>,
+    /// The Schema Environment, for the one thing a right-hand side resolves
+    /// symbols for: a Facet named by its local name inside an update
+    /// expression, `?m.facets["MnemonicState"].memory_strength`. A read that
+    /// did not resolve it would find nothing and silently decay `null`.
+    pub env: Option<&'a crate::schema::SchemaEnvironment>,
 }
 
 impl Bindings<'_> {
@@ -93,7 +98,7 @@ impl Bindings<'_> {
             BoundValue::Value(literal) => Json::from(literal.clone()),
             BoundValue::Param(name) => self.param(name)?,
             BoundValue::Handle(name) => reference(self.handle(name)?),
-            BoundValue::Variable(path) => read_own_field(target, path)?,
+            BoundValue::Variable(path) => self.own_field(target, path)?,
             BoundValue::Array(items) => Json::Array(
                 items
                     .iter()
@@ -121,7 +126,7 @@ impl Bindings<'_> {
             MutationValue::Value(literal) => Json::from(literal.clone()),
             MutationValue::Param(name) => self.param(name)?,
             MutationValue::Handle(name) => reference(self.handle(name)?),
-            MutationValue::Variable(path) => read_own_field(target, path)?,
+            MutationValue::Variable(path) => self.own_field(target, path)?,
             MutationValue::Array(items) => Json::Array(
                 items
                     .iter()
@@ -148,7 +153,7 @@ impl Bindings<'_> {
         Ok(match expr {
             UpdateExpr::Number(n) => Json::Number(n.clone()),
             UpdateExpr::Param(name) => self.param(name)?,
-            UpdateExpr::Variable(path) => read_own_field(target, path)?,
+            UpdateExpr::Variable(path) => self.own_field(target, path)?,
             UpdateExpr::Function { func, args } => {
                 if args.len() != func.arity() {
                     return Err(KipError::invalid_syntax(format!(
@@ -200,14 +205,34 @@ impl Bindings<'_> {
     }
 }
 
-/// Reads a value out of the element being written.
+impl Bindings<'_> {
+    /// Reads a dot path off the element being written, resolving Facet names
+    /// through the environment exactly as a KQL read would.
+    fn own_field(
+        &self,
+        target: Option<&Json>,
+        path: &anda_kip::DotPathVar,
+    ) -> Result<Json, KipError> {
+        let Some(env) = self.env else {
+            return read_own_field(target, path);
+        };
+        let target = target.ok_or_else(|| missing_target(path))?;
+        Ok(crate::view::read_path_in(env, target, &path.path))
+    }
+}
+
+/// The refusal for an expression that reads a target no clause provides.
+fn missing_target(path: &anda_kip::DotPathVar) -> KipError {
+    KipError::invalid_syntax(format!(
+        "{path} reads a field of the element being written, and this clause has no such element \
+         to read from"
+    ))
+}
+
+/// Reads a value out of the element being written, without an environment to
+/// resolve Facet names through.
 fn read_own_field(target: Option<&Json>, path: &anda_kip::DotPathVar) -> Result<Json, KipError> {
-    let target = target.ok_or_else(|| {
-        KipError::invalid_syntax(format!(
-            "{path} reads a field of the element being written, and this clause has no such \
-             element to read from"
-        ))
-    })?;
+    let target = target.ok_or_else(|| missing_target(path))?;
     let mut cursor = target;
     for step in &path.path {
         let key = match step {
@@ -222,6 +247,24 @@ fn read_own_field(target: Option<&Json>, path: &anda_kip::DotPathVar) -> Result<
         };
     }
     Ok(cursor.clone())
+}
+
+/// Normalizes a value written into a structural field.
+///
+/// A structural field holds references, and a reference is persisted as
+/// `{"id": "C-3"}`. A `?handle` already arrives in that shape; a `:parameter`
+/// carrying the same id arrives as the bare string `"C-3"`. Storing them
+/// differently would make the edge written one way traversable and the edge
+/// written the other way a literal that no `STRUCTURAL (…)` pattern can follow
+/// — a difference nothing in the command hints at.
+pub fn structural_value(value: Json) -> Json {
+    match value {
+        Json::String(text) => match text.parse::<ElementId>() {
+            Ok(id) => reference(id),
+            Err(_) => Json::String(text),
+        },
+        other => other,
+    }
 }
 
 /// The persisted form of a reference to a local element.
@@ -337,6 +380,7 @@ mod tests {
             request: Some(request),
             operation: Some(operation),
             handles,
+            env: None,
         }
     }
 

@@ -41,6 +41,56 @@ pub fn render(element: &Element) -> Json {
     }
 }
 
+/// Reads one dot path out of a rendered view, resolving a Facet's local name.
+///
+/// A Facet is stored under its exact symbol —
+/// `kip://profiles/cognitive-memory@2.0.0/MnemonicState` — because a persisted
+/// reference must name one version forever (§21). A command writes the local
+/// name the environment resolves: `?m.facets["MnemonicState"].salience`. That
+/// resolution belongs here, on the read, rather than in a second copy of the
+/// Facet map under a name that would go stale the moment the Space activates a
+/// different package version.
+///
+/// A name the environment cannot resolve is left alone, so it reads as `null`
+/// like any other missing member instead of failing a whole query.
+pub fn read_path_in(
+    env: &crate::schema::SchemaEnvironment,
+    view: &Json,
+    path: &[anda_kip::PathStep],
+) -> Json {
+    read_path(view, &resolve_facet_path(env, path))
+}
+
+/// Rewrites `facets["<local name>"]` to `facets["<exact symbol>"]`.
+fn resolve_facet_path<'a>(
+    env: &crate::schema::SchemaEnvironment,
+    path: &'a [anda_kip::PathStep],
+) -> std::borrow::Cow<'a, [anda_kip::PathStep]> {
+    use anda_kip::PathStep;
+    if path.len() < 2 {
+        return std::borrow::Cow::Borrowed(path);
+    }
+    let (PathStep::Field(head) | PathStep::Key(head)) = &path[0];
+    if head != "facets" {
+        return std::borrow::Cow::Borrowed(path);
+    }
+    let (PathStep::Field(name) | PathStep::Key(name)) = &path[1];
+    // An exact symbol is already what the row is keyed by.
+    if name.starts_with("kip://") {
+        return std::borrow::Cow::Borrowed(path);
+    }
+    let Ok(symbol) = env.resolve_symbol(
+        crate::schema::SymbolKind::Facet,
+        name,
+        crate::schema::Intent::Read,
+    ) else {
+        return std::borrow::Cow::Borrowed(path);
+    };
+    let mut resolved = path.to_vec();
+    resolved[1] = PathStep::Key(symbol.to_string());
+    std::borrow::Cow::Owned(resolved)
+}
+
 /// Reads one dot path out of a rendered view.
 ///
 /// A missing member reads as `null` rather than failing. KIP is open-world:

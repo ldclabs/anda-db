@@ -128,8 +128,8 @@ fn operand(
             // a value — or an element's rendered view, which is why the
             // element has to be loaded before a filter can mention it.
             if let Binding::Literal(value) = &binding {
-                return Ok(Value::One(Binding::Literal(crate::view::read_path(
-                    value, &path.path,
+                return Ok(Value::One(Binding::Literal(crate::view::read_path_in(
+                    &cx.env, value, &path.path,
                 ))));
             }
             let Some(id) = binding.element() else {
@@ -138,7 +138,9 @@ fn operand(
             let Some(view) = cx.cached_view(id) else {
                 return Ok(Value::One(Binding::Null));
             };
-            Value::One(Binding::Literal(crate::view::read_path(&view, &path.path)))
+            Value::One(Binding::Literal(crate::view::read_path_in(
+                &cx.env, &view, &path.path,
+            )))
         }
         FilterOperand::List(items) => {
             let mut values = Vec::new();

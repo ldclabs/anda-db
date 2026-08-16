@@ -1,0 +1,94 @@
+{
+  "name": "mutation-selection",
+  "description": "A mutation may choose what it acts on. The judgement calls an engine has to make here are what this fixture pins down: UPDATE reaches mutable state and nothing else, a bounded sweep takes a documented order, a selection block reads the transaction's starting state, and a merge consolidates identity without copying or erasing anything.",
+  "setup": [
+    "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" SET FIELDS {key: \"person:alice\"} }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" }\n  CREATE CONCEPT ?e1 { TYPE \"Experience\" NAME \"First\" SET ATTRIBUTES {goal: \"learn\", outcome_status: \"success\"} SET FACET \"MnemonicState\" {memory_strength: 0.8, salience: 0.5} }\n  CREATE CONCEPT ?e2 { TYPE \"Experience\" NAME \"Second\" SET ATTRIBUTES {goal: \"learn\", outcome_status: \"failure\"} SET FACET \"MnemonicState\" {memory_strength: 0.4, salience: 0.5} }\n  CREATE CONCEPT ?e3 { TYPE \"Experience\" NAME \"Third\" SET ATTRIBUTES {goal: \"rest\", outcome_status: \"success\"} SET FACET \"MnemonicState\" {memory_strength: 0.2, salience: 0.5} }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 }\n  }\n}"
+  ],
+  "cases": [
+    {
+      "name": "a sweep decays a Facet member by reading the target's own value",
+      "command": "UPDATE ?m SET FACET \"MnemonicState\" { memory_strength: MUL(?m.facets[\"MnemonicState\"].memory_strength, 0.5) } WHERE { ?m CONCEPT {type: \"Experience\"} } LIMIT 2",
+      "expect": {}
+    },
+    {
+      "name": "LIMIT cuts in ascending element id, so the same sweep twice takes the same elements",
+      "command": "FIND(?m.name, ?m.facets[\"MnemonicState\"].memory_strength) WHERE { ?m CONCEPT {type: \"Experience\"} } ORDER BY ?m.name",
+      "ordered": true,
+      "expect": {
+        "result": [
+          [
+            "First",
+            0.4
+          ],
+          [
+            "Second",
+            0.2
+          ],
+          [
+            "Third",
+            0.2
+          ]
+        ]
+      }
+    },
+    {
+      "name": "a Facet assignment merges members rather than replacing the Facet",
+      "command": "FIND(?m.facets[\"MnemonicState\"].salience) WHERE { ?m CONCEPT {name: \"First\"} }",
+      "expect": {
+        "result": [
+          0.5
+        ]
+      }
+    },
+    {
+      "name": "UPDATE does not reach an Assertion's epistemic payload",
+      "command": "UPDATE ?a SET FIELDS { name: \"relabelled\" } WHERE { ?a ASSERTION {} }",
+      "expect": {
+        "error": "EpistemicRevisionRequired"
+      }
+    },
+    {
+      "name": "a selection block that matches nothing changes nothing, and does not create",
+      "command": "UPDATE ?m SET ATTRIBUTES { outcome_status: \"aborted\" } WHERE { ?m CONCEPT {type: \"Experience\"} FILTER(?m.attributes.goal == \"no such goal\") }",
+      "expect": {}
+    },
+    {
+      "name": "a selection block reads the state the transaction started from",
+      "command": "MUTATE {\n  CREATE CONCEPT ?fresh { TYPE \"Experience\" NAME \"Fourth\" SET ATTRIBUTES {goal: \"learn\", outcome_status: \"success\"} }\n  ARCHIVE ?m WHERE { ?m CONCEPT {type: \"Experience\"} }\n}",
+      "expect": {}
+    },
+    {
+      "name": "so the Concept the same transaction created is still in recall",
+      "command": "FIND(?m.name) WHERE { ?m CONCEPT {type: \"Experience\"} }",
+      "expect": {
+        "result": [
+          "Fourth"
+        ]
+      }
+    },
+    {
+      "name": "a duplicate of the same person, recorded separately",
+      "command": "UPSERT CONCEPT ?dup { MATCH {key: \"person:alice-duplicate\"} SET FIELDS {name: \"Alice\"} }",
+      "expect": {}
+    },
+    {
+      "name": "a merge never picks an identity by description: two Concepts share the name",
+      "command": "MERGE CONCEPT ?source INTO ?target WHERE { ?source CONCEPT {key: \"person:alice-duplicate\"} ?target CONCEPT {name: \"Alice\"} }",
+      "expect": {
+        "error": "IdentitySelectorRequired"
+      }
+    },
+    {
+      "name": "named by stable identity instead, the merge consolidates them",
+      "command": "MERGE CONCEPT ?source INTO ?target WHERE { ?source CONCEPT {key: \"person:alice-duplicate\"} ?target CONCEPT {key: \"person:alice\"} }",
+      "expect": {}
+    },
+    {
+      "name": "PURGE is refused: erasure is a Governance decision, not a mutation",
+      "command": "PURGE ?m WHERE { ?m CONCEPT {type: \"Experience\"} } CONFIRM \"PURGE\"",
+      "expect": {
+        "error": "UnsupportedCapability"
+      }
+    }
+  ]
+}

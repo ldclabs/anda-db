@@ -113,9 +113,9 @@ impl Context<'_> {
             // A projection result is a value, not an element, and `?b.status`
             // has to read out of it exactly as `?c.name` reads out of a
             // Concept.
-            Binding::Literal(value) => crate::view::read_path(value, &path.path),
+            Binding::Literal(value) => crate::view::read_path_in(&self.env, value, &path.path),
             _ => match binding.element().and_then(|id| self.cached_view(id)) {
-                Some(view) => crate::view::read_path(&view, &path.path),
+                Some(view) => crate::view::read_path_in(&self.env, &view, &path.path),
                 None => Json::Null,
             },
         }

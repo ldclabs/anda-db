@@ -16,6 +16,8 @@
 //! transaction.
 
 pub mod clauses;
+pub mod select;
+pub mod update;
 pub mod value;
 
 use anda_kip::{

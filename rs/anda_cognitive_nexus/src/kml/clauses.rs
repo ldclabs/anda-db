@@ -22,12 +22,15 @@
 
 use anda_kip::{
     ConceptCreate, ConceptUpsert, CorrectEvidence, ElementKind, EnsureProposition, Json, KipError,
-    Map, MatchValue, MutationClause, RecordCreate, RemovalStatement, RetractAssertion,
-    SetRetention, SupersedeAssertion, SymbolRef as AstSymbolRef, TransitionActivity,
+    KipErrorCode, Map, MatchValue, MergeConcept, MutationClause, RecordCreate, RemovalStatement,
+    RetractAssertion, SetRetention, SupersedeAssertion, SymbolRef as AstSymbolRef,
+    TransitionActivity, UpdateAction, UpdateStatement,
 };
 use std::collections::BTreeMap;
 
-use super::value::{Bindings, assignments_to_json, reference};
+use super::select::{self, Targets};
+use super::update;
+use super::value::{Bindings, assignments_to_json, reference, structural_value};
 use crate::id::ElementId;
 use crate::schema::{EndpointFacts, Intent};
 use crate::store::rows::*;
@@ -113,27 +116,45 @@ pub async fn apply(
         MutationClause::CreateActivity(c) => {
             create_record(tx, c, ElementKind::Activity, request, operation).await
         }
-        MutationClause::RetractAssertion(c) => retract(tx, c, request, operation).await,
+        MutationClause::Update(c) => update_elements(store, tx, c, request, operation).await,
+        MutationClause::RetractAssertion(c) => retract(store, tx, c, request, operation).await,
         MutationClause::SupersedeAssertion(c) => supersede(tx, c, request, operation).await,
         MutationClause::CorrectEvidence(c) => correct_evidence(tx, c, request, operation).await,
         MutationClause::TransitionActivity(c) => transition(tx, c, request, operation).await,
-        MutationClause::SetRetention(c) => set_retention(tx, c, request, operation).await,
+        MutationClause::SetRetention(c) => set_retention(store, tx, c, request, operation).await,
         MutationClause::Archive(c) => {
-            remove(tx, c, state::ARCHIVED, "archive", request, operation).await
+            remove(store, tx, c, state::ARCHIVED, "archive", request, operation).await
         }
         MutationClause::Tombstone(c) => {
-            remove(tx, c, state::TOMBSTONED, "tombstone", request, operation).await
+            remove(
+                store,
+                tx,
+                c,
+                state::TOMBSTONED,
+                "tombstone",
+                request,
+                operation,
+            )
+            .await
         }
-        MutationClause::Update(_) | MutationClause::Purge(_) | MutationClause::MergeConcept(_) => {
-            Err(KipError::unsupported_capability(
-                "UPDATE, PURGE and MERGE CONCEPT are not implemented in this engine yet; they need \
-             the KQL solver for their selection blocks and, for PURGE, the Governance plane",
-            ))
-        }
+        MutationClause::MergeConcept(c) => merge_concept(store, tx, c, request, operation).await,
+        // PURGE is physical erasure, and the decision to erase is a Governance
+        // one: a legal hold, a reference policy and an authorization all have
+        // to be evaluated before bytes go away. This engine has no Governance
+        // plane, so it cannot make that decision — and an engine that erased
+        // anyway, on the grounds that the caller asked, would be exactly the
+        // failure the confirmation ritual exists to prevent.
+        MutationClause::Purge(_) => Err(KipError::unsupported_capability(
+            "PURGE physically erases an element, which needs the Governance plane this engine \
+             does not have: legal holds, the REFERENCE POLICY and the authority to erase are all \
+             Governance decisions. ARCHIVE and TOMBSTONE remove an element from recall without \
+             erasing it",
+        )),
     }
 }
 
-fn bindings<'a>(
+/// The substitution scope one clause evaluates its right-hand sides in.
+pub fn bindings<'a>(
     tx: &'a Transaction,
     request: Option<&'a Map<String, Json>>,
     operation: Option<&'a Map<String, Json>>,
@@ -142,8 +163,63 @@ fn bindings<'a>(
         request,
         operation,
         handles: tx.handles(),
+        env: Some(&tx.env),
     }
 }
+
+/// Whether an action changed anything.
+///
+/// A clause that computes the state an element is already in changes nothing:
+/// no version bump, no change record, and a receipt that says `no_effect`
+/// rather than claiming a transition that did not happen (§44).
+#[derive(Debug, Default)]
+pub struct Applied {
+    /// Whether the element's stored state differs from what was there before.
+    pub changed: bool,
+}
+
+/// Reads a `SymbolRef` slot — a quoted symbol or a parameter — to a local name.
+pub fn symbol_of(b: &Bindings<'_>, symbol: &AstSymbolRef) -> Result<String, KipError> {
+    symbol_name(b, symbol)
+}
+
+/// Resolves a Profile structural field name to its exact schema symbol.
+///
+/// A Concept carries no Core structural fields — every one it has is
+/// Profile-defined (§8.2) — so this is the whole resolution for the `UPDATE`
+/// path.
+pub fn resolve_structural_field(
+    tx: &Transaction,
+    b: &Bindings<'_>,
+    field: &AstSymbolRef,
+) -> Result<String, KipError> {
+    let name = symbol_name(b, field)?;
+    if CORE_STRUCTURAL_FIELDS.contains(&name.as_str()) {
+        return Err(KipError::structural_reference_invalid(format!(
+            "`{name}` is a Core structural field of a record, not a Concept topology field; a \
+             Concept's structural fields are Profile-defined"
+        )));
+    }
+    Ok(tx
+        .env
+        .resolve_symbol(
+            crate::schema::SymbolKind::StructuralField,
+            &name,
+            Intent::Write,
+        )?
+        .to_string())
+}
+
+/// Every Core structural field, across the record kinds that own one.
+const CORE_STRUCTURAL_FIELDS: &[&str] = &[
+    "evidence",
+    "context",
+    "source",
+    "generated_by",
+    "inputs",
+    "outputs",
+    "associated_actors",
+];
 
 /// Reads a `SymbolRef` slot — a quoted symbol or a parameter — to a local name.
 fn symbol_name(b: &Bindings<'_>, symbol: &AstSymbolRef) -> Result<String, KipError> {
@@ -224,13 +300,29 @@ async fn facets_of(
     assignments: &[anda_kip::FacetAssignment],
     carrier: ElementKind,
 ) -> Result<Map<String, Json>, KipError> {
+    apply_facets(tx, b, assignments, carrier, None).await
+}
+
+/// Builds the Facets map, optionally letting each member read the element being
+/// updated.
+///
+/// `view` is what makes `MUL(?m.facets["MnemonicState"].memory_strength, 0.9)`
+/// mean anything: an update expression reads the target's own current value and
+/// nothing else (§52.4).
+pub async fn apply_facets(
+    tx: &Transaction,
+    b: &Bindings<'_>,
+    assignments: &[anda_kip::FacetAssignment],
+    carrier: ElementKind,
+    view: Option<&Json>,
+) -> Result<Map<String, Json>, KipError> {
     let mut facets = Map::new();
     for assignment in assignments {
         let name = symbol_name(b, &assignment.facet)?;
         let symbol =
             tx.env
                 .resolve_symbol(crate::schema::SymbolKind::Facet, &name, Intent::Write)?;
-        let members = assignments_to_json(b, &assignment.values, None)?;
+        let members = assignments_to_json(b, &assignment.values, view)?;
         facets.insert(symbol.to_string(), Json::Object(members));
     }
     tx.env
@@ -288,7 +380,7 @@ fn collect_structural(
     let mut grouped: BTreeMap<String, Vec<Json>> = BTreeMap::new();
     for edge in edges {
         let name = symbol_name(b, &edge.field)?;
-        let value = b.value(&edge.value, None)?;
+        let value = structural_value(b.value(&edge.value, None)?);
         if core_fields.contains(&name.as_str()) {
             let mut options = Map::new();
             if let Some(block) = &edge.options {
@@ -594,6 +686,13 @@ async fn ensure_proposition(
     // `b` borrows `tx`, and resolving endpoint facts needs it mutably.
     let _ = b;
 
+    // §11.3: a new write canonicalizes a merged reference to the surviving
+    // Concept. Without this a merge would be decorative — every later claim
+    // about the merged-away Concept would accumulate on the identity the merge
+    // said was the same one, and the two would never meet again.
+    let subject = canonicalize(tx, subject).await?;
+    let object = canonicalize(tx, object).await?;
+
     let subject_facts = facts_for(store, tx, &subject).await?;
     let object_facts = facts_for(store, tx, &object).await?;
     let (symbol, validation) =
@@ -738,6 +837,14 @@ async fn upsert_concept(
     apply_concept_assignments(tx, clause, id, request, operation).await
 }
 
+/// Applies an `UPSERT CONCEPT`'s mutable state.
+///
+/// The clause carries its actions as separate optional members rather than as
+/// an ordered list, so the engine picks the order — and then runs them through
+/// the same appliers `UPDATE` uses. Two code paths for "write mutable Concept
+/// state" is how `UNSET FACET` came to be accepted, parsed, and silently
+/// dropped: a caller cannot tell a mutation that did nothing from one that was
+/// never implemented.
 async fn apply_concept_assignments(
     tx: &mut Transaction,
     clause: &ConceptUpsert,
@@ -745,64 +852,38 @@ async fn apply_concept_assignments(
     request: Option<&Map<String, Json>>,
     operation: Option<&Map<String, Json>>,
 ) -> Result<(), KipError> {
-    let b = bindings(tx, request, operation);
-    let attributes = clause
-        .set_attributes
-        .as_ref()
-        .map(|a| assignments_to_json(&b, a, None))
-        .transpose()?;
-    let mut fields = Fields(
-        clause
-            .set_fields
-            .as_ref()
-            .map(|f| assignments_to_json(&b, f, None))
-            .transpose()?
-            .unwrap_or_default(),
-    );
-    let name = fields.take("name");
-    let canonical_id = fields.take("canonical_id");
-    let unset = clause.unset_attributes.clone().unwrap_or_default();
-    let facets = facets_of(tx, &b, &clause.set_facets, ElementKind::Concept).await?;
-    fields.rest("Concept")?;
+    let mut actions: Vec<UpdateAction> = Vec::new();
+    if let Some(fields) = &clause.set_fields {
+        actions.push(UpdateAction::SetFields(fields.clone()));
+    }
+    if let Some(attributes) = &clause.set_attributes {
+        actions.push(UpdateAction::SetAttributes(attributes.clone()));
+    }
+    if let Some(unset) = &clause.unset_attributes {
+        actions.push(UpdateAction::UnsetAttributes(unset.clone()));
+    }
+    for facet in &clause.set_facets {
+        actions.push(UpdateAction::SetFacet(facet.clone()));
+    }
+    for facet in &clause.unset_facets {
+        actions.push(UpdateAction::UnsetFacet(facet.clone()));
+    }
+    if let Some(edges) = &clause.set_structural {
+        actions.push(UpdateAction::SetStructural(edges.clone()));
+    }
+    if let Some(removals) = &clause.unset_structural {
+        actions.push(UpdateAction::UnsetStructural(removals.clone()));
+    }
 
-    let element = tx.load(id).await?;
-    let Element::Concept(row) = element else {
-        return Err(KipError::structural_reference_invalid(format!(
-            "{id} is not a Concept"
-        )));
-    };
-
+    // An UPSERT has no update expressions — the parser rejects `?var` reads
+    // outside UPDATE — but the appliers still take the view, so the same
+    // function serves both.
+    let view = crate::view::render(tx.load(id).await?);
     let mut changed = false;
-    if let Some(attributes) = attributes {
-        for (key, value) in attributes {
-            if row.attributes.get(&key) != Some(&value) {
-                row.attributes.insert(key, value);
-                changed = true;
-            }
-        }
-    }
-    for key in unset {
-        if row.attributes.remove(&key).is_some() {
-            changed = true;
-        }
-    }
-    if let Some(Json::String(name)) = name
-        && row.name != name
-    {
-        row.name = name;
-        changed = true;
-    }
-    if let Some(Json::String(canonical)) = canonical_id
-        && row.canonical_id != canonical
-    {
-        row.canonical_id = canonical;
-        changed = true;
-    }
-    for (facet, value) in facets {
-        if row.facets.get(&facet) != Some(&value) {
-            row.facets.insert(facet, value);
-            changed = true;
-        }
+    for action in &actions {
+        changed |= update::apply_action(tx, id, action, &view, request, operation)
+            .await?
+            .changed;
     }
 
     // A no-effect final state changes nothing: no version bump, no change
@@ -813,36 +894,104 @@ async fn apply_concept_assignments(
     Ok(())
 }
 
+/// `UPDATE` — mutable state on already-existing elements.
+///
+/// UPDATE never creates (§52.4): a selection block that matches nothing leaves
+/// the transaction with nothing to do, which is a `no_effect`, not an error and
+/// certainly not an insert.
+async fn update_elements(
+    store: &Store,
+    tx: &mut Transaction,
+    clause: &UpdateStatement,
+    request: Option<&Map<String, Json>>,
+    operation: Option<&Map<String, Json>>,
+) -> Result<(), KipError> {
+    let targets = {
+        let b = bindings(tx, request, operation);
+        select::targets(
+            store,
+            tx,
+            "UPDATE",
+            &clause.target,
+            clause.where_clauses.as_ref(),
+            clause.limit.as_ref(),
+            &b,
+        )
+        .await?
+    };
+
+    for id in targets.ids {
+        if let Some(expected) = &clause.expect_version {
+            let expected = {
+                let b = bindings(tx, request, operation);
+                b.scalar_u64(expected, "EXPECT VERSION")?
+            };
+            tx.expect_version(id, expected).await?;
+        }
+
+        // Every action of one UPDATE reads the element as it was when the
+        // statement began: two actions on the same Facet member must not
+        // compound, or the second would silently operate on what the first
+        // just wrote for reasons the author cannot see in the text.
+        let view = crate::view::render(tx.load(id).await?);
+        let mut changed = false;
+        for action in &clause.actions {
+            changed |= update::apply_action(tx, id, action, &view, request, operation)
+                .await?
+                .changed;
+        }
+        if changed {
+            tx.mark_changed(id, "update");
+        }
+    }
+    Ok(())
+}
+
 async fn retract(
+    store: &Store,
     tx: &mut Transaction,
     clause: &RetractAssertion,
     request: Option<&Map<String, Json>>,
     operation: Option<&Map<String, Json>>,
 ) -> Result<(), KipError> {
-    if clause.where_clauses.is_some() {
-        return Err(unsupported_selection("RETRACT ASSERTION"));
-    }
-    let b = bindings(tx, request, operation);
-    let id = b.element_ref(&clause.target)?;
-    let expect_state = clause
-        .expect_state
-        .as_ref()
-        .map(|s| b.scalar_str(s, "EXPECT STATE"))
-        .transpose()?;
+    let targets = {
+        let b = bindings(tx, request, operation);
+        select::targets(
+            store,
+            tx,
+            "RETRACT ASSERTION",
+            &clause.target,
+            clause.where_clauses.as_ref(),
+            clause.limit.as_ref(),
+            &b,
+        )
+        .await?
+    };
+    let expect_state = {
+        let b = bindings(tx, request, operation);
+        clause
+            .expect_state
+            .as_ref()
+            .map(|s| b.scalar_str(s, "EXPECT STATE"))
+            .transpose()?
+    };
     let at = tx.cx.at.clone();
 
-    if let Some(expected) = expect_state {
-        tx.expect_assertion_status(id, &expected).await?;
+    for id in targets.ids {
+        if let Some(expected) = &expect_state {
+            tx.expect_assertion_status(id, expected).await?;
+        }
+        let row = assertion_mut(tx, id).await?;
+        // Spec §41.1: retraction is not deletion. The Assertion goes on
+        // existing, so the record of what was once believed — and by whom —
+        // survives.
+        if row.status == "retracted" {
+            continue;
+        }
+        row.status = "retracted".to_string();
+        row.retracted_at = at.clone();
+        tx.mark_changed(id, "retract");
     }
-    let row = assertion_mut(tx, id).await?;
-    // Spec §41.1: retraction is not deletion. The Assertion goes on existing,
-    // so the record of what was once believed — and by whom — survives.
-    if row.status == "retracted" {
-        return Ok(());
-    }
-    row.status = "retracted".to_string();
-    row.retracted_at = at;
-    tx.mark_changed(id, "retract");
     Ok(())
 }
 
@@ -1000,39 +1149,57 @@ async fn transition(
 }
 
 async fn set_retention(
+    store: &Store,
     tx: &mut Transaction,
     clause: &SetRetention,
     request: Option<&Map<String, Json>>,
     operation: Option<&Map<String, Json>>,
 ) -> Result<(), KipError> {
-    if clause.where_clauses.is_some() {
-        return Err(unsupported_selection("SET RETENTION"));
-    }
-    let b = bindings(tx, request, operation);
-    let id = b.element_ref(&clause.target)?;
-    let values = assignments_to_json(&b, &clause.values, None)?;
-    if let Some(expected) = &clause.expect_version {
-        let expected = b.scalar_u64(expected, "EXPECT VERSION")?;
-        tx.expect_version(id, expected).await?;
-    }
+    let (targets, values, expected) = {
+        let b = bindings(tx, request, operation);
+        let targets = select::targets(
+            store,
+            tx,
+            "SET RETENTION",
+            &clause.target,
+            clause.where_clauses.as_ref(),
+            clause.limit.as_ref(),
+            &b,
+        )
+        .await?;
+        let values = assignments_to_json(&b, &clause.values, None)?;
+        let expected = clause
+            .expect_version
+            .as_ref()
+            .map(|scalar| b.scalar_u64(scalar, "EXPECT VERSION"))
+            .transpose()?;
+        (targets, values, expected)
+    };
 
     // Spec §19: retention is storage lifecycle. `expires_at` here is when the
     // *record* stops being retained, never when the claim stops applying —
     // that is `valid_time.until`, on an Assertion, and nothing here touches it.
     let retention = Json::Object(values);
     let expires = expires_at(&retention)?;
-    let element = tx.load(id).await?;
-    let (current, current_expires) = retention_mut(element);
-    if *current == retention {
-        return Ok(());
+    for id in targets.ids {
+        if let Some(expected) = expected {
+            tx.expect_version(id, expected).await?;
+        }
+        let element = tx.load(id).await?;
+        let (current, current_expires) = retention_mut(element);
+        if *current == retention {
+            continue;
+        }
+        *current = retention.clone();
+        *current_expires = expires.clone();
+        tx.mark_changed(id, "set_retention");
     }
-    *current = retention;
-    *current_expires = expires;
-    tx.mark_changed(id, "set_retention");
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn remove(
+    store: &Store,
     tx: &mut Transaction,
     clause: &RemovalStatement,
     to: &str,
@@ -1040,42 +1207,221 @@ async fn remove(
     request: Option<&Map<String, Json>>,
     operation: Option<&Map<String, Json>>,
 ) -> Result<(), KipError> {
-    if clause.where_clauses.is_some() {
-        return Err(unsupported_selection("ARCHIVE / TOMBSTONE"));
+    let (targets, expect_state) = {
+        let b = bindings(tx, request, operation);
+        let targets = select::targets(
+            store,
+            tx,
+            op,
+            &clause.target,
+            clause.where_clauses.as_ref(),
+            clause.limit.as_ref(),
+            &b,
+        )
+        .await?;
+        let expect_state = clause
+            .expect_state
+            .as_ref()
+            .map(|s| b.scalar_str(s, "EXPECT STATE"))
+            .transpose()?;
+        (targets, expect_state)
+    };
+
+    for id in targets.ids {
+        if let Some(expected) = &expect_state {
+            tx.expect_state(id, expected).await?;
+        }
+
+        // Neither archive nor tombstone erases anything: references keep
+        // resolving (§93.33), which is what stops a removal from silently
+        // breaking every Assertion that cited the element.
+        let element = tx.load(id).await?;
+        if element.state() == to {
+            continue;
+        }
+        set_state(element, to);
+        tx.mark_changed(id, op);
     }
-    let b = bindings(tx, request, operation);
-    let id = b.element_ref(&clause.target)?;
-    let expect_state = clause
-        .expect_state
-        .as_ref()
-        .map(|s| b.scalar_str(s, "EXPECT STATE"))
-        .transpose()?;
-    if let Some(expected) = expect_state {
-        tx.expect_state(id, &expected).await?;
+    Ok(())
+}
+
+/// `MERGE CONCEPT ?source INTO ?target` — non-destructive identity
+/// consolidation (§11.1).
+///
+/// Nothing is copied and nothing is deleted. The source keeps its id, its
+/// attributes and its history; it gains a forwarding pointer and leaves
+/// ordinary recall. That is the whole merge, and the restraint is the point:
+/// copying the source's state onto the target would invent claims nobody made,
+/// and rewriting the references would erase what the memory used to say.
+async fn merge_concept(
+    store: &Store,
+    tx: &mut Transaction,
+    clause: &MergeConcept,
+    request: Option<&Map<String, Json>>,
+    operation: Option<&Map<String, Json>>,
+) -> Result<(), KipError> {
+    let (source, target, expected) = {
+        let b = bindings(tx, request, operation);
+        // MERGE takes no LIMIT: its operands are named, and the block only
+        // guards them (§52.7). Each side must therefore resolve to exactly one
+        // Concept — a pattern that binds several is selecting an identity by
+        // description, which is what merge exists to stop people doing.
+        let source = one_operand(
+            store,
+            tx,
+            "MERGE CONCEPT source",
+            &clause.source,
+            clause.where_clauses.as_ref(),
+            &b,
+        )
+        .await?;
+        let target = one_operand(
+            store,
+            tx,
+            "MERGE CONCEPT target",
+            &clause.into,
+            clause.where_clauses.as_ref(),
+            &b,
+        )
+        .await?;
+        let expected = clause
+            .expect_version
+            .as_ref()
+            .map(|scalar| b.scalar_u64(scalar, "EXPECT VERSION"))
+            .transpose()?;
+        (source, target, expected)
+    };
+    let (Some(source), Some(target)) = (source, target) else {
+        // The guard block matched nothing: no merge, no error.
+        return Ok(());
+    };
+
+    if source == target {
+        return Err(KipError::new(
+            KipErrorCode::IdentityMergeConflict,
+            "a Concept cannot be merged into itself",
+        ));
+    }
+    if source.kind != ElementKind::Concept || target.kind != ElementKind::Concept {
+        return Err(KipError::structural_reference_invalid(
+            "MERGE CONCEPT consolidates Concepts; other element kinds have no merged identity",
+        ));
+    }
+    if let Some(expected) = expected {
+        tx.expect_version(source, expected).await?;
     }
 
-    // Neither archive nor tombstone erases anything: references keep resolving
-    // (§93.33), which is what stops a removal from silently breaking every
-    // Assertion that cited the element.
-    let element = tx.load(id).await?;
-    if element.state() == to {
+    // §11.1: canonical resolution follows `merged_into` to its fixpoint, so a
+    // cycle would make that walk run forever. The check is on the target's
+    // chain, before anything is written.
+    let chain = canonical_chain(tx, target).await?;
+    if chain.contains(&source) {
+        return Err(KipError::new(
+            KipErrorCode::IdentityMergeConflict,
+            format!(
+                "{target} already resolves back to {source}; merging would make canonical \
+                 resolution cycle"
+            ),
+        ));
+    }
+
+    let element = tx.load(source).await?;
+    let Element::Concept(row) = element else {
+        return Err(KipError::structural_reference_invalid(format!(
+            "{source} is not a Concept"
+        )));
+    };
+    if row.merged_into == target.to_string() {
         return Ok(());
     }
-    set_state(element, to);
-    tx.mark_changed(id, op);
+    if !row.merged_into.is_empty() {
+        return Err(KipError::new(
+            KipErrorCode::IdentityMergeConflict,
+            format!(
+                "{source} is already merged into {}; re-pointing it would rewrite an identity \
+                 decision that other writes have since canonicalized through",
+                row.merged_into
+            ),
+        ));
+    }
+    row.merged_into = target.to_string();
+    // Merged, not archived: the two say different things. Archived means "out
+    // of ordinary recall"; merged additionally means "this identity is now
+    // that one", which is what a reader needs in order to follow the pointer.
+    row.state = state::MERGED.to_string();
+    tx.mark_changed(source, "merge");
     Ok(())
+}
+
+/// Resolves one operand of a statement that acts on exactly one element.
+async fn one_operand(
+    store: &Store,
+    tx: &Transaction,
+    what: &str,
+    target: &anda_kip::ElementRef,
+    where_clauses: Option<&Vec<anda_kip::WhereClause>>,
+    b: &Bindings<'_>,
+) -> Result<Option<ElementId>, KipError> {
+    let targets: Targets = select::targets(store, tx, what, target, where_clauses, None, b).await?;
+    match targets.ids.len() {
+        0 => Ok(None),
+        1 => Ok(Some(targets.ids[0])),
+        n => Err(KipError::new(
+            KipErrorCode::IdentitySelectorRequired,
+            format!("the {what} block binds {n} elements; it must name exactly one"),
+        )),
+    }
+}
+
+/// Follows a merged Concept's forwarding pointer to the identity that survived.
+///
+/// Only for endpoints of a *new* write (§11.3). A historical Proposition keeps
+/// referring to what it referred to (§11.2): rewriting those would erase what
+/// the memory used to say, which is the whole reason merge is non-destructive.
+async fn canonicalize(tx: &mut Transaction, endpoint: Endpoint) -> Result<Endpoint, KipError> {
+    let Endpoint::Local(id) = endpoint else {
+        return Ok(endpoint);
+    };
+    if id.kind != ElementKind::Concept {
+        return Ok(endpoint);
+    }
+    let chain = canonical_chain(tx, id).await?;
+    Ok(Endpoint::Local(*chain.last().unwrap_or(&id)))
+}
+
+/// The `merged_into` chain above one Concept, ending at its canonical id.
+///
+/// Bounded independently of the cycle check that maintains it: a chain longer
+/// than this is corrupt state, and walking it forever would turn corruption
+/// into a hang.
+async fn canonical_chain(
+    tx: &mut Transaction,
+    from: ElementId,
+) -> Result<Vec<ElementId>, KipError> {
+    const MAX_HOPS: usize = 64;
+    let mut chain = vec![from];
+    let mut cursor = from;
+    for _ in 0..MAX_HOPS {
+        let next = match tx.load(cursor).await {
+            Ok(Element::Concept(row)) if !row.merged_into.is_empty() => {
+                row.merged_into.parse::<ElementId>()?
+            }
+            _ => return Ok(chain),
+        };
+        if chain.contains(&next) {
+            return Ok(chain);
+        }
+        chain.push(next);
+        cursor = next;
+    }
+    Err(KipError::internal_error(format!(
+        "the merged_into chain above {from} is longer than {MAX_HOPS} hops"
+    )))
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-fn unsupported_selection(what: &str) -> KipError {
-    KipError::unsupported_capability(format!(
-        "{what} with a WHERE block needs the KQL solver, which is not wired into the mutation \
-         path yet; name the target directly instead"
-    ))
-}
 
 fn is_terminal(status: &str) -> bool {
     matches!(status, "completed" | "failed" | "cancelled" | "aborted")

@@ -141,10 +141,19 @@ pub fn capabilities() -> Json {
             "kml": [
                 "CREATE CONCEPT", "UPSERT CONCEPT", "ENSURE PROPOSITION",
                 "CREATE EVIDENCE", "CREATE ASSERTION", "CREATE ACTIVITY",
-                "ASSERT (desugared)", "RETRACT ASSERTION", "SUPERSEDE ASSERTION",
-                "CORRECT EVIDENCE", "TRANSITION ACTIVITY", "SET RETENTION",
-                "ARCHIVE", "TOMBSTONE"
+                "ASSERT (desugared)", "UPDATE", "RETRACT ASSERTION",
+                "SUPERSEDE ASSERTION", "CORRECT EVIDENCE", "TRANSITION ACTIVITY",
+                "SET RETENTION", "ARCHIVE", "TOMBSTONE", "MERGE CONCEPT",
+                "WHERE selection blocks", "LIMIT"
             ],
+            "selection": {
+                // §52.7: a bounded sweep may be assumed repeatable only where
+                // the runtime documents an order. This one does.
+                "limit_order": "ascending element id",
+                // A selection block reads the state the transaction started
+                // from, so a sweep cannot act on what the same MUTATE created.
+                "reads": "transaction snapshot"
+            },
             "kql": [
                 "CONCEPT", "PROPOSITION", "ASSERTION", "EVIDENCE", "ACTIVITY",
                 "STRUCTURAL", "BELIEF", "BELIEF SLOT", "FILTER", "NOT",
@@ -220,9 +229,11 @@ pub fn capabilities() -> Json {
                            source is a claim a destination cannot check"
             },
             {
-                "capability": "kml_selection_blocks",
-                "detail": "UPDATE / PURGE / MERGE CONCEPT, and clause forms with a WHERE block",
-                "reason": "the mutation path does not run the KQL solver yet"
+                "capability": "physical_purge",
+                "detail": "PURGE",
+                "reason": "erasure is a Governance decision — legal holds, the REFERENCE POLICY \
+                           and the authority to erase — and this engine has no Governance plane. \
+                           ARCHIVE and TOMBSTONE remove an element from recall without erasing it"
             }
         ]
     })

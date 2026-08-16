@@ -123,6 +123,34 @@ rewriting the old one.
   (`profiles::COGNITIVE_MEMORY`), vendored verbatim from the spec repository,
   and `CognitiveNexus::ensure_schema` activates a Schema Lock only when it
   differs from the one already in force.
+- **The mutation path selects what it acts on.** `UPDATE` and `MERGE CONCEPT`
+  are implemented, and `WHERE` selection blocks with `LIMIT` now work on
+  `UPDATE`, `RETRACT ASSERTION`, `SET RETENTION`, `ARCHIVE` and `TOMBSTONE`.
+  Three decisions a second engine has to match, all pinned by
+  `fixtures/kip-conformance-2.0/mutation-selection.json`: a selection block
+  reads the state the **transaction started from**, so a sweep cannot act on
+  what the same `MUTATE` just created (clause order carries no mutation
+  semantics, §24); `LIMIT` cuts in **ascending element id**, which §52.7 permits
+  a runtime to document and which makes a bounded sweep repeatable; and a block
+  that matches nothing is a `no_effect`, not an error — `UPDATE` never creates.
+  `UPDATE`'s reach is enforced against the element the engine loaded, not
+  against what the command looked like, because `UPDATE :A-7` names an id and
+  only the engine knows what wears it: an Assertion answers
+  `EpistemicRevisionRequired`, Evidence `EvidenceCorrectionRequired`, an
+  Activity `InvalidLifecycleTransition`, each naming the ritual that *is* legal.
+  `MERGE CONCEPT` is non-destructive (§11.1) — the source keeps its state and
+  gains `merged_into`, cycles and re-pointing are refused — and a new write
+  canonicalizes a merged reference to the survivor (§11.3), without rewriting
+  the history that referred to it (§11.2). `PURGE` remains refused: erasure is a
+  Governance decision this engine cannot make.
+- **Two defects surfaced by that work**: `UPSERT CONCEPT` parsed
+  `UNSET FACET` / `SET STRUCTURAL` / `UNSET STRUCTURAL` and silently dropped
+  them (both clause families now run through one applier), and a structural
+  reference written from a `:parameter` was stored as a bare id string rather
+  than `{"id": …}`, so the edge existed but no `STRUCTURAL (…)` pattern could
+  follow it. A Facet's local name now also resolves in a dot path —
+  `?m.facets["MnemonicState"].salience` — on both the read and the write side,
+  instead of quietly reading `null` outside its canonical `kip://…` spelling.
 - **`anda_cognitive_nexus_server` speaks the 2.0 envelope.** `execute_kip`'s
   `params` is now the KIP 2.0 request envelope rather than a bare command:
   `{"kip": "2.0", "operations": [{"command": "..."}]}`. Execution goes through

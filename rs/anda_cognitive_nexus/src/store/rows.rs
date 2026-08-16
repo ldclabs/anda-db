@@ -34,6 +34,12 @@ pub mod state {
     pub const ARCHIVED: &str = "archived";
     /// Logically deleted; identity and references survive (§41.3).
     pub const TOMBSTONED: &str = "tombstoned";
+    /// Consolidated into another Concept, and still addressable (§11.1).
+    ///
+    /// Distinct from `archived`: both leave ordinary recall, but only this one
+    /// says *where the identity went*, which is what lets a reader follow
+    /// `merged_into` instead of concluding the Concept was retired.
+    pub const MERGED: &str = "merged";
     /// Minted by an in-flight transaction and not yet committed.
     ///
     /// Not a KIP state: it exists because `anda_db` assigns element ids at

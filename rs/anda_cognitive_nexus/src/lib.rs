@@ -42,9 +42,10 @@
 //! The KIP 2.0 engine is being built in stages. [`CognitiveNexus`] implements
 //! [`anda_kip::Executor`] and today runs:
 //!
-//! - **KML** — creation, `ENSURE`, `UPSERT`, the Assertion and Evidence
-//!   lifecycles, retention and removal, inside real transactions with handles,
-//!   preconditions, receipts and dry runs;
+//! - **KML** — creation, `ENSURE`, `UPSERT`, `UPDATE`, `MERGE CONCEPT`, the
+//!   Assertion and Evidence lifecycles, retention and removal, each with an
+//!   optional `WHERE` selection block and `LIMIT`, inside real transactions
+//!   with handles, preconditions, receipts and dry runs;
 //! - **KQL** — element and tuple patterns, structural patterns, `FILTER`,
 //!   `NOT` / `OPTIONAL` / `UNION`, projection by dot path, aggregates,
 //!   `ORDER BY`, paging and `FOR TIME`;
@@ -72,8 +73,7 @@
 //! semantic / hybrid SEARCH       no embedding model
 //! Capsule import (the semantic merge), Capsule signatures
 //! DESCRIBE TRUST / ACCESS        no Governance plane
-//! UPDATE / PURGE / MERGE CONCEPT
-//! clause forms with a WHERE block
+//! PURGE                          erasure is a Governance decision
 //! ```
 //!
 //! An engine that returned empty results for a read it cannot perform would be
