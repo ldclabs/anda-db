@@ -464,6 +464,39 @@ pub struct SchemaEnvRow {
     pub tx_id: String,
 }
 
+/// One historical version of one element (Spec §36, §78).
+///
+/// Rows are updated in place, so the current row is all a reader would have if
+/// this log did not exist — and `AS OF` would have nothing to read. Each commit
+/// appends the complete row it wrote, so a past coordinate can be reconstructed
+/// rather than guessed at from a change list.
+///
+/// The whole row is stored, not a diff: a diff chain has to be replayed from
+/// the beginning to answer one question, and a chain with one missing link
+/// answers it wrongly instead of refusing.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, AndaDBSchema)]
+pub struct ElementVersionRow {
+    /// The row id.
+    pub _id: u64,
+    /// The Space the element lives in.
+    pub space: String,
+    /// The element this is a version of, e.g. `C-1`.
+    pub element: String,
+    /// The element's kind tag, so a scan can narrow without parsing ids.
+    pub kind: String,
+    /// The element's version at this coordinate.
+    pub version: u64,
+    /// The Space sequence this version became current at. `AS OF SEQ s` reads
+    /// the greatest version whose `seq` is at most `s`.
+    pub seq: u64,
+    /// The transaction that wrote it.
+    pub tx_id: String,
+    /// What the change was called: `create`, `update`, `archive`, …
+    pub op: String,
+    /// The complete row, as stored.
+    pub row: Json,
+}
+
 /// One committed transaction (Spec §82).
 ///
 /// The journal is what makes `HISTORY`, `CHANGES` and idempotent recovery

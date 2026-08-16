@@ -123,6 +123,45 @@ rewriting the old one.
   (`profiles::COGNITIVE_MEMORY`), vendored verbatim from the spec repository,
   and `CognitiveNexus::ensure_schema` activates a Schema Lock only when it
   differs from the one already in force.
+- **Both time axes now answer.** `AS OF SEQ | TX | TIME` reads the Space at a
+  past coordinate, and `SNAPSHOT` issues a token a later request binds to
+  through `read.snapshot_token`. This needed state the engine did not keep: a
+  row is updated in place, so version 3 overwrites version 2 and version 2 is
+  gone. Every commit now appends the complete row it wrote to a version log —
+  in the same commit as the row, because a history written afterwards can be
+  missing exactly the write a crash interrupted, and a history with a hole
+  answers wrongly instead of refusing. A historical pattern cannot use the
+  indexes (they describe the present), so it reconstructs its candidates from
+  that log and re-checks every constraint against the element as it stood;
+  the cost is charged to the same query budget. `AS OF` resolves symbols
+  through the Schema Environment that was in force *then* (§144), the
+  projection sees only the Assertions of its coordinate, and a request bound to
+  one coordinate whose command names another is refused rather than silently
+  preferring one. `SEARCH ... AS OF SEQ` stays unsupported: the index reflects
+  the present, and reporting today's matches as if they were then's is the one
+  answer worse than none.
+- **Hop-quantified paths traverse.** `(?a, "leads_to"{1,3}, ?b)` walks the raw
+  Proposition graph, from whichever end is pinned — including by an earlier
+  pattern in the same block, which is what made `Context::bound` real rather
+  than a field nothing wrote. Binding a variable to a multi-hop path is
+  refused: the walk is not a Proposition, and naming one of the tuples it
+  crossed would name a claim the query never asked about. A path reports
+  reachability, never belief (§45).
+- **Capsule import performs the semantic merge.** Identity resolves in the
+  spec's order (§38.2) — a prior import of the same artifact, a trusted
+  `canonical_id`, then a Proposition's own tuple — and the mapping lives on the
+  elements as their `client_key`, so a re-import after a restart resolves to
+  what the first import created rather than duplicating it. Every reference is
+  rewritten onto destination ids; a Capsule citing something it does not carry
+  is refused whole. The source's Space-local `key` stays at the source (§5.3),
+  the epistemic payload arrives unchanged, and what *this* runtime observed —
+  the import — is stamped into engine origin (§27). Import is a host API
+  (`CognitiveNexus::import_capsule`), not a command: KML has no import clause
+  and META is read-only, so no prompt decides that a Space accepts another
+  Brain's cognition. Two bugs surfaced on the way: an `EvidenceRef` spells its
+  target `evidence_id`, so citations were being written through unrewritten,
+  and the derived `evidence_ids` index column came out empty for the same
+  reason.
 - **The mutation path selects what it acts on.** `UPDATE` and `MERGE CONCEPT`
   are implemented, and `WHERE` selection blocks with `LIMIT` now work on
   `UPDATE`, `RETRACT ASSERTION`, `SET RETENTION`, `ARCHIVE` and `TOMBSTONE`.

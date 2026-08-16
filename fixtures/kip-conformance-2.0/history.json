@@ -1,0 +1,67 @@
+{
+  "name": "history",
+  "description": "Two independent time axes. FOR TIME asks what was true then; AS OF asks what this Brain held then. A coordinate keeps what was later corrected, retracted or archived, because the record of what was once believed is the point.",
+  "setup": [
+    "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 }\n  }\n}"
+  ],
+  "cases": [
+    {
+      "name": "the claim is active at the coordinate its transaction produced (seq 1)",
+      "command": "FIND(?a.lifecycle.status, ?a.confidence) WHERE { ?a ASSERTION {} } AS OF SEQ 1",
+      "expect": {
+        "result": [
+          [
+            "active",
+            0.9
+          ]
+        ]
+      }
+    },
+    {
+      "name": "retracting it changes the present",
+      "command": "RETRACT ASSERTION ?a WHERE { ?a ASSERTION {} }",
+      "expect": {}
+    },
+    {
+      "name": "the present says retracted",
+      "command": "FIND(?a.lifecycle.status) WHERE { ?a ASSERTION {} }",
+      "expect": {
+        "result": [
+          "retracted"
+        ]
+      }
+    },
+    {
+      "name": "and the earlier coordinate still says active: history is not rewritten",
+      "command": "FIND(?a.lifecycle.status) WHERE { ?a ASSERTION {} } AS OF SEQ 1",
+      "expect": {
+        "result": [
+          "active"
+        ]
+      }
+    },
+    {
+      "name": "a coordinate before anything existed is empty, not an error",
+      "command": "FIND(COUNT(?c)) WHERE { ?c CONCEPT {} } AS OF SEQ 0",
+      "expect": {
+        "result": [
+          0
+        ]
+      }
+    },
+    {
+      "name": "a coordinate the Space has not reached is refused, never rounded to the present",
+      "command": "SNAPSHOT AS OF SEQ 9999",
+      "expect": {
+        "error": "HistoricalSnapshotUnavailable"
+      }
+    },
+    {
+      "name": "an unknown transaction names no coordinate",
+      "command": "FIND(COUNT(?c)) WHERE { ?c CONCEPT {} } AS OF TX \"kip:space:default#9999\"",
+      "expect": {
+        "error": "TransactionUnknown"
+      }
+    }
+  ]
+}

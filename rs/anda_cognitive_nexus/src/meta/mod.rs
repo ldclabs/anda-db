@@ -159,7 +159,7 @@ pub fn capabilities() -> Json {
                 "STRUCTURAL", "BELIEF", "BELIEF SLOT", "FILTER", "NOT",
                 "OPTIONAL", "UNION", "ORDER BY", "LIMIT", "CURSOR", "FOR TIME",
                 "WITH EPISTEMIC", "aggregates", "predicate alternation",
-                "hop quantifiers"
+                "hop quantifiers", "AS OF SEQ | TX | TIME"
             ],
             "meta": [
                 "DESCRIBE", "LIST", "SEARCH", "VALIDATE", "PREVIEW KML",
@@ -174,6 +174,16 @@ pub fn capabilities() -> Json {
                 "identity_resolution": ["prior import", "canonical_id", "proposition tuple"]
             },
             "execution_modes": ["independent", "sequence"],
+            "historical_read": {
+                // Every commit appends the row it wrote, so a past coordinate
+                // is reconstructed rather than approximated.
+                "retention": "unbounded: every element version is kept",
+                "coordinates": ["SEQ", "TX", "TIME"],
+                "snapshot_token": true,
+                // The indexes describe the present, so a historical pattern
+                // reconstructs its candidates from the version log.
+                "cost": "a historical read scans the version log for its Space"
+            },
             "search_modes": ["keyword"],
             "transactions": {
                 "atomic_visibility": "in_process",
@@ -196,10 +206,11 @@ pub fn capabilities() -> Json {
                            operations are not implemented; a batch runs operation by operation"
             },
             {
-                "capability": "historical_read",
-                "detail": "AS OF SEQ / TX / TIME",
-                "reason": "no historical snapshots are retained, so a past coordinate cannot be \
-                           reconstructed"
+                "capability": "historical_search",
+                "detail": "SEARCH ... AS OF SEQ",
+                "reason": "the search index reflects the present only; a historical SEARCH would \
+                           report today's matches as if they were then's. FIND ... AS OF reads \
+                           the past exactly"
             },
             {
                 "capability": "semantic_search",

@@ -267,11 +267,14 @@ pub async fn export_capsule(
     cx: &mut Context<'_>,
     command: &anda_kip::ExportCapsuleCommand,
 ) -> Result<Answer, KipError> {
-    if command.as_of.is_some() {
-        return Err(KipError::new(
-            KipErrorCode::HistoricalSnapshotUnavailable,
-            "this engine retains no historical coordinates, so it cannot export one",
-        ));
+    // An export is snapshot-consistent (§41.1): binding the read coordinate
+    // before the roots are selected is what makes the closure it walks one
+    // coherent state rather than several.
+    if let Some(as_of) = &command.as_of {
+        let seq = cx.resolve_as_of(as_of).await?;
+        cx.as_of = Some(seq);
+        let version = cx.store.schema_version_at(&cx.space, seq).await?;
+        cx.env = cx.store.schema_environment_at(&cx.space, version).await?;
     }
     let mut options = anda_kip::Map::new();
     if let Some(block) = &command.options {

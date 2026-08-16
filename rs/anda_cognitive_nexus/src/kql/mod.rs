@@ -70,6 +70,12 @@ pub struct Context<'a> {
     /// Whether any clause actually projected, so the answer can report the
     /// policy it ran under — and stay silent about one it never used.
     pub projected: bool,
+    /// The past coordinate this read is bound to, when it is bound to one.
+    ///
+    /// `None` means now. Every read in this context answers at the same
+    /// coordinate: a query whose patterns disagreed about *when* they were
+    /// reading would join two different Brains together.
+    pub as_of: Option<u64>,
     budget: usize,
 }
 
@@ -93,6 +99,7 @@ impl<'a> Context<'a> {
             policy: crate::projection::Policy::baseline(),
             at: crate::time::now(),
             projected: false,
+            as_of: None,
             budget: MAX_CANDIDATES,
         })
     }
@@ -116,11 +123,17 @@ impl<'a> Context<'a> {
     }
 
     /// Loads an element once per query, caching both the row and its view.
+    ///
+    /// A bound read loads the version that was current at its coordinate, so
+    /// every dot path, filter and sort key downstream reads the same past.
     pub async fn load(&mut self, id: ElementId) -> Result<Option<Element>, KipError> {
         if let Some(cached) = self.loaded.get(&id) {
             return Ok(cached.clone());
         }
-        let element = self.store.get_element(id).await.ok();
+        let element = match self.as_of {
+            Some(seq) => self.store.element_at(&self.space, id, seq).await?,
+            None => self.store.get_element(id).await.ok(),
+        };
         if let Some(element) = &element {
             self.views.insert(id, crate::view::render(element));
         }
@@ -171,7 +184,14 @@ impl<'a> Context<'a> {
     }
 
     /// Every active Concept in the Space, for patterns no index narrows.
-    pub async fn active_concepts(&self) -> Result<Vec<ElementId>, KipError> {
+    pub async fn active_concepts(&mut self) -> Result<Vec<ElementId>, KipError> {
+        if self.as_of.is_some() {
+            return Ok(self
+                .candidates(ElementKind::Concept, None)
+                .await?
+                .into_iter()
+                .collect());
+        }
         let ids = self
             .store
             .concepts()
@@ -185,6 +205,132 @@ impl<'a> Context<'a> {
             .into_iter()
             .map(|seq| ElementId::new(ElementKind::Concept, seq))
             .collect())
+    }
+
+    /// The candidate elements one pattern starts from.
+    ///
+    /// Now: the index narrows, and `filters` is what it narrows by. At a past
+    /// coordinate: the indexes describe the present and say nothing about what
+    /// was there then, so the version log is reconstructed instead and every
+    /// constraint is re-checked against the loaded element. Same answers,
+    /// different cost — which is why it is charged to the same budget.
+    pub async fn candidates(
+        &mut self,
+        kind: ElementKind,
+        filters: Option<anda_db::query::Filter>,
+    ) -> Result<Vec<ElementId>, KipError> {
+        if let Some(seq) = self.as_of {
+            let elements = self.store.elements_at(&self.space, kind, seq).await?;
+            self.charge(elements.len())?;
+            let mut ids = Vec::with_capacity(elements.len());
+            for element in elements {
+                let id = element.id();
+                // Seed the cache: the historical row was just read, and
+                // re-reading it through `load` would answer from the present.
+                self.views.insert(id, crate::view::render(&element));
+                self.loaded.insert(id, Some(element));
+                ids.push(id);
+            }
+            return Ok(ids);
+        }
+        let ids = match filters {
+            Some(filters) => self
+                .store
+                .elements(kind)
+                .query_all_ids(filters)
+                .await
+                .map_err(db_error)?,
+            None => self
+                .store
+                .elements(kind)
+                .query_all_ids(anda_db::query::Filter::Field((
+                    "space".to_string(),
+                    anda_db::query::RangeQuery::Eq(Fv::Text(self.space.clone())),
+                )))
+                .await
+                .map_err(db_error)?,
+        };
+        Ok(ids
+            .into_iter()
+            .map(|seq| ElementId::new(kind, seq))
+            .collect())
+    }
+
+    /// Whether this read is bound to a past coordinate.
+    pub fn is_historical(&self) -> bool {
+        self.as_of.is_some()
+    }
+
+    /// Binds this read to a coordinate, from `AS OF` or from the envelope.
+    ///
+    /// Both may not disagree: a request that pinned one coordinate and a
+    /// command that named another would leave the answer's own `snapshot_seq`
+    /// unable to say which one it means.
+    pub async fn bind_read(
+        &mut self,
+        as_of: Option<&anda_kip::AsOf>,
+        request: &Request,
+    ) -> Result<(), KipError> {
+        let from_token = match request
+            .read
+            .as_ref()
+            .and_then(|read| read.snapshot_token.as_ref())
+        {
+            Some(token) => {
+                Some(crate::store::history::Coordinate::from_token(token, &self.space)?.seq)
+            }
+            None => None,
+        };
+        let from_command = match as_of {
+            Some(as_of) => Some(self.resolve_as_of(as_of).await?),
+            None => None,
+        };
+        match (from_token, from_command) {
+            (Some(bound), Some(named)) if bound != named => {
+                return Err(KipError::invalid_request_envelope(format!(
+                    "this request is bound to snapshot {bound} and its command reads AS OF                      {named}; one read answers at one coordinate"
+                )));
+            }
+            _ => {}
+        }
+        self.as_of = from_command.or(from_token);
+        // The Schema that was in force then is what a historical read resolves
+        // symbols through: reconstructing the past under today's schema would
+        // answer a question nobody asked (§144).
+        if let Some(seq) = self.as_of {
+            let version = self.store.schema_version_at(&self.space, seq).await?;
+            self.env = self
+                .store
+                .schema_environment_at(&self.space, version)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Resolves an `AS OF` coordinate to a Space sequence.
+    pub async fn resolve_as_of(&mut self, as_of: &anda_kip::AsOf) -> Result<u64, KipError> {
+        let (scalar, kind) = match as_of {
+            anda_kip::AsOf::Seq(scalar) => (scalar, "SEQ"),
+            anda_kip::AsOf::Tx(scalar) => (scalar, "TX"),
+            anda_kip::AsOf::Time(scalar) => (scalar, "TIME"),
+        };
+        let value = match scalar {
+            Scalar::Literal(literal) => Json::from(literal.clone()),
+            Scalar::Param(name) => self.param_ref(name)?,
+        };
+        match (kind, value) {
+            ("SEQ", Json::Number(number)) => number
+                .as_u64()
+                .ok_or_else(|| KipError::type_mismatch("AS OF SEQ takes a non-negative sequence")),
+            ("TX", Json::String(tx_id)) => self.store.seq_of_transaction(&self.space, &tx_id).await,
+            ("TIME", Json::String(at)) => {
+                let at = crate::time::normalize(&at, "AS OF TIME")?;
+                self.store.seq_at_time(&self.space, &at).await
+            }
+            (kind, other) => Err(KipError::type_mismatch(format!(
+                "AS OF {kind} does not take {other}"
+            ))),
+        }
     }
 
     /// Evaluates a `WHERE` block into one set of solutions.
@@ -357,12 +503,6 @@ async fn run(
     request: &Request,
     operation: &Operation,
 ) -> Result<Answer, KipError> {
-    if query.as_of.is_some() {
-        return Err(KipError::unsupported_capability(
-            "AS OF reads the Space at a past coordinate, which needs historical snapshots this \
-             engine does not keep yet",
-        ));
-    }
     let mut cx = Context::open(
         store,
         space,
@@ -370,6 +510,7 @@ async fn run(
         operation.parameters.as_ref(),
     )
     .await?;
+    cx.bind_read(query.as_of.as_ref(), request).await?;
     let environment_version = cx.env.version;
 
     if let Some(block) = &query.epistemic {

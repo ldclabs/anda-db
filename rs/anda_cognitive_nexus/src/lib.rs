@@ -48,7 +48,8 @@
 //!   with handles, preconditions, receipts and dry runs;
 //! - **KQL** — element and tuple patterns, structural patterns, hop-quantified
 //!   path traversal, `FILTER`, `NOT` / `OPTIONAL` / `UNION`, projection by dot
-//!   path, aggregates, `ORDER BY`, paging and `FOR TIME`;
+//!   path, aggregates, `ORDER BY`, paging, and both time axes: `FOR TIME` (what
+//!   was true then) and `AS OF` (what this Brain held then);
 //! - **BELIEF / BELIEF SLOT** — the [`Epistemic Projection`](projection),
 //!   under a named, versioned policy, with an explanation ledger;
 //! - **META** — `DESCRIBE`, `LIST`, `SEARCH`, `VALIDATE`, `PREVIEW`,
@@ -69,8 +70,8 @@
 //! answered wrongly:
 //!
 //! ```text
-//! AS OF                          historical snapshots
 //! semantic / hybrid SEARCH       no embedding model
+//! SEARCH ... AS OF SEQ           the index reflects the present only
 //! Capsule signatures, the "isolate" and "restore" import modes
 //! DESCRIBE TRUST / ACCESS        no Governance plane
 //! PURGE                          erasure is a Governance decision

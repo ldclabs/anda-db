@@ -342,22 +342,25 @@ impl Context<'_> {
         &mut self,
         proposition: ElementId,
     ) -> Result<Vec<AssertionRow>, KipError> {
+        let target = proposition.to_string();
         let ids = self
-            .store
-            .assertions()
-            .query_all_ids(crate::store::eq_field(
-                "proposition_id",
-                anda_db_schema::Fv::Text(proposition.to_string()),
-            ))
-            .await
-            .map_err(crate::error::db_error)?;
+            .candidates(
+                anda_kip::ElementKind::Assertion,
+                Some(crate::store::eq_field(
+                    "proposition_id",
+                    anda_db_schema::Fv::Text(target.clone()),
+                )),
+            )
+            .await?;
         self.charge(ids.len())?;
 
         let mut rows = Vec::with_capacity(ids.len());
-        for seq in ids {
-            let id = ElementId::new(anda_kip::ElementKind::Assertion, seq);
+        for id in ids {
             if let Some(Element::Assertion(row)) = self.load(id).await?
                 && row.space == self.space
+                // At a coordinate the index could not narrow, so the claim is
+                // matched to its Proposition here.
+                && row.proposition_id == target
             {
                 rows.push(*row);
             }
@@ -402,33 +405,46 @@ impl Context<'_> {
         predicate_ref: &str,
     ) -> Result<Vec<ElementId>, KipError> {
         let ids = self
-            .store
-            .propositions()
-            .query_all_ids(anda_db::query::Filter::And(vec![
-                Box::new(crate::store::eq_field(
-                    "space",
-                    anda_db_schema::Fv::Text(self.space.clone()),
-                )),
-                Box::new(crate::store::eq_field(
-                    "state",
-                    anda_db_schema::Fv::Text("active".to_string()),
-                )),
-                Box::new(crate::store::eq_field(
-                    "subject_key",
-                    anda_db_schema::Fv::Text(subject_key.to_string()),
-                )),
-                Box::new(crate::store::eq_field(
-                    "predicate_ref",
-                    anda_db_schema::Fv::Text(predicate_ref.to_string()),
-                )),
-            ]))
-            .await
-            .map_err(crate::error::db_error)?;
+            .candidates(
+                anda_kip::ElementKind::Proposition,
+                Some(anda_db::query::Filter::And(vec![
+                    Box::new(crate::store::eq_field(
+                        "space",
+                        anda_db_schema::Fv::Text(self.space.clone()),
+                    )),
+                    Box::new(crate::store::eq_field(
+                        "state",
+                        anda_db_schema::Fv::Text("active".to_string()),
+                    )),
+                    Box::new(crate::store::eq_field(
+                        "subject_key",
+                        anda_db_schema::Fv::Text(subject_key.to_string()),
+                    )),
+                    Box::new(crate::store::eq_field(
+                        "predicate_ref",
+                        anda_db_schema::Fv::Text(predicate_ref.to_string()),
+                    )),
+                ])),
+            )
+            .await?;
         self.charge(ids.len())?;
-        Ok(ids
-            .into_iter()
-            .map(|seq| ElementId::new(anda_kip::ElementKind::Proposition, seq))
-            .collect())
+
+        if !self.is_historical() {
+            return Ok(ids);
+        }
+        // At a coordinate the index could not narrow, so the slot is matched
+        // against the historical rows.
+        let mut slot = Vec::new();
+        for id in ids {
+            if let Some(Element::Proposition(row)) = self.load(id).await?
+                && row.state == "active"
+                && row.subject_key == subject_key
+                && row.predicate_ref == predicate_ref
+            {
+                slot.push(id);
+            }
+        }
+        Ok(slot)
     }
 }
 

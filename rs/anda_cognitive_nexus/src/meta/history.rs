@@ -21,23 +21,29 @@ use crate::store::rows::TransactionRow;
 
 /// `SNAPSHOT [AS OF ...]` — the coordinate a later read can bind to.
 pub async fn snapshot(cx: &mut Context<'_>, as_of: Option<&AsOf>) -> Result<Answer, KipError> {
-    if as_of.is_some() {
+    let space = cx.store.get_space(&cx.space).await?;
+    let seq = match as_of {
+        Some(as_of) => cx.resolve_as_of(as_of).await?,
+        None => space.seq,
+    };
+    if seq > space.seq {
         return Err(KipError::new(
             KipErrorCode::HistoricalSnapshotUnavailable,
-            "this engine retains no historical snapshots; SNAPSHOT reports the current \
-             coordinate only",
+            format!(
+                "this Space is at sequence {}, so {seq} is not a coordinate it has reached",
+                space.seq
+            ),
         ));
     }
-    let space = cx.store.get_space(&cx.space).await?;
-    Ok(Answer::whole(serde_json::json!({
-        "space_id": space.space_id,
-        "snapshot_seq": space.seq,
-        "schema_environment_version": space.schema_environment_version,
-        // No token: a token promises a later read can be bound to this
-        // coordinate, and this engine cannot honour that.
-        "snapshot_token": Json::Null,
-        "note": "the current committed coordinate; it cannot be re-read later",
-    })))
+    let coordinate = crate::store::history::Coordinate { seq };
+    let schema_version = cx.store.schema_version_at(&cx.space, seq).await?;
+    // The token is now a promise the engine keeps: a later read carrying it in
+    // `read.snapshot_token` answers at this coordinate.
+    Ok(Answer::whole(crate::store::history::snapshot_json(
+        &cx.space,
+        coordinate,
+        schema_version,
+    )))
 }
 
 /// `HISTORY ELEMENT` and `HISTORY SPACE`.

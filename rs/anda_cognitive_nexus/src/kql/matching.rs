@@ -28,7 +28,6 @@ use anda_kip::{
 
 use super::Context;
 use super::binding::{Binding, Solutions};
-use crate::error::db_error;
 use crate::id::ElementId;
 use crate::schema::{Intent, SymbolKind};
 use crate::store::eq_field;
@@ -124,10 +123,26 @@ impl Context<'_> {
         let mut constrains_state = false;
         let mut by_id: Option<ElementId> = None;
 
+        let historical = self.is_historical();
         for (key, value) in matcher {
             let slot = self.classify(value)?;
             if key == "state" {
                 constrains_state = true;
+            }
+            // At a past coordinate the indexes describe the present, so every
+            // constraint is decided against the historical element instead —
+            // after the same normalization the index path applies, or a local
+            // type name would be compared against the exact symbol it
+            // resolves to and never match.
+            if historical && !matches!(column_of(kind, key), Some("__id")) {
+                let slot = match slot {
+                    Slot::Value(value) => {
+                        Slot::Value(Json::String(self.matcher_text(kind, key, &value)?))
+                    }
+                    bind => bind,
+                };
+                post.push((key.clone(), slot));
+                continue;
             }
             match (&slot, column_of(kind, key)) {
                 (Slot::Value(value), Some("__id")) => {
@@ -147,16 +162,18 @@ impl Context<'_> {
             filters.push(eq_field("state", Fv::Text("active".to_string())));
         }
 
-        let collection = self.store.elements(kind);
-        let ids = match by_id {
+        let ids: Vec<ElementId> = match by_id {
             // Naming an id is the narrowest possible pattern, so it skips the
             // index entirely — but the remaining constraints still apply, or
             // `{id: "C-1", state: "archived"}` would match an active element.
-            Some(id) => vec![id.seq],
-            None => collection
-                .query_all_ids(Filter::And(filters.into_iter().map(Box::new).collect()))
-                .await
-                .map_err(db_error)?,
+            Some(id) => vec![id],
+            None => {
+                self.candidates(
+                    kind,
+                    Some(Filter::And(filters.into_iter().map(Box::new).collect())),
+                )
+                .await?
+            }
         };
         self.charge(ids.len())?;
 
@@ -170,12 +187,11 @@ impl Context<'_> {
         }
 
         let mut rows = Vec::new();
-        'candidates: for seq in ids {
-            let id = ElementId::new(kind, seq);
+        'candidates: for id in ids {
             let Some(element) = self.load(id).await? else {
                 continue;
             };
-            if by_id.is_some() {
+            if by_id.is_some() || historical {
                 // The id path bypassed the filters, so re-check the ones that
                 // would have been applied.
                 if element.space() != self.space {
@@ -274,12 +290,13 @@ impl Context<'_> {
             )));
         }
 
+        let historical = self.is_historical();
         let ids = self
-            .store
-            .propositions()
-            .query_all_ids(Filter::And(filters.into_iter().map(Box::new).collect()))
-            .await
-            .map_err(db_error)?;
+            .candidates(
+                ElementKind::Proposition,
+                Some(Filter::And(filters.into_iter().map(Box::new).collect())),
+            )
+            .await?;
         self.charge(ids.len())?;
 
         let mut vars: Vec<String> = Vec::new();
@@ -300,11 +317,15 @@ impl Context<'_> {
         }
 
         let mut rows = Vec::new();
-        for seq in ids {
-            let id = ElementId::new(ElementKind::Proposition, seq);
+        for id in ids {
             let Some(crate::store::Element::Proposition(row)) = self.load(id).await? else {
                 continue;
             };
+            // At a coordinate the filters could not be pushed down, so the
+            // tuple is matched here against the historical row.
+            if historical && !tuple_matches(&row, &subject, &object, &predicates) {
+                continue;
+            }
             let mut solution = vec![Binding::Null; vars.len()];
             if let Some(var) = variable {
                 set(&vars, &mut solution, var, Binding::Element(id));
@@ -692,28 +713,40 @@ impl Context<'_> {
         } else {
             ("object_key", "subject")
         };
+        let anchor_key = from.key();
         let ids = self
-            .store
-            .propositions()
-            .query_all_ids(Filter::And(vec![
-                Box::new(eq_field("space", Fv::Text(self.space.clone()))),
-                Box::new(eq_field("state", Fv::Text("active".to_string()))),
-                Box::new(eq_field(anchor, Fv::Text(from.key()))),
-                Box::new(Filter::Field((
-                    "predicate_ref".to_string(),
-                    RangeQuery::Include(symbols.iter().map(|s| Fv::Text(s.clone())).collect()),
-                ))),
-            ]))
-            .await
-            .map_err(db_error)?;
+            .candidates(
+                ElementKind::Proposition,
+                Some(Filter::And(vec![
+                    Box::new(eq_field("space", Fv::Text(self.space.clone()))),
+                    Box::new(eq_field("state", Fv::Text("active".to_string()))),
+                    Box::new(eq_field(anchor, Fv::Text(anchor_key.clone()))),
+                    Box::new(Filter::Field((
+                        "predicate_ref".to_string(),
+                        RangeQuery::Include(symbols.iter().map(|s| Fv::Text(s.clone())).collect()),
+                    ))),
+                ])),
+            )
+            .await?;
         self.charge(ids.len())?;
 
+        let historical = self.is_historical();
         let mut out = Vec::new();
-        for seq in ids {
-            let id = ElementId::new(ElementKind::Proposition, seq);
+        for id in ids {
             let Some(crate::store::Element::Proposition(row)) = self.load(id).await? else {
                 continue;
             };
+            if historical {
+                let matches_anchor = if forward {
+                    row.subject_key == anchor_key
+                } else {
+                    row.object_key == anchor_key
+                };
+                if !matches_anchor || row.state != "active" || !symbols.contains(&row.predicate_ref)
+                {
+                    continue;
+                }
+            }
             let value = if opposite == "object" {
                 &row.object
             } else {
@@ -730,26 +763,29 @@ impl Context<'_> {
     /// ends unbound.
     async fn tuple_subjects(&mut self, symbols: &[String]) -> Result<Vec<Endpoint>, KipError> {
         let ids = self
-            .store
-            .propositions()
-            .query_all_ids(Filter::And(vec![
-                Box::new(eq_field("space", Fv::Text(self.space.clone()))),
-                Box::new(eq_field("state", Fv::Text("active".to_string()))),
-                Box::new(Filter::Field((
-                    "predicate_ref".to_string(),
-                    RangeQuery::Include(symbols.iter().map(|s| Fv::Text(s.clone())).collect()),
-                ))),
-            ]))
-            .await
-            .map_err(db_error)?;
+            .candidates(
+                ElementKind::Proposition,
+                Some(Filter::And(vec![
+                    Box::new(eq_field("space", Fv::Text(self.space.clone()))),
+                    Box::new(eq_field("state", Fv::Text("active".to_string()))),
+                    Box::new(Filter::Field((
+                        "predicate_ref".to_string(),
+                        RangeQuery::Include(symbols.iter().map(|s| Fv::Text(s.clone())).collect()),
+                    ))),
+                ])),
+            )
+            .await?;
         self.charge(ids.len())?;
 
+        let historical = self.is_historical();
         let mut subjects: Vec<Endpoint> = Vec::new();
-        for seq in ids {
-            let id = ElementId::new(ElementKind::Proposition, seq);
+        for id in ids {
             let Some(crate::store::Element::Proposition(row)) = self.load(id).await? else {
                 continue;
             };
+            if historical && (row.state != "active" || !symbols.contains(&row.predicate_ref)) {
+                continue;
+            }
             if let Ok(endpoint) = Endpoint::from_json(&row.subject)
                 && !subjects.contains(&endpoint)
             {
@@ -835,6 +871,37 @@ impl Context<'_> {
 enum EndpointSlot {
     Fixed(Endpoint),
     Bind(String),
+}
+
+/// Whether a Proposition row satisfies a tuple pattern.
+///
+/// Only the historical path needs this: a present-day read pushes the same
+/// three constraints into the index.
+fn tuple_matches(
+    row: &crate::store::rows::PropositionRow,
+    subject: &EndpointSlot,
+    object: &EndpointSlot,
+    predicates: &PredicateSlot,
+) -> bool {
+    if row.state != "active" {
+        return false;
+    }
+    if let EndpointSlot::Fixed(endpoint) = subject
+        && row.subject_key != endpoint.key()
+    {
+        return false;
+    }
+    if let EndpointSlot::Fixed(endpoint) = object
+        && row.object_key != endpoint.key()
+    {
+        return false;
+    }
+    if let PredicateSlot::Fixed(symbols) = predicates
+        && !symbols.contains(&row.predicate_ref)
+    {
+        return false;
+    }
+    true
 }
 
 /// One quantified alternative of a raw predicate path.

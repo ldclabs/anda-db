@@ -509,32 +509,6 @@ async fn a_structural_pattern_reads_record_topology() {
 }
 
 #[tokio::test]
-async fn unsupported_reads_say_so_instead_of_answering_something_else() {
-    let nexus = seeded("unsupported").await;
-    // Hop quantifiers moved out of this list when traversal landed; see
-    // `tests/traversal.rs`.
-    for (command, fragment) in [(
-        r#"FIND(?c) WHERE { ?c CONCEPT {type: "Person"} } AS OF SEQ 1"#,
-        "historical snapshots",
-    )] {
-        let response = run(&nexus, command).await;
-        let error = response.error.as_ref().unwrap_or_else(|| {
-            panic!("{command} should not have succeeded");
-        });
-        assert_eq!(
-            error.code.as_str(),
-            "UnsupportedCapability",
-            "for {command}"
-        );
-        assert!(
-            error.message.contains(fragment),
-            "for {command}: {}",
-            error.message
-        );
-    }
-}
-
-#[tokio::test]
 async fn an_empty_where_block_is_one_solution_not_zero() {
     let nexus = seeded("unit").await;
     // `?c CONCEPT {}` constrains nothing but the kind, so it finds them all.

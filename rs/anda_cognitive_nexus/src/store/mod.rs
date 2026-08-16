@@ -36,6 +36,7 @@
 //! [`Store::reopen`] can replace, and every mutating entry point checks
 //! [`Store::has_poisoned_handle`] first.
 
+pub mod history;
 pub mod rows;
 pub mod schema;
 pub mod space;
@@ -74,6 +75,8 @@ pub const TRANSACTIONS: &str = "transactions";
 pub const SCHEMA_PACKAGES: &str = "schema_packages";
 /// The Schema Environment version collection name.
 pub const SCHEMA_ENVS: &str = "schema_envs";
+/// The collection holding one row per element version.
+pub const ELEMENT_VERSIONS: &str = "element_versions";
 
 /// A collection handle that survives poisoning.
 #[derive(Clone, Debug)]
@@ -107,6 +110,7 @@ pub struct Store {
     transactions: Slot,
     schema_packages: Slot,
     schema_envs: Slot,
+    element_versions: Slot,
 }
 
 /// The columns every element kind is indexed on.
@@ -228,6 +232,17 @@ async fn init_schema_envs(c: &mut Collection) -> Result<(), DBError> {
     Ok(())
 }
 
+async fn init_element_versions(c: &mut Collection) -> Result<(), DBError> {
+    c.create_btree_index_nx(&["space"]).await?;
+    // The historical read is "the greatest version of this element at or
+    // before this sequence", so both columns are ranged over.
+    c.create_btree_index_nx(&["element"]).await?;
+    c.create_btree_index_nx(&["seq"]).await?;
+    c.create_btree_index_nx(&["kind"]).await?;
+    c.create_btree_index_nx(&["tx_id"]).await?;
+    Ok(())
+}
+
 async fn init_transactions(c: &mut Collection) -> Result<(), DBError> {
     c.create_btree_index_nx(&["tx_id"]).await?;
     c.create_btree_index_nx(&["space"]).await?;
@@ -318,6 +333,15 @@ impl Store {
             .await
             .map_err(db_error)?;
 
+        let element_versions = db
+            .open_or_create_collection(
+                ElementVersionRow::schema().map_err(schema_error)?,
+                collection_config(ELEMENT_VERSIONS, "One row per element version"),
+                init_element_versions,
+            )
+            .await
+            .map_err(db_error)?;
+
         Ok(Self {
             db,
             concepts: Slot::new(concepts),
@@ -329,6 +353,7 @@ impl Store {
             transactions: Slot::new(transactions),
             schema_packages: Slot::new(schema_packages),
             schema_envs: Slot::new(schema_envs),
+            element_versions: Slot::new(element_versions),
         })
     }
 
@@ -377,6 +402,11 @@ impl Store {
         self.schema_envs.get()
     }
 
+    /// The element version log handle.
+    pub fn element_versions(&self) -> Arc<Collection> {
+        self.element_versions.get()
+    }
+
     /// The collection holding one Core element kind.
     pub fn elements(&self, kind: ElementKind) -> Arc<Collection> {
         match kind {
@@ -400,6 +430,7 @@ impl Store {
             self.transactions(),
             self.schema_packages(),
             self.schema_envs(),
+            self.element_versions(),
         ]
         .iter()
         .any(|c| c.is_poisoned())
@@ -429,6 +460,8 @@ impl Store {
             .set(self.reload(SCHEMA_PACKAGES, init_schema_packages).await?);
         self.schema_envs
             .set(self.reload(SCHEMA_ENVS, init_schema_envs).await?);
+        self.element_versions
+            .set(self.reload(ELEMENT_VERSIONS, init_element_versions).await?);
         Ok(())
     }
 
@@ -462,6 +495,7 @@ impl Store {
             self.transactions(),
             self.schema_packages(),
             self.schema_envs(),
+            self.element_versions(),
         ] {
             collection.flush(now_ms).await.map_err(db_error)?;
         }

@@ -40,8 +40,18 @@ pub async fn run(cx: &mut Context<'_>, target: &DescribeTarget) -> Result<Answer
             Answer::whole(space(cx, &id).await?)
         }
         DescribeTarget::SchemaEnvironment { as_of } => {
-            if as_of.is_some() {
-                return Err(historical());
+            // The environment a past coordinate resolved through, not today's:
+            // reconstructing history under current schema would answer a
+            // question nobody asked (§144).
+            if let Some(as_of) = as_of {
+                let seq = cx.resolve_as_of(as_of).await?;
+                let version = cx.store.schema_version_at(&cx.space, seq).await?;
+                let env = cx.store.schema_environment_at(&cx.space, version).await?;
+                let mut answer = schema_environment_of(&env);
+                if let Some(object) = answer.as_object_mut() {
+                    object.insert("snapshot_seq".to_string(), serde_json::json!(seq));
+                }
+                return Ok(Answer::whole(answer));
             }
             Answer::whole(schema_environment(cx))
         }
@@ -281,12 +291,16 @@ async fn spaces(cx: &mut Context<'_>) -> Result<Vec<Json>, KipError> {
 }
 
 fn schema_environment(cx: &Context<'_>) -> Json {
+    schema_environment_of(&cx.env)
+}
+
+fn schema_environment_of(env: &crate::schema::SchemaEnvironment) -> Json {
     serde_json::json!({
-        "version": cx.env.version,
-        "packages": cx.env.lock.packages,
-        "states": cx.env.lock.states,
-        "write_defaults": cx.env.lock.write_defaults,
-        "aliases": cx.env.lock.aliases,
+        "version": env.version,
+        "packages": env.lock.packages,
+        "states": env.lock.states,
+        "write_defaults": env.lock.write_defaults,
+        "aliases": env.lock.aliases,
     })
 }
 
@@ -459,13 +473,6 @@ fn policy(name: &str) -> Result<Json, KipError> {
             "corroboration groups are counted once; repetition is not evidence",
         ],
     }))
-}
-
-fn historical() -> KipError {
-    KipError::new(
-        KipErrorCode::HistoricalSchemaUnavailable,
-        "this engine retains no historical coordinates, so AS OF cannot be answered",
-    )
 }
 
 pub(super) fn scalar_str(

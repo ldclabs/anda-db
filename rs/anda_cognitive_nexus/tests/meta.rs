@@ -136,7 +136,7 @@ async fn capabilities_report_the_gaps_as_data_not_as_errors() {
         .collect();
     for expected in [
         "atomic_batch",
-        "historical_read",
+        "historical_search",
         "semantic_search",
         "trust_model",
         "governance",
@@ -456,17 +456,31 @@ async fn a_transaction_is_recoverable_by_id_and_by_idempotency_key() {
 }
 
 #[tokio::test]
-async fn a_snapshot_reports_the_coordinate_without_promising_to_keep_it() {
-    // A token would promise a later read can bind to this coordinate, and this
-    // engine cannot honour that.
+async fn a_snapshot_reports_a_coordinate_a_later_read_can_bind_to() {
+    // A token promises a later read can be bound to this coordinate. The
+    // engine keeps that promise now, so it issues one; `tests/history.rs`
+    // exercises the binding itself.
     let nexus = seeded("snapshot").await;
     let snapshot = ok(&nexus, "SNAPSHOT").await;
-    assert!(snapshot["snapshot_seq"].as_u64().unwrap() >= 1);
-    assert!(snapshot["snapshot_token"].is_null());
+    let seq = snapshot["snapshot_seq"].as_u64().unwrap();
+    assert!(seq >= 1);
+    assert!(snapshot["snapshot_token"].is_string());
 
-    let historical = run(&nexus, "SNAPSHOT AS OF SEQ 1").await;
+    let historical = ok(&nexus, "SNAPSHOT AS OF SEQ 1").await;
+    assert_eq!(historical["snapshot_seq"], serde_json::json!(1));
+
+    // A coordinate the Space has not reached is refused rather than rounded
+    // down to the present.
+    let ahead = run(&nexus, &format!("SNAPSHOT AS OF SEQ {}", seq + 50)).await;
     assert_eq!(
-        historical.error.as_ref().unwrap().code.as_str(),
+        ahead
+            .results
+            .iter()
+            .find_map(|result| result.error.as_ref())
+            .or(ahead.error.as_ref())
+            .unwrap()
+            .code
+            .as_str(),
         "HistoricalSnapshotUnavailable"
     );
 }

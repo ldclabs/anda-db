@@ -342,7 +342,8 @@ impl Transaction {
             } else {
                 staged.row.version().saturating_add(1)
             };
-            self.write(id, staged.row, version, staged.is_new).await?;
+            self.write(id, staged.row, version, staged.op, staged.is_new)
+                .await?;
             changes.push(change_record(id, staged.op, version));
             written += 1;
         }
@@ -416,6 +417,7 @@ impl Transaction {
         id: ElementId,
         row: Element,
         version: u64,
+        op: &str,
         is_new: bool,
     ) -> Result<(), KipError> {
         macro_rules! put {
@@ -436,6 +438,13 @@ impl Transaction {
                     row.state = state::ACTIVE.to_string();
                 }
                 self.store.put(&row).await?;
+                // The version log is appended in the same commit as the row it
+                // records. A history written afterwards can be missing the
+                // last write a crash interrupted, and a history with a hole in
+                // it answers `AS OF` wrongly rather than refusing.
+                self.store
+                    .record_version(&self.cx, id, version, op, &row)
+                    .await?;
             }};
         }
         match row {
