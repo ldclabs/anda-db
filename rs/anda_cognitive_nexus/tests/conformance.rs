@@ -27,7 +27,7 @@ use serde::Deserialize;
 use serde_json::{Map, json};
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
-const COGNITIVE_MEMORY: &str = include_str!("fixtures/cognitive-memory-2.0.0.json");
+const COGNITIVE_MEMORY: &str = anda_cognitive_nexus::profiles::COGNITIVE_MEMORY;
 
 #[derive(Deserialize)]
 struct Fixture {

@@ -93,6 +93,7 @@ pub mod kml;
 pub mod kql;
 pub mod meta;
 pub mod nexus;
+pub mod profiles;
 pub mod projection;
 pub mod schema;
 pub mod store;

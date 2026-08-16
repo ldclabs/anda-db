@@ -109,6 +109,29 @@ impl CognitiveNexus {
             .await
     }
 
+    /// Activates `lock` in a Space, but only when it differs from the one
+    /// already in force.
+    ///
+    /// This is what a host calls on every start. Every activation mints a new
+    /// environment version (§143), so a host that unconditionally re-activated
+    /// its baseline lock would walk the version forward on each restart —
+    /// invalidating clients' `preconditions.schema_environment_version` and
+    /// filling `HISTORY` with schema changes that changed nothing.
+    pub async fn ensure_schema(
+        &self,
+        space_id: &str,
+        lock: crate::schema::SchemaLock,
+    ) -> Result<SchemaEnvironment, KipError> {
+        let _guard = self.lock.write().await;
+        let current = self.store.schema_environment(space_id).await?;
+        if current.lock == lock {
+            return Ok(current);
+        }
+        self.store
+            .activate_schema(space_id, lock, "governance")
+            .await
+    }
+
     /// The Space a request runs against.
     ///
     /// A Space named in the envelope must exist: creating one implicitly would

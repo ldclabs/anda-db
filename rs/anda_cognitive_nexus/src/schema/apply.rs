@@ -284,7 +284,7 @@ mod tests {
     use serde_json::json;
     use std::{collections::BTreeMap, sync::Arc};
 
-    const COGNITIVE_MEMORY: &str = include_str!("../../tests/fixtures/cognitive-memory-2.0.0.json");
+    const COGNITIVE_MEMORY: &str = crate::profiles::COGNITIVE_MEMORY;
     const PROFILE: &str = "kip://profiles/cognitive-memory";
 
     fn env() -> SchemaEnvironment {

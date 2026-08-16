@@ -377,7 +377,7 @@ mod tests {
     use crate::schema::package::SchemaPackage;
     use serde_json::json;
 
-    const COGNITIVE_MEMORY: &str = include_str!("../../tests/fixtures/cognitive-memory-2.0.0.json");
+    const COGNITIVE_MEMORY: &str = crate::profiles::COGNITIVE_MEMORY;
 
     fn profile() -> SchemaPackage {
         SchemaPackage::parse(COGNITIVE_MEMORY).unwrap()

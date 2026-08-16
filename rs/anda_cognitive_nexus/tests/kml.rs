@@ -17,7 +17,7 @@ use object_store::memory::InMemory;
 use serde_json::json;
 use std::sync::Arc;
 
-const COGNITIVE_MEMORY: &str = include_str!("fixtures/cognitive-memory-2.0.0.json");
+const COGNITIVE_MEMORY: &str = anda_cognitive_nexus::profiles::COGNITIVE_MEMORY;
 const PROFILE_ID: &str = "kip://profiles/cognitive-memory";
 
 async fn nexus(name: &str) -> CognitiveNexus {

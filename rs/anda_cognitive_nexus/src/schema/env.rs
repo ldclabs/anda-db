@@ -422,7 +422,7 @@ impl SchemaEnvironment {
 mod tests {
     use super::*;
 
-    const COGNITIVE_MEMORY: &str = include_str!("../../tests/fixtures/cognitive-memory-2.0.0.json");
+    const COGNITIVE_MEMORY: &str = crate::profiles::COGNITIVE_MEMORY;
 
     /// A second package that also defines `Person`, to force ambiguity.
     const ACME_HR: &str = r#"{

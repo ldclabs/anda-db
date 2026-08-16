@@ -469,7 +469,7 @@ mod tests {
     /// Parsing the real artifact rather than a hand-written imitation is the
     /// point: an imitation would drift toward whatever this module already
     /// supports, and stop testing anything.
-    const COGNITIVE_MEMORY: &str = include_str!("../../tests/fixtures/cognitive-memory-2.0.0.json");
+    const COGNITIVE_MEMORY: &str = crate::profiles::COGNITIVE_MEMORY;
 
     fn profile() -> SchemaPackage {
         SchemaPackage::parse(COGNITIVE_MEMORY).unwrap()

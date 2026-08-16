@@ -60,10 +60,12 @@ struct Cli {
     #[clap(long, env = "INSECURE_NO_API_KEY")]
     insecure_no_api_key: bool,
 
-    /// Reserved principal id injected into the `$self` genesis KML on
-    /// first start
-    #[clap(long, env = "SELF_PRINCIPAL_ID", default_value = "uuc56-gyb")]
-    self_principal_id: String,
+    /// Additional Schema Package artifacts (JSON files) to install and
+    /// activate in the default MemorySpace, on top of the bundled
+    /// cognitive-memory profile. Repeat the flag, or separate paths with
+    /// commas in the environment variable.
+    #[clap(long, env = "SCHEMA_PACKAGE", value_delimiter = ',')]
+    schema_package: Vec<String>,
 
     /// Background flush interval in seconds for the database
     #[clap(long, env = "FLUSH_INTERVAL_SECS", default_value = "30")]
@@ -152,13 +154,9 @@ async fn main() -> Result<(), BoxError> {
         lock: None,
     };
 
+    let packages = read_schema_packages(&cli.schema_package)?;
     let db = Arc::new(AndaDB::connect(object_store.clone(), db_config).await?);
-    let nexus = nexus::Nexus::connect(
-        db.clone(),
-        cli.self_principal_id,
-        cli.max_logged_request_bytes,
-    )
-    .await?;
+    let nexus = nexus::Nexus::connect(db.clone(), &packages, cli.max_logged_request_bytes).await?;
 
     let admission = CancellationToken::new();
     let mutation_tasks = TaskTracker::new();
@@ -367,6 +365,26 @@ async fn main() -> Result<(), BoxError> {
     }
     result?;
     Ok(())
+}
+
+/// Reads the operator-supplied Schema Package artifacts.
+///
+/// Read before the database is opened: a missing or unreadable package must
+/// stop the process at startup, not after a Space is already serving. The
+/// artifacts are not parsed here — `Nexus::connect` does that, so one code path
+/// owns what "a valid package" means.
+fn read_schema_packages(paths: &[String]) -> Result<Vec<nexus::SchemaPackageSource>, BoxError> {
+    paths
+        .iter()
+        .map(|path| {
+            let artifact = std::fs::read_to_string(path)
+                .map_err(|err| format!("failed to read schema package {path:?}: {err}"))?;
+            Ok(nexus::SchemaPackageSource {
+                source: path.clone(),
+                artifact,
+            })
+        })
+        .collect()
 }
 
 /// Converts the configured retention window from days to hours.
