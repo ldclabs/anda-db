@@ -47,6 +47,7 @@ use anda_kip::{Capsule, ElementKind, Json, KipError, KipErrorCode, Map};
 use std::collections::BTreeMap;
 
 use super::ImportReport;
+use crate::governance::{AuthContext, EffectiveAuthority};
 use crate::id::ElementId;
 use crate::store::rows::*;
 use crate::store::{Element, Store, eq_field};
@@ -76,6 +77,7 @@ pub async fn merge(
     space_id: &str,
     digest: &str,
     mut report: ImportReport,
+    auth: AuthContext,
 ) -> Result<ImportReport, KipError> {
     let records = collect(capsule)?;
 
@@ -102,7 +104,10 @@ pub async fn merge(
             "source_snapshot_seq": capsule.payload.source.snapshot_seq,
         }
     });
-    let mut tx = Transaction::begin(store, space_id, origin, false).await?;
+    // Import runs on the host's own authority: it is a host API, and the host
+    // already decided that this Space accepts another Brain's cognition.
+    let authority = EffectiveAuthority::resolve(store, space_id, &auth).await?;
+    let mut tx = Transaction::begin(store, space_id, origin, false, authority, auth).await?;
 
     // Phase 2: mint the ids the new records will wear, so a reference to a
     // record that appears later in the artifact still resolves.

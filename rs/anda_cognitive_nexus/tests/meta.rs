@@ -139,12 +139,20 @@ async fn capabilities_report_the_gaps_as_data_not_as_errors() {
         "historical_search",
         "semantic_search",
         "trust_model",
-        "governance",
+        // Governance is enforced at command scope; what is still missing is
+        // the per-element half, and the gap list says exactly that rather
+        // than claiming the whole plane either way.
+        "governance_element_scope",
+        "trust_governance",
         "capsule_import_modes",
         "capsule_signatures",
     ] {
         assert!(unsupported.contains(&expected), "missing {expected}");
     }
+    assert!(
+        caps["supported"]["governance"]["default_deny"] == json!(true),
+        "and what is enforced is reported as supported"
+    );
     // Each gap says why, not just that.
     for entry in caps["unsupported"].as_array().unwrap() {
         assert!(!entry["reason"].as_str().unwrap().is_empty());
@@ -486,19 +494,30 @@ async fn a_snapshot_reports_a_coordinate_a_later_read_can_bind_to() {
 }
 
 #[tokio::test]
-async fn trust_and_access_refuse_rather_than_reporting_an_empty_judgement() {
-    // An empty trust report reads as "nothing is trusted" and an empty access
-    // report as "nothing is permitted". Both are claims this engine cannot
-    // make.
+async fn trust_refuses_rather_than_reporting_an_empty_judgement() {
+    // An empty trust report reads as "nothing is trusted", which is a claim
+    // this engine cannot make: it evaluates no source trust at all.
+    //
+    // `DESCRIBE ACCESS` used to refuse for the parallel reason and no longer
+    // does, because there is now a Governance plane with something true to say.
     let nexus = fresh("governance").await;
-    for command in ["DESCRIBE TRUST", "DESCRIBE ACCESS"] {
-        let response = run(&nexus, command).await;
-        assert_eq!(
-            response.error.as_ref().unwrap().code.as_str(),
-            "UnsupportedCapability",
-            "for {command}"
-        );
-    }
+    let response = run(&nexus, "DESCRIBE TRUST").await;
+    assert_eq!(
+        response.error.as_ref().unwrap().code.as_str(),
+        "UnsupportedCapability"
+    );
+
+    let access = ok(&nexus, "DESCRIBE ACCESS").await;
+    assert_eq!(access["principal"]["id"], "kip:principal:system");
+    assert_eq!(access["is_owner"], true);
+    assert!(
+        access["permissions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|permission| permission == "read"),
+        "an owner holds the read permission"
+    );
 }
 
 #[tokio::test]

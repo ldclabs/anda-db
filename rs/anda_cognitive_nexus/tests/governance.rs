@@ -9,10 +9,11 @@
 use anda_cognitive_nexus::{
     CognitiveNexus,
     governance::{
-        SYSTEM_PRINCIPAL, classification,
+        AuthContext, SYSTEM_PRINCIPAL, classification,
         rows::{
             ActorBindingRow, AuthorityConditions, AuthorityConstraints, AuthorityScope, GrantRow,
-            PolicyStatement, assurance, auth_strength, binding_class, principal_class, status,
+            PolicyStatement, assurance, auth_strength, binding_class, principal_class,
+            purpose_assurance, status,
         },
         store::{
             ActorBindingDraft, ApprovalDraft, DelegationDraft, GovernanceStore, GrantDraft,
@@ -20,8 +21,11 @@ use anda_cognitive_nexus::{
         },
     },
     nexus::DEFAULT_SPACE,
+    nexus::Session,
+    schema::{PackageState, SchemaLock, SchemaPackage},
 };
 use anda_db::database::{AndaDB, DBConfig};
+use anda_kip::{Executor, Request, Response, TopLevelStatus};
 use object_store::memory::InMemory;
 use std::sync::Arc;
 
@@ -309,6 +313,12 @@ async fn a_policy_version_is_never_overwritten() {
         .unwrap();
     assert_eq!(first.version, 1);
     assert_eq!(first.policy_ref, "kip:policy:space-default@1");
+
+    // The historical coordinate is a timestamp with millisecond resolution, so
+    // two publishes in the same millisecond genuinely share one coordinate and
+    // "the version in force at T" is then the later one. Separating them is
+    // what makes the assertion below about history rather than about clocks.
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
 
     let second = gov
         .publish_policy(
@@ -599,4 +609,727 @@ async fn every_control_plane_change_lands_in_the_audit() {
     let global_ops: Vec<&str> = global.iter().map(|e| e.operation.as_str()).collect();
     assert!(global_ops.contains(&"create_principal"));
     assert!(global_ops.contains(&"put_group"));
+}
+
+// ---------------------------------------------------------------------------
+// Sessions: what a caller can actually do
+// ---------------------------------------------------------------------------
+
+/// A Nexus with the bundled profile in force, so KML has types to write.
+async fn stocked(name: &str) -> CognitiveNexus {
+    let nexus = fresh(name).await;
+    nexus
+        .install_package(
+            &SchemaPackage::parse(anda_cognitive_nexus::profiles::COGNITIVE_MEMORY).unwrap(),
+            "test",
+        )
+        .await
+        .unwrap();
+    let mut lock = SchemaLock::default();
+    lock.packages
+        .insert("kip://profiles/cognitive-memory".into(), "2.0.0".into());
+    lock.states.insert(
+        "kip://profiles/cognitive-memory".into(),
+        PackageState::Active,
+    );
+    nexus.activate_schema(DEFAULT_SPACE, lock).await.unwrap();
+    nexus
+}
+
+async fn run_as(session: &Session, command: &str) -> Response {
+    let request = Request::single(command);
+    let parsed = anda_kip::parse_kip(command).unwrap_or_else(|err| panic!("{command}\n{err}"));
+    session
+        .execute(parsed, &request, &request.operations[0])
+        .await
+}
+
+fn error_code(response: &Response) -> &str {
+    response
+        .error
+        .as_ref()
+        .or_else(|| response.results.first().and_then(|r| r.error.as_ref()))
+        .map(|error| error.code.as_str())
+        .unwrap_or("")
+}
+
+#[tokio::test]
+async fn a_caller_with_no_grants_is_denied_rather_than_shown_an_empty_space() {
+    // §41: default deny. A missing policy must not become public access — and
+    // an empty result set would tell the caller something about the world.
+    let nexus = stocked("default_deny").await;
+    agent(nexus.governance(), "kip:principal:stranger").await;
+    let stranger = nexus.session(AuthContext::principal("kip:principal:stranger"));
+
+    let response = run_as(
+        &stranger,
+        r#"FIND(?c) WHERE { ?c CONCEPT {type: "Person"} }"#,
+    )
+    .await;
+    assert_eq!(error_code(&response), "NotAuthorized");
+    assert!(
+        response.error.as_ref().unwrap().message.contains("read"),
+        "the denial names the permission, and nothing else"
+    );
+}
+
+#[tokio::test]
+async fn an_unregistered_principal_is_a_configuration_bug_not_a_denial() {
+    // A host that asserts an identity the control plane never heard of has a
+    // bug. Resolving it to "a caller with no Grants" would hide that bug behind
+    // something that reads like policy.
+    let nexus = stocked("unregistered").await;
+    let ghost = nexus.session(AuthContext::principal("kip:principal:ghost"));
+    let response = run_as(&ghost, "DESCRIBE PRIMER").await;
+    assert_eq!(error_code(&response), "Unauthenticated");
+}
+
+#[tokio::test]
+async fn a_read_grant_permits_reading_and_not_exporting() {
+    // §271: Read ≠ Export. A caller who may see every element in a Space still
+    // may not package them and take them away.
+    let nexus = stocked("read_not_export").await;
+    let gov = nexus.governance();
+    let reader = agent(gov, "kip:principal:reader").await;
+    gov.create_grant(
+        GrantDraft {
+            space_id: DEFAULT_SPACE.into(),
+            grantee_principal: reader.clone(),
+            actions: vec!["read".into(), "discover".into()],
+            ..Default::default()
+        },
+        SYSTEM_PRINCIPAL,
+    )
+    .await
+    .unwrap();
+    let session = nexus.session(AuthContext::principal(&reader));
+
+    let query = run_as(
+        &session,
+        r#"FIND(?c) WHERE { ?c CONCEPT {type: "Person"} }"#,
+    )
+    .await;
+    assert_eq!(query.status, TopLevelStatus::Succeeded);
+
+    let export = run_as(
+        &session,
+        r#"EXPORT CAPSULE :out WHERE { ?c CONCEPT {type: "Person"} }"#,
+    )
+    .await;
+    assert_eq!(error_code(&export), "NotAuthorized");
+    assert!(export.error.as_ref().unwrap().message.contains("export"));
+}
+
+#[tokio::test]
+async fn reading_the_past_is_a_permission_of_its_own() {
+    let nexus = stocked("read_history").await;
+    let gov = nexus.governance();
+    let reader = agent(gov, "kip:principal:reader").await;
+    gov.create_grant(
+        GrantDraft {
+            space_id: DEFAULT_SPACE.into(),
+            grantee_principal: reader.clone(),
+            actions: vec!["read".into()],
+            ..Default::default()
+        },
+        SYSTEM_PRINCIPAL,
+    )
+    .await
+    .unwrap();
+    let session = nexus.session(AuthContext::principal(&reader));
+
+    assert_eq!(
+        run_as(
+            &session,
+            r#"FIND(?c) WHERE { ?c CONCEPT {type: "Person"} }"#
+        )
+        .await
+        .status,
+        TopLevelStatus::Succeeded
+    );
+    let historical = run_as(
+        &session,
+        r#"FIND(?c) WHERE { ?c CONCEPT {type: "Person"} } AS OF SEQ 1"#,
+    )
+    .await;
+    assert_eq!(error_code(&historical), "NotAuthorized");
+}
+
+#[tokio::test]
+async fn a_writer_without_the_clause_permission_is_refused() {
+    let nexus = stocked("clause_permissions").await;
+    let gov = nexus.governance();
+    let writer = agent(gov, "kip:principal:writer").await;
+    gov.create_grant(
+        GrantDraft {
+            space_id: DEFAULT_SPACE.into(),
+            grantee_principal: writer.clone(),
+            actions: vec!["read".into(), "create".into()],
+            ..Default::default()
+        },
+        SYSTEM_PRINCIPAL,
+    )
+    .await
+    .unwrap();
+    let session = nexus.session(AuthContext::principal(&writer));
+
+    let created = run_as(
+        &session,
+        r#"CREATE CONCEPT ?p { TYPE "Person" NAME "Alice" }"#,
+    )
+    .await;
+    assert_eq!(created.status, TopLevelStatus::Succeeded);
+
+    // Creating is not erasing, and it is not removing either.
+    for (command, code) in [
+        (r#"TOMBSTONE "C-1""#, "NotAuthorized"),
+        (r#"PURGE "C-1" CONFIRM "PURGE""#, "NotAuthorized"),
+    ] {
+        assert_eq!(
+            error_code(&run_as(&session, command).await),
+            code,
+            "{command}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn what_a_principal_wrote_is_stamped_on_the_element() {
+    // §26: engine origin is what the runtime observed. It comes from the
+    // authenticated session, never from the command's content.
+    let nexus = stocked("origin").await;
+    let gov = nexus.governance();
+    let writer = agent(gov, "kip:principal:writer").await;
+    gov.create_grant(
+        GrantDraft {
+            space_id: DEFAULT_SPACE.into(),
+            grantee_principal: writer.clone(),
+            actions: vec!["read".into(), "create".into()],
+            ..Default::default()
+        },
+        SYSTEM_PRINCIPAL,
+    )
+    .await
+    .unwrap();
+    let session = nexus.session(AuthContext::principal(&writer));
+    run_as(
+        &session,
+        r#"CREATE CONCEPT ?p { TYPE "Person" NAME "Alice" }"#,
+    )
+    .await;
+
+    let element = nexus
+        .store
+        .get_element(anda_cognitive_nexus::ElementId::new(
+            anda_kip::ElementKind::Concept,
+            1,
+        ))
+        .await
+        .unwrap();
+    let view = anda_cognitive_nexus::view::render(&element);
+    assert_eq!(view["_system"]["origin"]["principal_id"], writer);
+}
+
+#[tokio::test]
+async fn a_revoked_grant_stops_a_session_that_was_already_running() {
+    // §188, §245: a session must not assume its startup permissions hold
+    // forever. Authority is re-resolved on every request.
+    let nexus = stocked("revocation_live").await;
+    let gov = nexus.governance();
+    let reader = agent(gov, "kip:principal:reader").await;
+    let grant = gov
+        .create_grant(
+            GrantDraft {
+                space_id: DEFAULT_SPACE.into(),
+                grantee_principal: reader.clone(),
+                actions: vec!["read".into()],
+                ..Default::default()
+            },
+            SYSTEM_PRINCIPAL,
+        )
+        .await
+        .unwrap();
+    let session = nexus.session(AuthContext::principal(&reader));
+    let query = r#"FIND(?c) WHERE { ?c CONCEPT {type: "Person"} }"#;
+    assert_eq!(
+        run_as(&session, query).await.status,
+        TopLevelStatus::Succeeded
+    );
+
+    gov.revoke_grant(grant._id, SYSTEM_PRINCIPAL).await.unwrap();
+    assert_eq!(error_code(&run_as(&session, query).await), "NotAuthorized");
+}
+
+#[tokio::test]
+async fn suspending_a_principal_stops_it_without_touching_its_grants() {
+    let nexus = stocked("suspend").await;
+    let gov = nexus.governance();
+    let reader = agent(gov, "kip:principal:reader").await;
+    gov.create_grant(
+        GrantDraft {
+            space_id: DEFAULT_SPACE.into(),
+            grantee_principal: reader.clone(),
+            actions: vec!["read".into()],
+            ..Default::default()
+        },
+        SYSTEM_PRINCIPAL,
+    )
+    .await
+    .unwrap();
+    let session = nexus.session(AuthContext::principal(&reader));
+    let query = r#"FIND(?c) WHERE { ?c CONCEPT {type: "Person"} }"#;
+    assert_eq!(
+        run_as(&session, query).await.status,
+        TopLevelStatus::Succeeded
+    );
+
+    gov.set_principal_status(&reader, status::SUSPENDED, SYSTEM_PRINCIPAL)
+        .await
+        .unwrap();
+    assert_eq!(error_code(&run_as(&session, query).await), "NotAuthorized");
+    assert_eq!(
+        gov.grants_for(DEFAULT_SPACE, &reader, &[])
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "the Grant is untouched; the Principal is what changed"
+    );
+}
+
+#[tokio::test]
+async fn an_explicit_policy_deny_overrides_a_grant() {
+    // §42, and the reason exceptions are expressed by narrowing a deny rather
+    // than by a priority rule nobody can see.
+    let nexus = stocked("deny_overrides").await;
+    let gov = nexus.governance();
+    let reader = agent(gov, "kip:principal:reader").await;
+    gov.create_grant(
+        GrantDraft {
+            space_id: DEFAULT_SPACE.into(),
+            grantee_principal: reader.clone(),
+            actions: vec!["read".into(), "search".into()],
+            ..Default::default()
+        },
+        SYSTEM_PRINCIPAL,
+    )
+    .await
+    .unwrap();
+    gov.publish_policy(
+        PolicyDraft {
+            policy_id: "kip:policy:space".into(),
+            space_id: DEFAULT_SPACE.into(),
+            description: "No reading for this one".into(),
+            statements: vec![PolicyStatement {
+                effect: "deny".into(),
+                principals: vec![reader.clone()],
+                actions: vec!["read".into()],
+                ..Default::default()
+            }],
+        },
+        SYSTEM_PRINCIPAL,
+    )
+    .await
+    .unwrap();
+    let mut space = nexus.store.get_space(DEFAULT_SPACE).await.unwrap();
+    space.default_policy_id = "kip:policy:space".into();
+    nexus.store.put_space(&space).await.unwrap();
+
+    let session = nexus.session(AuthContext::principal(&reader));
+    let query = r#"FIND(?c) WHERE { ?c CONCEPT {type: "Person"} }"#;
+    assert_eq!(error_code(&run_as(&session, query).await), "NotAuthorized");
+}
+
+#[tokio::test]
+async fn a_policy_can_open_a_space_to_unauthenticated_readers() {
+    // §214: a public Space is one whose policy says so, never one whose check
+    // was missing.
+    let nexus = stocked("public_space").await;
+    let gov = nexus.governance();
+    gov.publish_policy(
+        PolicyDraft {
+            policy_id: "kip:policy:public".into(),
+            space_id: DEFAULT_SPACE.into(),
+            description: "Read-only public knowledge".into(),
+            statements: vec![PolicyStatement {
+                effect: "allow".into(),
+                principals: vec!["kip:principal:anonymous".into()],
+                actions: vec!["read".into(), "discover".into()],
+                ..Default::default()
+            }],
+        },
+        SYSTEM_PRINCIPAL,
+    )
+    .await
+    .unwrap();
+    let mut space = nexus.store.get_space(DEFAULT_SPACE).await.unwrap();
+    space.default_policy_id = "kip:policy:public".into();
+    nexus.store.put_space(&space).await.unwrap();
+
+    let anonymous = nexus.session(AuthContext::anonymous());
+    let query = r#"FIND(?c) WHERE { ?c CONCEPT {type: "Person"} }"#;
+    assert_eq!(
+        run_as(&anonymous, query).await.status,
+        TopLevelStatus::Succeeded
+    );
+    // Reading is not writing, even in a public Space.
+    assert_eq!(
+        error_code(&run_as(&anonymous, r#"CREATE CONCEPT ?p { TYPE "Person" }"#).await),
+        "NotAuthorized"
+    );
+}
+
+#[tokio::test]
+async fn a_delegation_cannot_confer_what_its_delegator_never_held() {
+    // §238, the delegation amplification fixture.
+    let nexus = stocked("amplification").await;
+    let gov = nexus.governance();
+    let owner_agent = agent(gov, "kip:principal:team-lead").await;
+    let sub_agent = agent(gov, "kip:principal:research-bot").await;
+    gov.create_grant(
+        GrantDraft {
+            space_id: DEFAULT_SPACE.into(),
+            grantee_principal: owner_agent.clone(),
+            actions: vec!["read".into()],
+            delegation_allowed: true,
+            ..Default::default()
+        },
+        SYSTEM_PRINCIPAL,
+    )
+    .await
+    .unwrap();
+    gov.create_delegation(
+        DelegationDraft {
+            space_id: DEFAULT_SPACE.into(),
+            delegator_principal: owner_agent.clone(),
+            delegate_principal: sub_agent.clone(),
+            // The delegate asks for more than the delegator holds.
+            actions: vec!["read".into(), "export".into()],
+            ..Default::default()
+        },
+        &owner_agent,
+    )
+    .await
+    .unwrap();
+
+    let session = nexus.session(AuthContext::principal(&sub_agent));
+    assert_eq!(
+        run_as(
+            &session,
+            r#"FIND(?c) WHERE { ?c CONCEPT {type: "Person"} }"#
+        )
+        .await
+        .status,
+        TopLevelStatus::Succeeded,
+        "the part the delegator held comes through"
+    );
+    assert_eq!(
+        error_code(
+            &run_as(
+                &session,
+                r#"EXPORT CAPSULE :out WHERE { ?c CONCEPT {type: "Person"} }"#,
+            )
+            .await
+        ),
+        "NotAuthorized",
+        "the part it never held does not"
+    );
+}
+
+#[tokio::test]
+async fn revoking_the_delegator_disables_the_delegation_it_made() {
+    // §35: a child Delegation cannot outlive the authority that created it,
+    // even though its own record still says active.
+    let nexus = stocked("delegation_parent").await;
+    let gov = nexus.governance();
+    let lead = agent(gov, "kip:principal:team-lead").await;
+    let bot = agent(gov, "kip:principal:research-bot").await;
+    let parent = gov
+        .create_grant(
+            GrantDraft {
+                space_id: DEFAULT_SPACE.into(),
+                grantee_principal: lead.clone(),
+                actions: vec!["read".into()],
+                delegation_allowed: true,
+                ..Default::default()
+            },
+            SYSTEM_PRINCIPAL,
+        )
+        .await
+        .unwrap();
+    let child = gov
+        .create_delegation(
+            DelegationDraft {
+                space_id: DEFAULT_SPACE.into(),
+                delegator_principal: lead.clone(),
+                delegate_principal: bot.clone(),
+                actions: vec!["read".into()],
+                ..Default::default()
+            },
+            &lead,
+        )
+        .await
+        .unwrap();
+
+    let session = nexus.session(AuthContext::principal(&bot));
+    let query = r#"FIND(?c) WHERE { ?c CONCEPT {type: "Person"} }"#;
+    assert_eq!(
+        run_as(&session, query).await.status,
+        TopLevelStatus::Succeeded
+    );
+
+    gov.revoke_grant(parent._id, SYSTEM_PRINCIPAL)
+        .await
+        .unwrap();
+    assert_eq!(error_code(&run_as(&session, query).await), "NotAuthorized");
+    assert_eq!(
+        gov.delegation(child._id).await.unwrap().unwrap().status,
+        status::ACTIVE,
+        "the Delegation record is untouched; what it rests on is gone"
+    );
+}
+
+#[tokio::test]
+async fn describe_access_answers_without_needing_any_permission() {
+    // §266: an Agent must be able to learn what it may do without already
+    // being allowed to do it. Otherwise a denied caller cannot find out why.
+    let nexus = stocked("describe_access").await;
+    let gov = nexus.governance();
+    let reader = agent(gov, "kip:principal:reader").await;
+    gov.create_grant(
+        GrantDraft {
+            space_id: DEFAULT_SPACE.into(),
+            grantee_principal: reader.clone(),
+            actions: vec!["read".into()],
+            constraints: AuthorityConstraints {
+                fields: vec!["name".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        SYSTEM_PRINCIPAL,
+    )
+    .await
+    .unwrap();
+    let session = nexus.session(AuthContext::principal(&reader));
+
+    let response = run_as(&session, "DESCRIBE ACCESS").await;
+    let report = response.first_result().unwrap().clone();
+    assert_eq!(report["principal"]["id"], reader);
+    assert_eq!(report["is_owner"], false);
+    let permissions = report["permissions"].as_array().unwrap();
+    assert!(permissions.iter().any(|p| p == "read"));
+    assert!(
+        !permissions.iter().any(|p| p == "export"),
+        "and it does not claim what the caller does not hold"
+    );
+
+    // A caller with nothing at all still gets an answer.
+    agent(gov, "kip:principal:stranger").await;
+    let stranger = nexus.session(AuthContext::principal("kip:principal:stranger"));
+    let response = run_as(&stranger, "DESCRIBE ACCESS").await;
+    assert_eq!(response.status, TopLevelStatus::Succeeded);
+    assert!(
+        response.first_result().unwrap()["permissions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn describe_access_can_be_asked_about_one_operation() {
+    let nexus = stocked("describe_access_with").await;
+    let gov = nexus.governance();
+    let reader = agent(gov, "kip:principal:reader").await;
+    gov.create_grant(
+        GrantDraft {
+            space_id: DEFAULT_SPACE.into(),
+            grantee_principal: reader.clone(),
+            actions: vec!["read".into()],
+            scope: AuthorityScope {
+                kinds: vec!["concept".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        SYSTEM_PRINCIPAL,
+    )
+    .await
+    .unwrap();
+    let session = nexus.session(AuthContext::principal(&reader));
+
+    let allowed = run_as(
+        &session,
+        r#"DESCRIBE ACCESS WITH {operation: "read", kind: "concept"}"#,
+    )
+    .await;
+    assert_eq!(
+        allowed.first_result().unwrap()["decision"]["decision"],
+        "allow"
+    );
+
+    let denied = run_as(
+        &session,
+        r#"DESCRIBE ACCESS WITH {operation: "read", kind: "evidence"}"#,
+    )
+    .await;
+    assert_eq!(
+        denied.first_result().unwrap()["decision"]["decision"],
+        "deny"
+    );
+}
+
+#[tokio::test]
+async fn describing_the_engine_works_before_anyone_is_authorized() {
+    let nexus = stocked("engine_description").await;
+    agent(nexus.governance(), "kip:principal:stranger").await;
+    let stranger = nexus.session(AuthContext::principal("kip:principal:stranger"));
+
+    for command in ["DESCRIBE PROTOCOL", "DESCRIBE CAPABILITIES"] {
+        assert_eq!(
+            run_as(&stranger, command).await.status,
+            TopLevelStatus::Succeeded,
+            "{command}"
+        );
+    }
+    // But the Space itself still needs discovery.
+    assert_eq!(
+        error_code(&run_as(&stranger, "DESCRIBE PRIMER").await),
+        "NotAuthorized"
+    );
+}
+
+#[tokio::test]
+async fn a_grant_that_expired_stops_working_without_being_revoked() {
+    let nexus = stocked("expiry").await;
+    let gov = nexus.governance();
+    let reader = agent(gov, "kip:principal:reader").await;
+    gov.create_grant(
+        GrantDraft {
+            space_id: DEFAULT_SPACE.into(),
+            grantee_principal: reader.clone(),
+            actions: vec!["read".into()],
+            conditions: AuthorityConditions {
+                valid_until: "2020-01-01T00:00:00.000Z".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        SYSTEM_PRINCIPAL,
+    )
+    .await
+    .unwrap();
+    let session = nexus.session(AuthContext::principal(&reader));
+    assert_eq!(
+        error_code(
+            &run_as(
+                &session,
+                r#"FIND(?c) WHERE { ?c CONCEPT {type: "Person"} }"#
+            )
+            .await
+        ),
+        "NotAuthorized"
+    );
+}
+
+#[tokio::test]
+async fn a_grant_can_require_stronger_authentication_than_the_session_has() {
+    let nexus = stocked("auth_strength").await;
+    let gov = nexus.governance();
+    let reader = agent(gov, "kip:principal:reader").await;
+    gov.create_grant(
+        GrantDraft {
+            space_id: DEFAULT_SPACE.into(),
+            grantee_principal: reader.clone(),
+            actions: vec!["read".into()],
+            conditions: AuthorityConditions {
+                min_auth_strength: auth_strength::STRONG.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        SYSTEM_PRINCIPAL,
+    )
+    .await
+    .unwrap();
+    let query = r#"FIND(?c) WHERE { ?c CONCEPT {type: "Person"} }"#;
+
+    let ordinary = nexus.session(AuthContext::principal(&reader));
+    assert_eq!(error_code(&run_as(&ordinary, query).await), "NotAuthorized");
+
+    let strong =
+        nexus.session(AuthContext::principal(&reader).with_auth_strength(auth_strength::STRONG));
+    assert_eq!(
+        run_as(&strong, query).await.status,
+        TopLevelStatus::Succeeded
+    );
+}
+
+#[tokio::test]
+async fn a_declared_purpose_does_not_unlock_a_purpose_bound_grant() {
+    // §12 end to end: writing purpose into the request envelope gets nothing.
+    let nexus = stocked("purpose").await;
+    let gov = nexus.governance();
+    let bot = agent(gov, "kip:principal:maintenance-bot").await;
+    gov.create_grant(
+        GrantDraft {
+            space_id: DEFAULT_SPACE.into(),
+            grantee_principal: bot.clone(),
+            actions: vec!["read".into()],
+            conditions: AuthorityConditions {
+                purpose: vec!["maintenance".into()],
+                min_purpose_assurance: purpose_assurance::SESSION_BOUND.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        SYSTEM_PRINCIPAL,
+    )
+    .await
+    .unwrap();
+    let query = r#"FIND(?c) WHERE { ?c CONCEPT {type: "Person"} }"#;
+
+    // Declared in the envelope by the caller.
+    let session = nexus.session(AuthContext::principal(&bot));
+    let mut request = Request::single(query);
+    request.context = Some(anda_kip::RequestContext {
+        purpose: Some("maintenance".into()),
+        ..Default::default()
+    });
+    let parsed = anda_kip::parse_kip(query).unwrap();
+    let response = session
+        .execute(parsed, &request, &request.operations[0])
+        .await;
+    assert_eq!(error_code(&response), "NotAuthorized");
+
+    // Bound to the session by the host.
+    let bound = nexus.session(
+        AuthContext::principal(&bot).with_purpose("maintenance", purpose_assurance::SESSION_BOUND),
+    );
+    assert_eq!(
+        run_as(&bound, query).await.status,
+        TopLevelStatus::Succeeded
+    );
+}
+
+#[tokio::test]
+async fn a_denied_operation_is_recorded_in_the_audit() {
+    let nexus = stocked("decision_audit").await;
+    let gov = nexus.governance();
+    agent(gov, "kip:principal:stranger").await;
+    let stranger = nexus.session(AuthContext::principal("kip:principal:stranger"));
+    run_as(
+        &stranger,
+        r#"FIND(?c) WHERE { ?c CONCEPT {type: "Person"} }"#,
+    )
+    .await;
+
+    let audit = gov.read_audit(DEFAULT_SPACE, 50).await.unwrap();
+    let denial = audit
+        .iter()
+        .find(|entry| entry.entry_class == "decision" && entry.decision == "deny")
+        .expect("the denial is on record");
+    assert_eq!(denial.principal_id, "kip:principal:stranger");
+    assert_eq!(denial.operation, "read");
 }

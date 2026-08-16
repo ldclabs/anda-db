@@ -71,7 +71,15 @@ pub async fn targets(
         });
     };
 
-    let mut cx = kql::Context::open(store, &tx.cx.space, b.request, b.operation).await?;
+    let mut cx = kql::Context::open(
+        store,
+        &tx.cx.space,
+        b.request,
+        b.operation,
+        &tx.authority,
+        &tx.auth,
+    )
+    .await?;
     let solutions = cx.solve(clauses).await?;
     let limit = limit
         .map(|scalar| b.scalar_u64(scalar, "LIMIT"))

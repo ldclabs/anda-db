@@ -37,6 +37,7 @@ use anda_kip::{
     Json, KipError, MetaCommand, Operation, Request, Response, ResponseContext, ResultContext,
 };
 
+use crate::governance::{AuthContext, EffectiveAuthority};
 use crate::store::Store;
 
 /// Runs one META command.
@@ -46,12 +47,16 @@ pub async fn execute(
     command: &MetaCommand,
     request: &Request,
     operation: &Operation,
+    authority: &EffectiveAuthority,
+    auth: &AuthContext,
 ) -> Response {
     let mut cx = match crate::kql::Context::open(
         store,
         space,
         request.parameters.as_ref(),
         operation.parameters.as_ref(),
+        authority,
+        auth,
     )
     .await
     {
@@ -196,6 +201,24 @@ pub fn capabilities() -> Json {
                 "explanation": true,
                 "conflict_set_expansion": true,
                 "corroboration_grouping": true
+            },
+            "governance": {
+                // What is enforced, stated as what it is rather than as a
+                // bare "true": a client that knows the granularity knows
+                // which questions this endpoint can actually answer.
+                "default_deny": true,
+                "deny_overrides": true,
+                "principals": true,
+                "groups": true,
+                "grants": true,
+                "delegation": "attenuating, non-transitive by default",
+                "actor_bindings": true,
+                "policies": "versioned, append-only",
+                "approvals": "multi-party, separation of duties",
+                "audit": "append-preserving: control-plane mutations and decisions",
+                "enforcement": "command scope: every KQL, KML and META command is \
+                                authorized before it runs",
+                "permission_registry": "DESCRIBE ACCESS"
             }
         },
         "unsupported": [
@@ -224,16 +247,25 @@ pub fn capabilities() -> Json {
                            and every projection says so"
             },
             {
-                "capability": "governance",
-                "detail": "DESCRIBE ACCESS / TRUST, classification enforcement, PURGE",
-                "reason": "no Governance plane; there is no authorization to report"
+                "capability": "governance_element_scope",
+                "detail": "per-element authorization: classification filtering, field \
+                           redaction, existence protection in counts and search",
+                "reason": "authorization runs at command scope, so a caller either may read \
+                           this Space or may not. Narrowing a Grant to a classification or a \
+                           field set is recorded and reported, and not yet applied per element"
+            },
+            {
+                "capability": "trust_governance",
+                "detail": "DESCRIBE TRUST",
+                "reason": "the trust policy binding is Governance state, but this engine \
+                           evaluates no source trust, so there is no trust judgement to report"
             },
             {
                 "capability": "capsule_import_modes",
                 "detail": "the \"isolate\" and \"restore\" import modes (§39.2, §39.4)",
                 "reason": "isolate needs a quarantine state ordinary recall excludes, and restore \
-                           needs Governance to verify owner, lineage and restore authority; \
-                           neither exists here. \"merge\" is what this engine performs"
+                           needs owner and lineage verification; neither is implemented. \
+                           \"merge\" is what this engine performs"
             },
             {
                 "capability": "capsule_signatures",
@@ -244,9 +276,10 @@ pub fn capabilities() -> Json {
             {
                 "capability": "physical_purge",
                 "detail": "PURGE",
-                "reason": "erasure is a Governance decision — legal holds, the REFERENCE POLICY \
-                           and the authority to erase — and this engine has no Governance plane. \
-                           ARCHIVE and TOMBSTONE remove an element from recall without erasing it"
+                "reason": "the purge permission is authorized, but erasure also needs legal \
+                           holds and the REFERENCE POLICY for content derived from what is \
+                           being erased, and neither is implemented. ARCHIVE and TOMBSTONE \
+                           remove an element from recall without erasing it"
             }
         ]
     })

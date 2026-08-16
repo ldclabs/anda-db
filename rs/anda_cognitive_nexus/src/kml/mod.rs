@@ -24,6 +24,7 @@ use anda_kip::{
     Json, KipError, KmlStatement, Map, Operation, Request, Response, ResponseContext, Warning,
 };
 
+use crate::governance::{AuthContext, EffectiveAuthority};
 use crate::store::Store;
 use crate::store::space::JournalEntry;
 use crate::tx::{Outcome, Transaction};
@@ -35,11 +36,22 @@ pub async fn execute(
     statement: &KmlStatement,
     request: &Request,
     operation: &Operation,
+    authority: &EffectiveAuthority,
+    auth: &AuthContext,
 ) -> Response {
     let dry_run = request.is_dry_run();
-    let origin = origin_of(request);
+    let origin = origin_of(request, auth);
 
-    let mut tx = match Transaction::begin(store, space_id, origin, dry_run).await {
+    let mut tx = match Transaction::begin(
+        store,
+        space_id,
+        origin,
+        dry_run,
+        authority.clone(),
+        auth.clone(),
+    )
+    .await
+    {
         Ok(tx) => tx,
         Err(err) => return Response::from(err),
     };
@@ -116,15 +128,31 @@ fn success(outcome: Outcome, space_id: &str, schema_environment_version: u64) ->
 
 /// The engine's own record of who wrote this, and through what.
 ///
-/// Taken from the transport envelope, never from the command's content: engine
-/// origin is what the runtime observed, and content that could set it would be
-/// laundering provenance (§26).
-fn origin_of(request: &Request) -> Json {
+/// The Principal comes from the authenticated session and the channel from the
+/// transport — never from the command's content. Engine origin is what the
+/// runtime observed, and content that could set it would be laundering
+/// provenance (§26). No policy can authorize writing it either (§43).
+///
+/// This is also the field that stays true after a Principal is revoked: what
+/// it wrote remains attributable to it (§9).
+fn origin_of(request: &Request, auth: &AuthContext) -> Json {
     let mut origin = Map::new();
-    if let Some(context) = &request.context
-        && let Some(client) = &context.client
-    {
-        origin.insert("channel".into(), Json::String(client.clone()));
+    if !auth.principal_id.is_empty() {
+        origin.insert(
+            "principal_id".into(),
+            Json::String(auth.principal_id.clone()),
+        );
+    }
+    let channel = if auth.client.is_empty() {
+        request
+            .context
+            .as_ref()
+            .and_then(|context| context.client.clone())
+    } else {
+        Some(auth.client.clone())
+    };
+    if let Some(channel) = channel {
+        origin.insert("channel".into(), Json::String(channel));
     }
     Json::Object(origin)
 }

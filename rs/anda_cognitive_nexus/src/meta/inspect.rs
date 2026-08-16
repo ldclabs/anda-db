@@ -322,7 +322,7 @@ pub async fn preview(cx: &mut Context<'_>, command: &PreviewCommand) -> Result<A
         // the schema has to resolve — an artifact that is fine here may be
         // unreadable there.
         let nexus = crate::CognitiveNexus::attach(cx.store.clone());
-        let report = crate::capsule::import(&nexus, &parsed, &into, true).await?;
+        let report = crate::capsule::import(&nexus, &parsed, &into, true, cx.auth.clone()).await?;
         return Ok(Answer::whole(report.to_json(true)));
     };
     let source = scalar_str(cx, scalar, "PREVIEW KML")?;
@@ -345,7 +345,16 @@ pub async fn preview(cx: &mut Context<'_>, command: &PreviewCommand) -> Result<A
         ..Default::default()
     });
     let operation = request.operations[0].clone();
-    let response = crate::kml::execute(cx.store, &cx.space, &statement, &request, &operation).await;
+    let response = crate::kml::execute(
+        cx.store,
+        &cx.space,
+        &statement,
+        &request,
+        &operation,
+        cx.authority,
+        cx.auth,
+    )
+    .await;
 
     if let Some(error) = response.error {
         return Ok(Answer::whole(serde_json::json!({

@@ -725,6 +725,16 @@ impl GovernanceStore {
         .map(|_| ())
     }
 
+    /// Looks a Delegation up by row id.
+    pub async fn delegation(&self, id: u64) -> Result<Option<DelegationRow>, KipError> {
+        Ok(self.delegations.get().get_as(id).await.ok())
+    }
+
+    /// Looks a Grant up by row id.
+    pub async fn grant(&self, id: u64) -> Result<Option<GrantRow>, KipError> {
+        Ok(self.grants.get().get_as(id).await.ok())
+    }
+
     /// The active Delegations naming a Principal as delegate in a Space.
     pub async fn delegations_to(
         &self,

@@ -48,10 +48,15 @@
 //! [`CognitiveNexus`]: crate::CognitiveNexus
 //! [`CognitiveNexus::session`]: crate::CognitiveNexus::session
 
+pub mod auth;
+pub mod decision;
+pub mod gate;
 pub mod permission;
 pub mod rows;
 pub mod store;
 
+pub use auth::AuthContext;
+pub use decision::{Authorization, EffectiveAuthority, ResourceContext};
 pub use permission::{Family, Permission};
 
 /// The Principal the engine itself acts as (§212).

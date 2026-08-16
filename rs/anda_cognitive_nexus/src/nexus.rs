@@ -25,9 +25,12 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::governance::SYSTEM_PRINCIPAL;
 use crate::governance::rows::principal_class;
 use crate::governance::store::PrincipalDraft;
+use crate::governance::{
+    ANONYMOUS_PRINCIPAL, AuthContext, Authorization, EffectiveAuthority, Permission,
+    ResourceContext, SYSTEM_PRINCIPAL, gate,
+};
 use crate::schema::{SchemaEnvironment, SchemaPackage};
 use crate::store::Store;
 use crate::store::space::SpaceDraft;
@@ -73,6 +76,19 @@ impl CognitiveNexus {
                 auth_subject: SYSTEM_PRINCIPAL.to_string(),
             })
             .await?;
+        // Registered rather than special-cased, so that "unauthenticated" is a
+        // Principal a policy can name — which is how a Space becomes publicly
+        // readable on purpose (§214) instead of by an absent check.
+        store
+            .governance
+            .ensure_principal(PrincipalDraft {
+                principal_id: ANONYMOUS_PRINCIPAL.to_string(),
+                principal_class: principal_class::ANONYMOUS.to_string(),
+                display_name: "An unauthenticated caller".to_string(),
+                auth_provider: "engine".to_string(),
+                auth_subject: String::new(),
+            })
+            .await?;
         store
             .open_or_create_space(SpaceDraft {
                 space_id: DEFAULT_SPACE.to_string(),
@@ -100,6 +116,24 @@ impl CognitiveNexus {
             default_space: DEFAULT_SPACE.to_string(),
             lock: Arc::new(RwLock::new(())),
         }
+    }
+
+    /// Opens a session for an authenticated caller.
+    ///
+    /// The [`AuthContext`] must come from what the host observed about the
+    /// connection, never from the request body — the envelope's own
+    /// documentation calls its context non-authoritative, because an Agent
+    /// under prompt injection can write anything into it (§10).
+    pub fn session(&self, auth: AuthContext) -> Session {
+        Session {
+            nexus: self.clone(),
+            auth: Arc::new(auth),
+        }
+    }
+
+    /// A session as the engine's own Principal (§212).
+    pub fn system_session(&self) -> Session {
+        self.session(AuthContext::system())
     }
 
     /// The Governance Control Plane.
@@ -215,7 +249,7 @@ impl CognitiveNexus {
     ) -> Result<crate::capsule::ImportReport, KipError> {
         let _guard = self.lock.write().await;
         self.store.reopen_if_poisoned().await?;
-        crate::capsule::import(self, capsule, space_id, false).await
+        crate::capsule::import(self, capsule, space_id, false, AuthContext::system()).await
     }
 
     /// The Space a request runs against.
@@ -239,51 +273,248 @@ impl CognitiveNexus {
     }
 }
 
+/// One authenticated caller's view of a Nexus.
+///
+/// This is the type a multi-tenant host executes through: it authenticates the
+/// caller itself, builds an [`AuthContext`] from what it observed, and every
+/// command run here is authorized against the control plane before it touches
+/// anything.
+///
+/// A session holds identity, not authority. Authority is resolved from the
+/// control plane on each request, so a session that has been running since
+/// January does not still hold what January's Grants said (§188, §245).
+#[derive(Clone)]
+pub struct Session {
+    nexus: CognitiveNexus,
+    auth: Arc<AuthContext>,
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("principal_id", &self.auth.principal_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Session {
+    /// The identity this session runs as.
+    pub fn auth(&self) -> &AuthContext {
+        &self.auth
+    }
+
+    /// The Nexus underneath.
+    pub fn nexus(&self) -> &CognitiveNexus {
+        &self.nexus
+    }
+
+    /// What this Principal may do in a Space, resolved fresh.
+    pub async fn effective_authority(
+        &self,
+        space_id: &str,
+    ) -> Result<EffectiveAuthority, KipError> {
+        EffectiveAuthority::resolve(&self.nexus.store, space_id, &self.auth).await
+    }
+}
+
 #[async_trait]
-impl Executor for CognitiveNexus {
+impl Executor for Session {
     async fn execute(
         &self,
         command: Command,
         request: &Request,
         operation: &Operation,
     ) -> Response {
-        let space = match self.space_of(request).await {
+        let space = match self.nexus.space_of(request).await {
             Ok(space) => space,
             Err(err) => return Response::from(err),
         };
+        // The envelope contributes a purpose and a client label and nothing
+        // else. Identity, strength and delegation come from the host (§10).
+        let auth = self.auth.merged_with_request(request);
 
         match command {
             Command::Kml(statement) => {
                 // Exclusive: readers must not observe a partly-written
                 // transaction, and `anda_db` cannot make the multi-row write
                 // atomic on its own.
-                let _guard = self.lock.write().await;
-                if let Err(err) = self.store.reopen_if_poisoned().await {
+                let _guard = self.nexus.lock.write().await;
+                if let Err(err) = self.nexus.store.reopen_if_poisoned().await {
                     return Response::from(err);
                 }
-                let response =
-                    crate::kml::execute(&self.store, &space, &statement, request, operation).await;
+                // Resolved under the write lock, so a Grant revoked while this
+                // request was queued is already gone when it is read (§28.6).
+                let authority = match self.authority(&space, &auth).await {
+                    Ok(authority) => authority,
+                    Err(err) => return Response::from(err),
+                };
+                if let Err(err) = self
+                    .gate(&authority, &auth, gate::kml_permissions(&statement))
+                    .await
+                {
+                    return Response::from(err);
+                }
+                let response = crate::kml::execute(
+                    &self.nexus.store,
+                    &space,
+                    &statement,
+                    request,
+                    operation,
+                    &authority,
+                    &auth,
+                )
+                .await;
                 // A poison event costs no further command: the next mutation
                 // would be rejected outright, so recovery happens here rather
                 // than being deferred to the caller's next attempt.
-                if self.store.has_poisoned_handle() {
-                    let _ = self.store.reopen().await;
+                if self.nexus.store.has_poisoned_handle() {
+                    let _ = self.nexus.store.reopen().await;
                 }
                 response
             }
             Command::Kql(query) => {
                 // Shared: readers may run concurrently, but none of them
                 // overlaps a commit.
-                let _guard = self.lock.read().await;
-                crate::kql::execute(&self.store, &space, &query, request, operation).await
+                let _guard = self.nexus.lock.read().await;
+                let authority = match self.authority(&space, &auth).await {
+                    Ok(authority) => authority,
+                    Err(err) => return Response::from(err),
+                };
+                if let Err(err) = self
+                    .gate(&authority, &auth, gate::kql_permissions(&query))
+                    .await
+                {
+                    return Response::from(err);
+                }
+                crate::kql::execute(
+                    &self.nexus.store,
+                    &space,
+                    &query,
+                    request,
+                    operation,
+                    &authority,
+                    &auth,
+                )
+                .await
             }
             Command::Meta(command) => {
                 // META is semantically read-only (§63.2), so it shares the
                 // lock with KQL rather than taking it exclusively.
-                let _guard = self.lock.read().await;
-                crate::meta::execute(&self.store, &space, &command, request, operation).await
+                let _guard = self.nexus.lock.read().await;
+                let authority = match self.authority(&space, &auth).await {
+                    Ok(authority) => authority,
+                    Err(err) => return Response::from(err),
+                };
+                if let Err(err) = self
+                    .gate(&authority, &auth, gate::meta_permissions(&command))
+                    .await
+                {
+                    return Response::from(err);
+                }
+                crate::meta::execute(
+                    &self.nexus.store,
+                    &space,
+                    &command,
+                    request,
+                    operation,
+                    &authority,
+                    &auth,
+                )
+                .await
             }
         }
+    }
+}
+
+impl Session {
+    async fn authority(
+        &self,
+        space: &str,
+        auth: &AuthContext,
+    ) -> Result<EffectiveAuthority, KipError> {
+        EffectiveAuthority::resolve(&self.nexus.store, space, auth).await
+    }
+
+    /// Requires every permission a command asks for, at Space scope.
+    ///
+    /// Space scope rather than element scope, because at this point no element
+    /// has been read yet — and reading one to decide whether it may be read
+    /// would be the disclosure the check exists to prevent. Per-element
+    /// authorization happens where the elements are.
+    async fn gate(
+        &self,
+        authority: &EffectiveAuthority,
+        auth: &AuthContext,
+        needed: Vec<Permission>,
+    ) -> Result<(), KipError> {
+        for permission in needed {
+            let decision = authority.authorize(permission, &ResourceContext::default(), auth);
+            if !decision.is_permitted() {
+                self.audit(authority, auth, &decision).await;
+                return decision.into_result().map(|_| ());
+            }
+            if decision.obligations.audit {
+                self.audit(authority, auth, &decision).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes one decision to the Governance audit.
+    ///
+    /// Best effort by design at this layer: a denial that could not be logged
+    /// is still a denial, and failing the request a second time over the log
+    /// would turn an audit outage into an availability outage. An obligation
+    /// that genuinely must not proceed unlogged is the caller's to enforce
+    /// (§184), and those paths check the write.
+    async fn audit(
+        &self,
+        authority: &EffectiveAuthority,
+        auth: &AuthContext,
+        decision: &Authorization,
+    ) {
+        let _ = self
+            .nexus
+            .store
+            .governance
+            .record_decision(crate::governance::rows::GovernanceAuditRow {
+                at: crate::time::now(),
+                space_id: authority.space.space_id.clone(),
+                principal_id: auth.principal_id.clone(),
+                delegation_chain: auth.delegation_chain.clone(),
+                operation: decision.permission.as_str().to_string(),
+                decision: decision.decision.as_str().to_string(),
+                reason: decision.reason.clone(),
+                policy_id: decision.policy_id.clone(),
+                policy_version: decision.policy_version,
+                authorities_used: decision.authorities_used.clone(),
+                ..Default::default()
+            })
+            .await;
+    }
+}
+
+#[async_trait]
+impl Executor for CognitiveNexus {
+    /// Runs a command as the system Principal.
+    ///
+    /// This is the embedded case: one process, one owner, and the process *is*
+    /// the owner. It is a real authorization — the system Principal owns the
+    /// default Space and the decision goes through the same path as anyone
+    /// else's — rather than a bypass, so a Space whose policy denies something
+    /// denies it here too.
+    ///
+    /// A host serving more than one caller must not use this. Authenticate and
+    /// go through [`CognitiveNexus::session`], or every caller is the owner.
+    async fn execute(
+        &self,
+        command: Command,
+        request: &Request,
+        operation: &Operation,
+    ) -> Response {
+        self.system_session()
+            .execute(command, request, operation)
+            .await
     }
 }
 

@@ -342,6 +342,7 @@ pub async fn import(
     capsule: &Capsule,
     space_id: &str,
     dry_run: bool,
+    auth: crate::governance::AuthContext,
 ) -> Result<ImportReport, KipError> {
     capsule.validate_frame()?;
     let mut report = ImportReport::default();
@@ -415,7 +416,7 @@ pub async fn import(
     if dry_run {
         return merge::preview(&nexus.store, capsule, space_id, &digest, report).await;
     }
-    merge::merge(&nexus.store, capsule, space_id, &digest, report).await
+    merge::merge(&nexus.store, capsule, space_id, &digest, report, auth).await
 }
 
 /// Parses a Capsule artifact.

@@ -55,7 +55,21 @@
 //! - **META** — `DESCRIBE`, `LIST`, `SEARCH`, `VALIDATE`, `PREVIEW`,
 //!   `HISTORY`, `CHANGES`, `SNAPSHOT`, plus `EXPORT CAPSULE` and
 //!   `VERIFY CAPSULE`; Capsule import is a host API
-//!   ([`CognitiveNexus::import_capsule`]).
+//!   ([`CognitiveNexus::import_capsule`]);
+//! - **[Governance](governance)** — Principals, groups, Grants, Delegations,
+//!   ActorBindings, versioned Policies, approvals and an append-preserving
+//!   audit. Every command is authorized before it runs, under default deny.
+//!
+//! A caller reaches the engine through [`CognitiveNexus::session`], which binds
+//! an [`AuthContext`](governance::AuthContext) the *host* built from
+//! authenticated transport state — never from the request body, whose own
+//! `context` block is documented as non-authoritative because an Agent under
+//! prompt injection can write anything into it.
+//!
+//! An embedded host that simply executes against the [`CognitiveNexus`] runs as
+//! the system Principal, which owns the default Space. That is a real
+//! authorization through the same path, not a bypass; a host serving more than
+//! one caller must authenticate them and open a session each.
 //!
 //! `DESCRIBE CAPABILITIES` reports the gaps below as structured data, so an
 //! Agent can read what is missing instead of discovering it by triggering an
@@ -73,9 +87,16 @@
 //! semantic / hybrid SEARCH       no embedding model
 //! SEARCH ... AS OF SEQ           the index reflects the present only
 //! Capsule signatures, the "isolate" and "restore" import modes
-//! DESCRIBE TRUST / ACCESS        no Governance plane
-//! PURGE                          erasure is a Governance decision
+//! DESCRIBE TRUST                 no trust evaluation to report
+//! PURGE                          erasure also needs legal holds and a
+//!                                reference policy for derived content
 //! ```
+//!
+//! Governance is enforced at **command** scope: a caller either may read this
+//! Space or may not. A Grant narrowed to a classification, a field set or a
+//! result cap is stored and reported faithfully and is not yet applied per
+//! element — so `DESCRIBE CAPABILITIES` lists that as a gap rather than letting
+//! a constrained Grant look like a filter it is not.
 //!
 //! An engine that returned empty results for a read it cannot perform would be
 //! worse than one that says so: an Agent would read "no memories" as an answer

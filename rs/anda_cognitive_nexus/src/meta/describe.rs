@@ -9,6 +9,7 @@
 use anda_kip::{DescribeTarget, Json, KipError, KipErrorCode, ListCommand, ListTarget, Scalar};
 
 use super::{Answer, capabilities, protocol};
+use crate::governance::{Permission, ResourceContext};
 use crate::kql::Context;
 use crate::projection::Policy;
 use crate::schema::{Intent, SymbolKind};
@@ -99,22 +100,103 @@ pub async fn run(cx: &mut Context<'_>, target: &DescribeTarget) -> Result<Answer
                 "this engine has no Capsule reader, so it cannot describe one",
             ));
         }
-        // Reporting an empty trust or access answer would read as "nothing is
-        // trusted" and "nothing is permitted", which are claims. There is no
-        // Governance plane here to make either one.
+        // Reporting an empty trust answer would read as "nothing is trusted",
+        // which is a judgement. This engine evaluates no source trust, so it
+        // says that instead of implying it.
         DescribeTarget::Trust { .. } => {
             return Err(KipError::unsupported_capability(
                 "this engine evaluates no source trust; an empty trust report would read as a \
                  judgement that nothing is trusted",
             ));
         }
-        DescribeTarget::Access { .. } => {
-            return Err(KipError::unsupported_capability(
-                "this engine has no Governance plane; an empty access report would read as a \
-                 denial rather than as an absence of policy",
-            ));
-        }
+        DescribeTarget::Access { with } => Answer::whole(access(cx, with.as_ref())?),
     })
+}
+
+/// `DESCRIBE ACCESS` — what this caller may do here (§229, §230, §266).
+///
+/// Answers about the caller's own authority and nothing else. It names the
+/// permissions held and the Grants that carry them, and it does **not** list
+/// policy statements, other Principals, or which elements exist — an access
+/// report that explained the whole policy would be a disclosure channel for
+/// the state the policy protects (§267).
+///
+/// The permission list is Space-scoped and deliberately coarse: it answers
+/// "could this ever be allowed here", not "is it allowed on element X". The
+/// second question cannot be answered without naming X, and naming X to a
+/// caller who may not discover it is the leak §103 is about.
+fn access(cx: &mut Context<'_>, with: Option<&anda_kip::BoundObject>) -> Result<Json, KipError> {
+    let authority = cx.authority;
+    let auth = cx.auth;
+    let mut report = serde_json::json!({
+        "space_id": cx.space,
+        "principal": {
+            "id": authority.principal.principal_id,
+            "class": authority.principal.principal_class,
+            "status": authority.principal.status,
+            "authenticated": auth.is_authenticated(),
+            "authentication_strength": auth.auth_strength,
+        },
+        "groups": authority.groups,
+        "is_owner": authority.is_owner,
+        "purpose": {
+            "value": auth.purpose,
+            "assurance": auth.purpose_assurance,
+        },
+        "delegation_chain": auth.delegation_chain,
+        "permissions": authority.permission_names(auth),
+        "default_classification": authority.default_classification(),
+        "policy": match &authority.policy {
+            Some(policy) => serde_json::json!({
+                "id": policy.policy_id,
+                "version": policy.version,
+            }),
+            // "No policy is bound" is a fact about configuration, not a denial.
+            None => serde_json::json!(null),
+        },
+        "note": "permissions are Space-scoped; an element may still be out of \
+                 scope for the Grant that carries one",
+    });
+
+    if let Some(block) = with {
+        let settings = crate::projection::settings_of(block, |name| cx.param_ref(name))?;
+        let operation = settings
+            .get("operation")
+            .and_then(Json::as_str)
+            .ok_or_else(|| {
+                KipError::invalid_request_envelope("DESCRIBE ACCESS WITH must name an `operation`")
+            })?;
+        let permission = Permission::parse(operation)?;
+        let resource = ResourceContext {
+            kind: string_of(&settings, "kind"),
+            schema_ref: string_of(&settings, "schema_ref"),
+            classification: string_of(&settings, "classification"),
+            element_id: string_of(&settings, "element"),
+        };
+        let decision = authority.authorize(permission, &resource, auth);
+        if let Some(object) = report.as_object_mut() {
+            object.insert(
+                "decision".to_string(),
+                serde_json::json!({
+                    "operation": permission.as_str(),
+                    "family": permission.family().as_str(),
+                    "decision": decision.decision.as_str(),
+                    "reason": decision.reason,
+                    "constraints": decision.constraints,
+                    "obligations": decision.obligations,
+                }),
+            );
+        }
+    }
+    Ok(report)
+}
+
+fn string_of(settings: &anda_kip::Map<String, Json>, key: &str) -> String {
+    settings
+        .get(key)
+        .and_then(Json::as_str)
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// Runs one `LIST`.
@@ -163,9 +245,21 @@ async fn execution_context(cx: &mut Context<'_>) -> Result<Json, KipError> {
         "space_seq": space.seq,
         "schema_environment_version": cx.env.version,
         "epistemic_policy": {"id": cx.policy.id, "version": cx.policy.version},
-        // Stated rather than implied: a caller reading this should know the
-        // read it is about to do sees committed state only.
-        "read_basis": "current committed state; historical coordinates are not supported",
+        // Who this request is running as. An Agent that cannot see its own
+        // identity cannot reason about why something was refused (§266).
+        "principal": {
+            "id": cx.auth.principal_id,
+            "authenticated": cx.auth.is_authenticated(),
+            "authentication_strength": cx.auth.auth_strength,
+        },
+        "governance": {
+            "enforced": true,
+            "hint": "DESCRIBE ACCESS reports what this Principal may do here",
+        },
+        // Stated rather than implied: a caller reading this should know that a
+        // plain read sees committed state, and that a past coordinate has to
+        // be asked for.
+        "read_basis": "current committed state; a past coordinate is read with AS OF",
     }))
 }
 

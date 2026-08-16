@@ -33,6 +33,7 @@ use anda_kip::{
 use std::collections::BTreeMap;
 
 use crate::error::db_error;
+use crate::governance::{AuthContext, EffectiveAuthority};
 use crate::id::ElementId;
 use crate::schema::SchemaEnvironment;
 use crate::store::{Element, Store, eq_field};
@@ -76,6 +77,10 @@ pub struct Context<'a> {
     /// coordinate: a query whose patterns disagreed about *when* they were
     /// reading would join two different Brains together.
     pub as_of: Option<u64>,
+    /// What the caller may see here, resolved once for the whole read.
+    pub authority: &'a EffectiveAuthority,
+    /// Who the caller is.
+    pub auth: &'a AuthContext,
     budget: usize,
 }
 
@@ -86,6 +91,8 @@ impl<'a> Context<'a> {
         space: &str,
         request: Option<&'a Map<String, Json>>,
         operation: Option<&'a Map<String, Json>>,
+        authority: &'a EffectiveAuthority,
+        auth: &'a AuthContext,
     ) -> Result<Self, KipError> {
         Ok(Self {
             env: store.schema_environment(space).await?,
@@ -100,6 +107,8 @@ impl<'a> Context<'a> {
             at: crate::time::now(),
             projected: false,
             as_of: None,
+            authority,
+            auth,
             budget: MAX_CANDIDATES,
         })
     }
@@ -463,8 +472,10 @@ pub async fn execute(
     query: &KqlQuery,
     request: &Request,
     operation: &Operation,
+    authority: &EffectiveAuthority,
+    auth: &AuthContext,
 ) -> Response {
-    match run(store, space, query, request, operation).await {
+    match run(store, space, query, request, operation, authority, auth).await {
         Ok((projected, schema_environment_version, epistemic_policy)) => {
             let result = Json::Array(projected.rows);
             Response {
@@ -502,12 +513,16 @@ async fn run(
     query: &KqlQuery,
     request: &Request,
     operation: &Operation,
+    authority: &EffectiveAuthority,
+    auth: &AuthContext,
 ) -> Result<Answer, KipError> {
     let mut cx = Context::open(
         store,
         space,
         request.parameters.as_ref(),
         operation.parameters.as_ref(),
+        authority,
+        auth,
     )
     .await?;
     cx.bind_read(query.as_of.as_ref(), request).await?;

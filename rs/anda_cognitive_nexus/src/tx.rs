@@ -33,6 +33,7 @@ use anda_kip::{ElementKind, Json, KipError, Map, Receipt, ReceiptStatus};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::error::db_error;
+use crate::governance::{AuthContext, EffectiveAuthority};
 use crate::id::ElementId;
 use crate::schema::SchemaEnvironment;
 use crate::store::rows::*;
@@ -54,6 +55,15 @@ pub struct Transaction {
     pub env: SchemaEnvironment,
     /// Whether this run may become durable.
     pub dry_run: bool,
+    /// What the caller may do here, resolved before the transaction opened.
+    ///
+    /// Cloned rather than borrowed: a transaction outlives the borrow that
+    /// produced it, and a stale authority is not a risk here — it was resolved
+    /// under the same write lock this transaction holds, so nothing can have
+    /// revoked anything in between (§28.6).
+    pub authority: EffectiveAuthority,
+    /// Who the caller is.
+    pub auth: AuthContext,
     handles: BTreeMap<String, ElementId>,
     staged: BTreeMap<ElementId, Staged>,
     shells: Vec<ElementId>,
@@ -77,6 +87,8 @@ impl Transaction {
         space_id: &str,
         origin: Json,
         dry_run: bool,
+        authority: EffectiveAuthority,
+        auth: AuthContext,
     ) -> Result<Self, KipError> {
         let env = store.schema_environment(space_id).await?;
         let cx = store.begin_transaction(space_id, origin).await?;
@@ -85,6 +97,8 @@ impl Transaction {
             cx,
             env,
             dry_run,
+            authority,
+            auth,
             handles: BTreeMap::new(),
             staged: BTreeMap::new(),
             shells: Vec::new(),

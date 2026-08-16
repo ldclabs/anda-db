@@ -228,7 +228,9 @@ impl Nexus {
                 .iter()
                 .map(|entry| (entry.source.as_str(), entry.artifact.as_str())),
         );
-        let environment = nexus.install_and_activate(&artifacts, DEFAULT_SPACE).await?;
+        let environment = nexus
+            .install_and_activate(&artifacts, DEFAULT_SPACE)
+            .await?;
         log::info!(
             space = DEFAULT_SPACE,
             version = environment.version,
