@@ -213,6 +213,7 @@ impl Context<'_> {
         &mut self,
         variable: Option<&str>,
         matcher: &PropositionMatcher,
+        known: &Solutions,
     ) -> Result<Solutions, KipError> {
         match matcher {
             PropositionMatcher::Id(scalar) => {
@@ -227,7 +228,7 @@ impl Context<'_> {
                     (_, None) => Solutions::empty(),
                 })
             }
-            PropositionMatcher::Tuple(triple) => self.match_tuple(variable, triple).await,
+            PropositionMatcher::Tuple(triple) => self.match_tuple(variable, triple, known).await,
         }
     }
 
@@ -235,9 +236,25 @@ impl Context<'_> {
         &mut self,
         variable: Option<&str>,
         triple: &PropositionTriple,
+        known: &Solutions,
     ) -> Result<Solutions, KipError> {
         let subject = self.endpoint_slot(&triple.subject)?;
         let object = self.endpoint_slot(&triple.object)?;
+
+        // A quantified path is a traversal, not a tuple: `(?a, "knows"{1,3},
+        // ?b)` asks whether ?b is reachable, and the walk that answers it is
+        // not itself a Proposition anybody stated.
+        if let Some(walks) = self.traversal_of(&triple.predicate)? {
+            if let Some(var) = variable {
+                return Err(KipError::invalid_syntax(format!(
+                    "?{var} cannot bind a hop-quantified path: a multi-hop walk is not a \
+                     Proposition, and binding one of the tuples it crossed would name a claim the \
+                     query never asked about. Drop the variable, or write an exact predicate"
+                )));
+            }
+            return self.match_traversal(subject, object, &walks, known).await;
+        }
+
         let predicates = self.predicate_slot(&triple.predicate)?;
 
         let mut filters = vec![
@@ -472,17 +489,290 @@ impl Context<'_> {
         })
     }
 
+    /// The walks a predicate slot describes, when any of them is quantified.
+    ///
+    /// `None` means every alternative is exactly one hop, which is the ordinary
+    /// tuple pattern — one Proposition, matched by index.
+    ///
+    /// The quantifier binds to the atom it was written on (`predicate_path_atom
+    /// = predicate_atom, [path_quantifier]`), so `"a"{1,3} | "b"` is *(1 to 3
+    /// hops of `a`)* or *(1 hop of `b`)*. A walk that alternates predicates
+    /// hop by hop is not something this grammar can express, and inventing it
+    /// here would answer a question nobody asked.
+    fn traversal_of(&mut self, predicate: &PredTerm) -> Result<Option<Vec<Walk>>, KipError> {
+        let PredTerm::Path(atoms) = predicate else {
+            return Ok(None);
+        };
+        if !atoms.iter().any(|atom| {
+            atom.hops
+                .is_some_and(|hops| hops.min != 1 || hops.max != Some(1))
+        }) {
+            return Ok(None);
+        }
+
+        let mut walks = Vec::with_capacity(atoms.len());
+        for atom in atoms {
+            let hops = atom.hops.unwrap_or(anda_kip::HopRange {
+                min: 1,
+                max: Some(1),
+            });
+            if let Some(max) = hops.max
+                && max < hops.min
+            {
+                return Err(KipError::invalid_syntax(format!(
+                    "a hop range must not count down: {{{},{max}}}",
+                    hops.min
+                )));
+            }
+            let PredicateSlot::Fixed(symbols) = self.predicate_atom(&atom.predicate)? else {
+                return Err(KipError::unsupported_capability(
+                    "a variable predicate inside a quantified path is not supported: the walk \
+                     would have to try every predicate in the Space",
+                ));
+            };
+            walks.push(Walk { symbols, hops });
+        }
+        Ok(Some(walks))
+    }
+
+    /// Walks the raw Proposition graph.
+    ///
+    /// Raw, and only raw: a path reports that the tuples exist, never that the
+    /// chain is believed (§45). Belief does not compose along a path — two
+    /// separately credible claims do not make their conclusion credible — so a
+    /// traversal answers reachability and leaves the epistemics to `BELIEF`.
+    async fn match_traversal(
+        &mut self,
+        subject: EndpointSlot,
+        object: EndpointSlot,
+        walks: &[Walk],
+        known: &Solutions,
+    ) -> Result<Solutions, KipError> {
+        let zero_hop = walks.iter().any(|walk| walk.hops.min == 0);
+        // Walking backwards from a fixed object costs the same as forwards
+        // from a fixed subject, and either beats enumerating every subject in
+        // the Space, so the direction follows whichever end is pinned — by the
+        // pattern itself, or by an earlier pattern in the same block.
+        let (starts, forward) = match (&subject, &object) {
+            (EndpointSlot::Fixed(from), _) => (vec![from.clone()], true),
+            (EndpointSlot::Bind(_), EndpointSlot::Fixed(to)) => (vec![to.clone()], false),
+            (EndpointSlot::Bind(name), _) if known.binds(name) => (seeds(known, name), true),
+            (_, EndpointSlot::Bind(name)) if known.binds(name) => (seeds(known, name), false),
+            _ => {
+                if zero_hop {
+                    // Every element in the Space matches itself at zero hops.
+                    return Err(KipError::resource_exhausted(
+                        "a path whose minimum is 0 hops matches every element against itself; \
+                         bind one endpoint before asking for it",
+                    ));
+                }
+                let symbols: Vec<String> = walks
+                    .iter()
+                    .flat_map(|walk| walk.symbols.iter().cloned())
+                    .collect();
+                (self.tuple_subjects(&symbols).await?, true)
+            }
+        };
+
+        let mut pairs: Vec<(Endpoint, Endpoint)> = Vec::new();
+        for start in starts {
+            for walk in walks {
+                let reached = self.walk_from(&start, walk, forward).await?;
+                for endpoint in reached {
+                    let pair = if forward {
+                        (start.clone(), endpoint)
+                    } else {
+                        (endpoint, start.clone())
+                    };
+                    if !pairs.contains(&pair) {
+                        pairs.push(pair);
+                    }
+                }
+            }
+        }
+
+        // A fixed endpoint is a constraint, not a binding: keep only the pairs
+        // that agree with it.
+        if let EndpointSlot::Fixed(to) = &object {
+            pairs.retain(|(_, reached)| reached == to);
+        }
+        if let EndpointSlot::Fixed(from) = &subject {
+            pairs.retain(|(origin, _)| origin == from);
+        }
+
+        let mut vars: Vec<String> = Vec::new();
+        for slot in [&subject, &object] {
+            if let EndpointSlot::Bind(name) = slot
+                && !vars.contains(name)
+            {
+                vars.push(name.clone());
+            }
+        }
+        if vars.is_empty() {
+            // Both ends pinned: the pattern is a yes/no question about
+            // reachability, and `unit` is the yes.
+            return Ok(if pairs.is_empty() {
+                Solutions::empty()
+            } else {
+                Solutions::unit()
+            });
+        }
+
+        let mut rows = Vec::new();
+        for (from, to) in pairs {
+            let mut solution = vec![Binding::Null; vars.len()];
+            if let EndpointSlot::Bind(name) = &subject {
+                set(&vars, &mut solution, name, endpoint_to_binding(&from));
+            }
+            if let EndpointSlot::Bind(name) = &object {
+                set(&vars, &mut solution, name, endpoint_to_binding(&to));
+            }
+            rows.push(solution);
+        }
+        Ok(Solutions::table(vars, rows))
+    }
+
+    /// Breadth-first walk from one endpoint, collecting what it reaches within
+    /// the hop range.
+    ///
+    /// The visited set is what makes a cyclic graph terminate; the budget is
+    /// what makes an acyclic but enormous one refuse rather than run forever.
+    async fn walk_from(
+        &mut self,
+        start: &Endpoint,
+        walk: &Walk,
+        forward: bool,
+    ) -> Result<Vec<Endpoint>, KipError> {
+        let mut reached: Vec<Endpoint> = Vec::new();
+        if walk.hops.min == 0 {
+            reached.push(start.clone());
+        }
+        let mut visited: Vec<Endpoint> = vec![start.clone()];
+        let mut frontier: Vec<Endpoint> = vec![start.clone()];
+
+        let mut depth = 0u32;
+        while !frontier.is_empty() {
+            depth += 1;
+            if walk.hops.max.is_some_and(|max| depth > max) {
+                break;
+            }
+            let mut next: Vec<Endpoint> = Vec::new();
+            for endpoint in &frontier {
+                // A literal has no outgoing tuples: `"+08:00"` is a value, not
+                // a place the walk can continue from.
+                let Endpoint::Local(_) = endpoint else {
+                    continue;
+                };
+                for neighbour in self.neighbours(endpoint, &walk.symbols, forward).await? {
+                    if visited.contains(&neighbour) {
+                        continue;
+                    }
+                    visited.push(neighbour.clone());
+                    next.push(neighbour.clone());
+                    if depth >= walk.hops.min {
+                        reached.push(neighbour);
+                    }
+                }
+            }
+            self.charge(next.len())?;
+            frontier = next;
+        }
+        Ok(reached)
+    }
+
+    /// One hop out of (or into) an endpoint, along any of the predicates.
+    async fn neighbours(
+        &mut self,
+        from: &Endpoint,
+        symbols: &[String],
+        forward: bool,
+    ) -> Result<Vec<Endpoint>, KipError> {
+        let (anchor, opposite) = if forward {
+            ("subject_key", "object")
+        } else {
+            ("object_key", "subject")
+        };
+        let ids = self
+            .store
+            .propositions()
+            .query_all_ids(Filter::And(vec![
+                Box::new(eq_field("space", Fv::Text(self.space.clone()))),
+                Box::new(eq_field("state", Fv::Text("active".to_string()))),
+                Box::new(eq_field(anchor, Fv::Text(from.key()))),
+                Box::new(Filter::Field((
+                    "predicate_ref".to_string(),
+                    RangeQuery::Include(symbols.iter().map(|s| Fv::Text(s.clone())).collect()),
+                ))),
+            ]))
+            .await
+            .map_err(db_error)?;
+        self.charge(ids.len())?;
+
+        let mut out = Vec::new();
+        for seq in ids {
+            let id = ElementId::new(ElementKind::Proposition, seq);
+            let Some(crate::store::Element::Proposition(row)) = self.load(id).await? else {
+                continue;
+            };
+            let value = if opposite == "object" {
+                &row.object
+            } else {
+                &row.subject
+            };
+            if let Ok(endpoint) = Endpoint::from_json(value) {
+                out.push(endpoint);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every distinct subject of the given predicates, for a walk with both
+    /// ends unbound.
+    async fn tuple_subjects(&mut self, symbols: &[String]) -> Result<Vec<Endpoint>, KipError> {
+        let ids = self
+            .store
+            .propositions()
+            .query_all_ids(Filter::And(vec![
+                Box::new(eq_field("space", Fv::Text(self.space.clone()))),
+                Box::new(eq_field("state", Fv::Text("active".to_string()))),
+                Box::new(Filter::Field((
+                    "predicate_ref".to_string(),
+                    RangeQuery::Include(symbols.iter().map(|s| Fv::Text(s.clone())).collect()),
+                ))),
+            ]))
+            .await
+            .map_err(db_error)?;
+        self.charge(ids.len())?;
+
+        let mut subjects: Vec<Endpoint> = Vec::new();
+        for seq in ids {
+            let id = ElementId::new(ElementKind::Proposition, seq);
+            let Some(crate::store::Element::Proposition(row)) = self.load(id).await? else {
+                continue;
+            };
+            if let Ok(endpoint) = Endpoint::from_json(&row.subject)
+                && !subjects.contains(&endpoint)
+            {
+                subjects.push(endpoint);
+            }
+        }
+        Ok(subjects)
+    }
+
     fn predicate_slot(&mut self, predicate: &PredTerm) -> Result<PredicateSlot, KipError> {
         match predicate {
             PredTerm::Atom(atom) => self.predicate_atom(atom),
             PredTerm::Path(atoms) => {
-                if atoms.iter().any(|atom| atom.hops.is_some()) {
-                    return Err(KipError::unsupported_capability(
-                        "hop quantifiers such as `\"knows\"{1,3}` need transitive traversal, which \
-                         this engine does not implement yet",
-                    ));
-                }
-                // Every atom unquantified is an alternation: one hop, several
+                // Anything quantified beyond a single hop was already routed to
+                // the traversal; what reaches here is one hop, spelled either
+                // bare or as `{1}` / `{1,1}`.
+                debug_assert!(
+                    atoms.iter().all(|atom| atom
+                        .hops
+                        .is_none_or(|hops| hops.min == 1 && hops.max == Some(1))),
+                    "a quantified path must be matched as a traversal"
+                );
+                // Every atom a single hop is an alternation: one hop, several
                 // acceptable predicates.
                 let mut symbols = Vec::new();
                 for atom in atoms {
@@ -545,6 +835,35 @@ impl Context<'_> {
 enum EndpointSlot {
     Fixed(Endpoint),
     Bind(String),
+}
+
+/// One quantified alternative of a raw predicate path.
+struct Walk {
+    /// The predicate symbols this alternative traverses.
+    symbols: Vec<String>,
+    /// How many hops of them are acceptable.
+    hops: anda_kip::HopRange,
+}
+
+/// The endpoints a variable is already bound to by the solutions so far.
+///
+/// Only elements: a Literal has no outgoing tuples, so seeding a walk with one
+/// would add a start that can never move.
+fn seeds(known: &Solutions, name: &str) -> Vec<Endpoint> {
+    known
+        .elements_of(name)
+        .into_iter()
+        .map(Endpoint::Local)
+        .collect()
+}
+
+/// The binding one endpoint of a walk produces.
+fn endpoint_to_binding(endpoint: &Endpoint) -> Binding {
+    match endpoint {
+        Endpoint::Local(id) => Binding::Element(*id),
+        Endpoint::Literal(literal) => Binding::Literal(literal.value.clone()),
+        other => Binding::Literal(other.to_json()),
+    }
 }
 
 /// A predicate slot, once resolved.
@@ -668,7 +987,9 @@ impl Context<'_> {
             anda_kip::BeliefTarget::Tuple(triple) => {
                 // A tuple names the Proposition structurally, and a Space keeps
                 // one canonical Proposition per semantic tuple.
-                let found = self.match_tuple(Some("__belief_target"), triple).await?;
+                let found = self
+                    .match_tuple(Some("__belief_target"), triple, &Solutions::unit())
+                    .await?;
                 (None, found.elements_of("__belief_target"))
             }
         };

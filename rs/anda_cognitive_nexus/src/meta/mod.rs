@@ -158,7 +158,8 @@ pub fn capabilities() -> Json {
                 "CONCEPT", "PROPOSITION", "ASSERTION", "EVIDENCE", "ACTIVITY",
                 "STRUCTURAL", "BELIEF", "BELIEF SLOT", "FILTER", "NOT",
                 "OPTIONAL", "UNION", "ORDER BY", "LIMIT", "CURSOR", "FOR TIME",
-                "WITH EPISTEMIC", "aggregates"
+                "WITH EPISTEMIC", "aggregates", "predicate alternation",
+                "hop quantifiers"
             ],
             "meta": [
                 "DESCRIBE", "LIST", "SEARCH", "VALIDATE", "PREVIEW KML",
@@ -192,11 +193,6 @@ pub fn capabilities() -> Json {
                 "detail": "AS OF SEQ / TX / TIME",
                 "reason": "no historical snapshots are retained, so a past coordinate cannot be \
                            reconstructed"
-            },
-            {
-                "capability": "transitive_traversal",
-                "detail": "hop quantifiers such as \"knows\"{1,3}",
-                "reason": "not implemented"
             },
             {
                 "capability": "semantic_search",

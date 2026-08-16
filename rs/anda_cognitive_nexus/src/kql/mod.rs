@@ -243,7 +243,14 @@ impl<'a> Context<'a> {
                 solutions.join(table)
             }
             WhereClause::Proposition { variable, matcher } => {
-                let table = self.match_proposition(variable.as_deref(), matcher).await?;
+                // The solutions so far are passed in so a traversal can start
+                // from what an earlier pattern already pinned: `?a CONCEPT
+                // {name: "A"} (?a, "leads_to"{1,3}, ?b)` should walk from A,
+                // not walk the whole Space and then throw most of it away in
+                // the join.
+                let table = self
+                    .match_proposition(variable.as_deref(), matcher, &solutions)
+                    .await?;
                 solutions.join(table)
             }
             WhereClause::Structural {

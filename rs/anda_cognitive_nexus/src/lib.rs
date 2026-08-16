@@ -46,9 +46,9 @@
 //!   Assertion and Evidence lifecycles, retention and removal, each with an
 //!   optional `WHERE` selection block and `LIMIT`, inside real transactions
 //!   with handles, preconditions, receipts and dry runs;
-//! - **KQL** — element and tuple patterns, structural patterns, `FILTER`,
-//!   `NOT` / `OPTIONAL` / `UNION`, projection by dot path, aggregates,
-//!   `ORDER BY`, paging and `FOR TIME`;
+//! - **KQL** — element and tuple patterns, structural patterns, hop-quantified
+//!   path traversal, `FILTER`, `NOT` / `OPTIONAL` / `UNION`, projection by dot
+//!   path, aggregates, `ORDER BY`, paging and `FOR TIME`;
 //! - **BELIEF / BELIEF SLOT** — the [`Epistemic Projection`](projection),
 //!   under a named, versioned policy, with an explanation ledger;
 //! - **META** — `DESCRIBE`, `LIST`, `SEARCH`, `VALIDATE`, `PREVIEW`,
@@ -69,7 +69,6 @@
 //!
 //! ```text
 //! AS OF                          historical snapshots
-//! hop quantifiers                transitive traversal
 //! semantic / hybrid SEARCH       no embedding model
 //! Capsule import (the semantic merge), Capsule signatures
 //! DESCRIBE TRUST / ACCESS        no Governance plane

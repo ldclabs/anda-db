@@ -137,7 +137,6 @@ async fn capabilities_report_the_gaps_as_data_not_as_errors() {
     for expected in [
         "atomic_batch",
         "historical_read",
-        "transitive_traversal",
         "semantic_search",
         "trust_model",
         "governance",

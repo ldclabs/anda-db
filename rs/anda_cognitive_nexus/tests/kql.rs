@@ -511,16 +511,12 @@ async fn a_structural_pattern_reads_record_topology() {
 #[tokio::test]
 async fn unsupported_reads_say_so_instead_of_answering_something_else() {
     let nexus = seeded("unsupported").await;
-    for (command, fragment) in [
-        (
-            r#"FIND(?c) WHERE { ?c CONCEPT {type: "Person"} } AS OF SEQ 1"#,
-            "historical snapshots",
-        ),
-        (
-            r#"FIND(?o) WHERE { ?p PROPOSITION (?s, "prefers"{1,3}, ?o) }"#,
-            "transitive traversal",
-        ),
-    ] {
+    // Hop quantifiers moved out of this list when traversal landed; see
+    // `tests/traversal.rs`.
+    for (command, fragment) in [(
+        r#"FIND(?c) WHERE { ?c CONCEPT {type: "Person"} } AS OF SEQ 1"#,
+        "historical snapshots",
+    )] {
         let response = run(&nexus, command).await;
         let error = response.error.as_ref().unwrap_or_else(|| {
             panic!("{command} should not have succeeded");
