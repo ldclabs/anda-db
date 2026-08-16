@@ -625,3 +625,111 @@ fn matches_value(read: &Json, expected: &Json) -> bool {
     }
     false
 }
+
+impl Context<'_> {
+    /// Matches `?b BELIEF (...)` — an Epistemic Projection, not a read.
+    ///
+    /// The bound value is the projection output object, so `?b.status` and
+    /// `?b.support.score` read out of it. It is virtual and read-only by
+    /// construction: nothing here writes, and there is no element id to bind,
+    /// because a belief is not a thing the Nexus stores (§48).
+    pub async fn match_belief(
+        &mut self,
+        variable: &str,
+        target: &anda_kip::BeliefTarget,
+        solutions: &Solutions,
+    ) -> Result<Solutions, KipError> {
+        self.projected = true;
+        let policy = self.policy.clone();
+        let at = self.at.clone();
+
+        // When the target is a variable an earlier pattern bound, the result
+        // has to carry that variable too, or the join would cross-product every
+        // projection against every Proposition.
+        let (carried, propositions): (Option<String>, Vec<ElementId>) = match target {
+            anda_kip::BeliefTarget::Id(scalar) => (
+                None,
+                vec![self.scalar_element(scalar, ElementKind::Proposition)?],
+            ),
+            anda_kip::BeliefTarget::Proposition(name) => {
+                if !solutions.binds(name) {
+                    return Err(KipError::projection_target_unbound(format!(
+                        "?{name} is not bound to a Proposition; BELIEF projects about a \
+                         Proposition, so one has to be identified before it can be projected"
+                    )));
+                }
+                let ids: Vec<ElementId> = solutions
+                    .elements_of(name)
+                    .into_iter()
+                    .filter(|id| id.kind == ElementKind::Proposition)
+                    .collect();
+                (Some(name.clone()), ids)
+            }
+            anda_kip::BeliefTarget::Tuple(triple) => {
+                // A tuple names the Proposition structurally, and a Space keeps
+                // one canonical Proposition per semantic tuple.
+                let found = self.match_tuple(Some("__belief_target"), triple).await?;
+                (None, found.elements_of("__belief_target"))
+            }
+        };
+
+        let mut vars = vec![variable.to_string()];
+        if let Some(name) = &carried {
+            vars.push(name.clone());
+        }
+        let mut rows = Vec::with_capacity(propositions.len());
+        for id in propositions {
+            let belief = self.project_belief(id, &policy, &at).await?;
+            let mut row = vec![Binding::Literal(belief.to_json())];
+            if carried.is_some() {
+                row.push(Binding::Element(id));
+            }
+            rows.push(row);
+        }
+        Ok(Solutions::table(vars, rows))
+    }
+
+    /// Matches `?slot BELIEF SLOT (?s, "pred")` — the conflict set of one slot.
+    ///
+    /// Answers with every candidate value and their projected states, rather
+    /// than with "the" value: a functional slot with two accepted candidates is
+    /// contested, and collapsing it to one would be the engine picking a
+    /// winner nobody authorized (§35).
+    pub async fn match_belief_slot(
+        &mut self,
+        variable: &str,
+        subject: &Term,
+        predicate: &PredAtom,
+    ) -> Result<Solutions, KipError> {
+        self.projected = true;
+        let policy = self.policy.clone();
+        let at = self.at.clone();
+
+        let subject_key = match self.endpoint_slot(subject)? {
+            EndpointSlot::Fixed(endpoint) => endpoint.key(),
+            EndpointSlot::Bind(name) => {
+                return Err(KipError::projection_target_unbounded(format!(
+                    "?{name} is unbound, so this would project every slot in the Space; identify \
+                     the subject first"
+                )));
+            }
+        };
+        let predicate_ref = match self.predicate_atom(predicate)? {
+            PredicateSlot::Fixed(mut symbols) if symbols.len() == 1 => symbols.remove(0),
+            _ => {
+                return Err(KipError::projection_target_unbounded(
+                    "BELIEF SLOT needs one exact predicate; projection never walks a raw path",
+                ));
+            }
+        };
+
+        let beliefs = self
+            .project_slot(&subject_key, &predicate_ref, &policy, &at)
+            .await?;
+        let rendered = crate::projection::slot_to_json(&subject_key, &predicate_ref, &beliefs);
+        Ok(Solutions::table(
+            vec![variable.to_string()],
+            vec![vec![Binding::Literal(rendered)]],
+        ))
+    }
+}

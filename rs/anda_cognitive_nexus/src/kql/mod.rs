@@ -63,6 +63,13 @@ pub struct Context<'a> {
     views: BTreeMap<ElementId, Json>,
     /// Variables already bound, so a later pattern can narrow on them.
     pub bound: BTreeMap<String, crate::term::Endpoint>,
+    /// The policy `BELIEF` projects under.
+    pub policy: crate::projection::Policy,
+    /// The world time a projection is evaluated at.
+    pub at: String,
+    /// Whether any clause actually projected, so the answer can report the
+    /// policy it ran under — and stay silent about one it never used.
+    pub projected: bool,
     budget: usize,
 }
 
@@ -83,6 +90,9 @@ impl<'a> Context<'a> {
             loaded: BTreeMap::new(),
             views: BTreeMap::new(),
             bound: BTreeMap::new(),
+            policy: crate::projection::Policy::baseline(),
+            at: crate::time::now(),
+            projected: false,
             budget: MAX_CANDIDATES,
         })
     }
@@ -277,13 +287,17 @@ impl<'a> Context<'a> {
                 let branch = self.solve(inner).await?;
                 solutions.union(branch)
             }
-            WhereClause::Belief { .. } | WhereClause::BeliefSlot { .. } => {
-                return Err(KipError::unsupported_capability(
-                    "BELIEF projects what is currently believed from the Assertions on record, \
-                     under a named policy; this engine does not implement the Epistemic \
-                     Projection yet. Read the Assertions directly with `?a ASSERTION {...}` — but \
-                     they are claims, not beliefs",
-                ));
+            WhereClause::Belief { variable, target } => {
+                let table = self.match_belief(variable, target, &solutions).await?;
+                solutions.join(table)
+            }
+            WhereClause::BeliefSlot {
+                variable,
+                subject,
+                predicate,
+            } => {
+                let table = self.match_belief_slot(variable, subject, predicate).await?;
+                solutions.join(table)
             }
         })
     }
@@ -298,7 +312,7 @@ pub async fn execute(
     operation: &Operation,
 ) -> Response {
     match run(store, space, query, request, operation).await {
-        Ok((projected, schema_environment_version)) => {
+        Ok((projected, schema_environment_version, epistemic_policy)) => {
             let result = Json::Array(projected.rows);
             Response {
                 context: Some(ResponseContext {
@@ -312,6 +326,9 @@ pub async fn execute(
                     context: Some(ResultContext {
                         space_id: Some(space.to_string()),
                         schema_environment_version: Some(schema_environment_version),
+                        // Spec §54: a belief reported without the policy it was
+                        // projected under is not auditable.
+                        epistemic_policy,
                         ..Default::default()
                     }),
                     next_cursor: projected.next_cursor,
@@ -324,26 +341,21 @@ pub async fn execute(
     }
 }
 
+type Answer = (Projected, u64, Option<anda_kip::PolicyIdentity>);
+
 async fn run(
     store: &Store,
     space: &str,
     query: &KqlQuery,
     request: &Request,
     operation: &Operation,
-) -> Result<(Projected, u64), KipError> {
+) -> Result<Answer, KipError> {
     if query.as_of.is_some() {
         return Err(KipError::unsupported_capability(
             "AS OF reads the Space at a past coordinate, which needs historical snapshots this \
              engine does not keep yet",
         ));
     }
-    if query.epistemic.is_some() {
-        return Err(KipError::unsupported_capability(
-            "WITH EPISTEMIC configures the Epistemic Projection, which this engine does not \
-             implement yet",
-        ));
-    }
-
     let mut cx = Context::open(
         store,
         space,
@@ -352,6 +364,22 @@ async fn run(
     )
     .await?;
     let environment_version = cx.env.version;
+
+    if let Some(block) = &query.epistemic {
+        let settings = crate::projection::settings_of(block, |name| cx.param_ref(name))?;
+        cx.policy = crate::projection::Policy::from_settings(&settings)?;
+    }
+    // `FOR TIME` names the world time a claim has to apply at, so a projection
+    // in the same query answers about that instant rather than about now.
+    if let Some(for_time) = &query.for_time {
+        let at = match for_time {
+            Scalar::Literal(literal) => Json::from(literal.clone()),
+            Scalar::Param(name) => cx.param_ref(name)?,
+        };
+        if let Json::String(at) = at {
+            cx.at = crate::time::normalize(&at, "FOR TIME")?;
+        }
+    }
 
     let mut solutions = cx.solve(&query.where_clauses).await?;
     if let Some(for_time) = &query.for_time {
@@ -382,6 +410,7 @@ async fn run(
 
     // ORDER BY and the projection both read fields off bound elements.
     cx.warm(&solutions).await?;
+    let policy = cx.projected.then(|| cx.policy.identity());
     let projected = cx.project(
         solutions,
         &query.find_clause,
@@ -389,7 +418,7 @@ async fn run(
         limit,
         cursor,
     )?;
-    Ok((projected, environment_version))
+    Ok((projected, environment_version, policy))
 }
 
 /// Drops solutions whose Assertions did not apply at the given world time.

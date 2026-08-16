@@ -206,28 +206,35 @@ async fn an_assertion_pattern_reads_claims_not_beliefs() {
 }
 
 #[tokio::test]
-async fn belief_says_it_cannot_answer_rather_than_answering_a_different_question() {
-    // Returning the raw Assertions for a BELIEF query would conflate "Alice
-    // asserted X" with "X is believed", which is the distinction the whole
-    // version exists for.
-    let nexus = seeded("belief").await;
-    let response = run(
+async fn a_raw_read_and_a_projection_answer_different_questions() {
+    // The two competing Assertions about Alice's preference are both on
+    // record, so the raw read reports two rows. The projection reports one
+    // contested belief. Neither is the other, and presenting a raw row as
+    // accepted belief is exactly what this version exists to prevent.
+    let nexus = seeded("raw_vs_projected").await;
+    let raw = ok(
         &nexus,
-        r#"FIND(?b) WHERE { ?b BELIEF (:alice, "prefers", :dark) }"#,
+        r#"FIND(?a.stance)
+           WHERE {
+             ?person CONCEPT {name: "Alice"}
+             ?p PROPOSITION (?person, "prefers", ?thing)
+             ?a ASSERTION {proposition: ?p}
+           }"#,
     )
     .await;
-    assert_eq!(
-        response.error.as_ref().unwrap().code.as_str(),
-        "UnsupportedCapability"
-    );
-    assert!(
-        response
-            .error
-            .as_ref()
-            .unwrap()
-            .message
-            .contains("claims, not beliefs")
-    );
+    assert_eq!(rows(&raw).len(), 2, "two claims on record");
+
+    let projected = ok(
+        &nexus,
+        r#"FIND(?b.status)
+           WHERE {
+             ?person CONCEPT {name: "Alice"}
+             ?p PROPOSITION (?person, "prefers", ?thing)
+             ?b BELIEF (?p)
+           }"#,
+    )
+    .await;
+    assert_eq!(rows(&projected), &vec![json!("contested")]);
 }
 
 #[tokio::test]

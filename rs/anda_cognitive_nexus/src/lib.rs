@@ -47,13 +47,19 @@
 //!   preconditions, receipts and dry runs;
 //! - **KQL** — element and tuple patterns, structural patterns, `FILTER`,
 //!   `NOT` / `OPTIONAL` / `UNION`, projection by dot path, aggregates,
-//!   `ORDER BY`, paging and `FOR TIME`.
+//!   `ORDER BY`, paging and `FOR TIME`;
+//! - **BELIEF / BELIEF SLOT** — the [`Epistemic Projection`](projection),
+//!   under a named, versioned policy, with an explanation ledger.
+//!
+//! The projection is partial and says so in its own output: there is no trust
+//! model and no evidence-quality evaluation in this engine, so every eligible
+//! corroboration group counts equally, and every answer carries that warning
+//! rather than reading as a judgement it did not make.
 //!
 //! Not implemented yet, and reported as `UnsupportedCapability` rather than
 //! answered wrongly:
 //!
 //! ```text
-//! BELIEF / BELIEF SLOT / WITH EPISTEMIC   the Epistemic Projection
 //! META introspection
 //! AS OF                                   historical snapshots
 //! hop quantifiers                         transitive traversal
@@ -76,6 +82,7 @@ pub mod id;
 pub mod kml;
 pub mod kql;
 pub mod nexus;
+pub mod projection;
 pub mod schema;
 pub mod store;
 pub mod term;

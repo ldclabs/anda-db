@@ -124,8 +124,14 @@ fn operand(
             if path.path.is_empty() {
                 return Ok(Value::One(binding));
             }
-            // A dot path reads the element's rendered view, which is why the
+            // A dot path reads either a projection result — which is already
+            // a value — or an element's rendered view, which is why the
             // element has to be loaded before a filter can mention it.
+            if let Binding::Literal(value) = &binding {
+                return Ok(Value::One(Binding::Literal(crate::view::read_path(
+                    value, &path.path,
+                ))));
+            }
             let Some(id) = binding.element() else {
                 return Ok(Value::One(Binding::Null));
             };
