@@ -9,10 +9,9 @@ All notable changes to this workspace are documented in this file.
 KIP 2.0 in `rs/anda_kip`. This is a rewrite, not an upgrade: 1.x and 2.0 are
 semantically different protocols, so the old API is gone rather than deprecated.
 
-**Downstream crates are not migrated and currently do not build**:
-`anda_cognitive_nexus`, `anda_cognitive_nexus_server`, `anda_kip_wasm` and
-`py/anda_cognitive_nexus_py` all implement KIP 1.x graph semantics and need
-their own port.
+`anda_cognitive_nexus`, `anda_cognitive_nexus_server` and `anda_kip_wasm` have
+since been ported (see below); `py/anda_cognitive_nexus_py` and `ts/kip-do` are
+still KIP 1.x and do not build against this protocol.
 
 ### Why it is a rewrite
 
@@ -107,6 +106,51 @@ rewriting the old one.
 - **`ConceptNode` / `PropositionLink` / `Entity` / `UpsertResult` and the
   `metadata.*` constants**, superseded by the five Core element kinds.
 - **The numeric `KIP_xxxx` error codes**, superseded by the named registry.
+
+### Downstream ports
+
+- **`anda_cognitive_nexus` was rewritten, not migrated.** The 1.x engine that
+  lived here is deleted; 2.0 is a different data model, and a renamed 1.x engine
+  would have been a worse lie than an absent one. The new engine implements
+  `Executor` over nine `anda_db` collections and runs KML transactions, KQL
+  reads, the Epistemic Projection, the META families, and Cognitive Capsule
+  export/verification. What it deliberately does **not** do — Capsule import,
+  Governance, trust and evidence-quality evaluation, `AS OF`, hop quantifiers,
+  `UPDATE`/`PURGE`/`MERGE CONCEPT`, semantic `SEARCH`, Capsule signatures,
+  atomic batches — is reported by `DESCRIBE CAPABILITIES` as structured data
+  with a reason, and refused rather than answered wrongly. The crate now ships
+  the baseline cognitive-memory profile as `profiles/cognitive-memory-2.0.0.json`
+  (`profiles::COGNITIVE_MEMORY`), vendored verbatim from the spec repository,
+  and `CognitiveNexus::ensure_schema` activates a Schema Lock only when it
+  differs from the one already in force.
+- **`anda_cognitive_nexus_server` speaks the 2.0 envelope.** `execute_kip`'s
+  `params` is now the KIP 2.0 request envelope rather than a bare command:
+  `{"kip": "2.0", "operations": [{"command": "..."}]}`. Execution goes through
+  `execute_request`, so `independent` and `sequence` batches run and `atomic` is
+  refused with `UnsupportedCapability` instead of being downgraded. HTTP status
+  mapping follows the named registry (§87) — including `207` for a `partial`
+  batch, whose earlier commits are durable, and `501` for a capability this
+  runtime declares it lacks. The `$self` genesis KML and `SELF_PRINCIPAL_ID` are
+  **removed**: a `Person` is not a Principal (§88.1), Principals are Governance
+  state, and this runtime has no Governance plane. In their place, the server
+  installs and activates the bundled cognitive-memory profile in the default
+  Space, extensible with `SCHEMA_PACKAGE` / `--schema-package`. The `kip_logs`
+  audit document records `languages` (classified from the parsed commands, never
+  from the advisory `operation.language`) and the response's status, `tx_id` and
+  errors; the size cap now also bounds `ingest` payloads and client-supplied
+  correlation metadata. A mutation that overruns its *response* deadline now
+  answers `outcome_unknown` instead of `ExecutionTimeout`: the execution is
+  deliberately not cancelled, so it may still commit, and `ExecutionTimeout`'s
+  registered retry class (`safe_same_request`) would have invited the client to
+  write the same cognition twice.
+- **`anda_kip_wasm` reports the 2.0 error shape.** `error_catalog()` enumerates
+  `KipErrorCode::ALL` with each code's category, retry class and hint, so a code
+  added to `anda_kip` cannot be missed by the generated TypeScript table, and
+  parse failures carry the full `ErrorObject` — `retry` included, because
+  flattening `outcome_lookup_required` into "it failed" is how a lost write
+  becomes a duplicated one. `ts/kip-do` consumes this and has not been migrated:
+  its `scripts/codegen-errors.mjs` reads the 1.x shape of `error.rs` and will
+  need to be rewritten with the rest of that package.
 
 ## [KIP v1.0-RC11] — 2026-08-14
 
