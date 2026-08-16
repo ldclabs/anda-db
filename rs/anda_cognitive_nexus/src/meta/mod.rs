@@ -255,6 +255,15 @@ pub fn capabilities() -> Json {
                            field set is recorded and reported, and not yet applied per element"
             },
             {
+                "capability": "protected_element_governance_fields",
+                "detail": "an element's own `governance` and `retention` members",
+                "reason": "a KML write may still set them, so a caller who may create an \
+                           element may also label it. §50 makes those Governance state, \
+                           needing declassify and manage_retention rather than write \
+                           permission. Read a classification on an element as the author's \
+                           label, not as an enforced one"
+            },
+            {
                 "capability": "trust_governance",
                 "detail": "DESCRIBE TRUST",
                 "reason": "the trust policy binding is Governance state, but this engine \
