@@ -156,10 +156,12 @@ impl Executor for CognitiveNexus {
                 let _guard = self.lock.read().await;
                 crate::kql::execute(&self.store, &space, &query, request, operation).await
             }
-            Command::Meta(_) => Response::from(KipError::unsupported_capability(
-                "this engine does not execute META yet; introspection follows the read path in \
-                 the KIP 2.0 rewrite",
-            )),
+            Command::Meta(command) => {
+                // META is semantically read-only (§63.2), so it shares the
+                // lock with KQL rather than taking it exclusively.
+                let _guard = self.lock.read().await;
+                crate::meta::execute(&self.store, &space, &command, request, operation).await
+            }
         }
     }
 }
@@ -169,5 +171,5 @@ impl Executor for CognitiveNexus {
 /// Stated as data rather than prose so a caller can branch on it instead of
 /// discovering the gap through an error.
 pub fn supported_command_types() -> &'static [CommandType] {
-    &[CommandType::Kml, CommandType::Kql]
+    &[CommandType::Kml, CommandType::Kql, CommandType::Meta]
 }

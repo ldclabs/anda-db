@@ -647,18 +647,21 @@ async fn a_committed_transaction_is_recoverable_by_its_idempotency_key() {
 }
 
 #[tokio::test]
-async fn the_introspection_path_reports_its_absence() {
-    // An engine that silently returned an empty answer for a command it
-    // cannot run would be worse than one that says so: an Agent would read
-    // the emptiness as a fact about the world.
-    let nexus = nexus("unsupported").await;
-    let response = run(&nexus, "DESCRIBE PRIMER").await;
-    assert_eq!(
-        response.error.as_ref().unwrap().code.as_str(),
-        "UnsupportedCapability"
-    );
-
-    // The read path, by contrast, now answers.
-    let read = run(&nexus, r#"FIND(?c) WHERE { ?c CONCEPT {type: "Person"} }"#).await;
-    assert_eq!(read.status, TopLevelStatus::Succeeded);
+async fn all_three_command_families_reach_this_engine() {
+    // The Executor dispatches on what the command *is*, so a caller does not
+    // need to know which family it wrote.
+    let nexus = nexus("families").await;
+    for command in [
+        r#"CREATE CONCEPT ?x { TYPE "Person" NAME "Alice" }"#,
+        r#"FIND(?c) WHERE { ?c CONCEPT {type: "Person"} }"#,
+        "DESCRIBE PRIMER",
+    ] {
+        let response = run(&nexus, command).await;
+        assert_eq!(
+            response.status,
+            TopLevelStatus::Succeeded,
+            "{command}\n{:#?}",
+            response.error
+        );
+    }
 }

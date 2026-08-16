@@ -49,7 +49,13 @@
 //!   `NOT` / `OPTIONAL` / `UNION`, projection by dot path, aggregates,
 //!   `ORDER BY`, paging and `FOR TIME`;
 //! - **BELIEF / BELIEF SLOT** — the [`Epistemic Projection`](projection),
-//!   under a named, versioned policy, with an explanation ledger.
+//!   under a named, versioned policy, with an explanation ledger;
+//! - **META** — `DESCRIBE`, `LIST`, `SEARCH`, `VALIDATE`, `PREVIEW KML`,
+//!   `HISTORY`, `CHANGES` and `SNAPSHOT`.
+//!
+//! `DESCRIBE CAPABILITIES` reports the gaps below as structured data, so an
+//! Agent can read what is missing instead of discovering it by triggering an
+//! error — or, worse, reading an absent feature as an absent fact.
 //!
 //! The projection is partial and says so in its own output: there is no trust
 //! model and no evidence-quality evaluation in this engine, so every eligible
@@ -60,9 +66,11 @@
 //! answered wrongly:
 //!
 //! ```text
-//! META introspection
-//! AS OF                                   historical snapshots
-//! hop quantifiers                         transitive traversal
+//! AS OF                          historical snapshots
+//! hop quantifiers                transitive traversal
+//! semantic / hybrid SEARCH       no embedding model
+//! VERIFY, EXPORT / IMPORT CAPSULE
+//! DESCRIBE TRUST / ACCESS        no Governance plane
 //! UPDATE / PURGE / MERGE CONCEPT
 //! clause forms with a WHERE block
 //! ```
@@ -81,6 +89,7 @@ pub mod error;
 pub mod id;
 pub mod kml;
 pub mod kql;
+pub mod meta;
 pub mod nexus;
 pub mod projection;
 pub mod schema;
