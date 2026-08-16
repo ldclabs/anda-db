@@ -39,25 +39,44 @@
 //!
 //! ## Status
 //!
-//! The KIP 2.0 engine is being built in stages. What exists today is the
-//! foundation — element identity, the reference and Literal model, time
-//! normalization, the storage layer, and Schema Packages with their resolution
-//! and validation. KML, KQL, Epistemic Projection and META are not implemented
-//! yet; the KIP 1.x engine that used to live here was removed rather than
-//! ported, because 2.0 is a different data model and a renamed 1.x engine would
-//! be a worse lie than an absent one.
+//! The KIP 2.0 engine is being built in stages. [`CognitiveNexus`] implements
+//! [`anda_kip::Executor`] and today runs **KML**: creation, `ENSURE`, `UPSERT`,
+//! the Assertion and Evidence lifecycles, retention and removal, inside real
+//! transactions with handles, preconditions, receipts and dry runs.
+//!
+//! Not implemented yet, and reported as `UnsupportedCapability` rather than
+//! answered wrongly:
+//!
+//! ```text
+//! KQL and the Epistemic Projection
+//! META introspection
+//! UPDATE / PURGE / MERGE CONCEPT      (their selection blocks need the solver)
+//! clause forms with a WHERE block     (same reason)
+//! ```
+//!
+//! An engine that returned empty results for a read it cannot perform would be
+//! worse than one that says so: an Agent would read "no memories" as an answer
+//! about the world.
+//!
+//! The KIP 1.x engine that used to live here was removed rather than ported,
+//! because 2.0 is a different data model and a renamed 1.x engine would be a
+//! worse lie than an absent one.
 
 #![doc(html_root_url = "https://docs.rs/anda_cognitive_nexus")]
 
 pub mod error;
 pub mod id;
+pub mod kml;
+pub mod nexus;
 pub mod schema;
 pub mod store;
 pub mod term;
 pub mod time;
+pub mod tx;
 
 pub use error::*;
 pub use id::*;
+pub use nexus::CognitiveNexus;
 pub use store::{
     Element, Store, rows,
     space::{JournalEntry, SpaceDraft},

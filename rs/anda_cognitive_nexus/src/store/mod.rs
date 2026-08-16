@@ -614,6 +614,75 @@ impl Element {
     }
 }
 
+impl Store {
+    /// Looks a Proposition up by its tuple identity.
+    ///
+    /// This is what makes `ENSURE PROPOSITION` resolve-or-create rather than
+    /// create-or-collide: the same semantic tuple in the same Space is the
+    /// same Proposition (§93.6).
+    pub async fn find_proposition(
+        &self,
+        tuple_key: &str,
+    ) -> Result<Option<rows::PropositionRow>, KipError> {
+        let collection = self.propositions();
+        let ids = collection
+            .query_all_ids(eq_field("tuple_key", Fv::Text(tuple_key.to_string())))
+            .await
+            .map_err(crate::error::db_error)?;
+        match ids.first() {
+            None => Ok(None),
+            Some(id) => Ok(Some(
+                collection
+                    .get_as(*id)
+                    .await
+                    .map_err(crate::error::db_error)?,
+            )),
+        }
+    }
+
+    /// Looks a Concept up by its Space-local logical key.
+    ///
+    /// The key is immutable identity, unlike `name`, which is why `UPSERT`
+    /// resolves through it (§54).
+    pub async fn find_concept_by_key(
+        &self,
+        space: &str,
+        key: &str,
+    ) -> Result<Option<rows::ConceptRow>, KipError> {
+        if key.is_empty() {
+            // The empty string stores "no logical key", so it must never
+            // match — otherwise every keyless Concept in the Space would
+            // answer an upsert meant for one of them.
+            return Ok(None);
+        }
+        let collection = self.concepts();
+        let ids = collection
+            .query_all_ids(eq_fields(&[
+                ("space", Fv::Text(space.to_string())),
+                ("key", Fv::Text(key.to_string())),
+            ]))
+            .await
+            .map_err(crate::error::db_error)?;
+        match ids.first() {
+            None => Ok(None),
+            Some(id) => Ok(Some(
+                collection
+                    .get_as(*id)
+                    .await
+                    .map_err(crate::error::db_error)?,
+            )),
+        }
+    }
+
+    /// Loads one Concept row by id.
+    pub async fn find_concept(&self, id: ElementId) -> Result<rows::ConceptRow, KipError> {
+        self.concepts()
+            .get_as(id.seq)
+            .await
+            .map_err(crate::error::db_error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -61,6 +61,9 @@ pub trait Row: serde::Serialize + Send + Sync {
 
     /// Mutable access to the shared envelope columns.
     fn envelope_mut(&mut self) -> EnvelopeMut<'_>;
+
+    /// The row id, readable without a mutable borrow.
+    fn id(&self) -> u64;
 }
 
 macro_rules! impl_row {
@@ -68,6 +71,10 @@ macro_rules! impl_row {
         $(
             impl Row for $ty {
                 const KIND: ElementKind = ElementKind::$kind;
+
+                fn id(&self) -> u64 {
+                    self._id
+                }
 
                 fn envelope_mut(&mut self) -> EnvelopeMut<'_> {
                     EnvelopeMut {
@@ -183,6 +190,19 @@ impl Store {
         let fields = row_fields(&collection, row)?;
         collection.update(id, fields).await.map_err(db_error)?;
         Ok(*row.envelope_mut().version)
+    }
+
+    /// Writes a row back exactly as given, touching no envelope column.
+    ///
+    /// The version-bumping [`Store::update`] is the right primitive for a
+    /// standalone edit; this one is for a transaction commit, where the
+    /// version was already decided once for the whole transaction (§44).
+    pub(crate) async fn put_row<R: Row>(&self, row: &R) -> Result<(), KipError> {
+        let collection = self.elements(R::KIND);
+        let id = row.id();
+        let fields = row_fields(&collection, row)?;
+        collection.update(id, fields).await.map_err(db_error)?;
+        Ok(())
     }
 
     /// Checks an `EXPECT VERSION` precondition (Spec §81).

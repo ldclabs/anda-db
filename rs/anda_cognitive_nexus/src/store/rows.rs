@@ -34,6 +34,15 @@ pub mod state {
     pub const ARCHIVED: &str = "archived";
     /// Logically deleted; identity and references survive (§41.3).
     pub const TOMBSTONED: &str = "tombstoned";
+    /// Minted by an in-flight transaction and not yet committed.
+    ///
+    /// Not a KIP state: it exists because `anda_db` assigns element ids at
+    /// insert time, so a transaction that needs an id before it can resolve a
+    /// forward reference has to insert something first. Nothing reads a pending
+    /// element, and anything still wearing this state after a crash belongs to
+    /// no committed transaction, which is what makes the recovery sweep
+    /// correct rather than heuristic.
+    pub const PENDING: &str = "pending";
 }
 
 /// A Concept — a unit of meaning (Spec §10).
