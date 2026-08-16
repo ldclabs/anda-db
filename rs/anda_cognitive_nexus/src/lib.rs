@@ -30,19 +30,28 @@
 //! Space              ≠ Domain
 //! ```
 //!
+//! A fifth distinction has its own module. In KIP 1.x, authoritative schema
+//! was graph state, so an ordinary write could change what a type meant. Here
+//! it is an immutable versioned artifact resolved through a per-Space
+//! [`SchemaEnvironment`](schema::SchemaEnvironment), and every persisted
+//! `schema_ref` names an exact version — which is why an element's meaning
+//! cannot drift when somebody publishes something.
+//!
 //! ## Status
 //!
 //! The KIP 2.0 engine is being built in stages. What exists today is the
 //! foundation — element identity, the reference and Literal model, time
-//! normalization and the storage layer. KML, KQL, Epistemic Projection and META
-//! are not implemented yet; the KIP 1.x engine that used to live here was
-//! removed rather than ported, because 2.0 is a different data model and a
-//! renamed 1.x engine would be a worse lie than an absent one.
+//! normalization, the storage layer, and Schema Packages with their resolution
+//! and validation. KML, KQL, Epistemic Projection and META are not implemented
+//! yet; the KIP 1.x engine that used to live here was removed rather than
+//! ported, because 2.0 is a different data model and a renamed 1.x engine would
+//! be a worse lie than an absent one.
 
 #![doc(html_root_url = "https://docs.rs/anda_cognitive_nexus")]
 
 pub mod error;
 pub mod id;
+pub mod schema;
 pub mod store;
 pub mod term;
 pub mod time;

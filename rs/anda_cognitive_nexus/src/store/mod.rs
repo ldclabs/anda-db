@@ -1,7 +1,8 @@
 //! # The storage layer
 //!
-//! Seven `anda_db` collections: one per Core element kind (Spec §6.1), plus the
-//! MemorySpace registry and the transaction journal.
+//! Nine `anda_db` collections: one per Core element kind (Spec §6.1), plus the
+//! MemorySpace registry, the transaction journal, and the Schema Package and
+//! Schema Environment registries.
 //!
 //! ## Why the element kinds do not share a collection
 //!
@@ -36,6 +37,7 @@
 //! [`Store::has_poisoned_handle`] first.
 
 pub mod rows;
+pub mod schema;
 pub mod space;
 pub mod write;
 
@@ -68,6 +70,10 @@ pub const ACTIVITIES: &str = "activities";
 pub const SPACES: &str = "spaces";
 /// The transaction journal collection name.
 pub const TRANSACTIONS: &str = "transactions";
+/// The installed Schema Package collection name.
+pub const SCHEMA_PACKAGES: &str = "schema_packages";
+/// The Schema Environment version collection name.
+pub const SCHEMA_ENVS: &str = "schema_envs";
 
 /// A collection handle that survives poisoning.
 #[derive(Clone, Debug)]
@@ -99,6 +105,8 @@ pub struct Store {
     activities: Slot,
     spaces: Slot,
     transactions: Slot,
+    schema_packages: Slot,
+    schema_envs: Slot,
 }
 
 /// The columns every element kind is indexed on.
@@ -208,6 +216,18 @@ async fn init_spaces(c: &mut Collection) -> Result<(), DBError> {
     Ok(())
 }
 
+async fn init_schema_packages(c: &mut Collection) -> Result<(), DBError> {
+    c.create_btree_index_nx(&["package_ref"]).await?;
+    c.create_btree_index_nx(&["package_id"]).await?;
+    Ok(())
+}
+
+async fn init_schema_envs(c: &mut Collection) -> Result<(), DBError> {
+    c.create_btree_index_nx(&["space"]).await?;
+    c.create_btree_index_nx(&["version"]).await?;
+    Ok(())
+}
+
 async fn init_transactions(c: &mut Collection) -> Result<(), DBError> {
     c.create_btree_index_nx(&["tx_id"]).await?;
     c.create_btree_index_nx(&["space"]).await?;
@@ -281,6 +301,23 @@ impl Store {
             .await
             .map_err(db_error)?;
 
+        let schema_packages = db
+            .open_or_create_collection(
+                SchemaPackageRow::schema().map_err(schema_error)?,
+                collection_config(SCHEMA_PACKAGES, "Installed Schema Package artifacts"),
+                init_schema_packages,
+            )
+            .await
+            .map_err(db_error)?;
+        let schema_envs = db
+            .open_or_create_collection(
+                SchemaEnvRow::schema().map_err(schema_error)?,
+                collection_config(SCHEMA_ENVS, "Schema Environment versions"),
+                init_schema_envs,
+            )
+            .await
+            .map_err(db_error)?;
+
         Ok(Self {
             db,
             concepts: Slot::new(concepts),
@@ -290,6 +327,8 @@ impl Store {
             activities: Slot::new(activities),
             spaces: Slot::new(spaces),
             transactions: Slot::new(transactions),
+            schema_packages: Slot::new(schema_packages),
+            schema_envs: Slot::new(schema_envs),
         })
     }
 
@@ -328,6 +367,16 @@ impl Store {
         self.transactions.get()
     }
 
+    /// The installed Schema Package handle.
+    pub fn schema_packages(&self) -> Arc<Collection> {
+        self.schema_packages.get()
+    }
+
+    /// The Schema Environment version handle.
+    pub fn schema_envs(&self) -> Arc<Collection> {
+        self.schema_envs.get()
+    }
+
     /// The collection holding one Core element kind.
     pub fn elements(&self, kind: ElementKind) -> Arc<Collection> {
         match kind {
@@ -349,6 +398,8 @@ impl Store {
             self.activities(),
             self.spaces(),
             self.transactions(),
+            self.schema_packages(),
+            self.schema_envs(),
         ]
         .iter()
         .any(|c| c.is_poisoned())
@@ -374,6 +425,10 @@ impl Store {
         self.spaces.set(self.reload(SPACES, init_spaces).await?);
         self.transactions
             .set(self.reload(TRANSACTIONS, init_transactions).await?);
+        self.schema_packages
+            .set(self.reload(SCHEMA_PACKAGES, init_schema_packages).await?);
+        self.schema_envs
+            .set(self.reload(SCHEMA_ENVS, init_schema_envs).await?);
         Ok(())
     }
 
@@ -405,6 +460,8 @@ impl Store {
             self.activities(),
             self.spaces(),
             self.transactions(),
+            self.schema_packages(),
+            self.schema_envs(),
         ] {
             collection.flush(now_ms).await.map_err(db_error)?;
         }
@@ -573,6 +630,8 @@ mod tests {
             ACTIVITIES,
             SPACES,
             TRANSACTIONS,
+            SCHEMA_PACKAGES,
+            SCHEMA_ENVS,
         ];
         let mut sorted = names.to_vec();
         sorted.sort_unstable();

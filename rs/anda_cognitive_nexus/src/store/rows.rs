@@ -394,6 +394,61 @@ pub struct SpaceRow {
     pub policies: Json,
 }
 
+/// One installed Schema Package artifact (Spec §4, §28).
+///
+/// Immutable: `package_id + version` identifies one canonical content forever,
+/// and the same reference arriving with different content is an integrity
+/// error rather than an update (§240.4, §240.5). Installation is also not
+/// activation — an installed package takes no part in resolution until
+/// Governance says so (§240.18).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, AndaDBSchema)]
+pub struct SchemaPackageRow {
+    /// The row id.
+    pub _id: u64,
+    /// The canonical exact reference, e.g. `kip://core@2.0.0`.
+    #[unique]
+    pub package_ref: String,
+    /// The stable namespace-qualified name.
+    pub package_id: String,
+    /// The exact version.
+    pub version: String,
+    /// The engine's own digest over the stored artifact.
+    ///
+    /// Distinct from `declared_digest`: this one is computed here and is what
+    /// detects a same-version replacement (§150). The artifact's own digest is
+    /// recorded but not treated as verified.
+    pub content_digest: String,
+    /// The digest the artifact claims for itself, verbatim.
+    pub declared_digest: String,
+    /// The artifact itself.
+    pub artifact: Json,
+    /// When this Nexus installed it.
+    pub installed_at: String,
+    /// Where it came from. Transport is not verification (§240.42).
+    pub source: String,
+}
+
+/// One immutable version of a Space's Schema Environment (Spec §23, §143).
+///
+/// Appended, never updated: a transaction records which environment version it
+/// ran under (§144), and rewriting an environment in place would retroactively
+/// change what those transactions meant.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, AndaDBSchema)]
+pub struct SchemaEnvRow {
+    /// The row id.
+    pub _id: u64,
+    /// The Space this environment governs.
+    pub space: String,
+    /// The environment version; monotonic per Space.
+    pub version: u64,
+    /// The resolved Schema Lock (§25).
+    pub lock: Json,
+    /// When this version was activated.
+    pub created_at: String,
+    /// The transaction that activated it.
+    pub tx_id: String,
+}
+
 /// One committed transaction (Spec §82).
 ///
 /// The journal is what makes `HISTORY`, `CHANGES` and idempotent recovery
