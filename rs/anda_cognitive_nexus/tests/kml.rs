@@ -647,20 +647,18 @@ async fn a_committed_transaction_is_recoverable_by_its_idempotency_key() {
 }
 
 #[tokio::test]
-async fn the_read_and_introspection_paths_report_their_absence() {
-    // An engine that silently returned empty results for KQL would be worse
-    // than one that says it cannot answer: an Agent would read "no memories"
-    // as an answer about the world.
+async fn the_introspection_path_reports_its_absence() {
+    // An engine that silently returned an empty answer for a command it
+    // cannot run would be worse than one that says so: an Agent would read
+    // the emptiness as a fact about the world.
     let nexus = nexus("unsupported").await;
-    for command in [
-        r#"FIND(?c) WHERE { ?c CONCEPT {type: "Person"} }"#,
-        "DESCRIBE PRIMER",
-    ] {
-        let response = run(&nexus, command).await;
-        assert_eq!(
-            response.error.as_ref().unwrap().code.as_str(),
-            "UnsupportedCapability",
-            "for {command}"
-        );
-    }
+    let response = run(&nexus, "DESCRIBE PRIMER").await;
+    assert_eq!(
+        response.error.as_ref().unwrap().code.as_str(),
+        "UnsupportedCapability"
+    );
+
+    // The read path, by contrast, now answers.
+    let read = run(&nexus, r#"FIND(?c) WHERE { ?c CONCEPT {type: "Person"} }"#).await;
+    assert_eq!(read.status, TopLevelStatus::Succeeded);
 }

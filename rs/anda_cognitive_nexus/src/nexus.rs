@@ -150,10 +150,12 @@ impl Executor for CognitiveNexus {
                 }
                 response
             }
-            Command::Kql(_) => Response::from(KipError::unsupported_capability(
-                "this engine does not execute KQL yet; the read path and the Epistemic Projection \
-                 are the next stages of the KIP 2.0 rewrite",
-            )),
+            Command::Kql(query) => {
+                // Shared: readers may run concurrently, but none of them
+                // overlaps a commit.
+                let _guard = self.lock.read().await;
+                crate::kql::execute(&self.store, &space, &query, request, operation).await
+            }
             Command::Meta(_) => Response::from(KipError::unsupported_capability(
                 "this engine does not execute META yet; introspection follows the read path in \
                  the KIP 2.0 rewrite",
@@ -167,5 +169,5 @@ impl Executor for CognitiveNexus {
 /// Stated as data rather than prose so a caller can branch on it instead of
 /// discovering the gap through an error.
 pub fn supported_command_types() -> &'static [CommandType] {
-    &[CommandType::Kml]
+    &[CommandType::Kml, CommandType::Kql]
 }

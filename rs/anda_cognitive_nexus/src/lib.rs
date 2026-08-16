@@ -40,18 +40,25 @@
 //! ## Status
 //!
 //! The KIP 2.0 engine is being built in stages. [`CognitiveNexus`] implements
-//! [`anda_kip::Executor`] and today runs **KML**: creation, `ENSURE`, `UPSERT`,
-//! the Assertion and Evidence lifecycles, retention and removal, inside real
-//! transactions with handles, preconditions, receipts and dry runs.
+//! [`anda_kip::Executor`] and today runs:
+//!
+//! - **KML** — creation, `ENSURE`, `UPSERT`, the Assertion and Evidence
+//!   lifecycles, retention and removal, inside real transactions with handles,
+//!   preconditions, receipts and dry runs;
+//! - **KQL** — element and tuple patterns, structural patterns, `FILTER`,
+//!   `NOT` / `OPTIONAL` / `UNION`, projection by dot path, aggregates,
+//!   `ORDER BY`, paging and `FOR TIME`.
 //!
 //! Not implemented yet, and reported as `UnsupportedCapability` rather than
 //! answered wrongly:
 //!
 //! ```text
-//! KQL and the Epistemic Projection
+//! BELIEF / BELIEF SLOT / WITH EPISTEMIC   the Epistemic Projection
 //! META introspection
-//! UPDATE / PURGE / MERGE CONCEPT      (their selection blocks need the solver)
-//! clause forms with a WHERE block     (same reason)
+//! AS OF                                   historical snapshots
+//! hop quantifiers                         transitive traversal
+//! UPDATE / PURGE / MERGE CONCEPT
+//! clause forms with a WHERE block
 //! ```
 //!
 //! An engine that returned empty results for a read it cannot perform would be
@@ -67,12 +74,14 @@
 pub mod error;
 pub mod id;
 pub mod kml;
+pub mod kql;
 pub mod nexus;
 pub mod schema;
 pub mod store;
 pub mod term;
 pub mod time;
 pub mod tx;
+pub mod view;
 
 pub use error::*;
 pub use id::*;
