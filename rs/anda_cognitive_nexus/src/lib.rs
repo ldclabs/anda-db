@@ -50,8 +50,9 @@
 //!   `ORDER BY`, paging and `FOR TIME`;
 //! - **BELIEF / BELIEF SLOT** — the [`Epistemic Projection`](projection),
 //!   under a named, versioned policy, with an explanation ledger;
-//! - **META** — `DESCRIBE`, `LIST`, `SEARCH`, `VALIDATE`, `PREVIEW KML`,
-//!   `HISTORY`, `CHANGES` and `SNAPSHOT`.
+//! - **META** — `DESCRIBE`, `LIST`, `SEARCH`, `VALIDATE`, `PREVIEW`,
+//!   `HISTORY`, `CHANGES`, `SNAPSHOT`, plus `EXPORT CAPSULE` and
+//!   `VERIFY CAPSULE`.
 //!
 //! `DESCRIBE CAPABILITIES` reports the gaps below as structured data, so an
 //! Agent can read what is missing instead of discovering it by triggering an
@@ -69,7 +70,7 @@
 //! AS OF                          historical snapshots
 //! hop quantifiers                transitive traversal
 //! semantic / hybrid SEARCH       no embedding model
-//! VERIFY, EXPORT / IMPORT CAPSULE
+//! Capsule import (the semantic merge), Capsule signatures
 //! DESCRIBE TRUST / ACCESS        no Governance plane
 //! UPDATE / PURGE / MERGE CONCEPT
 //! clause forms with a WHERE block
@@ -85,6 +86,7 @@
 
 #![doc(html_root_url = "https://docs.rs/anda_cognitive_nexus")]
 
+pub mod capsule;
 pub mod error;
 pub mod id;
 pub mod kml;

@@ -141,7 +141,8 @@ async fn capabilities_report_the_gaps_as_data_not_as_errors() {
         "semantic_search",
         "trust_model",
         "governance",
-        "capsule",
+        "capsule_import",
+        "capsule_signatures",
     ] {
         assert!(unsupported.contains(&expected), "missing {expected}");
     }
@@ -330,19 +331,35 @@ async fn preview_computes_an_effect_and_commits_nothing() {
 async fn verify_refuses_rather_than_reporting_an_unchecked_artifact_as_valid() {
     // Integrity is the one layer a caller trusts to be paranoid on its behalf.
     let nexus = fresh("verify").await;
-    let response = run(&nexus, r#"VERIFY CAPSULE "artifact""#).await;
+
+    // An unreadable artifact is a parse failure, not a pass.
+    let garbage = run(&nexus, r#"VERIFY CAPSULE "not a capsule""#).await;
     assert_eq!(
-        response.error.as_ref().unwrap().code.as_str(),
-        "UnsupportedCapability"
+        garbage.error.as_ref().unwrap().code.as_str(),
+        "ArtifactParseError"
     );
-    assert!(
-        response
-            .error
-            .as_ref()
-            .unwrap()
-            .message
-            .contains("defeat the purpose")
-    );
+
+    // The kinds this engine cannot check say so rather than answering.
+    for command in [
+        r#"VERIFY RECEIPT "x""#,
+        r#"VERIFY BLOB "x""#,
+        r#"VERIFY SCHEMA PACKAGE "x""#,
+    ] {
+        let response = run(&nexus, command).await;
+        assert_eq!(
+            response.error.as_ref().unwrap().code.as_str(),
+            "UnsupportedCapability",
+            "for {command}"
+        );
+        assert!(
+            response
+                .error
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("defeat the purpose")
+        );
+    }
 }
 
 #[tokio::test]

@@ -75,6 +75,18 @@ impl CognitiveNexus {
         })
     }
 
+    /// Wraps an already-open store, for a caller that has one.
+    ///
+    /// Takes no lock of its own beyond a fresh one, so this is for read paths
+    /// that are already holding the caller's lock.
+    pub(crate) fn attach(store: Store) -> Self {
+        Self {
+            store,
+            default_space: DEFAULT_SPACE.to_string(),
+            lock: Arc::new(RwLock::new(())),
+        }
+    }
+
     /// Installs a Schema Package artifact. Installing does not activate it.
     pub async fn install_package(
         &self,

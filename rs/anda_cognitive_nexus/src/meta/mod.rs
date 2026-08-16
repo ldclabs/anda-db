@@ -103,6 +103,14 @@ impl Answer {
             next_cursor: None,
         }
     }
+
+    /// Adds one field to an object answer.
+    pub fn with_detail(mut self, key: &str, value: Json) -> Self {
+        if let Some(object) = self.result.as_object_mut() {
+            object.insert(key.to_string(), value);
+        }
+        self
+    }
 }
 
 async fn run(cx: &mut crate::kql::Context<'_>, command: &MetaCommand) -> Result<Answer, KipError> {
@@ -116,10 +124,7 @@ async fn run(cx: &mut crate::kql::Context<'_>, command: &MetaCommand) -> Result<
         MetaCommand::History(history) => history::history(cx, history).await,
         MetaCommand::Changes(changes) => history::changes(cx, changes).await,
         MetaCommand::Snapshot { as_of } => history::snapshot(cx, as_of.as_ref()).await,
-        MetaCommand::ExportCapsule(_) => Err(KipError::unsupported_capability(
-            "EXPORT CAPSULE produces a portable, digest-bearing artifact; this engine has no \
-             Capsule writer yet, and an export that skipped the digest would not be a Capsule",
-        )),
+        MetaCommand::ExportCapsule(command) => inspect::export_capsule(cx, command).await,
     }
 }
 
@@ -148,7 +153,8 @@ pub fn capabilities() -> Json {
             ],
             "meta": [
                 "DESCRIBE", "LIST", "SEARCH", "VALIDATE", "PREVIEW KML",
-                "HISTORY", "CHANGES", "SNAPSHOT"
+                "PREVIEW IMPORT CAPSULE", "HISTORY", "CHANGES", "SNAPSHOT",
+                "EXPORT CAPSULE", "VERIFY CAPSULE"
             ],
             "execution_modes": ["independent", "sequence"],
             "search_modes": ["keyword"],
@@ -200,9 +206,18 @@ pub fn capabilities() -> Json {
                 "reason": "no Governance plane; there is no authorization to report"
             },
             {
-                "capability": "capsule",
-                "detail": "EXPORT / IMPORT / VERIFY CAPSULE",
-                "reason": "no Capsule writer or verifier"
+                "capability": "capsule_import",
+                "detail": "importing a Capsule's records into a Space",
+                "reason": "export, verification and import preview work; the semantic merge — \
+                           rewriting every reference onto destination ids, recording import \
+                           provenance and staying idempotent across restarts — is a write path \
+                           that must not be half-built"
+            },
+            {
+                "capability": "capsule_signatures",
+                "detail": "signing an exported Capsule and verifying a signed one",
+                "reason": "no signing keys; an exported Capsule is unsigned, and its stated \
+                           source is a claim a destination cannot check"
             },
             {
                 "capability": "kml_selection_blocks",

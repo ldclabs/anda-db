@@ -250,19 +250,77 @@ pub fn validate(cx: &mut Context<'_>, command: &ValidateCommand) -> Result<Answe
             ),
         },
         ValidateTarget::Capsule | ValidateTarget::ImportPlan => {
-            return Err(KipError::unsupported_capability(
-                "this engine has no Capsule reader, so it cannot validate one",
-            ));
+            match crate::capsule::parse(&input) {
+                Ok(capsule) => report(true, vec![])
+                    .with_detail("records", Json::from(capsule.payload.records.len())),
+                Err(err) => report(
+                    false,
+                    vec![serde_json::json!({"code": err.name(), "message": err.message})],
+                ),
+            }
         }
     })
 }
 
-/// `PREVIEW KML` — effect, without committing.
+/// `EXPORT CAPSULE` — the portable form of a subgraph.
+pub async fn export_capsule(
+    cx: &mut Context<'_>,
+    command: &anda_kip::ExportCapsuleCommand,
+) -> Result<Answer, KipError> {
+    if command.as_of.is_some() {
+        return Err(KipError::new(
+            KipErrorCode::HistoricalSnapshotUnavailable,
+            "this engine retains no historical coordinates, so it cannot export one",
+        ));
+    }
+    let mut options = anda_kip::Map::new();
+    if let Some(block) = &command.options {
+        options = crate::projection::settings_of(block, |name| cx.param_ref(name))?;
+    }
+
+    // The roots come from the selection block, exactly as a KQL read would
+    // find them — an export selects with the same solver a query uses, so the
+    // two cannot disagree about what a pattern matches.
+    let solutions = cx.solve(&command.where_clauses).await?;
+    let roots: Vec<crate::id::ElementId> = match &command.target {
+        anda_kip::ElementRef::Handle(name) => solutions.elements_of(name),
+        anda_kip::ElementRef::Id(id) => vec![id.parse()?],
+        anda_kip::ElementRef::Param(name) => match cx.param_ref(name)? {
+            Json::String(id) => vec![id.parse()?],
+            other => {
+                return Err(KipError::type_mismatch(format!(
+                    "the parameter :{name} must carry an element id, got {other}"
+                )));
+            }
+        },
+    };
+    if roots.is_empty() {
+        return Err(KipError::projection_target_unbound(
+            "the selection block bound no root elements, so there is nothing to export",
+        ));
+    }
+
+    let capsule = crate::capsule::export(cx, roots, &options).await?;
+    Ok(Answer::whole(serde_json::to_value(&capsule).map_err(
+        |err| KipError::internal_error(format!("a Capsule failed to encode: {err}")),
+    )?))
+}
+
+/// `PREVIEW KML` and `PREVIEW IMPORT CAPSULE` — effect, without committing.
 pub async fn preview(cx: &mut Context<'_>, command: &PreviewCommand) -> Result<Answer, KipError> {
     let PreviewCommand::Kml(scalar) = command else {
-        return Err(KipError::unsupported_capability(
-            "this engine has no Capsule importer, so it cannot preview one",
-        ));
+        let PreviewCommand::ImportCapsule { capsule, into } = command else {
+            unreachable!("the two preview forms are exhaustive");
+        };
+        let source = scalar_str(cx, capsule, "PREVIEW IMPORT CAPSULE")?;
+        let into = scalar_str(cx, into, "INTO")?;
+        let parsed = crate::capsule::parse(&source)?;
+        // Validation runs against the destination Space, because that is where
+        // the schema has to resolve — an artifact that is fine here may be
+        // unreadable there.
+        let nexus = crate::CognitiveNexus::attach(cx.store.clone());
+        let report = crate::capsule::import(&nexus, &parsed, &into, true).await?;
+        return Ok(Answer::whole(report.to_json(true)));
     };
     let source = scalar_str(cx, scalar, "PREVIEW KML")?;
     let statement = match anda_kip::parse_kip(&source)? {
@@ -302,16 +360,22 @@ pub async fn preview(cx: &mut Context<'_>, command: &PreviewCommand) -> Result<A
 
 /// `VERIFY` — integrity.
 pub fn verify(
-    _cx: &mut Context<'_>,
+    cx: &mut Context<'_>,
     target: VerifyTarget,
-    _value: &anda_kip::Scalar,
+    value: &anda_kip::Scalar,
 ) -> Result<Answer, KipError> {
-    // Answering `{"valid": true}` without checking a digest or a signature
-    // would be the worst possible failure here: integrity is exactly the layer
-    // a caller trusts to be paranoid on its behalf.
-    Err(KipError::unsupported_capability(format!(
-        "this engine cannot verify a {target:?}: it implements no digest profile and no \
-         signature checking, and reporting an unverified artifact as valid would defeat the \
-         purpose of asking"
-    )))
+    match target {
+        VerifyTarget::Capsule => {
+            let source = scalar_str(cx, value, "VERIFY CAPSULE")?;
+            let capsule = crate::capsule::parse(&source)?;
+            Ok(Answer::whole(crate::capsule::verify(&capsule)?))
+        }
+        // Answering `{"valid": true}` without checking anything would be the
+        // worst possible failure here: integrity is exactly the layer a caller
+        // trusts to be paranoid on its behalf.
+        other => Err(KipError::unsupported_capability(format!(
+            "this engine cannot verify a {other:?}: it implements no signature checking for one, \
+             and reporting an unverified artifact as valid would defeat the purpose of asking"
+        ))),
+    }
 }
