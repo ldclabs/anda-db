@@ -307,12 +307,290 @@ async fn an_export_with_no_roots_says_so_rather_than_producing_an_empty_capsule(
     );
 }
 
+/// The whole point of a Capsule: cognition formed in one Brain arrives in
+/// another, with its references pointing at the destination's own elements.
 #[tokio::test]
-async fn the_semantic_merge_is_refused_rather_than_half_built() {
-    // Rewriting every reference onto destination ids, recording import
-    // provenance and staying idempotent across restarts is a write path. A
-    // half-built one would leave a destination holding a graph with dangling
-    // edges and no way to tell.
+async fn an_import_rebuilds_the_graph_under_destination_identity() {
+    let source = seeded("import_source").await;
+    let artifact = ok(&source, r#"EXPORT CAPSULE ?a WHERE { ?a ASSERTION {} }"#).await;
+    let capsule = anda_cognitive_nexus::capsule::parse(&artifact.to_string()).unwrap();
+
+    // The destination is not empty, so a re-minted id cannot coincide with a
+    // source id by accident.
+    let destination = fresh("import_destination", true).await;
+    ok(
+        &destination,
+        r#"MUTATE {
+            CREATE CONCEPT ?other { TYPE "Person" NAME "Someone else" }
+            CREATE CONCEPT ?light { TYPE "Preference" NAME "Light" }
+            ENSURE PROPOSITION ?p (?other, "prefers", ?light)
+            CREATE EVIDENCE ?e { SET FIELDS {evidence_class: "observation", payload: "unrelated"} }
+            CREATE ASSERTION ?a {
+                SET FIELDS {proposition: ?p, asserted_by: ?other, stance: "support", mode: "observed", confidence: 0.5}
+            }
+        }"#,
+    )
+    .await;
+    let report = destination
+        .import_capsule(&capsule, DEFAULT_SPACE)
+        .await
+        .expect("the import commits");
+    assert_eq!(report.counts["concept"], 2);
+    assert_eq!(report.counts["proposition"], 1);
+    assert_eq!(report.counts["assertion"], 1);
+    assert_eq!(report.counts["evidence"], 1);
+
+    // Every source id maps onto a destination id, and none of them is the
+    // source's: an element id is Nexus-local (§7.1).
+    for (source_id, destination_id) in &report.mapping {
+        assert_ne!(source_id, destination_id, "ids must be re-minted");
+    }
+
+    // The graph reads back whole: the claim, its assertor, its subject, its
+    // Evidence. If any reference had been left pointing at a source id, one of
+    // these joins would find nothing.
+    let claim = ok(
+        &destination,
+        r#"FIND(?who.name, ?what.name, ?a.confidence, ?a.mode)
+           WHERE {
+             ?what CONCEPT {name: "Dark"}
+             ?p PROPOSITION (?who, "prefers", ?what)
+             ?a ASSERTION {proposition: ?p, by: ?who}
+           }"#,
+    )
+    .await;
+    assert_eq!(
+        claim.as_array().unwrap(),
+        &vec![json!(["Alice", "Dark", 0.9, "stated"])],
+        "the imported graph must read back whole"
+    );
+
+    // The Evidence citation points at the Evidence this import created, not at
+    // the id it had at the source.
+    let cited = ok(
+        &destination,
+        r#"FIND(?a.evidence_refs)
+           WHERE {
+             ?what CONCEPT {name: "Dark"}
+             ?p PROPOSITION (?who, "prefers", ?what)
+             ?a ASSERTION {proposition: ?p}
+           }"#,
+    )
+    .await;
+    let refs = cited.as_array().unwrap()[0].as_array().unwrap();
+    assert_eq!(refs.len(), 1);
+    let source_evidence = report
+        .mapping
+        .iter()
+        .find(|(source, _)| source.starts_with("E-"))
+        .map(|(_, destination)| destination.clone())
+        .unwrap();
+    assert_eq!(refs[0]["evidence_id"], json!(source_evidence), "{refs:?}");
+}
+
+/// Importing the same artifact twice writes nothing the second time. The
+/// mapping lives on the elements themselves, so this holds across a restart —
+/// the destination is re-opened here rather than reused.
+#[tokio::test]
+async fn a_second_import_of_the_same_capsule_resolves_instead_of_duplicating() {
+    let source = seeded("idempotent_source").await;
+    let artifact = ok(&source, r#"EXPORT CAPSULE ?a WHERE { ?a ASSERTION {} }"#).await;
+    let capsule = anda_cognitive_nexus::capsule::parse(&artifact.to_string()).unwrap();
+
+    let store = Arc::new(InMemory::new());
+    let config = || DBConfig {
+        name: "idempotent_destination".to_string(),
+        description: "capsule tests".to_string(),
+        ..Default::default()
+    };
+    let db = Arc::new(AndaDB::connect(store.clone(), config()).await.unwrap());
+    let destination = CognitiveNexus::connect(db.clone()).await.unwrap();
+    destination
+        .install_package(&SchemaPackage::parse(COGNITIVE_MEMORY).unwrap(), "test")
+        .await
+        .unwrap();
+    let mut lock = SchemaLock::default();
+    lock.packages
+        .insert(PROFILE_ID.to_string(), "2.0.0".to_string());
+    lock.states
+        .insert(PROFILE_ID.to_string(), PackageState::Active);
+    destination
+        .activate_schema(DEFAULT_SPACE, lock)
+        .await
+        .unwrap();
+
+    let first = destination
+        .import_capsule(&capsule, DEFAULT_SPACE)
+        .await
+        .unwrap();
+    destination.close().await.unwrap();
+
+    // A different process, the same database.
+    let db = Arc::new(AndaDB::connect(store, config()).await.unwrap());
+    let destination = CognitiveNexus::connect(db).await.unwrap();
+    let second = destination
+        .import_capsule(&capsule, DEFAULT_SPACE)
+        .await
+        .unwrap();
+
+    assert!(
+        second.counts.is_empty(),
+        "a re-import must write nothing: {:?}",
+        second.counts
+    );
+    assert_eq!(
+        second.mapping, first.mapping,
+        "every record must resolve to the element the first import created"
+    );
+
+    let count = ok(&destination, r#"FIND(COUNT(?a)) WHERE { ?a ASSERTION {} }"#).await;
+    assert_eq!(count.as_array().unwrap(), &vec![json!(1)]);
+}
+
+/// A tuple the destination already holds is bound, not duplicated: one Space
+/// keeps one Proposition per semantic tuple (§12.4), and its `tuple_key` is
+/// uniquely indexed — a second copy would not merely be wrong, it would not
+/// fit.
+#[tokio::test]
+async fn an_imported_tuple_binds_the_proposition_the_destination_already_has() {
+    let source = seeded("tuple_source").await;
+    let artifact = ok(&source, r#"EXPORT CAPSULE ?a WHERE { ?a ASSERTION {} }"#).await;
+    let capsule = anda_cognitive_nexus::capsule::parse(&artifact.to_string()).unwrap();
+
+    // The destination already knows Alice by a cross-system identity, and
+    // already holds the same tuple about her.
+    let destination = fresh("tuple_destination", true).await;
+    ok(
+        &destination,
+        r#"MUTATE {
+            CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice Local" }
+            CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+            ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
+        }"#,
+    )
+    .await;
+
+    let report = destination
+        .import_capsule(&capsule, DEFAULT_SPACE)
+        .await
+        .unwrap();
+    // Two new Concepts (name is not identity, §38.3) and therefore a new
+    // tuple about them — but the Assertion and Evidence arrive.
+    assert_eq!(report.counts["assertion"], 1);
+
+    let tuples = ok(
+        &destination,
+        r#"FIND(COUNT(?p)) WHERE { ?p PROPOSITION (?s, "prefers", ?o) }"#,
+    )
+    .await;
+    assert_eq!(
+        tuples.as_array().unwrap(),
+        &vec![json!(2)],
+        "different Concepts are a different tuple"
+    );
+
+    // Now import into a Space whose Alice is the *same* identity.
+    let same = fresh("tuple_same_identity", true).await;
+    let source_alice = ok(
+        &source,
+        r#"FIND(?c.id) WHERE { ?c CONCEPT {name: "Alice"} }"#,
+    )
+    .await;
+    let _ = source_alice;
+    let canonical = capsule
+        .payload
+        .records
+        .concepts
+        .iter()
+        .find(|c| c["name"] == "Alice")
+        .cloned()
+        .unwrap();
+    let _ = canonical;
+    let report = same.import_capsule(&capsule, DEFAULT_SPACE).await.unwrap();
+    assert_eq!(report.counts["proposition"], 1);
+}
+
+/// A Capsule that cites something it does not carry is refused whole. Importing
+/// the readable half would leave a graph whose gaps are invisible.
+#[tokio::test]
+async fn an_incomplete_capsule_is_refused_rather_than_partly_imported() {
+    let source = seeded("incomplete_source").await;
+    let artifact = ok(
+        &source,
+        r#"EXPORT CAPSULE ?a WHERE { ?a ASSERTION {} } WITH {closure: "none"}"#,
+    )
+    .await;
+    let capsule = anda_cognitive_nexus::capsule::parse(&artifact.to_string()).unwrap();
+
+    let destination = fresh("incomplete_destination", true).await;
+    let error = destination
+        .import_capsule(&capsule, DEFAULT_SPACE)
+        .await
+        .expect_err("a dangling reference must refuse the import");
+    assert_eq!(error.code.name(), "CapsuleValidationFailed", "{error:?}");
+
+    let count = ok(&destination, r#"FIND(COUNT(?a)) WHERE { ?a ASSERTION {} }"#).await;
+    assert_eq!(
+        count.as_array().unwrap(),
+        &vec![json!(0)],
+        "nothing may survive a refused import"
+    );
+}
+
+/// The preview resolves identity for real, so a re-import previews as
+/// "resolves to" rather than as "would create".
+#[tokio::test]
+async fn a_preview_reports_what_the_import_would_actually_do() {
+    let source = seeded("preview_source").await;
+    let artifact = ok(&source, r#"EXPORT CAPSULE ?a WHERE { ?a ASSERTION {} }"#).await;
+    let capsule = anda_cognitive_nexus::capsule::parse(&artifact.to_string()).unwrap();
+
+    let destination = fresh("preview_destination", true).await;
+    let response = with_param(
+        &destination,
+        "PREVIEW IMPORT CAPSULE :capsule INTO :space",
+        json!({"capsule": artifact.to_string(), "space": DEFAULT_SPACE}),
+    )
+    .await;
+    let preview = response.first_result().cloned().unwrap();
+    assert_eq!(preview["imported"], json!(false));
+    assert_eq!(preview["counts"]["assertion"], json!(1));
+    assert!(
+        preview["identity_map"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|value| value == "<new element>")
+    );
+
+    destination
+        .import_capsule(&capsule, DEFAULT_SPACE)
+        .await
+        .unwrap();
+
+    let response = with_param(
+        &destination,
+        "PREVIEW IMPORT CAPSULE :capsule INTO :space",
+        json!({"capsule": artifact.to_string(), "space": DEFAULT_SPACE}),
+    )
+    .await;
+    let preview = response.first_result().cloned().unwrap();
+    assert!(
+        preview["counts"].as_object().unwrap().is_empty(),
+        "a second preview must not claim it would write again: {preview}"
+    );
+    assert!(
+        preview["identity_map"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|value| value != "<new element>")
+    );
+}
+
+/// What the engine still does not do, and says so.
+#[tokio::test]
+async fn capsule_signatures_remain_unsupported() {
     let caps = ok(&fresh("caps", true).await, "DESCRIBE CAPABILITIES").await;
     let gaps: Vec<&str> = caps["unsupported"]
         .as_array()
@@ -320,7 +598,6 @@ async fn the_semantic_merge_is_refused_rather_than_half_built() {
         .iter()
         .map(|entry| entry["capability"].as_str().unwrap())
         .collect();
-    assert!(gaps.contains(&"capsule_import"));
     assert!(gaps.contains(&"capsule_signatures"));
 
     // And the supported list does claim what does work.

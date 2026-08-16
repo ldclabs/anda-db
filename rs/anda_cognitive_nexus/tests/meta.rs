@@ -140,7 +140,7 @@ async fn capabilities_report_the_gaps_as_data_not_as_errors() {
         "semantic_search",
         "trust_model",
         "governance",
-        "capsule_import",
+        "capsule_import_modes",
         "capsule_signatures",
     ] {
         assert!(unsupported.contains(&expected), "missing {expected}");

@@ -53,7 +53,8 @@
 //!   under a named, versioned policy, with an explanation ledger;
 //! - **META** — `DESCRIBE`, `LIST`, `SEARCH`, `VALIDATE`, `PREVIEW`,
 //!   `HISTORY`, `CHANGES`, `SNAPSHOT`, plus `EXPORT CAPSULE` and
-//!   `VERIFY CAPSULE`.
+//!   `VERIFY CAPSULE`; Capsule import is a host API
+//!   ([`CognitiveNexus::import_capsule`]).
 //!
 //! `DESCRIBE CAPABILITIES` reports the gaps below as structured data, so an
 //! Agent can read what is missing instead of discovering it by triggering an
@@ -70,7 +71,7 @@
 //! ```text
 //! AS OF                          historical snapshots
 //! semantic / hybrid SEARCH       no embedding model
-//! Capsule import (the semantic merge), Capsule signatures
+//! Capsule signatures, the "isolate" and "restore" import modes
 //! DESCRIBE TRUST / ACCESS        no Governance plane
 //! PURGE                          erasure is a Governance decision
 //! ```

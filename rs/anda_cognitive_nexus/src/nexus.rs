@@ -168,6 +168,26 @@ impl CognitiveNexus {
             .await
     }
 
+    /// Imports a Cognitive Capsule into a Space (§39.3, the `merge` mode).
+    ///
+    /// A host operation, not a KIP command: KML has no import clause and META
+    /// is read-only, so the only thing an Agent can do through the protocol is
+    /// `PREVIEW IMPORT CAPSULE`. Deciding that this Space accepts another
+    /// Brain's cognition is the host's call, and leaving it outside the command
+    /// surface keeps a prompt from making it.
+    ///
+    /// Re-importing the same artifact is idempotent: every record resolves back
+    /// to the element the first import created.
+    pub async fn import_capsule(
+        &self,
+        capsule: &anda_kip::Capsule,
+        space_id: &str,
+    ) -> Result<crate::capsule::ImportReport, KipError> {
+        let _guard = self.lock.write().await;
+        self.store.reopen_if_poisoned().await?;
+        crate::capsule::import(self, capsule, space_id, false).await
+    }
+
     /// The Space a request runs against.
     ///
     /// A Space named in the envelope must exist: creating one implicitly would

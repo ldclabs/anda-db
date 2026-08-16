@@ -166,6 +166,13 @@ pub fn capabilities() -> Json {
                 "PREVIEW IMPORT CAPSULE", "HISTORY", "CHANGES", "SNAPSHOT",
                 "EXPORT CAPSULE", "VERIFY CAPSULE"
             ],
+            "capsule": {
+                // The import itself is a host operation: KML has no import
+                // clause and META is read-only, so a command cannot decide
+                // that this Space accepts another Brain's cognition.
+                "import_modes": ["preview", "merge"],
+                "identity_resolution": ["prior import", "canonical_id", "proposition tuple"]
+            },
             "execution_modes": ["independent", "sequence"],
             "search_modes": ["keyword"],
             "transactions": {
@@ -211,12 +218,11 @@ pub fn capabilities() -> Json {
                 "reason": "no Governance plane; there is no authorization to report"
             },
             {
-                "capability": "capsule_import",
-                "detail": "importing a Capsule's records into a Space",
-                "reason": "export, verification and import preview work; the semantic merge — \
-                           rewriting every reference onto destination ids, recording import \
-                           provenance and staying idempotent across restarts — is a write path \
-                           that must not be half-built"
+                "capability": "capsule_import_modes",
+                "detail": "the \"isolate\" and \"restore\" import modes (§39.2, §39.4)",
+                "reason": "isolate needs a quarantine state ordinary recall excludes, and restore \
+                           needs Governance to verify owner, lineage and restore authority; \
+                           neither exists here. \"merge\" is what this engine performs"
             },
             {
                 "capability": "capsule_signatures",

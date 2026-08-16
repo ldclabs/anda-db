@@ -31,6 +31,8 @@ use anda_kip::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod merge;
+
 use crate::id::ElementId;
 use crate::kql::Context;
 use crate::store::Element;
@@ -277,7 +279,7 @@ pub fn payload_digest(payload: &CapsulePayload) -> Result<String, KipError> {
 }
 
 /// What an import did, or would do.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct ImportReport {
     /// Source element id → destination element id.
     pub mapping: BTreeMap<String, String>,
@@ -344,6 +346,22 @@ pub async fn import(
     capsule.validate_frame()?;
     let mut report = ImportReport::default();
 
+    // Integrity first (§41.2: VERIFY → VALIDATE → PREVIEW → import). A
+    // modified artifact must not reach identity resolution: everything after
+    // this point trusts the record ids to mean what the digest covers.
+    let digest = payload_digest(&capsule.payload)?;
+    if digest != capsule.integrity.content_digest {
+        return Err(KipError::new(
+            KipErrorCode::DigestMismatch,
+            format!(
+                "this Capsule declares the digest {} and its payload digests to {digest}; it was \
+                 modified after it was written, or written by an engine using a different \
+                 canonicalization",
+                capsule.integrity.content_digest
+            ),
+        ));
+    }
+
     let env = nexus.store.schema_environment(space_id).await?;
     for dependency in &capsule.payload.schema {
         let package_ref = format!("{}@{}", dependency.package, dependency.version);
@@ -385,46 +403,19 @@ pub async fn import(
                 .to_string(),
         );
     }
-
-    // Everything the Capsule carries is written as new destination elements.
-    // The source ids survive only in the identity map and in import
-    // provenance — never as the ids themselves (§7.1).
-    for (kind, records) in [
-        (ElementKind::Concept, &capsule.payload.records.concepts),
-        (
-            ElementKind::Proposition,
-            &capsule.payload.records.propositions,
-        ),
-        (ElementKind::Assertion, &capsule.payload.records.assertions),
-        (ElementKind::Evidence, &capsule.payload.records.evidence),
-        (ElementKind::Activity, &capsule.payload.records.activities),
-    ] {
-        if !records.is_empty() {
-            report.counts.insert(kind.to_string(), records.len());
-        }
-        for record in records.iter() {
-            if let Some(source_id) = record.get("id").and_then(Json::as_str) {
-                report
-                    .mapping
-                    .insert(source_id.to_string(), String::from("<assigned on import>"));
-            }
-        }
-    }
+    // §39.5: none of the source's trust travels with its records. This engine
+    // has no trust model to apply either, and says so rather than letting the
+    // absence read as acceptance.
+    report.warnings.push(
+        "imported records carry no trust from their source, and this engine has no trust model \
+         to apply in its place: what arrived is a record of what somebody else claimed"
+            .to_string(),
+    );
 
     if dry_run {
-        report.warnings.push(
-            "preview only: no identity was reserved and no durable state was established"
-                .to_string(),
-        );
-        return Ok(report);
+        return merge::preview(&nexus.store, capsule, space_id, &digest, report).await;
     }
-
-    Err(KipError::unsupported_capability(
-        "this engine validates and previews a Capsule import but does not yet perform the \
-         semantic merge: rewriting every reference onto destination ids, recording import \
-         provenance and preserving idempotency across restarts is a write path that must not be \
-         half-built. Use PREVIEW IMPORT CAPSULE to check an artifact, and MUTATE to write",
-    ))
+    merge::merge(&nexus.store, capsule, space_id, &digest, report).await
 }
 
 /// Parses a Capsule artifact.
