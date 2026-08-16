@@ -1,4 +1,4 @@
-//! Fuzz-style property tests for the KIP parsers.
+//! Fuzz-style property tests for the KIP 2.0 parsers.
 //!
 //! The KQL/KML/META parsers are exposed to external input through
 //! `anda_db_server` and the cognitive nexus, so they are an attack surface:
@@ -6,9 +6,9 @@
 //! never panic, never hang. Two input generators are used:
 //!
 //! - completely arbitrary unicode strings, and
-//! - mutated valid documents (the shipped `.kip` capsules and known-good
-//!   statements with random splices, deletions and truncations), which reach
-//!   much deeper into the grammar than random noise.
+//! - mutated valid documents (known-good statements with random splices,
+//!   deletions and truncations), which reach much deeper into the grammar than
+//!   random noise.
 //!
 //! A `cargo fuzz` setup with the same targets lives in `rs/anda_kip/fuzz/`
 //! for open-ended coverage-guided runs; these proptest cases are the
@@ -26,34 +26,71 @@ const KQL_SEEDS: &[&str] = &[
     }
     "#,
     r#"
-    FIND(?drug_class, COUNT(?drug))
+    FIND(?drug_class, COUNT(DISTINCT ?drug))
     WHERE {
-        ?drug {type: "Drug"}
-        (?drug, "is_class_of", ?drug_class)
+        ?drug CONCEPT {type: "Drug"}
+        (?drug, "is_class_of"|"subclass_of"{1,3}, ?drug_class)
+        OPTIONAL { ?edge STRUCTURAL (?drug, "has_step", ?step) }
+        FILTER(?drug.attributes.risk_level < 3 && !IS_NULL(?drug_class))
+    }
+    ORDER BY COUNT(?drug) DESC
+    LIMIT 10
+    "#,
+    r#"
+    FIND(?b, ?slot)
+    WHERE {
+        ?b BELIEF (:alice, "timezone", ?tz)
+        ?slot BELIEF SLOT (:alice, "timezone")
+        ?a ASSERTION {proposition: (id: "P-1"), stance: "support"}
+    }
+    AS OF SEQ 4200
+    FOR TIME :world_time
+    WITH EPISTEMIC { explain: "summary" }
+    "#,
+];
+
+const KML_SEEDS: &[&str] = &[
+    r#"
+    ASSERT ?a (:alice, "prefers", :dark_mode) {
+        by: :alice,
+        mode: "stated",
+        confidence: 0.9,
+        evidence: [:msg, :screenshot]
+    } SUPERSEDING :old
+    "#,
+    r#"
+    MUTATE {
+        CREATE CONCEPT ?alice { TYPE "Person" CLIENT KEY "person:alice" NAME "Alice" }
+        CREATE EVIDENCE ?msg { SET FIELDS { evidence_class: "user_statement" } }
+        ENSURE PROPOSITION ?p (?alice, "prefers", :dark_mode)
+        CREATE ASSERTION ?claim {
+            SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: "support" }
+            SET STRUCTURAL { ("evidence", ?msg) {role: "support"} }
+        }
+        UPSERT CONCEPT ?drug {
+            MATCH {key: "drug:aspirin"}
+            EXPECT VERSION 3
+            SET ATTRIBUTES { risk_level: 2 }
+            UNSET ATTRIBUTES { deprecated_note }
+            SET FACET "MnemonicState" { salience: 0.4 }
+        }
+        UPDATE ?c
+            SET FACET "MnemonicState" { memory_strength: MUL(?c.facets["MnemonicState"].memory_strength, 0.99) }
+            WHERE { ?c CONCEPT {type: "Experience"} }
+            LIMIT 100
+        TRANSITION ACTIVITY :act TO "succeeded" SET FIELDS { ended_at: :now }
+        PURGE :leak REFERENCE POLICY "detach" CONFIRM "PURGE"
     }
     "#,
 ];
 
-const KML_SEEDS: &[&str] = &[r#"
-    UPSERT {
-        CONCEPT ?drug {
-            { type: "Drug", name: "Aspirin" }
-            SET ATTRIBUTES {
-                molecular_formula: "C9H8O4",
-                risk_level: 2
-            }
-        }
-    }
-    "#];
-
-const META_SEEDS: &[&str] = &["DESCRIBE PRIMER", "DESCRIBE CONCEPT TYPE \"Drug\""];
-
-/// Larger real-world documents (knowledge capsules shipped with the crate).
-const CAPSULE_SEEDS: &[&str] = &[
-    include_str!("../capsules/Person.kip"),
-    include_str!("../capsules/Event.kip"),
-    include_str!("../capsules/Genesis.kip"),
-    include_str!("../capsules/Insight.kip"),
+const META_SEEDS: &[&str] = &[
+    "DESCRIBE PRIMER MODE \"compact\"",
+    "DESCRIBE TYPE \"Person\"",
+    "LIST SCHEMA PACKAGES STATUS \"active\" LIMIT 20 CURSOR :page",
+    "SEARCH COGNITION \"dark mode\" WITH TYPE \"Preference\" MODE \"hybrid\" THRESHOLD 0.7 LIMIT 5",
+    "HISTORY ELEMENT \"C-1\" FROM SEQ 1 TO SEQ 99 LIMIT 10",
+    "EXPORT CAPSULE :out WHERE { ?c CONCEPT {type: \"Experience\"} } WITH { redact: true } AS OF SEQ 7",
 ];
 
 /// Snippets spliced into seeds to stress token boundaries.
@@ -62,6 +99,8 @@ const SPLICES: &[&str] = &[
     "}",
     "(",
     ")",
+    "[",
+    "]",
     "\"",
     "\\",
     "'",
@@ -72,20 +111,29 @@ const SPLICES: &[&str] = &[
     "$",
     ":",
     ";",
+    "|",
     "\u{0}",
     "\u{7f}",
     "🦀",
     "NULL",
     "FIND",
-    "UPSERT",
-    "DELETE",
+    "MUTATE",
+    "ASSERT",
+    "BELIEF",
+    "SLOT",
+    "SUPERSEDING",
+    "PURGE",
+    "CONFIRM",
     "WHERE",
     "META",
     "ATTRIBUTES",
-    "ON",
+    "STRUCTURAL",
+    "EXPECT",
+    "AS OF",
     "0x",
     "1e999",
     "-0",
+    "{1,}",
     "//",
     "/*",
     "*/",
@@ -202,13 +250,13 @@ proptest! {
         all_parsers_terminate(&input);
     }
 
-    /// Mutated knowledge capsules (large, deeply nested documents).
+    /// Mutated META commands, which have the widest keyword dispatch surface.
     #[test]
-    fn mutated_capsules_never_panic(
-        seed in 0usize..CAPSULE_SEEDS.len(),
+    fn mutated_meta_never_panics(
+        seed in 0usize..META_SEEDS.len(),
         mutations in prop::collection::vec(mutation_strategy(), 1..6),
     ) {
-        let input = apply_mutations(CAPSULE_SEEDS[seed], &mutations);
+        let input = apply_mutations(META_SEEDS[seed], &mutations);
         all_parsers_terminate(&input);
     }
 

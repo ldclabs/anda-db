@@ -1,951 +1,661 @@
 # `anda_kip` — Technical Reference
 
-> A pure-Rust SDK for the [**Knowledge Interaction Protocol (KIP)**](https://github.com/ldclabs/kip) — the
-> declarative protocol that lets Large Language Models query, evolve and
-> introspect a long-lived knowledge graph (the *Cognitive Nexus*).
+`anda_kip` is the protocol layer of the AndaDB workspace: it turns KIP 2.0
+command text into a closed, executable AST, models the runtime envelope, and
+defines the seam an engine implements. It holds no state and makes no storage
+decisions.
 
-|                       |                                                                                                                                                                    |
-| :-------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Crate                 | [`anda_kip`](../rs/anda_kip/)                                                                                                                                      |
-| Version               | `0.11.x`                                                                                                                                                           |
-| Spec                  | KIP **v1.0-RC11** ([SPECIFICATION.md](../rs/anda_kip/SPECIFICATION.md))                                                                                            |
-| Reference executor    | [`anda_cognitive_nexus`](../rs/anda_cognitive_nexus/) (graph store backed by [Anda DB](../rs/anda_db/))                                                            |
-| Other implementations | [`anda_cognitive_nexus_server`](../rs/anda_cognitive_nexus_server/) (HTTP/JSON-RPC), [`anda_cognitive_nexus_py`](../py/anda_cognitive_nexus_py/) (Python bindings) |
-| Status                | Library is feature-complete for KIP v1.0-RC11 (parser + AST + request/response + executor trait). Bundled `kip_cli` provides an interactive REPL.                  |
-
----
+- **Crate**: `rs/anda_kip`
+- **Protocol**: KIP 2.0 (`SPECIFICATION.md` ships with the crate)
+- **Reference implementation cross-check**: `@ldclabs/kip-lang`
 
 ## Contents
 
-- [`anda_kip` — Technical Reference](#anda_kip--technical-reference)
-  - [Contents](#contents)
-  - [1. Overview](#1-overview)
-    - [1.1 Why KIP?](#11-why-kip)
-    - [1.2 What this crate provides](#12-what-this-crate-provides)
-    - [1.3 Quick start](#13-quick-start)
-  - [2. Crate layout](#2-crate-layout)
-  - [3. The KIP language at a glance](#3-the-kip-language-at-a-glance)
-    - [3.1 KQL — Knowledge Query Language](#31-kql--knowledge-query-language)
-    - [3.2 KML — Knowledge Manipulation Language](#32-kml--knowledge-manipulation-language)
-    - [3.3 META — schema introspection](#33-meta--schema-introspection)
-  - [4. AST (`anda_kip::ast`)](#4-ast-anda_kipast)
-    - [4.1 Top-level](#41-top-level)
-    - [4.2 KQL nodes](#42-kql-nodes)
-    - [4.3 KML nodes](#43-kml-nodes)
-    - [4.4 META nodes](#44-meta-nodes)
-    - [4.5 Value / `Json` aliases](#45-value--json-aliases)
-  - [5. Parser (`anda_kip::parser`)](#5-parser-anda_kipparser)
-    - [5.1 Public entry points](#51-public-entry-points)
-    - [5.2 Whitespace and keywords](#52-whitespace-and-keywords)
-    - [5.3 Error reporting](#53-error-reporting)
-  - [6. Executor framework (`anda_kip::executor`)](#6-executor-framework-anda_kipexecutor)
-    - [6.1 The `Executor` trait](#61-the-executor-trait)
-    - [6.2 Convenience helpers](#62-convenience-helpers)
-    - [6.3 Implementing a backend](#63-implementing-a-backend)
-  - [7. Request / Response (`anda_kip::request`)](#7-request--response-anda_kiprequest)
-    - [7.1 `Request`](#71-request)
-    - [7.2 `Request::execute`](#72-requestexecute)
-    - [7.3 `Response`](#73-response)
-    - [7.4 End-to-end](#74-end-to-end)
-  - [8. Errors (`anda_kip::error`)](#8-errors-anda_kiperror)
-  - [9. Genesis capsules (`anda_kip::capsule`)](#9-genesis-capsules-anda_kipcapsule)
-  - [10. Entity types (`anda_kip::types`)](#10-entity-types-anda_kiptypes)
-  - [11. Function-calling integration](#11-function-calling-integration)
-  - [12. Executor implementer's checklist (RC11 semantics)](#12-executor-implementers-checklist-rc11-semantics)
-  - [13. Cookbook](#13-cookbook)
-    - [13.1 Parse and inspect](#131-parse-and-inspect)
-    - [13.2 Single command via `execute_kip`](#132-single-command-via-execute_kip)
-    - [13.3 Read-only sandbox](#133-read-only-sandbox)
-    - [13.4 Batch with shared and per-item parameters](#134-batch-with-shared-and-per-item-parameters)
-    - [13.5 Implementing an executor](#135-implementing-an-executor)
-    - [13.6 Building the function-calling tool definition](#136-building-the-function-calling-tool-definition)
-  - [14. `kip_cli`](#14-kip_cli)
-  - [15. Compatibility notes](#15-compatibility-notes)
+1. [Why KIP 2.0 is a different protocol](#1-why-kip-20-is-a-different-protocol)
+2. [Crate layout](#2-crate-layout)
+3. [The language at a glance](#3-the-language-at-a-glance)
+4. [The executable AST](#4-the-executable-ast)
+5. [Parser](#5-parser)
+6. [What the parser rejects, and why](#6-what-the-parser-rejects-and-why)
+7. [Errors](#7-errors)
+8. [Runtime envelope](#8-runtime-envelope)
+9. [Executor framework](#9-executor-framework)
+10. [Core data model](#10-core-data-model)
+11. [Cognitive Capsules](#11-cognitive-capsules)
+12. [Function-calling integration](#12-function-calling-integration)
+13. [Implementer's checklist](#13-implementers-checklist)
+14. [`kip_cli`](#14-kip_cli)
+15. [Migrating from `anda_kip` 0.11 (KIP 1.x)](#15-migrating-from-anda_kip-011-kip-1x)
 
 ---
 
-## 1. Overview
+## 1. Why KIP 2.0 is a different protocol
 
-### 1.1 Why KIP?
+KIP 1.x stored a self-describing Concept/Proposition graph in which a
+Proposition carried `metadata.confidence`, an `author` string and an
+`access_level`. That single plane made four different questions look like one:
 
-LLMs are stateless and probabilistic; production agents need a **persistent,
-deterministic, traceable** memory. KIP closes that gap by exposing a
-graph-shaped knowledge store through a **declarative, model-friendly DSL** and
-a **JSON request/response envelope** that maps cleanly onto LLM
-function-calling.
+- what does this *mean*?
+- who *claims* it, and how sure are they?
+- what was actually *observed*?
+- who is *allowed* to see it?
 
-A KIP backend (a *Cognitive Nexus*) stores two kinds of entity:
+KIP 2.0 separates them, and everything in this crate follows from one line:
 
-- **Concept node** — `{type, name}` plus `attributes` and `metadata`.
-- **Proposition link** — a triple `(subject, predicate, object)` plus
-  `attributes` and `metadata`. `subject` / `object` may themselves reference
-  another proposition link, enabling *higher-order* facts (provenance,
-  beliefs, meta-claims).
-
-KIP defines three instruction families:
-
-| Family   | Purpose                          | Statements                                                                                                          |
-| :------- | :------------------------------- | :------------------------------------------------------------------------------------------------------------------ |
-| **KQL**  | Knowledge retrieval & reasoning  | `FIND … WHERE { … } [ORDER BY] [LIMIT] [CURSOR]`                                                                    |
-| **KML**  | Knowledge evolution / writes     | `UPSERT { … }`, `UPDATE ?t SET … WHERE { … }`, `MERGE CONCEPT … INTO …`, `DELETE CONCEPT/PROPOSITIONS/ATTRIBUTES/METADATA …` |
-| **META** | Schema introspection & grounding | `DESCRIBE PRIMER/DOMAINS/CONCEPT TYPE[S]/PROPOSITION TYPE[S]`, `SEARCH …`, `EXPORT ?t WHERE { … }`                  |
-
-### 1.2 What this crate provides
-
-`anda_kip` is the **protocol-only** layer (no storage, no I/O):
-
-- A complete, RC11-compliant **parser** (`nom` + `nom-language`, no regex).
-- A strongly-typed **AST** for every KIP construct.
-- A small **`Executor` trait** (`async fn execute(Command, dry_run) -> Response`)
-  that any backend can implement.
-- A standardized **`Request` / `Response`** envelope including parameter
-  substitution (`:name` placeholders) and **batch execution semantics**.
-- KIP **standard error codes** (`KIP_1xxx`–`KIP_4xxx`) with recovery hints.
-- The canonical **Genesis capsules** (`$ConceptType`, `$PropositionType`,
-  `Domain`, `Person`, `Event`, `Insight`, `Preference`, `Commitment`,
-  `SleepTask`, `$self`, `$system`) plus RC11's Experience-learning profile
-  (`Experience`, `ExperienceStep`, `Skill` and their predicates).
-- LLM-facing **function-calling JSON schemas** for `execute_kip` and
-  `execute_kip_readonly`.
-- An interactive REPL: `kip_cli` (built from the bundled `bin/kip_cli.rs`).
-
-### 1.3 Quick start
-
-```toml
-[dependencies]
-anda_kip = "0.11"
+```text
+a Proposition existing  ≠  the Proposition being true
 ```
 
-```rust
-use anda_kip::{parse_kip, Command, KqlQuery};
+| Element | What it is | Mutability |
+| --- | --- | --- |
+| **Concept** | a referable typed entity | mutable state |
+| **Proposition** | truth-neutral `(subject, predicate, object)` | tuple immutable |
+| **Assertion** | one actor's commitment about a Proposition | payload immutable; revise by supersession |
+| **Evidence** | what was actually observed | payload immutable; correct via lineage |
+| **Activity** | provenance for a process | immutable once terminal |
 
-let cmd: Command = parse_kip(r#"
-    FIND(?drug.name, ?drug.attributes.risk_level)
-    WHERE {
-        ?drug   {type: "Drug"}
-        ?head   {name: "Headache"}
-        (?drug, "treats", ?head)
-        FILTER(?drug.attributes.risk_level < 3)
-    }
-    ORDER BY ?drug.attributes.risk_level ASC
-    LIMIT 10
-"#)?;
+Belief is **projected** from Assertions under a named policy. It is never
+stored, which is why `BELIEF` exists only in KQL — a Projection can never be a
+mutation target or an export selector.
 
-assert!(matches!(cmd, Command::Kql(KqlQuery { .. })));
-# Ok::<_, anda_kip::KipError>(())
+Distinctions the API deliberately keeps apart:
+
+```text
+missing            ≠ false          (open world: insufficient, not rejected)
+search score       ≠ confidence
+confidence         ≠ trust ≠ memory strength ≠ salience
+name               ≠ identity
+Principal (caller) ≠ semantic actor (whose claim it is)
+cognitive content  ≠ authority
+batch              ≠ transaction
+timeout            ≠ abort
+progress           ≠ commit
 ```
-
-Parsing is pure and synchronous; execution is delegated to whatever
-[`Executor`](#6-executor-framework-anda_kipexecutor) you wire up.
 
 ---
 
 ## 2. Crate layout
 
 ```text
-rs/anda_kip/src/
-├── lib.rs            # Public re-exports + LLM function-calling schema constants
-├── ast.rs            # Strongly-typed AST for KQL / KML / META
-├── capsule.rs        # Bootstrapping capsules and reserved-name constants
-├── error.rs          # KipError, KipErrorCode (KIP_1xxx–4xxx)
-├── executor.rs       # Executor trait + execute_kip / execute_readonly
-├── parser.rs         # parse_kip / parse_kql / parse_kml / parse_meta / parse_json
-├── parser/
-│   ├── common.rs     # Shared combinators (identifier, ws, keyword/keywords, …)
-│   ├── json.rs       # JSON value parser (Value, Object, Array, …)
-│   ├── kql.rs        # FIND / WHERE / FILTER / ORDER BY / LIMIT / CURSOR
-│   ├── kml.rs        # UPSERT / UPDATE / MERGE / DELETE / EXPECT VERSION
-│   └── meta.rs       # DESCRIBE / SEARCH / EXPORT
-├── request.rs        # Request / CommandItem / Response / ErrorObject
-├── types.rs          # Entity / ConceptNode / PropositionLink (+ borrowed refs)
-└── bin/kip_cli.rs    # Interactive REPL using anda_cognitive_nexus
+rs/anda_kip/
+├── src/
+│   ├── lib.rs          re-exports, bundled prompts and tool schemas
+│   ├── ast.rs          the executable AST (mirrors kip-lang's exec-ast.ts)
+│   ├── parser.rs       entry points, input budget, quoting helpers
+│   ├── parser/
+│   │   ├── common.rs   lexical layer + rules shared by the three grammars
+│   │   ├── kql.rs      FIND
+│   │   ├── kml.rs      mutations, ASSERT desugaring, mutation guards
+│   │   ├── meta.rs     DESCRIBE / LIST / SEARCH / VERIFY / … / EXPORT CAPSULE
+│   │   └── json.rs     the model-friendly JSON dialect
+│   ├── error.rs        Core Error Registry, categories, retry classes
+│   ├── request.rs      request/response envelope
+│   ├── types.rs        Core data model
+│   ├── capsule.rs      Cognitive Capsules
+│   ├── executor.rs     the engine seam
+│   └── bin/kip_cli.rs  syntax checker
+├── SPECIFICATION.md    the normative KIP 2.0 specification
+├── KIPSyntax.md        LLM-facing syntax reference
+├── SelfInstructions.md how an Agent should use its memory
+└── SystemInstructions.md what a runtime owes its callers
 ```
-
-Bundled assets:
-
-- `capsules/*.kip` — KIP source for the Genesis capsules and standard types.
-- `FunctionDefinition.json`, `FunctionDefinitionReadonly.json` — JSON schema
-  for the OpenAI / generic function-calling envelope.
-- `SystemInstructions.md`, `SelfInstructions.md` — prompt scaffolding for
-  agents calling KIP.
-- `SPECIFICATION.md`, `KIPSyntax.md` — the normative spec and a condensed
-  syntax cheat sheet.
 
 ---
 
-## 3. The KIP language at a glance
+## 3. The language at a glance
 
-This section is a **fast tour** for readers who already write SQL / Cypher /
-SPARQL. The full grammar is in
-[`KIPSyntax.md`](../rs/anda_kip/KIPSyntax.md); the normative semantics live in
-[`SPECIFICATION.md`](../rs/anda_kip/SPECIFICATION.md).
+### 3.1 KQL — reads
 
-### 3.1 KQL — Knowledge Query Language
-
-```kip
-FIND( ?drug.name, COUNT(?symptom) )
+```prolog
+FIND(?drug.name, COUNT(DISTINCT ?trial))
 WHERE {
-    ?drug   {type: "Drug"}
-    ?symptom {type: "Symptom"}
-    (?drug, "treats", ?symptom)
-    FILTER( ?drug.attributes.risk_level < 3 )
+    ?drug CONCEPT {type: "Drug"}
+    (?drug, "studied_in", ?trial)
+    OPTIONAL { ?edge STRUCTURAL (?drug, "has_step", ?step) }
+    FILTER(?drug.attributes.risk_level < 3)
 }
-ORDER BY COUNT(?symptom) DESC
-LIMIT 20
-CURSOR "<opaque-token>"
+AS OF SEQ 4200            // which cognitive history
+FOR TIME :world_time      // which world-valid time — an independent axis
+WITH EPISTEMIC { explain: "summary" }
+ORDER BY COUNT(?trial) DESC
+LIMIT 10
+CURSOR :page
 ```
 
-| Construct                             | Notes                                                                                                                         |
-| :------------------------------------ | :---------------------------------------------------------------------------------------------------------------------------- |
-| `FIND( … )`                           | Projection list. Variables, dot-paths (`?x.attributes.k`), and aggregates (`COUNT`/`COUNT_DISTINCT`/`SUM`/`AVG`/`MIN`/`MAX`). |
-| Concept matcher `?v {type, name, id}` | Either `{id: "C:…"}`, `{type, name}`, `{type}`, or `{name}`.                                                                  |
-| Proposition matcher `(?s, "p", ?o)`   | Either `(id: "P:…")` or `(subject, predicate, object)`. Subject and object may themselves be matchers — *higher-order* facts. |
-| Predicate term                        | Literal `"treats"`, **variable** `?p` (binds the predicate name — associative recall), alternative `"treats" \| "cures"`, or **multi-hop** `"follows"{1,3}` (path operator). |
-| `OPTIONAL { … }`                      | Left-join semantics; missing variables project as `null`.                                                                     |
-| `NOT { … }`                           | Negation-as-failure; internal variable bindings stay private.                                                                 |
-| `UNION { … } UNION { … }`             | Row-wise union; branches have **independent** scopes; missing columns are filled with `null`.                                 |
-| `FILTER( expr )`                      | Comparisons, arithmetic, `&&`/`\|\|`/`!`, `CONTAINS`, `STARTS_WITH`, `ENDS_WITH`, `REGEX`, `IN`, `IS_NULL`, `IS_NOT_NULL`.    |
-| Pagination                            | `LIMIT n` (cap row count) and `CURSOR "<token>"` (resumable).                                                                 |
-| `ORDER BY`                            | One or more sort keys (dot-paths or aggregation expressions), each `ASC`/`DESC` — multi-key since RC9.                        |
-| Aggregation                           | When `FIND` mixes plain variables with aggregates, the plain variables form an **implicit `GROUP BY`** key.                   |
-| Result shape                          | **Columnar** (RC11 §6.2.2): one array per `FIND` expression; a single-expression `FIND` unwraps to the bare column. Duplicate solutions collapse (set semantics, RC11 §3.3). |
-| Path operator zero-hop                | `"p"{0,n}` includes the reflexive case `?s == ?o`.                                                                            |
+Pattern families: `CONCEPT`, `PROPOSITION`, `ASSERTION`, `EVIDENCE`,
+`ACTIVITY`, `STRUCTURAL`, `BELIEF`, `BELIEF SLOT`, plus `FILTER`, `NOT`,
+`OPTIONAL`, `UNION`.
 
-### 3.2 KML — Knowledge Manipulation Language
+Raw reads and belief are different questions:
 
-```kip
-UPSERT {
-    CONCEPT ?aspirin {
-        {type: "Drug", name: "Aspirin"}              // match-or-create
-        SET ATTRIBUTES { risk_level: 1, formula: "C9H8O4" }
-        SET PROPOSITIONS {
-            ("treats",        {type: "Symptom", name: "Headache"})
-            ("belongs_to",    ?nsaid_class) WITH METADATA { source: "PubMed:1" }
-        }
+```prolog
+// every claim ever made, truth-neutral
+?p (:alice, "timezone", ?tz)
+
+// what is believed now, and how contested it is
+?b BELIEF (:alice, "timezone", ?tz)
+?slot BELIEF SLOT (:alice, "timezone")
+```
+
+`BELIEF` never walks a raw path: alternation and hop quantifiers are traversal
+syntax, and belief does not propagate along a traversal.
+
+### 3.2 KML — mutations
+
+```prolog
+MUTATE {
+    CREATE CONCEPT ?alice { TYPE "Person" CLIENT KEY "person:alice" NAME "Alice" }
+    CREATE EVIDENCE ?msg  { SET FIELDS { evidence_class: "user_statement" } }
+    ASSERT ?claim (?alice, "prefers", :dark_mode) {
+        by: ?alice, mode: "stated", confidence: 0.9, evidence: ?msg
     }
-    CONCEPT ?nsaid_class {
-        {type: "DrugClass", name: "NSAID"}
-    }
-    PROPOSITION ?claim {
-        ({type: "Person", name: "$self"}, "stated",
-         ({type: "Drug", name: "Aspirin"}, "treats", {type: "Symptom", name: "Headache"}))
-    }
-} WITH METADATA { source: "agent_v1", confidence: 0.95 }
-```
-
-Key rules:
-
-1. **Sequential, top-to-bottom**; handles must be defined before use; the
-   dependency graph must be a DAG.
-2. **`SET ATTRIBUTES`** does shallow merge; **`SET PROPOSITIONS`** is
-   *additive* (it never deletes unspecified links).
-3. `WITH METADATA` precedence: per-link override > inner block override >
-   outer `UPSERT { … } WITH METADATA { … }` default.
-4. `DELETE CONCEPT ?x DETACH WHERE { … }` removes the concept **and
-   transitively** every proposition that references it (directly or via
-   higher-order chains).
-5. Modifying or deleting the *protected scope* (`$ConceptType`,
-   `$PropositionType`, `$self`, `$system`, core domains like `CoreSchema`)
-   returns `KIP_3004 ImmutableTarget`.
-
-Beyond `UPSERT`/`DELETE`, RC9 added two more KML statements and a write guard
-(spec §4.3, §4.4, §2.11):
-
-- `UPDATE ?t SET ATTRIBUTES { … } SET METADATA { … } WHERE { … } [LIMIT n]` —
-  pattern-matched bulk mutation that never creates; values may be update
-  expressions built from `ADD` / `MUL` / `CLAMP` / `COALESCE`.
-- `MERGE CONCEPT ?src INTO ?dst WHERE { … }` — atomic entity consolidation:
-  links are repointed and deduplicated, missing attributes filled (target
-  wins, `aliases` unioned), and `_merged_from` provenance recorded.
-- `EXPECT VERSION <n>` after a block's identity clause — optimistic
-  concurrency against the engine-maintained `metadata._version`; a mismatch
-  aborts the whole statement with `KIP_3005 VersionConflict`.
-- Metadata keys starting with `_` (`_version`, `_updated_at`, …) are an
-  engine-maintained reserved namespace: readable in KQL, rejected in KML
-  writes with `KIP_2002`.
-
-### 3.3 META — schema introspection
-
-```kip
-DESCRIBE PRIMER                        -- agent self-summary + domain map
-DESCRIBE DOMAINS                       -- list of Domain concepts
-DESCRIBE CONCEPT TYPES                 -- all concept type names
-DESCRIBE CONCEPT TYPE "Drug"           -- single type definition
-DESCRIBE PROPOSITION TYPES
-DESCRIBE PROPOSITION TYPE "treats"
-SEARCH CONCEPT "antiinflammatory" WITH TYPE "Drug" MODE "hybrid" THRESHOLD 0.4 LIMIT 10
-SEARCH PROPOSITION "treats" LIMIT 5
-EXPORT ?t WHERE { ?t {type: "Drug"} } LIMIT 100    -- idempotent UPSERT capsule (+ CURSOR)
-```
-
-`SEARCH` supports retrieval modes (`MODE "keyword" | "semantic" | "hybrid"`)
-and a `THRESHOLD` on the transient, normalized `metadata._score`; engines
-without semantic capability degrade `semantic`/`hybrid` to `keyword`
-(spec §5.2). `EXPORT` serializes a matched subgraph into an idempotent
-`UPSERT` capsule, paginated via `CURSOR` (spec §5.3).
-
----
-
-## 4. AST (`anda_kip::ast`)
-
-The AST is the lossless internal representation produced by the parser.
-Every node implements `Clone + Debug + Serialize + Deserialize + PartialEq`.
-
-### 4.1 Top-level
-
-| Type           | Variants / fields                                                                                     |
-| :------------- | :----------------------------------------------------------------------------------------------------- |
-| `Command`      | `Kql(KqlQuery)`, `Kml(KmlStatement)`, `Meta(MetaCommand)`                                             |
-| `CommandType`  | `Kql`, `Kml`, `Meta`, `Unknown` (used by `Request::execute`)                                          |
-| `KqlQuery`     | `find_clause`, `where_clauses`, `order_by: Option<Vec<OrderByCondition>>` (multi-key), `limit`, `cursor` |
-| `KmlStatement` | `Upsert(Vec<UpsertBlock>)` \| `Update(UpdateStatement)` \| `Merge(MergeStatement)` \| `Delete(DeleteStatement)` |
-| `MetaCommand`  | `Describe(DescribeTarget)` \| `Search(SearchCommand)` \| `Export(ExportCommand)`                      |
-
-### 4.2 KQL nodes
-
-- `FindClause` — list of `FindExpression`s.
-- `FindExpression::Variable(DotPathVar)` and `FindExpression::Aggregation { func, var, distinct }`.
-- `AggregationFunction` — `Count | Sum | Avg | Min | Max`.
-- `WhereClause` —
-  - `Concept(ConceptClause)` `?x {…}`
-  - `Proposition(PropositionClause)` `?l (s, p, o)` or `(id: "…")`
-  - `Filter(FilterClause)`
-  - `Optional(Vec<WhereClause>)`
-  - `Not(Vec<WhereClause>)`
-  - `Union(Vec<WhereClause>)` (one entry per `UNION { … }` block)
-- `ConceptMatcher` — `ID(String)`, `Type(String)`, `Name(String)`,
-  `Object { type, name }`.
-- `PropositionMatcher` — `ID(String)` or `Object { subject, predicate, object }`.
-- `TargetTerm` — `Variable(String)`, `Concept(ConceptMatcher)`,
-  `Proposition(Box<PropositionMatcher>)`.
-- `PredTerm` —
-  - `Literal(String)`,
-  - `Variable(String)` (predicate variable — binds the predicate name, RC11 §3.4.2),
-  - `Alternative(Vec<String>)` (`pred1 | pred2`),
-  - `MultiHop { predicate, min: u16, max: Option<u16> }` (`None` = unbounded,
-    engine-capped). Zero-hop is encoded as `min == 0` and is bound by the
-    executor (RC11 §3.4.2).
-- `FilterExpression`, `FilterOperand`, `ComparisonOperator`, `LogicalOperator`,
-  `FilterFunction` (`Contains | StartsWith | EndsWith | Regex | In | IsNull | IsNotNull`).
-- `OrderByCondition { variable, direction, aggregation }` (one per sort key),
-  `OrderDirection`.
-
-### 4.3 KML nodes
-
-- `UpsertBlock { items: Vec<UpsertItem>, metadata: Option<Map> }`.
-- `UpsertItem::Concept(ConceptBlock)` / `::Proposition(PropositionBlock)`.
-- `ConceptBlock { handle, concept, expect_version, set_attributes, set_propositions, metadata }`.
-- `PropositionBlock { handle, proposition, expect_version, set_attributes, metadata }`.
-  `expect_version` is the optional `EXPECT VERSION <n>` guard (RC11 §2.11.2);
-  on mismatch the whole statement aborts with `KIP_3005`.
-- `UpdateStatement { target, set_attributes, set_metadata, where_clauses, limit }` —
-  values are plain JSON or `UpdateExpr`s built from
-  `UpdateFunction::{Add, Mul, Clamp, Coalesce}` (RC11 §4.3).
-- `MergeStatement { source, target, where_clauses }` (RC11 §4.4).
-- `DeleteStatement` —
-  - `DeleteAttributes { attributes, target, where_clauses }`,
-  - `DeleteMetadata { keys, target, where_clauses }`,
-  - `DeletePropositions { target, where_clauses }`,
-  - `DeleteConcept { target, where_clauses }` (RC11 mandates `DETACH`).
-
-### 4.4 META nodes
-
-- `DescribeTarget::Primer | Domains | ConceptTypes { limit, cursor }
-  | ConceptType(String) | PropositionTypes { limit, cursor } | PropositionType(String)`.
-- `SearchCommand { target: SearchTarget, term, in_type, mode, threshold, limit }`
-  where `SearchTarget = Concept | Proposition` and
-  `SearchMode = Keyword | Semantic | Hybrid` (RC11 §5.2).
-- `ExportCommand { target, where_clauses, limit, cursor }` — serializes the
-  matched subgraph as an idempotent `UPSERT` capsule, resumable via `CURSOR`
-  (RC11 §5.3).
-
-### 4.5 Value / `Json` aliases
-
-- `pub type Json = serde_json::Value;` — used for free-form attribute /
-  metadata payloads.
-- `pub use serde_json::{Map, Number};`.
-- `Value` — restricted primitive type used in identifiers, parameters, and
-  filter literals (`Null | Bool | Number | String`). Implements `From<&str>`,
-  `From<bool>`, `From<Number>`, `TryFrom<Json>`, plus `into_opt_string` /
-  `into_opt_number` / `into_opt_bool` / `is_null` accessors.
-
----
-
-## 5. Parser (`anda_kip::parser`)
-
-The parser is a single hand-written `nom` pipeline. There is no separate
-lexer: tokens are matched directly inside combinators, which keeps error
-messages source-anchored.
-
-### 5.1 Public entry points
-
-| Function                                        | Returns                               | Notes                                         |
-| :---------------------------------------------- | :------------------------------------ | :-------------------------------------------- |
-| `parse_kip(&str) -> Result<Command, KipError>`  | `Command` (auto-detects KQL/KML/META) | Used by `execute_kip` / `Request::execute`.   |
-| `parse_kql(&str) -> Result<KqlQuery, KipError>` | strict KQL                            | Useful when the input is known to be a query. |
-| `parse_kml(&str) -> Result<KmlStatement, _>`    | strict KML                            | Used internally to load Genesis capsules.     |
-| `parse_meta(&str) -> Result<MetaCommand, _>`    | strict META                           |                                               |
-| `parse_json(&str) -> Result<Json, _>`           | a single JSON value                   | Useful for parameter payloads.                |
-| `quote_str(&str) -> String`                     | JSON-escaped quoted form              | Re-uses `serde_json` escaping rules.          |
-| `unquote_str(&str) -> Option<String>`           | inverse of `quote_str`                | Returns `None` if not a valid JSON string.    |
-
-All entry points enforce `all_consuming(ws(...))` — trailing garbage is
-rejected as `KIP_1001 InvalidSyntax`.
-
-### 5.2 Whitespace and keywords
-
-The parser treats *any* Unicode whitespace as a separator between tokens.
-The two combinators worth knowing about (in `parser::common`) are:
-
-- `keyword(&'static str)` — match a single keyword followed by **at least
-  one** whitespace char; rejects `tag("WORD ")` style ambiguity around
-  newlines and tabs.
-- `keywords(&'static [&'static str])` — match a sequence of keywords with
-  required whitespace **between** tokens but not after the last one. Wrap
-  with `ws(...)` if trailing whitespace is also expected.
-
-This is what makes commands like the following parse identically:
-
-```kip
-ORDER          BY ?x ASC
-ORDER
-  BY ?x ASC
-ORDER\tBY ?x ASC
-```
-
-### 5.3 Error reporting
-
-`parse_kip` emits `KipError { code: KIP_1001 (or 1002), message }`. The
-message is produced by `format_nom_error`, which:
-
-- preserves the offending source slice,
-- includes the `nom_language::VerboseError` context stack (top-most context
-  first),
-- highlights identifier-rule violations as `KIP_1002 InvalidIdentifier` so
-  the LLM can self-correct without ambiguity.
-
----
-
-## 6. Executor framework (`anda_kip::executor`)
-
-### 6.1 The `Executor` trait
-
-```rust
-#[async_trait::async_trait]
-pub trait Executor: Send + Sync {
-    async fn execute(&self, command: Command, dry_run: bool) -> Response;
-}
-```
-
-That's it. The trait is intentionally minimal — the rich plumbing is in
-`Request` / `Response`. `Executor` is implemented out of the box for
-`Box<dyn Executor>`, `Arc<dyn Executor>`, and `&dyn Executor`, so any owned
-or shared executor is usable wherever `impl Executor` is required.
-
-### 6.2 Convenience helpers
-
-```rust
-pub async fn execute_kip(
-    executor: &impl Executor,
-    command: &str,
-    dry_run: bool,
-) -> (CommandType, Response);
-
-pub async fn execute_readonly(
-    executor: &impl Executor,
-    command: &str,
-    dry_run: bool,
-) -> (CommandType, Response);
-```
-
-- Both parse the command first; a parse error short-circuits with
-  `CommandType::Unknown` and a `Response::Err`.
-- `execute_readonly` rejects `Command::Kml` with `KIP_1001 InvalidSyntax`
-  ("Only KQL and META commands are allowed in read-only mode"). It is the
-  recommended path for untrusted callers, evaluator pipelines, or sandboxed
-  tool calls.
-
-### 6.3 Implementing a backend
-
-```rust
-use anda_kip::{Command, Executor, Json, Response};
-use async_trait::async_trait;
-
-struct Mem;
-
-#[async_trait]
-impl Executor for Mem {
-    async fn execute(&self, cmd: Command, _dry_run: bool) -> Response {
-        match cmd {
-            Command::Kql(_)  => Response::ok(Json::Array(vec![])),
-            Command::Kml(_)  => Response::ok(Json::Object(Default::default())),
-            Command::Meta(_) => Response::ok(Json::Null),
-        }
+    UPSERT CONCEPT ?drug {
+        MATCH {key: "drug:aspirin"}
+        EXPECT VERSION 3
+        SET ATTRIBUTES { risk_level: 2 }
     }
 }
 ```
 
-For a production-quality implementation, see
-[`anda_cognitive_nexus`](../rs/anda_cognitive_nexus/) which:
+Families: `CREATE CONCEPT` / `EVIDENCE` / `ASSERTION` / `ACTIVITY`,
+`UPSERT CONCEPT`, `ENSURE PROPOSITION`, `ASSERT`, `UPDATE`, `RETRACT ASSERTION`,
+`SUPERSEDE ASSERTION`, `CORRECT EVIDENCE`, `TRANSITION ACTIVITY`,
+`SET RETENTION`, `ARCHIVE`, `TOMBSTONE`, `PURGE`, `MERGE CONCEPT`.
 
-- runs KQL with index-backed lookups, BFS multi-hop traversal,
-  short-circuiting `FILTER` evaluation, regex caching, and BTree-backed
-  `CURSOR` pagination;
-- runs KML under a single `RwLock` write guard (KQL/META take the read
-  guard) and enforces RC11 protected-scope and transitive-cascade rules;
-- runs META through BM25 (CJK-aware via `jieba_tokenizer`) and BTree-backed
-  type listings.
+A statement written on its own is still a one-clause transaction;
+`explicit_transaction` only records which spelling the source used.
+
+### 3.3 META — grounding and introspection
+
+```prolog
+DESCRIBE PRIMER MODE "compact"
+DESCRIBE TYPE "Person"
+LIST SCHEMA PACKAGES STATUS "active" LIMIT 20
+SEARCH COGNITION "dark mode" MODE "hybrid" THRESHOLD 0.7 LIMIT 5
+HISTORY ELEMENT "C-1" FROM SEQ 1 TO SEQ 99
+VERIFY CAPSULE :artifact
+VALIDATE KML :command
+PREVIEW IMPORT CAPSULE :capsule INTO "space-1"
+EXPORT CAPSULE :out WHERE { ?c CONCEPT {type: "Experience"} } AS OF SEQ 7
+```
+
+META is semantically read-only. `VERIFY`, `VALIDATE`, `PREVIEW` and commit are
+four different things and must not be collapsed.
 
 ---
 
-## 7. Request / Response (`anda_kip::request`)
+## 4. The executable AST
 
-This is the JSON envelope LLMs see when KIP is exposed via function-calling.
+`anda_kip::ast` is the *executable* tree, not a syntax tree. Every open-ended
+grammar position is already closed:
 
-### 7.1 `Request`
+- a predicate is `PredTerm::Atom` or `PredTerm::Path`, never a nested
+  alternation/quantifier tree;
+- a filter is a comparison, a logical node, a negation, or a call to one of the
+  registered `FilterFunction`s;
+- a variable is a name plus a path of `PathStep`s;
+- `ASSERT` is gone — the parser desugared it.
 
-```rust
-pub struct Request {
-    pub command:    String,                 // single-command mode
-    pub commands:   Vec<CommandItem>,       // batch mode (mutually exclusive)
-    pub parameters: Map<String, Json>,      // shared :param substitution
-    pub dry_run:    bool,
-    pub readonly:   bool,
-}
+A consumer matching on these enums is total.
 
-pub enum CommandItem {
-    Simple(String),
-    WithParams { command: String, parameters: Map<String, Json> },
-}
-```
+### 4.1 Wire compatibility
 
-Behavior summary:
-
-- Exactly one of `command` / `commands` must be set; both populated returns
-  `KIP_1001`.
-- `parameters` keys are referenced as `:name` in command text. They MUST sit
-  at a JSON value position (`name: :n`, `LIMIT :k`); embedding placeholders
-  inside string literals is rejected with a syntax-friendly hint.
-- `iter_commands()` yields `(Cow<'_, str>, Cow<'_, Map<String, Json>>)` for
-  every item in the request, merging shared parameters with per-item ones
-  (per-item wins).
-- `to_command()` returns a fully substituted command for single-command
-  requests (no allocation when `parameters` is empty).
-- `readonly()` is a builder helper that toggles read-only execution.
-
-### 7.2 `Request::execute`
+The encoding is serde's default externally-tagged representation, matching
+`exec-ast.ts` in `@ldclabs/kip-lang` field for field:
 
 ```rust
-pub async fn execute(&self, nexus: &impl Executor) -> (CommandType, Response);
+use anda_kip::{KipValue, Scalar, SymbolRef};
+
+assert_eq!(serde_json::to_string(&KipValue::Null)?, r#""Null""#);
+assert_eq!(serde_json::to_string(&Scalar::Param("limit".into()))?, r#"{"Param":"limit"}"#);
+assert_eq!(serde_json::to_string(&SymbolRef::Name("has_step".into()))?, r#"{"Name":"has_step"}"#);
+# Ok::<(), serde_json::Error>(())
 ```
 
-Single-command path:
+That is what lets the Rust engine and the TypeScript toolkit be differentially
+tested against the same conformance fixtures.
 
-1. Substitute `:placeholders`, validate them.
-2. Dispatch through `execute_kip` or `execute_readonly`.
-3. On `KIP_1xxx`, scan the original command for misplaced placeholders inside
-   strings and append a remediation hint.
+### 4.2 Value slots
 
-Batch path (`commands` non-empty):
+| Type | Grammar position | Notes |
+| --- | --- | --- |
+| `KipValue` | a literal | `Null` is a unit variant |
+| `Scalar` | `parameter \| literal` | an unbound `:name` survives as `Param` |
+| `BoundValue` | `data_value` | collapses to `Value` when nothing needs binding |
+| `MutationValue` | assignment right-hand side | adds `Expr` for `ADD`/`MUL`/`CLAMP`/`COALESCE` |
+| `MatchValue` | `pattern_value` | inside an `ObjectMatcher` |
+| `Term` | tuple endpoint | may itself be a Proposition |
+| `SymbolRef` | `schema_symbol` | quoted name or parameter |
+| `ElementRef` | `target_ref` | `Handle` / `Param` / `Id` |
 
-1. Iterate items in order.
-2. Each item is parsed and executed independently.
-3. **`Response::Ok` and `Response::Err` are appended verbatim to the result
-   array** — so the caller sees a heterogeneous list mirroring `commands`.
-4. **Stop-on-write-error**: the first KML failure stops the batch; the
-   partial array is wrapped in `Response::ok(json!(results))` so the caller
-   knows what *did* execute.
-5. KQL / META / parse errors do **not** stop the batch (RC11 §6.2.3).
-
-### 7.3 `Response`
-
-```rust
-#[serde(untagged)]
-pub enum Response {
-    Ok  { result: Json, next_cursor: Option<String> },
-    Err { error: ErrorObject, result: Option<Json> },
-}
-
-pub struct ErrorObject {
-    pub code:    String,    // e.g. "KIP_2001"
-    pub message: String,
-    pub hint:    Option<String>,
-    pub data:    Option<Json>,
-}
-```
-
-- `Response::ok(Json)` and `Response::err(impl Into<ErrorObject>)` are the
-  ergonomic constructors; `into_result()` collapses to
-  `Result<Json, ErrorObject>`.
-- `next_cursor` is set by KQL responses that support `CURSOR` resumption.
-- `result` may be set on errors when a partial outcome is meaningful (e.g.
-  the prefix of a batch).
-
-`KipError` implements `Into<ErrorObject>`, so executors can simply `?` and
-the SDK does the rest.
-
-### 7.4 End-to-end
-
-```rust
-use anda_kip::Request;
-use serde_json::json;
-
-let req: Request = serde_json::from_value(json!({
-    "command": "FIND(?d.name) WHERE { ?d {type: :ty} } LIMIT :n",
-    "parameters": { "ty": "Drug", "n": 10 },
-    "dry_run": false
-}))?;
-
-let (cmd_type, resp) = req.execute(&nexus).await;
-# Ok::<_, anda_kip::KipError>(())
-```
+One asymmetry worth knowing: in a **value** position a bare `?x` is a
+`Handle` — it names an element the plan created. `?x.field` is a *read* of that
+element's own field and keeps its path. In a **match** position `?x` is a
+binding.
 
 ---
 
-## 8. Errors (`anda_kip::error`)
+## 5. Parser
 
-KIP standardizes error codes so LLM agents can self-correct.
-
-| Code       | Name                  | Trigger                                                                  | Hint excerpt                                                           |
-| :--------- | :-------------------- | :----------------------------------------------------------------------- | :--------------------------------------------------------------------- |
-| `KIP_1001` | `InvalidSyntax`       | Parse failure                                                            | "Check parenthesis matching, keyword spelling…"                        |
-| `KIP_1002` | `InvalidIdentifier`   | Identifier breaks `[a-zA-Z_][a-zA-Z0-9_]*`                               | "Identifiers must match regex …"                                       |
-| `KIP_2001` | `TypeMismatch`        | Concept/Proposition type not defined in schema                           | "Execute `DESCRIBE` to confirm type names…"                            |
-| `KIP_2002` | `ConstraintViolation` | Constraint violation (e.g. subject == object, missing required field)    | "Supply the missing required attributes."                              |
-| `KIP_2003` | `InvalidValueType`    | JSON value type mismatches schema                                        | "Correct the JSON value type."                                         |
-| `KIP_3001` | `ReferenceError`      | Reference to undefined variable / handle                                 | "Ensure the variable is bound in `WHERE` / `CONCEPT` block placement…" |
-| `KIP_3002` | `NotFound`            | Target not in graph                                                      | "Try `SEARCH`/`FIND` first."                                           |
-| `KIP_3003` | `DuplicateExists`     | Uniqueness violation                                                     | "Use `UPSERT` instead of create-only."                                 |
-| `KIP_3004` | `ImmutableTarget`     | Modifying meta-types, system actors (`$self`/`$system`), or core domains | "**Operation Prohibited.** Do not modify system definitions."          |
-| `KIP_3005` | `VersionConflict`     | `EXPECT VERSION` mismatch on a conditional write                         | "Re-read the element (fresh `_version`), re-apply, and retry."         |
-| `KIP_4001` | `ExecutionTimeout`    | Query time budget exceeded                                               | "Reduce `UNION`, lower `LIMIT`, simplify regex/multi-hop."             |
-| `KIP_4002` | `ResourceExhausted`   | Result set / memory budget exceeded                                      | "Use `LIMIT` and `CURSOR` for pagination."                             |
-| `KIP_4003` | `InternalError`       | Unknown backend error                                                    | "Contact administrator or retry."                                      |
-
-Constructor helpers — one per code — live on `KipError`:
+### 5.1 Entry points
 
 ```rust
-KipError::invalid_syntax("…");
-KipError::type_mismatch("…");
-KipError::reference_error("…");
-KipError::immutable_target("…");
-// …etc.
+use anda_kip::{parse_kip, parse_kql, parse_kml, parse_meta, parse_json};
+
+let command = parse_kip(r#"DESCRIBE PRIMER"#)?;          // any surface
+let query   = parse_kql(r#"FIND(?x) WHERE { ?x {a: 1} }"#)?;
+let mutation = parse_kml(r#"ARCHIVE :old"#)?;
+let meta    = parse_meta(r#"SNAPSHOT"#)?;
+let value   = parse_json(r#"{ a: 1, /* not JSON5 */ }"#).is_err();
+# Ok::<(), anda_kip::KipError>(())
 ```
 
-`KipError` round-trips through `ErrorObject` (`From<KipError>` is provided),
-so an `Executor` typically writes `?`-flavored Rust:
+Every entry point is all-consuming: one input is one command. Two commands in
+one string is an error, not a silent "run the first one".
+
+### 5.2 Lexical rules
+
+- **Keywords are ASCII case-insensitive** (`find` == `FIND`), canonically
+  uppercase.
+- **Keywords are contextual, not reserved.** `by`, `mode`, `key`, `name`,
+  `type` and `status` are all field names in the Spec's own examples, and
+  `?a.lifecycle.status` is a legal dot path.
+- **`true` / `false` / `null` are case-sensitive** — they are JSON literals, not
+  protocol keywords. So is `id` in `(id: "P-1")`.
+- Line comments start with `//` and count as a token separator.
+- Whitespace is insignificant between tokens.
+
+### 5.3 Input budget
 
 ```rust
-let id = self.query_id(&pk).await
-    .ok_or_else(|| KipError::not_found(format!("{pk:?} missing")))?;
+use anda_kip::{MAX_KIP_INPUT_LEN, MAX_KIP_NESTING_DEPTH, MAX_KIP_BATCH_COMMANDS};
 ```
 
-`format_nom_error` adapts a `nom_language::VerboseError` to `KipError`,
-preserving the context stack and the offending source slice.
+Length and bracket depth are checked by a pre-scan before any parsing work, so a
+hostile input cannot exhaust the stack. The pre-scan skips string literals and
+line comments exactly as the parser does — otherwise a `"` inside a comment
+would latch string mode and every bracket after it would go uncounted.
 
----
+### 5.4 Error reporting
 
-## 9. Genesis capsules (`anda_kip::capsule`)
+Parse failures carry a line, a column and what was expected:
 
-The capsule module exposes the canonical bootstrap KIP source as `&'static
-str` constants plus the reserved-name sigils used by RC11's protected-scope
-guard.
-
-| Constant                                                                          | Purpose                                                               |
-| :-------------------------------------------------------------------------------- | :-------------------------------------------------------------------- |
-| `META_CONCEPT_TYPE`                                                               | `"$ConceptType"` — root of the concept-type meta hierarchy            |
-| `META_PROPOSITION_TYPE`                                                           | `"$PropositionType"` — root of the predicate hierarchy                |
-| `META_SELF_NAME`                                                                  | `"$self"` — the agent's waking persona name                           |
-| `META_SYSTEM_NAME`                                                                | `"$system"` — the agent's sleeping/maintenance persona                |
-| `DOMAIN_TYPE`                                                                     | `"Domain"`                                                            |
-| `EVENT_TYPE`, `INSIGHT_TYPE`, `PERSON_TYPE`, `PREFERENCE_TYPE`, `COMMITMENT_TYPE`, `SLEEP_TASK_TYPE` | standard concept types defined in the bundled capsules                |
-| `EXPERIENCE_TYPE`, `EXPERIENCE_STEP_TYPE`, `SKILL_TYPE`                           | the Experience-learning concept types added by RC11's cognitive memory profile |
-| `BELONGS_TO_DOMAIN_TYPE`                                                          | `"belongs_to_domain"` — predicate used by all CoreSchema entries      |
-| `INVOLVES_TYPE`, `MENTIONS_TYPE`, `CONSOLIDATED_TO_TYPE`, `DERIVED_FROM_TYPE`     | the shared episodic/provenance predicates, spanning `Event` and `Experience` |
-| `HAS_STEP_TYPE`, `CAUSED_BY_TYPE`, `DERIVED_INSIGHT_TYPE`, `COMPILED_TO_TYPE`     | the Experience-specific predicates (trajectory, causality, consolidation) |
-| `GENESIS_KIP`                                                                     | bootstraps `$ConceptType`, `$PropositionType`, `Domain`, and the core domains (`CoreSchema`, `Unsorted`, `Archived`, `System` — the latter added in RC10) |
-| `EVENT_KIP`, `INSIGHT_KIP`, `PERSON_KIP`, `PREFERENCE_KIP`, `COMMITMENT_KIP`, `SLEEP_TASK_KIP` | standard concept-type definitions                                     |
-| `EXPERIENCE_KIP`, `EXPERIENCE_STEP_KIP`, `SKILL_KIP`                              | the RC11 Experience-learning concept-type definitions                 |
-| `INVOLVES_PROP_KIP`, `MENTIONS_PROP_KIP`, `CONSOLIDATED_TO_PROP_KIP`, `DERIVED_FROM_PROP_KIP` | the shared predicate definitions — standalone capsules since RC11 pulled them out of `Event.kip` |
-| `HAS_STEP_PROP_KIP`, `CAUSED_BY_PROP_KIP`, `DERIVED_INSIGHT_PROP_KIP`, `COMPILED_TO_PROP_KIP` | the Experience-specific predicate definitions                         |
-| `PERSON_SELF_KIP`, `PERSON_SYSTEM_KIP`                                            | the `$self` and `$system` actor instances                             |
-
-A typical bootstrap loop is therefore:
-
-```rust
-nexus.execute_kml(parse_kml(GENESIS_KIP)?, false).await?;
-nexus.execute_kml(parse_kml(PERSON_KIP)?, false).await?;
-nexus.execute_kml(parse_kml(EVENT_KIP)?,  false).await?;
-// …concept types first, then the predicate capsules that reference them
-nexus.execute_kml(parse_kml(INVOLVES_PROP_KIP)?, false).await?;
-// …etc
-```
-
-The predicate capsules are ordered last on purpose: their `subject_types` /
-`object_types` name the concept types, so loading them first would declare
-predicates against types that do not exist yet.
-
----
-
-## 10. Entity types (`anda_kip::types`)
-
-Concrete data structures returned by an executor when it needs to surface a
-real concept or proposition (for example, by `DESCRIBE CONCEPT TYPE …`).
-
-```rust
-pub enum Entity { ConceptNode(ConceptNode), PropositionLink(PropositionLink) }
-
-pub struct ConceptNode {
-    pub id: String, pub r#type: String, pub name: String,
-    pub attributes: Map<String, Json>,
-    pub metadata:   Map<String, Json>,
-}
-
-pub struct PropositionLink {
-    pub id: String,
-    pub subject: String, pub predicate: String, pub object: String,
-    pub attributes: Map<String, Json>,
-    pub metadata:   Map<String, Json>,
-}
-```
-
-Each owned struct has a borrowed twin (`ConceptNodeRef<'a>`,
-`PropositionLinkRef<'a>`, `EntityRef<'a>`) for zero-copy serialization on
-hot paths. The `Entity` enum uses `#[serde(tag = "_type")]` so JSON output is
-self-describing.
-
-`EntityType { ConceptNode, PropositionLink }` is a tag-only enum used in
-contexts (e.g. cache keys, error builders) where the full payload is not
-needed.
-
-`UpsertResult { blocks, upsert_concept_nodes, upsert_proposition_links }` is
-the canonical `UPSERT` response payload (RC11 §6.2.2) that executors are
-expected to serialize.
-
----
-
-## 11. Function-calling integration
-
-`anda_kip::lib` exposes two `LazyLock<Json>` constants, populated from
-bundled JSON-schema files:
-
-```rust
-pub static KIP_FUNCTION_DEFINITION:          LazyLock<Json>; // execute_kip
-pub static KIP_READONLY_FUNCTION_DEFINITION: LazyLock<Json>; // execute_kip_readonly
-```
-
-Both schemas mirror the `Request` struct (single + batch + parameters +
-`dry_run`). They are designed to drop directly into an OpenAI-compatible
-`tools` array, into an MCP `tool` definition, or into a custom function
-registry.
-
-Two complementary prompt assets ship with the crate:
-
-- `SYSTEM_INSTRUCTIONS` — high-level system prompt that teaches an LLM what
-  KIP is and when to call the tool.
-- `SELF_INSTRUCTIONS` — agent-side instructions for managing memory through
-  KIP idiomatically (when to use `UPSERT` vs `SET ATTRIBUTES`, how to query
-  `DESCRIBE PRIMER`, etc.).
-
-Wire them into your prompt the same way you would a system message:
-
-```rust
-let system = format!(
-    "{}\n\n{}",
-    anda_kip::SYSTEM_INSTRUCTIONS,
-    anda_kip::SELF_INSTRUCTIONS,
-);
+```text
+InvalidSyntax: at line 3, column 12: expected a literal or a :parameter, found "}"
 ```
 
 ---
 
-## 12. Executor implementer's checklist (RC11 semantics)
+## 6. What the parser rejects, and why
 
-When writing a new backend (or porting an old one to RC11), these are the
-points the parser does **not** enforce — they are the executor's contract:
+These are schema-independent rules, so they are enforced here rather than left
+for an engine to discover. Each one exists because the alternative is silent
+corruption of the epistemic record.
 
-**KQL**
+| Rejected | Reason |
+| --- | --- |
+| `UPSERT CONCEPT ?c { MATCH {name: "Alice"} }` | `name` is mutable and duplicable; "the Concept named X" can silently address a different node over time. Match on `id` or `key`. |
+| `UPDATE ?a SET FIELDS {confidence: …}` where `?a` is an Assertion | Epistemic payload is immutable. Record a new Assertion with `SUPERSEDING`. |
+| `UPDATE ?e SET FIELDS {payload: …}` where `?e` is Evidence | Use `CORRECT EVIDENCE :old BY :new`. |
+| `UPDATE ?p SET FIELDS {subject: …}` where `?p` is a Proposition | A different tuple is a different Proposition. |
+| `SET STRUCTURAL` on an Assertion / Evidence / Activity | Record topology is immutable payload; a pending Activity finalizes through `TRANSITION ACTIVITY`. |
+| Any assignment naming `_system`, `governance`, `space_id`, `space_seq` | Engine-owned state; external cognition cannot self-escalate authority. |
+| `ENSURE PROPOSITION (id: "P-1")` | `(id: …)` is match-only — no structure can be created from an id. |
+| `ASSERT` without `by` or without `mode` | Guessing the actor forges attribution; guessing the mode turns hearsay into observation. |
+| `BELIEF` in KML or in `EXPORT CAPSULE` | A Projection is virtual and read-only. |
+| `BELIEF (?s, "a"\|"b", ?o)` | Belief does not propagate along a raw path. |
+| `ADD(?other.n, 1)` in an `UPDATE` on `?c` | An update expression may read only the element being updated; otherwise the result depends on a join the statement never declared. |
+| Two clauses claiming the same `?handle` | Every forward reference to it would be ambiguous. |
+| A `?handle` bound by neither the plan nor the clause's `WHERE` | `ReferenceError` rather than a dangling write. |
+| `PURGE … CONFIRM "purge"` | The confirmation spelling is frozen. |
+| Duplicate keys in any block | A duplicate key is almost always a generation slip; last-write-wins would hide it. |
 
-- [ ] Aggregates: when `FIND` mixes plain variables and aggregates, treat
-      plain variables as the **implicit `GROUP BY`** key and emit one row per
-      group.
-- [ ] `COUNT(?x)` with no joins should be answerable directly from index
-      cardinality without materializing rows.
-- [ ] `OPTIONAL`: missing bindings project as JSON `null`; `IS_NULL(?x)` on
-      such bindings must return `true`.
-- [ ] `NOT`: variables introduced inside `NOT` must not leak outside.
-- [ ] `UNION`: branches have **independent** scopes; rows are concatenated
-      with `null` filling for variables present in only one branch.
-- [ ] Path operator: `"p"{m,n}` traverses `m..=n` hops; `m == 0` includes the
-      reflexive `?s == ?o` row.
-- [ ] `CURSOR` tokens must be opaque, deterministic, and resumable (typical
-      implementation: BTree key prefix).
-- [ ] Results are **columnar** (§6.2.2): one column per `FIND` expression,
-      index-aligned; a single-expression `FIND` unwraps to the bare column.
-      Deduplicate identical solutions before `ORDER BY` / `LIMIT` (§3.3).
-- [ ] Predicate variables `(?s, ?p, ?o)` bind the predicate **name** (a
-      string); reject quantifiers/alternatives on them with `KIP_1001`.
-- [ ] `expires_at` is a **signal**, not an automatic filter. Agents add
-      `FILTER(IS_NULL(?x.metadata.expires_at) || ?x.metadata.expires_at > <now>)`
-      explicitly.
+### 6.1 The `ASSERT` desugaring
 
-**KML**
+`ASSERT` is normative sugar (§55.1), and the parser expands it to exactly what
+it is defined as — nothing more is fabricated:
 
-- [ ] `UPSERT` items execute top-to-bottom; handles must be defined before
-      use; cycles are illegal.
-- [ ] `WITH METADATA` precedence: per-link > inner block > outer default.
-- [ ] `SET ATTRIBUTES`: shallow merge; unspecified keys are preserved.
-- [ ] `SET PROPOSITIONS`: additive only; never deletes unspecified links.
-- [ ] `DELETE CONCEPT … DETACH`:
-  - Reject with `KIP_3004` if any target is in the protected scope
-    (`$ConceptType`, `$PropositionType`, `$self`, `$system`,
-    `Domain:CoreSchema` — the executor SHOULD also extend this to other
-    declared core domains and `core_directives`).
-  - Cascade through **all** propositions referencing the concept, then
-    through propositions referencing those propositions (transitively).
-- [ ] Report cascade counts so agents can audit impact
-      (`{"deleted_concepts": n, "deleted_propositions": m}`, §6.2.2).
-- [ ] `UPDATE`: never creates; mutate every matched element; report
-      `{"updated": n, "matched": m}` (an expression that resolves to
-      `null`/non-numeric skips that key, so `updated` may be `< matched`).
-- [ ] `MERGE`: repoint + deduplicate links, fill missing attributes (target
-      wins, `aliases` unioned), record `_merged_from` (carrying the source's
-      own trail forward); report the four counters from §6.2.2.
-- [ ] `EXPECT VERSION`: compare against `metadata._version`; on mismatch
-      abort the **whole** statement atomically with `KIP_3005`.
-- [ ] Maintain `_version` / `_updated_at`; reject KML writes to `_`-prefixed
-      metadata keys with `KIP_2002`.
+```prolog
+ASSERT ?a (:alice, "prefers", :dark_mode) {
+    by: :alice, mode: "stated", confidence: 0.9, evidence: [:e1, :e2]
+} SUPERSEDING :old
+```
 
-**META**
+becomes three clauses:
 
-- [ ] `DESCRIBE PRIMER` returns the agent identity, learned concept-type
-      counts per domain, and a domain map.
-- [ ] `DESCRIBE … TYPES` paginates via opaque `next_cursor`.
-- [ ] `SEARCH … WITH TYPE …` filters by concept type / predicate; `LIMIT`
-      should default to a small bound (e.g. 10) and cap at a documented
-      maximum.
-- [ ] `SEARCH` modes: degrade `semantic`/`hybrid` to `keyword` when there is
-      no embedding store; attach the transient normalized `metadata._score`
-      and apply `THRESHOLD` to it (§5.2).
-- [ ] `EXPORT`: emit an idempotent `UPSERT` capsule (strip `_` metadata,
-      handle out-of-set endpoints structurally) and paginate with `CURSOR`
-      (§5.3).
+1. `EnsureProposition { handle: "a#proposition", … }`
+2. `CreateAssertion { handle: "a", set_fields: [proposition, asserted_by, mode,
+   stance, confidence], set_structural: [("evidence", e1){role}, ("evidence", e2){role}] }`
+3. `SupersedeAssertion { target: :old, by: Handle("a") }`
 
-**Concurrency**
+Details that matter:
 
-- [ ] KQL / META acquire a *read* guard, KML acquires an exclusive *write*
-      guard. This is what `anda_cognitive_nexus` does and what the spec
-      assumes.
+- `stance` defaults to `"support"` and is **materialized**, not left for the
+  engine to re-derive;
+- `evidence` is a reserved *structural* field, so an array cites one
+  role-qualified edge per artifact;
+- a handle-less `ASSERT` gets a synthetic handle `#assert{N}` keyed on its
+  clause position, so two of them in one `MUTATE` cannot collide (`#` cannot
+  appear in a KIP identifier, so it cannot collide with a user handle either).
 
 ---
 
-## 13. Cookbook
+## 7. Errors
 
-### 13.1 Parse and inspect
-
-```rust
-use anda_kip::{parse_kip, Command, FindExpression, AggregationFunction};
-
-let cmd = parse_kip("FIND(COUNT(?x)) WHERE { ?x {type: \"Drug\"} }")?;
-if let Command::Kql(q) = cmd {
-    matches!(q.find_clause.expressions[0],
-             FindExpression::Aggregation { func: AggregationFunction::Count, .. });
-}
-# Ok::<_, anda_kip::KipError>(())
-```
-
-### 13.2 Single command via `execute_kip`
+KIP 2.0 replaces 1.x's numeric `KIP_xxxx` codes with a registry of stable names.
 
 ```rust
-use anda_kip::{execute_kip, Executor};
-let (ty, resp) = execute_kip(&nexus, "DESCRIBE PRIMER", false).await;
+use anda_kip::{ErrorCategory, KipError, KipErrorCode, RetryClass};
+
+let err = KipError::version_conflict("element changed since you read it");
+assert_eq!(err.name(), "VersionConflict");
+assert_eq!(err.category(), ErrorCategory::Transaction);
+assert_eq!(err.retry_class(), RetryClass::RequiresRefresh);
+assert!(err.effective_hint().contains("EXPECT VERSION"));
 ```
 
-### 13.3 Read-only sandbox
-
-```rust
-let (_ty, resp) = anda_kip::execute_readonly(
-    &nexus,
-    "UPSERT { CONCEPT ?d { {type: \"Drug\", name: \"X\"} } }",
-    false,
-).await;
-// resp is Response::Err with code KIP_1001 — KML rejected.
-```
-
-### 13.4 Batch with shared and per-item parameters
+The wire shape (§86.1):
 
 ```json
 {
-  "commands": [
-    "DESCRIBE PRIMER",
-    "FIND(?t.name) WHERE { ?t {type: \"$ConceptType\"} } LIMIT :limit",
-    {
-      "command": "UPSERT { CONCEPT ?e { {type:\"Event\", name: :name} } }",
-      "parameters": { "name": "TodaysEvent" }
-    }
-  ],
-  "parameters": { "limit": 50 },
-  "dry_run": false
+  "code": "SchemaSymbolAmbiguous",
+  "category": "schema",
+  "message": "…",
+  "hint": "…",
+  "retry": {"class": "requires_different_input"},
+  "details": {}
 }
 ```
 
-The result `Response::Ok { result: Json::Array([...]) }` contains three
-entries: a META response, a KQL response (cap 50), and a KML response in
-order. If the third entry had failed with a KML error, the batch would have
-stopped and returned an array of length 3 ending in `Response::Err`.
+Retry classes are a contract with the caller's recovery logic:
 
-### 13.5 Implementing an executor
+| Class | Meaning |
+| --- | --- |
+| `safe_same_request` | nothing durable happened; resend as-is |
+| `requires_refresh` | re-read current state, then retry |
+| `requires_different_input` | the request must change |
+| `requires_authority` | the caller lacks authority, not information |
+| `requires_new_snapshot` | acquire a fresh coordinate |
+| `requires_reacquire_artifact` | re-stage the bytes |
+| `outcome_lookup_required` | the write's fate is undecided — **do not re-issue** |
+| `non_retryable` | retrying cannot help |
 
-See [§6.3](#63-implementing-a-backend) and the production reference in
-[`rs/anda_cognitive_nexus/src/db.rs`](../rs/anda_cognitive_nexus/src/db.rs).
+`KipErrorCode::ALL` enumerates all 79 registry codes; `KipErrorCode::from_name`
+parses one back. Use `NotFoundOrNotVisible` wherever distinguishing "absent"
+from "forbidden" would leak protected existence.
 
-### 13.6 Building the function-calling tool definition
+---
+
+## 8. Runtime envelope
+
+### 8.1 Request
 
 ```rust
-let tool = serde_json::json!({
-    "type": "function",
-    "function": *anda_kip::KIP_FUNCTION_DEFINITION,
-});
+use anda_kip::{Execution, ExecutionMode, Operation, Request};
+
+let request = Request {
+    request_id: Some("req-1".into()),
+    execution: Some(Execution {
+        idempotency_key: Some("logical-write-key".into()),
+        ..Execution::new(ExecutionMode::Atomic)
+    }),
+    operations: vec![Operation::new(r#"ARCHIVE :old"#).with_op_id("op-1")],
+    ..Default::default()
+};
+request.validate()?;
+# Ok::<(), anda_kip::KipError>(())
 ```
+
+`Request::validate` enforces the envelope invariants that need no engine:
+protocol version, a non-empty and bounded `operations[]`, a declared
+`execution.mode` whenever there is more than one operation, `atomic` never
+paired with `on_error: continue`, unique `op_id`s, exactly one of
+`command`/`ast` per operation, well-formed parameter and ingest binding names.
+
+### 8.2 Execution modes
+
+| Mode | Guarantee |
+| --- | --- |
+| `independent` | separate snapshots and transactions; failures isolated |
+| `sequence` | ordered; each state change commits separately and **earlier commits are not rolled back** |
+| `atomic` | one transaction, one snapshot, read-your-writes, all-or-none |
+
+A batch is not a transaction unless the mode says `atomic`. A `sequence` run
+that fails partway is reported as `partial`, never `failed` — a caller that
+reads it as a total failure will re-issue writes that already landed.
+
+### 8.3 Ingestion
+
+Observed material should reach Evidence from the transport envelope, not
+through model-generated command text:
+
+```json
+{
+  "kip": "2.0",
+  "ingest": {"evidence": [{
+    "key": "msg",
+    "evidence_class": "user_statement",
+    "payload": "I prefer dark mode.",
+    "observed_at": "2026-08-14T01:00:00Z"
+  }]},
+  "operations": [{
+    "language": "KML",
+    "command": "ASSERT (:alice, \"prefers\", :dark_mode) { by: :alice, mode: \"stated\", evidence: :msg }"
+  }]
+}
+```
+
+Each `key` binds as a parameter naming the minted Evidence. Minting is
+transactional: if the transaction aborts, no Evidence is durably created.
+
+### 8.4 Response
+
+```rust
+use anda_kip::{OperationResult, Response, TopLevelStatus};
+
+let response = Response::from_results(vec![OperationResult::ok(serde_json::json!({"n": 1}))]);
+assert_eq!(response.status, TopLevelStatus::Succeeded);
+```
+
+Top-level status is `succeeded` / `failed` / `partial` / `outcome_unknown`;
+operation status is `succeeded` / `failed` / `skipped` / `rolled_back` /
+`no_effect`. A `Receipt` carries `tx_id`, `space_seq`, digests and proofs;
+`ResultContext.search` reports `index_seq` against `current_space_seq` so a
+lagging index is never passed off as snapshot-consistent.
+
+---
+
+## 9. Executor framework
+
+```rust
+use anda_kip::{Command, Executor, Operation, Request, Response};
+use async_trait::async_trait;
+
+struct MyNexus;
+
+#[async_trait]
+impl Executor for MyNexus {
+    async fn execute(
+        &self,
+        command: Command,
+        request: &Request,
+        operation: &Operation,
+    ) -> Response {
+        let dry_run = request.is_dry_run();
+        let _operation_parameters = &operation.parameters;
+        match command {
+            Command::Kql(_query) => todo!("run the read"),
+            Command::Kml(_statement) => todo!("run the transaction"),
+            Command::Meta(_command) => todo!("answer the introspection"),
+        }
+    }
+}
+```
+
+Helpers:
+
+- `execute_kip(executor, text, dry_run)` — parse, classify, execute;
+- `execute_readonly(executor, text, dry_run)` — the same, but rejects
+  state-changing semantics by *what the command is*, never by a declared label;
+- `execute_request(executor, &request)` — runs `independent` and `sequence`.
+  `atomic` is deliberately refused rather than emulated: one transaction, one
+  snapshot and all-or-none commit are engine properties, and a loop over an
+  `Executor` cannot provide them. The executor receives the complete request
+  and operation context, and must honor every applicable envelope field or
+  fail explicitly.
+
+---
+
+## 10. Core data model
+
+`anda_kip::types` models the element envelope and the Core kinds:
+`Concept`, `Proposition`, `Assertion`, `Evidence`, `Activity`, each carrying an
+`ElementEnvelope` with `governance`, `retention`, `facets` and `_system`.
+
+There is **no universal author-writable metadata bag**. Data goes where it
+belongs:
+
+```text
+semantic payload       → typed fields / attributes
+epistemic state        → Assertion
+observations           → Evidence
+provenance             → Activity / _system.origin
+governance             → Governance state
+storage lifecycle      → retention
+mnemonic/profile state → Facets
+engine truth           → _system
+```
+
+Vocabularies: `Stance` (`support`/`reject`/`uncertain`), `AssertionMode`
+(`observed`/`stated`/`inferred`/`predicted`/`hypothetical`/`imported`),
+`AssertionStatus`, `BeliefStatus`
+(`accepted`/`rejected`/`contested`/`uncertain`/`insufficient`), plus the
+recommended `EVIDENCE_CLASSES` and `ACTIVITY_CLASSES` lists.
+
+`BeliefStatus::is_decided()` is `true` only for `accepted` and `rejected`.
+`insufficient` is the open-world unknown and must never be read as "no".
+
+---
+
+## 11. Cognitive Capsules
+
+```text
+Capsule bytes  ≠  destination mutation authority
+```
+
+`anda_kip::capsule` models the artifact frame — manifest, source, schema
+dependencies, records, external refs, blobs, handling, integrity — and the
+import vocabulary. Record payloads stay as JSON because which fields a record
+has is the active Schema Packages' decision, validated by the destination.
+
+`Capsule::validate_frame` is the cheap structural gate: format, a content
+digest, and `base_seq`/`target_seq` on a delta Capsule. It is not
+`VALIDATE CAPSULE`, which needs an engine and a destination Space.
+
+`ImportMode` is `preview` / `isolate` / `merge` / `restore`, and
+`ImportMode::may_map_self()` is true only for `restore`: source `$self` must
+never silently become destination `$self`. `IdentityResolution::ORDER` encodes
+the conservative resolution sequence, ending in "create new".
+`ExternalRefKind` keeps `redacted` (the source withheld it) distinguishable
+from `unavailable` (the source does not have it).
+
+---
+
+## 12. Function-calling integration
+
+```rust
+use anda_kip::{KIP_FUNCTION_DEFINITION, KIP_READONLY_FUNCTION_DEFINITION};
+
+let write_tool = KIP_FUNCTION_DEFINITION.clone();      // execute_kip
+let read_tool  = KIP_READONLY_FUNCTION_DEFINITION.clone(); // execute_kip_readonly
+```
+
+Also bundled, for system prompts:
+
+- `KIP_SYNTAX` — the LLM-facing syntax reference;
+- `SELF_INSTRUCTIONS` — how an Agent should use its own memory;
+- `SYSTEM_INSTRUCTIONS` — what a runtime owes its callers.
+
+---
+
+## 13. Implementer's checklist
+
+Protocol invariants an executor must uphold; `anda_kip` enforces none of them
+for you because each needs state.
+
+**Identity**
+- engine-assigned, opaque, never-reused local `id`s
+- `key` immutable and unique per `(space_id, schema_ref, key)`
+- `client_key` conflicts → `ClientKeyConflict`
+- `MERGE CONCEPT` is non-destructive; raw historical references keep resolving
+
+**Epistemics**
+- Proposition tuples immutable; one canonical Proposition per semantic tuple
+- Assertion payload immutable; revision is a new Assertion + supersession
+- `RETRACT` only by the assertor or an authorized representative
+- never produce `rejected` merely because support is absent
+- N copies of one message are one evidential basis, not N
+
+**Governance**
+- deny overrides; protocol invariants override policy
+- `_system`, `governance`, `space_id`, `space_seq` never author-writable
+- `NotFoundOrNotVisible` where existence itself is protected
+- watch aggregate leakage: a `COUNT` over invisible elements is disclosure
+
+**Transactions**
+- `atomic` means one `tx_id`, one snapshot, one state-changing `space_seq`
+- honour `EXPECT VERSION` / `EXPECT STATE` at commit, not just at plan time
+- idempotency keys scoped by Space and authority; same key + different request
+  → `IdempotencyConflict`
+- when the outcome cannot be established, answer `outcome_unknown`
+
+**Reads**
+- `AS OF` and `FOR TIME` are independent axes
+- historical reads use the historical Schema, or fail with
+  `HistoricalSchemaUnavailable`
+- cursors unforgeable, and invalidated rather than silently re-anchored
+- report SEARCH index lag instead of implying snapshot consistency
+
+**Bounded mutation**
+- `UPDATE`, `RETRACT`, `SET RETENTION`, `ARCHIVE`, `TOMBSTONE` and `PURGE`
+  accept a `LIMIT`; an unbounded selection should be refused, not guessed at
+- no destructive cascade by default
 
 ---
 
 ## 14. `kip_cli`
 
-`anda_kip` ships an interactive REPL implemented in
-[`rs/anda_kip/src/bin/kip_cli.rs`](../rs/anda_kip/src/bin/kip_cli.rs). It
-opens an in-memory or local file-system Cognitive Nexus and lets you type
-KIP commands directly:
-
 ```bash
-cargo run -p anda_kip --bin kip_cli
+cargo run -p anda_kip --bin kip_cli -- path/to/file.kip path/to/dir
 ```
 
-The REPL is convenient for verifying parser behavior, exercising the
-function-calling envelope, and for ad-hoc exploration of bootstrapped
-capsules.
+Walks files and directories, parses every `.kip` file, prints the classified
+language on success and the error plus its recovery hint on failure. Exits
+non-zero if anything failed.
 
 ---
 
-## 15. Compatibility notes
+## 15. Migrating from `anda_kip` 0.11 (KIP 1.x)
 
-- **MSRV**: tracks the workspace toolchain (`edition.workspace = true`).
-- **Async runtime**: tokio is required only for tests; the trait itself is
-  runtime-agnostic.
-- **Serde**: the AST and request/response types serialize to stable JSON; the
-  on-the-wire shape matches the KIP specification exactly. Cross-language
-  bindings (e.g. the Python module under `py/anda_cognitive_nexus_py`) rely
-  on this.
-- **Spec drift**: the parser, AST, and request/response surface are aligned
-  with KIP **v1.0-RC11** (2026-08-13). When the spec advances, breaking
-  parser/AST changes will be released as a minor version bump and the
-  `Compatibility notes` section will track the diff.
-- **Performance posture**: the parser is allocation-light (combinator-based,
-  no regex); the request envelope uses `Cow` to avoid copying when no
-  parameter substitution is required; entity types ship borrowed twins for
-  zero-copy serialization. Heavy lifting (graph traversal, BM25, multi-hop
-  BFS) belongs in the executor, not in this crate.
+This is a breaking rewrite. The 1.x API is gone rather than deprecated, because
+the semantics behind it are gone.
 
----
+| 0.11 (KIP 1.x) | 0.12 (KIP 2.0) |
+| --- | --- |
+| `UPSERT { CONCEPT ?c {…} }` | `CREATE CONCEPT` / `UPSERT CONCEPT` / `ASSERT` |
+| `DELETE` | `ARCHIVE` / `TOMBSTONE` / `PURGE` / `RETRACT` — classify the intent |
+| `metadata.confidence` on a Proposition | `Assertion.confidence`; a Proposition has no confidence |
+| `metadata.author` | `Assertion.asserted_by` (semantic actor) and `_system.origin` (engine truth) — different things |
+| `access_level` | Governance classification and policy |
+| numeric `KIP_3002` | named `KipErrorCode::NotFoundOrNotVisible` with category and retry class |
+| `Response::Ok/Err` enum | `Response` struct with `status` + `results[]` |
+| `ConceptNode` / `PropositionLink` | `Concept` / `Proposition` / `Assertion` / `Evidence` / `Activity` |
+| genesis `.kip` capsules (`GENESIS_KIP`, …) | removed — Schema is immutable Package state, not graph nodes |
+| `capsule.rs` = bootstrap sources | `capsule.rs` = portable Cognitive Capsules |
 
-*Last updated: KIP v1.0-RC11 (2026-08-13), `anda_kip` 0.11.0.*
+Data migration is semantic decomposition, not a field rename: a legacy fact
+Proposition becomes a Proposition **plus** a migrated positive Assertion, and
+ambiguous legacy values (a decayed `confidence`, a bare `author` string) must be
+preserved as explicitly legacy rather than reinterpreted. The normative guidance
+is in `SPECIFICATION.md` §103 and the KIP repository's
+`v2/migration/KIP-2.0-Migration-from-1.x.md`.

@@ -22,12 +22,12 @@ rs/
 ├── anda_db_hnsw/                 # HNSW vector index
 ├── anda_db_utils/                # Shared utilities
 ├── anda_object_store/            # Metadata and encrypted object-store wrappers
-├── anda_kip/                     # Knowledge Interaction Protocol
-├── anda_cognitive_nexus/         # Reference KIP memory graph runtime
+├── anda_kip/                     # Knowledge Interaction Protocol — KIP 2.0
+├── anda_cognitive_nexus/         # Reference KIP memory graph runtime — still KIP 1.x, not yet ported
 ├── anda_db_server/               # HTTP server for core database APIs
-├── anda_cognitive_nexus_server/  # HTTP/JSON-RPC server for Cognitive Nexus
+├── anda_cognitive_nexus_server/  # HTTP/JSON-RPC server for Cognitive Nexus — still KIP 1.x
 ├── anda_db_shard_proxy/          # Shard proxy for multi-tenant deployments
-├── anda_kip_wasm/                # WASM wrapper of the KIP parser, test oracle for ts/kip-do
+├── anda_kip_wasm/                # WASM wrapper of the KIP parser, test oracle for ts/kip-do — still KIP 1.x
 └── cf-tokenizer/                 # Stateless jieba segmentation HTTP service (own nested workspace)
 
 ts/

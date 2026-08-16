@@ -1,2114 +1,235 @@
+//! KQL — the Cognitive Query Language (Spec §42–§50).
+//!
+//! KQL reads raw cognitive state by default. `BELIEF` is the only clause that
+//! interprets it, and it is a read-only Projection: never a mutation target.
+
 use nom::{
     Parser,
     branch::alt,
-    bytes::complete::tag,
-    character::complete::{char, multispace1},
-    combinator::{cut, map, map_res, opt, verify},
-    error::context,
-    multi::{many0, many1, separated_list1},
-    sequence::{delimited, pair, preceded, separated_pair, terminated},
+    character::complete::char,
+    combinator::{cut, map, opt, value},
+    multi::separated_list1,
+    sequence::preceded,
 };
 
-use super::common::*;
-use crate::ast::*;
+use super::common::{
+    Flavor, VResult, bound_object, dot_path_var, fail, identifier, opt_after, parenthesized,
+    scalar, where_block, word, words, ws,
+};
+use crate::ast::{
+    AggregationFunction, AsOf, DotPathVar, FindClause, FindExpression, KqlQuery, OrderByItem,
+    OrderDirection,
+};
 
-// --- Top Level KQL Parser ---
-
+/// Parses a whole `FIND ... WHERE ...` query.
 pub fn parse_kql_query(input: &str) -> VResult<'_, KqlQuery> {
-    context(
-        "KQL query: FIND(...) WHERE { ... } [ORDER BY ...] [LIMIT N] [CURSOR \"...\"]",
-        map(
-            (
-                ws(parse_find_clause),
-                cut(ws(parse_where_block)),
-                opt(ws(parse_order_by_clause)),
-                opt(ws(parse_limit_clause)),
-                opt(ws(parse_cursor_clause)),
-            ),
-            |(find_clause, where_clauses, order_by, limit, cursor)| KqlQuery {
-                find_clause,
-                where_clauses,
-                order_by,
-                limit,
-                cursor,
+    let (input, _) = ws(word("FIND")).parse(input)?;
+    let (input, expressions) = cut(parenthesized(separated_list1(
+        ws(char(',')),
+        ws(find_expression),
+    )))
+    .parse(input)?;
+
+    let (input, _) = cut(ws(word("WHERE"))).parse(input)?;
+    let (input, where_clauses) = cut(|i| where_block(i, Flavor::Kql)).parse(input)?;
+
+    let (input, as_of) = opt(ws(as_of_clause)).parse(input)?;
+    let (input, for_time) = opt_after(&["FOR", "TIME"], ws(scalar)).parse(input)?;
+    let (input, epistemic) = opt_after(&["WITH", "EPISTEMIC"], ws(bound_object)).parse(input)?;
+    let (input, order_by) = opt_after(
+        &["ORDER", "BY"],
+        separated_list1(ws(char(',')), ws(order_item)),
+    )
+    .parse(input)?;
+    let (input, limit) = opt_after(&["LIMIT"], ws(scalar)).parse(input)?;
+    let (input, cursor) = opt_after(&["CURSOR"], ws(scalar)).parse(input)?;
+
+    Ok((
+        input,
+        KqlQuery {
+            find_clause: FindClause { expressions },
+            where_clauses,
+            as_of,
+            for_time,
+            epistemic,
+            order_by,
+            limit,
+            cursor,
+        },
+    ))
+}
+
+/// `AS OF SEQ|TX|TIME ...` — the cognitive history the read runs against.
+///
+/// Shared with META, which uses the same clause on `SNAPSHOT`, `DESCRIBE
+/// SNAPSHOT`, `DESCRIBE SCHEMA ENVIRONMENT` and `EXPORT CAPSULE`.
+pub fn as_of_clause(input: &str) -> VResult<'_, AsOf> {
+    let (input, _) = ws(words(&["AS", "OF"])).parse(input)?;
+    cut(alt((
+        map(preceded(ws(word("SEQ")), cut(ws(scalar))), AsOf::Seq),
+        map(preceded(ws(word("TX")), cut(ws(scalar))), AsOf::Tx),
+        map(preceded(ws(word("TIME")), cut(ws(scalar))), AsOf::Time),
+    )))
+    .parse(input)
+}
+
+/// `projection_expression = aggregate_expression | expression`
+///
+/// Both spellings must resolve to one variable plus a path: a projection names
+/// a column, and an arbitrary expression has no column to name.
+fn find_expression(input: &str) -> VResult<'_, FindExpression> {
+    if let Ok((rest, (func, distinct, var))) = aggregate_call(input) {
+        return Ok((
+            rest,
+            FindExpression::Aggregation {
+                func,
+                var,
+                distinct,
             },
-        ),
-    )
-    .parse(input)
-}
-
-// --- FIND Clause ---
-
-fn parse_find_clause(input: &str) -> VResult<'_, FindClause> {
-    context(
-        "FIND( ... )",
-        map(
-            preceded(
-                ws(word("FIND")),
-                parenthesized_block(separated_list1(ws(char(',')), parse_find_expression)),
-            ),
-            |expressions| FindClause { expressions },
-        ),
-    )
-    .parse(input)
-}
-
-fn parse_find_expression(input: &str) -> VResult<'_, FindExpression> {
-    context(
-        "FIND expression: ?variable or COUNT(?var), SUM(?var), AVG(?var), MIN(?var), MAX(?var)",
-        alt((parse_aggregation_expression, parse_find_variable)),
-    )
-    .parse(input)
-}
-
-fn parse_find_variable(input: &str) -> VResult<'_, FindExpression> {
+        ));
+    }
     map(dot_path_var, FindExpression::Variable).parse(input)
 }
 
-fn parse_aggregation_expression(input: &str) -> VResult<'_, FindExpression> {
-    context(
-        "KQL aggregation expression",
-        map(
-            (
-                parse_aggregation_function,
-                parenthesized_block((opt(terminated(tag("DISTINCT"), multispace1)), dot_path_var)),
-            ),
-            |(func, (distinct, var))| FindExpression::Aggregation {
-                func,
-                var,
-                distinct: distinct.is_some(),
-            },
-        ),
-    )
-    .parse(input)
-}
-
-fn parse_aggregation_function(input: &str) -> VResult<'_, AggregationFunction> {
-    alt((
-        map(word("COUNT"), |_| AggregationFunction::Count),
-        map(word("SUM"), |_| AggregationFunction::Sum),
-        map(word("AVG"), |_| AggregationFunction::Avg),
-        map(word("MIN"), |_| AggregationFunction::Min),
-        map(word("MAX"), |_| AggregationFunction::Max),
+/// `order_item = projection_expression [ "ASC" | "DESC" ]`
+fn order_item(input: &str) -> VResult<'_, OrderByItem> {
+    let (input, (variable, aggregation)) = alt((
+        map(aggregate_call, |(func, _, var)| (var, Some(func))),
+        map(dot_path_var, |var| (var, None)),
     ))
-    .parse(input)
-}
+    .parse(input)?;
+    let (input, direction) = opt(ws(alt((
+        value(OrderDirection::Asc, word("ASC")),
+        value(OrderDirection::Desc, word("DESC")),
+    ))))
+    .parse(input)?;
 
-// --- WHERE Clause ---
-
-pub fn parse_where_block(input: &str) -> VResult<'_, Vec<WhereClause>> {
-    context(
-        "WHERE { ... }",
-        preceded(ws(word("WHERE")), parse_where_group),
-    )
-    .parse(input)
-}
-
-fn parse_where_group(input: &str) -> VResult<'_, Vec<WhereClause>> {
-    braced_block(many1(ws(parse_single_where_clause))).parse(input)
-}
-
-fn parse_single_where_clause(input: &str) -> VResult<'_, WhereClause> {
-    context(
-        "WHERE clause item: ?var {matcher} | (?s, \"pred\", ?o) | FILTER(...) | OPTIONAL {...} | NOT {...} | UNION {...}",
-        alt((
-            map(parse_optional_clause, WhereClause::Optional),
-            map(parse_not_clause, WhereClause::Not),
-            map(parse_union_expression, WhereClause::Union),
-            map(parse_filter_clause, WhereClause::Filter),
-            map(parse_concept_clause, WhereClause::Concept),
-            map(parse_prop_clause, WhereClause::Proposition),
-        )),
-    )
-    .parse(input)
-}
-
-// --- WHERE Clause Sub-parsers ---
-
-pub fn parse_concept_matcher(input: &str) -> VResult<'_, ConceptMatcher> {
-    context(
-        "KQL concept matcher",
-        map_res(
-            braced_block(cut(separated_list1(ws(char(',')), key_value_pair))),
-            ConceptMatcher::try_from,
-        ),
-    )
-    .parse(input)
-}
-
-fn parse_concept_clause(input: &str) -> VResult<'_, ConceptClause> {
-    context(
-        "KQL concept clause",
-        map((variable, parse_concept_matcher), |(variable, matcher)| {
-            ConceptClause { variable, matcher }
-        }),
-    )
-    .parse(input)
-}
-
-pub fn parse_target_term(input: &str) -> VResult<'_, TargetTerm> {
-    context(
-        "KQL target term: ?var, unnamed {concept clause}, or unnamed (proposition clause)",
-        alt((
-            // `?var` — a previously bound variable
-            map(variable, TargetTerm::Variable),
-            // unnamed `{matcher}` concept clause
-            map(parse_concept_matcher, TargetTerm::Concept),
-            // unnamed nested proposition clause `(...)`
-            map(parse_prop_mather, |p| TargetTerm::Proposition(Box::new(p))),
-        )),
-    )
-    .parse(input)
-}
-
-fn parse_predicate_path(input: &str) -> VResult<'_, PredTerm> {
-    let (input, first) = parse_multi_hop_predicate(input)?;
-
-    match first {
-        PredTerm::Literal(predicate) => {
-            let (remaining, alternatives) =
-                many0(preceded(ws(char('|')), quoted_string)).parse(input)?;
-            if alternatives.is_empty() {
-                Ok((remaining, PredTerm::Literal(predicate)))
-            } else {
-                let mut predicates = Vec::with_capacity(alternatives.len() + 1);
-                predicates.push(predicate);
-                predicates.extend(alternatives);
-                Ok((remaining, PredTerm::Alternative(predicates)))
-            }
-        }
-        _ => Ok((input, first)),
-    }
-}
-
-fn parse_multi_hop_predicate(input: &str) -> VResult<'_, PredTerm> {
-    alt((
-        map(
-            (quoted_string, parse_predicate_quantifier),
-            |(predicate, (min, max))| PredTerm::MultiHop {
-                predicate,
-                min,
-                max,
-            },
-        ),
-        map(quoted_string, PredTerm::Literal),
-    ))
-    .parse(input)
-}
-
-// parse: {m,n} | {m,} | {m}
-fn parse_predicate_quantifier(input: &str) -> VResult<'_, (u16, Option<u16>)> {
-    braced_block(ws(cut(alt((
-        // {m,n} format
-        map_res(
-            (
-                nom::character::complete::u16,
-                ws(char(',')),
-                nom::character::complete::u16,
-            ),
-            |(min, _, max)| {
-                if max >= min {
-                    Ok((min, Some(max)))
-                } else {
-                    Err(format!(
-                        "invalid multi-hop predicate: min {min} cannot be greater than max {max}"
-                    ))
-                }
-            },
-        ),
-        // {m,} format (no upper bound)
-        map(
-            (nom::character::complete::u16, ws(char(','))),
-            |(min, _)| (min, None),
-        ),
-        // {m} format (exact match)
-        map(nom::character::complete::u16, |min| (min, Some(min))),
-    )))))
-    .parse(input)
-}
-
-fn parse_pred_term(input: &str) -> VResult<'_, PredTerm> {
-    context(
-        "KQL predicate term",
-        alt((map(variable, PredTerm::Variable), parse_predicate_path)),
-    )
-    .parse(input)
-}
-
-pub fn parse_prop_mather(input: &str) -> VResult<'_, PropositionMatcher> {
-    context(
-        "KQL proposition matcher",
-        parenthesized_block(cut(alt((
-            map(
-                separated_pair(ws(word("id")), ws(char(':')), ws(quoted_string)),
-                |(_, id)| PropositionMatcher::ID(id),
-            ),
-            map(
-                (
-                    ws(parse_target_term),
-                    ws(char(',')),
-                    ws(parse_pred_term),
-                    ws(char(',')),
-                    ws(parse_target_term),
-                ),
-                |(subject, _, predicate, _, object)| PropositionMatcher::Object {
-                    subject,
-                    predicate,
-                    object,
-                },
-            ),
-        )))),
-    )
-    .parse(input)
-}
-
-fn parse_prop_clause(input: &str) -> VResult<'_, PropositionClause> {
-    context(
-        "KQL proposition clause",
-        map((opt(variable), parse_prop_mather), |(variable, matcher)| {
-            PropositionClause { matcher, variable }
-        }),
-    )
-    .parse(input)
-}
-
-fn parse_filter_clause(input: &str) -> VResult<'_, FilterClause> {
-    context(
-        "KQL FILTER clause",
-        map(
-            preceded(
-                ws(word("FILTER")),
-                cut(parenthesized_block(parse_filter_expression)),
-            ),
-            |expression| FilterClause { expression },
-        ),
-    )
-    .parse(input)
-}
-
-fn parse_filter_expression(input: &str) -> VResult<'_, FilterExpression> {
-    parse_logical_or_expression(input)
-}
-
-// Parses logical OR expression (lowest precedence)
-fn parse_logical_or_expression(input: &str) -> VResult<'_, FilterExpression> {
-    let (input, left) = parse_logical_and_expression(input)?;
-    // Collect the right-hand sides first so `left` is moved (not cloned) into
-    // the folded tree; `many0` does not allocate when there is no `||`.
-    let (input, rest) =
-        many0(preceded(ws(tag("||")), parse_logical_and_expression)).parse(input)?;
-
-    let expr = rest
-        .into_iter()
-        .fold(left, |acc, right| FilterExpression::Logical {
-            left: Box::new(acc),
-            operator: LogicalOperator::Or,
-            right: Box::new(right),
-        });
-    Ok((input, expr))
-}
-
-// Parses logical AND expression
-fn parse_logical_and_expression(input: &str) -> VResult<'_, FilterExpression> {
-    let (input, left) = parse_unary_expression(input)?;
-    let (input, rest) = many0(preceded(ws(tag("&&")), parse_unary_expression)).parse(input)?;
-
-    let expr = rest
-        .into_iter()
-        .fold(left, |acc, right| FilterExpression::Logical {
-            left: Box::new(acc),
-            operator: LogicalOperator::And,
-            right: Box::new(right),
-        });
-    Ok((input, expr))
-}
-
-// Parses unary expression (NOT)
-fn parse_unary_expression(input: &str) -> VResult<'_, FilterExpression> {
-    alt((
-        map(preceded(ws(char('!')), parse_primary_expression), |expr| {
-            FilterExpression::Not(Box::new(expr))
-        }),
-        parse_primary_expression,
-    ))
-    .parse(input)
-}
-
-// Parses primary expression (comparison, function, parenthesized)
-fn parse_primary_expression(input: &str) -> VResult<'_, FilterExpression> {
-    alt((
-        // Parenthesized expression
-        parenthesized_block(parse_filter_expression),
-        // Function call
-        parse_function_expression,
-        // Comparison expression
-        parse_comparison_expression,
-    ))
-    .parse(input)
-}
-
-// Parses comparison expression
-fn parse_comparison_expression(input: &str) -> VResult<'_, FilterExpression> {
-    context(
-        "FILTER comparison: ?var == value, ?var != value, ?var < value, etc.",
-        map(
-            (
-                parse_filter_operand,
-                ws(parse_comparison_operator),
-                cut(parse_filter_operand),
-            ),
-            |(left, operator, right)| FilterExpression::Comparison {
-                left,
-                operator,
-                right,
-            },
-        ),
-    )
-    .parse(input)
-}
-
-// Parses function expression
-fn parse_function_expression(input: &str) -> VResult<'_, FilterExpression> {
-    context(
-        "FILTER function call: CONTAINS(?str, \"sub\") | STARTS_WITH(?str, \"prefix\") | ENDS_WITH(?str, \"suffix\") | REGEX(?str, \"pattern\") | IN(?expr, [values]) | IS_NULL(?expr) | IS_NOT_NULL(?expr)",
-        map_res(
-            (
-                parse_filter_function,
-                parenthesized_block(separated_list1(ws(char(',')), parse_filter_operand)),
-            ),
-            |(func, args)| validate_filter_function_args(func, args),
-        ),
-    )
-    .parse(input)
-}
-
-fn validate_filter_function_args(
-    func: FilterFunction,
-    args: Vec<FilterOperand>,
-) -> Result<FilterExpression, String> {
-    match func {
-        FilterFunction::Contains
-        | FilterFunction::StartsWith
-        | FilterFunction::EndsWith
-        | FilterFunction::Regex => {
-            if args.len() != 2 {
-                return Err("string filter functions require exactly 2 arguments".to_string());
-            }
-        }
-        FilterFunction::In => {
-            if args.len() != 2 {
-                return Err("IN requires exactly 2 arguments: IN(?expr, [values])".to_string());
-            }
-            if !matches!(args.get(1), Some(FilterOperand::List(_))) {
-                return Err("IN requires a literal list as its second argument".to_string());
-            }
-        }
-        FilterFunction::IsNull | FilterFunction::IsNotNull => {
-            if args.len() != 1 {
-                return Err("IS_NULL and IS_NOT_NULL require exactly 1 argument".to_string());
-            }
-        }
-    }
-
-    Ok(FilterExpression::Function { func, args })
-}
-
-// Parses filter operand
-fn parse_filter_operand(input: &str) -> VResult<'_, FilterOperand> {
-    context(
-        "FILTER operand: ?variable.path, literal value, or [value, ...] list",
-        alt((
-            map(dot_path_var, FilterOperand::Variable),
-            map(
-                delimited(
-                    ws(char('[')),
-                    separated_list1(ws(char(',')), kip_value),
-                    ws(char(']')),
-                ),
-                FilterOperand::List,
-            ),
-            map(kip_value, FilterOperand::Literal),
-        )),
-    )
-    .parse(input)
-}
-
-// Parses comparison operator
-fn parse_comparison_operator(input: &str) -> VResult<'_, ComparisonOperator> {
-    alt((
-        map(tag("=="), |_| ComparisonOperator::Equal),
-        map(tag("!="), |_| ComparisonOperator::NotEqual),
-        map(tag("<="), |_| ComparisonOperator::LessEqual),
-        map(tag(">="), |_| ComparisonOperator::GreaterEqual),
-        map(tag("<"), |_| ComparisonOperator::LessThan),
-        map(tag(">"), |_| ComparisonOperator::GreaterThan),
-    ))
-    .parse(input)
-}
-
-// Parses filter function
-fn parse_filter_function(input: &str) -> VResult<'_, FilterFunction> {
-    alt((
-        map(word("CONTAINS"), |_| FilterFunction::Contains),
-        map(word("STARTS_WITH"), |_| FilterFunction::StartsWith),
-        map(word("ENDS_WITH"), |_| FilterFunction::EndsWith),
-        map(word("REGEX"), |_| FilterFunction::Regex),
-        map(word("IS_NOT_NULL"), |_| FilterFunction::IsNotNull),
-        map(word("IS_NULL"), |_| FilterFunction::IsNull),
-        map(word("IN"), |_| FilterFunction::In),
-    ))
-    .parse(input)
-}
-
-fn parse_optional_clause(input: &str) -> VResult<'_, Vec<WhereClause>> {
-    context(
-        "KQL OPTIONAL clause",
-        preceded(
-            ws(word("OPTIONAL")),
-            cut(braced_block(many1(ws(parse_single_where_clause)))),
-        ),
-    )
-    .parse(input)
-}
-
-fn parse_not_clause(input: &str) -> VResult<'_, Vec<WhereClause>> {
-    context(
-        "KQL NOT clause",
-        preceded(
-            ws(word("NOT")),
-            cut(braced_block(many1(ws(parse_single_where_clause)))),
-        ),
-    )
-    .parse(input)
-}
-
-fn parse_union_expression(input: &str) -> VResult<'_, Vec<WhereClause>> {
-    context(
-        "KQL UNION clause",
-        preceded(
-            ws(word("UNION")),
-            cut(braced_block(many1(ws(parse_single_where_clause)))),
-        ),
-    )
-    .parse(input)
-}
-
-// --- Solution Modifiers ---
-
-fn parse_order_by_clause(input: &str) -> VResult<'_, Vec<OrderByCondition>> {
-    context(
-        "ORDER BY ?variable [ASC|DESC], ...",
-        preceded(
-            ws(keywords(&["ORDER", "BY"])),
-            cut(separated_list1(ws(char(',')), parse_order_by_condition)),
-        ),
-    )
-    .parse(input)
-}
-
-fn parse_order_by_condition(input: &str) -> VResult<'_, OrderByCondition> {
-    alt((parse_order_by_aggregation, parse_order_by_variable)).parse(input)
-}
-
-fn parse_order_by_variable(input: &str) -> VResult<'_, OrderByCondition> {
-    map(
-        pair(
-            dot_path_var,
-            opt(alt((
-                map(ws(word("ASC")), |_| OrderDirection::Asc),
-                map(ws(word("DESC")), |_| OrderDirection::Desc),
-            ))),
-        ),
-        |(variable, direction)| OrderByCondition {
+    Ok((
+        input,
+        OrderByItem {
             variable,
-            direction: direction.unwrap_or(OrderDirection::Asc),
-            aggregation: None,
+            direction: direction.unwrap_or_default(),
+            aggregation,
         },
-    )
-    .parse(input)
+    ))
 }
 
-fn parse_order_by_aggregation(input: &str) -> VResult<'_, OrderByCondition> {
-    map(
-        (
-            parse_aggregation_function,
-            parenthesized_block(dot_path_var),
-            opt(alt((
-                map(ws(word("ASC")), |_| OrderDirection::Asc),
-                map(ws(word("DESC")), |_| OrderDirection::Desc),
-            ))),
-        ),
-        |(func, variable, direction)| OrderByCondition {
-            variable,
-            direction: direction.unwrap_or(OrderDirection::Asc),
-            aggregation: Some(func),
-        },
-    )
-    .parse(input)
-}
-
-pub fn parse_limit_clause(input: &str) -> VResult<'_, usize> {
-    // `LIMIT 0` is rejected: the engine's internal "no limit" sentinel is 0,
-    // and letting it through would make `LIMIT 0` silently mean "unlimited".
-    // Omit the LIMIT clause for an unlimited query.
-    //
-    // Once the `LIMIT` keyword has matched, a bad operand is a hard failure
-    // (`cut`): every caller wraps this parser in `opt(...)`, which would
-    // otherwise swallow the error and let the leftover "LIMIT ..." text
-    // surface as a misleading "Unexpected trailing content" error.
-    preceded(
-        ws(keyword("LIMIT")),
-        cut(context(
-            "LIMIT must be followed by a positive integer (LIMIT 0 is not allowed; omit LIMIT for the engine default)",
-            verify(nom::character::complete::usize, |n: &usize| *n > 0),
-        )),
-    )
-    .parse(input)
-}
-
-pub fn parse_cursor_clause(input: &str) -> VResult<'_, String> {
-    // An empty cursor is rejected: a pagination token is opaque but never
-    // empty, and `CURSOR ""` would silently mean "start from the beginning".
-    //
-    // The `cut` is for the same reason as in `parse_limit_clause`: every caller
-    // wraps this parser in `opt(...)`, which would otherwise swallow the error
-    // and let the leftover "CURSOR ..." text surface as a misleading
-    // "Unexpected trailing content" error.
-    preceded(
-        ws(keyword("CURSOR")),
-        cut(context(
-            "CURSOR must be followed by a non-empty quoted pagination token (CURSOR \"<opaque_token>\")",
-            verify(quoted_string, |token: &str| !token.is_empty()),
-        )),
-    )
-    .parse(input)
+/// `aggregate_expression = aggregate_name "(" [ "DISTINCT" ] expression ")"`
+fn aggregate_call(input: &str) -> VResult<'_, (AggregationFunction, bool, DotPathVar)> {
+    let (rest, name) = identifier(input)?;
+    let func = match name.to_ascii_uppercase().as_str() {
+        "COUNT" => AggregationFunction::Count,
+        "SUM" => AggregationFunction::Sum,
+        "AVG" => AggregationFunction::Avg,
+        "MIN" => AggregationFunction::Min,
+        "MAX" => AggregationFunction::Max,
+        _ => return fail(input, "an aggregate: COUNT, SUM, AVG, MIN or MAX"),
+    };
+    let (rest, (distinct, var)) = cut(parenthesized((
+        map(opt(ws(word("DISTINCT"))), |d| d.is_some()),
+        ws(dot_path_var),
+    )))
+    .parse(rest)?;
+    Ok((rest, (func, distinct, var)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::{Scalar, WhereClause};
+
+    fn kql(input: &str) -> KqlQuery {
+        let (rest, query) =
+            parse_kql_query(input).unwrap_or_else(|e| panic!("failed to parse:\n{input}\n{e}"));
+        assert!(rest.trim().is_empty(), "unconsumed input {rest:?}");
+        query
+    }
 
     #[test]
-    fn test_parse_simple_find_query() {
-        let input = r#"
-            FIND(?drug.name)
+    fn parses_the_full_query_skeleton() {
+        let query = kql(r#"
+            FIND(?drug.name, COUNT(DISTINCT ?trial))
             WHERE {
-                ?drug {type: "Drug"}
-            }
-        "#;
-
-        let result = parse_kql_query(input);
-        assert!(result.is_ok());
-
-        let (_, query) = result.unwrap();
-        assert_eq!(query.find_clause.expressions.len(), 1);
-        match &query.find_clause.expressions[0] {
-            FindExpression::Variable(var) => {
-                assert_eq!(var.var, "drug");
-                assert_eq!(var.path, vec!["name".to_string()]);
-            }
-            _ => panic!("Expected variable expression"),
-        }
-        assert_eq!(query.where_clauses.len(), 1);
-    }
-
-    #[test]
-    fn test_parse_aggregation_find() {
-        let input = r#"
-            FIND(?drug_class, COUNT(?drug))
-            WHERE {
-                ?drug {type: "Drug"}
-                (?drug, "is_class_of", ?drug_class)
-            }
-        "#;
-
-        let result = parse_kql_query(input);
-        assert!(result.is_ok());
-
-        let (_, query) = result.unwrap();
-        assert_eq!(query.find_clause.expressions.len(), 2);
-
-        match &query.find_clause.expressions[0] {
-            FindExpression::Variable(var) => {
-                assert_eq!(var.var, "drug_class");
-                assert!(var.path.is_empty());
-            }
-            _ => panic!("Expected variable expression"),
-        }
-
-        match &query.find_clause.expressions[1] {
-            FindExpression::Aggregation {
-                func,
-                var,
-                distinct,
-            } => {
-                assert_eq!(*func, AggregationFunction::Count);
-                assert_eq!(var.var, "drug");
-                assert!(var.path.is_empty());
-                assert!(!distinct);
-            }
-            _ => panic!("Expected aggregation expression"),
-        }
-    }
-
-    #[test]
-    fn test_parse_aggregation_with_distinct() {
-        let input = r#"
-            FIND(COUNT(DISTINCT ?symptom))
-            WHERE {
-                (?drug, "treats", ?symptom)
-            }
-        "#;
-
-        let result = parse_kql_query(input);
-        assert!(result.is_ok());
-
-        let (_, query) = result.unwrap();
-        match &query.find_clause.expressions[0] {
-            FindExpression::Aggregation {
-                func,
-                var,
-                distinct,
-            } => {
-                assert_eq!(*func, AggregationFunction::Count);
-                assert_eq!(var.var, "symptom");
-                assert!(var.path.is_empty());
-                assert!(*distinct);
-            }
-            _ => panic!("Expected aggregation expression"),
-        }
-    }
-
-    #[test]
-    fn test_parse_all_aggregation_functions() {
-        let functions = vec![
-            ("COUNT(?var)", AggregationFunction::Count),
-            ("SUM(?var)", AggregationFunction::Sum),
-            ("AVG(?var)", AggregationFunction::Avg),
-            ("MIN(?var)", AggregationFunction::Min),
-            ("MAX(?var)", AggregationFunction::Max),
-        ];
-
-        for (func_str, expected_func) in functions {
-            let input = format!("FIND({func_str}) WHERE {{ ?x{{type: \"Test\"}} }}");
-            let result = parse_kql_query(&input);
-            assert!(result.is_ok(), "Failed to parse: {func_str}");
-
-            let (_, query) = result.unwrap();
-            match &query.find_clause.expressions[0] {
-                FindExpression::Aggregation { func, .. } => {
-                    assert_eq!(*func, expected_func);
-                }
-                _ => panic!("Expected aggregation for: {func_str}"),
-            }
-        }
-    }
-
-    #[test]
-    fn test_parse_concept_clause() {
-        let input = r#"
-            FIND(?drug.name)
-            WHERE {
-                ?drug {type: "Drug", name: "Aspirin"}
-            }
-        "#;
-
-        let result = parse_kql_query(input);
-        assert!(result.is_ok());
-
-        let (_, query) = result.unwrap();
-        match &query.where_clauses[0] {
-            WhereClause::Concept(clause) => {
-                assert_eq!(clause.variable, "drug".to_string());
-                assert_eq!(
-                    clause.matcher,
-                    ConceptMatcher::Object {
-                        r#type: "Drug".to_string(),
-                        name: "Aspirin".to_string(),
-                    }
-                );
-            }
-            _ => panic!("Expected concept clause"),
-        }
-    }
-
-    #[test]
-    fn test_parse_proposition_clause() {
-        let input = r#"
-            FIND(?drug.name, ?symptom.name)
-            WHERE {
-                (?drug, "treats", ?symptom)
-            }
-        "#;
-
-        let result = parse_kql_query(input);
-        assert!(result.is_ok());
-
-        let (_, query) = result.unwrap();
-        match &query.where_clauses[0] {
-            WhereClause::Proposition(clause) => {
-                assert_eq!(clause.variable, None);
-                assert_eq!(
-                    clause.matcher,
-                    PropositionMatcher::Object {
-                        subject: TargetTerm::Variable("drug".to_string()),
-                        predicate: PredTerm::Literal("treats".to_string()),
-                        object: TargetTerm::Variable("symptom".to_string()),
-                    }
-                );
-            }
-            _ => panic!("Expected proposition clause"),
-        }
-    }
-
-    #[test]
-    fn test_parse_proposition_with_concept_clause() {
-        let input = r#"
-            FIND(?drug.name)
-            WHERE {
-                (?drug, "treats", { type: "Symptom", name: "Headache" })
-            }
-        "#;
-
-        let result = parse_kql_query(input);
-        assert!(result.is_ok());
-
-        let (_, query) = result.unwrap();
-        match &query.where_clauses[0] {
-            WhereClause::Proposition(clause) => {
-                assert_eq!(clause.variable, None);
-                assert_eq!(
-                    clause.matcher,
-                    PropositionMatcher::Object {
-                        subject: TargetTerm::Variable("drug".to_string()),
-                        predicate: PredTerm::Literal("treats".to_string()),
-                        object: TargetTerm::Concept(ConceptMatcher::Object {
-                            r#type: "Symptom".to_string(),
-                            name: "Headache".to_string(),
-                        }),
-                    }
-                );
-            }
-            _ => panic!("Expected proposition clause"),
-        }
-    }
-
-    #[test]
-    fn test_parse_nested_proposition_endpoint() {
-        // The endpoint proposition clause must be unnamed; bind it in a separate
-        // clause first, then reference the variable.
-        let input = r#"
-            FIND(?evidence)
-            WHERE {
-                ?evidence (?drug, "treats", ?symptom)
-                (?paper, "cites", ?evidence)
-            }
-        "#;
-
-        let result = parse_kql_query(input);
-        assert!(result.is_ok(), "Failed to parse: {:?}", result);
-
-        let (_, query) = result.unwrap();
-        assert_eq!(query.where_clauses.len(), 2);
-
-        match &query.where_clauses[0] {
-            WhereClause::Proposition(clause) => {
-                assert_eq!(clause.variable, Some("evidence".to_string()));
-                assert_eq!(
-                    clause.matcher,
-                    PropositionMatcher::Object {
-                        subject: TargetTerm::Variable("drug".to_string()),
-                        predicate: PredTerm::Literal("treats".to_string()),
-                        object: TargetTerm::Variable("symptom".to_string()),
-                    }
-                );
-            }
-            _ => panic!("Expected proposition clause"),
-        }
-
-        match &query.where_clauses[1] {
-            WhereClause::Proposition(clause) => {
-                assert_eq!(clause.variable, None);
-                assert_eq!(
-                    clause.matcher,
-                    PropositionMatcher::Object {
-                        subject: TargetTerm::Variable("paper".to_string()),
-                        predicate: PredTerm::Literal("cites".to_string()),
-                        object: TargetTerm::Variable("evidence".to_string()),
-                    }
-                );
-            }
-            _ => panic!("Expected proposition clause"),
-        }
-    }
-
-    #[test]
-    fn test_named_embedded_endpoint_is_rejected() {
-        // Attaching a variable name to an embedded endpoint clause was removed
-        // from the protocol: bind the variable in a separate clause instead.
-        let named_concept_endpoint = r#"
-            FIND(?e, ?y)
-            WHERE {
-                ?e {type: "Event", name: "Conversation:2026-04-27:introduction_yan"}
-                (?e, "involves", ?y {type: "Person", name: "Yan"})
-            }
-        "#;
-        assert!(parse_kql_query(named_concept_endpoint).is_err());
-
-        let named_proposition_endpoint = r#"
-            FIND(?evidence)
-            WHERE {
-                (?paper, "cites", ?evidence (?drug, "treats", ?symptom))
-            }
-        "#;
-        assert!(parse_kql_query(named_proposition_endpoint).is_err());
-
-        // The unnamed equivalents are valid.
-        let unnamed = r#"
-            FIND(?e)
-            WHERE {
-                ?e {type: "Event", name: "Conversation:2026-04-27:introduction_yan"}
-                (?e, "involves", {type: "Person", name: "Yan"})
-            }
-        "#;
-        let (_, query) = parse_kql_query(unnamed).unwrap();
-        assert_eq!(query.where_clauses.len(), 2);
-        match &query.where_clauses[1] {
-            WhereClause::Proposition(clause) => {
-                assert_eq!(
-                    clause.matcher,
-                    PropositionMatcher::Object {
-                        subject: TargetTerm::Variable("e".to_string()),
-                        predicate: PredTerm::Literal("involves".to_string()),
-                        object: TargetTerm::Concept(ConceptMatcher::Object {
-                            r#type: "Person".to_string(),
-                            name: "Yan".to_string(),
-                        }),
-                    }
-                );
-            }
-            _ => panic!("Expected proposition clause"),
-        }
-    }
-
-    #[test]
-    fn test_parse_proposition_with_id_matcher() {
-        let input = r#"
-            FIND(?link)
-            WHERE {
-                ?link (id: "P:12345:connect")
-            }
-        "#;
-
-        let result = parse_kql_query(input);
-        assert!(result.is_ok());
-
-        let (_, query) = result.unwrap();
-        assert_eq!(query.find_clause.expressions.len(), 1);
-        assert_eq!(query.where_clauses.len(), 1);
-
-        match &query.where_clauses[0] {
-            WhereClause::Proposition(clause) => {
-                assert_eq!(clause.variable, Some("link".to_string()));
-                assert_eq!(
-                    clause.matcher,
-                    PropositionMatcher::ID("P:12345:connect".to_string())
-                );
-            }
-            _ => panic!("Expected proposition clause"),
-        }
-    }
-
-    #[test]
-    fn test_parse_nested_proposition() {
-        let input = r#"
-            FIND(?paper.doi, ?drug.name)
-            WHERE {
-                ({type: "Person", name: "张三"}, "stated", (?paper, "cites_as_evidence", (?drug, "treats", ?symptom)))
-            }
-        "#;
-
-        let result = parse_kql_query(input);
-        assert!(result.is_ok());
-
-        let (_, query) = result.unwrap();
-        match &query.where_clauses[0] {
-            WhereClause::Proposition(clause) => {
-                assert_eq!(clause.variable, None);
-                assert_eq!(
-                    clause.matcher,
-                    PropositionMatcher::Object {
-                        subject: TargetTerm::Concept(ConceptMatcher::Object {
-                            r#type: "Person".to_string(),
-                            name: "张三".to_string(),
-                        }),
-                        predicate: PredTerm::Literal("stated".to_string()),
-                        object: TargetTerm::Proposition(Box::new(PropositionMatcher::Object {
-                            subject: TargetTerm::Variable("paper".to_string()),
-                            predicate: PredTerm::Literal("cites_as_evidence".to_string()),
-                            object: TargetTerm::Proposition(Box::new(PropositionMatcher::Object {
-                                subject: TargetTerm::Variable("drug".to_string()),
-                                predicate: PredTerm::Literal("treats".to_string()),
-                                object: TargetTerm::Variable("symptom".to_string()),
-                            })),
-                        })),
-                    }
-                );
-            }
-            _ => panic!("Expected proposition clause"),
-        }
-    }
-
-    #[test]
-    fn test_parse_quantified_predicate_path() {
-        let test_cases = vec![
-            // {2,5} - 2 to 5 hops
-            (r#"(?a, "follows"{2,5}, ?b)"#, 2, Some(5)),
-            // {3,} - at least 3 hops
-            (r#"(?a, "follows"{3,}, ?b)"#, 3, None),
-            // {4} - exactly 4 hops
-            (r#"(?a, "follows"{4}, ?b)"#, 4, Some(4)),
-        ];
-
-        for (input, expected_min, expected_max) in test_cases {
-            let result = parse_prop_mather(input);
-            assert!(result.is_ok(), "Failed to parse: {}", input);
-
-            let (_, matcher) = result.unwrap();
-            match &matcher {
-                PropositionMatcher::Object {
-                    subject,
-                    predicate,
-                    object,
-                } => {
-                    assert_eq!(subject, &TargetTerm::Variable("a".to_string()));
-                    assert_eq!(object, &TargetTerm::Variable("b".to_string()));
-                    match &predicate {
-                        PredTerm::MultiHop {
-                            predicate,
-                            min,
-                            max,
-                        } => {
-                            assert_eq!(predicate, "follows");
-                            assert_eq!(*min, expected_min);
-                            assert_eq!(*max, expected_max);
-                        }
-                        _ => panic!("Expected proposition for object"),
-                    }
-                }
-                _ => panic!("Expected quantified predicate path for: {}", input),
-            }
-        }
-    }
-
-    #[test]
-    fn test_parse_alternative_predicate_path() {
-        let input = r#"(?a, "follows" | "connected_to"| "mark", ?b)"#;
-        let result = parse_prop_mather(input);
-        assert!(result.is_ok());
-
-        let (_, matcher) = result.unwrap();
-        match matcher {
-            PropositionMatcher::Object {
-                predicate: PredTerm::Alternative(paths),
-                ..
-            } => {
-                assert_eq!(paths.len(), 3);
-                assert_eq!(paths[0], "follows");
-                assert_eq!(paths[1], "connected_to");
-                assert_eq!(paths[2], "mark");
-            }
-            _ => panic!("Expected alternative predicate path"),
-        }
-    }
-
-    #[test]
-    fn test_parse_literal_predicate_when_later_string_contains_pipe() {
-        let input = r#"(?a, "follows", {name: "A|B"})"#;
-        let result = parse_prop_mather(input);
-        assert!(result.is_ok());
-
-        let (_, matcher) = result.unwrap();
-        match matcher {
-            PropositionMatcher::Object {
-                predicate: PredTerm::Literal(predicate),
-                ..
-            } => {
-                assert_eq!(predicate, "follows");
-            }
-            _ => panic!("Expected literal predicate path"),
-        }
-    }
-
-    #[test]
-    fn test_parse_predicate_path_error_cases() {
-        let invalid_inputs = vec![
-            r#"(?a, "follows"{}, ?b)"#,    // Empty quantifier
-            r#"(?a, "follows"{a,b}, ?b)"#, // Non-numeric quantifier
-            r#"(?a, "follows"{5,2}, ?b)"#, // min > max
-            r#"(?a, "follows"{ , }, ?b)"#, // Missing number
-            r#"(?a, | "follows", ?b)"#,    // Starts with |
-            r#"(?a, "follows" |, ?b)"#,    // Ends with |
-        ];
-
-        for input in invalid_inputs {
-            let result = parse_prop_mather(input);
-            assert!(result.is_err(), "Should fail to parse: {}", input);
-        }
-    }
-
-    #[test]
-    fn test_parse_simple_comparison_filter() {
-        let input = "FILTER(?risk < 3)";
-        let result = parse_filter_clause(input);
-        assert!(result.is_ok());
-
-        let (_, filter) = result.unwrap();
-        match filter.expression {
-            FilterExpression::Comparison {
-                left,
-                operator,
-                right,
-            } => {
-                match left {
-                    FilterOperand::Variable(var) => assert_eq!(var.var, "risk"),
-                    _ => panic!("Expected variable operand"),
-                }
-                assert_eq!(operator, ComparisonOperator::LessThan);
-                match right {
-                    FilterOperand::Literal(Value::Number(_)) => {}
-                    _ => panic!("Expected number literal"),
-                }
-            }
-            _ => panic!("Expected comparison expression"),
-        }
-    }
-
-    #[test]
-    fn test_parse_all_comparison_operators() {
-        let test_cases = vec![
-            ("FILTER(?a == ?b)", ComparisonOperator::Equal),
-            ("FILTER(?a != ?b)", ComparisonOperator::NotEqual),
-            ("FILTER(?a < ?b)", ComparisonOperator::LessThan),
-            ("FILTER(?a > ?b)", ComparisonOperator::GreaterThan),
-            ("FILTER(?a <= ?b)", ComparisonOperator::LessEqual),
-            ("FILTER(?a >= ?b)", ComparisonOperator::GreaterEqual),
-        ];
-
-        for (input, expected_op) in test_cases {
-            let result = parse_filter_clause(input);
-            assert!(result.is_ok(), "Failed to parse: {input}");
-
-            let (_, filter) = result.unwrap();
-            match filter.expression {
-                FilterExpression::Comparison { operator, .. } => {
-                    assert_eq!(operator, expected_op);
-                }
-                _ => panic!("Expected comparison expression for: {input}"),
-            }
-        }
-    }
-
-    #[test]
-    fn test_parse_logical_and_filter() {
-        let input = "FILTER(?risk < 3 && ?score > 0.5)";
-        let result = parse_filter_clause(input);
-        assert!(result.is_ok());
-
-        let (_, filter) = result.unwrap();
-        match filter.expression {
-            FilterExpression::Logical {
-                left,
-                operator,
-                right,
-            } => {
-                assert_eq!(operator, LogicalOperator::And);
-                match left.as_ref() {
-                    FilterExpression::Comparison { operator, .. } => {
-                        assert_eq!(*operator, ComparisonOperator::LessThan);
-                    }
-                    _ => panic!("Expected comparison in left side"),
-                }
-                match right.as_ref() {
-                    FilterExpression::Comparison { operator, .. } => {
-                        assert_eq!(*operator, ComparisonOperator::GreaterThan);
-                    }
-                    _ => panic!("Expected comparison in right side"),
-                }
-            }
-            _ => panic!("Expected logical expression"),
-        }
-    }
-
-    #[test]
-    fn test_parse_logical_or_filter() {
-        let input = "FILTER(?type == \"Drug\" || ?type == \"Medicine\")";
-        let result = parse_filter_clause(input);
-        assert!(result.is_ok());
-
-        let (_, filter) = result.unwrap();
-        match filter.expression {
-            FilterExpression::Logical { operator, .. } => {
-                assert_eq!(operator, LogicalOperator::Or);
-            }
-            _ => panic!("Expected logical OR expression"),
-        }
-    }
-
-    #[test]
-    fn test_parse_not_filter() {
-        let input = "FILTER(!(?risk > 5))";
-        let result = parse_filter_clause(input);
-        assert!(result.is_ok());
-
-        let (_, filter) = result.unwrap();
-        match filter.expression {
-            FilterExpression::Not(inner) => match inner.as_ref() {
-                FilterExpression::Comparison { operator, .. } => {
-                    assert_eq!(*operator, ComparisonOperator::GreaterThan);
-                }
-                _ => panic!("Expected comparison inside NOT"),
-            },
-            _ => panic!("Expected NOT expression"),
-        }
-    }
-
-    #[test]
-    fn test_parse_function_filter() {
-        let test_cases = vec![
-            (
-                "FILTER(CONTAINS(?name, \"acid\"))",
-                FilterFunction::Contains,
-            ),
-            (
-                "FILTER(STARTS_WITH(?name, \"pre\"))",
-                FilterFunction::StartsWith,
-            ),
-            (
-                "FILTER(ENDS_WITH(?name, \"ine\"))",
-                FilterFunction::EndsWith,
-            ),
-            ("FILTER(REGEX(?name, \"[A-Z]+\"))", FilterFunction::Regex),
-        ];
-
-        for (input, expected_func) in test_cases {
-            let result = parse_filter_clause(input);
-            assert!(result.is_ok(), "Failed to parse: {input}");
-
-            let (_, filter) = result.unwrap();
-            match filter.expression {
-                FilterExpression::Function { func, args } => {
-                    assert_eq!(func, expected_func);
-                    assert_eq!(args.len(), 2);
-                    match &args[0] {
-                        FilterOperand::Variable(_) => {}
-                        _ => panic!("Expected variable as first argument"),
-                    }
-                    match &args[1] {
-                        FilterOperand::Literal(Value::String(_)) => {}
-                        _ => panic!("Expected string literal as second argument"),
-                    }
-                }
-                _ => panic!("Expected function expression for: {input}"),
-            }
-        }
-    }
-
-    #[test]
-    fn test_parse_in_filter() {
-        let input = r#"FILTER(IN(?status, ["active", "pending", "review"]))"#;
-        let result = parse_filter_clause(input);
-        assert!(result.is_ok(), "Failed to parse IN filter");
-
-        let (_, filter) = result.unwrap();
-        match filter.expression {
-            FilterExpression::Function { func, args } => {
-                assert_eq!(func, FilterFunction::In);
-                assert_eq!(args.len(), 2);
-                match &args[0] {
-                    FilterOperand::Variable(var) => assert_eq!(var.var, "status"),
-                    _ => panic!("Expected variable as first argument"),
-                }
-                match &args[1] {
-                    FilterOperand::List(values) => {
-                        assert_eq!(values.len(), 3);
-                        assert_eq!(values[0], Value::String("active".to_string()));
-                        assert_eq!(values[1], Value::String("pending".to_string()));
-                        assert_eq!(values[2], Value::String("review".to_string()));
-                    }
-                    _ => panic!("Expected list as second argument"),
-                }
-            }
-            _ => panic!("Expected function expression"),
-        }
-    }
-
-    #[test]
-    fn test_parse_in_filter_with_mixed_values() {
-        let input = r#"FILTER(IN(?score, [1, 2, 3]))"#;
-        let result = parse_filter_clause(input);
-        assert!(result.is_ok(), "Failed to parse IN filter with numbers");
-
-        let (_, filter) = result.unwrap();
-        match filter.expression {
-            FilterExpression::Function { func, args } => {
-                assert_eq!(func, FilterFunction::In);
-                assert_eq!(args.len(), 2);
-                match &args[1] {
-                    FilterOperand::List(values) => {
-                        assert_eq!(values.len(), 3);
-                    }
-                    _ => panic!("Expected list as second argument"),
-                }
-            }
-            _ => panic!("Expected function expression"),
-        }
-    }
-
-    #[test]
-    fn test_parse_is_null_filter() {
-        let input = "FILTER(IS_NULL(?description))";
-        let result = parse_filter_clause(input);
-        assert!(result.is_ok(), "Failed to parse IS_NULL filter");
-
-        let (_, filter) = result.unwrap();
-        match filter.expression {
-            FilterExpression::Function { func, args } => {
-                assert_eq!(func, FilterFunction::IsNull);
-                assert_eq!(args.len(), 1);
-                match &args[0] {
-                    FilterOperand::Variable(var) => assert_eq!(var.var, "description"),
-                    _ => panic!("Expected variable as argument"),
-                }
-            }
-            _ => panic!("Expected function expression"),
-        }
-    }
-
-    #[test]
-    fn test_parse_is_not_null_filter() {
-        let input = "FILTER(IS_NOT_NULL(?drug.name))";
-        let result = parse_filter_clause(input);
-        assert!(result.is_ok(), "Failed to parse IS_NOT_NULL filter");
-
-        let (_, filter) = result.unwrap();
-        match filter.expression {
-            FilterExpression::Function { func, args } => {
-                assert_eq!(func, FilterFunction::IsNotNull);
-                assert_eq!(args.len(), 1);
-                match &args[0] {
-                    FilterOperand::Variable(var) => {
-                        assert_eq!(var.var, "drug");
-                        assert_eq!(var.path, vec!["name".to_string()]);
-                    }
-                    _ => panic!("Expected variable as argument"),
-                }
-            }
-            _ => panic!("Expected function expression"),
-        }
-    }
-
-    #[test]
-    fn test_parse_new_functions_in_complex_filter() {
-        let input =
-            r#"FILTER(IS_NOT_NULL(?drug.name) && IN(?drug.status, ["active", "approved"]))"#;
-        let result = parse_filter_clause(input);
-        assert!(
-            result.is_ok(),
-            "Failed to parse complex filter with new functions"
-        );
-
-        let (_, filter) = result.unwrap();
-        match filter.expression {
-            FilterExpression::Logical {
-                operator,
-                left,
-                right,
-            } => {
-                assert_eq!(operator, LogicalOperator::And);
-                match left.as_ref() {
-                    FilterExpression::Function { func, .. } => {
-                        assert_eq!(*func, FilterFunction::IsNotNull);
-                    }
-                    _ => panic!("Expected IS_NOT_NULL on left"),
-                }
-                match right.as_ref() {
-                    FilterExpression::Function { func, .. } => {
-                        assert_eq!(*func, FilterFunction::In);
-                    }
-                    _ => panic!("Expected IN on right"),
-                }
-            }
-            _ => panic!("Expected logical AND expression"),
-        }
-    }
-
-    #[test]
-    fn test_parse_complex_logical_filter() {
-        let input = "FILTER(?risk < 3 && (CONTAINS(?name, \"acid\") || ?score > 0.8))";
-        let result = parse_filter_clause(input);
-        assert!(result.is_ok());
-
-        let (_, filter) = result.unwrap();
-        match filter.expression {
-            FilterExpression::Logical {
-                left,
-                operator,
-                right,
-            } => {
-                assert_eq!(operator, LogicalOperator::And);
-                // Left side should be a comparison
-                match left.as_ref() {
-                    FilterExpression::Comparison { .. } => {}
-                    _ => panic!("Expected comparison on left side"),
-                }
-                // Right side should be a logical OR
-                match right.as_ref() {
-                    FilterExpression::Logical { operator, .. } => {
-                        assert_eq!(*operator, LogicalOperator::Or);
-                    }
-                    _ => panic!("Expected logical OR on right side"),
-                }
-            }
-            _ => panic!("Expected logical AND expression"),
-        }
-    }
-
-    #[test]
-    fn test_parse_filter_with_different_operand_types() {
-        let input = "FILTER(?active == true && ?count != null && ?score >= 3.14)";
-        let result = parse_filter_clause(input);
-        assert!(result.is_ok());
-
-        let (_, filter) = result.unwrap();
-        // This tests that we can parse different value types (boolean, null, float)
-        match filter.expression {
-            FilterExpression::Logical { .. } => {}
-            _ => panic!("Expected logical expression"),
-        }
-    }
-
-    #[test]
-    fn test_parse_operator_precedence() {
-        // Test that AND has higher precedence than OR
-        let input = "FILTER(?a == 1 || ?b == 2 && ?c == 3)";
-        let result = parse_filter_clause(input);
-        assert!(result.is_ok());
-
-        let (_, filter) = result.unwrap();
-        match filter.expression {
-            FilterExpression::Logical {
-                operator,
-                left,
-                right,
-            } => {
-                // Should be parsed as: (?a == 1) || (?b == 2 && ?c == 3)
-                assert_eq!(operator, LogicalOperator::Or);
-                match left.as_ref() {
-                    FilterExpression::Comparison { .. } => {}
-                    _ => panic!("Expected comparison on left"),
-                }
-                match right.as_ref() {
-                    FilterExpression::Logical { operator, .. } => {
-                        assert_eq!(*operator, LogicalOperator::And);
-                    }
-                    _ => panic!("Expected AND expression on right"),
-                }
-            }
-            _ => panic!("Expected OR expression at top level"),
-        }
-    }
-
-    #[test]
-    fn test_parse_parentheses_override_precedence() {
-        // Test that parentheses can override operator precedence
-        let input = "FILTER((?a == 1 || ?b == 2) && ?c == 3)";
-        let result = parse_filter_clause(input);
-        assert!(result.is_ok());
-
-        let (_, filter) = result.unwrap();
-        match filter.expression {
-            FilterExpression::Logical {
-                operator,
-                left,
-                right,
-            } => {
-                // Should be parsed as: (?a == 1 || ?b == 2) && (?c == 3)
-                assert_eq!(operator, LogicalOperator::And);
-                match left.as_ref() {
-                    FilterExpression::Logical { operator, .. } => {
-                        assert_eq!(*operator, LogicalOperator::Or);
-                    }
-                    _ => panic!("Expected OR expression on left"),
-                }
-                match right.as_ref() {
-                    FilterExpression::Comparison { .. } => {}
-                    _ => panic!("Expected comparison on right"),
-                }
-            }
-            _ => panic!("Expected AND expression at top level"),
-        }
-    }
-
-    #[test]
-    fn test_parse_filter_error_cases() {
-        let invalid_inputs = vec![
-            "FILTER()",                 // Empty filter
-            "FILTER(?a <)",             // Incomplete comparison
-            "FILTER(?a == && ?b)",      // Invalid logical expression
-            "FILTER(UNKNOWN_FUNC(?a))", // Unknown function
-            "FILTER(?a ===== ?b)",      // Invalid operator
-            "FILTER(!)",                // NOT without expression
-            "FILTER(IN(?a))",           // IN requires two arguments
-            "FILTER(IN(?a, ?b))",       // IN requires a literal list as second argument
-            "FILTER(IS_NULL(?a, ?b))",  // IS_NULL requires one argument
-            "FILTER(IS_NOT_NULL())",    // IS_NOT_NULL requires one argument
-            "FILTER(CONTAINS(?a))",     // String functions require two arguments
-        ];
-
-        for input in invalid_inputs {
-            let result = parse_filter_clause(input);
-            assert!(result.is_err(), "Should fail to parse: {input}");
-        }
-    }
-
-    #[test]
-    fn test_parse_filter_whitespace_handling() {
-        let input = "FILTER  (  ?risk   <   3   &&   CONTAINS  (  ?name  ,  \"acid\"  )  )";
-        let result = parse_filter_clause(input);
-        assert!(result.is_ok());
-
-        let (_, filter) = result.unwrap();
-        match filter.expression {
-            FilterExpression::Logical { operator, .. } => {
-                assert_eq!(operator, LogicalOperator::And);
-            }
-            _ => panic!("Expected logical expression"),
-        }
-    }
-
-    #[test]
-    fn test_parse_filter_clause() {
-        let input = r#"
-            FIND(?drug.name)
-            WHERE {
-                ?drug {type: "Drug"}
+                ?drug CONCEPT {type: "Drug"}
+                (?drug, "studied_in", ?trial)
                 FILTER(?drug.attributes.risk_level < 3)
             }
-        "#;
+            AS OF SEQ 4200
+            FOR TIME "2026-01-01T00:00:00Z"
+            WITH EPISTEMIC { explain: "summary" }
+            ORDER BY COUNT(?trial) DESC, ?drug.name
+            LIMIT 10
+            CURSOR :page
+            "#);
 
-        let result = parse_kql_query(input);
-        assert!(result.is_ok());
-
-        let (_, query) = result.unwrap();
-        match &query.where_clauses[1] {
-            WhereClause::Filter(filter) => match &filter.expression {
-                FilterExpression::Comparison {
-                    left,
-                    operator,
-                    right,
-                } => {
-                    match left {
-                        FilterOperand::Variable(var) => {
-                            assert_eq!(var.var, "drug");
-                            assert_eq!(
-                                var.path,
-                                vec!["attributes".to_string(), "risk_level".to_string()]
-                            );
-                        }
-                        _ => panic!("Expected variable operand"),
-                    }
-                    assert_eq!(*operator, ComparisonOperator::LessThan);
-                    match right {
-                        FilterOperand::Literal(Value::Number(_)) => {}
-                        _ => panic!("Expected number literal"),
-                    }
-                }
-                _ => panic!("Expected comparison expression"),
-            },
-            _ => panic!("Expected filter clause"),
-        }
-    }
-
-    #[test]
-    fn test_parse_complex_filter() {
-        let input = r#"
-        FIND(?drug.name)
-        WHERE {
-            ?drug {type: "Drug"}
-            FILTER(CONTAINS(?drug.name, "acid") && ?drug.attributes.risk_level < 3)
-        }
-    "#;
-
-        let result = parse_kql_query(input);
-        assert!(result.is_ok());
-
-        let (_, query) = result.unwrap();
-        match &query.where_clauses[1] {
-            WhereClause::Filter(filter) => {
-                // Check that this is a logical AND expression
-                match &filter.expression {
-                    FilterExpression::Logical {
-                        left,
-                        operator,
-                        right,
-                    } => {
-                        assert_eq!(*operator, LogicalOperator::And);
-
-                        // Left side should be CONTAINS function
-                        match left.as_ref() {
-                            FilterExpression::Function { func, args } => {
-                                assert_eq!(*func, FilterFunction::Contains);
-                                assert_eq!(args.len(), 2);
-                                match &args[0] {
-                                    FilterOperand::Variable(var) => {
-                                        assert_eq!(var.var, "drug");
-                                        assert_eq!(var.path, vec!["name".to_string()]);
-                                    }
-                                    _ => panic!("Expected variable as first argument"),
-                                }
-                                match &args[1] {
-                                    FilterOperand::Literal(Value::String(s)) => {
-                                        assert_eq!(s, "acid")
-                                    }
-                                    _ => panic!("Expected string literal as second argument"),
-                                }
-                            }
-                            _ => panic!("Expected function expression on left side"),
-                        }
-
-                        // Right side should be comparison expression
-                        match right.as_ref() {
-                            FilterExpression::Comparison {
-                                left,
-                                operator,
-                                right,
-                            } => {
-                                match left {
-                                    FilterOperand::Variable(var) => {
-                                        assert_eq!(var.var, "drug");
-                                        assert_eq!(
-                                            var.path,
-                                            vec![
-                                                "attributes".to_string(),
-                                                "risk_level".to_string()
-                                            ]
-                                        );
-                                    }
-                                    _ => panic!("Expected variable operand"),
-                                }
-                                assert_eq!(*operator, ComparisonOperator::LessThan);
-                                match right {
-                                    FilterOperand::Literal(Value::Number(_)) => {}
-                                    _ => panic!("Expected number literal"),
-                                }
-                            }
-                            _ => panic!("Expected comparison expression on right side"),
-                        }
-                    }
-                    _ => panic!("Expected logical AND expression"),
-                }
-            }
-            _ => panic!("Expected filter clause"),
-        }
-    }
-
-    #[test]
-    fn test_parse_optional_clause() {
-        let input = r#"
-            FIND(?drug.name, ?side_effect.name)
-            WHERE {
-                ?drug {type: "Drug" }
-                OPTIONAL {
-                    (?drug, "has_side_effect", ?side_effect)
-                }
-            }
-        "#;
-
-        let result = parse_kql_query(input);
-        assert!(result.is_ok());
-
-        let (_, query) = result.unwrap();
-        match &query.where_clauses[1] {
-            WhereClause::Optional(clauses) => {
-                assert_eq!(clauses.len(), 1);
-                match &clauses[0] {
-                    WhereClause::Proposition(clause) => match &clause.matcher {
-                        PropositionMatcher::Object {
-                            subject,
-                            predicate,
-                            object,
-                        } => {
-                            assert_eq!(subject, &TargetTerm::Variable("drug".to_string()));
-                            assert_eq!(
-                                predicate,
-                                &PredTerm::Literal("has_side_effect".to_string())
-                            );
-                            assert_eq!(object, &TargetTerm::Variable("side_effect".to_string()));
-                        }
-                        _ => panic!("Expected object matcher"),
-                    },
-                    _ => panic!("Expected proposition in optional"),
-                }
-            }
-            _ => panic!("Expected optional clause"),
-        }
-    }
-
-    #[test]
-    fn test_parse_not_clause() {
-        let input = r#"
-            FIND(?drug.name)
-            WHERE {
-                ?drug {type: "Drug"}
-                NOT {
-                    (?drug, "is_class_of", {name: "NSAID"})
-                }
-            }
-        "#;
-
-        let result = parse_kql_query(input);
-        assert!(result.is_ok());
-
-        let (_, query) = result.unwrap();
-        match &query.where_clauses[1] {
-            WhereClause::Not(clauses) => {
-                assert_eq!(clauses.len(), 1);
-                match &clauses[0] {
-                    WhereClause::Proposition(clause) => {
-                        assert_eq!(
-                            clause.matcher,
-                            PropositionMatcher::Object {
-                                subject: TargetTerm::Variable("drug".to_string()),
-                                predicate: PredTerm::Literal("is_class_of".to_string()),
-                                object: TargetTerm::Concept(ConceptMatcher::Name(
-                                    "NSAID".to_string()
-                                )),
-                            }
-                        );
-                    }
-                    _ => panic!("Expected proposition in NOT clause"),
-                }
-            }
-            _ => panic!("Expected NOT clause"),
-        }
-    }
-
-    #[test]
-    fn test_parse_union_clause() {
-        let input = r#"
-            FIND(?drug.name)
-            WHERE {
-                ?headache {name: "Headache"}
-                (?drug, "treats", ?headache)
-
-                UNION {
-                    (?drug, "treats", {name: "Fever"})
-                }
-            }
-        "#;
-
-        let result = parse_kql_query(input);
-        assert!(result.is_ok());
-
-        let (_, query) = result.unwrap();
-        assert_eq!(query.where_clauses.len(), 3);
-        match &query.where_clauses[2] {
-            WhereClause::Union(clauses) => {
-                assert_eq!(clauses.len(), 1);
-                match &clauses[0] {
-                    WhereClause::Proposition(clause) => {
-                        assert_eq!(
-                            clause.matcher,
-                            PropositionMatcher::Object {
-                                subject: TargetTerm::Variable("drug".to_string()),
-                                predicate: PredTerm::Literal("treats".to_string()),
-                                object: TargetTerm::Concept(ConceptMatcher::Name(
-                                    "Fever".to_string()
-                                )),
-                            }
-                        );
-                    }
-                    _ => panic!("Expected proposition in UNION clause"),
-                }
-            }
-            _ => panic!("Expected UNION clause"),
-        }
-    }
-
-    #[test]
-    fn test_parse_order_by_clause() {
-        let input = r#"
-            FIND(?drug.name, ?drug.attributes.risk_level)
-            WHERE {
-                ?drug {type: "Drug"}
-            }
-            ORDER BY ?drug.attributes.risk_level ASC, ?drug.name DESC
-        "#;
-
-        let result = parse_kql_query(input);
-        assert!(result.is_ok());
-
-        let (_, query) = result.unwrap();
-        assert!(query.order_by.is_some());
-        let order_by = query.order_by.unwrap();
-        assert_eq!(order_by.len(), 2);
-        assert_eq!(order_by[0].variable.var, "drug");
-        assert_eq!(
-            order_by[0].variable.path,
-            vec!["attributes".to_string(), "risk_level".to_string()]
-        );
-        assert_eq!(order_by[0].direction, OrderDirection::Asc);
-        assert_eq!(order_by[1].variable.var, "drug");
-        assert_eq!(order_by[1].variable.path, vec!["name".to_string()]);
-        assert_eq!(order_by[1].direction, OrderDirection::Desc);
-    }
-
-    #[test]
-    fn test_parse_order_by_default_asc() {
-        let input = r#"
-            FIND(?drug.name)
-            WHERE {
-                ?drug {type: "Drug"}
-            }
-            ORDER BY ?drug.name
-        "#;
-
-        let result = parse_kql_query(input);
-        assert!(result.is_ok());
-
-        let (_, query) = result.unwrap();
-        assert!(query.order_by.is_some());
-        let order_by = query.order_by.unwrap();
-        assert_eq!(order_by.len(), 1);
-        assert_eq!(order_by[0].direction, OrderDirection::Asc);
-    }
-
-    #[test]
-    fn test_parse_limit_and_cursor() {
-        let input = r#"
-            FIND(?drug.name)
-            WHERE {
-                ?drug {type: "Drug"}
-            }
-            ORDER BY ?drug.name
-            LIMIT 20
-            CURSOR "abcdef"
-        "#;
-
-        let result = parse_kql_query(input);
-        assert!(result.is_ok());
-
-        let (_, query) = result.unwrap();
-        assert_eq!(query.limit, Some(20));
-        assert_eq!(query.cursor, Some("abcdef".to_string()));
-    }
-
-    #[test]
-    fn test_parse_complex_query() {
-        let input = r#"
-            FIND(?drug.name, ?drug.attributes.risk_level)
-            WHERE {
-                ?drug {type: "Drug"}
-                ?headache{name: "Headache"}
-                ?nsaid_class  {name: "NSAID"}
-
-                (?drug, "treats", ?headache)
-
-                NOT {
-                    (?drug, "is_class_of", ?nsaid_class)
-                }
-
-                FILTER(?drug.attributes.risk_level < 4)
-            }
-            ORDER BY ?drug.attributes.risk_level ASC
-            LIMIT 20
-        "#;
-
-        let result = parse_kql_query(input);
-        assert!(result.is_ok());
-
-        let (_, query) = result.unwrap();
         assert_eq!(query.find_clause.expressions.len(), 2);
-        assert_eq!(query.where_clauses.len(), 6); // 3 groundings + 1 prop + 1 not + 1 filter
-        assert!(query.order_by.is_some());
-        assert_eq!(query.limit, Some(20));
-        assert!(query.cursor.is_none());
-    }
-
-    #[test]
-    fn test_parse_aggregation_with_grouping() {
-        let input = r#"
-            FIND(?class.name, COUNT(?drug.name))
-            WHERE {
-                ?class {type: "DrugClass"}
-                ?drug {type: "Drug"}
-                (?drug, "is_class_of", ?class)
-            }
-            ORDER BY ?class.name
-        "#;
-
-        let result = parse_kql_query(input);
-        assert!(result.is_ok());
-
-        let (_, query) = result.unwrap();
-        assert_eq!(query.find_clause.expressions.len(), 2);
-        match &query.find_clause.expressions[1] {
-            FindExpression::Aggregation { func, var, .. } => {
-                assert_eq!(*func, AggregationFunction::Count);
-                assert_eq!(var.var, "drug");
-                assert_eq!(var.path, vec!["name".to_string()]);
-            }
-            _ => panic!("Expected aggregation expression"),
-        }
-    }
-
-    #[test]
-    fn test_parse_error_cases() {
-        let invalid_inputs = vec![
-            "FIND() WHERE {}",           // Empty FIND
-            "FIND(?var WHERE {}",        // Missing closing parenthesis
-            "FIND(?var) WHERE",          // Missing WHERE block
-            "FIND(?var) WHERE { ?var }", // Invalid grounding syntax
-        ];
-
-        for input in invalid_inputs {
-            let result = parse_kql_query(input);
-            assert!(result.is_err(), "Should fail to parse: {input}");
-        }
-    }
-
-    #[test]
-    fn test_parse_whitespace_handling() {
-        let input_with_extra_whitespace = r#"
-            FIND  (  ?drug_name  ,  ?symptom_name  )
-            WHERE   {
-                ?drug  {  type:  "Drug"  }
-                ?prop  (  ?drug  ,  "treats"  ,  ?symptom  )
-            }
-            ORDER   BY   ?drug_name   ASC
-            LIMIT   10
-        "#;
-
-        let result = parse_kql_query(input_with_extra_whitespace);
-
-        assert!(result.is_ok());
-
-        let (_, query) = result.unwrap();
-        assert_eq!(query.find_clause.expressions.len(), 2);
-        assert_eq!(query.where_clauses.len(), 2);
-        assert_eq!(query.limit, Some(10));
-    }
-
-    #[test]
-    fn test_parse_limit_zero_is_rejected() {
-        // `LIMIT 0` would collide with the engine's internal "no limit"
-        // sentinel; the parser rejects it (omit LIMIT for unlimited).
-        let input = r#"
-            FIND(?drug.name)
-            WHERE { ?drug {type: "Drug"} }
-            LIMIT 0
-        "#;
-        assert!(crate::parse_kql(input).is_err());
-        assert!(parse_limit_clause("LIMIT 0").is_err());
-        assert!(parse_limit_clause("LIMIT 1").is_ok());
-
-        // The error must explain the LIMIT operand instead of degrading to a
-        // misleading "Unexpected trailing content" report (the old opt(...)
-        // pattern swallowed the LIMIT failure and left the text unconsumed).
-        let err = crate::parse_kql(input).unwrap_err();
-        let msg = format!("{err:?}");
-        assert!(
-            msg.contains("positive integer"),
-            "error should explain the LIMIT operand: {msg}"
-        );
-        assert!(
-            !msg.contains("Unexpected trailing content"),
-            "error must not be reported as trailing content: {msg}"
-        );
-
-        // UPDATE shares the same LIMIT clause parser.
-        let err = crate::parse_kml(
-            r#"UPDATE ?t SET ATTRIBUTES { n: 1 } WHERE { ?t {type: "T"} } LIMIT 0"#,
-        )
-        .unwrap_err();
-        let msg = format!("{err:?}");
-        assert!(
-            msg.contains("positive integer"),
-            "UPDATE LIMIT 0 error should explain the operand: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_parse_order_by_aggregation() {
-        // ORDER BY COUNT(?n) ASC
-        let input = r#"
-            FIND(?d.name, COUNT(?n))
-            WHERE {
-                ?d {type: "Domain"}
-                OPTIONAL {
-                    (?n, "belongs_to_domain", ?d)
-                }
-            }
-            ORDER BY COUNT(?n) ASC
-            LIMIT 20
-        "#;
-
-        let result = parse_kql_query(input);
-        assert!(result.is_ok());
-
-        let (_, query) = result.unwrap();
-        assert_eq!(query.find_clause.expressions.len(), 2);
-        assert!(query.order_by.is_some());
-        let order_by = query.order_by.unwrap();
-        assert_eq!(order_by.len(), 1);
-        assert!(order_by[0].is_aggregation());
-        assert_eq!(order_by[0].aggregation, Some(AggregationFunction::Count));
-        assert_eq!(order_by[0].variable.var, "n");
-        assert!(order_by[0].variable.path.is_empty());
-        assert_eq!(order_by[0].direction, OrderDirection::Asc);
-        assert_eq!(query.limit, Some(20));
-    }
-
-    #[test]
-    fn test_parse_order_by_aggregation_desc() {
-        // ORDER BY SUM(?item.price) DESC
-        let input = r#"
-            FIND(?category.name, SUM(?item.price))
-            WHERE {
-                ?category {type: "Category"}
-                (?item, "in_category", ?category)
-            }
-            ORDER BY SUM(?item.price) DESC
-        "#;
-
-        let result = parse_kql_query(input);
-        assert!(result.is_ok());
-
-        let (_, query) = result.unwrap();
-        let order_by = query.order_by.unwrap();
-        assert_eq!(order_by.len(), 1);
-        assert!(order_by[0].is_aggregation());
-        assert_eq!(order_by[0].aggregation, Some(AggregationFunction::Sum));
-        assert_eq!(order_by[0].variable.var, "item");
-        assert_eq!(order_by[0].variable.path, vec!["price".to_string()]);
-        assert_eq!(order_by[0].direction, OrderDirection::Desc);
-    }
-
-    #[test]
-    fn test_parse_order_by_mixed_aggregation_and_variable() {
-        // ORDER BY COUNT(?n) ASC, ?d.name DESC
-        let input = r#"
-            FIND(?d.name, COUNT(?n))
-            WHERE {
-                ?d {type: "Domain"}
-                (?n, "belongs_to_domain", ?d)
-            }
-            ORDER BY COUNT(?n) ASC, ?d.name DESC
-        "#;
-
-        let result = parse_kql_query(input);
-        assert!(result.is_ok());
-
-        let (_, query) = result.unwrap();
-        let order_by = query.order_by.unwrap();
-        assert_eq!(order_by.len(), 2);
-
-        // First: COUNT(?n) ASC
-        assert!(order_by[0].is_aggregation());
-        assert_eq!(order_by[0].aggregation, Some(AggregationFunction::Count));
-        assert_eq!(order_by[0].variable.var, "n");
-        assert_eq!(order_by[0].direction, OrderDirection::Asc);
-
-        // Second: ?d.name DESC
-        assert!(!order_by[1].is_aggregation());
-        assert_eq!(order_by[1].aggregation, None);
-        assert_eq!(order_by[1].variable.var, "d");
-        assert_eq!(order_by[1].variable.path, vec!["name".to_string()]);
-        assert_eq!(order_by[1].direction, OrderDirection::Desc);
-    }
-
-    #[test]
-    fn test_parse_order_by_aggregation_default_asc() {
-        // ORDER BY COUNT(?n) — should default to ASC
-        let input = r#"
-            FIND(?d.name, COUNT(?n))
-            WHERE {
-                ?d {type: "Domain"}
-                (?n, "belongs_to_domain", ?d)
-            }
-            ORDER BY COUNT(?n)
-        "#;
-
-        let result = parse_kql_query(input);
-        assert!(result.is_ok());
-
-        let (_, query) = result.unwrap();
-        let order_by = query.order_by.unwrap();
-        assert_eq!(order_by.len(), 1);
-        assert!(order_by[0].is_aggregation());
-        assert_eq!(order_by[0].direction, OrderDirection::Asc);
-    }
-
-    #[test]
-    fn test_concept_matcher_duplicate_keys_rejected() {
-        // Duplicate identifying keys in a concept matcher are almost always
-        // an LLM generation error; last-wins would silently mask them.
-        assert!(crate::parse_kql(r#"FIND(?d) WHERE { ?d {type: "A", type: "B"} }"#).is_err());
-        assert!(crate::parse_kql(r#"FIND(?d) WHERE { ?d {id: "1", id: "2"} }"#).is_err());
-        // Distinct keys still parse.
-        assert!(crate::parse_kql(r#"FIND(?d) WHERE { ?d {type: "A", name: "B"} }"#).is_ok());
-    }
-
-    #[test]
-    fn test_filter_bare_boolean_is_rejected() {
-        // Contract: FILTER requires a comparison, function call, or logical
-        // combination thereof; a bare (boolean) operand like `FILTER(?x.flag)`
-        // is not defined by KIP spec §3.4.3 and must be a syntax error.
-        assert!(
-            crate::parse_kql(r#"FIND(?x) WHERE { ?x {type: "T"} FILTER(?x.attributes.flag) }"#)
-                .is_err()
-        );
-        // The explicit comparison form is the supported spelling.
-        assert!(
-            crate::parse_kql(
-                r#"FIND(?x) WHERE { ?x {type: "T"} FILTER(?x.attributes.flag == true) }"#
-            )
-            .is_ok()
-        );
-    }
-
-    #[test]
-    fn test_filter_without_logical_operator_still_parses() {
-        // Regression guard for the fold() -> many0() rewrite: single
-        // comparisons and chains of && / || must both parse.
-        let (_, single) = parse_filter_clause(r#"FILTER(?a.attributes.x < 3)"#).unwrap();
         assert!(matches!(
-            single.expression,
-            FilterExpression::Comparison { .. }
-        ));
-
-        let (_, chained) = parse_filter_clause(
-            r#"FILTER(?a.attributes.x < 3 && ?a.attributes.y > 1 || ?a.attributes.z == 0)"#,
-        )
-        .unwrap();
-        match chained.expression {
-            FilterExpression::Logical { operator, .. } => {
-                assert_eq!(operator, LogicalOperator::Or)
+            query.find_clause.expressions[1],
+            FindExpression::Aggregation {
+                func: AggregationFunction::Count,
+                distinct: true,
+                ..
             }
-            other => panic!("expected logical expression, got {other:?}"),
-        }
+        ));
+        assert!(matches!(query.as_of, Some(AsOf::Seq(_))));
+        assert!(query.for_time.is_some());
+        assert!(query.epistemic.is_some());
+
+        let order = query.order_by.expect("ORDER BY");
+        assert_eq!(order[0].direction, OrderDirection::Desc);
+        assert_eq!(order[0].aggregation, Some(AggregationFunction::Count));
+        // An unwritten direction is ascending.
+        assert_eq!(order[1].direction, OrderDirection::Asc);
+        assert_eq!(order[1].aggregation, None);
+
+        assert!(matches!(query.cursor, Some(Scalar::Param(_))));
     }
 
     #[test]
-    fn test_keywords_require_word_boundary() {
-        // Keyword prefixes of longer identifiers must not silently match.
-        assert!(crate::parse_kql(r#"FINDX(?x) WHERE { ?x {type: "T"} }"#).is_err());
-        assert!(crate::parse_kql(r#"FIND(?x) WHEREX { ?x {type: "T"} }"#).is_err());
-        assert!(
-            crate::parse_kql(r#"FIND(?x) WHERE { ?x {type: "T"} } ORDER BY ?x DESCX"#).is_err()
-        );
-        // The regular spellings still parse.
-        assert!(crate::parse_kql(r#"FIND(?x) WHERE { ?x {type: "T"} } ORDER BY ?x DESC"#).is_ok());
+    fn as_of_and_for_time_are_independent_axes() {
+        // Spec §48.3: history basis and world-valid time never imply each other.
+        let query = kql(r#"FIND(?x) WHERE { ?x {type: "T"} } AS OF TX :tx FOR TIME :t"#);
+        assert!(matches!(query.as_of, Some(AsOf::Tx(_))));
+        assert!(query.for_time.is_some());
+
+        let only_time = kql(r#"FIND(?x) WHERE { ?x {type: "T"} } FOR TIME :t"#);
+        assert!(only_time.as_of.is_none());
+        assert!(only_time.for_time.is_some());
+    }
+
+    #[test]
+    fn keywords_are_case_insensitive() {
+        let query = kql(r#"find(?x) where { ?x {type: "T"} } limit 5"#);
+        assert_eq!(query.where_clauses.len(), 1);
+        assert!(query.limit.is_some());
+    }
+
+    #[test]
+    fn a_projection_must_name_a_column() {
+        assert!(parse_kql_query(r#"FIND("literal") WHERE { ?x {a: 1} }"#).is_err());
+        assert!(parse_kql_query(r#"FIND(1 + 1) WHERE { ?x {a: 1} }"#).is_err());
+        assert!(parse_kql_query(r#"FIND() WHERE { ?x {a: 1} }"#).is_err());
+    }
+
+    #[test]
+    fn union_is_a_block_not_a_binary_operator() {
+        let query = kql(r#"FIND(?x) WHERE { ?x {type: "A"} UNION { ?x {type: "B"} } }"#);
+        assert_eq!(query.where_clauses.len(), 2);
+        assert!(matches!(query.where_clauses[1], WhereClause::Union(_)));
+    }
+
+    #[test]
+    fn comments_are_ignored_between_clauses() {
+        let query = kql(r#"
+            // pick the drug
+            FIND(?x) // just the binding
+            WHERE {
+                // any drug will do
+                ?x {type: "Drug"}
+            }
+            LIMIT 1
+            "#);
+        assert_eq!(query.where_clauses.len(), 1);
+        assert!(query.limit.is_some());
     }
 }

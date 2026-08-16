@@ -1,16 +1,16 @@
 {
   "name": "execute_kip",
-  "description": "Executes one or more KIP (Knowledge Interaction Protocol) commands against the Cognitive Nexus to interact with your persistent memory.",
+  "description": "Executes KIP 2.0 (Knowledge Interaction Protocol) commands against your Cognitive Nexus — your persistent memory. Read with KQL (FIND), change cognition with KML (ASSERT / MUTATE / ENSURE / CREATE / UPDATE / RETRACT / SUPERSEDE / CORRECT / MERGE / ARCHIVE / TOMBSTONE / PURGE), and ground or introspect with META (DESCRIBE / LIST / SEARCH / VERIFY / VALIDATE / PREVIEW / HISTORY / CHANGES / SNAPSHOT / EXPORT CAPSULE). Remember: a Proposition existing is not the same as it being true — raw FIND reads claims, BELIEF projects what is currently believed. Never rewrite an Assertion to correct it; record a new one with SUPERSEDING.",
   "parameters": {
     "type": "object",
     "properties": {
       "command": {
         "type": "string",
-        "description": "A single complete KIP command (KQL / KML / META). Mutually exclusive with commands."
+        "description": "A single complete KIP 2.0 command (KQL / KML / META). Mutually exclusive with operations."
       },
-      "commands": {
+      "operations": {
         "type": "array",
-        "description": "An array of KIP commands (KQL / KML / META) for batch execution (reduces round-trips). Commands are executed sequentially. KQL/META/syntax errors are returned inline; the first KML (UPSERT/UPDATE/MERGE/DELETE) error stops the batch to preserve write atomicity.",
+        "description": "Several KIP commands in one round-trip. This is a batch, not a transaction: set execution.mode to atomic if the whole set must commit or abort together. Several mutations that belong to one cognitive transition should instead be written as one MUTATE { ... } command.",
         "items": {
           "oneOf": [
             {
@@ -19,13 +19,17 @@
             {
               "type": "object",
               "properties": {
+                "op_id": {
+                  "type": "string",
+                  "description": "A request-local name so this operation's result can be correlated in the response."
+                },
                 "command": {
                   "type": "string",
-                  "description": "A complete KIP command with parameters scoped to this command."
+                  "description": "A complete KIP command."
                 },
                 "parameters": {
                   "type": "object",
-                  "description": "Optional parameters for this command. These override shared parameters with the same keys."
+                  "description": "Parameters scoped to this operation. They override shared parameters with the same keys."
                 }
               },
               "required": [
@@ -36,13 +40,44 @@
           ]
         }
       },
+      "execution": {
+        "type": "object",
+        "description": "How the operations relate to one another. Required when more than one operation is sent.",
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": [
+              "independent",
+              "sequence",
+              "atomic"
+            ],
+            "description": "independent: unrelated, may run concurrently, failures isolated. sequence: ordered, each state change commits separately and earlier commits are NOT rolled back. atomic: one transaction, all-or-none."
+          },
+          "on_error": {
+            "type": "string",
+            "enum": [
+              "stop",
+              "continue"
+            ],
+            "description": "What a sequence run does after a failure. Illegal with atomic, which always aborts as a whole."
+          },
+          "idempotency_key": {
+            "type": "string",
+            "description": "Names one logical mutation intent. If a response is lost, retry the exact same request with the same key rather than writing again — a lost response is not proof the write failed."
+          }
+        },
+        "required": [
+          "mode"
+        ],
+        "additionalProperties": false
+      },
       "parameters": {
         "type": "object",
-        "description": "An optional JSON object of key-value pairs used for safe substitution of placeholders in the command string(s). Placeholders should start with ':' (e.g., :name, :limit). IMPORTANT: A placeholder must occupy a complete KIP value position (e.g., name: :name, LIMIT :limit, or SEARCH CONCEPT :term). Do not embed placeholders inside quoted strings (e.g., \"Hello :name\"), because substitution uses JSON serialization."
+        "description": "Values bound into the command's :placeholders. Binding is structural, never string interpolation: a placeholder must occupy a complete KIP value position (name: :name, LIMIT :limit, SEARCH CONCEPT :term). Do not embed one inside a quoted string such as \"Hello :name\". Parameter names match [A-Za-z_][A-Za-z0-9_]*."
       },
       "dry_run": {
         "type": "boolean",
-        "description": "If set to true, the command(s) will only be validated for syntactical and logical correctness without being executed."
+        "description": "Validate and plan without committing. A dry run never establishes durable cognitive state."
       }
     },
     "oneOf": [
@@ -53,7 +88,7 @@
       },
       {
         "required": [
-          "commands"
+          "operations"
         ]
       }
     ],

@@ -75,7 +75,7 @@ where
 }
 
 /// Skips whitespace and line comments.
-fn skip_ws_and_comments(input: &str) -> IResult<&str, (), VerboseError<&str>> {
+pub(super) fn skip_ws_and_comments(input: &str) -> IResult<&str, (), VerboseError<&str>> {
     let mut remaining = input;
 
     loop {
@@ -448,11 +448,11 @@ mod tests {
 
         // In a statement the error is anchored at the offending literal.
         let err = crate::parse_kml(
-            r#"UPSERT { CONCEPT ?c { {type: "T", name: "n"} SET ATTRIBUTES { id: 18446744073709551617 } } }"#,
+            r#"CREATE CONCEPT ?c { TYPE "T" SET ATTRIBUTES { n: 18446744073709551617 } }"#,
         )
         .unwrap_err();
         assert!(
-            err.message.contains("line 1, column 67"),
+            err.message.contains("line 1, column 50"),
             "error should point at the literal: {}",
             err.message
         );

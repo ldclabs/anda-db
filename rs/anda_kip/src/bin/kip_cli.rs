@@ -6,7 +6,7 @@
 
 use std::{env, fs, path::Path, process};
 
-use anda_kip::parse_kip;
+use anda_kip::{CommandType, parse_kip};
 
 /// A simple CLI tool to parse .kip files and report syntax errors.
 /// Build: `cargo build --bin kip_cli --release`
@@ -74,20 +74,21 @@ fn parse_file(path: &Path) -> bool {
 
     match parse_kip(&content) {
         Ok(cmd) => {
-            println!("[OK] {} — parsed as {:?}", path.display(), cmd_kind(&cmd));
+            println!(
+                "[OK] {} — parsed as {}",
+                path.display(),
+                CommandType::from(&cmd)
+            );
             true
         }
         Err(e) => {
-            eprintln!("[ERROR] {} — syntax error:\n{}", path.display(), e);
+            eprintln!(
+                "[ERROR] {} — {}\n        hint: {}",
+                path.display(),
+                e,
+                e.effective_hint()
+            );
             false
         }
-    }
-}
-
-fn cmd_kind(cmd: &anda_kip::ast::Command) -> &'static str {
-    match cmd {
-        anda_kip::ast::Command::Kql(_) => "KQL",
-        anda_kip::ast::Command::Kml(_) => "KML",
-        anda_kip::ast::Command::Meta(_) => "META",
     }
 }

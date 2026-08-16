@@ -2,6 +2,112 @@
 
 All notable changes to this workspace are documented in this file.
 
+## [KIP 2.0] — 2026-08-16
+
+`anda_kip` 0.12.0.
+
+KIP 2.0 in `rs/anda_kip`. This is a rewrite, not an upgrade: 1.x and 2.0 are
+semantically different protocols, so the old API is gone rather than deprecated.
+
+**Downstream crates are not migrated and currently do not build**:
+`anda_cognitive_nexus`, `anda_cognitive_nexus_server`, `anda_kip_wasm` and
+`py/anda_cognitive_nexus_py` all implement KIP 1.x graph semantics and need
+their own port.
+
+### Why it is a rewrite
+
+KIP 1.x kept meaning, belief, evidence, provenance, retention and governance in
+one self-describing graph, where a Proposition carried `metadata.confidence`, an
+`author` string and an `access_level`. KIP 2.0 separates those planes, and
+everything else follows from one line:
+
+```text
+a Proposition existing  ≠  the Proposition being true
+```
+
+A Proposition is now a truth-neutral tuple. An Assertion is one actor's
+commitment about it — stance, mode, confidence, Evidence, valid time. What is
+*currently believed* is projected from those Assertions and never stored, which
+is why correcting a claim records a new Assertion with `SUPERSEDING` instead of
+rewriting the old one.
+
+### Added
+
+- **Three new grammars** implementing `v2/grammar/KIP-2.0-{KQL,KML,META}.ebnf`.
+  KQL gains `ASSERTION` / `EVIDENCE` / `ACTIVITY` / `STRUCTURAL` patterns,
+  `BELIEF` and `BELIEF SLOT` projections, raw predicate paths with alternation
+  and hop quantifiers, `AS OF SEQ|TX|TIME` and `FOR TIME` as independent axes,
+  and `WITH EPISTEMIC`. KML gains `CREATE CONCEPT/EVIDENCE/ASSERTION/ACTIVITY`,
+  `UPSERT CONCEPT`, `ENSURE PROPOSITION`, the `ASSERT` sugar, `UPDATE`,
+  `RETRACT` / `SUPERSEDE` / `CORRECT`, `TRANSITION ACTIVITY`, `SET RETENTION`,
+  `ARCHIVE` / `TOMBSTONE` / `PURGE`, non-destructive `MERGE CONCEPT`, and
+  `SET`/`UNSET` for fields, attributes, facets and structural references. META
+  gains the full `DESCRIBE` / `LIST` / `SEARCH` / `VERIFY` / `VALIDATE` /
+  `PREVIEW` / `HISTORY` / `CHANGES` / `SNAPSHOT` / `EXPORT CAPSULE` families.
+  Keywords are now ASCII case-insensitive and contextual — `by`, `mode`, `key`,
+  `type` and `status` are all legal field names, as the spec's own examples
+  require — while `true` / `false` / `null` and `id` stay case-sensitive.
+- **Schema-independent validation at parse time**, so a command that would ask
+  an engine to corrupt the epistemic record never reaches one: `UPSERT CONCEPT`
+  must match `id` or `key` (a name is mutable and duplicable); an `UPDATE` may
+  not rewrite immutable Assertion, Evidence or Proposition payload; structural
+  mutation reaches Concept topology only; `_system`, `governance`, `space_id`
+  and `space_seq` are never author-writable; `ENSURE PROPOSITION (id: ...)` is
+  rejected because `(id: ...)` is match-only; `ASSERT` requires `by` and `mode`,
+  neither of which has a safe default; an update expression may read only the
+  element being updated; local handles must be unique and resolvable.
+- **`ast`** — a closed executable AST matching `exec-ast.ts` from
+  `@ldclabs/kip-lang` field for field under serde's externally-tagged encoding,
+  so the Rust and TypeScript implementations can be differentially tested.
+- **`error`** — the 79-code Core Error Registry (§87) with categories and retry
+  classes. `outcome_lookup_required` is the one to wire into client recovery: a
+  lost response is not proof a write failed, and re-issuing it is how duplicate
+  cognition gets created.
+- **`request`** — the 2.0 envelope (§71–§85): `operations[]` with per-operation
+  parameters and idempotency keys, `execution.mode` of
+  `independent`/`sequence`/`atomic`, ingestion contexts that mint Evidence from
+  the transport rather than from model-generated command text, snapshot
+  binding, preconditions, receipts, and the `partial` top-level status that
+  keeps a half-committed `sequence` from being reported as a total failure.
+- **`types`** — the Core data model (§6–§19) with no universal metadata bag.
+- **`capsule`** — portable Cognitive Capsules (§37–§41), import modes, identity
+  resolution order, and the `redacted` vs `unavailable` distinction.
+- **`executor::execute_request`** — runs `independent` and `sequence`, and
+  refuses `atomic` rather than emulating it.
+- **A differential test against `@ldclabs/kip-lang`** —
+  `tests/fixtures/kip_lang_ast.json` holds 76 command → AST pairs produced by
+  the reference TypeScript implementation, covering every KQL pattern family,
+  every KML mutation family and every META statement family. `anda_kip` decodes
+  all of them to byte-identical trees, in both directions. Plus
+  `tests/syntax_docs.rs`, which parses every executable example in the bundled
+  `KIPSyntax.md`.
+
+### Changed
+
+- **`Response` is a struct, not an enum**: `{status, results[], receipt,
+  warnings, ...}` per §81, with `succeeded` / `failed` / `partial` /
+  `outcome_unknown` at the top level.
+- **`execute_readonly` rejects writes by parsed semantics**, and now reports
+  `ReadonlyViolation` instead of borrowing the syntax-error code.
+- **A declared operation `language` can no longer relabel a write as a read** —
+  a mismatch is `LanguageMismatch` (§73.1, §88.3).
+- **Bundled prompts and tool schemas rewritten for 2.0**: `SPECIFICATION.md` and
+  `KIPSyntax.md` are copies of the v2 documents; `SelfInstructions.md`,
+  `SystemInstructions.md`, `FunctionDefinition.json` and
+  `FunctionDefinitionReadonly.json` are new, and `KIP_SYNTAX` is exported
+  alongside the existing statics.
+
+### Removed
+
+- **The genesis capsules** (`capsules/*.kip`, `GENESIS_KIP`, `PERSON_KIP`, the
+  `*_PROP_KIP` predicate sources, `META_CONCEPT_TYPE` and friends). KIP 2.0
+  Schema is immutable Package state; a schema graph node is not authoritative
+  Schema (§103.9), and these files are 1.x `UPSERT` scripts the 2.0 parser
+  cannot read. `capsule.rs` now models Cognitive Capsules instead.
+- **`ConceptNode` / `PropositionLink` / `Entity` / `UpsertResult` and the
+  `metadata.*` constants**, superseded by the five Core element kinds.
+- **The numeric `KIP_xxxx` error codes**, superseded by the named registry.
+
 ## [KIP v1.0-RC11] — 2026-08-14
 
 `anda_kip` 0.11.1 · `anda_cognitive_nexus` 0.11.1 · `@ldclabs/kip-do` 0.12.2.
