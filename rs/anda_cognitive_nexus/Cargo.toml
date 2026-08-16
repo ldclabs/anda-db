@@ -40,8 +40,5 @@ object_store = { workspace = true, features = ["fs"] }
 structured-logger = { workspace = true }
 log = { workspace = true }
 
-[[example]]
-name = "kip_demo"
-
 [lib]
 doctest = false
