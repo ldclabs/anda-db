@@ -34,7 +34,7 @@ ts/
 └── kip-do/                       # @ldclabs/kip-do: KIP engine on SQLite-backed Durable Objects — still KIP 1.x
 
 py/
-└── anda_cognitive_nexus_py/      # Python binding crate, excluded from workspace by default — still KIP 1.x
+└── anda_cognitive_nexus_py/      # Python binding crate, excluded from workspace by default
 
 fixtures/
 ├── kip-conformance/              # KIP 1.x conformance fixtures (kept until ts/kip-do migrates)

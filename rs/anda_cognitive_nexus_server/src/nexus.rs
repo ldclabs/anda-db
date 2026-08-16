@@ -1,9 +1,4 @@
-use anda_cognitive_nexus::{
-    CognitiveNexus,
-    nexus::DEFAULT_SPACE,
-    profiles::COGNITIVE_MEMORY,
-    schema::{PackageState, SchemaLock, SchemaPackage},
-};
+use anda_cognitive_nexus::{CognitiveNexus, nexus::DEFAULT_SPACE, profiles::COGNITIVE_MEMORY};
 use anda_db::{
     collection::{Collection, CollectionConfig},
     database::AndaDB,
@@ -227,24 +222,13 @@ impl Nexus {
     ) -> Result<Self, BoxError> {
         let nexus = CognitiveNexus::connect(db.clone()).await?;
 
-        let bundled = SchemaPackageSource {
-            source: BUNDLED_SOURCE.to_string(),
-            artifact: COGNITIVE_MEMORY.to_string(),
-        };
-        let mut lock = SchemaLock::default();
-        for entry in std::iter::once(&bundled).chain(packages) {
-            let package = SchemaPackage::parse(&entry.artifact).map_err(|err| {
-                BoxError::from(format!("schema package from {}: {err}", entry.source))
-            })?;
-            let package_ref = nexus.install_package(&package, &entry.source).await?;
-            lock.packages.insert(
-                package_ref.package_id.clone(),
-                package_ref.version.to_string(),
-            );
-            lock.states
-                .insert(package_ref.package_id.clone(), PackageState::Active);
-        }
-        let environment = nexus.ensure_schema(DEFAULT_SPACE, lock).await?;
+        let mut artifacts: Vec<(&str, &str)> = vec![(BUNDLED_SOURCE, COGNITIVE_MEMORY)];
+        artifacts.extend(
+            packages
+                .iter()
+                .map(|entry| (entry.source.as_str(), entry.artifact.as_str())),
+        );
+        let environment = nexus.install_and_activate(&artifacts, DEFAULT_SPACE).await?;
         log::info!(
             space = DEFAULT_SPACE,
             version = environment.version,

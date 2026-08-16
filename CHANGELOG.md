@@ -151,6 +151,14 @@ rewriting the old one.
   becomes a duplicated one. `ts/kip-do` consumes this and has not been migrated:
   its `scripts/codegen-errors.mjs` reads the 1.x shape of `error.rs` and will
   need to be rewritten with the rest of that package.
+- **`py/anda_cognitive_nexus_py` builds a 2.0 envelope.** `execute_kip` wraps
+  the command in a single-operation request, binds parameters as request-level
+  bindings, and returns `(CommandType, Response)` instead of a `Result` whose
+  `Err` never happened — a KIP failure is an answer with a code, a hint and a
+  retry class, and flattening it into a Python string throws away everything
+  the caller needs to recover. `create_kip_db` activates the bundled
+  cognitive-memory profile, so `$ConceptType` bootstrapping is gone: a type is
+  a Schema Package symbol now, not something a write can invent.
 
 ## [KIP v1.0-RC11] — 2026-08-14
 

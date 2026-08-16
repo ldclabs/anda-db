@@ -1,20 +1,29 @@
-import json
+"""Python-level tests for the KIP 2.0 binding.
+
+`execute_kip` returns `{"type": PyCommandType, "response": <envelope>}`, where
+the envelope is the KIP 2.0 response (§81): a `status`, one `results[]` entry
+per operation, and — for an envelope-level failure — a request-level `error`.
+An ordinary command failure reports on its own result, so tests that want the
+error look at `results[0]["error"]`.
+"""
+
 import pytest
-import asyncio
 from anda_cognitive_nexus_py import PyCommandType, PyAndaDB, StoreLocationType, AndaDbConfig
+
+
+def operation_error(response):
+    """The error of a single-operation response, wherever it was reported."""
+    if response.get("error"):
+        return response["error"]
+    results = response.get("results") or []
+    return results[0].get("error") if results else None
+
 
 @pytest.mark.asyncio
 async def test_create_success():
-    # db_config = {
-    #     "store_location_type": StoreLocationType.InMem,
-    #     "store_location": "",
-    #     "db_name": "test_db",
-    #     "db_desc": "Test DB",
-    #     "meta_cache_capacity": 10000
-    # }
     db_config = AndaDbConfig(
-      StoreLocationType.InMem, 
-      "", 
+      StoreLocationType.InMem,
+      "",
       "test_db"
     )
     db = await PyAndaDB.create(db_config)
@@ -33,52 +42,50 @@ async def test_create_invalid_config():
 @pytest.mark.asyncio
 async def test_execute_kip_success():
     db_config = AndaDbConfig(
-      StoreLocationType.InMem, 
-      "", 
+      StoreLocationType.InMem,
+      "",
       "test_db",
       "Test_DB",
       10000
     )
     db = await PyAndaDB.create(db_config)
-    command = "FIND(?x) WHERE { ?x {type: 'TestType'} }"
+    command = 'FIND(?x) WHERE { ?x CONCEPT {type: "Person"} }'
     result = await db.execute_kip(command)
     assert isinstance(result, dict)
-    assert "type" in result
-    assert "response" in result
-    # type should be PyCommandType
     assert type(result["type"]).__name__ == "PyCommandType"
-    # response should be a dict or list (depending on command)
-    assert isinstance(result["response"], dict)
+    assert result["type"] == PyCommandType.Kql
+    response = result["response"]
+    assert response["kip"] == "2.0"
+    assert response["status"] == "succeeded"
+    # Nothing has been written, and an empty memory answers with an empty
+    # result — not with an error.
+    assert response["results"][0]["result"] == []
 
 @pytest.mark.asyncio
 async def test_execute_kip_invalid_command():
     db_config = AndaDbConfig(
-      StoreLocationType.InMem, 
-      "", 
+      StoreLocationType.InMem,
+      "",
       "test_db",
       "Test_DB",
       10000
     )
     db = await PyAndaDB.create(db_config)
-    bad_command = "INVALID_COMMAND"
-    result = await db.execute_kip(bad_command)
-    assert isinstance(result, dict)
-    assert "type" in result
-    assert "response" in result
-    # type should be PyCommandType
-    assert type(result["type"]).__name__ == "PyCommandType"
-    # response should contain error info (implementation dependent)
-    assert isinstance(result["response"], dict)
-    # Optionally inspect for error keys/messages
-    if isinstance(result["response"], dict):
-        assert result["type"] == PyCommandType.Unknown
-        assert len(result["response"]) and "error" in result["response"]
+    result = await db.execute_kip("INVALID_COMMAND")
+    assert result["type"] == PyCommandType.Unknown
+    response = result["response"]
+    assert response["status"] == "failed"
+    error = operation_error(response)
+    assert error["code"] == "InvalidSyntax"
+    # The hint is the agent-facing recovery instruction; without it a model
+    # cannot correct itself from the error alone.
+    assert error["hint"]
+    assert error["retry"]["class"] == "requires_different_input"
 
 @pytest.mark.asyncio
 async def test_execute_kip_invalid_parameters_error_message():
-    """
-    Test that execute_kip returns a user-friendly error message for invalid command/parameters.
-    """
+    """A syntactically invalid command fails with a registered code, not a
+    stringified panic."""
     db_config = AndaDbConfig(
         StoreLocationType.InMem,
         "",
@@ -87,24 +94,13 @@ async def test_execute_kip_invalid_parameters_error_message():
         10000
     )
     db = await PyAndaDB.create(db_config)
-    # Pass a syntactically invalid command
-    bad_command = "FIND( WHERE { ?x {type: 'TestType'} }"  # missing closing parenthesis
+    bad_command = 'FIND( WHERE { ?x CONCEPT {type: "Person"} }'  # missing ')'
     result = await db.execute_kip(bad_command)
-    assert isinstance(result, dict)
-    assert "type" in result
-    assert "response" in result
-    # Should indicate error in type or response
-    assert result["type"] == PyCommandType.Unknown or result["type"].__class__.__name__ == "PyCommandType"
-    assert isinstance(result["response"], dict)
-    # Check for user-friendly error message
-    assert any(
-        k in result["response"] for k in ("error", "message", "detail")
-    ), f"No error key found in response: {result['response']}"
-    # Optionally, check that the error message is not empty and is user-friendly
-    error_msg = result["response"].get("error") or result["response"].get("message") or result["response"].get("detail")
-    assert error_msg and isinstance(error_msg, dict)
-    error_str = json.dumps(error_msg)
-    assert "error" in error_str.lower()
+    assert result["type"] == PyCommandType.Unknown
+    error = operation_error(result["response"])
+    assert error is not None, result["response"]
+    assert error["code"] == "InvalidSyntax"
+    assert isinstance(error["message"], str) and error["message"]
 
 def test_andadbconfig_type_validation():
     # db_name should be a string, not an int
@@ -128,7 +124,7 @@ async def test_execute_kip_non_json_parameters_raise_value_error():
     """
     db_config = AndaDbConfig(StoreLocationType.InMem, "", "test_db_bad_params")
     db = await PyAndaDB.create(db_config)
-    command = "FIND(?x) WHERE { ?x {type: :t} }"
+    command = 'FIND(?x) WHERE { ?x CONCEPT {type: :t} }'
     # unsupported value type
     with pytest.raises(ValueError):
         await db.execute_kip(command, parameters={"t": object()})
@@ -141,32 +137,51 @@ async def test_execute_kip_non_json_parameters_raise_value_error():
 
 @pytest.mark.asyncio
 async def test_execute_kip_nested_parameters():
-    """Nested JSON-compatible parameters (lists, tuples, dicts) are accepted."""
+    """Nested JSON-compatible parameters (lists, tuples, dicts) are accepted,
+    and reach the graph as data rather than as command text."""
     db_config = AndaDbConfig(StoreLocationType.InMem, "", "test_db_nested_params")
     db = await PyAndaDB.create(db_config)
-    upsert = await db.execute_kip(
-        'UPSERT { CONCEPT ?c { {type: "$ConceptType", name: :tname} '
-        "SET ATTRIBUTES { tags: :tags, meta: :meta, pair: :pair } } }",
+    written = await db.execute_kip(
+        'CREATE CONCEPT ?c { TYPE "Person" NAME :who '
+        "SET ATTRIBUTES { aliases: :aliases, description: :description } }",
         parameters={
-            "tname": "Symptom",
-            "tags": ["a", "b"],
-            "meta": {"k": [1, 2.5, True, None]},
-            "pair": (1, 2),  # tuple becomes a JSON array
+            "who": "Alice",
+            "aliases": ["Ally", "Al"],
+            "description": "written through bound parameters",
         },
     )
-    assert "result" in upsert["response"], upsert["response"]
+    assert written["response"]["status"] == "succeeded", written["response"]
+    assert written["type"] == PyCommandType.Kml
+
     found = await db.execute_kip(
-        "FIND(?x.name) WHERE { ?x {type: :t, name: :n} }",
-        parameters={"t": "$ConceptType", "n": "Symptom"},
+        'FIND(?c.name, ?c.attributes.aliases) WHERE { ?c CONCEPT {type: "Person", name: :who} }',
+        parameters={"who": "Alice"},
     )
-    assert found["response"]["result"] == ["Symptom"]
+    assert found["response"]["status"] == "succeeded", found["response"]
+    assert found["response"]["results"][0]["result"] == [["Alice", ["Ally", "Al"]]]
+
+@pytest.mark.asyncio
+async def test_dry_run_commits_nothing():
+    """A dry run validates without establishing a durable commit (§69.3)."""
+    db_config = AndaDbConfig(StoreLocationType.InMem, "", "test_db_dry_run")
+    db = await PyAndaDB.create(db_config)
+    validated = await db.execute_kip(
+        'CREATE CONCEPT ?c { TYPE "Person" NAME "Ghost" }', dry_run=True
+    )
+    assert validated["response"]["status"] == "succeeded", validated["response"]
+
+    found = await db.execute_kip(
+        'FIND(?c.name) WHERE { ?c CONCEPT {type: "Person", name: "Ghost"} }'
+    )
+    assert found["response"]["results"][0]["result"] == []
 
 @pytest.mark.asyncio
 async def test_close_is_idempotent():
     db_config = AndaDbConfig(StoreLocationType.InMem, "", "test_db_close")
     db = await PyAndaDB.create(db_config)
     result = await db.execute_kip("DESCRIBE PRIMER")
-    assert "response" in result
+    assert result["type"] == PyCommandType.Meta
+    assert result["response"]["status"] == "succeeded"
     assert await db.close() is None
     # second close is a no-op
     assert await db.close() is None
@@ -189,11 +204,9 @@ async def test_pyandadb_thread_safety_and_async():
             10000
         )
         db = await PyAndaDB.create(db_config)
-        command = f"FIND(?x) WHERE {{ ?x {{type: 'TestType{idx}'}} }}"
+        command = f'FIND(?x) WHERE {{ ?x CONCEPT {{name: "person-{idx}"}} }}'
         result = await db.execute_kip(command)
-        assert isinstance(result, dict)
-        assert "type" in result
-        assert "response" in result
+        assert result["response"]["status"] == "succeeded", result["response"]
         return result
 
     # Run several tasks concurrently in asyncio
@@ -215,4 +228,3 @@ async def test_pyandadb_thread_safety_and_async():
         assert isinstance(res, dict)
         assert "type" in res
         assert "response" in res
-

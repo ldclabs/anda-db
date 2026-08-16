@@ -1,9 +1,12 @@
 #![allow(non_local_definitions)]
 
-use anda_cognitive_nexus::CognitiveNexus;
+use anda_cognitive_nexus::{nexus::DEFAULT_SPACE, profiles::COGNITIVE_MEMORY, CognitiveNexus};
 use anda_db::database::{AndaDB, DBConfig};
 use anda_kip::executor::Executor;
-use anda_kip::{CommandType, Json, KipError, Map, Number, Request, Response};
+use anda_kip::{
+    execute_request, parse_kip, CommandType, Json, KipError, Map, Number, Request, RequestOptions,
+    Response,
+};
 use anda_object_store::MetaStoreBuilder;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
@@ -152,33 +155,27 @@ impl PyAndaDB {
 
         // Async future that returns a PyObject (a Python dict)
         let fut = async move {
-            match execute_kip(nexus.as_ref(), command, Some(params_map), dry_run).await {
-                Ok((cmd_type, response)) => {
-                    // Convert both the cmd_type and the response into Python objects while holding the GIL
-                    let py_obj: PyObject = Python::with_gil(|py| -> PyResult<PyObject> {
-                        // 1) Wrap cmd_type into the Python-visible class
-                        let py_cmd_wrapper = Py::new(py, PyCommandType::from(cmd_type))?;
+            let (cmd_type, response) =
+                execute_kip(nexus.as_ref(), command, Some(params_map), dry_run).await;
+            // Convert both the cmd_type and the response into Python objects while holding the GIL
+            let py_obj: PyObject = Python::with_gil(|py| -> PyResult<PyObject> {
+                // 1) Wrap cmd_type into the Python-visible class
+                let py_cmd_wrapper = Py::new(py, PyCommandType::from(cmd_type))?;
 
-                        // 2) Convert response (serde-serializable) into a Python object using serde-pyobject
-                        let py_response = to_pyobject(py, &response).map_err(|e| {
-                            PyRuntimeError::new_err(format!("Response conversion error: {}", e))
-                        })?;
+                // 2) Convert response (serde-serializable) into a Python object using serde-pyobject
+                let py_response = to_pyobject(py, &response).map_err(|e| {
+                    PyRuntimeError::new_err(format!("Response conversion error: {}", e))
+                })?;
 
-                        // 3) Build the resulting Python dict {"type": <PyCommandType>, "response": <py_response>}
-                        let out_dict = PyDict::new(py);
-                        out_dict.set_item("type", py_cmd_wrapper.as_ref(py))?;
-                        out_dict.set_item("response", py_response)?;
+                // 3) Build the resulting Python dict {"type": <PyCommandType>, "response": <py_response>}
+                let out_dict = PyDict::new(py);
+                out_dict.set_item("type", py_cmd_wrapper.as_ref(py))?;
+                out_dict.set_item("response", py_response)?;
 
-                        Ok(out_dict.into())
-                    })?;
+                Ok(out_dict.into())
+            })?;
 
-                    Ok(py_obj)
-                }
-                Err(e) => Err(PyRuntimeError::new_err(format!(
-                    "KIP execution error: {}",
-                    e
-                ))),
-            }
+            Ok(py_obj)
         };
 
         // Convert the Rust Future -> Python awaitable
@@ -466,52 +463,67 @@ pub async fn create_kip_db(db_config: AndaDbConfig) -> Result<Arc<CognitiveNexus
     };
 
     let db = Arc::new(AndaDB::connect(object_store, db_config).await?);
-    let nexus = Arc::new(CognitiveNexus::connect(db, async |_| Ok(())).await?);
-    Ok(nexus)
+    let nexus = CognitiveNexus::connect(db).await?;
+    // A Space that has activated no Schema Package resolves the Core package
+    // only, and Core declares no Concept types — so without this the binding
+    // would open cleanly and then refuse every `CREATE CONCEPT` sent to it.
+    // Activation is skipped when the same lock is already in force, so
+    // re-opening a file-backed database does not mint an environment version.
+    nexus
+        .install_and_activate(&[("bundled", COGNITIVE_MEMORY)], DEFAULT_SPACE)
+        .await?;
+    Ok(Arc::new(nexus))
 }
 
-/// Executes a KIP command using an existing Executor instance.
+/// Executes one KIP command using an existing Executor instance.
+///
+/// The command is wrapped in a single-operation KIP 2.0 request envelope
+/// (§71). Parameters are bound structurally, as request-level bindings a
+/// command cites as `:name` — they are data, never text spliced into the
+/// command (§74, §88.2).
 ///
 /// # Arguments
 ///
 /// * `nexus` - Reference to an Executor instance (`&(impl Executor + Sync)`).
 /// * `command` - The KIP command string to execute (KML/KQL/META).
 /// * `parameters` - An optional map of command parameters (`Option<Map<String, Json>>`). If `None`, treated as empty.
-/// * `dry_run` - If true, performs a dry run without committing changes.
+/// * `dry_run` - If true, validates without establishing a durable commit.
 ///
 /// # Returns
 ///
-/// Returns a tuple of the command type and the response on success, or a boxed error on failure.
-///
-/// # Errors
-///
-/// Returns an error if the KIP command execution fails.
+/// The command family and the response. A failed execution is a `Response`
+/// carrying an error object, not an `Err`: a KIP failure is an answer with a
+/// registered code, hint and retry class, and flattening it into a string
+/// would throw away everything a caller needs to recover.
 ///
 /// # Example
 ///
-/// Refer to tools/anda_cognitive_nexus_py/examples directory
+/// Refer to the `examples` directory.
 pub async fn execute_kip(
     nexus: &impl Executor,
     command: String,
     parameters: Option<Map<String, Json>>,
     dry_run: bool,
-) -> Result<(CommandType, Response), BoxError> {
-    let params_map = parameters.unwrap_or_default();
+) -> (CommandType, Response) {
+    // Classified from the parsed command, never from a declared label (§73.1).
+    let language = parse_kip(&command).map_or(CommandType::Unknown, |c| CommandType::from(&c));
 
     let request = Request {
-        command,
-        parameters: params_map,
-        dry_run,
-        ..Default::default()
+        parameters: parameters.filter(|p| !p.is_empty()),
+        options: Some(RequestOptions {
+            dry_run: Some(dry_run),
+            ..Default::default()
+        }),
+        ..Request::single(command)
     };
 
-    Ok(request.execute(nexus).await)
+    (language, execute_request(nexus, &request).await)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anda_kip::{Json, Map};
+    use anda_kip::{Json, Map, TopLevelStatus};
     use std::future::Future;
 
     // Helper to run async code in tests
@@ -519,219 +531,183 @@ mod tests {
         tokio::runtime::Runtime::new().unwrap().block_on(fut)
     }
 
-    // Create basic concept types and medical knowledge capsule
-    static MEDICAL_KNOWLEDGE_KML: &str = r#"
-        UPSERT {
-            // Define concept types
-            CONCEPT ?drug_type {
-                {type: "$ConceptType", name: "Drug"}
-                SET ATTRIBUTES {
-                    description: "Pharmaceutical drug concept type"
+    /// Records what somebody prefers, the way KIP 2.0 records anything: the
+    /// Concepts exist, a Proposition states the tuple without claiming it, and
+    /// an Assertion is what commits to it.
+    ///
+    /// The types come from the bundled cognitive-memory profile. There is no
+    /// `$ConceptType` node to create first — in 2.0 authoritative Schema is an
+    /// immutable package artifact, not graph state, so a KML statement cannot
+    /// invent a type on its way to using it.
+    static RECORD_A_PREFERENCE: &str = r#"
+        MUTATE {
+            CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
+            CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark mode" }
+            CREATE EVIDENCE ?said {
+                SET FIELDS {
+                    evidence_class: "user_statement",
+                    payload: "I prefer dark mode."
                 }
             }
-
-            CONCEPT ?symptom_type {
-                {type: "$ConceptType", name: "Symptom"}
-                SET ATTRIBUTES {
-                    description: "Medical symptom concept type"
-                }
+            ASSERT ?a (?alice, "prefers", ?dark) {
+                by: ?alice, mode: "stated", confidence: 0.9, evidence: ?said
             }
-
-            // Define relation types
-            CONCEPT ?treats_relation {
-                {type: "$PropositionType", name: "treats"}
-                SET ATTRIBUTES {
-                    description: "Drug treats symptom relationship"
-                }
-            }
-
-            CONCEPT ?has_side_effect_relation {
-                {type: "$PropositionType", name: "has_side_effect"}
-                SET ATTRIBUTES {
-                    description: "Drug has side effect relationship"
-                }
-            }
-
-            // Create symptom concepts
-            CONCEPT ?headache {
-                {type: "Symptom", name: "Headache"}
-                SET ATTRIBUTES {
-                    severity_scale: "1-10",
-                    description: "Pain in the head or neck area"
-                }
-            }
-
-            CONCEPT ?fever {
-                {type: "Symptom", name: "Fever"}
-                SET ATTRIBUTES {
-                    normal_temp: "98.6°F (37°C)",
-                    description: "Elevated body temperature"
-                }
-            }
-
-            CONCEPT ?stomach_irritation {
-                {type: "Symptom", name: "Stomach Irritation"}
-                SET ATTRIBUTES {
-                    severity: "mild to moderate",
-                    description: "Gastrointestinal discomfort"
-                }
-            }
-
-            // Create specific drug concepts
-            CONCEPT ?aspirin {
-                {type: "Drug", name: "Aspirin"}
-                SET ATTRIBUTES {
-                    molecular_formula: "C9H8O4",
-                    risk_level: 1,
-                    description: "Common pain reliever and anti-inflammatory drug"
-                }
-                SET PROPOSITIONS {
-                    ("treats", ?headache)
-                    ("treats", ?fever)
-                    ("has_side_effect", ?stomach_irritation)
-                }
-            }
-        }
-        WITH METADATA {
-            source: "KIP Demo Medical Knowledge",
-            author: "Demo System",
-            confidence: 0.95,
-            created_at: "2025-07-01T00:00:00Z"
         }
         "#;
 
-    // Create a new hypothetical drug
-    static NEW_DRUG_KML: &str = r#"
-        UPSERT {
-            CONCEPT ?brain_fog {
-                {type: "Symptom", name: "Brain Fog"}
-                SET ATTRIBUTES {
-                    description: "Mental fatigue and lack of clarity",
-                    cognitive_impact: "high"
+    /// A second, independent claim, so the read below has more than one row to
+    /// order — and a second confidence to order them by.
+    static RECORD_ANOTHER_PREFERENCE: &str = r#"
+        MUTATE {
+            CREATE CONCEPT ?bob { TYPE "Person" NAME "Bob" }
+            CREATE CONCEPT ?light { TYPE "Preference" NAME "Light mode" }
+            CREATE EVIDENCE ?said {
+                SET FIELDS {
+                    evidence_class: "user_statement",
+                    payload: "Light mode, please."
                 }
             }
-
-            CONCEPT ?neural_bloom {
-                {type: "Symptom", name: "Neural Bloom"}
-                SET ATTRIBUTES {
-                    description: "A rare side effect characterized by temporary burst of creative thoughts",
-                    frequency: "rare",
-                    severity: "mild"
-                }
+            ASSERT ?a (?bob, "prefers", ?light) {
+                by: ?bob, mode: "stated", confidence: 0.6, evidence: ?said
             }
-
-            CONCEPT ?cognizine {
-                {type: "Drug", name: "Cognizine"}
-                SET ATTRIBUTES {
-                    molecular_formula: "C12H15N5O3",
-                    risk_level: 2,
-                    description: "A novel nootropic drug designed to enhance cognitive functions",
-                    status: "experimental"
-                }
-                SET PROPOSITIONS {
-                    ("treats", {type: "Symptom", name: "Brain Fog"})
-                    ("has_side_effect", ?neural_bloom)
-                }
-            }
-        }
-        WITH METADATA {
-            source: "Experimental Drug Research",
-            confidence: 0.75,
-            status: "under_review"
         }
         "#;
+
+    fn run(nexus: &CognitiveNexus, command: &str) -> Response {
+        let (_, response) = block_on(execute_kip(nexus, command.to_string(), None, false));
+        response
+    }
 
     #[test]
     fn test_execute_kip_in_mem() {
-        // 1. Execute the first KML command from the demo to set up schema and initial data
-        println!("\n1. Executing Medical Knowledge KML...");
-
-        // Add db_config for in-memory DB (as AndaDbConfig struct expects)
         let db_config_in_mem = AndaDbConfig {
             store_location_type: StoreLocationType::InMem,
             store_location: "".to_owned(),
-            db_name: "test_medical_db".to_string(),
-            db_desc: Some("Ephemeral DB for medical KIP test".to_string()),
+            db_name: "test_preferences_db".to_string(),
+            db_desc: Some("Ephemeral DB for the KIP binding test".to_string()),
             meta_cache_capacity: Some(10000),
         };
+        let nexus = block_on(create_kip_db(db_config_in_mem)).expect("Failed to create Nexus");
 
-        // Create Nexus instance for in-memory DB
-        let nexus_in_mem =
-            block_on(create_kip_db(db_config_in_mem)).expect("Failed to create in_mem Nexus");
-
-        // Use empty Map for parameters
-        let empty_params: Map<String, Json> = Map::new();
-
-        let (_, response1) = block_on(execute_kip(
-            nexus_in_mem.as_ref(),
-            MEDICAL_KNOWLEDGE_KML.to_string(),
-            Some(empty_params.clone()),
-            false,
-        ))
-        .expect("Execution of medical_knowledge_kml failed");
-        assert!(
-            matches!(response1, Response::Ok { .. }),
-            "Expected first KML execution to be Ok, but got {:?}",
-            response1
-        );
-        println!("Medical Knowledge KML executed successfully (in_mem DB).");
-
-        // 2. Execute the second KML command from the demo to add more data
-        println!("\n2. Executing New Drug KML...");
-
-        let (_, response2) = block_on(execute_kip(
-            nexus_in_mem.as_ref(),
-            NEW_DRUG_KML.to_string(),
-            None,
-            false,
-        ))
-        .expect("Execution of new_drug_kml failed");
-        assert!(
-            matches!(response2, Response::Ok { .. }),
-            "Expected third KML execution to be Ok, but got {:?}",
-            response2
-        );
-        println!("New Drug KML executed successfully (in_mem DB).");
-        // 3. Execute a KQL query from the demo to verify the data
-        println!("\n3. Executing KQL Query to find all drugs...");
-        let query = r#"
-        FIND(?drug.name, ?drug.attributes.molecular_formula, ?drug.attributes.risk_level)
-        WHERE {
-            ?drug {type: "Drug"}
-        }
-        ORDER BY ?drug.attributes.risk_level ASC
-        "#;
-
-        let (_, query_response) = block_on(execute_kip(
-            nexus_in_mem.as_ref(),
-            query.to_string(),
-            None,
-            false,
-        ))
-        .expect("Execution of KQL query failed");
-
-        println!("Query Response: {:#?}", query_response);
-
-        // 4. Assert that the query was successful and returned the correct data
-        assert!(
-            matches!(query_response, Response::Ok { .. }),
-            "Expected KQL query to be Ok, but got {:?}",
-            query_response
-        );
-
-        if let Response::Ok { result, .. } = query_response {
-            let result_array = result.as_array().expect("Result should be an array");
+        for kml in [RECORD_A_PREFERENCE, RECORD_ANOTHER_PREFERENCE] {
+            let response = run(nexus.as_ref(), kml);
             assert_eq!(
-                result_array.len(),
-                2,
-                "Expected to find 2 drugs, but found {}",
-                result_array.len()
+                response.status,
+                TopLevelStatus::Succeeded,
+                "KML failed: {:#?}",
+                response.results
             );
-            println!("Successfully found 2 drugs as expected.");
-        } else {
-            panic!("Query failed, expected Ok response");
         }
 
-        println!("\n--- Full Stateful KIP Execution Test Passed ---");
+        // Read the Assertions back. This asks who claimed what with how much
+        // confidence — not what is true: belief is projected from Assertions
+        // under a policy, and a raw read must not be mistaken for one.
+        let query = r#"
+        FIND(?person.name, ?a.confidence)
+        WHERE {
+            ?person CONCEPT {type: "Person"}
+            ?p PROPOSITION (?person, "prefers", ?pref)
+            ?a ASSERTION {proposition: ?p}
+        }
+        ORDER BY ?a.confidence DESC
+        "#;
+        let (language, query_response) =
+            block_on(execute_kip(nexus.as_ref(), query.to_string(), None, false));
+        assert!(matches!(language, CommandType::Kql));
+        assert_eq!(
+            query_response.status,
+            TopLevelStatus::Succeeded,
+            "KQL failed: {:#?}",
+            query_response.results
+        );
+
+        let result = query_response
+            .first_result()
+            .expect("the read returns a result");
+        let rows = result
+            .as_array()
+            .unwrap_or_else(|| panic!("unexpected result shape: {result:#}"));
+        // A row of a multi-variable projection is an array, in FIND order.
+        // ORDER BY confidence DESC puts Alice's 0.9 before Bob's 0.6.
+        assert_eq!(
+            rows,
+            &vec![
+                Json::from(vec![Json::from("Alice"), Json::from(0.9)]),
+                Json::from(vec![Json::from("Bob"), Json::from(0.6)]),
+            ],
+            "unexpected rows: {result:#}"
+        );
+    }
+
+    /// A dry run validates without committing (§69.3). The Concept it would
+    /// have created must not be readable afterwards.
+    #[test]
+    fn a_dry_run_leaves_nothing_behind() {
+        let nexus = block_on(create_kip_db(AndaDbConfig {
+            store_location_type: StoreLocationType::InMem,
+            store_location: "".to_owned(),
+            db_name: "test_dry_run_db".to_string(),
+            db_desc: None,
+            meta_cache_capacity: Some(10000),
+        }))
+        .expect("Failed to create Nexus");
+
+        let command = r#"CREATE CONCEPT ?c { TYPE "Person" NAME "Ghost" }"#.to_string();
+        let (_, response) = block_on(execute_kip(nexus.as_ref(), command, None, true));
+        assert_eq!(
+            response.status,
+            TopLevelStatus::Succeeded,
+            "dry run failed: {:#?}",
+            response.results
+        );
+
+        let read = run(
+            nexus.as_ref(),
+            r#"FIND(?c.name) WHERE { ?c CONCEPT {type: "Person", name: "Ghost"} }"#,
+        );
+        let rows = read
+            .first_result()
+            .and_then(|result| result.as_array().cloned())
+            .unwrap_or_default();
+        assert!(rows.is_empty(), "a dry run must not commit: {rows:#?}");
+    }
+
+    /// Parameters are bound as data, not spliced into the command text.
+    #[test]
+    fn parameters_are_bound_structurally() {
+        let nexus = block_on(create_kip_db(AndaDbConfig {
+            store_location_type: StoreLocationType::InMem,
+            store_location: "".to_owned(),
+            db_name: "test_params_db".to_string(),
+            db_desc: None,
+            meta_cache_capacity: Some(10000),
+        }))
+        .expect("Failed to create Nexus");
+
+        let response = run(
+            nexus.as_ref(),
+            r#"CREATE CONCEPT ?c { TYPE "Person" NAME "Carol" }"#,
+        );
+        assert_eq!(response.status, TopLevelStatus::Succeeded);
+
+        let mut parameters: Map<String, Json> = Map::new();
+        parameters.insert("who".to_string(), Json::from("Carol"));
+        let (_, response) = block_on(execute_kip(
+            nexus.as_ref(),
+            r#"FIND(?c.name) WHERE { ?c CONCEPT {type: "Person", name: :who} }"#.to_string(),
+            Some(parameters),
+            false,
+        ));
+        assert_eq!(
+            response.status,
+            TopLevelStatus::Succeeded,
+            "parameterized read failed: {:#?}",
+            response.results
+        );
+        let rows = response
+            .first_result()
+            .and_then(|result| result.as_array().cloned())
+            .unwrap_or_default();
+        assert_eq!(rows, vec![Json::from("Carol")], "{rows:#?}");
     }
 }

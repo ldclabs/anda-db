@@ -109,6 +109,44 @@ impl CognitiveNexus {
             .await
     }
 
+    /// Installs each artifact and puts exactly those packages in force in a
+    /// Space.
+    ///
+    /// This is the bootstrap a host runs on start: `artifacts` is `(source,
+    /// JSON)`, where the source is recorded on the installed package row so
+    /// `LIST PACKAGES` can say where an artifact entered. The resulting Schema
+    /// Lock names exactly the packages given — a host owns its Space's lock, so
+    /// dropping an artifact from the list deactivates it — and is activated
+    /// only when it differs from the one already in force.
+    ///
+    /// Installing is still not activating (§240.18): this activates because the
+    /// caller said which packages to activate, not because they were installed.
+    pub async fn install_and_activate(
+        &self,
+        artifacts: &[(&str, &str)],
+        space_id: &str,
+    ) -> Result<SchemaEnvironment, KipError> {
+        let mut lock = crate::schema::SchemaLock::default();
+        for (source, artifact) in artifacts {
+            let package = SchemaPackage::parse(artifact).map_err(|err| {
+                KipError::new(
+                    err.code,
+                    format!("schema package from {source}: {}", err.message),
+                )
+            })?;
+            let package_ref = self.install_package(&package, source).await?;
+            lock.packages.insert(
+                package_ref.package_id.clone(),
+                package_ref.version.to_string(),
+            );
+            lock.states.insert(
+                package_ref.package_id,
+                crate::schema::PackageState::Active,
+            );
+        }
+        self.ensure_schema(space_id, lock).await
+    }
+
     /// Activates `lock` in a Space, but only when it differs from the one
     /// already in force.
     ///
