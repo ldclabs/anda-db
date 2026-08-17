@@ -26,6 +26,58 @@ export {
 } from './errors.js'
 
 export {
+  digestParts,
+  sha256Hex,
+  sha256Text,
+} from './digest.js'
+
+export {
+  ELEMENT_KINDS,
+  UNREACHABLE_SEQ,
+  compareElementId,
+  elementId,
+  elementIdEquals,
+  formatElementId,
+  kindOfTag,
+  parseElementId,
+  parseElementIdOfKind,
+  tagOf,
+  tryParseElementId,
+  type ElementId,
+  type ElementKind,
+} from './id.js'
+
+export {
+  TIME_MAX,
+  TIME_MIN,
+  formatTime,
+  normalizeTime,
+  nowTime,
+  parseTime,
+  type Timestamp,
+} from './time.js'
+
+export {
+  DT_BOOLEAN,
+  DT_NULL,
+  DT_NUMBER,
+  DT_STRING,
+  endpointFromJson,
+  endpointKey,
+  endpointLocal,
+  endpointToJson,
+  literalFromObject,
+  literalFromScalar,
+  literalToJson,
+  localRef,
+  tupleKey,
+  type Endpoint,
+  type Literal,
+} from './term.js'
+
+export * from './store/index.js'
+
+export {
   canonicalJson,
   isJsonArray,
   isJsonMap,
