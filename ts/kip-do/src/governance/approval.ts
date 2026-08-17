@@ -26,9 +26,10 @@
 import { digestParts } from '../digest.js'
 import type { Store } from '../store/index.js'
 import type { AuthContext } from './auth.js'
+import { requirePermitted } from './decision.js'
 import type { Authorization, ResourceContext } from './decision.js'
 import type { Permission } from './permission.js'
-import { approvalId } from './rows.js'
+import { approvalId, rowIdOf } from './rows.js'
 
 /**
  * The identity of one concrete operation, for binding an approval to it.
@@ -98,17 +99,63 @@ export function resolveApproval(
   }
 }
 
-/** Consumes the approvals carried by a decision after its operation succeeds. */
-export function consumeResolvedApprovals(
-  store: Store,
-  decision: Authorization,
-): void {
+/** The approval rows a permitted decision is carrying. */
+function approvalsOf(decision: Authorization): number[] {
   const seen = new Set<number>()
   for (const authority of decision.authorities_used) {
     if (!authority.startsWith('kip:approval:')) continue
-    const id = Number(authority.slice('kip:approval:'.length))
-    if (!Number.isSafeInteger(id) || id < 1 || seen.has(id)) continue
-    store.governance.consumeApproval(id)
+    const id = rowIdOf(authority)
+    if (id === null || id < 1) continue
     seen.add(id)
   }
+  return [...seen]
+}
+
+/**
+ * A permitted decision, together with the approvals that made it one.
+ *
+ * The class exists because "resolve here, spend there" is a two-step contract
+ * that nothing else states. An approval buys one *completed* operation, so
+ * there is exactly one honest ending: {@link Approved.spend}, once the
+ * authorized operation has actually succeeded. Dropping one leaves the same
+ * signatures able to authorize the next attempt, which is precisely what
+ * requiring an approval was meant to prevent.
+ *
+ * @see rs/anda_cognitive_nexus/src/governance/approval.rs
+ */
+export class Approved {
+  /** The decision itself, for the constraints and obligations it carries. */
+  readonly decision: Authorization
+  readonly #approvals: number[]
+
+  private constructor(decision: Authorization) {
+    this.decision = decision
+    this.#approvals = approvalsOf(decision)
+  }
+
+  /**
+   * Requires an already-resolved decision to permit, and takes custody of the
+   * approvals it spent.
+   */
+  static require(decision: Authorization): Approved {
+    return new Approved(requirePermitted(decision))
+  }
+
+  /** Spends the approvals, after the authorized operation succeeded. */
+  spend(store: Store): void {
+    for (const id of this.#approvals) store.governance.consumeApproval(id)
+  }
+}
+
+/** Resolves a decision and requires it to permit, in one step. */
+export function requireApproved(
+  store: Store,
+  spaceId: string,
+  resource: ResourceContext,
+  decision: Authorization,
+  auth: AuthContext,
+): Approved {
+  return Approved.require(
+    resolveApproval(store, spaceId, resource, decision, auth),
+  )
 }

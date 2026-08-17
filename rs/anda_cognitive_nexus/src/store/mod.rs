@@ -55,10 +55,12 @@ use anda_db::{
 use anda_db_schema::Fv;
 use anda_db_tfs::jieba_tokenizer;
 use anda_kip::{ElementKind, KipError};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::error::{db_error, reopen_error, schema_error};
 use crate::id::ElementId;
+use crate::schema::SchemaEnvironment;
 use rows::*;
 
 /// The collection names, in one place so a rename cannot half-happen.
@@ -121,6 +123,15 @@ pub struct Store {
     schema_packages: Slot,
     schema_envs: Slot,
     element_versions: Slot,
+    /// Resolved Schema Environments, keyed by Space and version.
+    ///
+    /// Safe to keep forever, and that is a property of the data rather than a
+    /// bet: activation only ever mints a *new* version (§143), and an installed
+    /// package is immutable by reference (§240.4). So one `(space, version)`
+    /// resolves to one environment for the life of the database. Without this,
+    /// every KQL, KML and META command re-read every installed artifact and
+    /// re-parsed it — tens of KB of JSON before the command looked at any data.
+    environments: Arc<parking_lot::RwLock<BTreeMap<(String, u64), SchemaEnvironment>>>,
 }
 
 /// The columns every element kind is indexed on.
@@ -367,6 +378,7 @@ impl Store {
             schema_packages: Slot::new(schema_packages),
             schema_envs: Slot::new(schema_envs),
             element_versions: Slot::new(element_versions),
+            environments: Arc::new(parking_lot::RwLock::new(BTreeMap::new())),
         })
     }
 

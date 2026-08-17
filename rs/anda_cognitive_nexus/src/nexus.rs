@@ -25,6 +25,7 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
+use crate::governance::approval::Approved;
 use crate::governance::rows::principal_class;
 use crate::governance::store::PrincipalDraft;
 use crate::governance::{
@@ -518,7 +519,8 @@ impl Executor for Session {
                 };
                 // No approval guard here: the exclusive write lock above
                 // already serializes everything that could spend an approval.
-                let base = base_authorizations(&authority, &auth, gate::kml_permissions(&statement));
+                let base =
+                    base_authorizations(&authority, &auth, gate::kml_permissions(&statement));
                 let decisions = match self.gate(&authority, &auth, base).await {
                     Ok(decisions) => decisions,
                     Err(err) => return Response::from(err),
@@ -533,7 +535,7 @@ impl Executor for Session {
                     &auth,
                 )
                 .await;
-                let response = self.settle(response, &decisions).await;
+                let response = self.settle(response, decisions).await;
                 // A poison event costs no further command: the next mutation
                 // would be rejected outright, so recovery happens here rather
                 // than being deferred to the caller's next attempt.
@@ -566,7 +568,7 @@ impl Executor for Session {
                     &auth,
                 )
                 .await;
-                self.settle(response, &decisions).await
+                self.settle(response, decisions).await
             }
             Command::Meta(command) => {
                 // META is semantically read-only (§63.2), so it shares the
@@ -592,7 +594,7 @@ impl Executor for Session {
                     &auth,
                 )
                 .await;
-                self.settle(response, &decisions).await
+                self.settle(response, decisions).await
             }
         }
     }
@@ -635,7 +637,7 @@ impl Session {
         authority: &EffectiveAuthority,
         auth: &AuthContext,
         needed: Vec<Authorization>,
-    ) -> Result<Vec<Authorization>, KipError> {
+    ) -> Result<Vec<Approved>, KipError> {
         let resource = ResourceContext::default();
         let mut decisions = Vec::with_capacity(needed.len());
         for base in needed {
@@ -654,11 +656,11 @@ impl Session {
             if !decision.is_permitted() {
                 self.audit(authority, auth, &decision).await;
             }
-            let decision = decision.into_result()?;
-            if decision.obligations.audit {
-                self.audit(authority, auth, &decision).await;
+            let approved = Approved::require(decision)?;
+            if approved.decision().obligations.audit {
+                self.audit(authority, auth, approved.decision()).await;
             }
-            decisions.push(decision);
+            decisions.push(approved);
         }
         Ok(decisions)
     }
@@ -685,13 +687,12 @@ impl Session {
     ///
     /// A failed attempt leaves them unspent: an approval buys one completed
     /// operation, not one try at it.
-    async fn settle(&self, response: Response, decisions: &[Authorization]) -> Response {
+    async fn settle(&self, response: Response, approvals: Vec<Approved>) -> Response {
         if response.status != anda_kip::TopLevelStatus::Succeeded {
             return response;
         }
-        for decision in decisions {
-            if let Err(err) = crate::governance::approval::consume(&self.nexus.store, decision).await
-            {
+        for approved in approvals {
+            if let Err(err) = approved.spend(&self.nexus.store).await {
                 return Response::from(err);
             }
         }

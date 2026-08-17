@@ -319,7 +319,6 @@ impl Solutions {
         }
         Solutions { vars, rows }
     }
-
 }
 
 /// Whether two bindings of the same variable agree.

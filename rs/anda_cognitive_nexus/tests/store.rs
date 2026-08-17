@@ -267,15 +267,63 @@ async fn a_reference_out_of_the_space_is_refused() {
     let there_id = store.insert(&other_cx, &mut there).await.unwrap();
 
     store
-        .check_same_space(SPACE, here_id, "subject")
+        .check_same_space(SPACE, here_id, here_id)
         .await
         .unwrap();
     let err = store
-        .check_same_space(SPACE, there_id, "subject")
+        .check_same_space(SPACE, here_id, there_id)
         .await
         .unwrap_err();
     assert_eq!(err.name(), "StructuralReferenceInvalid");
     assert!(err.message.contains("space-other"));
+}
+
+#[tokio::test]
+async fn a_commit_refuses_a_reference_that_leaves_the_space() {
+    // Spec §7: baseline Core is same-Space closed. The rule used to live in a
+    // helper nothing called, so it held only for the clauses that remembered
+    // it; it is enforced at commit now, over every staged row, which is why a
+    // clause that never heard of it still cannot write past the boundary.
+    let store = fresh_store("closure").await;
+    store
+        .open_or_create_space(SpaceDraft {
+            space_id: SPACE.to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    store
+        .open_or_create_space(SpaceDraft {
+            space_id: "space-other".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let other_cx = store
+        .begin_transaction("space-other", json!({}))
+        .await
+        .unwrap();
+    let mut there = concept("There");
+    let there_id = store.insert(&other_cx, &mut there).await.unwrap();
+
+    let err = store
+        .check_same_space(SPACE, ElementId::new(ElementKind::Concept, 1), there_id)
+        .await
+        .unwrap_err();
+    assert_eq!(err.name(), "StructuralReferenceInvalid");
+    assert!(err.message.contains("space-other"));
+
+    // A reference to nothing is a different problem, and this rule stays out of
+    // it: naming an id that does not resolve did not leave the Space.
+    store
+        .check_same_space(
+            SPACE,
+            ElementId::new(ElementKind::Concept, 1),
+            ElementId::new(ElementKind::Concept, 9_999),
+        )
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

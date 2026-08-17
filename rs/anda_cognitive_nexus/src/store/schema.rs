@@ -131,6 +131,20 @@ impl Store {
         Ok(package_ref)
     }
 
+    /// A resolved environment this Nexus has already built, if it has.
+    fn cached_environment(&self, space_id: &str, version: u64) -> Option<SchemaEnvironment> {
+        self.environments
+            .read()
+            .get(&(space_id.to_string(), version))
+            .cloned()
+    }
+
+    fn remember_environment(&self, space_id: &str, version: u64, env: &SchemaEnvironment) {
+        self.environments
+            .write()
+            .insert((space_id.to_string(), version), env.clone());
+    }
+
     /// Every installed artifact, keyed by canonical reference.
     pub async fn installed_packages(
         &self,
@@ -267,6 +281,9 @@ impl Store {
         if version == 0 {
             return Ok(SchemaEnvironment::core_only());
         }
+        if let Some(cached) = self.cached_environment(space_id, version) {
+            return Ok(cached);
+        }
         let collection = self.schema_envs();
         let ids = collection
             .query_all_ids(anda_db::query::Filter::And(vec![
@@ -289,7 +306,9 @@ impl Store {
             KipError::internal_error(format!("a stored Schema Lock is unreadable: {err}"))
         })?;
         let available = self.installed_packages().await?;
-        SchemaEnvironment::resolve(row.version, lock, &available)
+        let environment = SchemaEnvironment::resolve(row.version, lock, &available)?;
+        self.remember_environment(space_id, version, &environment);
+        Ok(environment)
     }
 
     /// Installs the built-in Core package if it is not already present.

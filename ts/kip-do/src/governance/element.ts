@@ -55,14 +55,16 @@ import {
   type Store,
 } from '../store/index.js'
 import { nowTime } from '../time.js'
-import { consumeResolvedApprovals, resolveApproval } from './approval.js'
+import { requireApproved, type Approved } from './approval.js'
 import type { AuthContext } from './auth.js'
 import {
   requirePermitted,
   resourceOfElement,
   authorityCeiling,
   type EffectiveAuthority,
+  type ResourceContext,
 } from './decision.js'
+import type { Permission } from './permission.js'
 import { authority, classification } from './lattice.js'
 
 /** The `governance` member holding an element's influence-authority ceiling. */
@@ -111,22 +113,14 @@ export function classify(
   const effective = current === '' ? cx.authority.defaultClassification() : current
   const lowering = classification.rank(label) < classification.rank(effective)
   const permission = lowering ? 'declassify' : 'update'
-  const decision = requirePermitted(
-    resolveApproval(
-      cx.store,
-      cx.space,
-      resource,
-      cx.authority.authorize(permission, resource, cx.auth),
-      cx.auth,
-    ),
-  )
+  const approved = decide(cx, resource, permission)
 
   const op = lowering ? 'declassify' : 'classify'
-  const version = commit(cx, element, op, null, (block) =>
+  apply(cx, element, op, op, null, (block) =>
     setMember(block, 'classification', label),
+    (version) => ({ from: current, to: label, version }),
+    approved,
   )
-  audit(cx, id, op, { from: current, to: label, version })
-  consumeResolvedApprovals(cx.store, decision)
   return current
 }
 
@@ -155,20 +149,12 @@ export function elevateAuthority(
   // §129: elevation is exactly the operation a policy asks for independent
   // approval on, and §246 requires that one approval of two is not partial
   // activation. That is decided here rather than by the caller.
-  const decision = requirePermitted(
-    resolveApproval(
-      cx.store,
-      cx.space,
-      resource,
-      cx.authority.authorize('elevate_authority', resource, cx.auth),
-      cx.auth,
-    ),
-  )
+  const approved = decide(cx, resource, 'elevate_authority')
 
   const current = ceilingOf(element)
   const raising = authority.rank(cls) > authority.rank(current)
   if (raising) {
-    const grantedCeiling = authorityCeiling(decision.constraints)
+    const grantedCeiling = authorityCeiling(approved.decision.constraints)
     if (authority.rank(cls) > authority.rank(grantedCeiling)) {
       throw errors.notAuthorized(
         `${JSON.stringify(cls)} exceeds this Principal's influence-authority ` +
@@ -187,17 +173,15 @@ export function elevateAuthority(
   }
 
   const op = raising ? 'elevate' : 'downgrade'
-  const version = commit(cx, element, op, null, (block) =>
-    setMember(block, AUTHORITY_KEY, cls),
+  apply(cx, element, op,
+    raising ? 'elevate_authority' : 'downgrade_authority',
+    null,
+    (block) => setMember(block, AUTHORITY_KEY, cls),
+    // §130: an elevation record names the artifact, both ceilings, who decided
+    // and when. The transaction and the audit entry supply the rest between them.
+    (version) => ({ from: current, to: cls, version }),
+    approved,
   )
-  // §130: an elevation record names the artifact, both ceilings, who decided
-  // and when. The transaction and the audit entry supply the rest between them.
-  audit(cx, id, raising ? 'elevate_authority' : 'downgrade_authority', {
-    from: current,
-    to: cls,
-    version,
-  })
-  consumeResolvedApprovals(cx.store, decision)
   return current
 }
 
@@ -217,20 +201,12 @@ export function quarantine(
 ): void {
   const element = readable(cx, id)
   const resource = resourceOfElement(element)
-  const decision = requirePermitted(
-    resolveApproval(
-      cx.store,
-      cx.space,
-      resource,
-      cx.authority.authorize('quarantine', resource, cx.auth),
-      cx.auth,
-    ),
+  const approved = decide(cx, resource, 'quarantine')
+  apply(cx, element, 'quarantine', 'quarantine', State.QUARANTINED,
+    (block) => setMember(block, QUARANTINE_KEY, reason),
+    (version) => ({ reason, version }),
+    approved,
   )
-  const version = commit(cx, element, 'quarantine', State.QUARANTINED, (block) =>
-    setMember(block, QUARANTINE_KEY, reason),
-  )
-  audit(cx, id, 'quarantine', { reason, version })
-  consumeResolvedApprovals(cx.store, decision)
 }
 
 /** Returns a quarantined element to ordinary use. */
@@ -244,27 +220,58 @@ export function release(cx: ElementGovernanceContext, id: ElementId): void {
     )
   }
   const resource = resourceOfElement(element)
-  const decision = requirePermitted(
-    resolveApproval(
-      cx.store,
-      cx.space,
-      resource,
-      cx.authority.authorize('quarantine', resource, cx.auth),
-      cx.auth,
-    ),
-  )
+  const approved = decide(cx, resource, 'quarantine')
   // `release`, matching the reference engine: `HISTORY ELEMENT` returns this
   // verb, so a name only one engine uses is a wire divergence.
-  const version = commit(cx, element, 'release', State.ACTIVE, (block) =>
-    setMember(block, QUARANTINE_KEY, null),
+  apply(cx, element, 'release', 'release_quarantine', State.ACTIVE,
+    (block) => setMember(block, QUARANTINE_KEY, null),
+    (version) => ({ version }),
+    approved,
   )
-  audit(cx, id, 'release_quarantine', { version })
-  consumeResolvedApprovals(cx.store, decision)
 }
 
 // ---------------------------------------------------------------------------
 // Shared plumbing
 // ---------------------------------------------------------------------------
+
+/** Decides one governed element operation, taking custody of any approval. */
+function decide(
+  cx: ElementGovernanceContext,
+  resource: ResourceContext,
+  permission: Permission,
+): Approved {
+  return requireApproved(
+    cx.store,
+    cx.space,
+    resource,
+    cx.authority.authorize(permission, resource, cx.auth),
+    cx.auth,
+  )
+}
+
+/**
+ * Writes the patched element, audits it, then spends the approval.
+ *
+ * In that order, and in one place, because the order is the rule: an approval
+ * buys a completed operation, not an attempt at one. Every governed element
+ * operation ends here so that a fifth one cannot end differently.
+ */
+function apply(
+  cx: ElementGovernanceContext,
+  element: Element,
+  op: string,
+  auditOp: string,
+  newState: string | null,
+  patch: (block: JsonMap) => JsonMap,
+  record: (version: number) => Record<string, Json>,
+  approved: Approved,
+): number {
+  const id: ElementId = { kind: element.kind, seq: element.row.id }
+  const version = commit(cx, element, op as never, newState, patch)
+  audit(cx, id, auditOp, record(version))
+  approved.spend(cx.store)
+  return version
+}
 
 /**
  * Loads an element the caller is entitled to see.

@@ -35,7 +35,6 @@ pub mod merge;
 
 use crate::id::ElementId;
 use crate::kql::Context;
-use crate::view;
 
 /// The format tag this engine writes and accepts.
 pub const FORMAT: &str = "KIP-Cognitive-Capsule";
@@ -86,17 +85,22 @@ pub async fn export(
     let mut records = CapsuleRecords::default();
     let mut schema_refs: BTreeSet<String> = BTreeSet::new();
     for id in &ids {
-        let Some(element) = cx.load(*id).await? else {
+        let Some(_) = cx.load(*id).await? else {
             continue;
         };
         // The redacted view, for the same reason SEARCH uses it: a field the
         // caller may not read must not leave the Space in a Capsule either
         // (§144). Elements it may not read at all were already dropped by
         // `load`, which is what makes the manifest's `partial` honest.
-        let rendered = cx
-            .cached_view(*id)
-            .unwrap_or_else(|| view::render(&element));
+        // No fallback to the raw renderer: `load` caches a redacted view for
+        // every element it admits, so an absent one means the element was not
+        // admitted — and rendering it here would export exactly the fields the
+        // redaction removed.
+        let Some(rendered) = cx.cached_view(*id) else {
+            continue;
+        };
         collect_schema_refs(&rendered, &mut schema_refs);
+        let rendered = rendered.as_ref().clone();
         match id.kind {
             ElementKind::Concept => records.concepts.push(rendered),
             ElementKind::Proposition => records.propositions.push(rendered),

@@ -168,6 +168,11 @@ async fn init_audit(c: &mut Collection) -> Result<(), DBError> {
     c.create_btree_index_nx(&["entry_class"]).await?;
     c.create_btree_index_nx(&["at"]).await?;
     c.create_btree_index_nx(&["tx_id"]).await?;
+    // What every point-in-time lookup actually narrows on. Without it,
+    // `history_of` ranged on `operation` and filtered the resource in memory,
+    // so reconstructing one Principal's past cost a read of every Principal
+    // ever created.
+    c.create_btree_index_nx(&["resource"]).await?;
     Ok(())
 }
 
@@ -366,11 +371,10 @@ impl GovernanceStore {
 
     /// Every audit entry about one resource, under any of the named verbs.
     ///
-    /// Ranged on `operation`, which is indexed, and narrowed to the resource in
-    /// memory, which is not. Narrowing to the resource is not an optimization:
-    /// "this record has no history" has to mean *this* one, or a Space that
-    /// happens to share the log with another would be reported as having never
-    /// existed.
+    /// Both columns are indexed and both are in the filter. Narrowing to the
+    /// resource is not only an optimization: "this record has no history" has
+    /// to mean *this* one, or a Space that happens to share the log with
+    /// another would be reported as having never existed.
     async fn history_of(
         &self,
         resource: &str,
@@ -381,10 +385,13 @@ impl GovernanceStore {
             let rows: Vec<GovernanceAuditRow> = self
                 .all_rows(
                     &self.audit.get(),
-                    eq_field("operation", Fv::Text((*operation).to_string())),
+                    eq_fields(&[
+                        ("operation", Fv::Text((*operation).to_string())),
+                        ("resource", Fv::Text(resource.to_string())),
+                    ]),
                 )
                 .await?;
-            out.extend(rows.into_iter().filter(|row| row.resource == resource));
+            out.extend(rows);
         }
         Ok(out)
     }

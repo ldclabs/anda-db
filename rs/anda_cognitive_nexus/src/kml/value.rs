@@ -12,8 +12,8 @@
 //! whole reason the protocol has parameters instead of interpolation.
 
 use anda_kip::{
-    BoundValue, ElementRef, Json, KipError, Map, MutationValue, Number, Scalar, Term,
-    UpdateExpr, UpdateFunction,
+    BoundValue, ElementRef, Json, KipError, Map, MutationValue, Number, Scalar, Term, UpdateExpr,
+    UpdateFunction,
 };
 use std::collections::BTreeMap;
 

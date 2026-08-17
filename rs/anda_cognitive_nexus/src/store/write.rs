@@ -224,23 +224,30 @@ impl Store {
         Ok(())
     }
 
-    /// Rejects a reference that leaves the element's own MemorySpace.
+    /// Rejects a reference that leaves the referring element's MemorySpace.
     ///
     /// Baseline Core is same-Space closed (§7): an ordinary persisted
     /// reference resolves inside the writing element's Space. Letting one
     /// through would make a later read depend on a Space the reader may have
     /// no authority over, which is exactly the leak the rule prevents.
+    ///
+    /// A reference to an element that does not exist is not this rule's
+    /// business and passes: nothing left the Space, and refusing here would
+    /// turn a stale id into a commit failure under an error that names the
+    /// wrong problem.
     pub async fn check_same_space(
         &self,
         space: &str,
+        from: ElementId,
         referenced: ElementId,
-        field: &str,
     ) -> Result<(), KipError> {
-        let element = self.get_element(referenced).await?;
+        let Ok(element) = self.get_element(referenced).await else {
+            return Ok(());
+        };
         if element.space() != space {
             return Err(KipError::structural_reference_invalid(format!(
-                "`{field}` references {referenced}, which lives in Space {:?} rather than {space:?}; \
-                 baseline KIP references resolve inside one Space",
+                "{from} references {referenced}, which lives in Space {:?} rather than \
+                 {space:?}; baseline KIP references resolve inside one Space",
                 element.space()
             )));
         }

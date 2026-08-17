@@ -1946,6 +1946,27 @@ describe('erasure', () => {
     })
   })
 
+  it('writes the Governance audit one receipt per erased element', async () => {
+    await withNexus('purge-audit', (nexus) => {
+      nexus.execute(
+        'PURGE "C-1" REFERENCE POLICY "authorized_cascade" CONFIRM "PURGE"',
+      )
+      const purges = nexus
+        .systemSession()
+        .readAudit(100)
+        .filter((entry) => (entry as { operation?: string }).operation === 'purge')
+      // One per erased element, cascade included: an erasure that left no trace
+      // of having happened would defeat the reason §164 permits a receipt at
+      // all — the auditor still has to be able to say what was destroyed.
+      expect(purges.length).toBeGreaterThanOrEqual(1)
+      const record = (purges[0] as { record?: Record<string, unknown> }).record
+      expect(record?.element).toMatch(/^[CPAEX]-\d+$/)
+      // The digest of what was there, and none of what was there.
+      expect(record?.content_digest).toMatch(/^[0-9a-f]{64}$/)
+      expect(record?.reference_policy).toBe('authorized_cascade')
+    })
+  })
+
   it('leaves an identity stub rather than a hole', async () => {
     await withNexus('stub', (nexus) => {
       nexus.execute(

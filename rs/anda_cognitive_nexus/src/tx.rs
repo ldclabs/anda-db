@@ -33,10 +33,9 @@ use anda_kip::{ElementKind, Json, KipError, Map, Receipt, ReceiptStatus};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::error::db_error;
+use crate::governance::approval::Approved;
 use crate::governance::store::MutationEntry;
-use crate::governance::{
-    AuthContext, Authorization, EffectiveAuthority, Permission, ResourceContext,
-};
+use crate::governance::{AuthContext, EffectiveAuthority, Permission, ResourceContext};
 use crate::id::ElementId;
 use crate::schema::SchemaEnvironment;
 use crate::store::rows::*;
@@ -73,7 +72,7 @@ pub struct Transaction {
     /// The version rows each staged purge will destroy at commit, read when the
     /// stub was staged so the receipt and the erasure cannot disagree.
     purges: BTreeMap<ElementId, Vec<u64>>,
-    approval_decisions: Vec<Authorization>,
+    approval_decisions: Vec<Approved>,
     governance_audit: Vec<MutationEntry>,
 }
 
@@ -279,14 +278,45 @@ impl Transaction {
         Ok(destroyed)
     }
 
-    /// Defers spending approvals until this transaction commits successfully.
-    pub fn defer_approval(&mut self, decision: Authorization) {
-        self.approval_decisions.push(decision);
+    /// Defers spending an approval until this transaction commits successfully.
+    ///
+    /// Reached through [`Approved::defer`](crate::governance::approval::Approved::defer),
+    /// which is the half of the contract the caller states.
+    pub(crate) fn defer_approval(&mut self, approved: Approved) {
+        self.approval_decisions.push(approved);
     }
 
     /// Defers a Governance audit entry until this transaction commits.
     pub fn defer_governance_audit(&mut self, entry: MutationEntry) {
         self.governance_audit.push(entry);
+    }
+
+    /// Rejects any staged reference that leaves this transaction's Space (§7).
+    ///
+    /// Checked here, once over the staged rows, rather than by each clause that
+    /// happens to write a reference. [`Element::references`] is the complete
+    /// set — including the paths no index covers — so one pass covers `ENSURE`,
+    /// `UPSERT`, Profile structural fields and every clause added later, none
+    /// of which has to remember the rule. It runs before the first write, so a
+    /// violation refuses the whole transaction rather than half of it.
+    ///
+    /// An element this same transaction is staging needs no lookup: a
+    /// transaction writes into one Space, so anything it mints is in it.
+    async fn check_reference_closure(&self) -> Result<(), KipError> {
+        for (id, staged) in &self.staged {
+            if !staged.changed {
+                continue;
+            }
+            for referenced in staged.row.references() {
+                if self.staged.contains_key(&referenced) {
+                    continue;
+                }
+                self.store
+                    .check_same_space(&self.cx.space, *id, referenced)
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     /// Loads an existing element for modification, or returns the staged copy.
@@ -647,6 +677,7 @@ impl Transaction {
         }
 
         self.propagate_governance().await?;
+        self.check_reference_closure().await?;
 
         // Nothing this transaction touched keeps its shell state, and the
         // version rule is applied here so that a clause touching one element
@@ -704,8 +735,8 @@ impl Transaction {
         for entry in std::mem::take(&mut self.governance_audit) {
             self.store.governance.record_mutation(entry).await?;
         }
-        for decision in &self.approval_decisions {
-            crate::governance::approval::consume(&self.store, decision).await?;
+        for approved in std::mem::take(&mut self.approval_decisions) {
+            approved.spend(&self.store).await?;
         }
         self.store.flush(now_ms()).await?;
 

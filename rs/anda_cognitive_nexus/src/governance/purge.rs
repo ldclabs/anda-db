@@ -106,7 +106,7 @@ pub async fn stage(
     // §167 lists purging critical Evidence among the operations a policy may
     // require independent approval for, and this is where such an approval is
     // consumed — bound to this element, and spent by using it.
-    let decision = super::approval::resolve(
+    let approved = super::approval::require(
         store,
         &space_id,
         &resource,
@@ -114,8 +114,7 @@ pub async fn stage(
             .authorize(Permission::Purge, &resource, &tx.auth),
         &tx.auth,
     )
-    .await?
-    .into_result()?;
+    .await?;
 
     // §163: a legal hold is exactly the thing purge must not walk past, and it
     // is checked before anything else destructive is decided.
@@ -157,7 +156,7 @@ pub async fn stage(
         _ => {}
     }
 
-    tx.defer_approval(decision);
+    approved.defer(tx);
     let mut report = PurgeReport::default();
     for target in targets {
         let element = tx.load(target).await?.clone();

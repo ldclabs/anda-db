@@ -43,6 +43,7 @@
 
 use anda_kip::{Json, KipError};
 
+use super::approval::Approved;
 use super::auth::AuthContext;
 use super::decision::{EffectiveAuthority, ResourceContext};
 use super::store::MutationEntry;
@@ -114,29 +115,23 @@ pub async fn classify(
     } else {
         Permission::Update
     };
-    let decision = super::approval::resolve(
-        store,
-        space_id,
-        &resource,
-        authority.authorize(permission, &resource, auth),
-        auth,
-    )
-    .await?
-    .into_result()?;
+    let approved = decide(store, space_id, &resource, permission, authority, auth).await?;
 
     let op = if lowering { "declassify" } else { "classify" };
     let patch = |governance: &Json| set_member(governance, "classification", Json::from(label));
-    let version = commit(store, space_id, element, op, None, patch, auth).await?;
-    audit(
+    apply(
         store,
         space_id,
-        id,
+        element,
         op,
-        serde_json::json!({"from": current, "to": label, "version": version}),
+        op,
+        None,
+        patch,
+        |version| serde_json::json!({"from": current, "to": label, "version": version}),
+        approved,
         auth,
     )
     .await?;
-    super::approval::consume(store, &decision).await?;
     Ok(current)
 }
 
@@ -165,20 +160,20 @@ pub async fn elevate_authority(
     // §129: elevation is exactly the operation a policy asks for independent
     // approval on, and §246 requires that one approval of two is not partial
     // activation. That is decided here rather than by the caller.
-    let decision = super::approval::resolve(
+    let approved = decide(
         store,
         space_id,
         &resource,
-        authority_state.authorize(Permission::ElevateAuthority, &resource, auth),
+        Permission::ElevateAuthority,
+        authority_state,
         auth,
     )
-    .await?
-    .into_result()?;
+    .await?;
 
     let current = ceiling_of(&element).to_string();
     let raising = authority::rank(class) > authority::rank(&current);
     if raising {
-        let granted_ceiling = super::decision::authority_ceiling(&decision.constraints);
+        let granted_ceiling = super::decision::authority_ceiling(&approved.decision().constraints);
         if authority::rank(class) > authority::rank(granted_ceiling) {
             return Err(KipError::not_authorized(format!(
                 "{class:?} exceeds this Principal's influence-authority ceiling {granted_ceiling:?}"
@@ -196,24 +191,26 @@ pub async fn elevate_authority(
 
     let op = if raising { "elevate" } else { "downgrade" };
     let patch = |governance: &Json| set_member(governance, AUTHORITY_KEY, Json::from(class));
-    let version = commit(store, space_id, element, op, None, patch, auth).await?;
-    audit(
+    apply(
         store,
         space_id,
-        id,
+        element,
+        op,
         if raising {
             "elevate_authority"
         } else {
             "downgrade_authority"
         },
+        None,
+        patch,
         // §130: an elevation record names the artifact, both ceilings, who
         // decided, and when. The transaction and the audit entry supply the
         // rest between them.
-        serde_json::json!({"from": current, "to": class, "version": version}),
+        |version| serde_json::json!({"from": current, "to": class, "version": version}),
+        approved,
         auth,
     )
     .await?;
-    super::approval::consume(store, &decision).await?;
     Ok(current)
 }
 
@@ -232,38 +229,31 @@ pub async fn quarantine(
 ) -> Result<(), KipError> {
     let element = readable(store, space_id, id, authority, auth).await?;
     let resource = ResourceContext::of_element(&element);
-    let decision = super::approval::resolve(
+    let approved = decide(
         store,
         space_id,
         &resource,
-        authority.authorize(Permission::Quarantine, &resource, auth),
+        Permission::Quarantine,
+        authority,
         auth,
     )
-    .await?
-    .into_result()?;
+    .await?;
     let reason = reason.to_string();
     let patch =
         |governance: &Json| set_member(governance, QUARANTINE_KEY, Json::from(reason.as_str()));
-    let version = commit(
+    apply(
         store,
         space_id,
         element,
         "quarantine",
+        "quarantine",
         Some(state::QUARANTINED),
         patch,
+        |version| serde_json::json!({"reason": reason, "version": version}),
+        approved,
         auth,
     )
     .await?;
-    audit(
-        store,
-        space_id,
-        id,
-        "quarantine",
-        serde_json::json!({"reason": reason, "version": version}),
-        auth,
-    )
-    .await?;
-    super::approval::consume(store, &decision).await?;
     Ok(())
 }
 
@@ -284,42 +274,86 @@ pub async fn release(
         )));
     }
     let resource = ResourceContext::of_element(&element);
-    let decision = super::approval::resolve(
+    let approved = decide(
         store,
         space_id,
         &resource,
-        authority.authorize(Permission::Quarantine, &resource, auth),
+        Permission::Quarantine,
+        authority,
         auth,
     )
-    .await?
-    .into_result()?;
+    .await?;
     let patch = |governance: &Json| set_member(governance, QUARANTINE_KEY, Json::Null);
-    let version = commit(
+    apply(
         store,
         space_id,
         element,
         "release",
+        // `release_quarantine`, matching the reference engine: `HISTORY
+        // ELEMENT` returns this verb, so a name only one engine uses is a wire
+        // divergence.
+        "release_quarantine",
         Some(state::ACTIVE),
         patch,
+        |version| serde_json::json!({"version": version}),
+        approved,
         auth,
     )
     .await?;
-    audit(
-        store,
-        space_id,
-        id,
-        "release_quarantine",
-        serde_json::json!({"version": version}),
-        auth,
-    )
-    .await?;
-    super::approval::consume(store, &decision).await?;
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // Shared plumbing
 // ---------------------------------------------------------------------------
+
+/// Decides one governed element operation, taking custody of any approval.
+async fn decide(
+    store: &Store,
+    space_id: &str,
+    resource: &ResourceContext,
+    permission: Permission,
+    authority: &EffectiveAuthority,
+    auth: &AuthContext,
+) -> Result<Approved, KipError> {
+    super::approval::require(
+        store,
+        space_id,
+        resource,
+        authority.authorize(permission, resource, auth),
+        auth,
+    )
+    .await
+}
+
+/// Writes the patched element, audits it, then spends the approval.
+///
+/// In that order, and in one place, because the order is the rule: an approval
+/// buys a completed operation, not an attempt at one. Every governed element
+/// operation ends here so that a fifth one cannot end differently.
+#[allow(clippy::too_many_arguments)]
+async fn apply<F, R>(
+    store: &Store,
+    space_id: &str,
+    element: Element,
+    op: &'static str,
+    audit_op: &'static str,
+    new_state: Option<&str>,
+    patch: F,
+    record: R,
+    approved: Approved,
+    auth: &AuthContext,
+) -> Result<u64, KipError>
+where
+    F: Fn(&Json) -> Json,
+    R: FnOnce(u64) -> Json,
+{
+    let id = element.id();
+    let version = commit(store, space_id, element, op, new_state, patch, auth).await?;
+    audit(store, space_id, id, audit_op, record(version), auth).await?;
+    approved.spend(store).await?;
+    Ok(version)
+}
 
 /// Loads an element the caller is entitled to see.
 ///

@@ -104,21 +104,80 @@ pub async fn resolve(
     })
 }
 
-/// Consumes the approvals carried by a decision after its operation succeeds.
-pub async fn consume(store: &Store, decision: &Authorization) -> Result<(), KipError> {
+/// The approval rows a permitted decision is carrying.
+fn approvals_of(decision: &Authorization) -> Vec<u64> {
     let mut seen = BTreeSet::new();
     for authority in &decision.authorities_used {
-        let Some(id) = authority
+        if let Some(id) = authority
             .strip_prefix("kip:approval:")
             .and_then(|value| value.parse::<u64>().ok())
-        else {
-            continue;
-        };
-        if seen.insert(id) {
-            store.governance.consume_approval(id).await?;
+        {
+            seen.insert(id);
         }
     }
-    Ok(())
+    seen.into_iter().collect()
+}
+
+/// A permitted decision, together with the approvals that made it one.
+///
+/// The type exists because "resolve here, spend there" is a two-step contract
+/// that nothing else states. An approval buys one *completed* operation, so
+/// there are exactly two honest endings: [`Approved::spend`], once the
+/// authorized operation has actually succeeded, and [`Approved::defer`], which
+/// hands the same obligation to a transaction that spends it at commit.
+///
+/// Not `Clone`, and `#[must_use]`: dropping one on the floor leaves the same
+/// signatures able to authorize the next attempt, which is precisely what
+/// requiring an approval was meant to prevent.
+#[must_use = "an approval that is neither spent nor deferred still authorizes the next caller"]
+pub struct Approved {
+    decision: Authorization,
+    approvals: Vec<u64>,
+}
+
+impl Approved {
+    /// Requires an already-resolved decision to permit, and takes custody of
+    /// the approvals it spent.
+    pub fn require(decision: Authorization) -> Result<Self, KipError> {
+        let decision = decision.into_result()?;
+        let approvals = approvals_of(&decision);
+        Ok(Self {
+            decision,
+            approvals,
+        })
+    }
+
+    /// The decision itself, for the constraints and obligations it carries.
+    pub fn decision(&self) -> &Authorization {
+        &self.decision
+    }
+
+    /// Spends the approvals, after the authorized operation succeeded.
+    pub async fn spend(self, store: &Store) -> Result<(), KipError> {
+        for id in self.approvals {
+            store.governance.consume_approval(id).await?;
+        }
+        Ok(())
+    }
+
+    /// Hands the obligation to a transaction, which spends it at commit.
+    ///
+    /// A staged operation has not happened yet, so spending now would charge
+    /// an approval for a statement that may still refuse.
+    pub fn defer(self, tx: &mut crate::tx::Transaction) {
+        tx.defer_approval(self);
+    }
+}
+
+/// Resolves a decision and requires it to permit, in one step.
+pub async fn require(
+    store: &Store,
+    space_id: &str,
+    resource: &ResourceContext,
+    decision: Authorization,
+    auth: &AuthContext,
+) -> Result<Approved, KipError> {
+    Approved::require(resolve(store, space_id, resource, decision, auth).await?)
 }
 
 #[cfg(test)]

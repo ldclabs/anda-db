@@ -49,10 +49,17 @@ export {
 } from './decision.js'
 
 export {
-  consumeResolvedApprovals,
+  Approved,
+  requireApproved,
   resolveApproval,
   subjectDigest,
 } from './approval.js'
+
+export {
+  referencePolicy,
+  stage as stagePurge,
+  type ReferencePolicy,
+} from './purge.js'
 
 export { redactView } from './redact.js'
 

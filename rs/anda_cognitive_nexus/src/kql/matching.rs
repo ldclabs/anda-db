@@ -203,9 +203,7 @@ impl Context<'_> {
             // The cached view, not a fresh render: `load` redacted it, and a
             // matcher reading the unredacted row would let a masked field be
             // probed through which rows come back (§109).
-            let rendered = self
-                .cached_view(id)
-                .unwrap_or_else(|| Json::Object(Default::default()));
+            let rendered = self.view_of(id);
             let mut row = vec![Binding::Element(id)];
             row.resize(vars.len(), Binding::Null);
 
@@ -408,9 +406,7 @@ impl Context<'_> {
             if element.space() != self.space || !element.is_active() {
                 continue;
             }
-            let rendered = self
-                .cached_view(id)
-                .unwrap_or_else(|| Json::Object(Default::default()));
+            let rendered = self.view_of(id);
             let Some(refs) = rendered
                 .get("structural")
                 .and_then(|value| value.get(symbol.to_string()))

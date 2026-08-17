@@ -31,6 +31,7 @@ use anda_kip::{
     ResultContext, Scalar, WhereClause,
 };
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::error::db_error;
 use crate::governance::{AuthContext, EffectiveAuthority, Permission, ResourceContext};
@@ -61,7 +62,7 @@ pub struct Context<'a> {
     pub operation: Option<&'a Map<String, Json>>,
     /// Elements loaded so far, so one query reads each row once.
     loaded: BTreeMap<ElementId, Option<Element>>,
-    views: BTreeMap<ElementId, Json>,
+    views: BTreeMap<ElementId, Arc<Json>>,
     /// The policy `BELIEF` projects under.
     pub policy: crate::projection::Policy,
     /// The world time a projection is evaluated at.
@@ -183,13 +184,31 @@ impl<'a> Context<'a> {
         }
         let mut view = crate::view::render(&element);
         crate::governance::redact::apply(&mut view, &constraints, self.read_origin);
-        self.views.insert(element.id(), view);
+        self.views.insert(element.id(), Arc::new(view));
         Some(element)
     }
 
     /// The rendered view of an already-loaded element.
-    pub fn cached_view(&self, id: ElementId) -> Option<Json> {
+    ///
+    /// Shared rather than copied: a view is the whole rendered element, and the
+    /// read path asks for one per row per filter operand, per sort key and per
+    /// projected column. Deep-copying on every hit made the cache cost about
+    /// what not having it did.
+    pub fn cached_view(&self, id: ElementId) -> Option<Arc<Json>> {
         self.views.get(&id).cloned()
+    }
+
+    /// The rendered view of an element this read has admitted.
+    ///
+    /// [`Context::admit`] caches a view for every element it lets through, so
+    /// the empty object is unreachable for anything that came back from
+    /// [`Context::load`]. It exists so the read paths do not each invent their
+    /// own answer to a question that has one — which is how one of them once
+    /// came to fall back on the *unredacted* renderer, three lines under a
+    /// comment saying why the redacted view was required.
+    pub fn view_of(&self, id: ElementId) -> Arc<Json> {
+        self.cached_view(id)
+            .unwrap_or_else(|| Arc::new(Json::Object(Default::default())))
     }
 
     /// The tightest result cap carried by any authority used by this read.
@@ -650,7 +669,7 @@ fn restrict_to_valid_time(cx: &mut Context<'_>, solutions: &mut Solutions, at: &
     if assertion_vars.is_empty() {
         return;
     }
-    let views: BTreeMap<ElementId, Json> = solutions
+    let views: BTreeMap<ElementId, Arc<Json>> = solutions
         .rows
         .iter()
         .flat_map(|row| row.iter())

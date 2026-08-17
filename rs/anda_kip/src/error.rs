@@ -124,13 +124,49 @@ impl Display for RetryClass {
     }
 }
 
-/// The Core Error Registry (Spec §87).
+/// Declares the Core Error Registry once.
 ///
-/// Codes are stable names, not numbers: an Agent switching on
-/// `EpistemicRevisionRequired` keeps working across protocol revisions in a way
-/// a renumbered `KIP_3007` would not.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
-pub enum KipErrorCode {
+/// The registry is one list, and three things have to agree with it: the enum,
+/// the `ALL` slice a caller enumerates, and the wire name a code parses back
+/// from. Written out by hand they did agree — but only `ALL` was unchecked by
+/// the compiler, so a code added to the enum and to `name()` and forgotten
+/// here would compile and then be silently unparseable. Generating all three
+/// from the one list removes the failure rather than documenting it.
+macro_rules! kip_error_codes {
+    ($( $(#[$meta:meta])* $variant:ident ),+ $(,)?) => {
+        /// The Core Error Registry (Spec §87).
+        ///
+        /// Codes are stable names, not numbers: an Agent switching on
+        /// `EpistemicRevisionRequired` keeps working across protocol revisions in a way
+        /// a renumbered `KIP_3007` would not.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+        pub enum KipErrorCode {
+            $( $(#[$meta])* $variant, )+
+        }
+
+        impl KipErrorCode {
+            /// Every registered code, in registry order.
+            pub const ALL: &'static [KipErrorCode] = &[ $( KipErrorCode::$variant, )+ ];
+
+            /// The stable wire code, e.g. `"SchemaSymbolAmbiguous"`.
+            pub fn name(&self) -> &'static str {
+                match self {
+                    $( KipErrorCode::$variant => stringify!($variant), )+
+                }
+            }
+
+            /// Looks a code up by its stable wire name.
+            pub fn from_name(name: &str) -> Option<Self> {
+                match name {
+                    $( stringify!($variant) => Some(KipErrorCode::$variant), )+
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+kip_error_codes! {
     // ── §87.1 Protocol / syntax ──────────────────────────────────────
     /// The command text could not be parsed.
     InvalidSyntax,
@@ -313,175 +349,8 @@ pub enum KipErrorCode {
     InternalError,
 }
 
+
 impl KipErrorCode {
-    /// Every registered code, in registry order.
-    pub const ALL: &'static [KipErrorCode] = &[
-        KipErrorCode::InvalidSyntax,
-        KipErrorCode::InvalidIdentifier,
-        KipErrorCode::InvalidRequestEnvelope,
-        KipErrorCode::UnsupportedProtocolVersion,
-        KipErrorCode::UnsupportedCapability,
-        KipErrorCode::UnsupportedIsolation,
-        KipErrorCode::LanguageMismatch,
-        KipErrorCode::ReadonlyViolation,
-        KipErrorCode::DuplicateLocalHandle,
-        KipErrorCode::DuplicateMutationTarget,
-        KipErrorCode::SchemaSymbolNotFound,
-        KipErrorCode::SchemaSymbolAmbiguous,
-        KipErrorCode::SchemaFieldNotFound,
-        KipErrorCode::SchemaPackageUnavailable,
-        KipErrorCode::SchemaEnvironmentChanged,
-        KipErrorCode::HistoricalSchemaUnavailable,
-        KipErrorCode::TypeMismatch,
-        KipErrorCode::ConstraintViolation,
-        KipErrorCode::NotFoundOrNotVisible,
-        KipErrorCode::ReferenceError,
-        KipErrorCode::StructuralReferenceInvalid,
-        KipErrorCode::IdentitySelectorRequired,
-        KipErrorCode::NameIdentityForbidden,
-        KipErrorCode::IdentityConflict,
-        KipErrorCode::ClientKeyConflict,
-        KipErrorCode::IdentityMergeConflict,
-        KipErrorCode::ImmutableField,
-        KipErrorCode::EpistemicRevisionRequired,
-        KipErrorCode::EvidenceCorrectionRequired,
-        KipErrorCode::InvalidLifecycleTransition,
-        KipErrorCode::RetractionNotAuthorized,
-        KipErrorCode::SupersessionMismatch,
-        KipErrorCode::EvidenceCorrectionConflict,
-        KipErrorCode::ActivityTerminal,
-        KipErrorCode::ProjectionTargetUnbound,
-        KipErrorCode::ProjectionTargetUnbounded,
-        KipErrorCode::ProjectionNotAuthorized,
-        KipErrorCode::ProjectionPolicyUnavailable,
-        KipErrorCode::Unauthenticated,
-        KipErrorCode::NotAuthorized,
-        KipErrorCode::RequiresApproval,
-        KipErrorCode::RequiresStrongerAuthentication,
-        KipErrorCode::ActorBindingRequired,
-        KipErrorCode::ProtectedSystemField,
-        KipErrorCode::ProtectedGovernanceField,
-        KipErrorCode::ProtectedSchemaState,
-        KipErrorCode::LegalHoldConflict,
-        KipErrorCode::PurgeDenied,
-        KipErrorCode::VersionConflict,
-        KipErrorCode::PreconditionFailed,
-        KipErrorCode::SerializationConflict,
-        KipErrorCode::IdempotencyConflict,
-        KipErrorCode::TransactionUnknown,
-        KipErrorCode::OutcomeUnknown,
-        KipErrorCode::TransactionTooLarge,
-        KipErrorCode::HistoricalSnapshotUnavailable,
-        KipErrorCode::CursorMismatch,
-        KipErrorCode::CursorTypeMismatch,
-        KipErrorCode::CursorExpired,
-        KipErrorCode::CursorInvalidated,
-        KipErrorCode::ChangeCursorExpired,
-        KipErrorCode::ChangeCursorInvalid,
-        KipErrorCode::SearchModeUnsupported,
-        KipErrorCode::SearchIndexUnavailable,
-        KipErrorCode::HistoricalSearchUnavailable,
-        KipErrorCode::ArtifactUnavailable,
-        KipErrorCode::ArtifactTooLarge,
-        KipErrorCode::ArtifactParseError,
-        KipErrorCode::DigestMismatch,
-        KipErrorCode::ProofInvalid,
-        KipErrorCode::SignerUnknown,
-        KipErrorCode::BlobUnavailable,
-        KipErrorCode::CapsuleValidationFailed,
-        KipErrorCode::ImportPreviewConflict,
-        KipErrorCode::ResourceExhausted,
-        KipErrorCode::ResultLimitExceeded,
-        KipErrorCode::ExecutionTimeout,
-        KipErrorCode::RateLimited,
-        KipErrorCode::InternalError,
-    ];
-
-    /// The stable wire code, e.g. `"SchemaSymbolAmbiguous"`.
-    pub fn name(&self) -> &'static str {
-        match self {
-            KipErrorCode::InvalidSyntax => "InvalidSyntax",
-            KipErrorCode::InvalidIdentifier => "InvalidIdentifier",
-            KipErrorCode::InvalidRequestEnvelope => "InvalidRequestEnvelope",
-            KipErrorCode::UnsupportedProtocolVersion => "UnsupportedProtocolVersion",
-            KipErrorCode::UnsupportedCapability => "UnsupportedCapability",
-            KipErrorCode::UnsupportedIsolation => "UnsupportedIsolation",
-            KipErrorCode::LanguageMismatch => "LanguageMismatch",
-            KipErrorCode::ReadonlyViolation => "ReadonlyViolation",
-            KipErrorCode::DuplicateLocalHandle => "DuplicateLocalHandle",
-            KipErrorCode::DuplicateMutationTarget => "DuplicateMutationTarget",
-            KipErrorCode::SchemaSymbolNotFound => "SchemaSymbolNotFound",
-            KipErrorCode::SchemaSymbolAmbiguous => "SchemaSymbolAmbiguous",
-            KipErrorCode::SchemaFieldNotFound => "SchemaFieldNotFound",
-            KipErrorCode::SchemaPackageUnavailable => "SchemaPackageUnavailable",
-            KipErrorCode::SchemaEnvironmentChanged => "SchemaEnvironmentChanged",
-            KipErrorCode::HistoricalSchemaUnavailable => "HistoricalSchemaUnavailable",
-            KipErrorCode::TypeMismatch => "TypeMismatch",
-            KipErrorCode::ConstraintViolation => "ConstraintViolation",
-            KipErrorCode::NotFoundOrNotVisible => "NotFoundOrNotVisible",
-            KipErrorCode::ReferenceError => "ReferenceError",
-            KipErrorCode::StructuralReferenceInvalid => "StructuralReferenceInvalid",
-            KipErrorCode::IdentitySelectorRequired => "IdentitySelectorRequired",
-            KipErrorCode::NameIdentityForbidden => "NameIdentityForbidden",
-            KipErrorCode::IdentityConflict => "IdentityConflict",
-            KipErrorCode::ClientKeyConflict => "ClientKeyConflict",
-            KipErrorCode::IdentityMergeConflict => "IdentityMergeConflict",
-            KipErrorCode::ImmutableField => "ImmutableField",
-            KipErrorCode::EpistemicRevisionRequired => "EpistemicRevisionRequired",
-            KipErrorCode::EvidenceCorrectionRequired => "EvidenceCorrectionRequired",
-            KipErrorCode::InvalidLifecycleTransition => "InvalidLifecycleTransition",
-            KipErrorCode::RetractionNotAuthorized => "RetractionNotAuthorized",
-            KipErrorCode::SupersessionMismatch => "SupersessionMismatch",
-            KipErrorCode::EvidenceCorrectionConflict => "EvidenceCorrectionConflict",
-            KipErrorCode::ActivityTerminal => "ActivityTerminal",
-            KipErrorCode::ProjectionTargetUnbound => "ProjectionTargetUnbound",
-            KipErrorCode::ProjectionTargetUnbounded => "ProjectionTargetUnbounded",
-            KipErrorCode::ProjectionNotAuthorized => "ProjectionNotAuthorized",
-            KipErrorCode::ProjectionPolicyUnavailable => "ProjectionPolicyUnavailable",
-            KipErrorCode::Unauthenticated => "Unauthenticated",
-            KipErrorCode::NotAuthorized => "NotAuthorized",
-            KipErrorCode::RequiresApproval => "RequiresApproval",
-            KipErrorCode::RequiresStrongerAuthentication => "RequiresStrongerAuthentication",
-            KipErrorCode::ActorBindingRequired => "ActorBindingRequired",
-            KipErrorCode::ProtectedSystemField => "ProtectedSystemField",
-            KipErrorCode::ProtectedGovernanceField => "ProtectedGovernanceField",
-            KipErrorCode::ProtectedSchemaState => "ProtectedSchemaState",
-            KipErrorCode::LegalHoldConflict => "LegalHoldConflict",
-            KipErrorCode::PurgeDenied => "PurgeDenied",
-            KipErrorCode::VersionConflict => "VersionConflict",
-            KipErrorCode::PreconditionFailed => "PreconditionFailed",
-            KipErrorCode::SerializationConflict => "SerializationConflict",
-            KipErrorCode::IdempotencyConflict => "IdempotencyConflict",
-            KipErrorCode::TransactionUnknown => "TransactionUnknown",
-            KipErrorCode::OutcomeUnknown => "OutcomeUnknown",
-            KipErrorCode::TransactionTooLarge => "TransactionTooLarge",
-            KipErrorCode::HistoricalSnapshotUnavailable => "HistoricalSnapshotUnavailable",
-            KipErrorCode::CursorMismatch => "CursorMismatch",
-            KipErrorCode::CursorTypeMismatch => "CursorTypeMismatch",
-            KipErrorCode::CursorExpired => "CursorExpired",
-            KipErrorCode::CursorInvalidated => "CursorInvalidated",
-            KipErrorCode::ChangeCursorExpired => "ChangeCursorExpired",
-            KipErrorCode::ChangeCursorInvalid => "ChangeCursorInvalid",
-            KipErrorCode::SearchModeUnsupported => "SearchModeUnsupported",
-            KipErrorCode::SearchIndexUnavailable => "SearchIndexUnavailable",
-            KipErrorCode::HistoricalSearchUnavailable => "HistoricalSearchUnavailable",
-            KipErrorCode::ArtifactUnavailable => "ArtifactUnavailable",
-            KipErrorCode::ArtifactTooLarge => "ArtifactTooLarge",
-            KipErrorCode::ArtifactParseError => "ArtifactParseError",
-            KipErrorCode::DigestMismatch => "DigestMismatch",
-            KipErrorCode::ProofInvalid => "ProofInvalid",
-            KipErrorCode::SignerUnknown => "SignerUnknown",
-            KipErrorCode::BlobUnavailable => "BlobUnavailable",
-            KipErrorCode::CapsuleValidationFailed => "CapsuleValidationFailed",
-            KipErrorCode::ImportPreviewConflict => "ImportPreviewConflict",
-            KipErrorCode::ResourceExhausted => "ResourceExhausted",
-            KipErrorCode::ResultLimitExceeded => "ResultLimitExceeded",
-            KipErrorCode::ExecutionTimeout => "ExecutionTimeout",
-            KipErrorCode::RateLimited => "RateLimited",
-            KipErrorCode::InternalError => "InternalError",
-        }
-    }
-
     /// The registry section this code belongs to (Spec §86.2).
     pub fn category(&self) -> ErrorCategory {
         use KipErrorCode::*;
@@ -828,13 +697,6 @@ impl KipErrorCode {
         }
     }
 
-    /// Looks a code up by its stable wire name.
-    pub fn from_name(name: &str) -> Option<Self> {
-        KipErrorCode::ALL
-            .iter()
-            .copied()
-            .find(|code| code.name() == name)
-    }
 }
 
 impl Display for KipErrorCode {

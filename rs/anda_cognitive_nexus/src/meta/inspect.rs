@@ -144,9 +144,7 @@ pub async fn search(cx: &mut Context<'_>, command: &SearchCommand) -> Result<Ans
             // The redacted view `load` cached, not a fresh render: a search
             // snippet is a read, and a mask that hid a field from FIND must
             // hide it from SEARCH too (§105).
-            let rendered = cx
-                .cached_view(id)
-                .unwrap_or_else(|| Json::Object(Default::default()));
+            let rendered = cx.view_of(id);
             if let Some(expected) = &with_type
                 && rendered["schema_ref"].as_str() != Some(expected.as_str())
             {
@@ -166,7 +164,7 @@ pub async fn search(cx: &mut Context<'_>, command: &SearchCommand) -> Result<Ans
                     // Assertion would invent an epistemic commitment out of a
                     // text match.
                     "score": score,
-                    "element": rendered,
+                    "element": rendered.as_ref(),
                 }),
             ));
         }

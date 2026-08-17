@@ -16,7 +16,7 @@ import { errors, KipError } from './errors.js'
 import {
   EffectiveAuthority,
   classify,
-  consumeResolvedApprovals,
+  Approved,
   elevateAuthority,
   isPermitted,
   principalClass,
@@ -716,10 +716,10 @@ export class Session {
   private gate(
     authority: EffectiveAuthority,
     needed: readonly Permission[],
-  ): Authorization[] {
+  ): Approved[] {
     const space = authority.space.space_id
     const resource = spaceResource()
-    const decisions: Authorization[] = []
+    const decisions: Approved[] = []
     for (const permission of needed) {
       const decision = resolveApproval(
         this.nexus.store,
@@ -731,18 +731,18 @@ export class Session {
       if (!isPermitted(decision.decision)) {
         this.audit(authority, decision)
       }
-      const permitted = requirePermitted(decision)
-      if (permitted.obligations.audit) this.audit(authority, permitted)
-      decisions.push(permitted)
+      const approved = Approved.require(decision)
+      if (approved.decision.obligations.audit) {
+        this.audit(authority, approved.decision)
+      }
+      decisions.push(approved)
     }
     return decisions
   }
 
   /** Spends approvals only after the operation they authorized succeeded. */
-  private consume(decisions: readonly Authorization[]): void {
-    for (const decision of decisions) {
-      consumeResolvedApprovals(this.nexus.store, decision)
-    }
+  private consume(approvals: readonly Approved[]): void {
+    for (const approved of approvals) approved.spend(this.nexus.store)
   }
 
   /**

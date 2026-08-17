@@ -118,7 +118,7 @@ impl Context<'_> {
             // A bare element variable projects the whole element, because an
             // Agent asking for `?c` wants the Concept, not its id string.
             return match binding.element().and_then(|id| self.cached_view(id)) {
-                Some(view) => view,
+                Some(view) => view.as_ref().clone(),
                 None => binding.to_json(),
             };
         }
