@@ -43,8 +43,15 @@ here:
   its inputs' labels upward at commit — so *read secret Evidence, summarize,
   write public summary* is not an exfiltration path — while raising a label needs
   only `update` and lowering one needs `declassify`, because it is disclosure
-  that requires authority rather than caution. `DESCRIBE CAPABILITIES` still
-  names what is left, rather than letting the word "governance" imply it.
+  that requires authority rather than caution. The audit records every
+  control-plane change and every decision §172 asks for, and `accessAsOf` answers
+  who had access at a past instant without claiming anything about today.
+
+  The plane's own records are written through host APIs and are reachable from no
+  KML clause, which is what keeps a prompt injection into ordinary memory
+  formation off the control plane. `DESCRIBE CAPABILITIES` names what that costs
+  and what is still missing, rather than letting the word "governance" imply
+  more than is there.
 - **`SEARCH`, in every mode.** No search index is built here. A keyword search
   over unsegmented text would silently disagree with the reference engine about
   which documents match, and a caller cannot tell a narrow index from a narrow

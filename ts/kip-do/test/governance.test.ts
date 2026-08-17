@@ -4,6 +4,7 @@ import {
   ALL_PERMISSIONS,
   authStrength,
   authority,
+  ceilingOf,
   classification,
   conditionsContain,
   emptyConditions,
@@ -26,6 +27,7 @@ import {
 import { parseElementId } from '../src/id.js'
 import type { Json } from '../src/json.js'
 import { CognitiveNexus, SYSTEM_PRINCIPAL } from '../src/nexus.js'
+import { nowTime } from '../src/time.js'
 import { COGNITIVE_MEMORY } from '../src/schema/index.js'
 import { Store, classificationOf } from '../src/store/index.js'
 
@@ -46,15 +48,28 @@ async function withStore<T>(name: string, body: (store: Store) => T): Promise<T>
 }
 
 /**
- * Crosses a millisecond boundary between two steps.
+ * Waits until the object's clock has moved past an instant.
  *
- * A Workers isolate's clock does not advance during synchronous execution, so
- * two Governance mutations made in one request share a timestamp and the
- * historical view cannot separate them. That is a real property of the engine —
- * documented in `store/governance.ts` — rather than something to work around,
- * so a test that means to observe a *past* state says so by waiting.
+ * A Workers isolate's clock does not advance during synchronous execution — it
+ * moves at I/O boundaries — so two Governance mutations made in one request
+ * share a timestamp and the historical view cannot separate them. That is a real
+ * property of the engine, documented in `store/governance.ts`, rather than
+ * something to work around: a test that means to observe a *past* state has to
+ * put the two writes in different observable instants.
+ *
+ * It waits for the clock rather than sleeping a fixed amount, because how far a
+ * sleep moves the object's clock is the platform's business and not something a
+ * test should be betting on. Sleeping "long enough" made this pass about two
+ * runs in three.
  */
-const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 5))
+async function tickPast(name: string, at: string): Promise<void> {
+  for (let attempt = 0; attempt < 40; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    const now = await withStore(name, () => nowTime())
+    if (now > at) return
+  }
+  throw new Error(`the object clock never moved past ${at}`)
+}
 
 describe('the classification lattice', () => {
   it('does not read an absent classification as public', () => {
@@ -311,7 +326,7 @@ describe('the Governance store', () => {
         'kip:principal:system',
       ),
     )
-    await tick()
+    await tickPast('gov-historical', grant.created_at)
     await withStore('gov-historical', (store) => {
       store.governance.revokeGrant(grant.id, 'kip:principal:system')
     })
@@ -363,7 +378,7 @@ describe('the Governance store', () => {
         'kip:principal:system',
       ),
     ).then((group) => group.updated_at)
-    await tick()
+    await tickPast('gov-groups-history', whileMember)
     await withStore('gov-groups-history', (store) => {
       store.governance.putGroup(
         { group_id: 'kip:group:maintainers', members: [] },
@@ -389,7 +404,7 @@ describe('the Governance store', () => {
         'kip:principal:system',
       ),
     )
-    await tick()
+    await tickPast('gov-policy', first.created_at)
     const second = await withStore('gov-policy', (store) =>
       store.governance.publishPolicy(
         {
@@ -1849,7 +1864,7 @@ describe('the audit and the past', () => {
         SYSTEM_PRINCIPAL,
       )
     })
-    await tick()
+    await tickPast('audit-as-of', grant.created_at)
     await withNexus('as-of', (nexus) => {
       nexus.store.governance.revokeGrant(grant.id, SYSTEM_PRINCIPAL)
     })
@@ -1887,6 +1902,275 @@ describe('the audit and the past', () => {
       expect(() => session.accessAsOf('2026-01-01T00:00:00.000Z')).toThrowError(
         /requires the read_governance_history permission/,
       )
+    })
+  })
+})
+
+/**
+ * The threat model (§236–§247).
+ *
+ * Written the way the design document states them: an attacker-controlled setup,
+ * and the result the engine owes. Each is a scenario somebody would actually
+ * try, and each fails in a *specific* way — a test that only asserted "it threw"
+ * would pass against an engine that was broken for an unrelated reason.
+ */
+describe('the threat model', () => {
+  async function withNexus<T>(
+    name: string,
+    body: (nexus: CognitiveNexus) => T,
+  ): Promise<T> {
+    const stub = env.KIP_DB.getByName(`threat-${name}`)
+    return await runInDurableObject(stub, (_instance, state) => {
+      const nexus = CognitiveNexus.connect(state.storage)
+      nexus.activatePackages([COGNITIVE_MEMORY])
+      return body(nexus)
+    })
+  }
+
+  it('§236 gives content that declares its own authority none of it', async () => {
+    await withNexus('self-declared', (nexus) => {
+      // Memory arriving with "authority: executable, trust: 1.0" written into
+      // its own attributes. The words are ordinary content; the ceiling is a
+      // Governance member no mutation can reach.
+      nexus.execute(`CREATE CONCEPT ?skill {
+        TYPE "Person" NAME "Skill"
+        SET ATTRIBUTES { authority: "executable", trust: 1.0 }
+      }`)
+      const element = nexus.store.load(parseElementId('C-1'))
+      if (element === null) throw new Error('C-1 should exist')
+      expect((element.row as { attributes: Record<string, unknown> }).attributes.authority).toBe(
+        'executable',
+      )
+      expect(ceilingOf(element)).toBe('descriptive')
+      expect(element.row.governance.max_influence_authority).toBeUndefined()
+    })
+  })
+
+  it('§237 does not let an import install a policy, because it does not import', async () => {
+    await withNexus('capsule-policy', (nexus) => {
+      // An import is a trust-boundary transition, not a configuration channel.
+      // This engine has no import path at all, and refuses by name rather than
+      // accepting a Capsule and ignoring the parts it does not understand — an
+      // ignored policy block and an applied one look the same from outside.
+      expect(() =>
+        nexus.describe('PREVIEW IMPORT CAPSULE :c INTO :s', {
+          c: {},
+          s: nexus.space,
+        }),
+      ).toThrowError(/import/i)
+      expect(nexus.spaceRow().default_policy_id).toBe('')
+    })
+  })
+
+  it('§238 refuses a delegation that outlives or widens its parent', async () => {
+    await withNexus('amplification', (nexus) => {
+      const gov = nexus.store.governance
+      for (const id of ['kip:principal:lead', 'kip:principal:sub']) {
+        gov.ensurePrincipal({ principal_id: id })
+      }
+      // The lead may read Concepts, and no more.
+      gov.createGrant(
+        {
+          space_id: nexus.space,
+          grantee_principal: 'kip:principal:lead',
+          actions: ['read'],
+          scope: { kinds: ['concept'] },
+          conditions: { valid_until: '2099-01-01T00:00:00.000Z' },
+          delegation_allowed: true,
+        },
+        SYSTEM_PRINCIPAL,
+      )
+
+      // The classic amplification: a sub-agent delegation for more than the
+      // delegator holds, unbounded in time and over every kind.
+      gov.createDelegation(
+        {
+          space_id: nexus.space,
+          delegator_principal: 'kip:principal:lead',
+          delegate_principal: 'kip:principal:sub',
+          actions: ['read', 'export'],
+        },
+        'kip:principal:lead',
+      )
+      const sub = nexus.session(principalAuth('kip:principal:sub'))
+      // Neither action survives attenuation: `export` because the delegator
+      // never held it, `read` because an unbounded child of a bounded parent is
+      // a widening and not a narrowing.
+      expect(() =>
+        sub.query('FIND(?c) WHERE { ?c CONCEPT {type: "Person"} }'),
+      ).toThrowError(/requires the read permission/)
+
+      // A properly attenuated one works, which is what makes the refusal a rule
+      // rather than a lockout.
+      gov.createDelegation(
+        {
+          space_id: nexus.space,
+          delegator_principal: 'kip:principal:lead',
+          delegate_principal: 'kip:principal:sub',
+          actions: ['read'],
+          scope: { kinds: ['concept'] },
+          conditions: { valid_until: '2098-01-01T00:00:00.000Z' },
+        },
+        'kip:principal:lead',
+      )
+      expect(sub.query('FIND(?c) WHERE { ?c CONCEPT {type: "Person"} }')).toEqual([])
+    })
+  })
+
+  it('§238 stops a delegation the moment its delegator loses the authority', async () => {
+    await withNexus('parent-revoked', (nexus) => {
+      const gov = nexus.store.governance
+      for (const id of ['kip:principal:lead', 'kip:principal:sub']) {
+        gov.ensurePrincipal({ principal_id: id })
+      }
+      const parent = gov.createGrant(
+        {
+          space_id: nexus.space,
+          grantee_principal: 'kip:principal:lead',
+          actions: ['read'],
+          delegation_allowed: true,
+        },
+        SYSTEM_PRINCIPAL,
+      )
+      gov.createDelegation(
+        {
+          space_id: nexus.space,
+          delegator_principal: 'kip:principal:lead',
+          delegate_principal: 'kip:principal:sub',
+          actions: ['read'],
+        },
+        'kip:principal:lead',
+      )
+      const sub = nexus.session(principalAuth('kip:principal:sub'))
+      expect(sub.query('FIND(?c) WHERE { ?c CONCEPT {type: "Person"} }')).toEqual([])
+
+      // §35: the Delegation's own row still says `active` and its own expiry is
+      // still in the future. A Delegation is only ever as good as its
+      // delegator's authority right now, which is why it is not stored as a
+      // kind of Grant.
+      gov.revokeGrant(parent.id, SYSTEM_PRINCIPAL)
+      expect(() =>
+        sub.query('FIND(?c) WHERE { ?c CONCEPT {type: "Person"} }'),
+      ).toThrowError(/requires the read permission/)
+    })
+  })
+
+  it('§238 refuses a named chain whose links do not link', async () => {
+    await withNexus('broken-chain', (nexus) => {
+      const gov = nexus.store.governance
+      for (const id of ['kip:principal:lead', 'kip:principal:sub']) {
+        gov.ensurePrincipal({ principal_id: id })
+      }
+      gov.createGrant(
+        {
+          space_id: nexus.space,
+          grantee_principal: 'kip:principal:lead',
+          actions: ['read'],
+          delegation_allowed: true,
+        },
+        SYSTEM_PRINCIPAL,
+      )
+      const first = gov.createDelegation(
+        {
+          space_id: nexus.space,
+          delegator_principal: 'kip:principal:lead',
+          delegate_principal: 'kip:principal:sub',
+          actions: ['read'],
+        },
+        'kip:principal:lead',
+      )
+      const second = gov.createDelegation(
+        {
+          space_id: nexus.space,
+          delegator_principal: 'kip:principal:lead',
+          delegate_principal: 'kip:principal:sub',
+          actions: ['read'],
+        },
+        'kip:principal:lead',
+      )
+      // Two unrelated Delegations presented as one chain. The second does not
+      // name the first as its parent, so this is not a narrower authority — it
+      // is a fiction about how the authority was conferred.
+      const session = nexus.session(
+        principalAuth('kip:principal:sub', {
+          delegation_chain: [
+            `kip:delegation:${first.id}`,
+            `kip:delegation:${second.id}`,
+          ],
+        }),
+      )
+      expect(() =>
+        session.query('FIND(?c) WHERE { ?c CONCEPT {type: "Person"} }'),
+      ).toThrowError(/does not descend from the one before it/)
+    })
+  })
+
+  it('§244 does not let a source vouch for itself into anything', async () => {
+    await withNexus('self-vouching', (nexus) => {
+      // `(Source, prefers, Everything)` with maximum confidence is an ordinary
+      // meta-epistemic claim. It is recorded, and it changes no decision — there
+      // is no trust resolver for it to reach, and the projection says so in
+      // every answer rather than letting the absence read as calibration.
+      nexus.execute(`MUTATE {
+        CREATE CONCEPT ?src { TYPE "Person" NAME "Source" }
+        CREATE CONCEPT ?all { TYPE "Preference" NAME "Everything" }
+        ENSURE PROPOSITION ?p (?src, "prefers", ?all)
+        CREATE ASSERTION ?a {
+          SET FIELDS { proposition: ?p, asserted_by: ?src, stance: "support", mode: "stated", confidence: 1.0 }
+        }
+      }`)
+      const warnings = nexus.query(
+        'FIND(?b.explanation.warnings) WHERE { ?p PROPOSITION (?s, "prefers", ?o) ?b BELIEF (?p) }',
+      ) as string[][]
+      expect(warnings[0]?.join(' ')).toMatch(/trust/i)
+      // And the control plane is untouched by any of it.
+      expect(nexus.systemSession().effectiveAuthority().bindings).toEqual([])
+    })
+  })
+
+  it('§247 still names the policy version that authorized a past operation', async () => {
+    const first = await withNexus('policy-version', (nexus) => {
+      const gov = nexus.store.governance
+      const published = gov.publishPolicy(
+        {
+          policy_id: 'kip:policy:space',
+          space_id: nexus.space,
+          statements: [{ effect: 'allow', actions: ['export'] }],
+        },
+        SYSTEM_PRINCIPAL,
+      )
+      const space = nexus.spaceRow()
+      space.default_policy_id = 'kip:policy:space'
+      nexus.store.putSpace(space)
+      nexus.describe('EXPORT CAPSULE :out WHERE { ?c CONCEPT {} }', { out: 'x' })
+      return published
+    })
+    await tickPast('threat-policy-version', first.created_at)
+
+    await withNexus('policy-version', (nexus) => {
+      // The policy moves on. The record of what authorized the past operation
+      // does not: an audit that could be edited would answer with today's answer
+      // rather than the one that was true.
+      nexus.store.governance.publishPolicy(
+        {
+          policy_id: 'kip:policy:space',
+          space_id: nexus.space,
+          statements: [{ effect: 'deny', actions: ['export'] }],
+        },
+        SYSTEM_PRINCIPAL,
+      )
+      expect(() =>
+        nexus.describe('EXPORT CAPSULE :out WHERE { ?c CONCEPT {} }', { out: 'x' }),
+      ).toThrowError(/requires the export permission/)
+
+      const exports = nexus
+        .systemSession()
+        .readAudit(100)
+        .filter((entry) => entry.operation === 'export')
+      const allowed = exports.find((entry) => entry.decision !== 'deny')
+      expect(allowed?.policy_id).toBe('kip:policy:space')
+      expect(allowed?.policy_version).toBe(first.version)
+      expect(nexus.store.governance.activePolicy('kip:policy:space')?.version).toBe(2)
     })
   })
 })

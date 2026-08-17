@@ -239,6 +239,27 @@ export function capabilities(): Json {
     },
     unsupported: [
       {
+        capability: 'ungated_permissions',
+        detail:
+          'derive, moderate_assertion, share, bind_canonical_identity, and the ' +
+          'control-plane management names: manage_membership, manage_grants, ' +
+          'manage_delegation, delegate, manage_actor_binding, manage_trust, ' +
+          'manage_schema, approve_high_risk',
+        reason:
+          'these are registered names that no gate currently asks for, so a ' +
+          'Grant listing one confers nothing — the failure mode the registry ' +
+          'exists to prevent, named here rather than discovered during an ' +
+          'incident. Two different causes. The control-plane management names ' +
+          'are host APIs by design: no KML clause reaches the plane, which is ' +
+          'what keeps a prompt injection off it, and the consequence is that ' +
+          'managing the plane cannot be delegated *through* KIP. The rest name ' +
+          'operations this engine does not distinguish yet — setting ' +
+          '`canonical_id` currently needs only `update`, and a moderator uses ' +
+          'ARCHIVE or TOMBSTONE rather than `moderate_assertion`. The reference ' +
+          'engine has the same gap, so closing it is a change both engines make ' +
+          'together or the two disagree about what a command costs',
+      },
+      {
         capability: 'set_retention',
         detail: 'the SET RETENTION clause',
         reason:
