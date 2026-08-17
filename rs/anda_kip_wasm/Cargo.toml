@@ -5,6 +5,7 @@ description = "WebAssembly bindings for the anda_kip parser, consumed by the @ld
 repository = "https://github.com/ldclabs/anda-db/tree/main/rs/anda_kip_wasm"
 publish = false
 edition = "2024"
+rust-version = "1.88"
 license = "MIT"
 
 # Detached from the root workspace on purpose: this crate builds a `cdylib` for

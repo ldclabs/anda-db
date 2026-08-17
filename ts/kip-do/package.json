@@ -1,6 +1,6 @@
 {
   "name": "@ldclabs/kip-do",
-  "version": "0.12.2",
+  "version": "0.13.0",
   "description": "KIP 2.0 (Knowledge Interaction Protocol) Cognitive Nexus on SQLite-backed Cloudflare Durable Objects \u2014 one Nexus per Durable Object.",
   "keywords": [
     "kip",
@@ -27,8 +27,8 @@
       "default": "./dist/index.js"
     },
     "./schema": {
-      "types": "./dist/schema.d.ts",
-      "default": "./dist/schema.js"
+      "types": "./dist/schema/index.d.ts",
+      "default": "./dist/schema/index.js"
     }
   },
   "files": [
@@ -36,7 +36,8 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "clean": "node -e \"fs.rmSync('dist',{recursive:true,force:true})\"",
+    "build": "pnpm run clean && tsc -p tsconfig.build.json",
     "build:oracle-wasm": "bash scripts/build-wasm.sh",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
@@ -47,6 +48,7 @@
     "codegen:oracle-corpus": "node scripts/codegen-oracle-corpus.mjs",
     "codegen:profiles": "node scripts/codegen-profiles.mjs",
     "codegen:fixtures": "node scripts/codegen-fixtures.mjs",
+    "codegen": "pnpm run codegen:errors && pnpm run codegen:profiles && pnpm run codegen:fixtures && pnpm run codegen:oracle-corpus",
     "prepublishOnly": "pnpm run codegen:errors && pnpm run codegen:profiles && pnpm run build",
     "ncu": "npx npm-check-updates -u"
   },

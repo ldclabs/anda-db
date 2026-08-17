@@ -7,6 +7,7 @@ categories = ["database", "data-structures", "text-processing"]
 repository = "https://github.com/ldclabs/anda-db/tree/main/rs/anda_object_store"
 publish = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

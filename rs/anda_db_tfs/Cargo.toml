@@ -5,6 +5,7 @@ repository = "https://github.com/ldclabs/anda-db/tree/main/rs/anda_db_tfs"
 version = "0.11.0"
 publish = true
 edition.workspace = true
+rust-version.workspace = true
 keywords.workspace = true
 categories.workspace = true
 license.workspace = true

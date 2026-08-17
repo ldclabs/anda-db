@@ -6,6 +6,7 @@ categories = ["database", "data-structures", "web-programming"]
 repository = "https://github.com/ldclabs/anda-db/tree/main/rs/anda_db_server"
 publish = false
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

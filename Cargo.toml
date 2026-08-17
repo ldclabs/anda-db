@@ -37,6 +37,10 @@ categories = [
   "text-processing",
 ]
 edition = "2024"
+# let-chains in edition 2024 (`if let ... && ...`) are used across the KIP
+# crates and were stabilized in 1.88. Without this, an older toolchain reports
+# a syntax error instead of a version mismatch.
+rust-version = "1.88"
 license = "MIT"
 
 [workspace.dependencies]

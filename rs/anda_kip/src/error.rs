@@ -349,7 +349,6 @@ kip_error_codes! {
     InternalError,
 }
 
-
 impl KipErrorCode {
     /// The registry section this code belongs to (Spec §86.2).
     pub fn category(&self) -> ErrorCategory {
@@ -696,7 +695,6 @@ impl KipErrorCode {
             }
         }
     }
-
 }
 
 impl Display for KipErrorCode {
