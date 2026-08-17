@@ -1,12 +1,19 @@
 /**
  * The one place a read reaches an element.
  *
- * Every pattern, filter, projection and aggregate loads through `Context.load`.
- * Keeping that single choke point is what will let the Governance plane decide
- * element visibility in one place rather than in every caller — returning
- * nothing there means the element is simply not in this caller's query
- * universe (§104), which is a different and safer thing than filtering results
- * afterwards.
+ * Every pattern, filter, projection and aggregate loads through `Context.load`,
+ * and that single choke point is where the Governance plane decides element
+ * visibility. Returning `null` there means the element is not in this caller's
+ * query universe (§104) — it is not matched, not counted, does not affect
+ * ranking, and asking for it by id answers the same as asking for one that was
+ * never written. That last part is deliberate: a distinguishable "exists but
+ * hidden" is exactly the existence leak §103 is about, and filtering results
+ * afterwards would produce one.
+ *
+ * The field mask is applied here too, to the *cached view*, for a reason worth
+ * stating: a mask that only narrowed the projection list would still let
+ * `FILTER(?c.attributes.salary > 200000)` answer the question it was meant to
+ * refuse, because which rows come back is itself the disclosure.
  *
  * It is also where the query budget lives. A traversal that fans out has to be
  * stopped by something that counts, not by hoping the shape of the data is
@@ -14,6 +21,8 @@
  */
 
 import { errors } from '../errors.js'
+import type { AuthContext, EffectiveAuthority } from '../governance/index.js'
+import { redactView, spaceResource } from '../governance/index.js'
 import { formatElementId, type ElementId, type ElementKind } from '../id.js'
 import type { JsonMap } from '../json.js'
 import type { SchemaEnvironment } from '../schema/index.js'
@@ -43,14 +52,35 @@ export class Context {
   readonly env: SchemaEnvironment
   readonly space: string
   readonly budget: Budget = { loads: 0, scans: 0 }
+  /** What the caller may see here, resolved once for the whole read. */
+  readonly authority: EffectiveAuthority
+  /** Who the caller is. */
+  readonly auth: AuthContext
+  /**
+   * Whether `_system.origin` may be returned at all (§110).
+   *
+   * Space-scoped and decided once: engine origin is operational information
+   * about the deployment rather than about any one element, so a caller either
+   * may see who writes here or may not.
+   */
+  readonly readOrigin: boolean
 
   private readonly elements = new Map<string, Element | null>()
   private readonly views = new Map<string, JsonMap>()
 
-  constructor(store: Store, env: SchemaEnvironment, space: string) {
+  constructor(
+    store: Store,
+    env: SchemaEnvironment,
+    space: string,
+    authority: EffectiveAuthority,
+    auth: AuthContext,
+  ) {
     this.store = store
     this.env = env
     this.space = space
+    this.authority = authority
+    this.auth = auth
+    this.readOrigin = isPermittedRead(authority, auth)
   }
 
   /** Loads an element, or `null` when it is not in this caller's universe. */
@@ -60,9 +90,7 @@ export class Context {
     if (cached !== undefined) return cached
 
     this.spend('loads', 1)
-    const element = this.store.load(id)
-    const visible =
-      element !== null && element.row.space === this.space ? element : null
+    const visible = this.admit(key, this.store.load(id))
     this.elements.set(key, visible)
     return visible
   }
@@ -72,11 +100,8 @@ export class Context {
     const key = formatElementId(id)
     const cached = this.views.get(key)
     if (cached !== undefined) return cached
-    const element = this.load(id)
-    if (element === null) return null
-    const view = render(element)
-    this.views.set(key, view)
-    return view
+    if (this.load(id) === null) return null
+    return this.views.get(key) ?? null
   }
 
   /** Caches an element the caller already has, so a scan pays for it once. */
@@ -84,9 +109,39 @@ export class Context {
     const id: ElementId = { kind: element.kind, seq: element.row.id }
     const key = formatElementId(id)
     if (!this.elements.has(key)) {
-      this.elements.set(key, element.row.space === this.space ? element : null)
+      this.elements.set(key, this.admit(key, element))
     }
     return id
+  }
+
+  /**
+   * Whether this caller's authority reaches every element in the Space.
+   *
+   * A Space-wide answer — a count, a total — is only honest when it is: a caller
+   * whose Grant is narrowed must not be told how many elements exist outside it
+   * (§106). Answered from the authority rather than by scanning, because the
+   * point is to avoid producing the number at all.
+   */
+  readsWholeSpace(): boolean {
+    return this.authority.readsWholeSpace(this.auth)
+  }
+
+  /**
+   * Applies the read decision to one element, caching its redacted view.
+   *
+   * Returns `null` for an element this caller may not read, and caches the
+   * **redacted** view for one it may — so a `FILTER` or an `ORDER BY` on a
+   * masked field sees what the projection would, rather than being able to probe
+   * the value through row membership (§109).
+   */
+  private admit(key: string, element: Element | null): Element | null {
+    if (element === null || element.row.space !== this.space) return null
+    const constraints = this.authority.mayRead(element, this.auth)
+    if (constraints === null) return null
+    const view = render(element)
+    redactView(view, constraints, this.readOrigin)
+    this.views.set(key, view)
+    return element
   }
 
   /** The SQL table one kind lives in. */
@@ -113,4 +168,9 @@ export class Context {
 
   /** The lifecycle state a pattern matches when it names none. */
   static readonly DEFAULT_STATE = State.ACTIVE
+}
+
+function isPermittedRead(authority: EffectiveAuthority, auth: AuthContext): boolean {
+  const decision = authority.authorize('read_raw_origin', spaceResource(), auth)
+  return decision.decision === 'allow' || decision.decision === 'allow_with_constraints'
 }

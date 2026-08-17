@@ -445,6 +445,10 @@ export class Session {
       env: this.nexus.environment(space),
       request: params,
       ...options,
+      // After the spread: a caller may vary the Space or the parameters, and
+      // must not be able to vary who it is by passing an `options` object.
+      authority,
+      auth: this.auth,
     })
   }
 
@@ -467,6 +471,10 @@ export class Session {
       origin: options.origin ?? this.origin(),
       request: params,
       ...options,
+      // After the spread, for the same reason as the read path: identity is not
+      // one of the knobs an options object may turn.
+      authority,
+      auth: this.auth,
     }
     return this.nexus.transact(() => executeKml(statement, cx))
   }

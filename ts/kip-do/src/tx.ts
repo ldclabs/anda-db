@@ -36,6 +36,7 @@
  */
 
 import { errors } from './errors.js'
+import type { AuthContext, EffectiveAuthority } from './governance/index.js'
 import {
   formatElementId,
   type ElementId,
@@ -154,16 +155,31 @@ export class Transaction {
   private readonly shells: ElementId[] = []
   private readonly warnings: string[] = []
 
+  /**
+   * What the caller may do here, resolved once for the whole transaction.
+   *
+   * Resolved before the statement starts rather than per clause: a Grant
+   * revoked halfway through a `MUTATE` must not leave half of it applied, and
+   * one transaction is one decision about who is writing.
+   */
+  readonly authority: EffectiveAuthority
+  /** Who the caller is. */
+  readonly auth: AuthContext
+
   constructor(
     store: Store,
     space: string,
     env: SchemaEnvironment,
     origin: JsonMap,
     dryRun: boolean,
+    authority: EffectiveAuthority,
+    auth: AuthContext,
   ) {
     this.store = store
     this.env = env
     this.dryRun = dryRun
+    this.authority = authority
+    this.auth = auth
     this.snapshotSeq = store.currentSeq(space)
     this.cx = {
       // Provisional until commit: a dry run never advances the Space clock, so

@@ -25,7 +25,6 @@ import { Context } from '../kql/context.js'
 import { solveAll, type ReadBindings } from '../kql/matching.js'
 import { referencedIds } from '../store/index.js'
 import { nowTime } from '../time.js'
-import { render } from '../view.js'
 import type { MetaContext } from '../meta/index.js'
 
 /** How far the provenance walk follows references out from the roots. */
@@ -69,7 +68,10 @@ export function exportCapsule(
       : DEFAULT_DEPTH
   const includeSchema = options.include_schema !== false
 
-  const context = new Context(cx.store, cx.env, cx.space)
+  // The same choke point a query uses, so an export cannot root on an element
+  // the caller may not read (§78: export is a further permission over what a
+  // read already reached, never a way around it).
+  const context = new Context(cx.store, cx.env, cx.space, cx.authority, cx.auth)
   const roots = new Set<string>()
   for (const solution of solveAll(context, command.where_clauses, [new Map()], b)) {
     for (const binding of solution.values()) {
@@ -97,9 +99,14 @@ export function exportCapsule(
   }
 
   for (const text of ids.sort()) {
-    const element = context.load(parse(text))
-    if (element === null) continue
-    const view = render(element)
+    const id = parse(text)
+    const element = context.load(id)
+    // The *redacted* view, not a fresh render: a field mask that applied to a
+    // query and not to an export would make `EXPORT CAPSULE` the way around it,
+    // and export is meant to be a further permission over what a read already
+    // reached (§78, §109).
+    const view = context.view(id)
+    if (element === null || view === null) continue
     collectSchemaRefs(view, schemaRefs)
     records[bucket[element.kind] as string]?.push(view as Json)
   }

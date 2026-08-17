@@ -31,7 +31,12 @@ import {
   describePermission,
   type AuthContext,
 } from '../governance/index.js'
-import { parseElementId, type ElementId } from '../id.js'
+import {
+  formatElementId,
+  parseElementId,
+  tryParseElementId,
+  type ElementId,
+} from '../id.js'
 import type { Json, JsonMap } from '../json.js'
 import type {
   ChangesCommand,
@@ -44,6 +49,7 @@ import type {
 } from '../kip/ast.js'
 import { parseKip, parserVersion, specRevision } from '../kip/parser.js'
 import { executeKml } from '../kml/index.js'
+import { Context } from '../kql/context.js'
 import { kipLiteral, parameterValue, type ReadBindings } from '../kql/matching.js'
 import { baseline, forecast } from '../projection/policy.js'
 import {
@@ -56,7 +62,7 @@ import {
   type SchemaEnvironment,
   type SymbolKind,
 } from '../schema/index.js'
-import type { Store } from '../store/index.js'
+import type { ChangeEntry, Store } from '../store/index.js'
 import { capabilities, KIP_VERSION } from './capabilities.js'
 import { exportCapsule, verifyCapsule } from '../capsule/index.js'
 
@@ -162,7 +168,8 @@ function describe(
       // work it will not be allowed to finish.
       authority_expires_at: cx.authority.earliestExpiry(),
       governance: {
-        enforced: 'command scope; see DESCRIBE CAPABILITIES for the granularity',
+        enforced:
+          'commands and reads; see DESCRIBE CAPABILITIES for the granularity',
         default_classification: cx.authority.defaultClassification(),
         policy:
           cx.authority.policy === null
@@ -327,7 +334,9 @@ function describe(
       groups: cx.authority.groups,
       permissions: held,
       families: byFamily,
-      granularity: 'command scope; per-element authorization is not built yet',
+      granularity:
+        'commands and reads are authorized per element; writes are authorized ' +
+        'at command scope only',
       expires_at: cx.authority.earliestExpiry(),
     } as Json
   }
@@ -519,6 +528,11 @@ function previewKml(source: string, cx: MetaContext): Json {
     request: cx.request,
     operation: cx.operation,
     dryRun: true,
+    // A preview runs the real write path, so it is authorized like one. A
+    // preview that could compute an effect the caller may not cause would be a
+    // way to learn what a refused write would have done.
+    authority: cx.authority,
+    auth: cx.auth,
   })
   return {
     status: outcome.status,
@@ -555,6 +569,13 @@ function history(
     const id: ElementId = parseElementId(
       text(command.Element.value, b, 'HISTORY ELEMENT'),
     )
+    // Through the read path's choke point, so an element this caller may not
+    // read answers exactly as one that was never written does. A history that
+    // resolved where a read did not would make the version log an existence
+    // oracle (§103).
+    if (reader(cx).load(id) === null) {
+      throw errors.notFoundOrNotVisible(`no element ${formatElementId(id)}`)
+    }
     const { from, to, limit } = range(command.Element)
     return cx.store
       .versionsOf(cx.space, id, from, to, limit)
@@ -567,15 +588,55 @@ function history(
       })) as unknown as Json
   }
   const { from, to, limit } = range(command.Space)
-  return cx.store
-    .transactionsInSpace(cx.space, from, to, limit)
-    .map((row) => ({
+  return visibleChanges(
+    cx,
+    cx.store.transactionsInSpace(cx.space, from, to, limit).map((row) => ({
       tx_id: row.tx_id,
       space_seq: row.seq,
       committed_at: row.committed_at,
       status: row.status,
       changes: row.changes,
-    })) as unknown as Json
+    })),
+  ) as unknown as Json
+}
+
+/** A read context, for the META paths that have to resolve an element. */
+function reader(cx: MetaContext): Context {
+  return new Context(cx.store, cx.env, cx.space, cx.authority, cx.auth)
+}
+
+/**
+ * Narrows a change list to the elements this caller may read (§103).
+ *
+ * A transaction's change list names element ids, so an unfiltered history is an
+ * existence channel for a Principal whose read authority is narrower than the
+ * Space. Only restricted callers pay for the check: for one whose authority
+ * reaches the whole Space there is nothing to filter, and the whole journal is
+ * already theirs.
+ *
+ * A change to an element that has since been erased disappears from a restricted
+ * caller's history, because there is nothing left to authorize against. That is
+ * the conservative direction, and it is why the check is skipped entirely for
+ * the unrestricted case rather than applied uniformly and losing history for
+ * everyone.
+ */
+function visibleChanges<T extends { changes: readonly ChangeEntry[] }>(
+  cx: MetaContext,
+  rows: readonly T[],
+): T[] {
+  if (cx.authority.readsWholeSpace(cx.auth)) return [...rows]
+  const context = reader(cx)
+  return rows
+    .map((row) => ({
+      ...row,
+      changes: row.changes.filter((change) => {
+        const id = tryParseElementId(change.id)
+        return id !== null && context.load(id) !== null
+      }),
+    }))
+    // A transaction whose every change is hidden is one this caller has no
+    // business knowing happened.
+    .filter((row) => row.changes.length > 0)
 }
 
 function changes(
@@ -595,11 +656,9 @@ function changes(
     )
   }
 
-  const rows = cx.store.transactionsInSpace(
-    cx.space,
-    after + 1,
-    Number.MAX_SAFE_INTEGER,
-    limit,
+  const rows = visibleChanges(
+    cx,
+    cx.store.transactionsInSpace(cx.space, after + 1, Number.MAX_SAFE_INTEGER, limit),
   )
   return {
     changes: rows.flatMap((row) =>

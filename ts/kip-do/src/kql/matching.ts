@@ -37,7 +37,7 @@ import type {
   WhereClause,
 } from '../kip/ast.js'
 import { formatSymbolRef } from '../schema/index.js'
-import { State, type SqlRow } from '../store/index.js'
+import { State, type PropositionRow, type SqlRow } from '../store/index.js'
 import { decodeRow } from '../store/codec.js'
 import type { Element, ElementRow } from '../store/index.js'
 import { endpointFromJson, endpointKey } from '../term.js'
@@ -506,6 +506,10 @@ function propositions(
   for (const solution of incoming) {
     for (const row of tupleCandidates(cx, subject, predicate.Atom, object, solution, b)) {
       const id: ElementId = { kind: 'Proposition', seq: row.seq }
+      // The choke point, for the same reason every other pattern consults it: a
+      // Proposition this caller may not read is not matched, not counted and
+      // not bound.
+      if (cx.view(id) === null) continue
       let current: Solution | null = solution
       current = bindTerm(current, subject, row.subject, b)
       if (current === null) continue
@@ -564,21 +568,29 @@ function tupleCandidates(
     values.push(resolveSymbol(cx, 'predicate', name))
   }
 
+  // The whole row rather than the four columns the tuple needs, so the element
+  // can be remembered through `Context`'s visibility check. Reading less here
+  // would mean loading the row a second time to ask whether the caller may see
+  // it — and skipping the question would let a tuple pattern match a
+  // Proposition that is outside this caller's query universe (§104).
   const rows = cx.store.sql
-    .exec<{ id: number; subject: string; object: string; predicate_ref: string }>(
-      `SELECT id, subject, object, predicate_ref FROM propositions
-         WHERE ${wheres.join(' AND ')} ORDER BY id`,
+    .exec<SqlRow>(
+      `SELECT * FROM propositions WHERE ${wheres.join(' AND ')} ORDER BY id`,
       ...values,
     )
     .toArray()
   cx.spend('scans', rows.length)
 
-  return rows.map((row) => ({
-    seq: row.id,
-    subject: JSON.parse(row.subject) as Json,
-    object: JSON.parse(row.object) as Json,
-    predicate_ref: row.predicate_ref,
-  }))
+  return rows.map((row) => {
+    const decoded = decodeRow<PropositionRow>('propositions', row)
+    cx.remember({ kind: 'Proposition', row: decoded })
+    return {
+      seq: decoded.id,
+      subject: decoded.subject as Json,
+      object: decoded.object as Json,
+      predicate_ref: decoded.predicate_ref,
+    }
+  })
 }
 
 /**

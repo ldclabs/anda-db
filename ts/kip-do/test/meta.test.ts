@@ -50,8 +50,8 @@ describe('META', () => {
       // A partial capability names what is left rather than shrinking to one
       // word: Governance is enforced at command scope, so the gaps that remain
       // are the element-scope ones, and they are listed as themselves.
-      expect(gaps).toContain('element_scope_authorization')
-      expect(gaps).toContain('classification_enforcement')
+      expect(gaps).toContain('write_scope_authorization')
+      expect(gaps).toContain('classification_writes')
       expect(gaps).toContain('search')
       expect(gaps).toContain('historical_read')
       expect(gaps).toContain('capsule_import')

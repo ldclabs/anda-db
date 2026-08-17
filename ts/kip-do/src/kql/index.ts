@@ -9,6 +9,7 @@
  */
 
 import { errors } from '../errors.js'
+import type { AuthContext, EffectiveAuthority } from '../governance/index.js'
 import type { Json, JsonMap } from '../json.js'
 import type {
   AggregationFunction,
@@ -39,6 +40,17 @@ export interface KqlContext {
   env: SchemaEnvironment
   request?: JsonMap
   operation?: JsonMap
+  /**
+   * What the caller may see here, resolved once for the whole read.
+   *
+   * Required rather than optional. A default would have to be either "everything"
+   * or "nothing", and both are wrong in a way that is invisible: the first turns
+   * a forgotten argument into an unauthorized read, and the second turns it into
+   * an empty answer that reads as an empty world.
+   */
+  authority: EffectiveAuthority
+  /** Who the caller is. */
+  auth: AuthContext
 }
 
 /** Runs one KQL query and returns the result array. */
@@ -53,7 +65,7 @@ export function executeKql(query: KqlQuery, cx: KqlContext): Json[] {
       'FOR TIME is not implemented by this engine yet; see DESCRIBE CAPABILITIES',
     )
   }
-  const context = new Context(cx.store, cx.env, cx.space)
+  const context = new Context(cx.store, cx.env, cx.space, cx.authority, cx.auth)
   const b: ReadBindings = {
     request: cx.request ?? {},
     operation: cx.operation ?? {},

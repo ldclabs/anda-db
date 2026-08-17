@@ -32,15 +32,17 @@ a number.
 `DESCRIBE CAPABILITIES` reports every gap with a reason. Two are worth naming
 here:
 
-- **Governance is enforced at command scope, not yet at element scope.** There
-  are Principals, groups, Grants, Delegations, Policy versions and Approvals,
-  and every command is authorized against them before it runs — a caller with no
-  Grants can do nothing, and a revoked Grant stops working on the next command.
-  What is *not* built is the narrowing a permitted command then carries: a Grant
-  scoped to a kind, a type or a classification gates the command and does not yet
-  narrow what that command reaches. `DESCRIBE ACCESS` reports the same
-  granularity, because a half-built plane that does not say so is worse than an
-  absent one.
+- **Governance is enforced on commands and on reads; writes are still command
+  scope.** There are Principals, groups, Grants, Delegations, Policy versions and
+  Approvals. Every command is authorized before it runs, and every element a read
+  reaches is authorized again individually — an element outside the Grant is not
+  in the query universe at all, a masked field is invisible to `FILTER` as well as
+  to the projection, and an Assertion the caller may not read does not contribute
+  to a belief. What is *not* built is the same per-element check on the write
+  path: a Grant narrowed to a kind or a classification gates a mutation without
+  narrowing what that mutation may change. `DESCRIBE ACCESS` reports which is
+  which, because a half-built plane that does not say so is worse than an absent
+  one.
 - **`SEARCH`, in every mode.** No search index is built here. A keyword search
   over unsegmented text would silently disagree with the reference engine about
   which documents match, and a caller cannot tell a narrow index from a narrow

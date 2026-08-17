@@ -77,7 +77,7 @@ export function resolveTargets(
     )
   }
 
-  const cx = new Context(tx.store, tx.env, tx.cx.space)
+  const cx = new Context(tx.store, tx.env, tx.cx.space, tx.authority, tx.auth)
   const solutions = solveAll(
     cx,
     where,

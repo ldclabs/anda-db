@@ -50,6 +50,8 @@ export {
 
 export { resolveApproval, subjectDigest } from './approval.js'
 
+export { redactView } from './redact.js'
+
 export {
   clausePermissions,
   kmlPermissions,

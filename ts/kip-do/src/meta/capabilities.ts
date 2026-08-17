@@ -108,11 +108,30 @@ export function capabilities(): Json {
         // "governance: yes" and assumes its classification-scoped Grant narrows
         // what a query returns has been misled by this document, which is worse
         // than being told the plane is absent.
-        enforced: 'command scope',
+        enforced: 'command scope, and element scope on the read path',
         meaning:
           'every KQL, KML and META command is authorized against the control ' +
-          'plane before it runs; what a permitted command then reaches is not ' +
-          'yet narrowed per element',
+          'plane before it runs, and every element a read reaches is authorized ' +
+          'again individually. What a *write* touches is not yet checked per ' +
+          'element',
+        read_scope: {
+          visibility:
+            'an element outside the Grant is not in the query universe: not ' +
+            'matched, not counted, not ranked, and asking for it by id answers ' +
+            'as it would for one that was never written',
+          field_mask:
+            'applied to the view a query caches, so a masked field is invisible ' +
+            'to FILTER and ORDER BY as well as to the projection list',
+          raw_origin:
+            '`_system.origin` needs `read_raw_origin`, and is withheld rather ' +
+            'than removed — removing it would claim no origin was recorded',
+          projection:
+            'an Assertion the caller may not read does not contribute to a belief',
+          history:
+            'HISTORY and CHANGES narrow to the elements the caller may read',
+          export:
+            'a Capsule roots only on readable elements and carries the masked view',
+        },
         records: [
           'Principals and Principal groups',
           'ActorBindings',
@@ -133,26 +152,29 @@ export function capabilities(): Json {
     },
     unsupported: [
       {
-        capability: 'element_scope_authorization',
+        capability: 'write_scope_authorization',
         detail:
-          'per-element read visibility, field masks, classification ceilings ' +
-          'and the per-element checks a write performs',
+          'the per-element checks a mutation performs: authorizing each element ' +
+          'a clause touches, refining the Assertion permission from ' +
+          '`asserted_by`, and the standing a retraction needs',
         reason:
-          'authorization resolves at command scope only. A Grant narrowed to a ' +
-          'kind, a type or a classification gates the command and does not yet ' +
-          'narrow what that command reaches, so such a Grant is more permissive ' +
-          'in practice than it reads. DESCRIBE ACCESS reports the same ' +
-          'granularity rather than letting a caller infer a narrower one',
+          'a write is authorized at command scope only. A Grant narrowed to a ' +
+          'kind, a type or a classification gates the statement and does not ' +
+          'narrow what that statement may change, so such a Grant is more ' +
+          'permissive on the write path than it reads. The read path does check ' +
+          'per element, and DESCRIBE ACCESS reports which is which rather than ' +
+          'letting a caller infer one granularity from the other',
       },
       {
-        capability: 'classification_enforcement',
+        capability: 'classification_writes',
         detail:
           'classify / declassify, influence-authority elevation, quarantine, ' +
           'and the upward join of a derived element’s classification',
         reason:
-          'the lattice and the Space default exist and nothing writes a label ' +
-          'or reads one for a decision yet. `authority_lineage` is recorded at ' +
-          'commit — that is a record, not an enforcement',
+          'a classification label is *read* for every authorization decision — ' +
+          'a Grant’s ceiling and scope both consult it — but nothing writes one ' +
+          'yet, so every element carries the Space default. `authority_lineage` ' +
+          'is recorded at commit, which is a record and not an enforcement',
       },
       {
         capability: 'set_retention',

@@ -24,6 +24,7 @@ import {
   tightenConstraints,
 } from '../src/governance/index.js'
 import { parseElementId } from '../src/id.js'
+import type { Json } from '../src/json.js'
 import { CognitiveNexus, SYSTEM_PRINCIPAL } from '../src/nexus.js'
 import { COGNITIVE_MEMORY } from '../src/schema/index.js'
 import { Store } from '../src/store/index.js'
@@ -878,5 +879,256 @@ describe('the command gate', () => {
       )
       expect(session.effectiveAuthority().isOwner).toBe(false)
     })
+  })
+})
+
+describe('the read path', () => {
+  const SETUP = `MUTATE {
+    CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" SET ATTRIBUTES { salary: 210000 } }
+    CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+    ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
+  }`
+
+  async function withReader<T>(
+    name: string,
+    grant: Parameters<Store['governance']['createGrant']>[0]['scope'] extends never
+      ? never
+      : {
+          actions: string[]
+          scope?: Record<string, string[]>
+          constraints?: Record<string, unknown>
+        },
+    body: (nexus: CognitiveNexus, session: ReturnType<CognitiveNexus['session']>) => T,
+  ): Promise<T> {
+    const stub = env.KIP_DB.getByName(`read-${name}`)
+    return await runInDurableObject(stub, (_instance, state) => {
+      const nexus = CognitiveNexus.connect(state.storage)
+      nexus.activatePackages([COGNITIVE_MEMORY])
+      nexus.execute(SETUP)
+      nexus.store.governance.ensurePrincipal({ principal_id: 'kip:principal:reader' })
+      nexus.store.governance.createGrant(
+        {
+          space_id: nexus.space,
+          grantee_principal: 'kip:principal:reader',
+          actions: grant.actions,
+          scope: grant.scope,
+          constraints: grant.constraints,
+        },
+        SYSTEM_PRINCIPAL,
+      )
+      return body(nexus, nexus.session(principalAuth('kip:principal:reader')))
+    })
+  }
+
+  it('leaves an element outside the Grant out of the query universe', async () => {
+    await withReader(
+      'kind-scope',
+      { actions: ['read'], scope: { kinds: ['concept'] } },
+      (nexus, session) => {
+        // The owner sees both kinds…
+        expect(nexus.query('FIND(?c) WHERE { ?c CONCEPT {type: "Person"} }')).toHaveLength(1)
+        expect(
+          nexus.query('FIND(?p) WHERE { ?p PROPOSITION (?s, "prefers", ?o) }'),
+        ).toHaveLength(1)
+
+        // …and a Grant scoped to Concepts sees only those. Not an error: the
+        // Proposition is simply not in this caller's universe (§104).
+        expect(session.query('FIND(?c) WHERE { ?c CONCEPT {type: "Person"} }')).toHaveLength(1)
+        expect(
+          session.query('FIND(?p) WHERE { ?p PROPOSITION (?s, "prefers", ?o) }'),
+        ).toEqual([])
+      },
+    )
+  })
+
+  it('answers a hidden element by id exactly as one that was never written', async () => {
+    await withReader(
+      'existence',
+      { actions: ['read'], scope: { elements: ['C-1'] } },
+      (_nexus, session) => {
+        // §103: a distinguishable "exists but hidden" is the existence leak.
+        const hidden = session.query('FIND(?c) WHERE { ?c CONCEPT {id: "C-2"} }')
+        const absent = session.query('FIND(?c) WHERE { ?c CONCEPT {id: "C-99"} }')
+        expect(hidden).toEqual(absent)
+        expect(hidden).toEqual([])
+      },
+    )
+  })
+
+  it('hides a masked field from FILTER, not only from the projection', async () => {
+    await withReader(
+      'field-mask',
+      { actions: ['read'], constraints: { fields: ['name', 'schema_ref'] } },
+      (nexus, session) => {
+        // The value is really there, and the owner can filter on it.
+        expect(
+          nexus.query(
+            'FIND(?c.name) WHERE { ?c CONCEPT {type: "Person"} FILTER(?c.attributes.salary > 200000) }',
+          ),
+        ).toEqual(['Alice'])
+
+        // §109: answering this with an empty projection but a matching row
+        // would disclose the value through row membership. The mask is applied
+        // to the cached view, so the filter reads what the projection would.
+        expect(
+          session.query(
+            'FIND(?c.name) WHERE { ?c CONCEPT {type: "Person"} FILTER(?c.attributes.salary > 200000) }',
+          ),
+        ).toEqual([])
+        // The element itself is still readable, under the name the mask allows.
+        expect(
+          session.query('FIND(?c.name) WHERE { ?c CONCEPT {type: "Person"} }'),
+        ).toEqual(['Alice'])
+      },
+    )
+  })
+
+  it('withholds engine origin rather than erasing it', async () => {
+    await withReader('origin', { actions: ['read'] }, (nexus, session) => {
+      expect(
+        nexus.query(
+          'FIND(?c._system.origin) WHERE { ?c CONCEPT {type: "Person"} }',
+        ),
+      ).toEqual([{ principal_id: SYSTEM_PRINCIPAL, channel: 'engine' }])
+
+      // §110: removing it would say "no origin was recorded", which is false
+      // for every element here. What is withheld is *whose*.
+      expect(
+        session.query(
+          'FIND(?c._system.origin) WHERE { ?c CONCEPT {type: "Person"} }',
+        ),
+      ).toEqual([{ redacted: 'read_raw_origin' }])
+    })
+  })
+
+  it('honours a classification ceiling on the way in', async () => {
+    await withReader(
+      'classification',
+      {
+        actions: ['read'],
+        constraints: { max_classification: 'internal' },
+      },
+      (nexus, session) => {
+        // Writing the label is the classification stage's job; reading it for a
+        // decision is this one's. So the label is set through storage here, the
+        // way `classify` will.
+        const element = nexus.store.load(parseElementId('C-1'))
+        if (element === null) throw new Error('C-1 should exist')
+        element.row.governance = { classification: 'secret' }
+        nexus.store.put(element, 'update', 'test')
+
+        expect(nexus.query('FIND(?c.name) WHERE { ?c CONCEPT {} }').sort()).toEqual([
+          'Alice',
+          'Dark',
+        ])
+        // The secret Concept is above the ceiling and drops out; the other one,
+        // which states no label, is judged at the Space default and stays.
+        expect(session.query('FIND(?c.name) WHERE { ?c CONCEPT {} }')).toEqual(['Dark'])
+      },
+    )
+  })
+
+  it('does not let a history read resolve what a read cannot', async () => {
+    await withReader(
+      'history',
+      { actions: ['read', 'read_history'], scope: { elements: ['C-1'] } },
+      (_nexus, session) => {
+        expect(() => session.describe('HISTORY ELEMENT "C-1"')).not.toThrow()
+        // §103 again: the version log must not become an existence oracle.
+        expect(() => session.describe('HISTORY ELEMENT "C-2"')).toThrowError(
+          /no element C-2/,
+        )
+      },
+    )
+  })
+
+  it('narrows a change stream to the elements the caller may read', async () => {
+    await withReader(
+      'changes',
+      { actions: ['read', 'read_history'], scope: { elements: ['C-1'] } },
+      (nexus, session) => {
+        const all = nexus.describe('CHANGES SINCE 0') as { changes: { id: string }[] }
+        expect(all.changes.map((change) => change.id).sort()).toEqual([
+          'C-1',
+          'C-2',
+          'P-1',
+        ])
+
+        const mine = session.describe('CHANGES SINCE 0') as {
+          changes: { id: string }[]
+        }
+        expect(mine.changes.map((change) => change.id)).toEqual(['C-1'])
+      },
+    )
+  })
+
+  it('keeps a belief from being projected out of what the caller may not read', async () => {
+    const stub = env.KIP_DB.getByName('read-projection')
+    await runInDurableObject(stub, (_instance, state) => {
+      const nexus = CognitiveNexus.connect(state.storage)
+      nexus.activatePackages([COGNITIVE_MEMORY])
+      nexus.execute(`MUTATE {
+        CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
+        CREATE CONCEPT ?bob { TYPE "Person" NAME "Bob" }
+        CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+        ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
+        CREATE ASSERTION ?yes {
+          SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: "support", mode: "stated", confidence: 0.9 }
+        }
+        CREATE ASSERTION ?no {
+          SET FIELDS { proposition: ?p, asserted_by: ?bob, stance: "reject", mode: "stated", confidence: 0.9 }
+        }
+      }`)
+
+      const BELIEF =
+        'FIND(?b.opposition.assertion_ids) WHERE { ?p PROPOSITION (?s, "prefers", ?o) ?b BELIEF (?p) }'
+      expect(nexus.query(BELIEF)).toEqual([['A-2']])
+
+      nexus.store.governance.ensurePrincipal({ principal_id: 'kip:principal:reader' })
+      nexus.store.governance.createGrant(
+        {
+          space_id: nexus.space,
+          grantee_principal: 'kip:principal:reader',
+          actions: ['read', 'project'],
+          // Everything except the opposing Assertion, A-2.
+          scope: { elements: ['C-1', 'C-2', 'C-3', 'P-1', 'A-1'] },
+        },
+        SYSTEM_PRINCIPAL,
+      )
+      const session = nexus.session(principalAuth('kip:principal:reader'))
+
+      // The dissent is outside this caller's query universe, so the belief is
+      // projected without it. Silence and exclusion look the same here, and
+      // that is the point: reporting the opposition without its Assertion —
+      // or naming an id the caller may not resolve — would disclose exactly
+      // what the visibility rule refused.
+      expect(session.query(BELIEF)).toEqual([[]])
+    })
+  })
+
+  it('cannot root a Capsule export on an element the caller may not read', async () => {
+    await withReader(
+      'export',
+      { actions: ['read', 'export'], scope: { elements: ['C-1'] } },
+      (nexus, session) => {
+        const exported = (capsule: Json): number =>
+          Object.values(
+            (capsule as { payload: { records: Record<string, unknown[]> } }).payload
+              .records,
+          ).reduce((total, bucket) => total + bucket.length, 0)
+
+        const all = nexus.describe('EXPORT CAPSULE :out WHERE { ?c CONCEPT {} }', {
+          out: 'x',
+        })
+        expect(exported(all)).toBe(2)
+
+        // §78: export is a further permission over what a read already reached,
+        // never a way around it.
+        const mine = session.describe('EXPORT CAPSULE :out WHERE { ?c CONCEPT {} }', {
+          out: 'x',
+        })
+        expect(exported(mine)).toBe(1)
+      },
+    )
   })
 })

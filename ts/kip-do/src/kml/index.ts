@@ -18,6 +18,7 @@
  */
 
 import { KipError } from '../errors.js'
+import type { AuthContext, EffectiveAuthority } from '../governance/index.js'
 import type { JsonMap } from '../json.js'
 import type { KmlStatement } from '../kip/ast.js'
 import type { SchemaEnvironment } from '../schema/index.js'
@@ -40,6 +41,15 @@ export interface KmlContext {
   idempotencyKey?: string
   /** Whether this run may become durable. */
   dryRun?: boolean
+  /**
+   * What the caller may do here, resolved once for the whole statement.
+   *
+   * Required, like the read path's: a write that defaulted its authority would
+   * be an ungoverned write path arriving by omission.
+   */
+  authority: EffectiveAuthority
+  /** Who the caller is. */
+  auth: AuthContext
 }
 
 /**
@@ -58,6 +68,8 @@ export function executeKml(
     cx.env,
     cx.origin,
     cx.dryRun === true,
+    cx.authority,
+    cx.auth,
   )
 
   for (const clause of statement.clauses) {

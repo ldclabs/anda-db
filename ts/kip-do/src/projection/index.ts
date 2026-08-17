@@ -31,11 +31,16 @@
  * refuses — the caller cannot tell the difference from a calibrated answer.
  */
 
-import { formatElementId, parseElementId, type ElementId } from '../id.js'
+import { formatElementId, type ElementId } from '../id.js'
 import type { Json, JsonMap } from '../json.js'
 import { predicateDef } from '../schema/index.js'
 import { parseSymbolRef } from '../schema/index.js'
-import { State, type AssertionRow, type SqlRow } from '../store/index.js'
+import {
+  State,
+  type AssertionRow,
+  type PropositionRow,
+  type SqlRow,
+} from '../store/index.js'
 import { decodeRow } from '../store/codec.js'
 import type { Context } from '../kql/context.js'
 import { nowTime } from '../time.js'
@@ -358,7 +363,20 @@ export function slotToJson(
 
 // --- reads ------------------------------------------------------------------
 
-/** Every Assertion about one Proposition. */
+/**
+ * Every Assertion about one Proposition that this caller may read.
+ *
+ * Through `Context`'s choke point, which is what gives the projection its
+ * governance-visibility stage for free: an Assertion outside the caller's query
+ * universe must not contribute to a belief, because the belief's status and
+ * score would then be derived from content the caller is not entitled to — a
+ * number that answers the question the visibility rule refused.
+ *
+ * Silence and exclusion look the same to the projection, which is correct here:
+ * a caller who cannot see the dissent gets `accepted` rather than `contested`,
+ * exactly as it would if the dissent had never been written. Reporting
+ * "contested, but you may not see why" would be the disclosure.
+ */
 function assertionsAbout(cx: Context, proposition: ElementId): AssertionRow[] {
   const target = formatElementId(proposition)
   const rows = cx.store.sql
@@ -370,7 +388,14 @@ function assertionsAbout(cx: Context, proposition: ElementId): AssertionRow[] {
     )
     .toArray()
   cx.spend('scans', rows.length)
-  return rows.map((row) => decodeRow<AssertionRow>('assertions', row))
+  const visible: AssertionRow[] = []
+  for (const row of rows) {
+    const decoded = decodeRow<AssertionRow>('assertions', row)
+    const id = cx.remember({ kind: 'Assertion', row: decoded })
+    if (cx.view(id) === null) continue
+    visible.push(decoded)
+  }
+  return visible
 }
 
 /** The Propositions competing with this one for a functional slot. */
@@ -407,9 +432,13 @@ export function slotPropositions(
   subjectKey: string,
   predicateRef: string,
 ): ElementId[] {
+  // The whole row, so each rival is remembered through the visibility check
+  // rather than named by id alone. A rival this caller may not read must not
+  // widen a functional predicate's conflict set: its Assertions would then be
+  // read on the caller's behalf and reported as contest.
   const rows = cx.store.sql
-    .exec<{ id: number }>(
-      `SELECT id FROM propositions
+    .exec<SqlRow>(
+      `SELECT * FROM propositions
          WHERE space = ? AND state = ? AND subject_key = ? AND predicate_ref = ?
          ORDER BY id`,
       cx.space,
@@ -419,7 +448,15 @@ export function slotPropositions(
     )
     .toArray()
   cx.spend('scans', rows.length)
-  return rows.map((row) => parseElementId(`P-${row.id}`))
+  const visible: ElementId[] = []
+  for (const row of rows) {
+    const id = cx.remember({
+      kind: 'Proposition',
+      row: decodeRow<PropositionRow>('propositions', row),
+    })
+    if (cx.view(id) !== null) visible.push(id)
+  }
+  return visible
 }
 
 export {
