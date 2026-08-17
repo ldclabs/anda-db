@@ -75,6 +75,22 @@ export {
   type Literal,
 } from './term.js'
 
+export {
+  CognitiveNexus,
+  DEFAULT_SPACE,
+  SYSTEM_PRINCIPAL,
+  type NexusOptions,
+} from './nexus.js'
+
+export {
+  Transaction,
+  executeKml,
+  tryExecuteKml,
+  type KmlContext,
+  type Outcome,
+  type WriteContext,
+} from './kml/index.js'
+
 export * from './schema/index.js'
 
 export * from './store/index.js'

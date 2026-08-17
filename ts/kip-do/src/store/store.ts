@@ -156,6 +156,21 @@ export class Store {
     return { kind, seq: this.lastRowId() }
   }
 
+  /**
+   * Removes one reserved shell.
+   *
+   * Only a shell: the guard is what keeps this from being a delete path for
+   * real elements, which this engine does not have — a purge leaves an identity
+   * stub precisely so that references keep resolving.
+   */
+  removeShell(id: ElementId): void {
+    this.sql.exec(
+      `DELETE FROM ${TABLES[id.kind]} WHERE id = ? AND state = ?`,
+      id.seq,
+      State.PENDING,
+    )
+  }
+
   /** Deletes every element still wearing `pending`, in every Space. */
   sweepPending(): number {
     let removed = 0
