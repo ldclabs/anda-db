@@ -509,6 +509,33 @@ async fn a_structural_pattern_reads_record_topology() {
 }
 
 #[tokio::test]
+async fn ordering_by_an_aggregate_is_refused_rather_than_silently_ignored() {
+    let nexus = seeded("unit").await;
+    // `ORDER BY COUNT(?a)` is a grouped sort. The engine has no grouping, and
+    // the failure mode it replaced is the dangerous one: the aggregation was
+    // dropped and the rows came back sorted by the bare variable, which is a
+    // plausible-looking answer to a question nobody asked.
+    let response = run(
+        &nexus,
+        r#"FIND(?c.name)
+           WHERE {
+             ?c CONCEPT {type: "Person"}
+             ?a ASSERTION {asserted_by: ?c}
+           }
+           ORDER BY COUNT(?a) DESC"#,
+    )
+    .await;
+    assert_eq!(response.status, TopLevelStatus::Failed);
+    let error = response.error.expect("a refusal carries an error");
+    assert_eq!(error.code, "UnsupportedCapability");
+    assert!(
+        error.message.contains("ORDER BY over an aggregate"),
+        "{}",
+        error.message
+    );
+}
+
+#[tokio::test]
 async fn an_empty_where_block_is_one_solution_not_zero() {
     let nexus = seeded("unit").await;
     // `?c CONCEPT {}` constrains nothing but the kind, so it finds them all.

@@ -44,6 +44,22 @@ impl Context<'_> {
             (requested, governed) => requested.or(governed),
         };
 
+        // `ORDER BY COUNT(?x)` is a grouped sort: it orders rows by an
+        // aggregate computed per group, which needs the grouping this engine
+        // does not implement. The key is a separate axis from `FIND`, so the
+        // aggregate branch below does not cover it — and dropping the
+        // aggregate would sort by the bare variable instead, answering a
+        // question nobody asked rather than refusing the one they did.
+        if let Some(items) = order_by
+            && let Some(item) = items.iter().find(|item| item.aggregation.is_some())
+        {
+            return Err(KipError::unsupported_capability(format!(
+                "ORDER BY over an aggregate ({}) needs grouping, which this engine does not \
+                 implement yet; order by a projected variable instead",
+                item.variable.var
+            )));
+        }
+
         let aggregates: Vec<&FindExpression> = find
             .expressions
             .iter()
