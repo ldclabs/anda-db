@@ -235,7 +235,9 @@ export function release(cx: ElementGovernanceContext, id: ElementId): void {
   requirePermitted(
     cx.authority.authorize('quarantine', resourceOfElement(element), cx.auth),
   )
-  const version = commit(cx, element, 'restore', State.ACTIVE, (block) =>
+  // `release`, matching the reference engine: `HISTORY ELEMENT` returns this
+  // verb, so a name only one engine uses is a wire divergence.
+  const version = commit(cx, element, 'release', State.ACTIVE, (block) =>
     setMember(block, QUARANTINE_KEY, null),
   )
   audit(cx, id, 'release_quarantine', { version })

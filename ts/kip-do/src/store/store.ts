@@ -65,7 +65,7 @@ export type ChangeOp =
   | 'tombstone'
   | 'merge'
   | 'quarantine'
-  | 'restore'
+  | 'release'
   | 'purge'
   | 'retract'
   | 'supersede'

@@ -348,7 +348,14 @@ export const TABLE_SPECS: Readonly<Record<string, TableSpec>> = {
   },
 }
 
-function specOf(table: string): TableSpec {
+/**
+ * A table's declaration, or a failure naming the table.
+ *
+ * Exported so that anything needing to enumerate a table's columns — the purge
+ * stub, which has to clear every one of them — reads the same declaration the
+ * codec does rather than keeping a second list beside it.
+ */
+export function specOf(table: string): TableSpec {
   const found = TABLE_SPECS[table]
   if (!found) throw new Error(`unknown table ${table}`)
   return found

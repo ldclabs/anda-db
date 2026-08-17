@@ -1080,6 +1080,37 @@ describe('the read path', () => {
     )
   })
 
+  it('advances the change cursor past a window it may not see', async () => {
+    await withReader(
+      'changes-cursor',
+      { actions: ['read', 'read_history'], scope: { elements: ['C-1'] } },
+      (nexus, session) => {
+        // Every transaction after the setup touches an element this reader may
+        // not see, so its whole page is filtered away.
+        nexus.execute('CREATE CONCEPT ?c { TYPE "Person" NAME "Bob" }')
+        nexus.execute('CREATE CONCEPT ?c { TYPE "Person" NAME "Carol" }')
+
+        const first = session.describe('CHANGES SINCE 0') as {
+          changes: { id: string }[]
+          cursor: number
+        }
+        expect(first.changes.map((change) => change.id)).toEqual(['C-1'])
+        // The cursor names the coordinate the page consumed, not the last one
+        // it could show. Taking it from the visible rows would leave a reader
+        // whose page was entirely hidden exactly where it started, re-reading
+        // the same window forever.
+        expect(first.cursor).toBe(nexus.store.currentSeq(nexus.space))
+
+        const next = session.describe(`CHANGES SINCE ${first.cursor}`) as {
+          changes: { id: string }[]
+          cursor: number
+        }
+        expect(next.changes).toEqual([])
+        expect(next.cursor).toBe(first.cursor)
+      },
+    )
+  })
+
   it('keeps a belief from being projected out of what the caller may not read', async () => {
     const stub = env.KIP_DB.getByName('read-projection')
     await runInDurableObject(stub, (_instance, state) => {
@@ -1654,6 +1685,47 @@ describe('erasure', () => {
       expect((stub?.row as { name?: string }).name).toBe('')
       // The reference still resolves — to a stub that says what happened.
       expect(nexus.store.referrers(nexus.space, parseElementId('C-1'))).toHaveLength(1)
+    })
+  })
+
+  it('erases every content column, not the ones somebody remembered to list', async () => {
+    await withNexus('every-column', (nexus) => {
+      nexus.execute(`MUTATE {
+        CREATE ASSERTION ?a {
+          SET FIELDS { proposition: {id: "P-1"}, asserted_by: {id: "C-1"},
+                       stance: "support", mode: "stated", confidence: 0.9 }
+        }
+      }`)
+      nexus.execute(
+        'PURGE "P-1" REFERENCE POLICY "tombstone_reference" CONFIRM "PURGE"',
+      )
+      nexus.execute(
+        'PURGE "A-1" REFERENCE POLICY "tombstone_reference" CONFIRM "PURGE"',
+      )
+
+      // A Proposition *is* its tuple, and an Assertion *is* its epistemic
+      // payload. An erasure that scrubbed a Concept's `name` and left these
+      // behind would be an erasure of the one kind whose content somebody
+      // happened to enumerate.
+      const proposition = nexus.store.load(parseElementId('P-1'))
+      const tuple = proposition?.row as unknown as Record<string, unknown>
+      expect(tuple.subject).toEqual({})
+      expect(tuple.object).toEqual({})
+      expect(tuple.predicate_ref).toBe('')
+      expect(tuple.subject_key).toBe('')
+      expect(tuple.tuple_key).toBe('')
+
+      const assertion = nexus.store.load(parseElementId('A-1'))
+      const claim = assertion?.row as unknown as Record<string, unknown>
+      expect(claim.stance).toBe('')
+      expect(claim.mode).toBe('')
+      expect(claim.confidence).toBe(0)
+      expect(claim.asserted_by).toEqual({})
+      expect(claim.proposition_id).toBe('')
+
+      // Both still resolve as stubs, so nothing pointing at them dangles.
+      expect(proposition?.row.state).toBe('purged')
+      expect(assertion?.row.state).toBe('purged')
     })
   })
 

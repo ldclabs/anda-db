@@ -484,18 +484,20 @@ export class Session {
   ): Json[] {
     const space = options.space ?? this.nexus.space
     const authority = this.effectiveAuthority(space)
-    this.gate(
-      authority,
-      kqlPermissions(query, options.snapshot_token !== undefined),
-    )
+    // Both spellings, because both reach `executeKql`: the envelope's
+    // `snapshot_token` and the context's own `snapshotToken`. Gating on one of
+    // them would let the other buy a historical read for the price of an
+    // ordinary one, which is the whole reason this argument exists.
+    const snapshotToken = options.snapshot_token ?? options.snapshotToken
+    this.gate(authority, kqlPermissions(query, snapshotToken !== undefined))
     return executeKql(query, {
       store: this.nexus.store,
       space,
       env: this.nexus.environment(space),
       request: params,
       environmentAt: (version) => this.nexus.environmentAt(space, version),
-      snapshotToken: options.snapshot_token,
       ...options,
+      snapshotToken,
       // After the spread: a caller may vary the Space or the parameters, and
       // must not be able to vary who it is by passing an `options` object.
       authority,

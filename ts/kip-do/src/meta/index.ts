@@ -695,17 +695,24 @@ function changes(
     )
   }
 
-  const rows = visibleChanges(
-    cx,
-    cx.store.transactionsInSpace(cx.space, after + 1, Number.MAX_SAFE_INTEGER, limit),
+  const journal = cx.store.transactionsInSpace(
+    cx.space,
+    after + 1,
+    Number.MAX_SAFE_INTEGER,
+    limit,
   )
+  const rows = visibleChanges(cx, journal)
   return {
     changes: rows.flatMap((row) =>
       row.changes.map((change) => ({ ...change, space_seq: row.seq })),
     ),
-    // The next cursor is the coordinate reached, so a caller that saw nothing
-    // holds the same place rather than starting over.
-    cursor: rows[rows.length - 1]?.seq ?? after,
+    // The cursor advances to the last coordinate this page *consumed*, not to
+    // the last one it could show. They differ for a restricted caller whose
+    // authority hides a whole page of transactions: taking the cursor from the
+    // visible rows would leave it exactly where it started, and the follower
+    // would re-read the same hidden window forever instead of walking past it.
+    // A caller that saw nothing because there was nothing holds its place.
+    cursor: journal[journal.length - 1]?.seq ?? after,
   } as unknown as Json
 }
 

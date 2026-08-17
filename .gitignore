@@ -30,3 +30,4 @@ Cargo.lock
 # a root-level node_modules, so this is not scoped to js/.
 node_modules/
 .vite/
+pnpm-lock.yaml

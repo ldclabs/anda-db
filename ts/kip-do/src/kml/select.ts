@@ -21,7 +21,12 @@
  */
 
 import { errors } from '../errors.js'
-import { compareElementId, formatElementId, type ElementId } from '../id.js'
+import {
+  compareElementId,
+  formatElementId,
+  parseElementId,
+  type ElementId,
+} from '../id.js'
 import type { JsonMap } from '../json.js'
 import type { Permission } from '../governance/index.js'
 import type { ElementRef, Scalar, WhereClause } from '../kip/ast.js'
@@ -87,15 +92,15 @@ export function resolveTargets(
 ): Targets {
   const direct = (id: ElementId) => new Targets([id], true, permission)
   if (where === null) {
-    if ('Handle' in target) return direct(parse(handleId(b, target.Handle)))
-    if ('Id' in target) return direct(parse(target.Id))
+    if ('Handle' in target) return direct(parseElementId(handleId(b, target.Handle)))
+    if ('Id' in target) return direct(parseElementId(target.Id))
     const value = parameter(b, target.Param)
     if (typeof value !== 'string') {
       throw errors.typeMismatch(
         `${what} needs an element id, got ${JSON.stringify(value)}`,
       )
     }
-    return direct(parse(value))
+    return direct(parseElementId(value))
   }
 
   if (!('Handle' in target)) {
@@ -127,21 +132,6 @@ export function resolveTargets(
   const ids = [...seen.values()].sort(compareElementId)
   const cap = limit === null ? null : count(b, limit, `${what} LIMIT`)
   return new Targets(cap === null ? ids : ids.slice(0, cap), false, permission)
-}
-
-function parse(text: string): ElementId {
-  const hyphen = text.indexOf('-')
-  const kind = {
-    C: 'Concept',
-    P: 'Proposition',
-    A: 'Assertion',
-    E: 'Evidence',
-    X: 'Activity',
-  }[text.charAt(0)]
-  if (kind === undefined || hyphen !== 1) {
-    throw errors.invalidIdentifier(`${JSON.stringify(text)} is not an element id`)
-  }
-  return { kind: kind as ElementId['kind'], seq: Number(text.slice(2)) }
 }
 
 function count(b: Bindings, value: Scalar, what: string): number {

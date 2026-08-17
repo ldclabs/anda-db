@@ -76,6 +76,7 @@ export class Context {
 
   private readonly elements = new Map<string, Element | null>()
   private readonly views = new Map<string, JsonMap>()
+  private readonly reconstructed = new Map<ElementKind, Element[]>()
 
   constructor(
     store: Store,
@@ -159,9 +160,17 @@ export class Context {
    * the coordinate rather than re-reading the present. They still go through the
    * visibility check: a past coordinate is not a way around the present's
    * authorization, because the read is happening now, by this caller.
+   *
+   * Computed once per kind per query. Every historical pattern, every tuple
+   * candidate and every functional-rival lookup asks for the same coordinate —
+   * a query is bound to exactly one — so re-scanning the log per call would be
+   * quadratic in the solution count and would charge the budget again each
+   * time, refusing an ordinary query for work it did not need to do.
    */
   reconstruct(kind: ElementKind): Element[] {
     if (this.asOf === null) return []
+    const cached = this.reconstructed.get(kind)
+    if (cached !== undefined) return cached
     const elements = this.store.elementsAt(this.space, kind, this.asOf)
     this.spend('scans', elements.length)
     const visible: Element[] = []
@@ -169,6 +178,7 @@ export class Context {
       const id = this.remember(element)
       if (this.load(id) !== null) visible.push(element)
     }
+    this.reconstructed.set(kind, visible)
     return visible
   }
 

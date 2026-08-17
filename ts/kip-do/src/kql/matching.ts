@@ -344,9 +344,15 @@ function checkMatcher(
 ): Solution | null {
   const view = cx.view(id)
   if (view === null) return null
-  if (!Object.hasOwn(matcher, 'state') && view._system !== undefined) {
-    const state = readField(view, ['_system', 'state'])
-    if (state !== State.ACTIVE) return null
+  if (!Object.hasOwn(matcher, 'state')) {
+    // Read off the row, not off the view. A field-masked Grant redacts
+    // `_system` out of the view entirely, and reading the state from there
+    // would silently skip this check for exactly those callers — letting an
+    // archived, tombstoned or purged element match a pattern that named no
+    // state, on the two paths where the SQL narrowing is not there to catch it:
+    // a literal `{id: …}` target and every historical read.
+    const element = cx.load(id)
+    if (element === null || element.row.state !== State.ACTIVE) return null
   }
 
   let current: Solution = solution

@@ -43,6 +43,7 @@ export {
   decodeRow,
   insertStatement,
   rowToJson,
+  specOf,
   updateStatement,
   type SqlRow,
 } from './codec.js'
