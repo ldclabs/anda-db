@@ -99,6 +99,19 @@ export {
 
 export { readPath, render } from './view.js'
 
+export {
+  BASELINE_ID,
+  BASELINE_VERSION,
+  baseline,
+  beliefToJson,
+  forecast,
+  policyFromSettings,
+  project,
+  slotToJson,
+  type Belief,
+  type Policy,
+} from './projection/index.js'
+
 export * from './schema/index.js'
 
 export * from './store/index.js'

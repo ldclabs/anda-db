@@ -88,47 +88,6 @@ function engine(source: string): Outcome {
   }
 }
 
-/**
- * Commands the reference grammar rejects and `@ldclabs/kip-lang` accepts.
- *
- * Every entry here is an open bug in the language toolkit, not a licence: the
- * two engines currently disagree about whether these commands are executable
- * at all, and on a real deployment that is the same command succeeding in one
- * place and failing in another. They are listed rather than skipped so the
- * disagreement has a name, a reason and a size.
- *
- * The list is checked in both directions — `still diverges` below fails when
- * kip-lang starts rejecting one of these, which is what stops a fixed bug from
- * living on here as folklore. Delete the entry then.
- *
- * The first one is the worst: kip-lang does not reject the out-of-range
- * integer, it *rounds* it, so the command executes with a different number
- * than it says. This engine cannot defend against that on its own — by the
- * time it sees the lowered AST the digits are gone — which is why it is
- * recorded here rather than worked around in `src/`.
- */
-const KNOWN_DIVERGENCES: readonly { source: string; why: string }[] = [
-  {
-    source:
-      'CREATE CONCEPT ?c { TYPE "T" SET ATTRIBUTES { n: 18446744073709551617 } }',
-    why: 'an integer past the representable range is rounded, not refused',
-  },
-  {
-    source: 'EXPORT CAPSULE :out WHERE { }',
-    why: 'an unbounded EXPORT is not a Capsule; the empty selection is accepted',
-  },
-  {
-    source: 'UPSERT CONCEPT ?c { MATCH {id: ?anything} }',
-    why: 'UPSERT MATCH must name a stable identity, never a variable',
-  },
-  {
-    source: 'UPSERT CONCEPT ?c { SET FIELDS {name: "Alice"} }',
-    why: 'UPSERT with no MATCH clause is accepted',
-  },
-]
-
-const DIVERGENT = new Set(KNOWN_DIVERGENCES.map((d) => d.source))
-
 describe('parser oracle', () => {
   it('has a corpus worth trusting', () => {
     // A shrinking corpus is a silent loss of coverage: the generator walks the
@@ -140,17 +99,6 @@ describe('parser oracle', () => {
     // Negative cases are the point of harvesting the Rust tests; without them
     // the oracle only proves the two parsers agree on valid input.
     expect(CORPUS.length - accepted).toBeGreaterThan(150)
-  })
-
-  it('still diverges on exactly the known set, no more and no fewer', () => {
-    const fixed = KNOWN_DIVERGENCES.filter(
-      (d) => !('ok' in engine(d.source)) || 'ok' in reference(d.source),
-    ).map((d) => `${d.source}\n  was: ${d.why}`)
-
-    expect(
-      fixed,
-      'kip-lang no longer diverges here — delete these entries from KNOWN_DIVERGENCES',
-    ).toEqual([])
   })
 
   it('agrees with the reference grammar on every command in the corpus', () => {
@@ -169,7 +117,7 @@ describe('parser oracle', () => {
           )
         }
       } else if ('ok' in actual) {
-        if (!DIVERGENT.has(source)) overAccepted.push(source)
+        overAccepted.push(source)
       } else if ('ok' in expected) {
         overRejected.push(`${source}\n  engine: ${actual.error.message}`)
       }

@@ -60,6 +60,6 @@
     "node": ">=20"
   },
   "dependencies": {
-    "@ldclabs/kip-lang": "^2.0.0"
+    "@ldclabs/kip-lang": "^2.0.1"
   }
 }

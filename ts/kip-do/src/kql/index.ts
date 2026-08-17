@@ -12,6 +12,7 @@ import { errors } from '../errors.js'
 import type { Json, JsonMap } from '../json.js'
 import type {
   AggregationFunction,
+  BoundValue,
   FindExpression,
   KqlQuery,
   OrderByItem,
@@ -28,6 +29,8 @@ import {
   type ReadBindings,
 } from './matching.js'
 import { compareSolutions, type Solution } from './solution.js'
+import { policyFromSettings } from '../projection/index.js'
+import { boundValue } from '../kml/value.js'
 
 /** What one KQL execution needs from its caller. */
 export interface KqlContext {
@@ -50,17 +53,14 @@ export function executeKql(query: KqlQuery, cx: KqlContext): Json[] {
       'FOR TIME is not implemented by this engine yet; see DESCRIBE CAPABILITIES',
     )
   }
-  if (query.epistemic !== null) {
-    throw errors.unsupportedCapability(
-      'WITH EPISTEMIC is not implemented by this engine yet; see DESCRIBE ' +
-        'CAPABILITIES',
-    )
-  }
-
   const context = new Context(cx.store, cx.env, cx.space)
   const b: ReadBindings = {
     request: cx.request ?? {},
     operation: cx.operation ?? {},
+    // Resolved before anything runs: a query that projected half its beliefs
+    // under one policy and then failed on the settings would have reported an
+    // answer nobody asked for.
+    policy: policyFromSettings(epistemicSettings(query.epistemic, cx)),
   }
 
   const solutions = solveAll(context, query.where_clauses, [new Map()], b)
@@ -73,6 +73,27 @@ export function executeKql(query: KqlQuery, cx: KqlContext): Json[] {
   const ordered = sort(context, solutions, query.order_by, b)
   const rows = page(ordered, query, b)
   return rows.map((solution) => project(context, expressions, solution))
+}
+
+/**
+ * The `WITH EPISTEMIC { … }` block, with its parameters filled in.
+ *
+ * Evaluated through the same bound-value path a mutation uses, so a policy
+ * named by `:parameter` means the same thing on both sides of the language.
+ */
+function epistemicSettings(
+  epistemic: Record<string, BoundValue> | null,
+  cx: KqlContext,
+): JsonMap {
+  if (epistemic === null) return {}
+  const b = {
+    tx: null as never,
+    request: cx.request ?? {},
+    operation: cx.operation ?? {},
+  }
+  return Object.fromEntries(
+    Object.entries(epistemic).map(([key, value]) => [key, boundValue(b, value)]),
+  )
 }
 
 /** One row of the result: a scalar for one expression, an array for several. */

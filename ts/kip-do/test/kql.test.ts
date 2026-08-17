@@ -285,12 +285,23 @@ describe('KQL', () => {
     })
   })
 
+  it('projects a belief now that BELIEF is built', async () => {
+    await withNexus('belief', (nexus) => {
+      // Covered properly in `projection.test.ts`; here only to keep the
+      // "not built yet" list below honest about what is still missing.
+      expect(
+        nexus.query(
+          'FIND(?b.status) WHERE { ?p PROPOSITION (?s, "prefers", ?o) ?b BELIEF (?p) }',
+        ),
+      ).toEqual(['insufficient'])
+    })
+  })
+
   it('refuses the read features it has not built', async () => {
     await withNexus('unsupported', (nexus) => {
       for (const command of [
         'FIND(?c) WHERE { ?c CONCEPT {} } AS OF SEQ 1',
         'FIND(?c) WHERE { ?c CONCEPT {} } FOR TIME "2026-01-01T00:00:00Z"',
-        'FIND(?b) WHERE { ?p PROPOSITION (?s, "prefers", ?o) ?b BELIEF (?p) }',
         'FIND(?o) WHERE { ?p PROPOSITION (?s, "prefers"{1,3}, ?o) }',
       ]) {
         expect(() => nexus.query(command), command).toThrowError(

@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       '@ldclabs/kip-lang':
-        specifier: ^2.0.0
-        version: 2.0.0
+        specifier: ^2.0.1
+        version: 2.0.1
     devDependencies:
       '@cloudflare/vitest-pool-workers':
         specifier: ^0.20.2
@@ -574,8 +574,8 @@ packages:
   '@jridgewell/trace-mapping@0.3.9':
     resolution: {integrity: sha512-3Belt6tdc8bPgAtbcmdtNJlirVoTmEb5e2gC94PnkwEW9jI6CAHUeoG85tjWP5WquqfavoMtMwiG4P926ZKKuQ==}
 
-  '@ldclabs/kip-lang@2.0.0':
-    resolution: {integrity: sha512-9NzLZhzLbJxs4Ib3c2MdkuGlPRVgglMSwZQ88yyb0AKbIPlsFY9Y7hSS44yRNZPNHV8x2tZNStexvzsXFKBg4A==}
+  '@ldclabs/kip-lang@2.0.1':
+    resolution: {integrity: sha512-nMo3bu9s137omcT4E1bBEYF/aD3y4KQVS+cMwwhWF4hInB3I3uTskeM/LfbTqdXscFFCQOZX0SmLREQDNi/Wiw==}
     engines: {node: '>=18'}
 
   '@poppinss/colors@4.1.6':
@@ -1497,7 +1497,7 @@ snapshots:
       '@jridgewell/resolve-uri': 3.1.2
       '@jridgewell/sourcemap-codec': 1.5.5
 
-  '@ldclabs/kip-lang@2.0.0': {}
+  '@ldclabs/kip-lang@2.0.1': {}
 
   '@poppinss/colors@4.1.6':
     dependencies:

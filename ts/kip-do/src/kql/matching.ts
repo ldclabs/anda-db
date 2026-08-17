@@ -28,6 +28,7 @@ import {
 } from '../id.js'
 import { isJsonMap, type Json, type JsonMap } from '../json.js'
 import type {
+  BeliefTarget,
   MatchValue,
   ObjectMatcher,
   PredAtom,
@@ -41,6 +42,13 @@ import { decodeRow } from '../store/codec.js'
 import type { Element, ElementRow } from '../store/index.js'
 import { endpointFromJson, endpointKey } from '../term.js'
 import { readPath } from '../view.js'
+import {
+  beliefToJson,
+  project,
+  slotPropositions,
+  slotToJson,
+  type Policy,
+} from '../projection/index.js'
 import { Context, LIMITS } from './context.js'
 import { evaluateFilter } from './filter.js'
 import {
@@ -57,6 +65,8 @@ import {
 export interface ReadBindings {
   request: JsonMap
   operation: JsonMap
+  /** The Epistemic Policy a BELIEF in this query projects under. */
+  policy: Policy
 }
 
 export function parameterValue(b: ReadBindings, name: string): Json {
@@ -209,6 +219,12 @@ function solveClause(
   }
   if ('Structural' in clause) {
     return structural(cx, clause.Structural, incoming, b)
+  }
+  if ('Belief' in clause) {
+    return belief(cx, clause.Belief, incoming, b)
+  }
+  if ('BeliefSlot' in clause) {
+    return beliefSlot(cx, clause.BeliefSlot, incoming, b)
   }
 
   const name = Object.keys(clause)[0] ?? 'this pattern'
@@ -698,6 +714,126 @@ function structural(
   return out
 }
 
+// --- projection patterns ----------------------------------------------------
+
+/**
+ * `?b BELIEF (…)` — what this Brain currently holds about a Proposition.
+ *
+ * The target must already be bound. Projecting over an unbound variable would
+ * mean projecting over every Proposition in the Space, which is not a slower
+ * version of the question — it is a different one, and answering it would hand
+ * back beliefs about tuples the caller never mentioned.
+ */
+function belief(
+  cx: Context,
+  clause: { variable: string; target: BeliefTarget },
+  incoming: readonly Solution[],
+  b: ReadBindings,
+): Solution[] {
+  const out: Solution[] = []
+  for (const solution of incoming) {
+    const target = beliefTarget(cx, clause.target, solution, b)
+    const projected = project(cx, target, b.policy)
+    const next = extend(
+      solution,
+      clause.variable,
+      literalBinding(beliefToJson(projected) as Json),
+    )
+    if (next !== null) out.push(next)
+  }
+  return out
+}
+
+/** The Proposition a BELIEF clause names. */
+function beliefTarget(
+  cx: Context,
+  target: BeliefTarget,
+  solution: Solution,
+  b: ReadBindings,
+): ElementId {
+  if ('Proposition' in target) {
+    const bound = solution.get(target.Proposition)
+    if (bound === undefined || bound.kind !== 'element') {
+      throw errors.projectionTargetUnbound(
+        `?${target.Proposition} is not bound to a Proposition where the ` +
+          `BELIEF clause reads it; bind it with a pattern first`,
+      )
+    }
+    return bound.id
+  }
+  if ('Id' in target) {
+    const value =
+      'Param' in target.Id
+        ? parameterValue(b, target.Id.Param)
+        : kipLiteral(target.Id.Literal)
+    if (typeof value !== 'string') {
+      throw errors.typeMismatch('a Proposition id must be a string')
+    }
+    return parseElementId(value)
+  }
+  // An inline tuple: resolved the way a pattern would, and refused when it
+  // names no Proposition on record rather than projecting about nothing.
+  const tuple = propositions(cx, '__belief', { Tuple: target.Tuple }, [solution], b)
+  const first = tuple[0]?.get('__belief')
+  if (first === undefined || first.kind !== 'element') {
+    throw errors.notFoundOrNotVisible(
+      'the BELIEF tuple names no Proposition on record here',
+    )
+  }
+  return first.id
+}
+
+/**
+ * `?slot BELIEF SLOT (?subject, "predicate")` — the conflict set of one slot.
+ *
+ * Reports every candidate rather than a winner: a functional slot holding two
+ * accepted values is a real state, and naming one of them would be taking a
+ * side the record does not take.
+ */
+function beliefSlot(
+  cx: Context,
+  clause: { variable: string; subject: Term; predicate: PredAtom },
+  incoming: readonly Solution[],
+  b: ReadBindings,
+): Solution[] {
+  const out: Solution[] = []
+  for (const solution of incoming) {
+    const subject = termEndpoint(clause.subject, solution, b)
+    if (subject === null) {
+      // Unbounded rather than unbound: the clause is well-formed, and the set
+      // it would range over is every subject in the Space.
+      throw errors.projectionTargetUnbounded(
+        'BELIEF SLOT needs a bound subject; bind it with a pattern first',
+      )
+    }
+    if ('Variable' in clause.predicate) {
+      throw errors.projectionTargetUnbounded(
+        'BELIEF SLOT needs an exact predicate; a projection never walks a ' +
+          'variable predicate',
+      )
+    }
+    const name =
+      'Literal' in clause.predicate
+        ? clause.predicate.Literal
+        : parameterValue(b, clause.predicate.Param)
+    if (typeof name !== 'string') {
+      throw errors.typeMismatch('a predicate must be a symbol string')
+    }
+    const predicateRef = resolveSymbol(cx, 'predicate', name)
+    const key = endpointKey(endpointFromJson(subject))
+    const beliefs = slotPropositions(cx, key, predicateRef).map((id) =>
+      project(cx, id, b.policy),
+    )
+    const next = extend(
+      solution,
+      clause.variable,
+      literalBinding(slotToJson(subject, predicateRef, beliefs) as Json),
+    )
+    if (next !== null) out.push(next)
+  }
+  return out
+}
+
 /** Reads a dot path off a bound variable, for filters and projections. */
 export function readVariable(
   cx: Context,
@@ -715,9 +851,15 @@ export function readVariable(
       ? formatElementId(bound.id)
       : (bound.value as Json)
   }
-  if (bound.kind !== 'element') return null
-  const view = cx.view(bound.id)
-  return view === null ? null : readPath(cx.env, view, path)
+  if (bound.kind === 'element') {
+    const view = cx.view(bound.id)
+    return view === null ? null : readPath(cx.env, view, path)
+  }
+  // A non-element binding can still have members: a BELIEF binds a projection
+  // object, and `?b.support.score` reads into it exactly as a dot path reads
+  // into an element's view. Refusing here would make the projection's own
+  // output unreadable by the language that produced it.
+  return readPath(cx.env, bound.value as Json, path)
 }
 
 export { kipLiteral }
