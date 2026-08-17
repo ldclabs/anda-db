@@ -156,6 +156,17 @@ export interface ApprovalDraft {
 export interface MutationEntry {
   /** The Governance verb, e.g. `create_grant`. */
   operation: string
+  /**
+   * The instant the record it mirrors carries.
+   *
+   * Passed rather than read from the clock, because the two are not reliably
+   * the same value: a Workers isolate's clock advances at I/O boundaries, and
+   * writing the row is one. An audit entry stamped *later* than the record it
+   * describes makes a historical replay miss exactly that change — asking "who
+   * was in this group as of its own `updated_at`" would answer with the state
+   * before it. Defaults to now, for the entries that mirror nothing.
+   */
+  at?: string
   /** The Space it concerned; empty becomes `*`. */
   space_id?: string
   /** What it acted on. */
@@ -207,6 +218,7 @@ export class GovernanceStore {
     const stored = { ...row, id }
     this.recordMutation({
       operation: 'create_principal',
+      at: stored.updated_at,
       resource: stored.principal_id,
       record: stored as unknown as Json,
     })
@@ -240,6 +252,7 @@ export class GovernanceStore {
     this.update('gov_principals', row)
     this.recordMutation({
       operation: 'set_principal_status',
+      at: row.updated_at,
       resource: principalId,
       principal_id: actor,
       record: row as unknown as Json,
@@ -285,6 +298,7 @@ export class GovernanceStore {
     // now, and only this says who was in it then (§177).
     this.recordMutation({
       operation: 'put_group',
+      at: row.updated_at,
       resource: row.group_id,
       principal_id: actor,
       record: row as unknown as Json,
@@ -372,6 +386,7 @@ export class GovernanceStore {
     const stored = { ...row, id }
     this.recordMutation({
       operation: 'create_actor_binding',
+      at: stored.updated_at,
       resource: bindingId(id),
       principal_id: actor,
       record: stored as unknown as Json,
@@ -392,6 +407,7 @@ export class GovernanceStore {
     this.update('gov_actor_bindings', row)
     this.recordMutation({
       operation: 'revoke_actor_binding',
+      at: row.updated_at,
       resource: bindingId(id),
       principal_id: actor,
       record: row as unknown as Json,
@@ -455,6 +471,7 @@ export class GovernanceStore {
     const stored = { ...row, id }
     this.recordMutation({
       operation: 'create_grant',
+      at: stored.updated_at,
       space_id: stored.space_id,
       resource: grantId(id),
       principal_id: actor,
@@ -474,6 +491,7 @@ export class GovernanceStore {
     this.update('gov_grants', row)
     this.recordMutation({
       operation: 'revoke_grant',
+      at: row.updated_at,
       space_id: row.space_id,
       resource: grantId(id),
       principal_id: actor,
@@ -574,6 +592,7 @@ export class GovernanceStore {
     const stored = { ...row, id }
     this.recordMutation({
       operation: 'create_delegation',
+      at: stored.updated_at,
       space_id: stored.space_id,
       resource: delegationId(id),
       principal_id: actor,
@@ -595,6 +614,7 @@ export class GovernanceStore {
     this.update('gov_delegations', row)
     this.recordMutation({
       operation: 'revoke_delegation',
+      at: row.updated_at,
       space_id: row.space_id,
       resource: delegationId(id),
       principal_id: actor,
@@ -654,6 +674,7 @@ export class GovernanceStore {
     const stored = { ...row, id }
     this.recordMutation({
       operation: 'publish_policy',
+      at: stored.created_at,
       space_id: stored.space_id,
       resource: stored.policy_ref,
       principal_id: actor,
@@ -717,6 +738,7 @@ export class GovernanceStore {
     const stored = { ...row, id }
     this.recordMutation({
       operation: 'request_approval',
+      at: stored.updated_at,
       space_id: stored.space_id,
       resource: approvalId(id),
       principal_id: actor,
@@ -763,6 +785,7 @@ export class GovernanceStore {
     this.update('gov_approvals', row)
     this.recordMutation({
       operation: 'approve',
+      at: row.updated_at,
       space_id: row.space_id,
       resource: approvalId(id),
       principal_id: approver,
@@ -787,6 +810,7 @@ export class GovernanceStore {
     this.update('gov_approvals', row)
     this.recordMutation({
       operation: 'consume_approval',
+      at: row.updated_at,
       space_id: row.space_id,
       resource: approvalId(id),
       record: row as unknown as Json,
@@ -817,7 +841,7 @@ export class GovernanceStore {
   recordMutation(entry: MutationEntry): number {
     return this.appendAudit({
       entry_class: 'mutation',
-      at: nowTime(),
+      at: entry.at ?? nowTime(),
       space_id: entry.space_id === undefined || entry.space_id === '' ? ANY_SPACE : entry.space_id,
       principal_id: entry.principal_id ?? '',
       operation: entry.operation,
