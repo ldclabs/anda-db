@@ -100,6 +100,15 @@ export {
 export { readPath, render } from './view.js'
 
 export {
+  KIP_VERSION,
+  capabilities,
+  executeMeta,
+  type MetaContext,
+} from './meta/index.js'
+
+export { exportCapsule, verifyCapsule } from './capsule/index.js'
+
+export {
   BASELINE_ID,
   BASELINE_VERSION,
   baseline,

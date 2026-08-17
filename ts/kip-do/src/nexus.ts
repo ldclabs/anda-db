@@ -18,6 +18,7 @@ import { parseKip } from './kip/parser.js'
 import type { Command, KmlStatement } from './kip/ast.js'
 import { executeKml, type KmlContext } from './kml/index.js'
 import { executeKql, type KqlContext } from './kql/index.js'
+import { executeMeta, type MetaContext } from './meta/index.js'
 import {
   BUNDLED_PACKAGES,
   CORE_PACKAGE,
@@ -214,20 +215,38 @@ export class CognitiveNexus {
     return out
   }
 
-  /**
-   * Parses and runs one command.
-   *
-   * META is not built yet and is refused by name rather than answered emptily:
-   * an empty answer to "what do you know about X" reads as "nothing", which is
-   * a different and wrong claim.
-   */
+  /** Parses and runs one KML statement, returning its receipt. */
   execute(command: string, params: JsonMap = {}): Outcome {
     const parsed: Command = parseKip(command)
     if ('Kml' in parsed) return this.mutate(parsed.Kml, params)
-    throw errors.unsupportedCapability(
-      `${'Kql' in parsed ? 'a KQL query has no receipt; use query()' : 'META'} ` +
-        `is not available here; see DESCRIBE CAPABILITIES`,
+    throw errors.languageMismatch(
+      'this command is not a KML statement; a query has no receipt — use ' +
+        'query() for KQL and describe() for META',
     )
+  }
+
+  /**
+   * Parses and runs one META command.
+   *
+   * META is read-only by construction, with one exception the language makes
+   * explicit: `PREVIEW KML` runs the real dry-run path, which writes nothing.
+   */
+  describe(command: string, params: JsonMap = {}): Json {
+    const parsed: Command = parseKip(command)
+    if (!('Meta' in parsed)) {
+      throw errors.languageMismatch('this command is not a META command')
+    }
+    const space = this.space
+    const cx: MetaContext = {
+      store: this.store,
+      space,
+      env: this.environment(space),
+      request: params,
+    }
+    // `PREVIEW KML` mints shells to allocate ids and then discards them, so it
+    // runs inside a transaction like any other mutation path — one that is
+    // simply never committed.
+    return this.storage.transactionSync(() => executeMeta(parsed.Meta, cx))
   }
 
   /**

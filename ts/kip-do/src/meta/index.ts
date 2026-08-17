@@ -1,0 +1,578 @@
+/**
+ * # Executing META
+ *
+ * META is how an Agent finds its footing before it reads or writes anything:
+ * what this Nexus is, which Space it is in, what the schema says, what the
+ * engine can actually do.
+ *
+ * ## The five-layer discipline
+ *
+ * The syntax card states it and this module follows it, because collapsing any
+ * two of these is how a caller ends up believing something the engine never
+ * said:
+ *
+ * ```text
+ * DESCRIBE / SEARCH   find        — what is here
+ * VERIFY              integrity   — is this artifact what it claims to be
+ * VALIDATE            legality    — would this be accepted
+ * PREVIEW             effect      — what would it do
+ * Receipt             fact        — what actually committed
+ * ```
+ *
+ * A `VALIDATE` that passed is not a promise that a write will commit, and a
+ * `PREVIEW` that computed an effect is not a commit. Only a receipt says
+ * something happened.
+ */
+
+import { KipError, errors, KIP_ERROR_CODES, KIP_ERROR_REGISTRY } from '../errors.js'
+import { parseElementId, type ElementId } from '../id.js'
+import type { Json, JsonMap } from '../json.js'
+import type {
+  ChangesCommand,
+  DescribeTarget,
+  HistoryCommand,
+  ListCommand,
+  MetaCommand,
+  Scalar,
+  ValidateCommand,
+} from '../kip/ast.js'
+import { parseKip, parserVersion, specRevision } from '../kip/parser.js'
+import { executeKml } from '../kml/index.js'
+import { kipLiteral, parameterValue, type ReadBindings } from '../kql/matching.js'
+import { baseline, forecast } from '../projection/policy.js'
+import {
+  conceptTypeDef,
+  facetDef,
+  formatSymbolRef,
+  predicateDef,
+  structuralFieldDef,
+  symbols,
+  type SchemaEnvironment,
+  type SymbolKind,
+} from '../schema/index.js'
+import type { Store } from '../store/index.js'
+import { capabilities, KIP_VERSION } from './capabilities.js'
+import { exportCapsule, verifyCapsule } from '../capsule/index.js'
+
+/** What one META execution needs from its caller. */
+export interface MetaContext {
+  store: Store
+  space: string
+  env: SchemaEnvironment
+  request?: JsonMap
+  operation?: JsonMap
+}
+
+/** Runs one META command. */
+export function executeMeta(command: MetaCommand, cx: MetaContext): Json {
+  const b: ReadBindings = {
+    request: cx.request ?? {},
+    operation: cx.operation ?? {},
+    policy: baseline(),
+  }
+
+  if ('Describe' in command) return describe(command.Describe, cx, b)
+  if ('List' in command) return list(command.List, cx, b)
+  if ('Validate' in command) return validate(command.Validate, cx, b)
+  if ('Preview' in command) {
+    if (!('Kml' in command.Preview)) {
+      throw errors.unsupportedCapability(
+        'PREVIEW IMPORT CAPSULE needs the Capsule import path, which this ' +
+          'engine has not built; see DESCRIBE CAPABILITIES',
+      )
+    }
+    return previewKml(text(command.Preview.Kml, b, 'PREVIEW KML'), cx)
+  }
+  if ('History' in command) return history(command.History, cx, b)
+  if ('Changes' in command) return changes(command.Changes, cx, b)
+  if ('ExportCapsule' in command) {
+    return exportCapsule(command.ExportCapsule, cx, b)
+  }
+  if ('Verify' in command) {
+    if (command.Verify.target !== 'Capsule') {
+      throw errors.unsupportedCapability(
+        `VERIFY ${command.Verify.target} is not implemented by this engine; ` +
+          `reporting an unchecked artifact as valid would cancel the point of ` +
+          `asking`,
+      )
+    }
+    return verifyCapsule(scalarValue(command.Verify.value, b))
+  }
+  if ('Snapshot' in command) {
+    // A SNAPSHOT token promises a coordinate can be read back. This engine
+    // cannot read one back yet, so it does not issue the promise.
+    throw errors.unsupportedCapability(
+      'SNAPSHOT issues a token that promises a past coordinate can be read ' +
+        'back; this engine has no historical read path, so it does not issue one',
+    )
+  }
+  // SEARCH. Refused by name and for its own reason: a keyword search over
+  // unsegmented text would silently disagree with the reference engine about
+  // which documents match, and a caller cannot tell a narrow index from a
+  // narrow world.
+  throw errors.searchIndexUnavailable(
+    'this engine builds no search index; SEARCH in every mode is refused ' +
+      'rather than answered from a narrower index than the caller expects. ' +
+      'Use FIND with a pattern; see DESCRIBE CAPABILITIES',
+  )
+}
+
+// --- DESCRIBE ---------------------------------------------------------------
+
+function describe(
+  target: DescribeTarget,
+  cx: MetaContext,
+  b: ReadBindings,
+): Json {
+  if (target === 'Protocol') return protocol()
+  if (target === 'Capabilities') return capabilities()
+  if (target === 'ExecutionContext') {
+    return {
+      space_id: cx.space,
+      schema_environment_version: cx.env.version,
+      space_seq: cx.store.currentSeq(cx.space),
+      // No control plane: every caller has the same authority here, and saying
+      // so beats reporting an identity the engine does not actually check.
+      principal: null,
+      governance: 'not enforced by this engine; see DESCRIBE CAPABILITIES',
+    } as Json
+  }
+  if (target === 'ProjectionCapability') {
+    return {
+      policies: [baseline().id, forecast().id],
+      statuses: ['accepted', 'rejected', 'contested', 'uncertain', 'insufficient'],
+      score_semantics: 'normalized_support_not_probability',
+      explanation: true,
+      missing_stages: [
+        {
+          stage: 'trust_evaluation',
+          reason: 'no trust model; every eligible corroboration group counts equally',
+        },
+        {
+          stage: 'evidence_quality',
+          reason:
+            'a cited Evidence record is counted for its independence, never ' +
+            'for how good it is',
+        },
+      ],
+    } as Json
+  }
+
+  if ('Primer' in target) return primer(cx)
+  if ('Space' in target) {
+    const name =
+      target.Space.value === null ? cx.space : text(target.Space.value, b, 'SPACE')
+    const row = cx.store.space(name)
+    if (row === null) {
+      throw errors.notFoundOrNotVisible(`no MemorySpace ${name}`)
+    }
+    return { ...row, id: undefined } as unknown as Json
+  }
+  if ('SchemaEnvironment' in target) {
+    if (target.SchemaEnvironment.as_of !== null) {
+      throw errors.unsupportedCapability(
+        'DESCRIBE SCHEMA ENVIRONMENT AS OF needs a historical read path, ' +
+          'which this engine has not built',
+      )
+    }
+    return {
+      version: cx.env.version,
+      lock: cx.env.lock as unknown as Json,
+      packages: cx.env.packageRefs(),
+    } as Json
+  }
+  if ('Package' in target) {
+    const reference = text(target.Package, b, 'DESCRIBE PACKAGE')
+    const row = cx.store.packageByRef(reference)
+    if (row === null) {
+      throw errors.schemaPackageUnavailable(`${reference} is not installed here`)
+    }
+    return {
+      package_ref: row.package_ref,
+      content_digest: row.content_digest,
+      declared_digest: row.declared_digest,
+      installed_at: row.installed_at,
+      source: row.source,
+      // Whether it takes part in resolution is a different question from
+      // whether it is here (§240.18).
+      active: cx.env.packageRefs().includes(row.package_ref),
+      artifact: row.artifact as unknown as Json,
+    } as Json
+  }
+  for (const [key, kind] of [
+    ['Type', 'ConceptType'],
+    ['Predicate', 'PredicateType'],
+    ['Facet', 'Facet'],
+    ['StructuralField', 'StructuralField'],
+  ] as const) {
+    if (key in target) {
+      return symbol(cx, kind, text((target as never)[key], b, `DESCRIBE ${key}`))
+    }
+  }
+  if ('Error' in target) {
+    const code = text(target.Error, b, 'DESCRIBE ERROR')
+    const spec = KIP_ERROR_REGISTRY[code as never] as
+      | { category: string; retry: string; hint: string }
+      | undefined
+    if (spec === undefined) {
+      throw errors.notFoundOrNotVisible(`no registered error code ${code}`)
+    }
+    return {
+      code,
+      category: spec.category,
+      retry: spec.retry,
+      hint: spec.hint,
+    } as Json
+  }
+  if ('Transaction' in target) {
+    const id = text(target.Transaction, b, 'DESCRIBE TRANSACTION')
+    const row = cx.store.transaction(id)
+    if (row === null) {
+      throw errors.transactionUnknown(`no transaction ${id} in this Nexus`)
+    }
+    return { ...row, id: undefined } as unknown as Json
+  }
+  if ('TransactionByIdempotencyKey' in target) {
+    const key = text(
+      target.TransactionByIdempotencyKey,
+      b,
+      'DESCRIBE TRANSACTION BY IDEMPOTENCY KEY',
+    )
+    const row = cx.store.transactionByKey(cx.space, key)
+    if (row === null) {
+      // A key nobody committed under is not an error the caller can fix by
+      // retrying differently: it means the write never landed.
+      throw errors.transactionUnknown(
+        `no transaction committed under idempotency key ${JSON.stringify(key)}`,
+      )
+    }
+    return { ...row, id: undefined } as unknown as Json
+  }
+  if ('EpistemicPolicy' in target) {
+    const named =
+      target.EpistemicPolicy.value === null
+        ? baseline().id
+        : text(target.EpistemicPolicy.value, b, 'DESCRIBE EPISTEMIC POLICY')
+    for (const policy of [baseline(), forecast()]) {
+      if (policy.id === named) return policy as unknown as Json
+    }
+    throw errors.projectionPolicyUnavailable(
+      `no Epistemic Policy named ${JSON.stringify(named)} is available here`,
+    )
+  }
+
+  // Reporting an empty answer here would read as a judgement — "nothing is
+  // trusted", "you may do nothing" — which is not what an absent subsystem
+  // means.
+  if ('Trust' in target) {
+    throw errors.unsupportedCapability(
+      'this engine evaluates no source trust; an empty trust report would ' +
+        'read as a judgement that nothing is trusted',
+    )
+  }
+  if ('Access' in target) {
+    throw errors.unsupportedCapability(
+      'this engine has no Governance plane; an empty access report would read ' +
+        'as a judgement that the caller may do nothing',
+    )
+  }
+  if ('Capsule' in target) {
+    throw errors.unsupportedCapability(
+      'this engine has no Capsule reader, so it cannot describe one',
+    )
+  }
+  throw errors.unsupportedCapability(
+    'DESCRIBE COMPATIBILITY needs a package compatibility model this engine ' +
+      'has not built',
+  )
+}
+
+/** The orientation an Agent needs before its first command. */
+function primer(cx: MetaContext): Json {
+  return {
+    kip: KIP_VERSION,
+    space_id: cx.space,
+    schema_environment_version: cx.env.version,
+    packages: cx.env.packageRefs(),
+    types: symbolList(cx.env, 'ConceptType'),
+    predicates: symbolList(cx.env, 'PredicateType'),
+    facets: symbolList(cx.env, 'Facet'),
+    structural_fields: symbolList(cx.env, 'StructuralField'),
+    grammar: { parser: parserVersion(), spec_revision: specRevision() },
+    note:
+      'Concept types are schema-defined: a mutation never creates one. ' +
+      'Activate a Schema Package first.',
+  } as Json
+}
+
+function protocol(): Json {
+  return {
+    kip: KIP_VERSION,
+    implementation: { name: '@ldclabs/kip-do', runtime: 'cloudflare-durable-object' },
+    grammar: { parser: parserVersion(), spec_revision: specRevision() },
+    languages: ['KQL', 'KML', 'META'],
+  } as Json
+}
+
+/** A resolved symbol and the definition behind it. */
+function symbol(cx: MetaContext, kind: SymbolKind, name: string): Json {
+  const resolved = cx.env.resolveSymbol(kind, name, 'read')
+  const artifact = cx.env.definitionPackage(resolved)
+  const definition =
+    artifact === undefined
+      ? undefined
+      : kind === 'ConceptType'
+        ? conceptTypeDef(artifact, resolved.name)
+        : kind === 'PredicateType'
+          ? predicateDef(artifact, resolved.name)
+          : kind === 'Facet'
+            ? facetDef(artifact, resolved.name)
+            : structuralFieldDef(artifact, resolved.name)
+  return {
+    // The canonical identity, never the local name the caller wrote (§106):
+    // a local name means nothing outside the environment that resolved it.
+    ref: formatSymbolRef(resolved),
+    kind,
+    definition: (definition ?? null) as Json,
+  } as Json
+}
+
+function symbolList(env: SchemaEnvironment, kind: SymbolKind): string[] {
+  const out: string[] = []
+  for (const reference of env.packageRefs()) {
+    const artifact = env.artifact(reference)
+    if (artifact === undefined) continue
+    for (const name of symbols(artifact, kind)) out.push(`${reference}/${name}`)
+  }
+  return out.sort()
+}
+
+// --- LIST -------------------------------------------------------------------
+
+function list(command: ListCommand, cx: MetaContext, b: ReadBindings): Json {
+  const page = <T>(items: T[]): Json => {
+    const offset =
+      command.cursor === null ? 0 : Number(scalarValue(command.cursor, b))
+    const limit =
+      command.limit === null ? null : Number(scalarValue(command.limit, b))
+    const window = items.slice(offset)
+    return (limit === null ? window : window.slice(0, limit)) as Json
+  }
+
+  switch (command.target) {
+    case 'Spaces':
+      return page(cx.store.spaces().map((row) => row.space_id))
+    case 'SchemaPackages':
+      return page(
+        cx.store.packages().map((row) => ({
+          package_ref: row.package_ref,
+          // Installed is not active, and a list that conflated them would let
+          // a caller write against a package the Space does not resolve.
+          state: cx.env.packageRefs().includes(row.package_ref)
+            ? 'active'
+            : 'installed',
+        })),
+      )
+    case 'Types':
+      return page(symbolList(cx.env, 'ConceptType'))
+    case 'Predicates':
+      return page(symbolList(cx.env, 'PredicateType'))
+    case 'Facets':
+      return page(symbolList(cx.env, 'Facet'))
+    case 'StructuralFields':
+      return page(symbolList(cx.env, 'StructuralField'))
+    case 'EpistemicPolicies':
+      return page([baseline().id, forecast().id])
+  }
+}
+
+// --- VALIDATE and PREVIEW ---------------------------------------------------
+
+/**
+ * Legality, not effect and not permission.
+ *
+ * A `VALIDATE` that passed says the command is well-formed and its symbols
+ * resolve. It does not promise a write will commit: the state it would act on
+ * can change, and this engine's Governance plane does not exist to consult.
+ */
+function validate(
+  command: ValidateCommand,
+  cx: MetaContext,
+  b: ReadBindings,
+): Json {
+  const source = scalarValue(command.value, b)
+  switch (command.target) {
+    case 'Kql':
+    case 'Kml': {
+      if (typeof source !== 'string') {
+        throw errors.typeMismatch('VALIDATE takes the command text')
+      }
+      try {
+        const parsed = parseKip(source)
+        const language = 'Kql' in parsed ? 'Kql' : 'Kml' in parsed ? 'Kml' : 'Meta'
+        if (language !== command.target) {
+          return {
+            valid: false,
+            // The actual parsed semantics rule, not the keyword the caller
+            // used to ask.
+            violations: [
+              {
+                code: 'LanguageMismatch',
+                message: `this is a ${language} command, not ${command.target}`,
+              },
+            ],
+          } as Json
+        }
+        return { valid: true, violations: [] } as Json
+      } catch (err) {
+        const failure = KipError.from(err)
+        return {
+          valid: false,
+          violations: [{ code: failure.code, message: failure.message }],
+        } as Json
+      }
+    }
+    case 'Capsule':
+    case 'SchemaPackage':
+      return verifyCapsule(source)
+    case 'ImportPlan':
+      throw errors.unsupportedCapability(
+        'VALIDATE IMPORT PLAN needs the Capsule import path, which this ' +
+          'engine has not built',
+      )
+  }
+  void cx
+}
+
+/**
+ * What a mutation *would* do.
+ *
+ * The real dry-run path, not a separate simulation: a preview written twice
+ * drifts from the commit it is previewing, and the drift shows up as a caller
+ * acting on an effect that never happens.
+ */
+function previewKml(source: string, cx: MetaContext): Json {
+  const parsed = parseKip(source)
+  if (!('Kml' in parsed)) {
+    throw errors.languageMismatch('PREVIEW KML takes a KML statement')
+  }
+  const outcome = executeKml(parsed.Kml, {
+    store: cx.store,
+    space: cx.space,
+    env: cx.env,
+    origin: {},
+    request: cx.request,
+    operation: cx.operation,
+    dryRun: true,
+  })
+  return {
+    status: outcome.status,
+    changes: outcome.changes as unknown as Json,
+    handles: outcome.handles,
+    warnings: outcome.warnings,
+    // Said plainly, because "no_effect" on a preview is about the preview and
+    // not about what a commit would do.
+    note: 'a preview never commits; only a receipt says something happened',
+  } as Json
+}
+
+// --- HISTORY and CHANGES ----------------------------------------------------
+
+function history(
+  command: HistoryCommand,
+  cx: MetaContext,
+  b: ReadBindings,
+): Json {
+  const range = (paging: {
+    from_seq: Scalar | null
+    to_seq: Scalar | null
+    limit: Scalar | null
+  }) => ({
+    from: paging.from_seq === null ? 0 : Number(scalarValue(paging.from_seq, b)),
+    to:
+      paging.to_seq === null
+        ? Number.MAX_SAFE_INTEGER
+        : Number(scalarValue(paging.to_seq, b)),
+    limit: paging.limit === null ? 100 : Number(scalarValue(paging.limit, b)),
+  })
+
+  if ('Element' in command) {
+    const id: ElementId = parseElementId(
+      text(command.Element.value, b, 'HISTORY ELEMENT'),
+    )
+    const { from, to, limit } = range(command.Element)
+    return cx.store
+      .versionsOf(cx.space, id, from, to, limit)
+      .map((row) => ({
+        element: row.element,
+        version: row.version,
+        space_seq: row.seq,
+        tx_id: row.tx_id,
+        op: row.op,
+      })) as unknown as Json
+  }
+  const { from, to, limit } = range(command.Space)
+  return cx.store
+    .transactionsInSpace(cx.space, from, to, limit)
+    .map((row) => ({
+      tx_id: row.tx_id,
+      space_seq: row.seq,
+      committed_at: row.committed_at,
+      status: row.status,
+      changes: row.changes,
+    })) as unknown as Json
+}
+
+function changes(
+  command: ChangesCommand,
+  cx: MetaContext,
+  b: ReadBindings,
+): Json {
+  const after =
+    'Since' in command
+      ? Number(scalarValue(command.Since.cursor, b))
+      : Number(scalarValue(command.AfterSeq.seq, b))
+  const limitScalar = 'Since' in command ? command.Since.limit : command.AfterSeq.limit
+  const limit = limitScalar === null ? 100 : Number(scalarValue(limitScalar, b))
+  if (!Number.isInteger(after) || after < 0) {
+    throw errors.changeCursorInvalid(
+      'a CHANGES cursor from this engine is a Space sequence coordinate',
+    )
+  }
+
+  const rows = cx.store.transactionsInSpace(
+    cx.space,
+    after + 1,
+    Number.MAX_SAFE_INTEGER,
+    limit,
+  )
+  return {
+    changes: rows.flatMap((row) =>
+      row.changes.map((change) => ({ ...change, space_seq: row.seq })),
+    ),
+    // The next cursor is the coordinate reached, so a caller that saw nothing
+    // holds the same place rather than starting over.
+    cursor: rows[rows.length - 1]?.seq ?? after,
+  } as unknown as Json
+}
+
+// --- small helpers ----------------------------------------------------------
+
+function scalarValue(scalar: Scalar, b: ReadBindings): Json {
+  return 'Param' in scalar
+    ? parameterValue(b, scalar.Param)
+    : kipLiteral(scalar.Literal)
+}
+
+function text(scalar: Scalar, b: ReadBindings, what: string): string {
+  const value = scalarValue(scalar, b)
+  if (typeof value !== 'string') {
+    throw errors.typeMismatch(
+      `${what} takes a string, got ${JSON.stringify(value)}`,
+    )
+  }
+  return value
+}
+
+export { capabilities, KIP_VERSION } from './capabilities.js'
+export { KIP_ERROR_CODES }
