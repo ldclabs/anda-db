@@ -143,6 +143,14 @@ export interface Outcome {
   /** One record per changed element. */
   changes: ChangeEntry[]
   warnings: string[]
+  /**
+   * The access decision that authorized this statement (§178).
+   *
+   * Present only on high-impact statements — an erasure, an export, a
+   * Governance change. Attaching it to every commit would bury the cases that
+   * matter under the ones that do not.
+   */
+  governance?: JsonMap
 }
 
 /** The engine truth stamped on everything one transaction writes. */

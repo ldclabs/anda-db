@@ -30,6 +30,7 @@ import {
   type Permission,
 } from './governance/index.js'
 import { kmlPermissions, kqlPermissions, metaPermissions } from './governance/gate.js'
+import { isAlwaysAudited } from './governance/index.js'
 import type { Json, JsonMap } from './json.js'
 import { parseKip } from './kip/parser.js'
 import type { ElementId } from './id.js'
@@ -53,7 +54,7 @@ import {
 import { Store, type SpaceRow } from './store/index.js'
 import { canonicalJson } from './json.js'
 import { sha256Text } from './digest.js'
-import { nowTime } from './time.js'
+import { normalizeTime, nowTime } from './time.js'
 import type { Outcome } from './tx.js'
 
 /** The Space a Nexus uses when the caller names none. */
@@ -467,6 +468,7 @@ export class Session {
     const space = options.space ?? this.nexus.space
     const authority = this.effectiveAuthority(space)
     this.gate(authority, kmlPermissions(statement))
+    const provenance = accessProvenance(statement, authority, this.auth)
     const cx: KmlContext = {
       store: this.nexus.store,
       space,
@@ -482,7 +484,50 @@ export class Session {
       authority,
       auth: this.auth,
     }
-    return this.nexus.transact(() => executeKml(statement, cx))
+    const outcome = this.nexus.transact(() => executeKml(statement, cx))
+    return provenance === null ? outcome : { ...outcome, governance: provenance }
+  }
+
+  /**
+   * What this Principal could do in a Space at a past instant (§176, §177).
+   *
+   * A historical answer, and nothing more: that a Principal could read something
+   * in January says nothing about whether it can today (§179). Reading it needs
+   * `read_governance_history`, which is separate from `read_audit` — one is what
+   * the control plane *was*, the other is what people *did*.
+   */
+  accessAsOf(at: string, space = this.nexus.space): Json {
+    const now = this.effectiveAuthority(space)
+    requirePermitted(
+      now.authorize('read_governance_history', spaceResource(), this.auth),
+    )
+    const then = EffectiveAuthority.resolveAt(
+      this.nexus.store,
+      space,
+      this.auth,
+      normalizeTime(at, 'AS OF'),
+    )
+    return {
+      at,
+      space_id: space,
+      principal_id: then.principal.principal_id,
+      groups: then.groups,
+      is_space_owner: then.isOwner,
+      permissions: then.permissionNames(this.auth),
+      policy:
+        then.policy === null
+          ? null
+          : `${then.policy.policy_id}@${then.policy.version}`,
+      // Said out loud rather than implied: reconstructing a whole historical
+      // delegation chain would need the delegator's historical Grants
+      // recursively, so this report does not claim a precision it lacks.
+      caveats: [
+        'Delegations are resolved against their delegator’s authority as it ' +
+          'stands now, not as it stood then',
+        'this is what the control plane said at that instant, and says nothing ' +
+          'about today',
+      ],
+    } as Json
   }
 
   /** Runs a command and returns the failure instead of throwing it. */
@@ -630,6 +675,37 @@ export class Session {
       // See above: an audit failure does not become a second failure mode.
     }
   }
+}
+
+/**
+ * The access-decision provenance a high-impact receipt carries (§178).
+ *
+ * Only for high-impact statements. Attaching it to every commit would bury the
+ * cases that matter under the ones that do not, and the point of the record is
+ * that somebody reads it: an erasure, an export or a Governance change has to be
+ * explainable later in terms of the identity and policy that authorized it.
+ *
+ * It names the effective Principal, the delegation chain and the policy version,
+ * and deliberately not the Grants of anyone else.
+ */
+function accessProvenance(
+  statement: KmlStatement,
+  authority: EffectiveAuthority,
+  auth: AuthContext,
+): JsonMap | null {
+  const permissions = kmlPermissions(statement)
+  if (!permissions.some(isAlwaysAudited)) return null
+  return {
+    principal_id: auth.principal_id,
+    delegation_chain: [...auth.delegation_chain],
+    authentication_strength: auth.auth_strength,
+    purpose: { value: auth.purpose, assurance: auth.purpose_assurance },
+    policy:
+      authority.policy === null
+        ? null
+        : { id: authority.policy.policy_id, version: authority.policy.version },
+    operations: permissions,
+  } as unknown as JsonMap
 }
 
 /** Whether a decision lets the operation proceed. */

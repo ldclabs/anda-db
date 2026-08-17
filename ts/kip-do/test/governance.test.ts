@@ -1748,3 +1748,145 @@ describe('erasure', () => {
     })
   })
 })
+
+describe('the audit and the past', () => {
+  async function withNexus<T>(
+    name: string,
+    body: (nexus: CognitiveNexus) => T,
+  ): Promise<T> {
+    const stub = env.KIP_DB.getByName(`audit-${name}`)
+    return await runInDurableObject(stub, (_instance, state) => {
+      const nexus = CognitiveNexus.connect(state.storage)
+      nexus.activatePackages([COGNITIVE_MEMORY])
+      return body(nexus)
+    })
+  }
+
+  it('needs its own permission to read what everyone else did', async () => {
+    await withNexus('read-audit', (nexus) => {
+      const gov = nexus.store.governance
+      gov.ensurePrincipal({ principal_id: 'kip:principal:agent' })
+      gov.createGrant(
+        {
+          space_id: nexus.space,
+          grantee_principal: 'kip:principal:agent',
+          actions: ['read', 'create'],
+        },
+        SYSTEM_PRINCIPAL,
+      )
+      const session = nexus.session(principalAuth('kip:principal:agent'))
+      // A caller who may read a Space's cognition has not thereby earned the
+      // right to read who has been reading it.
+      expect(() => session.readAudit()).toThrowError(
+        /requires the read_audit permission/,
+      )
+      expect(() => nexus.systemSession().readAudit()).not.toThrow()
+    })
+  })
+
+  it('records a denial as well as an allow', async () => {
+    await withNexus('denials', (nexus) => {
+      const gov = nexus.store.governance
+      gov.ensurePrincipal({ principal_id: 'kip:principal:agent' })
+      const session = nexus.session(principalAuth('kip:principal:agent'))
+      expect(() =>
+        session.describe('EXPORT CAPSULE :out WHERE { ?c CONCEPT {} }', { out: 'x' }),
+      ).toThrow()
+
+      // §172 lists the operations whose absence from a log is itself the
+      // incident, and export is one of them — refused or not.
+      const denied = nexus
+        .systemSession()
+        .readAudit()
+        .find((entry) => entry.operation === 'export')
+      expect(denied?.entry_class).toBe('decision')
+      expect(denied?.decision).toBe('deny')
+      expect(denied?.principal_id).toBe('kip:principal:agent')
+    })
+  })
+
+  it('does not audit an ordinary read', async () => {
+    await withNexus('quiet', (nexus) => {
+      nexus.query('FIND(?c) WHERE { ?c CONCEPT {type: "Person"} }')
+      // §173: a log that recorded every read would bury the entries that
+      // matter under the ones that do not.
+      const reads = nexus
+        .systemSession()
+        .readAudit()
+        .filter((entry) => entry.operation === 'read')
+      expect(reads).toEqual([])
+    })
+  })
+
+  it('carries the deciding identity on a high-impact receipt, and only there', async () => {
+    await withNexus('provenance', (nexus) => {
+      const session = nexus.systemSession()
+      // An ordinary write carries none: attaching it everywhere would bury the
+      // cases the record exists for.
+      const ordinary = session.execute('CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }')
+      expect(ordinary.governance).toBeUndefined()
+
+      // §178: an erasure has to be explainable later in terms of the identity
+      // and policy that authorized it.
+      const erasure = session.execute(
+        'PURGE "C-1" REFERENCE POLICY "tombstone_reference" CONFIRM "PURGE"',
+      )
+      expect(erasure.governance?.principal_id).toBe(SYSTEM_PRINCIPAL)
+      expect(erasure.governance?.operations).toEqual(['purge'])
+    })
+  })
+
+  it('answers who had access then, without claiming anything about now', async () => {
+    const grant = await withNexus('as-of', (nexus) => {
+      const gov = nexus.store.governance
+      gov.ensurePrincipal({ principal_id: 'kip:principal:agent' })
+      return gov.createGrant(
+        {
+          space_id: nexus.space,
+          grantee_principal: 'kip:principal:agent',
+          actions: ['read', 'export'],
+        },
+        SYSTEM_PRINCIPAL,
+      )
+    })
+    await tick()
+    await withNexus('as-of', (nexus) => {
+      nexus.store.governance.revokeGrant(grant.id, SYSTEM_PRINCIPAL)
+    })
+
+    await withNexus('as-of', (nexus) => {
+      const auditor = nexus.systemSession()
+      const then = auditor.accessAsOf(grant.created_at) as {
+        permissions: string[]
+        caveats: string[]
+      }
+      // The Grant is revoked now and was in force then. Revocation being a
+      // status change rather than a delete is exactly what makes this
+      // answerable (§177).
+      expect(then.permissions).toContain('export')
+      // §179: and the report says out loud that it is not a claim about today.
+      expect(then.caveats.join(' ')).toMatch(/says nothing about today/)
+    })
+  })
+
+  it('needs read_governance_history, which read_audit does not confer', async () => {
+    await withNexus('as-of-permission', (nexus) => {
+      const gov = nexus.store.governance
+      gov.ensurePrincipal({ principal_id: 'kip:principal:auditor' })
+      gov.createGrant(
+        {
+          space_id: nexus.space,
+          grantee_principal: 'kip:principal:auditor',
+          actions: ['read', 'read_audit'],
+        },
+        SYSTEM_PRINCIPAL,
+      )
+      const session = nexus.session(principalAuth('kip:principal:auditor'))
+      expect(() => session.readAudit()).not.toThrow()
+      // One is what the control plane *was*, the other is what people *did*.
+      expect(() => session.accessAsOf('2026-01-01T00:00:00.000Z')).toThrowError(
+        /requires the read_governance_history permission/,
+      )
+    })
+  })
+})

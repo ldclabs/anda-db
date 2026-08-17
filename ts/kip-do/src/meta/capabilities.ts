@@ -214,9 +214,26 @@ export function capabilities(): Json {
           'Grant, Delegation or Policy statement — then default deny',
         revocation: 'resolved per command, so a session does not outlive it',
         reports: ['DESCRIBE ACCESS', 'DESCRIBE EXECUTION CONTEXT'],
-        audit:
-          'every control-plane mutation, plus every decision §172 or a policy ' +
-          'obligation asks to record',
+        audit: {
+          records:
+            'every control-plane mutation with its whole new record, plus every ' +
+            'decision §172 or a policy obligation asks for — allows and denials ' +
+            'alike. An ordinary read is not audited: a log that recorded every ' +
+            'read would bury the entries that matter',
+          reading:
+            '`read_audit`, which is separate from reading the Space: a caller ' +
+            'who may read the cognition has not earned the right to read who ' +
+            'has been reading it',
+          history:
+            '`read_governance_history` answers who had access at a past instant, ' +
+            'from the records’ own timestamps — which is what "revoke, never ' +
+            'delete" was for. It is a separate permission from `read_audit`: one ' +
+            'is what the control plane was, the other is what people did',
+          receipt:
+            'a high-impact statement carries the deciding identity, delegation ' +
+            'chain and policy version on its receipt (§178); an ordinary write ' +
+            'carries none',
+        },
       },
       grammar: { parser: parserVersion(), spec_revision: specRevision() },
     },
