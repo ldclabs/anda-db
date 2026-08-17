@@ -364,29 +364,44 @@ impl GovernanceStore {
         .await
     }
 
+    /// Every audit entry about one resource, under any of the named verbs.
+    ///
+    /// Ranged on `operation`, which is indexed, and narrowed to the resource in
+    /// memory, which is not. Narrowing to the resource is not an optimization:
+    /// "this record has no history" has to mean *this* one, or a Space that
+    /// happens to share the log with another would be reported as having never
+    /// existed.
+    async fn history_of(
+        &self,
+        resource: &str,
+        operations: &[&str],
+    ) -> Result<Vec<GovernanceAuditRow>, KipError> {
+        let mut out: Vec<GovernanceAuditRow> = Vec::new();
+        for operation in operations {
+            let rows: Vec<GovernanceAuditRow> = self
+                .all_rows(
+                    &self.audit.get(),
+                    eq_field("operation", Fv::Text((*operation).to_string())),
+                )
+                .await?;
+            out.extend(rows.into_iter().filter(|row| row.resource == resource));
+        }
+        Ok(out)
+    }
+
     /// The Principal record that was current at an instant.
     pub async fn principal_at(
         &self,
         principal_id: &str,
         at: &str,
     ) -> Result<Option<PrincipalRow>, KipError> {
-        let mut rows: Vec<GovernanceAuditRow> = self
-            .all_rows(
-                &self.audit.get(),
-                eq_field("operation", Fv::Text("create_principal".to_string())),
-            )
+        let rows = self
+            .history_of(principal_id, &["create_principal", "set_principal_status"])
             .await?;
-        rows.extend(
-            self.all_rows(
-                &self.audit.get(),
-                eq_field("operation", Fv::Text("set_principal_status".to_string())),
-            )
-            .await?,
-        );
         let has_history = !rows.is_empty();
         let latest = rows
             .into_iter()
-            .filter(|row| row.resource == principal_id && row.at.as_str() <= at)
+            .filter(|row| row.at.as_str() <= at)
             .max_by(|a, b| (a.at.as_str(), a._id).cmp(&(b.at.as_str(), b._id)));
         match latest {
             Some(row) => serde_json::from_value(row.record)
@@ -399,20 +414,13 @@ impl GovernanceStore {
 
     /// The MemorySpace governance record that was current at an instant.
     pub async fn space_at(&self, current: &SpaceRow, at: &str) -> Result<SpaceRow, KipError> {
-        let rows: Vec<GovernanceAuditRow> = self
-            .all_rows(
-                &self.audit.get(),
-                eq_field("space_id", Fv::Text(current.space_id.clone())),
-            )
+        let rows = self
+            .history_of(&current.space_id, &["create_space", "put_space"])
             .await?;
         let has_history = !rows.is_empty();
         let latest = rows
             .into_iter()
-            .filter(|row| {
-                row.resource == current.space_id
-                    && row.at.as_str() <= at
-                    && matches!(row.operation.as_str(), "create_space" | "put_space")
-            })
+            .filter(|row| row.at.as_str() <= at)
             .max_by(|a, b| (a.at.as_str(), a._id).cmp(&(b.at.as_str(), b._id)));
         match latest {
             Some(row) => serde_json::from_value(row.record)

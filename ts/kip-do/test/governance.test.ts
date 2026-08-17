@@ -2109,6 +2109,33 @@ describe('erasure', () => {
       expect(nexus.store.load(parseElementId('P-1'))?.row.state).toBe('purged')
     })
   })
+
+  it('leaves a stub that still names the Principal that wrote it', async () => {
+    // §19.3: the stub exists so an auditor can say something was here and who
+    // wrote it. The version log that would otherwise answer the second half has
+    // just been destroyed, so stamping the purging Principal over `origin`
+    // would leave the erasure unattributable rather than merely opaque.
+    await withNexus('purge-origin', (nexus) => {
+      const gov = nexus.store.governance
+      gov.ensurePrincipal({ principal_id: 'kip:principal:eraser' })
+      gov.createGrant(
+        {
+          space_id: nexus.space,
+          grantee_principal: 'kip:principal:eraser',
+          actions: ['read', 'purge'],
+        },
+        SYSTEM_PRINCIPAL,
+      )
+      nexus
+        .session(principalAuth('kip:principal:eraser'))
+        .execute(
+          'PURGE "C-2" REFERENCE POLICY "tombstone_reference" CONFIRM "PURGE"',
+        )
+      expect(
+        nexus.store.load(parseElementId('C-2'))?.row.origin.principal_id,
+      ).toBe(SYSTEM_PRINCIPAL)
+    })
+  })
 })
 
 describe('the audit and the past', () => {

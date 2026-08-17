@@ -171,9 +171,7 @@ impl CognitiveNexus {
         lock: crate::schema::SchemaLock,
     ) -> Result<SchemaEnvironment, KipError> {
         let _guard = self.lock.write().await;
-        self.store
-            .activate_schema(space_id, lock, "governance")
-            .await
+        self.store.activate_schema(space_id, lock).await
     }
 
     /// Installs each artifact and puts exactly those packages in force in a
@@ -230,9 +228,7 @@ impl CognitiveNexus {
         if current.lock == lock {
             return Ok(current);
         }
-        self.store
-            .activate_schema(space_id, lock, "governance")
-            .await
+        self.store.activate_schema(space_id, lock).await
     }
 
     /// Imports a Cognitive Capsule into a Space (§39.3, the `merge` mode).

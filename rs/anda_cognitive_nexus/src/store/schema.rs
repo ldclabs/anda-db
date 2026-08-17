@@ -190,7 +190,6 @@ impl Store {
         &self,
         space_id: &str,
         lock: SchemaLock,
-        _tx_id: &str,
     ) -> Result<SchemaEnvironment, KipError> {
         let space = self.get_space(space_id).await?;
         let available = self.installed_packages().await?;

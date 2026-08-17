@@ -85,11 +85,7 @@ async fn installing_a_package_does_not_activate_it() {
     );
 
     let after = store
-        .activate_schema(
-            SPACE,
-            lock(&[(PROFILE_ID, "2.0.0", PackageState::Active)]),
-            "tx-1",
-        )
+        .activate_schema(SPACE, lock(&[(PROFILE_ID, "2.0.0", PackageState::Active)]))
         .await
         .unwrap();
     assert_eq!(after.version, 1);
@@ -152,11 +148,7 @@ async fn a_historical_environment_version_stays_reconstructible() {
         .unwrap();
 
     store
-        .activate_schema(
-            SPACE,
-            lock(&[(PROFILE_ID, "2.0.0", PackageState::Active)]),
-            "tx-1",
-        )
+        .activate_schema(SPACE, lock(&[(PROFILE_ID, "2.0.0", PackageState::Active)]))
         .await
         .unwrap();
     store
@@ -166,7 +158,6 @@ async fn a_historical_environment_version_stays_reconstructible() {
                 (PROFILE_ID, "2.0.0", PackageState::Active),
                 ("kip://acme/hr", "1.0.0", PackageState::Active),
             ]),
-            "tx-2",
         )
         .await
         .unwrap();
@@ -215,11 +206,7 @@ async fn activating_an_uninstalled_package_leaves_the_space_untouched() {
         .await
         .unwrap();
     store
-        .activate_schema(
-            SPACE,
-            lock(&[(PROFILE_ID, "2.0.0", PackageState::Active)]),
-            "tx-1",
-        )
+        .activate_schema(SPACE, lock(&[(PROFILE_ID, "2.0.0", PackageState::Active)]))
         .await
         .unwrap();
 
@@ -230,7 +217,6 @@ async fn activating_an_uninstalled_package_leaves_the_space_untouched() {
                 (PROFILE_ID, "2.0.0", PackageState::Active),
                 ("kip://acme/nowhere", "1.0.0", PackageState::Active),
             ]),
-            "tx-2",
         )
         .await
         .unwrap_err();
@@ -280,11 +266,7 @@ async fn the_schema_registries_survive_a_reopen() {
         .await
         .unwrap();
     store
-        .activate_schema(
-            SPACE,
-            lock(&[(PROFILE_ID, "2.0.0", PackageState::Active)]),
-            "tx-1",
-        )
+        .activate_schema(SPACE, lock(&[(PROFILE_ID, "2.0.0", PackageState::Active)]))
         .await
         .unwrap();
     store.flush(1_755_000_000_000).await.unwrap();

@@ -557,6 +557,7 @@ pub struct AuthorityConstraints {
     /// The element fields that may be returned; empty means every field.
     pub fields: Vec<String>,
     /// The most rows a read may return; absent means the engine's own limit.
+    #[serde(deserialize_with = "lenient_max_results")]
     pub max_results: Option<u64>,
     /// The highest influence authority reachable, from the authority classes.
     pub max_influence_authority: String,
@@ -564,6 +565,25 @@ pub struct AuthorityConstraints {
     pub max_classification: String,
     /// Whether the result may leave the Space at all (§78).
     pub export: bool,
+}
+
+/// Reads `max_results`, treating anything that is not a non-negative integer as
+/// the tightest cap there is.
+///
+/// Fails closed rather than open. These blobs are parsed with
+/// `unwrap_or_default`, so a `max_results` serde cannot read would otherwise
+/// take the whole constraint set down with it and hand back an *unrestricted*
+/// authority — a malformed bound widening exactly what it was written to
+/// narrow. Matches `asConstraints` in the JavaScript engine.
+fn lenient_max_results<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match Option::<Json>::deserialize(deserializer)? {
+        None | Some(Json::Null) => None,
+        Some(Json::Number(number)) => Some(number.as_u64().unwrap_or(0)),
+        Some(_) => Some(0),
+    })
 }
 
 impl AuthorityConstraints {

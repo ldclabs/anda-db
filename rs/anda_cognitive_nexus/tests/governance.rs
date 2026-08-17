@@ -2938,6 +2938,52 @@ async fn purging_needs_the_purge_permission_and_not_merely_tombstone() {
 }
 
 #[tokio::test]
+async fn a_purged_stub_still_names_the_principal_that_wrote_it() {
+    // §19.3: the stub exists so an auditor can say something was here and who
+    // wrote it. The version log that would otherwise answer the second half has
+    // just been destroyed, so stamping the purging Principal over `origin`
+    // would leave the erasure unattributable rather than merely opaque.
+    let nexus = stocked("purge_origin").await;
+    run_as(
+        &nexus.system_session(),
+        r#"CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }"#,
+    )
+    .await;
+    let eraser = agent(nexus.governance(), "kip:principal:eraser").await;
+    grant(
+        &nexus,
+        &eraser,
+        &["read", "purge"],
+        AuthorityScope::default(),
+    )
+    .await;
+    let purged = run_as(
+        &nexus.session(AuthContext::principal(&eraser)),
+        r#"PURGE "C-1" CONFIRM "PURGE""#,
+    )
+    .await;
+    assert_eq!(
+        purged.status,
+        TopLevelStatus::Succeeded,
+        "{:?}",
+        purged.error
+    );
+
+    let origin = run_as(
+        &nexus.system_session(),
+        r#"FIND(?c._system.origin) WHERE { ?c CONCEPT {state: "purged"} }"#,
+    )
+    .await;
+    let rows = origin.first_result().unwrap().as_array().unwrap().clone();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]["principal_id"],
+        serde_json::json!(SYSTEM_PRINCIPAL),
+        "the stub keeps the origin of the element it replaced, not the eraser's"
+    );
+}
+
+#[tokio::test]
 async fn a_cognitive_writer_cannot_place_a_legal_hold_to_evade_deletion() {
     // §163 names this attack by its shape.
     let nexus = stocked("legal_hold_authority").await;

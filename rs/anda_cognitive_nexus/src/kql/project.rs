@@ -49,8 +49,16 @@ impl Context<'_> {
                 ));
             }
             let row = self.aggregate_row(&solutions, find)?;
+            // An aggregate is one row, so `LIMIT` has nothing to page — but a
+            // `max_results: 0` authority still caps it at nothing, the same way
+            // the JavaScript engine caps its aggregate output.
+            let rows = if self.governed_limit() == Some(0) {
+                Vec::new()
+            } else {
+                vec![row]
+            };
             return Ok(Projected {
-                rows: vec![row],
+                rows,
                 next_cursor: None,
             });
         }

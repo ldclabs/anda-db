@@ -546,7 +546,14 @@ export class Transaction {
       row.seq = seq
       row.updated_at = committedAt
       row.updated_tx = this.cx.tx_id
-      row.origin = this.cx.origin
+      // A purge keeps the origin it had, which is why `origin` is in
+      // PURGE_KEEPS. Every other write records who the runtime observed (§26),
+      // but the whole point of an identity stub is that an auditor can still
+      // say something was here and who wrote it — and the version log that
+      // would otherwise answer that has just been destroyed.
+      if (staged.op !== 'purge') {
+        row.origin = this.cx.origin
+      }
       if (staged.isNew) {
         row.created_at = committedAt
         row.created_tx = this.cx.tx_id

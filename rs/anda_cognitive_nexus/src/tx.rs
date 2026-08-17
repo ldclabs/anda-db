@@ -741,7 +741,14 @@ impl Transaction {
                 row.seq = self.cx.seq;
                 row.updated_at = self.cx.at.clone();
                 row.updated_tx = self.cx.tx_id.clone();
-                row.origin = self.cx.origin.clone();
+                // A purge keeps the origin it had. Every other write records
+                // who the runtime observed (§26), but the whole point of an
+                // identity stub is that an auditor can still say something was
+                // here and who wrote it — and the version log that would
+                // otherwise answer that has just been destroyed.
+                if op != "purge" {
+                    row.origin = self.cx.origin.clone();
+                }
                 if is_new {
                     row.created_at = self.cx.at.clone();
                     row.created_tx = self.cx.tx_id.clone();
