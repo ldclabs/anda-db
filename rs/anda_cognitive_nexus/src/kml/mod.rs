@@ -71,10 +71,62 @@ pub async fn execute(
         ..Default::default()
     };
     let schema_environment_version = tx.env.version;
+    let provenance = access_provenance(statement, authority, auth);
     match tx.commit(entry).await {
-        Ok(outcome) => success(outcome, space_id, schema_environment_version),
+        Ok(outcome) => {
+            let mut response = success(outcome, space_id, schema_environment_version);
+            if let Some(provenance) = provenance
+                && let Some(receipt) = response.receipt.as_mut()
+            {
+                receipt
+                    .extensions
+                    .get_or_insert_with(Map::new)
+                    .insert("governance".to_string(), provenance);
+            }
+            response
+        }
         Err(err) => Response::from(err),
     }
+}
+
+/// The access-decision provenance a high-impact receipt carries (§178).
+///
+/// Only for high-impact statements. Attaching it to every commit would bury the
+/// cases that matter under the ones that do not, and the point of the record is
+/// that somebody reads it: an erasure, an export or a Governance change has to
+/// be explainable later in terms of the identity and policy that authorized it.
+///
+/// It names the effective Principal, the delegation chain and the policy
+/// version, and deliberately not the Grants of anyone else.
+fn access_provenance(
+    statement: &KmlStatement,
+    authority: &EffectiveAuthority,
+    auth: &AuthContext,
+) -> Option<Json> {
+    let permissions = crate::governance::gate::kml_permissions(statement);
+    if !permissions
+        .iter()
+        .any(|permission| permission.is_always_audited())
+    {
+        return None;
+    }
+    Some(serde_json::json!({
+        "principal_id": auth.principal_id,
+        "delegation_chain": auth.delegation_chain,
+        "authentication_strength": auth.auth_strength,
+        "purpose": {"value": auth.purpose, "assurance": auth.purpose_assurance},
+        "policy": match &authority.policy {
+            Some(policy) => serde_json::json!({
+                "id": policy.policy_id,
+                "version": policy.version,
+            }),
+            None => Json::Null,
+        },
+        "operations": permissions
+            .iter()
+            .map(|permission| permission.as_str())
+            .collect::<Vec<_>>(),
+    }))
 }
 
 async fn plan(

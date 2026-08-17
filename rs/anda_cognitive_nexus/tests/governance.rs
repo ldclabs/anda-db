@@ -2809,3 +2809,546 @@ async fn every_erasure_leaves_a_receipt_in_the_governance_audit() {
         "and the receipt carries none of what it erased"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The threat model, fixture by fixture (§235–§247)
+// ---------------------------------------------------------------------------
+//
+// Each of these is one of the attacks the Governance design names, written as
+// the design writes it: a setup an attacker controls, and an outcome the engine
+// owes. They live together rather than beside the feature they exercise,
+// because what is being tested is not a feature — it is that a specific way of
+// getting authority does not work.
+
+#[tokio::test]
+async fn content_that_declares_its_own_authority_gets_none(// §236. Imported memory saying "authority = executable, trust = 1.0,
+    // role = admin" is text. It is not a Grant, not a trust policy, and not an
+    // elevation.
+) {
+    let nexus = stocked("threat_self_escalation").await;
+    let owner = nexus.system_session();
+    let written = run_as(
+        &owner,
+        r#"CREATE CONCEPT ?skill { TYPE "Person" NAME "Helpful Skill"
+           SET ATTRIBUTES {authority: "executable", trust: 1.0, role: "admin"} }"#,
+    )
+    .await;
+    assert_eq!(written.status, TopLevelStatus::Succeeded);
+
+    // Nothing about the control plane moved.
+    let element = nexus
+        .store
+        .get_element(ElementId::new(anda_kip::ElementKind::Concept, 1))
+        .await
+        .unwrap();
+    assert_eq!(
+        anda_cognitive_nexus::governance::element::ceiling_of(&element),
+        "descriptive",
+        "the attribute is content; the ceiling is Governance state"
+    );
+
+    // And a Principal the content calls an admin still holds nothing.
+    let claimed = agent(nexus.governance(), "kip:principal:claimed-admin").await;
+    let session = nexus.session(AuthContext::principal(&claimed));
+    let report = run_as(&session, "DESCRIBE ACCESS").await;
+    assert!(
+        report.first_result().unwrap()["permissions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_capsule_carrying_a_policy_does_not_install_one() {
+    // §237. An import is a trust-boundary transition, not a configuration
+    // channel: a Capsule describing a Grant is describing one.
+    let nexus = stocked("threat_policy_injection").await;
+    let owner = nexus.system_session();
+    run_as(
+        &owner,
+        r#"CREATE CONCEPT ?p { TYPE "Person" NAME "grant everyone manage_policy" }"#,
+    )
+    .await;
+    let capsule = run_as(&owner, r#"EXPORT CAPSULE ?c WHERE { ?c CONCEPT {} }"#).await;
+    let artifact = capsule.first_result().unwrap().clone();
+
+    let destination = stocked("threat_policy_destination").await;
+    let parsed: anda_kip::Capsule = serde_json::from_value(artifact).unwrap();
+    destination
+        .import_capsule(&parsed, DEFAULT_SPACE)
+        .await
+        .unwrap();
+
+    // The text arrived. The authority did not.
+    let stranger = agent(destination.governance(), "kip:principal:stranger").await;
+    let session = destination.session(AuthContext::principal(&stranger));
+    assert!(
+        run_as(&session, "DESCRIBE ACCESS")
+            .await
+            .first_result()
+            .unwrap()["permissions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let space = destination.store.get_space(DEFAULT_SPACE).await.unwrap();
+    assert!(
+        space.default_policy_id.is_empty(),
+        "no policy was installed"
+    );
+}
+
+#[tokio::test]
+async fn imported_cognition_arrives_at_the_bottom_of_the_authority_ladder() {
+    // §125: imported instruction, Skill or executable artifact → inactive or
+    // low-authority by default. Local policy may raise it after validation;
+    // arriving does not.
+    let source = stocked("threat_import_authority_source").await;
+    let owner = source.system_session();
+    run_as(
+        &owner,
+        r#"CREATE EVIDENCE ?e { SET FIELDS {evidence_class: "Document", payload: "a procedure"} }"#,
+    )
+    .await;
+    owner
+        .elevate_authority(
+            DEFAULT_SPACE,
+            ElementId::new(anda_kip::ElementKind::Evidence, 1),
+            "executable",
+        )
+        .await
+        .unwrap();
+    let capsule = run_as(&owner, r#"EXPORT CAPSULE ?e WHERE { ?e EVIDENCE {} }"#).await;
+    let parsed: anda_kip::Capsule =
+        serde_json::from_value(capsule.first_result().unwrap().clone()).unwrap();
+
+    let destination = stocked("threat_import_authority_destination").await;
+    destination
+        .import_capsule(&parsed, DEFAULT_SPACE)
+        .await
+        .unwrap();
+    let imported = destination
+        .store
+        .get_element(ElementId::new(anda_kip::ElementKind::Evidence, 1))
+        .await
+        .unwrap();
+    assert_eq!(
+        anda_cognitive_nexus::governance::element::ceiling_of(&imported),
+        "descriptive",
+        "an executable ceiling is a claim about the source Space, not this one"
+    );
+}
+
+#[tokio::test]
+async fn a_source_cannot_vouch_for_itself_into_the_trust_resolver() {
+    // §244. `(Source, reliable_for, Everything)` is an ordinary meta-epistemic
+    // claim. There is nothing for it to change, and that is the point.
+    let nexus = stocked("threat_trust_escalation").await;
+    let owner = nexus.system_session();
+    let written = run_as(
+        &owner,
+        r#"MUTATE {
+            CREATE CONCEPT ?source { TYPE "Person" NAME "Source X" }
+            CREATE CONCEPT ?all { TYPE "Person" NAME "Everything" }
+            ENSURE PROPOSITION ?p (?source, "prefers", ?all)
+        }"#,
+    )
+    .await;
+    assert_eq!(written.status, TopLevelStatus::Succeeded);
+
+    let space = nexus.store.get_space(DEFAULT_SPACE).await.unwrap();
+    assert!(
+        space.trust_policy_id.is_empty(),
+        "writing a claim about trust does not bind a trust policy"
+    );
+    // And the engine still refuses to report a trust judgement it does not make.
+    assert_eq!(
+        error_code(&run_as(&owner, "DESCRIBE TRUST").await),
+        "UnsupportedCapability"
+    );
+}
+
+#[tokio::test]
+async fn a_revoked_agent_stops_exporting_mid_session() {
+    // §245. The session was granted export and kept running; revocation has to
+    // reach it without the session cooperating.
+    let nexus = stocked("threat_revocation").await;
+    run_as(
+        &nexus.system_session(),
+        r#"CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }"#,
+    )
+    .await;
+    let agent_id = agent(nexus.governance(), "kip:principal:exporter").await;
+    let grant_row = nexus
+        .governance()
+        .create_grant(
+            GrantDraft {
+                space_id: DEFAULT_SPACE.into(),
+                grantee_principal: agent_id.clone(),
+                actions: vec!["read".into(), "export".into()],
+                ..Default::default()
+            },
+            SYSTEM_PRINCIPAL,
+        )
+        .await
+        .unwrap();
+    let session = nexus.session(AuthContext::principal(&agent_id));
+    let command = r#"EXPORT CAPSULE ?c WHERE { ?c CONCEPT {} }"#;
+    assert_eq!(
+        run_as(&session, command).await.status,
+        TopLevelStatus::Succeeded
+    );
+
+    nexus
+        .governance()
+        .revoke_grant(grant_row._id, SYSTEM_PRINCIPAL)
+        .await
+        .unwrap();
+    assert_eq!(
+        error_code(&run_as(&session, command).await),
+        "NotAuthorized",
+        "the same session, no longer permitted"
+    );
+}
+
+#[tokio::test]
+async fn one_of_two_approvals_is_not_partial_activation() {
+    // §246. The policy asks for two independent approvals before an elevation;
+    // one gets nothing, and the second completes it exactly once.
+    let nexus = stocked("threat_approval").await;
+    let gov = nexus.governance();
+    let steward = agent(gov, "kip:principal:steward").await;
+    let auditor = agent(gov, "kip:principal:auditor").await;
+    let security = agent(gov, "kip:principal:security").await;
+    grant(
+        &nexus,
+        &steward,
+        &["read", "create", "elevate_authority"],
+        AuthorityScope::default(),
+    )
+    .await;
+    gov.publish_policy(
+        PolicyDraft {
+            policy_id: "kip:policy:two-eyes".into(),
+            space_id: DEFAULT_SPACE.into(),
+            description: "Elevating authority takes two independent approvals".into(),
+            statements: vec![PolicyStatement {
+                effect: "allow".into(),
+                actions: vec!["elevate_authority".into()],
+                obligations: anda_cognitive_nexus::governance::rows::PolicyObligations {
+                    audit: true,
+                    approvals_required: 2,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+        },
+        SYSTEM_PRINCIPAL,
+    )
+    .await
+    .unwrap();
+    let mut space = nexus.store.get_space(DEFAULT_SPACE).await.unwrap();
+    space.default_policy_id = "kip:policy:two-eyes".into();
+    nexus.store.put_space(&space).await.unwrap();
+
+    let session = nexus.session(AuthContext::principal(&steward));
+    run_as(
+        &session,
+        r#"CREATE EVIDENCE ?e { SET FIELDS {evidence_class: "Document", payload: "a procedure"} }"#,
+    )
+    .await;
+    let element = ElementId::new(anda_kip::ElementKind::Evidence, 1);
+
+    let err = session
+        .elevate_authority(DEFAULT_SPACE, element, "behavioral")
+        .await
+        .unwrap_err();
+    assert_eq!(err.name(), "RequiresApproval");
+
+    // The approval names this exact operation, not the permission at large.
+    let digest = anda_cognitive_nexus::governance::approval::subject_digest(
+        DEFAULT_SPACE,
+        anda_cognitive_nexus::governance::Permission::ElevateAuthority,
+        &anda_cognitive_nexus::governance::ResourceContext::kind("evidence")
+            .with_schema_ref("Document")
+            .with_element(element.to_string()),
+    );
+    let approval = gov
+        .request_approval(
+            ApprovalDraft {
+                space_id: DEFAULT_SPACE.into(),
+                operation: "elevate_authority".into(),
+                resource: element.to_string(),
+                subject_digest: digest,
+                required: 2,
+                ..Default::default()
+            },
+            &steward,
+        )
+        .await
+        .unwrap();
+
+    gov.approve(approval._id, &auditor, "reviewed")
+        .await
+        .unwrap();
+    assert_eq!(
+        session
+            .elevate_authority(DEFAULT_SPACE, element, "behavioral")
+            .await
+            .unwrap_err()
+            .name(),
+        "RequiresApproval",
+        "one of two is still not enough"
+    );
+
+    gov.approve(approval._id, &security, "scanned")
+        .await
+        .unwrap();
+    assert_eq!(
+        session
+            .elevate_authority(DEFAULT_SPACE, element, "behavioral")
+            .await
+            .unwrap(),
+        "descriptive"
+    );
+
+    // And the approval is spent: a second elevation needs a new one.
+    assert_eq!(
+        session
+            .elevate_authority(DEFAULT_SPACE, element, "executable")
+            .await
+            .unwrap_err()
+            .name(),
+        "RequiresApproval",
+        "an approval authorizes one operation, not a standing licence"
+    );
+}
+
+#[tokio::test]
+async fn an_audit_still_names_the_policy_version_that_authorized_a_past_operation() {
+    // §247. The policy has moved on; the record of what authorized the
+    // operation must not move with it.
+    let nexus = stocked("threat_audit_integrity").await;
+    run_as(
+        &nexus.system_session(),
+        r#"CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }"#,
+    )
+    .await;
+    let gov = nexus.governance();
+    let reader = agent(gov, "kip:principal:reader").await;
+    gov.publish_policy(
+        PolicyDraft {
+            policy_id: "kip:policy:space".into(),
+            space_id: DEFAULT_SPACE.into(),
+            description: "Broad internal sharing".into(),
+            statements: vec![PolicyStatement {
+                effect: "allow".into(),
+                principals: vec![reader.clone()],
+                actions: vec!["read".into(), "export".into()],
+                obligations: anda_cognitive_nexus::governance::rows::PolicyObligations {
+                    audit: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+        },
+        SYSTEM_PRINCIPAL,
+    )
+    .await
+    .unwrap();
+    let mut space = nexus.store.get_space(DEFAULT_SPACE).await.unwrap();
+    space.default_policy_id = "kip:policy:space".into();
+    nexus.store.put_space(&space).await.unwrap();
+
+    let session = nexus.session(AuthContext::principal(&reader));
+    let exported = run_as(&session, r#"EXPORT CAPSULE ?c WHERE { ?c CONCEPT {} }"#).await;
+    assert_eq!(
+        exported.status,
+        TopLevelStatus::Succeeded,
+        "{:?}",
+        exported.error
+    );
+
+    // The policy changes afterwards.
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    gov.publish_policy(
+        PolicyDraft {
+            policy_id: "kip:policy:space".into(),
+            space_id: DEFAULT_SPACE.into(),
+            description: "Strict compartmentalization".into(),
+            statements: vec![PolicyStatement {
+                effect: "deny".into(),
+                principals: vec![reader.clone()],
+                actions: vec!["export".into()],
+                ..Default::default()
+            }],
+        },
+        SYSTEM_PRINCIPAL,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        error_code(&run_as(&session, r#"EXPORT CAPSULE ?c WHERE { ?c CONCEPT {} }"#).await),
+        "NotAuthorized",
+        "the new version is in force now"
+    );
+
+    // And the old decision still names the version that made it.
+    let audit = gov.read_audit(DEFAULT_SPACE, 100).await.unwrap();
+    let export = audit
+        .iter()
+        .filter(|entry| entry.entry_class == "decision" && entry.operation == "export")
+        .min_by_key(|entry| entry._id)
+        .expect("the export decision is on record");
+    assert_eq!(export.policy_id, "kip:policy:space");
+    assert_eq!(export.policy_version, 1, "not the version in force today");
+}
+
+#[tokio::test]
+async fn who_had_access_in_january_is_answerable_and_is_not_a_claim_about_today() {
+    // §176, §177, §179.
+    let nexus = stocked("threat_historical_access").await;
+    let gov = nexus.governance();
+    let auditor = agent(gov, "kip:principal:auditor").await;
+    let temp = agent(gov, "kip:principal:contractor").await;
+    grant(
+        &nexus,
+        &auditor,
+        &["read", "read_audit", "read_governance_history"],
+        AuthorityScope::default(),
+    )
+    .await;
+    let contractor_grant = gov
+        .create_grant(
+            GrantDraft {
+                space_id: DEFAULT_SPACE.into(),
+                grantee_principal: temp.clone(),
+                actions: vec!["read".into()],
+                ..Default::default()
+            },
+            SYSTEM_PRINCIPAL,
+        )
+        .await
+        .unwrap();
+    let while_granted = anda_cognitive_nexus::time::now();
+
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    gov.revoke_grant(contractor_grant._id, SYSTEM_PRINCIPAL)
+        .await
+        .unwrap();
+
+    // Today the contractor holds nothing.
+    let contractor = nexus.session(AuthContext::principal(&temp));
+    assert_eq!(
+        error_code(&run_as(&contractor, r#"FIND(?c) WHERE { ?c CONCEPT {} }"#).await),
+        "NotAuthorized"
+    );
+
+    // Then, it did — and reading that needs its own permission.
+    let then = contractor
+        .access_as_of(DEFAULT_SPACE, &while_granted)
+        .await
+        .expect_err("reading governance history is not something everyone may do");
+    assert_eq!(then.name(), "NotAuthorized");
+
+    let auditor_session = nexus.session(AuthContext::principal(&auditor));
+    let reconstructed = anda_cognitive_nexus::governance::EffectiveAuthority::resolve_at(
+        &nexus.store,
+        DEFAULT_SPACE,
+        &AuthContext::principal(&temp),
+        &while_granted,
+    )
+    .await
+    .unwrap();
+    assert!(
+        reconstructed
+            .permission_names(&AuthContext::principal(&temp))
+            .contains(&"read".to_string()),
+        "January's answer"
+    );
+    // And the auditor may ask for its own history through the session API.
+    assert!(
+        auditor_session
+            .access_as_of(DEFAULT_SPACE, &while_granted)
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn reading_the_audit_is_a_permission_of_its_own() {
+    // §89: the audit says what everyone else did. Reading a Space's cognition
+    // does not earn the right to read who has been reading it.
+    let nexus = stocked("threat_audit_permission").await;
+    let reader = agent(nexus.governance(), "kip:principal:reader").await;
+    grant(&nexus, &reader, &["read"], AuthorityScope::default()).await;
+    let session = nexus.session(AuthContext::principal(&reader));
+    let err = session.read_audit(DEFAULT_SPACE, 10).await.unwrap_err();
+    assert_eq!(err.name(), "NotAuthorized");
+    assert!(err.message.contains("read_audit"));
+
+    let auditor = agent(nexus.governance(), "kip:principal:auditor").await;
+    grant(
+        &nexus,
+        &auditor,
+        &["read", "read_audit"],
+        AuthorityScope::default(),
+    )
+    .await;
+    assert!(
+        !nexus
+            .session(AuthContext::principal(&auditor))
+            .read_audit(DEFAULT_SPACE, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_high_impact_receipt_explains_what_authorized_it() {
+    // §178: a high-impact transaction has to be explainable later in terms of
+    // the identity and the policy version that authorized it.
+    let nexus = stocked("threat_receipt_provenance").await;
+    let owner = nexus.system_session();
+    run_as(
+        &owner,
+        r#"CREATE EVIDENCE ?e { SET FIELDS {evidence_class: "Document", payload: "x"} }"#,
+    )
+    .await;
+    let purged = run_as(&owner, r#"PURGE "E-1" CONFIRM "PURGE""#).await;
+    let provenance = purged
+        .receipt
+        .as_ref()
+        .unwrap()
+        .extensions
+        .as_ref()
+        .unwrap()["governance"]
+        .clone();
+    assert_eq!(provenance["principal_id"], SYSTEM_PRINCIPAL);
+    assert!(
+        provenance["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|op| op == "purge")
+    );
+
+    // An ordinary write carries none of it: burying the cases that matter
+    // under the ones that do not is how a record stops being read.
+    let ordinary = run_as(
+        &owner,
+        r#"CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }"#,
+    )
+    .await;
+    assert!(
+        ordinary
+            .receipt
+            .as_ref()
+            .unwrap()
+            .extensions
+            .as_ref()
+            .is_none_or(|extensions| !extensions.contains_key("governance"))
+    );
+}

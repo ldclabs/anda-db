@@ -349,6 +349,75 @@ impl EffectiveAuthority {
         })
     }
 
+    /// Reads the control plane as it stood at a past instant (§176, §177).
+    ///
+    /// Answers *who had access at time T*, which is a different question from
+    /// *who has access now* and must never be mistaken for it: an auditor who
+    /// observes that a Principal could read something in January learns nothing
+    /// about today (§179). Nothing here is cached and nothing here authorizes —
+    /// this is a reconstruction for an authorized reader, not a decision path.
+    ///
+    /// Delegations are resolved against the *present* authority of their
+    /// delegator, because reconstructing a whole historical chain would need
+    /// the delegator's historical Grants recursively; the report says so rather
+    /// than implying a precision it does not have.
+    pub async fn resolve_at(
+        store: &Store,
+        space_id: &str,
+        auth: &AuthContext,
+        at: &str,
+    ) -> Result<Self, KipError> {
+        let governance = &store.governance;
+        let space = store.get_space(space_id).await?;
+        let principal = governance
+            .find_principal(&auth.principal_id)
+            .await?
+            .ok_or_else(|| {
+                KipError::unauthenticated(format!(
+                    "no Principal {:?} is registered in this Nexus",
+                    auth.principal_id
+                ))
+            })?;
+        let groups = governance.groups_of_at(&auth.principal_id, at).await?;
+        let is_owner = space.owner_principal == auth.principal_id
+            || space.owners.iter().any(|owner| owner == &auth.principal_id);
+
+        let mut candidates = Vec::new();
+        for grant in governance
+            .grants_at(space_id, &auth.principal_id, &groups, at)
+            .await?
+        {
+            candidates.push(candidate_of_grant(&grant)?);
+        }
+        for delegation in governance
+            .delegations_at(space_id, &auth.principal_id, at)
+            .await?
+        {
+            if let Some(candidate) = resolve_delegation(store, space_id, &delegation, 0).await? {
+                candidates.push(candidate);
+            }
+        }
+
+        let policy = if space.default_policy_id.is_empty() {
+            None
+        } else {
+            governance.policy_at(&space.default_policy_id, at).await?
+        };
+        let bindings = governance
+            .bindings_at(&auth.principal_id, space_id, at)
+            .await?;
+
+        Ok(Self {
+            space,
+            principal,
+            groups,
+            is_owner,
+            policy,
+            bindings,
+            candidates,
+        })
+    }
+
     /// Decides whether `permission` may be exercised on `resource`.
     ///
     /// Pure: everything it reads was loaded by [`Self::resolve`].
@@ -563,6 +632,21 @@ impl EffectiveAuthority {
         } else {
             &self.space.default_classification
         }
+    }
+
+    /// When the first of this Principal's authorities lapses, if any does.
+    ///
+    /// §266 lists this among the things an Agent must be able to learn about
+    /// itself: autonomous planning that does not know when its Delegation
+    /// expires plans work it will not be allowed to finish.
+    pub fn earliest_expiry(&self) -> Option<String> {
+        self.candidates
+            .iter()
+            .filter_map(|candidate| {
+                let until = &candidate.conditions.valid_until;
+                (!until.is_empty()).then(|| until.clone())
+            })
+            .min()
     }
 
     /// The permission names this Principal holds somewhere in this Space.

@@ -656,6 +656,134 @@ impl GovernanceStore {
         Ok(rows)
     }
 
+    /// The Grants that were in force at a past instant (§177).
+    ///
+    /// Reads the same rows as the live lookup and judges them by their own
+    /// timestamps instead of by their current status — which is exactly what
+    /// "revoke, never delete" was for. An auditor asking *who could read this
+    /// in January* gets January's answer, and gets it without that being a
+    /// claim about today (§179).
+    pub async fn grants_at(
+        &self,
+        space_id: &str,
+        principal_id: &str,
+        groups: &[String],
+        at: &str,
+    ) -> Result<Vec<GrantRow>, KipError> {
+        let collection = self.grants.get();
+        let mut rows: Vec<GrantRow> = self
+            .all_rows(
+                &collection,
+                eq_fields(&[
+                    ("space_id", Fv::Text(space_id.to_string())),
+                    ("grantee_principal", Fv::Text(principal_id.to_string())),
+                ]),
+            )
+            .await?;
+        for group in groups {
+            let group_rows: Vec<GrantRow> = self
+                .all_rows(
+                    &collection,
+                    eq_fields(&[
+                        ("space_id", Fv::Text(space_id.to_string())),
+                        ("grantee_group", Fv::Text(group.clone())),
+                    ]),
+                )
+                .await?;
+            rows.extend(group_rows);
+        }
+        rows.retain(|row| in_force_at(&row.created_at, &row.revoked_at, at));
+        Ok(rows)
+    }
+
+    /// The Delegations that were in force at a past instant.
+    pub async fn delegations_at(
+        &self,
+        space_id: &str,
+        principal_id: &str,
+        at: &str,
+    ) -> Result<Vec<DelegationRow>, KipError> {
+        let mut rows: Vec<DelegationRow> = self
+            .all_rows(
+                &self.delegations.get(),
+                eq_fields(&[
+                    ("space_id", Fv::Text(space_id.to_string())),
+                    ("delegate_principal", Fv::Text(principal_id.to_string())),
+                ]),
+            )
+            .await?;
+        rows.retain(|row| in_force_at(&row.created_at, &row.revoked_at, at));
+        Ok(rows)
+    }
+
+    /// The ActorBindings that were in force at a past instant.
+    pub async fn bindings_at(
+        &self,
+        principal_id: &str,
+        space_id: &str,
+        at: &str,
+    ) -> Result<Vec<ActorBindingRow>, KipError> {
+        let mut rows: Vec<ActorBindingRow> = self
+            .all_rows(
+                &self.bindings.get(),
+                eq_field("principal_id", Fv::Text(principal_id.to_string())),
+            )
+            .await?;
+        rows.retain(|row| {
+            (row.scope == space_id || row.scope == ANY_SPACE)
+                && in_force_at(&row.created_at, &row.revoked_at, at)
+        });
+        Ok(rows)
+    }
+
+    /// Which groups a Principal belonged to at a past instant.
+    ///
+    /// Replayed from the audit rather than read off the group rows, because a
+    /// group's membership is stored as one current list: the row says who is in
+    /// it now and the audit says who was in it then. §177 needs the second, and
+    /// the audit carrying whole records rather than diffs is what makes the
+    /// replay a lookup instead of a reconstruction.
+    pub async fn groups_of_at(
+        &self,
+        principal_id: &str,
+        at: &str,
+    ) -> Result<Vec<String>, KipError> {
+        let entries: Vec<GovernanceAuditRow> = self
+            .all_rows(
+                &self.audit.get(),
+                eq_field("operation", Fv::Text("put_group".to_string())),
+            )
+            .await?;
+        let mut latest: std::collections::BTreeMap<String, (String, bool)> = Default::default();
+        for entry in entries {
+            if entry.at.as_str() > at {
+                continue;
+            }
+            let Some(group) = entry.record.get("group_id").and_then(Json::as_str) else {
+                continue;
+            };
+            let member = entry
+                .record
+                .get("members")
+                .and_then(Json::as_array)
+                .is_some_and(|members| {
+                    members
+                        .iter()
+                        .any(|value| value.as_str() == Some(principal_id))
+                });
+            let slot = latest
+                .entry(group.to_string())
+                .or_insert_with(|| (String::new(), false));
+            if entry.at >= slot.0 {
+                *slot = (entry.at.clone(), member);
+            }
+        }
+        Ok(latest
+            .into_iter()
+            .filter_map(|(group, (_, member))| member.then_some(group))
+            .collect())
+    }
+
     // -----------------------------------------------------------------------
     // Delegations
     // -----------------------------------------------------------------------
@@ -952,6 +1080,30 @@ impl GovernanceStore {
         Ok(row)
     }
 
+    /// Marks an approval as spent.
+    ///
+    /// An approval authorizes one operation, not a standing licence: the same
+    /// two signatures must not be usable twice. Re-running the operation needs
+    /// a new approval, which is the whole point of requiring one.
+    pub async fn consume_approval(&self, id: u64) -> Result<(), KipError> {
+        let Some(mut row) = self.find_approval(id).await? else {
+            return Ok(());
+        };
+        row.status = "consumed".to_string();
+        row.updated_at = time::now();
+        row.version = row.version.saturating_add(1);
+        self.put(&self.approvals.get(), id, &row).await?;
+        self.record_mutation(MutationEntry {
+            operation: "consume_approval",
+            space_id: row.space_id.clone(),
+            resource: approval_id(id),
+            principal_id: String::new(),
+            record: json_of(&row)?,
+        })
+        .await
+        .map(|_| ())
+    }
+
     /// The granted, unexpired approvals bound to one operation subject.
     pub async fn granted_approvals(
         &self,
@@ -1207,6 +1359,16 @@ pub struct ApprovalDraft {
     pub allow_self_approval: bool,
     /// When the approval stops being usable; empty for no expiry.
     pub expires_at: String,
+}
+
+/// Whether a record with these timestamps was in force at an instant.
+///
+/// A record created after the coordinate did not exist then, and one revoked at
+/// or before it was already gone. Both bounds are checked against the record's
+/// own timestamps rather than against its current status, which is the whole
+/// reason revocation is a status change rather than a delete.
+fn in_force_at(created_at: &str, revoked_at: &str, at: &str) -> bool {
+    created_at <= at && (revoked_at.is_empty() || revoked_at > at)
 }
 
 /// Normalizes an actor reference into the endpoint key it is compared against.

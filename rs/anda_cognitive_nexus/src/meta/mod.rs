@@ -231,6 +231,10 @@ pub fn capabilities() -> Json {
                 "policies": "versioned, append-only",
                 "approvals": "multi-party, separation of duties",
                 "audit": "append-preserving: control-plane mutations and decisions",
+                "historical": "policy-as-of, and which Grants were in force at an instant",
+                "approvals_bind": "one operation, and are spent by using it",
+                "receipt_provenance": "high-impact commits carry the identity and policy \
+                                       version that authorized them",
                 "enforcement": "every KQL, KML and META command is authorized before it \
                                 runs, and every element a read or a write touches is \
                                 authorized again",

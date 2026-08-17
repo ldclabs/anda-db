@@ -113,9 +113,18 @@ pub async fn purge(
     authority
         .authorize(Permission::Read, &resource, auth)
         .into_result()?;
-    authority
-        .authorize(Permission::Purge, &resource, auth)
-        .into_result()?;
+    // §167 lists purging critical Evidence among the operations a policy may
+    // require independent approval for, and this is where such an approval is
+    // consumed — bound to this element, and spent by using it.
+    super::approval::resolve(
+        store,
+        space_id,
+        &resource,
+        authority.authorize(Permission::Purge, &resource, auth),
+        auth,
+    )
+    .await?
+    .into_result()?;
 
     // §163: a legal hold is exactly the thing purge must not walk past, and it
     // is checked before anything else destructive is decided.

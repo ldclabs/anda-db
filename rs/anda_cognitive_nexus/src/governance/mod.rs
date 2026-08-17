@@ -48,6 +48,7 @@
 //! [`CognitiveNexus`]: crate::CognitiveNexus
 //! [`CognitiveNexus::session`]: crate::CognitiveNexus::session
 
+pub mod approval;
 pub mod auth;
 pub mod decision;
 pub mod element;

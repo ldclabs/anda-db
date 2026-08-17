@@ -149,6 +149,9 @@ fn access(cx: &mut Context<'_>, with: Option<&anda_kip::BoundObject>) -> Result<
             "assurance": auth.purpose_assurance,
         },
         "delegation_chain": auth.delegation_chain,
+        // §266: an Agent planning its own work needs to know when what it
+        // holds runs out, not only that it holds it.
+        "expires_at": authority.earliest_expiry(),
         "permissions": authority.permission_names(auth),
         "default_classification": authority.default_classification(),
         "policy": match &authority.policy {

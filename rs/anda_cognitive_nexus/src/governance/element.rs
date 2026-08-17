@@ -114,9 +114,15 @@ pub async fn classify(
     } else {
         Permission::Update
     };
-    authority
-        .authorize(permission, &resource, auth)
-        .into_result()?;
+    super::approval::resolve(
+        store,
+        space_id,
+        &resource,
+        authority.authorize(permission, &resource, auth),
+        auth,
+    )
+    .await?
+    .into_result()?;
 
     let op = if lowering { "declassify" } else { "classify" };
     let patch = |governance: &Json| set_member(governance, "classification", Json::from(label));
@@ -155,9 +161,18 @@ pub async fn elevate_authority(
     }
     let element = readable(store, space_id, id, authority_state, auth).await?;
     let resource = ResourceContext::of_element(&element);
-    authority_state
-        .authorize(Permission::ElevateAuthority, &resource, auth)
-        .into_result()?;
+    // §129: elevation is exactly the operation a policy asks for independent
+    // approval on, and §246 requires that one approval of two is not partial
+    // activation. That is decided here rather than by the caller.
+    super::approval::resolve(
+        store,
+        space_id,
+        &resource,
+        authority_state.authorize(Permission::ElevateAuthority, &resource, auth),
+        auth,
+    )
+    .await?
+    .into_result()?;
 
     let current = ceiling_of(&element).to_string();
     let raising = authority::rank(class) > authority::rank(&current);
@@ -208,13 +223,16 @@ pub async fn quarantine(
     auth: &AuthContext,
 ) -> Result<(), KipError> {
     let element = readable(store, space_id, id, authority, auth).await?;
-    authority
-        .authorize(
-            Permission::Quarantine,
-            &ResourceContext::of_element(&element),
-            auth,
-        )
-        .into_result()?;
+    let resource = ResourceContext::of_element(&element);
+    super::approval::resolve(
+        store,
+        space_id,
+        &resource,
+        authority.authorize(Permission::Quarantine, &resource, auth),
+        auth,
+    )
+    .await?
+    .into_result()?;
     let reason = reason.to_string();
     let patch =
         |governance: &Json| set_member(governance, QUARANTINE_KEY, Json::from(reason.as_str()));

@@ -334,6 +334,56 @@ impl Session {
         EffectiveAuthority::resolve(&self.nexus.store, space_id, &self.auth).await
     }
 
+    /// Reads the Governance audit for a Space (§89, §172).
+    ///
+    /// Its own permission, because the audit says what everyone else did: a
+    /// caller who may read a Space's cognition has not thereby earned the right
+    /// to read who has been reading it.
+    pub async fn read_audit(
+        &self,
+        space_id: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::governance::rows::GovernanceAuditRow>, KipError> {
+        let _guard = self.nexus.lock.read().await;
+        let authority = self.authority(space_id, &self.auth).await?;
+        authority
+            .authorize(
+                Permission::ReadAudit,
+                &ResourceContext::default(),
+                &self.auth,
+            )
+            .into_result()?;
+        self.nexus
+            .store
+            .governance
+            .read_audit(space_id, limit)
+            .await
+    }
+
+    /// What this Principal could do in a Space at a past instant (§176, §177).
+    ///
+    /// A historical answer, and nothing more: that a Principal could read
+    /// something in January says nothing about whether it can today (§179).
+    /// Reading it needs `read_governance_history`, which is separate from
+    /// `read_audit` — one is what the control plane *was*, the other is what
+    /// people *did*.
+    pub async fn access_as_of(
+        &self,
+        space_id: &str,
+        at: &str,
+    ) -> Result<EffectiveAuthority, KipError> {
+        let _guard = self.nexus.lock.read().await;
+        let now = self.authority(space_id, &self.auth).await?;
+        now.authorize(
+            Permission::ReadGovernanceHistory,
+            &ResourceContext::default(),
+            &self.auth,
+        )
+        .into_result()?;
+        let at = crate::time::normalize(at, "AS OF")?;
+        EffectiveAuthority::resolve_at(&self.nexus.store, space_id, &self.auth, &at).await
+    }
+
     /// Raises or lowers how strongly one element may influence action.
     ///
     /// Raising is bounded by the element's authority lineage, so no chain of
@@ -567,7 +617,19 @@ impl Session {
         needed: Vec<Permission>,
     ) -> Result<(), KipError> {
         for permission in needed {
-            let decision = authority.authorize(permission, &ResourceContext::default(), auth);
+            let resource = ResourceContext::default();
+            // A policy may require independent approval for a whole command
+            // family — declassification, elevation, export — and a satisfied
+            // approval is what turns that into an allow. An unsatisfied one
+            // stays a refusal: `require_approval` is not a soft yes (§40).
+            let decision = crate::governance::approval::resolve(
+                &self.nexus.store,
+                &authority.space.space_id,
+                &resource,
+                authority.authorize(permission, &resource, auth),
+                auth,
+            )
+            .await?;
             if !decision.is_permitted() {
                 self.audit(authority, auth, &decision).await;
                 return decision.into_result().map(|_| ());
