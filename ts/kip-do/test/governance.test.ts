@@ -16,10 +16,16 @@ import {
   isAlwaysAudited,
   mergeObligations,
   parsePermission,
+  principalAuth,
   rowIdOf,
   scopeContains,
+  spaceResource,
+  subjectDigest,
   tightenConstraints,
 } from '../src/governance/index.js'
+import { parseElementId } from '../src/id.js'
+import { CognitiveNexus, SYSTEM_PRINCIPAL } from '../src/nexus.js'
+import { COGNITIVE_MEMORY } from '../src/schema/index.js'
 import { Store } from '../src/store/index.js'
 
 /**
@@ -532,6 +538,345 @@ describe('the Governance store', () => {
         'read',
         'export',
       ])
+    })
+  })
+})
+
+describe('the command gate', () => {
+  async function withNexus<T>(
+    name: string,
+    body: (nexus: CognitiveNexus) => T,
+  ): Promise<T> {
+    const stub = env.KIP_DB.getByName(`gate-${name}`)
+    return await runInDurableObject(stub, (_instance, state) => {
+      const nexus = CognitiveNexus.connect(state.storage)
+      nexus.activatePackages([COGNITIVE_MEMORY])
+      return body(nexus)
+    })
+  }
+
+  const CREATE = 'CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }'
+  const READ = 'FIND(?c) WHERE { ?c CONCEPT {type: "Person"} }'
+
+  it('runs the embedded host through the authorization path, not around it', async () => {
+    await withNexus('system-owner', (nexus) => {
+      // §212: the system Principal owns the default Space, so an in-process
+      // host is not locked out by default deny — and is not exempt from it
+      // either.
+      const authority = nexus.systemSession().effectiveAuthority()
+      expect(authority.isOwner).toBe(true)
+      expect(nexus.execute(CREATE).status).toBe('committed')
+      expect(nexus.query(READ)).toHaveLength(1)
+    })
+  })
+
+  it('refuses a Principal the control plane has never heard of', async () => {
+    await withNexus('unknown-principal', (nexus) => {
+      // A host naming an unregistered identity has a configuration bug.
+      // Resolving it to "some caller with no Grants" would hide that bug behind
+      // a denial that looks like policy.
+      const session = nexus.session(principalAuth('kip:principal:ghost'))
+      expect(() => session.query(READ)).toThrowError(/is registered in this Nexus/)
+    })
+  })
+
+  it('denies by default: a registered Principal with no Grants may do nothing', async () => {
+    await withNexus('default-deny', (nexus) => {
+      nexus.store.governance.ensurePrincipal({ principal_id: 'kip:principal:agent' })
+      const session = nexus.session(principalAuth('kip:principal:agent'))
+      // §41: a missing policy must never become public access.
+      expect(() => session.query(READ)).toThrowError(/requires the read permission/)
+      expect(() => session.execute(CREATE)).toThrowError(/requires the create permission/)
+    })
+  })
+
+  it('lets a Grant confer exactly what it names, and nothing beside it', async () => {
+    await withNexus('narrow-grant', (nexus) => {
+      const gov = nexus.store.governance
+      gov.ensurePrincipal({ principal_id: 'kip:principal:reader' })
+      gov.createGrant(
+        {
+          space_id: nexus.space,
+          grantee_principal: 'kip:principal:reader',
+          actions: ['read'],
+        },
+        SYSTEM_PRINCIPAL,
+      )
+      nexus.execute(CREATE)
+
+      const session = nexus.session(principalAuth('kip:principal:reader'))
+      expect(session.query(READ)).toHaveLength(1)
+      // §271: read ≠ export. A caller who may read every element still may not
+      // package them and take them away.
+      expect(() =>
+        session.describe('EXPORT CAPSULE :out WHERE { ?c CONCEPT {type: "Person"} }', {
+          out: 'x',
+        }),
+      ).toThrowError(/requires the export permission/)
+      expect(() => session.execute(CREATE)).toThrowError(/requires the create permission/)
+    })
+  })
+
+  it('takes effect the moment a Grant is revoked, mid-session', async () => {
+    await withNexus('revocation', (nexus) => {
+      const gov = nexus.store.governance
+      gov.ensurePrincipal({ principal_id: 'kip:principal:reader' })
+      const grant = gov.createGrant(
+        {
+          space_id: nexus.space,
+          grantee_principal: 'kip:principal:reader',
+          actions: ['read'],
+        },
+        SYSTEM_PRINCIPAL,
+      )
+      const session = nexus.session(principalAuth('kip:principal:reader'))
+      expect(session.query(READ)).toEqual([])
+
+      gov.revokeGrant(grant.id, SYSTEM_PRINCIPAL)
+      // §188, §245: the session held identity, never authority. It does not
+      // still hold what its first request resolved.
+      expect(() => session.query(READ)).toThrowError(/requires the read permission/)
+    })
+  })
+
+  it('lets an explicit deny outrank every allow, including the owner’s', async () => {
+    await withNexus('explicit-deny', (nexus) => {
+      const gov = nexus.store.governance
+      gov.publishPolicy(
+        {
+          policy_id: 'kip:policy:no-export',
+          space_id: nexus.space,
+          statements: [{ effect: 'deny', actions: ['export'] }],
+        },
+        SYSTEM_PRINCIPAL,
+      )
+      const space = nexus.spaceRow()
+      space.default_policy_id = 'kip:policy:no-export'
+      nexus.store.putSpace(space)
+
+      // §42: nothing arriving through a request can talk past a deny. The owner
+      // is not locked out — a host holds the control plane directly and can
+      // publish a new version — but it cannot out-argue one from here.
+      expect(() =>
+        nexus.describe('EXPORT CAPSULE :out WHERE { ?c CONCEPT {type: "Person"} }', {
+          out: 'x',
+        }),
+      ).toThrowError(/requires the export permission/)
+      expect(nexus.query(READ)).toEqual([])
+    })
+  })
+
+  it('blocks rather than softly allowing when a policy requires approval', async () => {
+    await withNexus('require-approval', (nexus) => {
+      const gov = nexus.store.governance
+      gov.publishPolicy(
+        {
+          policy_id: 'kip:policy:two-eyes',
+          space_id: nexus.space,
+          statements: [
+            {
+              effect: 'allow',
+              actions: ['export'],
+              obligations: { audit: true, approvals_required: 2, redaction_profile: '' },
+            },
+          ],
+        },
+        SYSTEM_PRINCIPAL,
+      )
+      const space = nexus.spaceRow()
+      space.default_policy_id = 'kip:policy:two-eyes'
+      nexus.store.putSpace(space)
+
+      const EXPORT = 'EXPORT CAPSULE :out WHERE { ?c CONCEPT {type: "Person"} }'
+      // §40: `require_approval` is not a soft yes. The operation does not run
+      // while it is outstanding, and the owner is no exception.
+      expect(() => nexus.describe(EXPORT, { out: 'x' })).toThrowError(
+        /independent approval/,
+      )
+
+      const digest = subjectDigest(nexus.space, 'export', spaceResource())
+      const approval = gov.requestApproval(
+        {
+          space_id: nexus.space,
+          operation: 'export',
+          resource: 'the Space',
+          subject_digest: digest,
+          required: 2,
+        },
+        'kip:principal:requester',
+      )
+      gov.approve(approval.id, 'kip:principal:reviewer-a')
+      // §246: one approval where two are required is not partial activation.
+      expect(() => nexus.describe(EXPORT, { out: 'x' })).toThrowError(
+        /independent approval/,
+      )
+
+      gov.approve(approval.id, 'kip:principal:reviewer-b')
+      expect(() => nexus.describe(EXPORT, { out: 'x' })).not.toThrow()
+      // Consumed by use: the same two signatures do not authorize it twice.
+      expect(gov.findApproval(approval.id)?.status).toBe('consumed')
+      expect(() => nexus.describe(EXPORT, { out: 'x' })).toThrowError(
+        /independent approval/,
+      )
+    })
+  })
+
+  it('describes the engine without asking for authority', async () => {
+    await withNexus('open-describe', (nexus) => {
+      nexus.store.governance.ensurePrincipal({ principal_id: 'kip:principal:agent' })
+      const session = nexus.session(principalAuth('kip:principal:agent'))
+      // Otherwise an unauthorized caller could not learn how to become one.
+      expect(() => session.describe('DESCRIBE PROTOCOL')).not.toThrow()
+      expect(() => session.describe('DESCRIBE CAPABILITIES')).not.toThrow()
+      // §266: and it must be able to learn what it may do without first being
+      // permitted to do it.
+      const access = session.describe('DESCRIBE ACCESS') as {
+        permissions: string[]
+        principal_id: string
+      }
+      expect(access.principal_id).toBe('kip:principal:agent')
+      expect(access.permissions).toEqual([])
+      // Describing the *Space* is a different question and does need discovery.
+      expect(() => session.describe('DESCRIBE PRIMER')).toThrowError(
+        /requires the discover permission/,
+      )
+    })
+  })
+
+  it('reports what a Grant actually confers, grouped by family', async () => {
+    await withNexus('access-report', (nexus) => {
+      const gov = nexus.store.governance
+      gov.ensurePrincipal({ principal_id: 'kip:principal:agent' })
+      gov.createGrant(
+        {
+          space_id: nexus.space,
+          grantee_principal: 'kip:principal:agent',
+          actions: ['read', 'discover'],
+        },
+        SYSTEM_PRINCIPAL,
+      )
+      const session = nexus.session(principalAuth('kip:principal:agent'))
+      const access = session.describe('DESCRIBE ACCESS') as {
+        permissions: string[]
+        families: Record<string, unknown[]>
+      }
+      expect(access.permissions.sort()).toEqual(['discover', 'read'])
+      expect(access.families.discovery).toHaveLength(2)
+    })
+  })
+
+  it('stamps the acting Principal on what it writes', async () => {
+    await withNexus('origin', (nexus) => {
+      const gov = nexus.store.governance
+      gov.ensurePrincipal({ principal_id: 'kip:principal:writer' })
+      gov.createGrant(
+        {
+          space_id: nexus.space,
+          grantee_principal: 'kip:principal:writer',
+          actions: ['create', 'read'],
+        },
+        SYSTEM_PRINCIPAL,
+      )
+      const session = nexus.session(principalAuth('kip:principal:writer'))
+      const receipt = session.execute(CREATE)
+      const id = receipt.changes[0]?.id ?? ''
+      const element = nexus.store.load(parseElementId(id))
+      // §26: origin is what the runtime observed, never what the content
+      // claimed — so it names the session's Principal and not the engine's.
+      expect(element?.row.origin.principal_id).toBe('kip:principal:writer')
+    })
+  })
+
+  it('does not let a declared purpose widen what a session may do', async () => {
+    await withNexus('purpose', (nexus) => {
+      const gov = nexus.store.governance
+      gov.ensurePrincipal({ principal_id: 'kip:principal:agent' })
+      gov.createGrant(
+        {
+          space_id: nexus.space,
+          grantee_principal: 'kip:principal:agent',
+          actions: ['read'],
+          conditions: {
+            purpose: ['incident_response'],
+            min_purpose_assurance: 'session_bound',
+          },
+        },
+        SYSTEM_PRINCIPAL,
+      )
+      // §12: writing purpose: "incident_response" in a request gets a caller
+      // nothing. Only the host can vouch for a purpose.
+      const declared = nexus.session(
+        principalAuth('kip:principal:agent', {
+          purpose: 'incident_response',
+          purpose_assurance: 'declared',
+        }),
+      )
+      expect(() => declared.query(READ)).toThrowError(/requires the read permission/)
+
+      const bound = nexus.session(
+        principalAuth('kip:principal:agent', {
+          purpose: 'incident_response',
+          purpose_assurance: 'session_bound',
+        }),
+      )
+      expect(bound.query(READ)).toEqual([])
+    })
+  })
+
+  it('reads a suspended Principal as not permitted rather than as an error', async () => {
+    await withNexus('suspended', (nexus) => {
+      const gov = nexus.store.governance
+      gov.ensurePrincipal({ principal_id: 'kip:principal:agent' })
+      gov.createGrant(
+        {
+          space_id: nexus.space,
+          grantee_principal: 'kip:principal:agent',
+          actions: ['read'],
+        },
+        SYSTEM_PRINCIPAL,
+      )
+      const session = nexus.session(principalAuth('kip:principal:agent'))
+      expect(session.query(READ)).toEqual([])
+
+      gov.setPrincipalStatus('kip:principal:agent', 'suspended', SYSTEM_PRINCIPAL)
+      // The record survives — a past write stays attributable to it — and the
+      // refusal reads as "not permitted", which is what it is.
+      expect(() => session.query(READ)).toThrowError(/requires the read permission/)
+    })
+  })
+
+  it('never lets cognitive content confer authority', async () => {
+    await withNexus('no-cognitive-authority', (nexus) => {
+      const gov = nexus.store.governance
+      gov.ensurePrincipal({ principal_id: 'kip:principal:agent' })
+      gov.createGrant(
+        {
+          space_id: nexus.space,
+          grantee_principal: 'kip:principal:agent',
+          actions: ['create', 'read', 'assert'],
+        },
+        SYSTEM_PRINCIPAL,
+      )
+      const session = nexus.session(principalAuth('kip:principal:agent'))
+      // The Space can hold a Concept, a Proposition and a high-confidence
+      // Assertion all saying the agent administers this Brain…
+      session.execute(`MUTATE {
+        CREATE CONCEPT ?agent { TYPE "Person" NAME "the agent" }
+        CREATE CONCEPT ?role { TYPE "Preference" NAME "administrator" }
+        ENSURE PROPOSITION ?p (?agent, "prefers", ?role)
+        CREATE ASSERTION ?a {
+          SET FIELDS {
+            proposition: ?p, asserted_by: ?agent, stance: "support",
+            mode: "stated", confidence: 1.0
+          }
+        }
+      }`)
+      // …and it administers nothing. Authorization reads Grants, and a
+      // Proposition is a claim.
+      expect(() => session.execute('ARCHIVE "C-1"')).toThrowError(
+        /requires the archive permission/,
+      )
+      expect(session.effectiveAuthority().isOwner).toBe(false)
     })
   })
 })

@@ -25,6 +25,12 @@
  */
 
 import { KipError, errors, KIP_ERROR_CODES, KIP_ERROR_REGISTRY } from '../errors.js'
+import {
+  EffectiveAuthority,
+  familyOf,
+  describePermission,
+  type AuthContext,
+} from '../governance/index.js'
 import { parseElementId, type ElementId } from '../id.js'
 import type { Json, JsonMap } from '../json.js'
 import type {
@@ -61,6 +67,17 @@ export interface MetaContext {
   env: SchemaEnvironment
   request?: JsonMap
   operation?: JsonMap
+  /**
+   * What the caller may do here, resolved once for the whole command.
+   *
+   * Required rather than optional: `DESCRIBE ACCESS` and `DESCRIBE EXECUTION
+   * CONTEXT` answer *about the caller*, and a context that could arrive without
+   * one would have to invent a fallback — which is how "no control plane" and
+   * "no authority" become the same answer.
+   */
+  authority: EffectiveAuthority
+  /** Who the caller is. */
+  auth: AuthContext
 }
 
 /** Runs one META command. */
@@ -131,10 +148,27 @@ function describe(
       space_id: cx.space,
       schema_environment_version: cx.env.version,
       space_seq: cx.store.currentSeq(cx.space),
-      // No control plane: every caller has the same authority here, and saying
-      // so beats reporting an identity the engine does not actually check.
-      principal: null,
-      governance: 'not enforced by this engine; see DESCRIBE CAPABILITIES',
+      principal: {
+        principal_id: cx.authority.principal.principal_id,
+        principal_class: cx.authority.principal.principal_class,
+        status: cx.authority.principal.status,
+        groups: cx.authority.groups,
+        is_space_owner: cx.authority.isOwner,
+        auth_strength: cx.auth.auth_strength,
+        purpose: cx.auth.purpose,
+        purpose_assurance: cx.auth.purpose_assurance,
+      },
+      // §266: an Agent that does not know when its Delegation expires plans
+      // work it will not be allowed to finish.
+      authority_expires_at: cx.authority.earliestExpiry(),
+      governance: {
+        enforced: 'command scope; see DESCRIBE CAPABILITIES for the granularity',
+        default_classification: cx.authority.defaultClassification(),
+        policy:
+          cx.authority.policy === null
+            ? null
+            : `${cx.authority.policy.policy_id}@${cx.authority.policy.version}`,
+      },
     } as Json
   }
   if (target === 'ProjectionCapability') {
@@ -270,11 +304,32 @@ function describe(
         'read as a judgement that nothing is trusted',
     )
   }
+  // §266: an Agent must be able to learn what it may do without first being
+  // permitted to do it, so this asks for no permission of its own.
+  //
+  // Deliberately coarse. It answers "could this ever be allowed here" rather
+  // than "is this allowed on that element", because the second question's answer
+  // depends on an element whose existence the caller may not be entitled to
+  // learn — a per-element access report is an existence oracle (§103).
   if ('Access' in target) {
-    throw errors.unsupportedCapability(
-      'this engine has no Governance plane; an empty access report would read ' +
-        'as a judgement that the caller may do nothing',
-    )
+    const held = cx.authority.permissionNames(cx.auth)
+    const byFamily: Record<string, Json> = {}
+    for (const permission of held) {
+      const family = familyOf(permission)
+      const entries = (byFamily[family] ?? []) as Json[]
+      entries.push({ permission, description: describePermission(permission) })
+      byFamily[family] = entries
+    }
+    return {
+      space_id: cx.space,
+      principal_id: cx.authority.principal.principal_id,
+      is_space_owner: cx.authority.isOwner,
+      groups: cx.authority.groups,
+      permissions: held,
+      families: byFamily,
+      granularity: 'command scope; per-element authorization is not built yet',
+      expires_at: cx.authority.earliestExpiry(),
+    } as Json
   }
   if ('Capsule' in target) {
     throw errors.unsupportedCapability(

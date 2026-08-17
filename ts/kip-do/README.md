@@ -23,22 +23,33 @@ than an absent one. It is recoverable from this branch's history.
 
 What works today: the storage layer, Schema Packages and symbol resolution,
 transactions and the KML mutation clauses, KQL, the Epistemic Projection, META,
-and Capsule export and verification. **56 of the 62 shared conformance cases
-pass**; the remaining 6 are all the historical read path (`AS OF`), and
-`test/conformance.test.ts` names them individually so closing the gap has to be
-acknowledged rather than absorbed into a number.
+Capsule export and verification, and the Governance control plane at command
+scope. **56 of the 62 shared conformance cases pass**; the remaining 6 are all
+the historical read path (`AS OF`), and `test/conformance.test.ts` names them
+individually so closing the gap has to be acknowledged rather than absorbed into
+a number.
 
-Two things are deliberately absent, and `DESCRIBE CAPABILITIES` says so with a
-reason for each:
+`DESCRIBE CAPABILITIES` reports every gap with a reason. Two are worth naming
+here:
 
-- **The Governance control plane.** There are no Principals, Grants or
-  classifications, and every caller has the same authority. A half-built
-  Governance plane is worse than an absent one, because it looks like it is
-  enforcing something.
+- **Governance is enforced at command scope, not yet at element scope.** There
+  are Principals, groups, Grants, Delegations, Policy versions and Approvals,
+  and every command is authorized against them before it runs — a caller with no
+  Grants can do nothing, and a revoked Grant stops working on the next command.
+  What is *not* built is the narrowing a permitted command then carries: a Grant
+  scoped to a kind, a type or a classification gates the command and does not yet
+  narrow what that command reaches. `DESCRIBE ACCESS` reports the same
+  granularity, because a half-built plane that does not say so is worse than an
+  absent one.
 - **`SEARCH`, in every mode.** No search index is built here. A keyword search
   over unsegmented text would silently disagree with the reference engine about
   which documents match, and a caller cannot tell a narrow index from a narrow
   world.
+
+A multi-tenant host authenticates its callers by overriding
+`KipDatabase.authenticate`, which returns the identity the *host observed* about
+the connection. It deliberately cannot be read off the request body: a request
+body is exactly what an Agent under prompt injection controls.
 
 The Rust engine is the reference for all of it, and
 `fixtures/kip-conformance-2.0/` is the shared acceptance suite both engines

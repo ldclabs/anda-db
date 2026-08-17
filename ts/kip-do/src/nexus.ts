@@ -13,9 +13,21 @@
  */
 
 import { errors, KipError } from './errors.js'
+import {
+  EffectiveAuthority,
+  principalClass,
+  requirePermitted,
+  resolveApproval,
+  spaceResource,
+  systemAuth,
+  type AuthContext,
+  type Authorization,
+  type Permission,
+} from './governance/index.js'
+import { kmlPermissions, kqlPermissions, metaPermissions } from './governance/gate.js'
 import type { Json, JsonMap } from './json.js'
 import { parseKip } from './kip/parser.js'
-import type { Command, KmlStatement } from './kip/ast.js'
+import type { Command, KmlStatement, KqlQuery } from './kip/ast.js'
 import { executeKml, type KmlContext } from './kml/index.js'
 import { executeKql, type KqlContext } from './kql/index.js'
 import { executeMeta, type MetaContext } from './meta/index.js'
@@ -87,6 +99,17 @@ export class CognitiveNexus {
       // enforce and a surviving `pending` row would be invisible rather than
       // obviously wrong.
       store.sweepPending()
+      // Default deny would lock an embedded host out of its own database, so
+      // the system Principal exists and owns the default Space. That is not a
+      // bypass: the in-process host runs with owner authority *through* the
+      // authorization path, so a Space whose policy denies something denies it
+      // here too (§212).
+      store.governance.ensurePrincipal({
+        principal_id: SYSTEM_PRINCIPAL,
+        principal_class: principalClass.SYSTEM,
+        display_name: 'the engine itself',
+        auth_provider: 'engine',
+      })
       if (store.space(space) === null) nexus.registerSpace(space)
       if (options.installBundled !== false) {
         for (const artifact of [CORE_PACKAGE, ...BUNDLED_PACKAGES]) {
@@ -215,6 +238,33 @@ export class CognitiveNexus {
     return out
   }
 
+  /**
+   * One authenticated caller's view of this Nexus.
+   *
+   * This is what a multi-tenant host executes through: it authenticates the
+   * caller itself, builds an {@link AuthContext} from what it *observed*, and
+   * every command run here is authorized against the control plane before it
+   * touches anything.
+   *
+   * A session holds identity, not authority. Authority is resolved from the
+   * control plane on each request, so a session that has been running since
+   * January does not still hold what January's Grants said (§188, §245).
+   */
+  session(auth: AuthContext): Session {
+    return new Session(this, auth)
+  }
+
+  /**
+   * A session running as the engine itself.
+   *
+   * The embedded case: one object, one owner, and the object *is* the owner. A
+   * host serving more than one caller must not use this — authenticate and go
+   * through {@link CognitiveNexus.session}, or every caller is the owner.
+   */
+  systemSession(): Session {
+    return this.session(systemAuth())
+  }
+
   /** Parses and runs one KML statement, returning its receipt. */
   execute(command: string, params: JsonMap = {}): Outcome {
     const parsed: Command = parseKip(command)
@@ -232,21 +282,7 @@ export class CognitiveNexus {
    * explicit: `PREVIEW KML` runs the real dry-run path, which writes nothing.
    */
   describe(command: string, params: JsonMap = {}): Json {
-    const parsed: Command = parseKip(command)
-    if (!('Meta' in parsed)) {
-      throw errors.languageMismatch('this command is not a META command')
-    }
-    const space = this.space
-    const cx: MetaContext = {
-      store: this.store,
-      space,
-      env: this.environment(space),
-      request: params,
-    }
-    // `PREVIEW KML` mints shells to allocate ids and then discards them, so it
-    // runs inside a transaction like any other mutation path — one that is
-    // simply never committed.
-    return this.storage.transactionSync(() => executeMeta(parsed.Meta, cx))
+    return this.systemSession().describe(command, params)
   }
 
   /**
@@ -256,30 +292,16 @@ export class CognitiveNexus {
    * can change underneath a query that has already started.
    */
   query(command: string, params: JsonMap = {}): Json[] {
-    const parsed: Command = parseKip(command)
-    if (!('Kql' in parsed)) {
-      throw errors.languageMismatch(
-        'this command is not a KQL query',
-      )
-    }
-    return this.find(parsed.Kql, params)
+    return this.systemSession().query(command, params)
   }
 
   /** Runs one parsed KQL query. */
   find(
-    query: Parameters<typeof executeKql>[0],
+    query: KqlQuery,
     params: JsonMap = {},
     options: Partial<KqlContext> = {},
   ): Json[] {
-    const space = options.space ?? this.space
-    const cx: KqlContext = {
-      store: this.store,
-      space,
-      env: this.environment(space),
-      request: params,
-      ...options,
-    }
-    return executeKql(query, cx)
+    return this.systemSession().find(query, params, options)
   }
 
   /** Runs one KML statement, all-or-nothing. */
@@ -288,18 +310,7 @@ export class CognitiveNexus {
     params: JsonMap = {},
     options: Partial<KmlContext> = {},
   ): Outcome {
-    const env = this.environment(options.space ?? this.space)
-    const cx: KmlContext = {
-      store: this.store,
-      space: options.space ?? this.space,
-      env,
-      origin: options.origin ?? { principal_id: SYSTEM_PRINCIPAL },
-      request: params,
-      ...options,
-    }
-    // The transaction boundary: a clause that throws unwinds everything this
-    // statement wrote, including the shells its handles were minted from.
-    return this.storage.transactionSync(() => executeKml(statement, cx))
+    return this.systemSession().mutate(statement, params, options)
   }
 
   /** Runs a command and returns the failure instead of throwing it. */
@@ -312,6 +323,19 @@ export class CognitiveNexus {
     } catch (err) {
       return { error: KipError.from(err) }
     }
+  }
+
+  /**
+   * Runs `body` inside the object's transaction.
+   *
+   * Exposed for {@link Session}, which owns the command paths but not the
+   * storage handle. The boundary is the platform's: a clause that throws
+   * unwinds everything the statement wrote, shells included.
+   *
+   * @internal
+   */
+  transact<T>(body: () => T): T {
+    return this.storage.transactionSync(body)
   }
 
   private registerSpace(space: string): void {
@@ -335,4 +359,207 @@ export class CognitiveNexus {
       policies: {} as Json as JsonMap,
     })
   }
+}
+
+/**
+ * One authenticated caller's view of a Nexus.
+ *
+ * Every command runs through {@link Session.gate} first, which asks whether this
+ * Principal may do this *here at all*. That is Space scope and deliberately so:
+ * at this point no element has been read, and reading one to decide whether it
+ * may be read would be the disclosure the check exists to prevent. Per-element
+ * authorization happens where the elements are.
+ *
+ * The session caches identity and nothing else. Authority is resolved from the
+ * control plane on every command, which is what makes a revocation take effect
+ * for a session that started before it (§188, §245).
+ */
+export class Session {
+  readonly nexus: CognitiveNexus
+  readonly auth: AuthContext
+
+  constructor(nexus: CognitiveNexus, auth: AuthContext) {
+    this.nexus = nexus
+    this.auth = auth
+  }
+
+  /** What this Principal may do in a Space, resolved fresh. */
+  effectiveAuthority(space = this.nexus.space): EffectiveAuthority {
+    return EffectiveAuthority.resolve(this.nexus.store, space, this.auth)
+  }
+
+  /** Parses and runs one KML statement, returning its receipt. */
+  execute(command: string, params: JsonMap = {}): Outcome {
+    const parsed: Command = parseKip(command)
+    if ('Kml' in parsed) return this.mutate(parsed.Kml, params)
+    throw errors.languageMismatch(
+      'this command is not a KML statement; a query has no receipt — use ' +
+        'query() for KQL and describe() for META',
+    )
+  }
+
+  /** Parses and runs one KQL query, returning the bare result array. */
+  query(command: string, params: JsonMap = {}): Json[] {
+    const parsed: Command = parseKip(command)
+    if (!('Kql' in parsed)) {
+      throw errors.languageMismatch('this command is not a KQL query')
+    }
+    return this.find(parsed.Kql, params)
+  }
+
+  /** Parses and runs one META command. */
+  describe(command: string, params: JsonMap = {}): Json {
+    const parsed: Command = parseKip(command)
+    if (!('Meta' in parsed)) {
+      throw errors.languageMismatch('this command is not a META command')
+    }
+    const space = this.nexus.space
+    const authority = this.effectiveAuthority(space)
+    this.gate(authority, metaPermissions(parsed.Meta))
+    const cx: MetaContext = {
+      store: this.nexus.store,
+      space,
+      env: this.nexus.environment(space),
+      request: params,
+      authority,
+      auth: this.auth,
+    }
+    // `PREVIEW KML` mints shells to allocate ids and then discards them, so it
+    // runs inside a transaction like any other mutation path — one that is
+    // simply never committed.
+    return this.nexus.transact(() => executeMeta(parsed.Meta, cx))
+  }
+
+  /** Runs one parsed KQL query. */
+  find(
+    query: KqlQuery,
+    params: JsonMap = {},
+    options: Partial<KqlContext> = {},
+  ): Json[] {
+    const space = options.space ?? this.nexus.space
+    const authority = this.effectiveAuthority(space)
+    this.gate(authority, kqlPermissions(query))
+    return executeKql(query, {
+      store: this.nexus.store,
+      space,
+      env: this.nexus.environment(space),
+      request: params,
+      ...options,
+    })
+  }
+
+  /** Runs one KML statement, all-or-nothing. */
+  mutate(
+    statement: KmlStatement,
+    params: JsonMap = {},
+    options: Partial<KmlContext> = {},
+  ): Outcome {
+    const space = options.space ?? this.nexus.space
+    const authority = this.effectiveAuthority(space)
+    this.gate(authority, kmlPermissions(statement))
+    const cx: KmlContext = {
+      store: this.nexus.store,
+      space,
+      env: this.nexus.environment(space),
+      // `_system.origin` records who the runtime *observed*, never what the
+      // content claimed (§26). It is the session's Principal, so an element
+      // written under a revoked identity stays attributable to it.
+      origin: options.origin ?? this.origin(),
+      request: params,
+      ...options,
+    }
+    return this.nexus.transact(() => executeKml(statement, cx))
+  }
+
+  /** Runs a command and returns the failure instead of throwing it. */
+  tryExecute(
+    command: string,
+    params: JsonMap = {},
+  ): { ok: Outcome } | { error: KipError } {
+    try {
+      return { ok: this.execute(command, params) }
+    } catch (err) {
+      return { error: KipError.from(err) }
+    }
+  }
+
+  /**
+   * Reads the Governance audit for a Space (§89, §172).
+   *
+   * Its own permission, because the audit says what everyone else did: a caller
+   * who may read a Space's cognition has not thereby earned the right to read
+   * who has been reading it.
+   */
+  readAudit(limit = 50, space = this.nexus.space) {
+    const authority = this.effectiveAuthority(space)
+    requirePermitted(authority.authorize('read_audit', spaceResource(), this.auth))
+    return this.nexus.store.governance.readAudit(space, limit)
+  }
+
+  /** The `_system.origin` this session stamps on what it writes. */
+  private origin(): JsonMap {
+    return {
+      principal_id: this.auth.principal_id,
+      ...(this.auth.client === '' ? {} : { channel: this.auth.client }),
+    }
+  }
+
+  /**
+   * Requires every permission a command asks for, at Space scope.
+   *
+   * A policy may require independent approval for a whole command family —
+   * declassification, elevation, export — and a satisfied approval is what turns
+   * that into an allow. An unsatisfied one stays a refusal: `require_approval`
+   * is not a soft yes (§40).
+   */
+  private gate(authority: EffectiveAuthority, needed: readonly Permission[]): void {
+    const space = authority.space.space_id
+    const resource = spaceResource()
+    for (const permission of needed) {
+      const decision = resolveApproval(
+        this.nexus.store,
+        space,
+        resource,
+        authority.authorize(permission, resource, this.auth),
+        this.auth,
+      )
+      if (!isPermittedDecision(decision)) {
+        this.audit(authority, decision)
+        requirePermitted(decision)
+      }
+      if (decision.obligations.audit) this.audit(authority, decision)
+    }
+  }
+
+  /**
+   * Writes one decision to the Governance audit.
+   *
+   * Best effort by design at this layer: a denial that could not be logged is
+   * still a denial, and failing the request a second time over the log would turn
+   * an audit outage into an availability outage. An obligation that genuinely
+   * must not proceed unlogged is the caller's to enforce (§184).
+   */
+  private audit(authority: EffectiveAuthority, decision: Authorization): void {
+    try {
+      this.nexus.store.governance.recordDecision({
+        at: nowTime(),
+        space_id: authority.space.space_id,
+        principal_id: this.auth.principal_id,
+        delegation_chain: [...this.auth.delegation_chain],
+        operation: decision.permission,
+        decision: decision.decision,
+        reason: decision.reason,
+        policy_id: decision.policy_id,
+        policy_version: decision.policy_version,
+        authorities_used: [...decision.authorities_used],
+      })
+    } catch {
+      // See above: an audit failure does not become a second failure mode.
+    }
+  }
+}
+
+/** Whether a decision lets the operation proceed. */
+function isPermittedDecision(decision: Authorization): boolean {
+  return decision.decision === 'allow' || decision.decision === 'allow_with_constraints'
 }

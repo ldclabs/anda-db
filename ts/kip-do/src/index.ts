@@ -86,8 +86,11 @@ export {
   CognitiveNexus,
   DEFAULT_SPACE,
   SYSTEM_PRINCIPAL,
+  Session,
   type NexusOptions,
 } from './nexus.js'
+
+export * from './governance/index.js'
 
 export {
   Transaction,

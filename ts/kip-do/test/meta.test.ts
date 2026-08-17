@@ -47,7 +47,11 @@ describe('META', () => {
       }
       expect(report.kip).toBe('2.0')
       const gaps = report.unsupported.map((entry) => entry.capability)
-      expect(gaps).toContain('governance')
+      // A partial capability names what is left rather than shrinking to one
+      // word: Governance is enforced at command scope, so the gaps that remain
+      // are the element-scope ones, and they are listed as themselves.
+      expect(gaps).toContain('element_scope_authorization')
+      expect(gaps).toContain('classification_enforcement')
       expect(gaps).toContain('search')
       expect(gaps).toContain('historical_read')
       expect(gaps).toContain('capsule_import')
@@ -211,13 +215,10 @@ describe('META', () => {
 
   it('refuses rather than answering emptily where an empty answer is a judgement', async () => {
     await withNexus('refusals', (nexus) => {
-      // "Nothing is trusted" and "you may do nothing" are judgements. An
-      // absent subsystem is not one.
+      // "Nothing is trusted" is a judgement. An absent subsystem is not one, so
+      // the trust report refuses instead of answering emptily.
       expect(() => nexus.describe('DESCRIBE TRUST')).toThrowError(
         /would read as a judgement that nothing is trusted/,
-      )
-      expect(() => nexus.describe('DESCRIBE ACCESS')).toThrowError(
-        /would read as a judgement that the caller may do nothing/,
       )
       // A token that promises a coordinate can be read back is not issued
       // while nothing can read one back.

@@ -16,6 +16,12 @@ import { DurableObject } from 'cloudflare:workers'
 import { KipError, type KipErrorJSON } from './errors.js'
 import type { Json, JsonMap } from './json.js'
 import { parseKip } from './kip/parser.js'
+import {
+  mergeRequestContext,
+  systemAuth,
+  type AuthContext,
+  type RequestContext,
+} from './governance/index.js'
 import { CognitiveNexus, type NexusOptions } from './nexus.js'
 import {
   BUNDLED_PACKAGES,
@@ -72,22 +78,47 @@ export class KipDatabase<Env = KipDatabaseEnv> extends DurableObject<Env> {
   }
 
   /**
+   * The identity one request runs as.
+   *
+   * The default is the engine itself, which owns the default Space — the
+   * embedded case, where the object *is* the owner. A multi-tenant host
+   * overrides this: it authenticates the caller from what it observed about the
+   * connection and returns that Principal, and every command then gets exactly
+   * what the caller's Grants say.
+   *
+   * `context` is the envelope's non-authoritative block, and it is passed for
+   * one reason: a caller may *narrow* its session with a declared purpose and can
+   * never widen it (§12). Identity, authentication strength and delegation are
+   * the host's to decide — an override that read `principal_id` off the request
+   * body would make the whole plane decorative, because a request body is
+   * exactly what an Agent under prompt injection controls.
+   */
+  protected authenticate(context: RequestContext | undefined): AuthContext {
+    return mergeRequestContext(systemAuth(), context)
+  }
+
+  /**
    * Runs one command, whichever language it is.
    *
    * The parsed semantics decide, never the caller's framing: a request that
    * calls its command a query and sends a mutation runs as the mutation it is,
    * or not at all.
    */
-  executeKip(command: string, params: JsonMap = {}): KipResult {
+  executeKip(
+    command: string,
+    params: JsonMap = {},
+    context?: RequestContext,
+  ): KipResult {
     try {
+      const session = this.nexus.session(this.authenticate(context))
       const parsed = parseKip(command)
       if ('Kml' in parsed) {
-        return { receipt: this.nexus.mutate(parsed.Kml, params) }
+        return { receipt: session.mutate(parsed.Kml, params) }
       }
       if ('Kql' in parsed) {
-        return { result: this.nexus.find(parsed.Kql, params) as Json }
+        return { result: session.find(parsed.Kql, params) as Json }
       }
-      return { result: this.nexus.describe(command, params) }
+      return { result: session.describe(command, params) }
     } catch (err) {
       return { error: KipError.from(err).toJSON() }
     }
@@ -100,12 +131,18 @@ export class KipDatabase<Env = KipDatabaseEnv> extends DurableObject<Env> {
    * "atomic"` would need one transaction across all of them, which this engine
    * does not have — so a request asking for it is refused rather than run as a
    * sequence that looks like one.
+   *
+   * The envelope's context is authenticated once and applies to every operation:
+   * a batch is one request, and letting operation two run as a different
+   * Principal from operation one would make the identity per-command state that
+   * a caller could vary.
    */
   executeKipBatch(
     commands: readonly { command: string; parameters?: JsonMap }[],
+    context?: RequestContext,
   ): KipResult[] {
     return commands.map((operation) =>
-      this.executeKip(operation.command, operation.parameters ?? {}),
+      this.executeKip(operation.command, operation.parameters ?? {}, context),
     )
   }
 
@@ -130,6 +167,7 @@ export class KipDatabase<Env = KipDatabaseEnv> extends DurableObject<Env> {
       kip?: string
       operations?: { command?: string; parameters?: JsonMap }[]
       execution?: { mode?: string }
+      context?: RequestContext
     }
     if (envelope.execution?.mode === 'atomic') {
       return this.envelope(
@@ -162,6 +200,7 @@ export class KipDatabase<Env = KipDatabaseEnv> extends DurableObject<Env> {
         command: operation.command ?? '',
         parameters: operation.parameters,
       })),
+      envelope.context,
     )
     return this.envelope({ results }, statusFor(results))
   }

@@ -18,6 +18,8 @@ export {
 export {
   State,
   TABLES,
+  classificationOf,
+  schemaRefOf,
   type ActivityRow,
   type AssertionRow,
   type ChangeEntry,

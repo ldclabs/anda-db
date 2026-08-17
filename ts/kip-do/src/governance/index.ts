@@ -26,6 +26,38 @@ export {
 } from './lattice.js'
 
 export {
+  anonymousAuth,
+  effectivePurpose,
+  isAuthenticated,
+  mergeRequestContext,
+  principalAuth,
+  systemAuth,
+  type AuthContext,
+  type RequestContext,
+} from './auth.js'
+
+export {
+  EffectiveAuthority,
+  authorityCeiling,
+  isSpaceScope,
+  requirePermitted,
+  resourceOf,
+  resourceOfElement,
+  spaceResource,
+  type Authorization,
+  type ResourceContext,
+} from './decision.js'
+
+export { resolveApproval, subjectDigest } from './approval.js'
+
+export {
+  clausePermissions,
+  kmlPermissions,
+  kqlPermissions,
+  metaPermissions,
+} from './gate.js'
+
+export {
   ALL_PERMISSIONS,
   PERMISSIONS,
   describePermission,

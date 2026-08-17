@@ -103,16 +103,56 @@ export function capabilities(): Json {
         retention: 'unbounded: every element version is kept',
         available_through: ['HISTORY ELEMENT', 'HISTORY SPACE', 'CHANGES'],
       },
+      governance: {
+        // The granularity is named rather than implied. A caller that reads
+        // "governance: yes" and assumes its classification-scoped Grant narrows
+        // what a query returns has been misled by this document, which is worse
+        // than being told the plane is absent.
+        enforced: 'command scope',
+        meaning:
+          'every KQL, KML and META command is authorized against the control ' +
+          'plane before it runs; what a permitted command then reaches is not ' +
+          'yet narrowed per element',
+        records: [
+          'Principals and Principal groups',
+          'ActorBindings',
+          'Grants and Delegations',
+          'Governance Policy versions',
+          'Approvals',
+        ],
+        resolution:
+          'explicit deny, then the least restrictive matching allow — owner, ' +
+          'Grant, Delegation or Policy statement — then default deny',
+        revocation: 'resolved per command, so a session does not outlive it',
+        reports: ['DESCRIBE ACCESS', 'DESCRIBE EXECUTION CONTEXT'],
+        audit:
+          'every control-plane mutation, plus every decision §172 or a policy ' +
+          'obligation asks to record',
+      },
       grammar: { parser: parserVersion(), spec_revision: specRevision() },
     },
     unsupported: [
       {
-        capability: 'governance',
-        detail: 'Principals, Grants, classification, DESCRIBE ACCESS',
+        capability: 'element_scope_authorization',
+        detail:
+          'per-element read visibility, field masks, classification ceilings ' +
+          'and the per-element checks a write performs',
         reason:
-          'there is no control plane in this engine yet, so every caller has ' +
-          'the same authority. A half-built Governance plane is worse than an ' +
-          'absent one, because it looks like it is enforcing something',
+          'authorization resolves at command scope only. A Grant narrowed to a ' +
+          'kind, a type or a classification gates the command and does not yet ' +
+          'narrow what that command reaches, so such a Grant is more permissive ' +
+          'in practice than it reads. DESCRIBE ACCESS reports the same ' +
+          'granularity rather than letting a caller infer a narrower one',
+      },
+      {
+        capability: 'classification_enforcement',
+        detail:
+          'classify / declassify, influence-authority elevation, quarantine, ' +
+          'and the upward join of a derived element’s classification',
+        reason:
+          'the lattice and the Space default exist and nothing writes a label ' +
+          'or reads one for a decision yet. `authority_lineage` is recorded at ' +
+          'commit — that is a record, not an enforcement',
       },
       {
         capability: 'set_retention',

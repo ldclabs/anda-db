@@ -4,7 +4,15 @@
   "compatibility_date": "2025-01-01",
   "compatibility_flags": ["nodejs_compat"],
   "durable_objects": {
-    "bindings": [{ "name": "KIP_DB", "class_name": "TestKipDatabase" }]
+    "bindings": [
+      { "name": "KIP_DB", "class_name": "TestKipDatabase" },
+      { "name": "KIP_TENANT_DB", "class_name": "TenantKipDatabase" }
+    ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["TestKipDatabase"] }]
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["TestKipDatabase", "TenantKipDatabase"]
+    }
+  ]
 }

@@ -268,6 +268,42 @@ export type Element =
   | { kind: 'Evidence'; row: EvidenceRow }
   | { kind: 'Activity'; row: ActivityRow }
 
+/**
+ * The classification label this element carries, if it carries one.
+ *
+ * Empty means the element states none, which is **not** `public`: the Space's
+ * default applies instead (§95). Resolving that default is the authorization
+ * layer's job, because only it knows which Space the read is running in.
+ */
+export function classificationOf(element: Element): string {
+  const label = element.row.governance.classification
+  return typeof label === 'string' ? label : ''
+}
+
+/**
+ * The exact Schema symbol this element is typed by, where it has one.
+ *
+ * A Proposition's predicate and an Evidence record's class play the same role
+ * for authorization — they are what a Grant scoped to a schema reference is
+ * scoped to — so they answer here rather than forcing every caller to match on
+ * the kind first. An Assertion is typed by the Proposition it is about, not by a
+ * symbol of its own, so it answers with nothing.
+ */
+export function schemaRefOf(element: Element): string {
+  switch (element.kind) {
+    case 'Concept':
+      return element.row.schema_ref
+    case 'Proposition':
+      return element.row.predicate_ref
+    case 'Evidence':
+      return element.row.evidence_class
+    case 'Activity':
+      return element.row.activity_class
+    case 'Assertion':
+      return ''
+  }
+}
+
 /** The SQL table each Core kind lives in. */
 export const TABLES: Readonly<Record<ElementKind, string>> = {
   Concept: 'concepts',
