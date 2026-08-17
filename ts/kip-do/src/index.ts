@@ -1,28 +1,39 @@
 /**
- * `@ldclabs/kip-do` — a KIP knowledge graph on SQLite-backed Durable Objects.
+ * `@ldclabs/kip-do` — a KIP 2.0 knowledge graph on SQLite-backed Durable
+ * Objects. One Cognitive Nexus per Durable Object.
  *
- * One KIP database per Durable Object. See README.md for deployment and for
- * the list of known divergences from the Rust reference engine.
+ * The engine is being rebuilt for KIP 2.0. The 1.x executor was deleted rather
+ * than ported: 2.0 is a different data model — a Proposition existing is not
+ * the Proposition being true — and a renamed 1.x engine would have been a
+ * worse lie than an absent one. It is recoverable from the branch history.
+ *
+ * What is exported here is what exists. As each stage lands, its surface
+ * joins this list; nothing is re-exported ahead of the code that implements it.
  */
-
-export { KipDatabase, type KipDatabaseEnv } from './durable-object.js'
-export {
-  CognitiveNexus,
-  normalizeScore,
-  parseOffsetCursor,
-  type KipResponse,
-  type NexusOptions,
-  type TransactionRunner,
-} from './nexus.js'
 
 export {
   KipError,
   KIP_ERROR_CODES,
-  KIP_ERROR_HINTS,
-  KIP_ERROR_NAMES,
+  KIP_ERROR_REGISTRY,
+  errors,
+  type ErrorFactories,
+  type KipErrorCategory,
   type KipErrorCode,
   type KipErrorJSON,
+  type KipErrorSpec,
+  type KipRetryClass,
+  type RetryInfo,
 } from './errors.js'
+
+export {
+  canonicalJson,
+  isJsonArray,
+  isJsonMap,
+  jsonEquals,
+  parseJson,
+  type Json,
+  type JsonMap,
+} from './json.js'
 
 export {
   parseKip,
@@ -32,24 +43,6 @@ export {
   specRevision,
 } from './kip/parser.js'
 export type * from './kip/ast.js'
-
-export {
-  compareEntityID,
-  conceptID,
-  conceptNode,
-  formatEntityID,
-  parseEntityID,
-  propositionID,
-  propositionLink,
-  tryParseEntityID,
-  type Concept,
-  type ConceptID,
-  type EntityID,
-  type JsonMap,
-  type LinkProperties,
-  type Proposition,
-  type PropositionID,
-} from './entity.js'
 
 export {
   AlinkTokenizer,
@@ -62,18 +55,11 @@ export {
 } from './tokenizer.js'
 
 export {
-  SCHEMA_STATEMENTS,
-  SCHEMA_VERSION,
-  applySchema,
-  metaGet,
-  metaSet,
-} from './schema.js'
-
-export { Store } from './store.js'
-export {
   MAX_BOUND_PARAMS,
   MAX_VALUE_BYTES,
   checkParamCount,
   checkValueSize,
+  encodeJson,
+  ftsQuote,
   idSet,
 } from './sql.js'

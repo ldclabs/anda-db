@@ -27,28 +27,45 @@ import {
   PARSER_VERSION,
 } from '@ldclabs/kip-lang'
 import type { Program } from '@ldclabs/kip-lang'
-import { KipError, internalError } from '../errors.js'
+import { KipError, errors, type KipErrorCode } from '../errors.js'
 import type { Command } from './ast.js'
+
+/**
+ * The parse-time codes kip-lang reports, in this engine's registry.
+ *
+ * The toolkit still spells its three codes the 1.x way (`KIP_1001` and
+ * friends) while KIP 2.0 replaced the numbers with stable names, so the
+ * translation has to happen somewhere. It happens here, at the boundary,
+ * rather than by teaching the rest of the engine two spellings — and an
+ * unrecognized code becomes `InvalidSyntax` rather than `InternalError`,
+ * because whatever it was, the command did not parse.
+ */
+const SYNTAX_CODES: Record<string, KipErrorCode> = {
+  KIP_1001: 'InvalidSyntax',
+  KIP_1002: 'InvalidIdentifier',
+  KIP_4002: 'ResourceExhausted',
+}
 
 /**
  * Turns whatever kip-lang reports into a `KipError`.
  *
  * `parse` accumulates diagnostics so an editor can keep showing a tree after a
  * mistake; an engine wants the opposite — the first thing that makes the
- * command unexecutable, with a code it can put on the wire. The `hint` comes
- * from this package's own generated taxonomy, so the agent-facing recovery
- * text is identical to what the Rust engine sends for the same code.
+ * command unexecutable, with a code it can put on the wire. The `hint` and
+ * `retry` class come from this package's own generated registry, so the
+ * agent-facing recovery contract is identical to what the Rust engine sends
+ * for the same code.
  */
 function toKipError(err: unknown): KipError {
   if (err instanceof KipSyntaxError) {
-    return new KipError(err.code, err.message)
+    return new KipError(SYNTAX_CODES[err.code] ?? 'InvalidSyntax', err.message)
   }
   // A diagnostic raised by `parseProgram` is already a `KipError`; re-wrapping
   // it would turn a syntax error into an InternalError and strip the code the
   // agent recovers from.
   if (err instanceof KipError) return err
-  if (err instanceof Error) return internalError(err.message)
-  return internalError(String(err))
+  if (err instanceof Error) return errors.internalError(err.message)
+  return errors.internalError(String(err))
 }
 
 /** Parses to a syntax tree, raising the first error diagnostic. */
@@ -60,7 +77,7 @@ function parseProgram(source: string): Program {
     const where = ` (line ${fatal.range.start.line + 1}, column ${
       fatal.range.start.column + 1
     })`
-    throw new KipError('KIP_1001', fatal.message + where)
+    throw errors.invalidSyntax(fatal.message + where)
   }
   return ast
 }

@@ -1,26 +1,19 @@
-import { KipDatabase, type KipResponse } from '../src/index.js'
+import { DurableObject } from 'cloudflare:workers'
 
 /**
- * Test harness object. Uses the package's default tokenizer (SimpleTokenizer)
- * so the suite has no external dependency; the Chinese-segmentation tests
- * inject a stub tokenizer instead.
+ * Test harness object.
+ *
+ * `wrangler.jsonc` names a SQLite-backed Durable Object class, and the workers
+ * test pool boots the whole Worker before it runs any file — including the
+ * parser tests, which touch no storage at all. So this class has to exist for
+ * the suite to start.
+ *
+ * It is a placeholder while the KIP 2.0 engine is being rebuilt: the 1.x
+ * `KipDatabase` was deleted with the rest of the 1.x executor, and the 2.0 one
+ * does not exist yet. The engine's own tests will replace this with the real
+ * class rather than adding a second one beside it.
  */
-export class TestKipDatabase extends KipDatabase {}
-
-/**
- * Calls the one RPC method used by tests without asking TypeScript to expand
- * Cloudflare's recursive Durable Object RPC mapped type over the whole class.
- */
-export function executeTestKip(
-  stub: DurableObjectStub<TestKipDatabase>,
-  command: string,
-): Promise<KipResponse> {
-  return (
-    stub as unknown as {
-      executeKip(command: string): Promise<KipResponse>
-    }
-  ).executeKip(command)
-}
+export class TestKipDatabase extends DurableObject {}
 
 export interface Env {
   KIP_DB: DurableObjectNamespace<TestKipDatabase>

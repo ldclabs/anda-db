@@ -2,3 +2,5 @@ allowBuilds:
   esbuild: true
   sharp: false
   workerd: true
+minimumReleaseAgeExclude:
+  - '@ldclabs/kip-lang@2.0.0'

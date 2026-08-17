@@ -13,7 +13,8 @@
  * grows past 100 matching rows, which is exactly the kind of bug that ships.
  */
 
-import { resourceExhausted } from './errors.js'
+import { errors } from './errors.js'
+import { canonicalJson } from './json.js'
 
 /** Durable Object SQLite: maximum bound parameters per query. */
 export const MAX_BOUND_PARAMS = 100
@@ -58,7 +59,7 @@ export function idSet(ids: Iterable<number | string>): string {
  */
 export function checkParamCount(count: number, context: string): void {
   if (count > MAX_BOUND_PARAMS) {
-    throw resourceExhausted(
+    throw errors.resourceExhausted(
       `${context} needs ${count} bound parameters but Durable Object SQLite ` +
         `allows ${MAX_BOUND_PARAMS}; batch the values through json_each() instead`,
     )
@@ -79,7 +80,7 @@ export function checkValueSize(value: string, what: string): string {
   if (value.length * 3 > MAX_VALUE_BYTES) {
     const bytes = new TextEncoder().encode(value).length
     if (bytes > MAX_VALUE_BYTES) {
-      throw resourceExhausted(
+      throw errors.resourceExhausted(
         `${what} is ${bytes} bytes, over the ${MAX_VALUE_BYTES}-byte limit ` +
           `for a single Durable Object SQLite value`,
       )
@@ -88,15 +89,9 @@ export function checkValueSize(value: string, what: string): string {
   return value
 }
 
-/** Serializes a JSON map for storage, size-checked. */
+/** Serializes a value for storage, size-checked and canonically ordered. */
 export function encodeJson(value: unknown, what: string): string {
-  return checkValueSize(JSON.stringify(value ?? {}), what)
-}
-
-/** Parses a stored JSON map, tolerating legacy nulls. */
-export function decodeJson<T = Record<string, unknown>>(raw: string | null): T {
-  if (!raw) return {} as T
-  return JSON.parse(raw) as T
+  return checkValueSize(canonicalJson(value ?? {}), what)
 }
 
 /**

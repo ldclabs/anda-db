@@ -4,10 +4,9 @@
  *
  * The oracle is only as good as what it is fed, so the corpus is harvested
  * from everything in the repository that already encodes what a KIP command
- * means: the cross-engine conformance fixtures, every KIP literal in the Rust
- * parser's and engine's own tests (which is where the negative cases live —
- * the malformed commands somebody once had to fix a bug for), and the bundled
- * schema capsules.
+ * means: the cross-engine conformance fixtures, and every KIP literal in the
+ * Rust parser's and engine's own tests — which is where the negative cases
+ * live, the malformed commands somebody once had to fix a bug for.
  *
  * Harvesting beats hand-writing here: a case added to the Rust tests joins the
  * TypeScript oracle on the next regeneration, with nobody remembering to do it.
@@ -24,8 +23,16 @@ const here = dirname(fileURLToPath(import.meta.url))
 const pkgRoot = dirname(here)
 const repoRoot = join(pkgRoot, '..', '..')
 
+/**
+ * What can begin a KIP 2.0 command.
+ *
+ * `SET` is qualified because it only starts a statement as `SET RETENTION`;
+ * bare `SET FIELDS { … }` is a clause fragment, and admitting it would fill
+ * the corpus with text that is *correctly* rejected by both parsers for a
+ * reason the comparison is not about.
+ */
 const STARTS_A_COMMAND =
-  /^\s*(FIND|UPSERT|UPDATE|MERGE|DELETE|DESCRIBE|SEARCH|EXPORT)\b/
+  /^\s*(FIND|MUTATE|CREATE|UPSERT|ENSURE|ASSERT|UPDATE|RETRACT|SUPERSEDE|CORRECT|TRANSITION|SET\s+RETENTION|ARCHIVE|TOMBSTONE|PURGE|MERGE|DESCRIBE|LIST|SEARCH|VERIFY|VALIDATE|PREVIEW|HISTORY|CHANGES|SNAPSHOT|EXPORT)\b/
 
 const commands = new Set()
 
@@ -41,31 +48,37 @@ function rustFiles(dir) {
 }
 
 for (const crate of ['anda_kip', 'anda_cognitive_nexus']) {
-  for (const file of rustFiles(join(repoRoot, 'rs', crate, 'src'))) {
-    const source = readFileSync(file, 'utf8')
-    // Raw strings hold the multi-line commands; ordinary literals hold the
-    // one-liners, mostly negative cases.
-    for (const m of source.matchAll(/r#"([\s\S]*?)"#/g)) {
-      if (STARTS_A_COMMAND.test(m[1])) commands.add(m[1].trim())
+  const root = join(repoRoot, 'rs', crate)
+  for (const dir of ['src', 'tests']) {
+    let files
+    try {
+      files = rustFiles(join(root, dir))
+    } catch {
+      continue
     }
-    for (const m of source.matchAll(/"((?:[^"\\]|\\.)*)"/g)) {
-      let text
-      try {
-        text = JSON.parse(`"${m[1]}"`)
-      } catch {
-        continue
+    for (const file of files) {
+      const source = readFileSync(file, 'utf8')
+      // Raw strings hold the multi-line commands; ordinary literals hold the
+      // one-liners, mostly negative cases.
+      for (const m of source.matchAll(/r#"([\s\S]*?)"#/g)) {
+        if (STARTS_A_COMMAND.test(m[1])) commands.add(m[1].trim())
       }
-      if (text.length > 12 && STARTS_A_COMMAND.test(text)) commands.add(text.trim())
+      for (const m of source.matchAll(/"((?:[^"\\]|\\.)*)"/g)) {
+        let text
+        try {
+          text = JSON.parse(`"${m[1]}"`)
+        } catch {
+          continue
+        }
+        if (text.length > 12 && STARTS_A_COMMAND.test(text)) {
+          commands.add(text.trim())
+        }
+      }
     }
   }
 }
 
-const capsuleDir = join(repoRoot, 'rs', 'anda_kip', 'capsules')
-for (const name of readdirSync(capsuleDir).filter((f) => f.endsWith('.kip'))) {
-  commands.add(readFileSync(join(capsuleDir, name), 'utf8').trim())
-}
-
-const fixtureDir = join(repoRoot, 'fixtures', 'kip-conformance')
+const fixtureDir = join(repoRoot, 'fixtures', 'kip-conformance-2.0')
 for (const name of readdirSync(fixtureDir).filter((f) => f.endsWith('.json'))) {
   const fixture = JSON.parse(readFileSync(join(fixtureDir, name), 'utf8'))
   for (const setup of fixture.setup ?? []) commands.add(setup.trim())
@@ -80,8 +93,8 @@ const out = `/**
  * Differential corpus — GENERATED FILE, DO NOT EDIT.
  *
  * Regenerate with \`pnpm run codegen:oracle-corpus\`.
- * Sources: rs/anda_kip and rs/anda_cognitive_nexus tests, the bundled
- * capsules, and fixtures/kip-conformance.
+ * Sources: the \`rs/anda_kip\` and \`rs/anda_cognitive_nexus\` sources and
+ * tests, and fixtures/kip-conformance-2.0.
  */
 
 const CORPUS: readonly string[] = [
