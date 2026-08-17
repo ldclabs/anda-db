@@ -533,6 +533,14 @@ impl EffectiveAuthority {
             .any(|binding| binding.actor_key == actor_key)
     }
 
+    /// The class of binding this Principal holds to an actor, if any.
+    pub fn binding_class(&self, actor_key: &str) -> Option<&str> {
+        self.bindings
+            .iter()
+            .find(|binding| binding.actor_key == actor_key)
+            .map(|binding| binding.binding_class.as_str())
+    }
+
     /// How well a claim attributed to this actor is attributable (§16).
     pub fn attribution_assurance(&self, actor_key: &str) -> &'static str {
         match self

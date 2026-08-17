@@ -140,9 +140,7 @@ async fn capabilities_report_the_gaps_as_data_not_as_errors() {
         "semantic_search",
         "trust_model",
         "trust_governance",
-        // Command and element scope are both enforced now; retention is the
-        // element member a write can still set without asking.
-        "protected_retention_fields",
+        "legal_hold",
         "capsule_import_modes",
         "capsule_signatures",
     ] {

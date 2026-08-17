@@ -216,7 +216,14 @@ pub struct ActorBindingRow {
     pub _id: u64,
     /// The Principal side of the binding.
     pub principal_id: String,
-    /// The semantic actor: an element reference or a canonical identity.
+    /// The semantic actor as the caller named it: an element id or a canonical
+    /// identity. Kept verbatim so a report can show what was configured.
+    pub actor_ref: String,
+    /// The same actor as an endpoint key.
+    ///
+    /// Normalized on write, because this is what it is compared against:
+    /// `Assertion.asserted_by_key` is an endpoint key, and a binding stored in
+    /// any other spelling would silently never match.
     pub actor_key: String,
     /// One of [`binding_class`].
     pub binding_class: String,

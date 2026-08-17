@@ -484,7 +484,8 @@ impl GovernanceStore {
         let row = ActorBindingRow {
             _id: 0,
             principal_id: draft.principal_id,
-            actor_key: draft.actor_key,
+            actor_key: actor_key(&draft.actor_key),
+            actor_ref: draft.actor_key,
             binding_class: draft.binding_class,
             assurance: draft.assurance,
             scope: draft.scope,
@@ -1206,6 +1207,19 @@ pub struct ApprovalDraft {
     pub allow_self_approval: bool,
     /// When the approval stops being usable; empty for no expiry.
     pub expires_at: String,
+}
+
+/// Normalizes an actor reference into the endpoint key it is compared against.
+///
+/// A local element id becomes the local endpoint key; anything else is treated
+/// as a canonical identity. The alternative — storing what the caller typed —
+/// makes a binding that looks right and matches nothing, which is the worst
+/// possible failure for a record whose whole job is to be found.
+fn actor_key(reference: &str) -> String {
+    match reference.parse::<crate::id::ElementId>() {
+        Ok(id) => crate::term::Endpoint::Local(id).key(),
+        Err(_) => crate::term::Endpoint::Canonical(reference.to_string()).key(),
+    }
 }
 
 /// Serializes any value into the `Json` a row column holds.

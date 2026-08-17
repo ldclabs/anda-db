@@ -1870,3 +1870,434 @@ async fn an_export_carries_only_what_the_caller_could_read() {
     let names: Vec<&str> = concepts.iter().filter_map(|c| c["name"].as_str()).collect();
     assert_eq!(names, vec!["Public Note"]);
 }
+
+// ---------------------------------------------------------------------------
+// The write path, element by element
+// ---------------------------------------------------------------------------
+
+async fn grant(nexus: &CognitiveNexus, principal: &str, actions: &[&str], scope: AuthorityScope) {
+    nexus
+        .governance()
+        .create_grant(
+            GrantDraft {
+                space_id: DEFAULT_SPACE.into(),
+                grantee_principal: principal.to_string(),
+                actions: actions.iter().map(|a| a.to_string()).collect(),
+                scope,
+                ..Default::default()
+            },
+            SYSTEM_PRINCIPAL,
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_grant_scoped_to_one_kind_does_not_create_another() {
+    // The command gate said "may create here". Only the element check can say
+    // "may create *that*", and a Grant that named one kind meant one kind.
+    let nexus = stocked("create_scope").await;
+    let writer = agent(nexus.governance(), "kip:principal:writer").await;
+    grant(
+        &nexus,
+        &writer,
+        &["read", "create"],
+        AuthorityScope {
+            kinds: vec!["concept".into()],
+            ..Default::default()
+        },
+    )
+    .await;
+    let session = nexus.session(AuthContext::principal(&writer));
+
+    assert_eq!(
+        run_as(
+            &session,
+            r#"CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }"#
+        )
+        .await
+        .status,
+        TopLevelStatus::Succeeded
+    );
+    let evidence = run_as(
+        &session,
+        r#"CREATE EVIDENCE ?e { SET FIELDS {evidence_class: "Document", payload: "x"} }"#,
+    )
+    .await;
+    assert_eq!(error_code(&evidence), "NotAuthorized");
+}
+
+#[tokio::test]
+async fn a_sweep_refuses_what_it_may_not_touch_rather_than_doing_less() {
+    // A mutation that reported success for work it did not do is the failure
+    // this engine keeps finding: accepted, then quietly dropped.
+    let nexus = stocked("sweep_scope").await;
+    let owner = nexus.system_session();
+    run_as(
+        &owner,
+        r#"CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }"#,
+    )
+    .await;
+    run_as(
+        &owner,
+        r#"CREATE EVIDENCE ?e { SET FIELDS {evidence_class: "Document", payload: "x"} }"#,
+    )
+    .await;
+
+    let keeper = agent(nexus.governance(), "kip:principal:keeper").await;
+    // Reading is unrestricted, so the sweep really does find the Evidence; it
+    // is archiving that stops at Concepts.
+    grant(&nexus, &keeper, &["read"], AuthorityScope::default()).await;
+    grant(
+        &nexus,
+        &keeper,
+        &["archive"],
+        AuthorityScope {
+            kinds: vec!["concept".into()],
+            ..Default::default()
+        },
+    )
+    .await;
+    let session = nexus.session(AuthContext::principal(&keeper));
+
+    assert_eq!(
+        run_as(
+            &session,
+            r#"ARCHIVE ?c WHERE { ?c CONCEPT {type: "Person"} }"#
+        )
+        .await
+        .status,
+        TopLevelStatus::Succeeded
+    );
+    let overreach = run_as(&session, r#"ARCHIVE ?e WHERE { ?e EVIDENCE {} }"#).await;
+    assert_eq!(error_code(&overreach), "NotAuthorized");
+
+    // And the Evidence really is still active, so the refusal was not partial.
+    let still_there = run_as(&owner, r#"FIND(?e) WHERE { ?e EVIDENCE {} }"#).await;
+    assert_eq!(
+        still_there
+            .first_result()
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn setting_retention_in_a_create_asks_what_set_retention_asks() {
+    // Otherwise the clause that checks is the one nobody uses.
+    let nexus = stocked("retention_protection").await;
+    let writer = agent(nexus.governance(), "kip:principal:writer").await;
+    grant(
+        &nexus,
+        &writer,
+        &["read", "create"],
+        AuthorityScope::default(),
+    )
+    .await;
+    let session = nexus.session(AuthContext::principal(&writer));
+
+    let smuggled = run_as(
+        &session,
+        r#"CREATE CONCEPT ?c { TYPE "Person" NAME "Alice"
+           SET FIELDS {retention: {expires_at: "2030-01-01T00:00:00Z"}} }"#,
+    )
+    .await;
+    assert_eq!(error_code(&smuggled), "NotAuthorized");
+    assert!(
+        smuggled
+            .error
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("manage_retention")
+    );
+
+    let custodian = agent(nexus.governance(), "kip:principal:custodian").await;
+    grant(
+        &nexus,
+        &custodian,
+        &["read", "create", "manage_retention"],
+        AuthorityScope::default(),
+    )
+    .await;
+    assert_eq!(
+        run_as(
+            &nexus.session(AuthContext::principal(&custodian)),
+            r#"CREATE CONCEPT ?c { TYPE "Person" NAME "Alice"
+               SET FIELDS {retention: {expires_at: "2030-01-01T00:00:00Z"}} }"#,
+        )
+        .await
+        .status,
+        TopLevelStatus::Succeeded
+    );
+}
+
+/// Creates Alice and a Proposition about her, returning the Proposition id.
+async fn alice_prefers(nexus: &CognitiveNexus) -> String {
+    let owner = nexus.system_session();
+    let response = run_as(
+        &owner,
+        r#"MUTATE {
+            CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
+            CREATE CONCEPT ?dark { TYPE "Person" NAME "Dark Mode" }
+            ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
+        }"#,
+    )
+    .await;
+    assert_eq!(response.status, TopLevelStatus::Succeeded);
+    "P-1".to_string()
+}
+
+#[tokio::test]
+async fn recording_another_actors_claim_is_not_impersonating_them() {
+    // §17, and the §239 fixture. A Formation Agent that heard Alice say
+    // something must be able to store it as Alice's claim — and must not
+    // thereby be able to act as Alice.
+    let nexus = stocked("attribution").await;
+    let proposition = alice_prefers(&nexus).await;
+
+    let formation = agent(nexus.governance(), "kip:principal:formation-agent").await;
+    grant(
+        &nexus,
+        &formation,
+        &["read", "create", "assert"],
+        AuthorityScope::default(),
+    )
+    .await;
+    let session = nexus.session(AuthContext::principal(&formation));
+
+    let command = format!(
+        r#"CREATE ASSERTION ?a {{ SET FIELDS {{proposition: "{proposition}",
+           asserted_by: {{id: "C-1"}}, stance: "support", mode: "stated", confidence: 0.9}} }}"#
+    );
+    let refused = run_as(&session, &command).await;
+    assert_eq!(error_code(&refused), "NotAuthorized");
+    assert!(
+        refused
+            .error
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("record_attributed_assertion"),
+        "the denial names the permission recording actually needs"
+    );
+
+    let recorder = agent(nexus.governance(), "kip:principal:recorder").await;
+    grant(
+        &nexus,
+        &recorder,
+        &["read", "create", "assert", "record_attributed_assertion"],
+        AuthorityScope::default(),
+    )
+    .await;
+    assert_eq!(
+        run_as(&nexus.session(AuthContext::principal(&recorder)), &command)
+            .await
+            .status,
+        TopLevelStatus::Succeeded
+    );
+}
+
+#[tokio::test]
+async fn speaking_as_a_represented_actor_is_a_stronger_permission() {
+    // §18: `assert_as_actor` is more privileged than recording. The engine
+    // tells them apart by what Governance says about the writer, never by what
+    // the command claims.
+    let nexus = stocked("representation").await;
+    let proposition = alice_prefers(&nexus).await;
+    let assistant = agent(nexus.governance(), "kip:principal:assistant").await;
+    nexus
+        .governance()
+        .create_binding(
+            ActorBindingDraft {
+                principal_id: assistant.clone(),
+                actor_key: "C-1".into(),
+                binding_class: binding_class::REPRESENTS.into(),
+                assurance: assurance::VERIFIED.into(),
+                scope: DEFAULT_SPACE.into(),
+            },
+            SYSTEM_PRINCIPAL,
+        )
+        .await
+        .unwrap();
+    grant(
+        &nexus,
+        &assistant,
+        // Deliberately holds `record_attributed_assertion` and not
+        // `assert_as_actor`: being bound to the actor is what makes this the
+        // stronger operation, so the weaker permission must not cover it.
+        &["read", "create", "assert", "record_attributed_assertion"],
+        AuthorityScope::default(),
+    )
+    .await;
+    let session = nexus.session(AuthContext::principal(&assistant));
+
+    let command = format!(
+        r#"CREATE ASSERTION ?a {{ SET FIELDS {{proposition: "{proposition}",
+           asserted_by: {{id: "C-1"}}, stance: "support", mode: "stated", confidence: 0.9}} }}"#
+    );
+    let refused = run_as(&session, &command).await;
+    assert_eq!(error_code(&refused), "NotAuthorized");
+    assert!(
+        refused
+            .error
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("assert_as_actor")
+    );
+}
+
+#[tokio::test]
+async fn a_self_binding_only_needs_assert() {
+    let nexus = stocked("self_binding").await;
+    let proposition = alice_prefers(&nexus).await;
+    let alice = agent(nexus.governance(), "kip:principal:alice").await;
+    nexus
+        .governance()
+        .create_binding(
+            ActorBindingDraft {
+                principal_id: alice.clone(),
+                actor_key: "C-1".into(),
+                binding_class: binding_class::SELF.into(),
+                assurance: assurance::VERIFIED.into(),
+                scope: DEFAULT_SPACE.into(),
+            },
+            SYSTEM_PRINCIPAL,
+        )
+        .await
+        .unwrap();
+    grant(
+        &nexus,
+        &alice,
+        &["read", "create", "assert"],
+        AuthorityScope::default(),
+    )
+    .await;
+
+    let command = format!(
+        r#"CREATE ASSERTION ?a {{ SET FIELDS {{proposition: "{proposition}",
+           asserted_by: {{id: "C-1"}}, stance: "support", mode: "stated", confidence: 0.9}} }}"#
+    );
+    assert_eq!(
+        run_as(&nexus.session(AuthContext::principal(&alice)), &command)
+            .await
+            .status,
+        TopLevelStatus::Succeeded,
+        "asserting one's own commitment needs nothing more"
+    );
+}
+
+#[tokio::test]
+async fn a_moderator_may_remove_a_claim_but_not_say_the_source_withdrew_it() {
+    // The §240 fixture, and §68. Administrative exclusion is honest; a
+    // manufactured retraction is the engine reporting an event that never
+    // happened.
+    let nexus = stocked("retraction_honesty").await;
+    let proposition = alice_prefers(&nexus).await;
+    let author = agent(nexus.governance(), "kip:principal:author").await;
+    grant(
+        &nexus,
+        &author,
+        &[
+            "read",
+            "create",
+            "assert",
+            "record_attributed_assertion",
+            "retract_own",
+        ],
+        AuthorityScope::default(),
+    )
+    .await;
+    let written = run_as(
+        &nexus.session(AuthContext::principal(&author)),
+        &format!(
+            r#"CREATE ASSERTION ?a {{ SET FIELDS {{proposition: "{proposition}",
+               asserted_by: {{id: "C-1"}}, stance: "support", mode: "stated", confidence: 0.9}} }}"#
+        ),
+    )
+    .await;
+    assert_eq!(written.status, TopLevelStatus::Succeeded);
+
+    let moderator = agent(nexus.governance(), "kip:principal:moderator").await;
+    grant(
+        &nexus,
+        &moderator,
+        &["read", "retract_own", "archive", "moderate_assertion"],
+        AuthorityScope::default(),
+    )
+    .await;
+    let session = nexus.session(AuthContext::principal(&moderator));
+
+    let manufactured = run_as(&session, r#"RETRACT ASSERTION "A-1""#).await;
+    assert_eq!(error_code(&manufactured), "RetractionNotAuthorized");
+    let message = &manufactured.error.as_ref().unwrap().message;
+    assert!(message.contains("ARCHIVE") && message.contains("TOMBSTONE"));
+
+    // The author, who wrote it, may withdraw their own record.
+    let own = run_as(
+        &nexus.session(AuthContext::principal(&author)),
+        r#"RETRACT ASSERTION "A-1""#,
+    )
+    .await;
+    assert_eq!(own.status, TopLevelStatus::Succeeded, "{:?}", own.error);
+
+    // And what the moderator may do instead says what it means: removal from
+    // recall, with no claim about the source.
+    assert_eq!(
+        run_as(&session, r#"ARCHIVE "A-1""#).await.status,
+        TopLevelStatus::Succeeded
+    );
+}
+
+#[tokio::test]
+async fn representing_the_actor_is_the_other_way_to_withdraw_a_claim() {
+    let nexus = stocked("retraction_representation").await;
+    let proposition = alice_prefers(&nexus).await;
+    run_as(
+        &nexus.system_session(),
+        &format!(
+            r#"CREATE ASSERTION ?a {{ SET FIELDS {{proposition: "{proposition}",
+               asserted_by: {{id: "C-1"}}, stance: "support", mode: "stated", confidence: 0.9}} }}"#
+        ),
+    )
+    .await;
+
+    let agent_for_alice = agent(nexus.governance(), "kip:principal:alice-agent").await;
+    grant(
+        &nexus,
+        &agent_for_alice,
+        &["read", "retract_own"],
+        AuthorityScope::default(),
+    )
+    .await;
+    let session = nexus.session(AuthContext::principal(&agent_for_alice));
+    assert_eq!(
+        error_code(&run_as(&session, r#"RETRACT ASSERTION "A-1""#).await),
+        "RetractionNotAuthorized",
+        "no binding, and it did not write the claim"
+    );
+
+    nexus
+        .governance()
+        .create_binding(
+            ActorBindingDraft {
+                principal_id: agent_for_alice.clone(),
+                actor_key: "C-1".into(),
+                binding_class: binding_class::REPRESENTS.into(),
+                assurance: assurance::VERIFIED.into(),
+                scope: DEFAULT_SPACE.into(),
+            },
+            SYSTEM_PRINCIPAL,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        run_as(&session, r#"RETRACT ASSERTION "A-1""#).await.status,
+        TopLevelStatus::Succeeded,
+        "representation authority is the other way to hold this"
+    );
+}

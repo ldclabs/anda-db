@@ -32,16 +32,56 @@
 use anda_kip::{ElementRef, KipError, Scalar, WhereClause};
 
 use super::value::Bindings;
+use crate::governance::Permission;
 use crate::id::ElementId;
 use crate::kql;
 use crate::store::Store;
 use crate::tx::Transaction;
 
 /// The elements one clause will act on, ascending by id.
+///
+/// The ids are private and reachable only through [`Targets::authorized`],
+/// which is the whole point of the type: a clause cannot mutate an element it
+/// forgot to authorize, because it cannot get at the id without asking. The
+/// two-step shape exists because resolving borrows the transaction and
+/// authorizing mutates it, and collapsing them would only be possible by
+/// letting the ids out first.
+#[must_use = "targets have to be authorized before a clause may act on them"]
 pub struct Targets {
-    /// The elements themselves. Empty is an ordinary outcome: a sweep whose
-    /// block matched nothing changes nothing.
-    pub ids: Vec<ElementId>,
+    ids: Vec<ElementId>,
+    permission: Permission,
+}
+
+impl Targets {
+    /// The elements this clause may act on, ascending by id.
+    ///
+    /// Every target — whether the caller named it or a sweep found it — is
+    /// authorized individually. A sweep does not silently skip what it may not
+    /// touch: a mutation reporting success for work it did not do is the
+    /// "accepted, then quietly dropped" failure this engine keeps finding.
+    ///
+    /// Empty is an ordinary outcome: a sweep whose block matched nothing
+    /// changes nothing.
+    pub async fn authorized(self, tx: &mut Transaction) -> Result<Vec<ElementId>, KipError> {
+        for id in &self.ids {
+            tx.authorize_element(*id, self.permission).await?;
+        }
+        Ok(self.ids)
+    }
+
+    /// How many elements the block bound, before authorization.
+    ///
+    /// Only for the statements that must bind exactly one operand and want to
+    /// say so precisely; it discloses a count of elements the caller could
+    /// already read, because the solver filtered them.
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    /// Whether the block bound nothing.
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
 }
 
 /// Resolves the targets of a mutation clause.
@@ -56,10 +96,12 @@ pub struct Targets {
 ///
 /// `WHERE` absent: the statement names its target, and `LIMIT` has nothing to
 /// bound.
+#[allow(clippy::too_many_arguments)]
 pub async fn targets(
     store: &Store,
     tx: &Transaction,
     what: &str,
+    permission: Permission,
     target: &ElementRef,
     where_clauses: Option<&Vec<WhereClause>>,
     limit: Option<&Scalar>,
@@ -68,6 +110,7 @@ pub async fn targets(
     let Some(clauses) = where_clauses else {
         return Ok(Targets {
             ids: vec![b.element_ref(target)?],
+            permission,
         });
     };
 
@@ -127,5 +170,5 @@ pub async fn targets(
         }
     };
 
-    Ok(Targets { ids })
+    Ok(Targets { ids, permission })
 }

@@ -217,7 +217,8 @@ pub fn capabilities() -> Json {
                 "approvals": "multi-party, separation of duties",
                 "audit": "append-preserving: control-plane mutations and decisions",
                 "enforcement": "every KQL, KML and META command is authorized before it \
-                                runs, and every element a read touches is authorized again",
+                                runs, and every element a read or a write touches is \
+                                authorized again",
                 "element_scope": {
                     // What per-element authorization actually does here.
                     "visibility": "an element the caller may not read is outside the query \
@@ -227,7 +228,16 @@ pub fn capabilities() -> Json {
                     "raw_origin": "`_system.origin` needs read_raw_origin; without it the \
                                    member says it was withheld rather than disappearing",
                     "counts": "withheld, with a reason, for a Principal whose read authority \
-                               is narrower than the Space"
+                               is narrower than the Space",
+                    "writes": "every mutation target is authorized individually, and a sweep \
+                               that reaches one it may not touch fails rather than doing less",
+                    "protected_fields": "`governance` is refused by the protocol's parser; \
+                                         `retention` needs manage_retention wherever it is \
+                                         written",
+                    "attribution": "which epistemic permission a new Assertion needs is \
+                                    decided by the writer's ActorBinding, not by the command",
+                    "retraction": "recorded only by the Principal that wrote the Assertion or \
+                                   one representing its actor; moderation uses ARCHIVE"
                 },
                 "permission_registry": "DESCRIBE ACCESS"
             }
@@ -258,12 +268,11 @@ pub fn capabilities() -> Json {
                            and every projection says so"
             },
             {
-                "capability": "protected_retention_fields",
-                "detail": "an element's own `retention` member inside SET FIELDS",
-                "reason": "`governance` is refused by the protocol's own parser, but \
-                           `retention` is not, so a create or update may set an expiry \
-                           without the manage_retention permission that SET RETENTION asks \
-                           for. Legal holds are unimplemented for the same reason"
+                "capability": "legal_hold",
+                "detail": "`retention.legal_hold` blocking erasure",
+                "reason": "the permission exists in the registry and nothing reads the flag \
+                           yet, because the operation it would block — PURGE — is itself \
+                           unimplemented"
             },
             {
                 "capability": "trust_governance",

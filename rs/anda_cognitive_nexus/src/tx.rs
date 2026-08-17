@@ -33,7 +33,7 @@ use anda_kip::{ElementKind, Json, KipError, Map, Receipt, ReceiptStatus};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::error::db_error;
-use crate::governance::{AuthContext, EffectiveAuthority};
+use crate::governance::{AuthContext, EffectiveAuthority, Permission, ResourceContext};
 use crate::id::ElementId;
 use crate::schema::SchemaEnvironment;
 use crate::store::rows::*;
@@ -268,6 +268,106 @@ impl Transaction {
             );
         }
         Ok(&mut self.staged.get_mut(&id).expect("just inserted").row)
+    }
+
+    /// Authorizes one permission over an element this transaction will touch.
+    ///
+    /// The command gate already asked whether the caller may do this *here*;
+    /// this asks whether it may do it to *that*. The two are different questions
+    /// whenever a Grant is scoped to a kind, a type or a classification, and
+    /// answering only the first is how a narrowed Grant turns into an
+    /// unnarrowed one.
+    ///
+    /// Reads the element from storage rather than from the staging map, because
+    /// what matters is the state the caller is acting on — an element this
+    /// transaction has already edited is still governed by the classification it
+    /// had when the transaction started.
+    pub async fn authorize_element(
+        &mut self,
+        id: ElementId,
+        permission: Permission,
+    ) -> Result<(), KipError> {
+        let element = self.load(id).await?.clone();
+        let resource = ResourceContext::of_element(&element);
+        self.authority
+            .authorize(permission, &resource, &self.auth)
+            .into_result()
+            .map(|_| ())
+    }
+
+    /// Authorizes one permission over an element that does not exist yet.
+    ///
+    /// A creation has no element to read a classification off, so it is judged
+    /// at the Space default — which is what the element will carry. A Grant
+    /// narrowed to Concepts must not be a way to create Evidence.
+    pub fn authorize_new(
+        &self,
+        kind: anda_kip::ElementKind,
+        schema_ref: &str,
+        permission: Permission,
+    ) -> Result<(), KipError> {
+        let resource = ResourceContext {
+            kind: kind.to_string(),
+            schema_ref: schema_ref.to_string(),
+            classification: self.authority.default_classification().to_string(),
+            element_id: String::new(),
+        };
+        self.authority
+            .authorize(permission, &resource, &self.auth)
+            .into_result()
+            .map(|_| ())
+    }
+
+    /// Authorizes a permission over an element this transaction is about to
+    /// create, judged on the element as it will be written.
+    pub fn authorize_created(
+        &self,
+        element: &Element,
+        permission: Permission,
+    ) -> Result<(), KipError> {
+        let mut resource = ResourceContext::of_element(element);
+        if resource.classification.is_empty() {
+            resource.classification = self.authority.default_classification().to_string();
+        }
+        // The id is the one this transaction minted and nothing has committed
+        // yet, so a Grant narrowed to specific elements cannot be satisfied by
+        // an element that does not exist. Judging on kind and type is what
+        // such a Grant can actually be about.
+        resource.element_id = String::new();
+        self.authority
+            .authorize(permission, &resource, &self.auth)
+            .into_result()
+            .map(|_| ())
+    }
+
+    /// Authorizes a permission that is about the Space rather than an element.
+    pub fn require(&self, permission: Permission) -> Result<(), KipError> {
+        self.authority
+            .authorize(permission, &ResourceContext::default(), &self.auth)
+            .into_result()
+            .map(|_| ())
+    }
+
+    /// Whether this caller may withdraw or supersede one Assertion (§67, §68).
+    ///
+    /// Two ways to hold that authority, and administrative dislike is neither:
+    ///
+    /// ```text
+    /// the caller wrote it            withdrawing one's own record
+    /// the caller represents the actor  ActorBinding says so
+    /// ```
+    ///
+    /// A moderator who holds neither may exclude the Assertion from recall, but
+    /// must not record it as *the source having retracted* — that would be the
+    /// engine stating something about the source that never happened, which is
+    /// the dishonesty §68 exists to forbid.
+    pub fn may_represent_assertion(&self, row: &AssertionRow) -> bool {
+        let wrote_it = row
+            .origin
+            .get("principal_id")
+            .and_then(Json::as_str)
+            .is_some_and(|principal| principal == self.auth.principal_id);
+        wrote_it || self.authority.is_bound_to_actor(&row.asserted_by_key)
     }
 
     /// Marks a staged element as actually changed.

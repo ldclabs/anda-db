@@ -31,6 +31,7 @@ use std::collections::BTreeMap;
 use super::select::{self, Targets};
 use super::update;
 use super::value::{Bindings, assignments_to_json, reference, structural_value};
+use crate::governance::Permission;
 use crate::id::ElementId;
 use crate::schema::{EndpointFacts, Intent};
 use crate::store::rows::*;
@@ -123,7 +124,17 @@ pub async fn apply(
         MutationClause::TransitionActivity(c) => transition(tx, c, request, operation).await,
         MutationClause::SetRetention(c) => set_retention(store, tx, c, request, operation).await,
         MutationClause::Archive(c) => {
-            remove(store, tx, c, state::ARCHIVED, "archive", request, operation).await
+            remove(
+                store,
+                tx,
+                c,
+                state::ARCHIVED,
+                "archive",
+                Permission::Archive,
+                request,
+                operation,
+            )
+            .await
         }
         MutationClause::Tombstone(c) => {
             remove(
@@ -132,6 +143,7 @@ pub async fn apply(
                 c,
                 state::TOMBSTONED,
                 "tombstone",
+                Permission::Tombstone,
                 request,
                 operation,
             )
@@ -458,7 +470,7 @@ async fn create_concept(
         .filter_map(|value| value.as_str().map(str::to_string))
         .collect();
     let retention = fields.json("retention");
-    let governance = fields.json("governance");
+    require_retention_authority(tx, &retention)?;
     let extra_name = fields.text("name")?;
     fields.rest("Concept")?;
 
@@ -484,10 +496,11 @@ async fn create_concept(
         client_key,
         expires_at: expires_at(&retention)?,
         retention,
-        governance,
         ..Default::default()
     };
-    tx.stage_new(id, Element::Concept(Box::new(row)), "create");
+    let element = Element::Concept(Box::new(row));
+    tx.authorize_created(&element, Permission::Create)?;
+    tx.stage_new(id, element, "create");
     Ok(())
 }
 
@@ -518,7 +531,7 @@ async fn create_record(
     let mut structural =
         collect_structural(tx, &b, clause.set_structural.as_ref(), core_fields(kind))?;
     let retention = fields.json("retention");
-    let governance = fields.json("governance");
+    require_retention_authority(tx, &retention)?;
 
     let row = match kind {
         ElementKind::Evidence => {
@@ -546,7 +559,6 @@ async fn create_record(
                 structural: structural.profile,
                 expires_at: expires_at(&retention)?,
                 retention,
-                governance,
                 ..Default::default()
             };
             Element::Evidence(Box::new(row))
@@ -598,7 +610,6 @@ async fn create_record(
                 structural: structural.profile,
                 expires_at: expires_at(&retention)?,
                 retention,
-                governance,
                 ..Default::default()
             };
             if row.confidence > 1.0 {
@@ -635,7 +646,6 @@ async fn create_record(
                 structural: structural.profile,
                 expires_at: expires_at(&retention)?,
                 retention,
-                governance,
                 ..Default::default()
             };
             Element::Activity(Box::new(row))
@@ -647,8 +657,68 @@ async fn create_record(
         }
     };
     fields.rest(&kind.to_string())?;
+    // §17, §18: which epistemic-mutation permission this needs depends on whom
+    // the claim is attributed to, and that is only knowable here. `assert` is
+    // the floor for writing any commitment; recording somebody else's claim or
+    // speaking as an actor each add their own on top of it.
+    if let Element::Assertion(row) = &row {
+        tx.authorize_created(&row_element(row), Permission::Assert)?;
+        let extra = attribution_permission(tx, &row.asserted_by_key);
+        if extra != Permission::Assert {
+            tx.authorize_created(&row_element(row), extra)?;
+        }
+    } else {
+        tx.authorize_created(&row, Permission::Create)?;
+    }
     tx.stage_new(id, row, "create");
     Ok(())
+}
+
+/// Wraps one Assertion row back into an [`Element`] for authorization.
+fn row_element(row: &AssertionRow) -> Element {
+    Element::Assertion(Box::new(row.clone()))
+}
+
+/// Which epistemic-mutation permission a new Assertion needs, beyond `assert`.
+///
+/// The three cases §17 keeps apart, decided by what Governance says about the
+/// writer rather than by what the command claims:
+///
+/// ```text
+/// bound as this actor          assert                one's own commitment
+/// bound as representing it     assert_as_actor       exercising its authority
+/// not bound to it at all       record_attributed_assertion   "X said P"
+/// ```
+///
+/// The third is not impersonation and must stay ordinary: a Formation Agent
+/// that observed "Alice: I prefer dark mode" has to be able to store it as
+/// Alice's stated claim without thereby being able to act as Alice.
+fn attribution_permission(tx: &Transaction, actor_key: &str) -> Permission {
+    if actor_key.is_empty() {
+        return Permission::Assert;
+    }
+    match tx.authority.binding_class(actor_key) {
+        None => Permission::RecordAttributedAssertion,
+        Some(class)
+            if class == crate::governance::rows::binding_class::SELF
+                || class == crate::governance::rows::binding_class::SERVICE_IDENTITY =>
+        {
+            Permission::Assert
+        }
+        Some(_) => Permission::AssertAsActor,
+    }
+}
+
+/// Refuses a retention block written by a caller who may not set one.
+///
+/// `SET RETENTION` asks for `manage_retention`; `SET FIELDS {retention: …}`
+/// writes the same state and must ask for the same thing, or the clause that
+/// checks is the one nobody uses.
+fn require_retention_authority(tx: &Transaction, retention: &Json) -> Result<(), KipError> {
+    if retention.is_null() {
+        return Ok(());
+    }
+    tx.require(Permission::ManageRetention)
 }
 
 async fn ensure_proposition(
@@ -741,7 +811,9 @@ async fn ensure_proposition(
         tuple_key: key,
         ..Default::default()
     };
-    tx.stage_new(id, Element::Proposition(Box::new(row)), "create");
+    let element = Element::Proposition(Box::new(row));
+    tx.authorize_created(&element, Permission::Create)?;
+    tx.stage_new(id, element, "create");
     Ok(())
 }
 
@@ -828,11 +900,19 @@ async fn upsert_concept(
                 key: selector_value.clone(),
                 ..Default::default()
             };
-            tx.stage_new(id, Element::Concept(Box::new(row)), "create");
+            let element = Element::Concept(Box::new(row));
+            tx.authorize_created(&element, Permission::Create)?;
+            tx.stage_new(id, element, "create");
             id
         }
     };
     tx.bind_existing(&clause.handle, id)?;
+    // An upsert that resolved to an existing Concept is changing it, and the
+    // caller may hold `create` without holding `update` — which is exactly the
+    // case an upsert makes hard to see from the command alone.
+    if existing.is_some() {
+        tx.authorize_element(id, Permission::Update).await?;
+    }
 
     apply_concept_assignments(tx, clause, id, request, operation).await
 }
@@ -912,6 +992,7 @@ async fn update_elements(
             store,
             tx,
             "UPDATE",
+            Permission::Update,
             &clause.target,
             clause.where_clauses.as_ref(),
             clause.limit.as_ref(),
@@ -920,7 +1001,7 @@ async fn update_elements(
         .await?
     };
 
-    for id in targets.ids {
+    for id in targets.authorized(tx).await? {
         if let Some(expected) = &clause.expect_version {
             let expected = {
                 let b = bindings(tx, request, operation);
@@ -960,6 +1041,7 @@ async fn retract(
             store,
             tx,
             "RETRACT ASSERTION",
+            Permission::RetractOwn,
             &clause.target,
             clause.where_clauses.as_ref(),
             clause.limit.as_ref(),
@@ -977,10 +1059,11 @@ async fn retract(
     };
     let at = tx.cx.at.clone();
 
-    for id in targets.ids {
+    for id in targets.authorized(tx).await? {
         if let Some(expected) = &expect_state {
             tx.expect_assertion_status(id, expected).await?;
         }
+        require_representation(tx, id, "RETRACT ASSERTION").await?;
         let row = assertion_mut(tx, id).await?;
         // Spec §41.1: retraction is not deletion. The Assertion goes on
         // existing, so the record of what was once believed — and by whom —
@@ -993,6 +1076,35 @@ async fn retract(
         tx.mark_changed(id, "retract");
     }
     Ok(())
+}
+
+/// Refuses to record a withdrawal the caller has no standing to make (§68).
+///
+/// Retraction and supersession both say something about the *source*: that it
+/// took its claim back, or replaced it. A moderator who merely wants the claim
+/// out of recall has `ARCHIVE` and `TOMBSTONE`, which say what they actually
+/// mean. Letting administrative dislike write itself down as the source's own
+/// withdrawal would make the epistemic record report an event that never
+/// happened — and that record is the entire product of this engine.
+async fn require_representation(
+    tx: &mut Transaction,
+    id: ElementId,
+    what: &str,
+) -> Result<(), KipError> {
+    let row = assertion_mut(tx, id).await?.clone();
+    if tx.may_represent_assertion(&row) {
+        return Ok(());
+    }
+    Err(KipError::retraction_not_authorized(format!(
+        "{what} records that the source withdrew this claim, and this Principal neither wrote \
+         {id} nor holds an ActorBinding representing {}. ARCHIVE or TOMBSTONE removes it from \
+         recall without claiming a withdrawal that did not happen",
+        if row.asserted_by_key.is_empty() {
+            "its author"
+        } else {
+            row.asserted_by_key.as_str()
+        }
+    )))
 }
 
 async fn supersede(
@@ -1018,6 +1130,9 @@ async fn supersede(
     if let Some(expected) = expect_state {
         tx.expect_assertion_status(old, &expected).await?;
     }
+    tx.authorize_element(old, Permission::SupersedeOwn).await?;
+    tx.authorize_element(new, Permission::SupersedeOwn).await?;
+    require_representation(tx, old, "SUPERSEDE ASSERTION").await?;
 
     let old_row = assertion_mut(tx, old).await?;
     let proposition = old_row.proposition_id.clone();
@@ -1064,6 +1179,9 @@ async fn correct_evidence(
         ));
     }
 
+    tx.authorize_element(old, Permission::Maintain).await?;
+    tx.authorize_element(new, Permission::Maintain).await?;
+
     // Spec §70: wrong Evidence is corrected, never rewritten. The original
     // observation stays exactly as observed, because what a source said is a
     // historical fact even when it was wrong.
@@ -1105,10 +1223,14 @@ async fn transition(
     let at = tx.cx.at.clone();
 
     let element = tx.load(id).await?;
-    let Element::Activity(row) = element else {
+    let Element::Activity(_) = element else {
         return Err(KipError::structural_reference_invalid(format!(
             "{id} is not an Activity"
         )));
+    };
+    tx.authorize_element(id, Permission::Update).await?;
+    let Element::Activity(row) = tx.load(id).await? else {
+        unreachable!("just checked");
     };
     if let Some(expected) = expect_state
         && row.status != expected
@@ -1161,6 +1283,7 @@ async fn set_retention(
             store,
             tx,
             "SET RETENTION",
+            Permission::ManageRetention,
             &clause.target,
             clause.where_clauses.as_ref(),
             clause.limit.as_ref(),
@@ -1181,7 +1304,7 @@ async fn set_retention(
     // that is `valid_time.until`, on an Assertion, and nothing here touches it.
     let retention = Json::Object(values);
     let expires = expires_at(&retention)?;
-    for id in targets.ids {
+    for id in targets.authorized(tx).await? {
         if let Some(expected) = expected {
             tx.expect_version(id, expected).await?;
         }
@@ -1204,6 +1327,7 @@ async fn remove(
     clause: &RemovalStatement,
     to: &str,
     op: &'static str,
+    permission: Permission,
     request: Option<&Map<String, Json>>,
     operation: Option<&Map<String, Json>>,
 ) -> Result<(), KipError> {
@@ -1213,6 +1337,7 @@ async fn remove(
             store,
             tx,
             op,
+            permission,
             &clause.target,
             clause.where_clauses.as_ref(),
             clause.limit.as_ref(),
@@ -1227,7 +1352,7 @@ async fn remove(
         (targets, expect_state)
     };
 
-    for id in targets.ids {
+    for id in targets.authorized(tx).await? {
         if let Some(expected) = &expect_state {
             tx.expect_state(id, expected).await?;
         }
@@ -1270,6 +1395,7 @@ async fn merge_concept(
             store,
             tx,
             "MERGE CONCEPT source",
+            Permission::MergeIdentity,
             &clause.source,
             clause.where_clauses.as_ref(),
             &b,
@@ -1279,6 +1405,7 @@ async fn merge_concept(
             store,
             tx,
             "MERGE CONCEPT target",
+            Permission::MergeIdentity,
             &clause.into,
             clause.where_clauses.as_ref(),
             &b,
@@ -1290,6 +1417,14 @@ async fn merge_concept(
             .map(|scalar| b.scalar_u64(scalar, "EXPECT VERSION"))
             .transpose()?;
         (source, target, expected)
+    };
+    let source = match source {
+        Some(targets) => targets.authorized(tx).await?.into_iter().next(),
+        None => None,
+    };
+    let target = match target {
+        Some(targets) => targets.authorized(tx).await?.into_iter().next(),
+        None => None,
     };
     let (Some(source), Some(target)) = (source, target) else {
         // The guard block matched nothing: no merge, no error.
@@ -1358,14 +1493,16 @@ async fn one_operand(
     store: &Store,
     tx: &Transaction,
     what: &str,
+    permission: Permission,
     target: &anda_kip::ElementRef,
     where_clauses: Option<&Vec<anda_kip::WhereClause>>,
     b: &Bindings<'_>,
-) -> Result<Option<ElementId>, KipError> {
-    let targets: Targets = select::targets(store, tx, what, target, where_clauses, None, b).await?;
-    match targets.ids.len() {
+) -> Result<Option<Targets>, KipError> {
+    let targets: Targets =
+        select::targets(store, tx, what, permission, target, where_clauses, None, b).await?;
+    match targets.len() {
         0 => Ok(None),
-        1 => Ok(Some(targets.ids[0])),
+        1 => Ok(Some(targets)),
         n => Err(KipError::new(
             KipErrorCode::IdentitySelectorRequired,
             format!("the {what} block binds {n} elements; it must name exactly one"),
