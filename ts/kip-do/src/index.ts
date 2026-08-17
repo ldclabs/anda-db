@@ -91,6 +91,14 @@ export {
   type WriteContext,
 } from './kml/index.js'
 
+export {
+  Context as KqlContextState,
+  executeKql,
+  type KqlContext,
+} from './kql/index.js'
+
+export { readPath, render } from './view.js'
+
 export * from './schema/index.js'
 
 export * from './store/index.js'

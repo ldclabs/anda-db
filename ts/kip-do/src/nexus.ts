@@ -17,6 +17,7 @@ import type { Json, JsonMap } from './json.js'
 import { parseKip } from './kip/parser.js'
 import type { Command, KmlStatement } from './kip/ast.js'
 import { executeKml, type KmlContext } from './kml/index.js'
+import { executeKql, type KqlContext } from './kql/index.js'
 import {
   BUNDLED_PACKAGES,
   CORE_PACKAGE,
@@ -216,17 +217,50 @@ export class CognitiveNexus {
   /**
    * Parses and runs one command.
    *
-   * KQL and META are not built yet and are refused by name rather than
-   * answered emptily: an empty answer to "what do you know about X" reads as
-   * "nothing", which is a different and wrong claim.
+   * META is not built yet and is refused by name rather than answered emptily:
+   * an empty answer to "what do you know about X" reads as "nothing", which is
+   * a different and wrong claim.
    */
   execute(command: string, params: JsonMap = {}): Outcome {
     const parsed: Command = parseKip(command)
     if ('Kml' in parsed) return this.mutate(parsed.Kml, params)
     throw errors.unsupportedCapability(
-      `${'Kql' in parsed ? 'KQL' : 'META'} is not implemented by this engine ` +
-        `yet; see DESCRIBE CAPABILITIES`,
+      `${'Kql' in parsed ? 'a KQL query has no receipt; use query()' : 'META'} ` +
+        `is not available here; see DESCRIBE CAPABILITIES`,
     )
+  }
+
+  /**
+   * Parses and runs one KQL query, returning the bare result array.
+   *
+   * Reads take no transaction: a Durable Object is single-threaded, so nothing
+   * can change underneath a query that has already started.
+   */
+  query(command: string, params: JsonMap = {}): Json[] {
+    const parsed: Command = parseKip(command)
+    if (!('Kql' in parsed)) {
+      throw errors.languageMismatch(
+        'this command is not a KQL query',
+      )
+    }
+    return this.find(parsed.Kql, params)
+  }
+
+  /** Runs one parsed KQL query. */
+  find(
+    query: Parameters<typeof executeKql>[0],
+    params: JsonMap = {},
+    options: Partial<KqlContext> = {},
+  ): Json[] {
+    const space = options.space ?? this.space
+    const cx: KqlContext = {
+      store: this.store,
+      space,
+      env: this.environment(space),
+      request: params,
+      ...options,
+    }
+    return executeKql(query, cx)
   }
 
   /** Runs one KML statement, all-or-nothing. */
