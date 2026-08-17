@@ -392,7 +392,7 @@ describe('KML', () => {
     })
   })
 
-  it('replays a lost response from its idempotency key', async () => {
+  it('journals enough for a lost response to be looked up', async () => {
     await withNexus('idempotency', (nexus) => {
       const parsed = nexus.execute(SETUP)
       expect(parsed.status).toBe('committed')
@@ -400,6 +400,35 @@ describe('KML', () => {
       expect(journalled?.changes).toHaveLength(4)
       expect(journalled?.snapshot_seq).toBe(0)
       expect(journalled?.schema_environment_version).toBe(1)
+    })
+  })
+
+  it('refuses a resend under the same key rather than replaying it', async () => {
+    // This pins the gap `DESCRIBE CAPABILITIES` names as `idempotent_replay`
+    // (§34.3). The write path never looks the key up, so a resend is not
+    // replayed. What saves it from committing twice is the unique index, which
+    // means the caller gets a failure instead of the original receipt — worth
+    // pinning, because the reference engine has no such index and commits the
+    // duplicate. When replay lands, this test fails and forces it and the
+    // capability declaration to move together.
+    await withNexus('idempotency-resend', (nexus) => {
+      const statement = parseKip(
+        'CREATE CONCEPT ?x { TYPE "Person" NAME "Alice" }',
+      )
+      if (!('Kml' in statement)) throw new Error('the setup is a KML statement')
+
+      const first = nexus.mutate(statement.Kml, {}, { idempotencyKey: 'key-1' })
+      expect(first.status).toBe('committed')
+
+      expect(() =>
+        nexus.mutate(statement.Kml, {}, { idempotencyKey: 'key-1' }),
+      ).toThrow()
+
+      // And the refusal left no second Alice behind.
+      const found = nexus.query(
+        'FIND(COUNT(?c)) WHERE { ?c CONCEPT {type: "Person", name: "Alice"} }',
+      )
+      expect(found).toEqual([1])
     })
   })
 

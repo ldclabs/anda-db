@@ -51,6 +51,9 @@ export function capabilities(): Json {
         atomicity: 'all-or-none per statement, from SQLite',
         versioning: 'one version increment per element per transaction',
         no_effect: 'a transaction that changes nothing takes no Space sequence',
+        // Recorded, not replayed — see the `idempotent_replay` gap below.
+        // Stated here too because this is the block a retry policy reads.
+        idempotency: 'recorded_not_replayed',
       },
       kql: [
         'CONCEPT',
@@ -321,12 +324,30 @@ export function capabilities(): Json {
         reason: 'transitive traversal is not implemented',
       },
       {
-        capability: 'grouped_aggregation',
-        detail: 'FIND(?c.name, COUNT(?x))',
+        capability: 'idempotent_replay',
+        detail:
+          'execution.idempotency_key returning the original outcome on a resend',
         reason:
-          'a plain variable projected beside an aggregate would need grouping; ' +
-          'answering it as a global aggregate returns one row where the caller ' +
-          'asked for one per group',
+          'the key is recorded on the committed transaction and is findable ' +
+          'with DESCRIBE TRANSACTION BY IDEMPOTENCY KEY, but the write path ' +
+          'does not look it up before executing. A resend does not replay: it ' +
+          'trips the unique index and fails, which at least refuses rather ' +
+          'than committing twice, but the caller gets a constraint failure ' +
+          'instead of the original receipt. A client that lost a response ' +
+          'must look the transaction up before retrying — which is what the ' +
+          'outcome_lookup_required retry class is telling it to do. The ' +
+          'reference engine has the same gap, and lacking the unique index it ' +
+          'commits the duplicate instead of refusing it',
+      },
+      {
+        capability: 'grouped_aggregation',
+        detail: 'FIND(?c.name, COUNT(?x)) and ORDER BY COUNT(?x)',
+        reason:
+          'a plain variable projected beside an aggregate, or an aggregate used ' +
+          'as a sort key, needs grouping. Answering either without it returns ' +
+          'one global row where the caller asked for one per group, or sorts by ' +
+          'the bare variable instead of the aggregate. The reference engine has ' +
+          'the same gap',
       },
       {
         capability: 'structural_core_fields',

@@ -207,7 +207,14 @@ pub fn capabilities() -> Json {
             },
             "transactions": {
                 "atomic_visibility": "in_process",
-                "idempotency": true,
+                // Recorded, not replayed. A key is stored on the committed
+                // transaction and `DESCRIBE TRANSACTION BY IDEMPOTENCY KEY`
+                // will find it, which is what lets a client that lost a
+                // response discover the outcome — but the write path does not
+                // check the key first, so re-sending re-executes. Stated as
+                // what it is: reporting `true` here is what a retry policy
+                // reads before deciding a resend is free.
+                "idempotency": "recorded_not_replayed",
                 "preconditions": ["EXPECT VERSION", "EXPECT STATE"],
                 "dry_run": true
             },
@@ -267,6 +274,50 @@ pub fn capabilities() -> Json {
                 "detail": "execution.mode \"atomic\" over several operations",
                 "reason": "one transaction, one snapshot and all-or-none commit across \
                            operations are not implemented; a batch runs operation by operation"
+            },
+            {
+                "capability": "idempotent_replay",
+                "detail": "execution.idempotency_key returning the original outcome on a resend",
+                "reason": "the key is recorded on the committed transaction and is findable with \
+                           DESCRIBE TRANSACTION BY IDEMPOTENCY KEY, but the write path does not \
+                           look it up before executing: a resend commits a second time rather \
+                           than replaying the first, and a resend under a key that named a \
+                           different request is not detected either. A client that lost a \
+                           response must look the transaction up before retrying — which is what \
+                           the outcome_lookup_required retry class is telling it to do. \
+                           ts/kip-do has the same gap"
+            },
+            {
+                "capability": "grouped_aggregation",
+                "detail": "FIND(?c.name, COUNT(?x)) and ORDER BY COUNT(?x)",
+                "reason": "a plain variable projected beside an aggregate, or an aggregate used \
+                           as a sort key, needs grouping. Answering either without it returns one \
+                           global row where the caller asked for one per group, or sorts by the \
+                           bare variable instead of the aggregate"
+            },
+            {
+                "capability": "structural_core_fields",
+                "detail": "STRUCTURAL over an Assertion's evidence, an Activity's inputs/outputs, \
+                           an Evidence record's source",
+                "reason": "the pattern walks Profile structural fields only, so it cannot ask \
+                           which Assertions cite a given Evidence. The derived index holds the \
+                           answer; the pattern is what does not ask it. ts/kip-do has the same gap"
+            },
+            {
+                "capability": "ungated_permissions",
+                "detail": "derive, moderate_assertion, share, bind_canonical_identity, and the \
+                           control-plane management names: manage_membership, manage_grants, \
+                           manage_delegation, delegate, manage_actor_binding, manage_trust, \
+                           manage_schema, approve_high_risk",
+                "reason": "these are registered names that no gate currently asks for, so a Grant \
+                           listing one confers nothing — named here rather than discovered during \
+                           an incident. Two causes. The control-plane names are host APIs by \
+                           design: no KML clause reaches the plane, which is what keeps a prompt \
+                           injection off it, and the consequence is that managing the plane \
+                           cannot be delegated through KIP. The rest name operations this engine \
+                           does not distinguish yet — setting canonical_id needs only `update`, \
+                           and a moderator uses ARCHIVE or TOMBSTONE. ts/kip-do has the same gap, \
+                           so closing it is a change both engines make together"
             },
             {
                 "capability": "historical_search",

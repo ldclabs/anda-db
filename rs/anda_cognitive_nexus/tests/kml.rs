@@ -647,6 +647,46 @@ async fn a_committed_transaction_is_recoverable_by_its_idempotency_key() {
 }
 
 #[tokio::test]
+async fn a_resend_under_the_same_key_re_executes_rather_than_replaying() {
+    // This pins the gap `DESCRIBE CAPABILITIES` names as `idempotent_replay`
+    // (§34.3): the key is journalled, but the write path never looks it up, so
+    // the same logical write commits twice. The test asserts the behaviour the
+    // engine actually has rather than the one the spec asks for, because a
+    // capability document that says `recorded_not_replayed` has to be checkable
+    // — and when replay does land, this test fails and forces both it and the
+    // declaration to move together.
+    let nexus = nexus("idempotency_resend").await;
+    let request = serde_json::from_value::<Request>(json!({
+        "kip": "2.0",
+        "execution": {"mode": "independent", "idempotency_key": "key-1"},
+        "operations": [{"command": r#"CREATE CONCEPT ?x { TYPE "Person" NAME "Alice" }"#}]
+    }))
+    .unwrap();
+
+    let mut tx_ids = Vec::new();
+    for _ in 0..2 {
+        let parsed = request.operations[0].parse().unwrap();
+        let response = nexus
+            .execute(parsed, &request, &request.operations[0])
+            .await;
+        assert_eq!(response.status, TopLevelStatus::Succeeded);
+        tx_ids.push(response.receipt.as_ref().unwrap().tx_id.clone().unwrap());
+    }
+
+    // Two transactions, not one replayed twice.
+    assert_ne!(tx_ids[0], tx_ids[1]);
+
+    // And two Concepts: the duplicate cognition a retry policy reading
+    // `"idempotency": true` would have caused.
+    let found = ok(
+        &nexus,
+        r#"FIND(COUNT(?c)) WHERE { ?c CONCEPT {type: "Person", name: "Alice"} }"#,
+    )
+    .await;
+    assert_eq!(found, json!([2]));
+}
+
+#[tokio::test]
 async fn all_three_command_families_reach_this_engine() {
     // The Executor dispatches on what the command *is*, so a caller does not
     // need to know which family it wrote.
