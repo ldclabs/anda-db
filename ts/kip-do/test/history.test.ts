@@ -148,13 +148,36 @@ describe('AS OF', () => {
     await withNexus('schema', (nexus) => {
       const before = nexus.environment().version
       nexus.execute('CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }')
-      // Activating a Schema mints a new environment version; the coordinate
-      // before it was written under the old one (§144).
-      nexus.activatePackages([COGNITIVE_MEMORY])
-      const env = nexus.describe('DESCRIBE SCHEMA ENVIRONMENT AS OF SEQ 1') as {
+
+      // A genuinely different lock, so a new environment version is really
+      // minted rather than the activation being a no-op.
+      nexus.activatePackages([])
+      expect(nexus.environment().version).toBe(before + 1)
+
+      // §144: the Concept at coordinate 1 was written under the environment
+      // before the activation, and that is what a read there resolves through.
+      // Reconstructing the past under today's schema would return different
+      // elements rather than an error.
+      const then = nexus.describe('DESCRIBE SCHEMA ENVIRONMENT AS OF SEQ 1') as {
         version: number
+        packages: string[]
       }
-      expect(env.version).toBe(before)
+      expect(then.version).toBe(before)
+      expect(then.packages.some((ref) => ref.includes('cognitive-memory'))).toBe(true)
+
+      const now = nexus.describe('DESCRIBE SCHEMA ENVIRONMENT') as {
+        packages: string[]
+      }
+      expect(now.packages.some((ref) => ref.includes('cognitive-memory'))).toBe(false)
+
+      // And it is the query path that has to honour it, not only the report:
+      // `"Person"` no longer resolves under today's environment, and still
+      // resolves at the coordinate where it was written.
+      const FIND = 'FIND(?c.name) WHERE { ?c CONCEPT {type: "Person"} }'
+      expect(() => nexus.query(FIND)).toThrowError(
+        /no active Schema Package defines/,
+      )
+      expect(nexus.query(`${FIND} AS OF SEQ 1`)).toEqual(['Alice'])
     })
   })
 })
