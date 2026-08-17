@@ -854,7 +854,10 @@ describe('the command gate', () => {
         {
           space_id: nexus.space,
           grantee_principal: 'kip:principal:agent',
-          actions: ['create', 'read', 'assert'],
+          // `record_attributed_assertion` because the claim is attributed to a
+          // Concept this Principal is not bound to — recording what somebody
+          // else said is ordinary, and is not `assert_as_actor` (§17).
+          actions: ['create', 'read', 'assert', 'record_attributed_assertion'],
         },
         SYSTEM_PRINCIPAL,
       )
@@ -1130,5 +1133,265 @@ describe('the read path', () => {
         expect(exported(mine)).toBe(1)
       },
     )
+  })
+})
+
+describe('the write path', () => {
+  async function withWriter<T>(
+    name: string,
+    actions: string[],
+    body: (
+      nexus: CognitiveNexus,
+      session: ReturnType<CognitiveNexus['session']>,
+    ) => T,
+    scope?: Record<string, string[]>,
+  ): Promise<T> {
+    const stub = env.KIP_DB.getByName(`write-${name}`)
+    return await runInDurableObject(stub, (_instance, state) => {
+      const nexus = CognitiveNexus.connect(state.storage)
+      nexus.activatePackages([COGNITIVE_MEMORY])
+      nexus.store.governance.ensurePrincipal({ principal_id: 'kip:principal:agent' })
+      nexus.store.governance.createGrant(
+        {
+          space_id: nexus.space,
+          grantee_principal: 'kip:principal:agent',
+          actions,
+          scope,
+        },
+        SYSTEM_PRINCIPAL,
+      )
+      return body(nexus, nexus.session(principalAuth('kip:principal:agent')))
+    })
+  }
+
+  it('judges a creation on the element it will write, not on the command', async () => {
+    await withWriter(
+      'kind-scope',
+      ['create', 'read'],
+      (_nexus, session) => {
+        // The command gate said `create` is allowed here; this says it is not
+        // allowed *for that*. A Grant narrowed to Concepts must not be a way to
+        // create Evidence.
+        expect(() =>
+          session.execute('CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }'),
+        ).not.toThrow()
+        expect(() =>
+          session.execute(
+            'CREATE EVIDENCE ?e { SET FIELDS { evidence_class: "Observation" } }',
+          ),
+        ).toThrowError(/requires the create permission/)
+      },
+      { kinds: ['concept'] },
+    )
+  })
+
+  it('fails a sweep that reaches something it may not touch', async () => {
+    await withWriter('sweep', ['create', 'read'], (nexus, session) => {
+      nexus.execute(`MUTATE {
+        CREATE CONCEPT ?a { TYPE "Person" NAME "Alice" }
+        CREATE CONCEPT ?b { TYPE "Person" NAME "Bob" }
+      }`)
+      // Reading and writing are separate authorities, and the sweep rule bites
+      // exactly where they differ: this caller may *read* both Concepts, so the
+      // selection block sees both, and may archive only one.
+      nexus.store.governance.createGrant(
+        {
+          space_id: nexus.space,
+          grantee_principal: 'kip:principal:agent',
+          actions: ['archive'],
+          scope: { elements: ['C-1'] },
+        },
+        SYSTEM_PRINCIPAL,
+      )
+
+      // Archiving only C-1 would report success having done half the job — the
+      // defect shape this project keeps finding — and would let the caller
+      // learn what it may not touch by counting what changed.
+      expect(() =>
+        session.execute('ARCHIVE ?c WHERE { ?c CONCEPT {type: "Person"} }'),
+      ).toThrowError(/requires the archive permission/)
+      // Nothing was archived: the statement unwound whole.
+      expect(
+        nexus.query('FIND(COUNT(?c)) WHERE { ?c CONCEPT {type: "Person"} }'),
+      ).toEqual([2])
+
+      // Naming the one it may touch works, which is what makes the refusal a
+      // narrowing rather than a lockout.
+      expect(session.execute('ARCHIVE "C-1"').status).toBe('committed')
+    })
+  })
+
+  it('keeps a selection block inside what the caller may read', async () => {
+    await withWriter(
+      'sweep-visibility',
+      ['create', 'read', 'archive'],
+      (nexus, session) => {
+        nexus.execute(`MUTATE {
+          CREATE CONCEPT ?a { TYPE "Person" NAME "Alice" }
+          CREATE CONCEPT ?b { TYPE "Person" NAME "Bob" }
+        }`)
+        // C-2 is outside the Grant entirely, so it is not in this caller's
+        // query universe — the block cannot select what a read cannot see, and
+        // the sweep succeeds over exactly what it could.
+        expect(
+          session.execute('ARCHIVE ?c WHERE { ?c CONCEPT {type: "Person"} }').status,
+        ).toBe('committed')
+        expect(
+          nexus.query(
+            'FIND(COUNT(?c)) WHERE { ?c CONCEPT {type: "Person", state: "archived"} }',
+          ),
+        ).toEqual([1])
+      },
+      { elements: ['C-1'] },
+    )
+  })
+
+  it('keeps recording what somebody said apart from speaking as them', async () => {
+    await withWriter('attribution', ['create', 'read', 'assert'], (nexus, session) => {
+      nexus.execute(`MUTATE {
+        CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
+        CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+        ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
+      }`)
+      const ASSERT = `CREATE ASSERTION ?a {
+        SET FIELDS {
+          proposition: {id: "P-1"}, asserted_by: {id: "C-1"},
+          stance: "support", mode: "stated", confidence: 0.9
+        }
+      }`
+
+      // §17: attributing a claim to an actor this Principal is not bound to is
+      // *recording what somebody said*. It needs its own permission and is not
+      // covered by `assert` — but it is also not impersonation, so it must stay
+      // ordinary rather than needing representation authority.
+      expect(() => session.execute(ASSERT)).toThrowError(
+        /requires the record_attributed_assertion permission/,
+      )
+
+      nexus.store.governance.createGrant(
+        {
+          space_id: nexus.space,
+          grantee_principal: 'kip:principal:agent',
+          actions: ['record_attributed_assertion'],
+        },
+        SYSTEM_PRINCIPAL,
+      )
+      expect(session.execute(ASSERT).status).toBe('committed')
+    })
+  })
+
+  it('asks for representation authority only where the caller is bound', async () => {
+    await withWriter(
+      'as-actor',
+      ['create', 'read', 'assert', 'record_attributed_assertion'],
+      (nexus, session) => {
+        nexus.execute(`MUTATE {
+          CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
+          CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+          ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
+        }`)
+        // A binding that says this Principal *represents* Alice moves the
+        // Assertion out of "recording a claim" and into "exercising Alice's
+        // authority", which is a permission it does not hold.
+        nexus.store.governance.createBinding(
+          {
+            principal_id: 'kip:principal:agent',
+            actor_ref: 'C-1',
+            binding_class: 'represents',
+          },
+          SYSTEM_PRINCIPAL,
+        )
+        expect(() =>
+          session.execute(`CREATE ASSERTION ?a {
+            SET FIELDS {
+              proposition: {id: "P-1"}, asserted_by: {id: "C-1"},
+              stance: "support", mode: "stated", confidence: 0.9
+            }
+          }`),
+        ).toThrowError(/requires the assert_as_actor permission/)
+      },
+    )
+  })
+
+  it('does not let a moderator record a retraction that did not happen', async () => {
+    await withWriter(
+      'retraction',
+      [
+        'create',
+        'read',
+        'assert',
+        'record_attributed_assertion',
+        'retract_own',
+        'archive',
+      ],
+      (nexus, session) => {
+        // Written by the system Principal, attributed to Alice. The agent
+        // neither wrote it nor represents her.
+        nexus.execute(`MUTATE {
+          CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
+          CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+          ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
+          CREATE ASSERTION ?a {
+            SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: "support", mode: "stated", confidence: 0.9 }
+          }
+        }`)
+
+        // §68: RETRACT states that the *source* took its claim back. Saying so
+        // on somebody else's behalf would be the engine asserting something
+        // that never happened.
+        expect(() => session.execute('RETRACT ASSERTION "A-1"')).toThrowError(
+          /neither wrote it nor is bound to the actor/,
+        )
+        // The honest alternative is available and needs no impersonation.
+        expect(session.execute('ARCHIVE "A-1"').status).toBe('committed')
+      },
+    )
+  })
+
+  it('lets a Principal withdraw what it wrote itself', async () => {
+    await withWriter(
+      'own-retraction',
+      ['create', 'read', 'assert', 'record_attributed_assertion', 'retract_own'],
+      (_nexus, session) => {
+        session.execute(`MUTATE {
+          CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
+          CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+          ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
+          CREATE ASSERTION ?a {
+            SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: "support", mode: "stated", confidence: 0.9 }
+          }
+        }`)
+        // Withdrawing one's own record is not impersonation, so it needs no
+        // ActorBinding — which is what keeps the ordinary case ordinary.
+        expect(session.execute('RETRACT ASSERTION "A-1"').status).toBe('committed')
+      },
+    )
+  })
+
+  it('needs a lifecycle permission to set retention, not just create', async () => {
+    await withWriter('retention', ['create', 'read'], (_nexus, session) => {
+      // §80: how long an element is kept is a lifecycle decision, not a side
+      // effect of writing content.
+      expect(() =>
+        session.execute(`CREATE CONCEPT ?c {
+          TYPE "Person" NAME "Alice"
+          SET FIELDS { retention: {expires_at: "2030-01-01T00:00:00.000Z"} }
+        }`),
+      ).toThrowError(/requires the manage_retention permission/)
+    })
+  })
+
+  it('refuses a governance block written by cognitive content', async () => {
+    await withWriter('protected', ['create', 'read'], (_nexus, session) => {
+      // The parser refuses it, which is the right layer: an engine-side check
+      // would be one branch away from an ungoverned path. §264 is the reason —
+      // content that could set this would be granting itself authority.
+      expect(() =>
+        session.execute(`CREATE CONCEPT ?c {
+          TYPE "Person" NAME "Alice"
+          SET FIELDS { governance: {classification: "public"} }
+        }`),
+      ).toThrowError(/governance/i)
+    })
   })
 })

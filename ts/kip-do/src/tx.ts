@@ -36,7 +36,14 @@
  */
 
 import { errors } from './errors.js'
-import type { AuthContext, EffectiveAuthority } from './governance/index.js'
+import {
+  requirePermitted,
+  resourceOfElement,
+  spaceResource,
+  type AuthContext,
+  type EffectiveAuthority,
+  type Permission,
+} from './governance/index.js'
 import {
   formatElementId,
   type ElementId,
@@ -46,6 +53,7 @@ import type { Json, JsonMap } from './json.js'
 import type { SchemaEnvironment } from './schema/index.js'
 import {
   State,
+  type AssertionRow,
   type ChangeEntry,
   type ChangeOp,
   type Element,
@@ -189,6 +197,92 @@ export class Transaction {
       at: nowTime(),
       origin,
     }
+  }
+
+  /**
+   * Authorizes one permission over an element this transaction will touch.
+   *
+   * The command gate already asked whether the caller may do this *here*; this
+   * asks whether it may do it to *that*. The two are different questions
+   * whenever a Grant is scoped to a kind, a type or a classification, and
+   * answering only the first is how a narrowed Grant turns into an unnarrowed
+   * one.
+   *
+   * The element is read through {@link load}, so the classification judged is
+   * the one it had when this transaction first saw it. Nothing a KML statement
+   * can write changes that — the `governance` block is not author-writable —
+   * so there is no window where a clause could relabel an element and then act
+   * on the new label.
+   */
+  authorizeElement(id: ElementId, permission: Permission): void {
+    requirePermitted(
+      this.authority.authorize(permission, resourceOfElement(this.load(id)), this.auth),
+    )
+  }
+
+  /**
+   * Authorizes a permission over an element this transaction is about to
+   * create, judged on the element as it will be written.
+   *
+   * The id is the one this transaction minted and nothing has committed yet, so
+   * a Grant narrowed to specific elements cannot be satisfied by an element that
+   * does not exist. Judging on kind and type is what such a Grant can actually
+   * be about.
+   */
+  authorizeCreated(element: Element, permission: Permission): void {
+    const resource = resourceOfElement(element)
+    resource.element_id = ''
+    if (resource.classification === '') {
+      resource.classification = this.authority.defaultClassification()
+    }
+    requirePermitted(this.authority.authorize(permission, resource, this.auth))
+  }
+
+  /**
+   * Authorizes a permission over an element that does not exist yet.
+   *
+   * A creation has no element to read a classification off, so it is judged at
+   * the Space default — which is what the element will carry. A Grant narrowed
+   * to Concepts must not be a way to create Evidence.
+   */
+  authorizeNew(kind: ElementKind, schemaRef: string, permission: Permission): void {
+    requirePermitted(
+      this.authority.authorize(
+        permission,
+        {
+          kind: kind.toLowerCase(),
+          schema_ref: schemaRef,
+          classification: this.authority.defaultClassification(),
+          element_id: '',
+        },
+        this.auth,
+      ),
+    )
+  }
+
+  /** Authorizes a permission that is about the Space rather than an element. */
+  require(permission: Permission): void {
+    requirePermitted(this.authority.authorize(permission, spaceResource(), this.auth))
+  }
+
+  /**
+   * Whether this caller may withdraw or supersede one Assertion (§67, §68).
+   *
+   * Two ways to hold that authority, and administrative dislike is neither:
+   *
+   * ```text
+   * the caller wrote it              withdrawing one's own record
+   * the caller represents the actor  an ActorBinding says so
+   * ```
+   *
+   * A moderator who holds neither may exclude the Assertion from recall with
+   * `ARCHIVE` or `TOMBSTONE`, but must not record it as *the source having
+   * retracted* — that would be the engine stating something about the source
+   * that never happened, which is the dishonesty §68 exists to forbid.
+   */
+  mayRepresentAssertion(row: AssertionRow): boolean {
+    const wroteIt = row.origin.principal_id === this.auth.principal_id
+    return wroteIt || this.authority.isBoundToActor(row.asserted_by_key)
   }
 
   /** Records a non-fatal caveat. */

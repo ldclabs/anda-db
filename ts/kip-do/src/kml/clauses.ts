@@ -17,6 +17,7 @@
  */
 
 import { errors } from '../errors.js'
+import type { Permission } from '../governance/index.js'
 import {
   formatElementId,
   parseElementId,
@@ -153,7 +154,9 @@ export function apply(
     where: readonly WhereClause[] | null,
     limit: Scalar | null,
     what: string,
-  ) => resolveTargets(tx, b, target, where, limit, request, operation, what)
+    permission: Permission,
+  ) =>
+    resolveTargets(tx, b, target, where, limit, request, operation, what, permission)
 
   if ('CreateConcept' in clause) return createConcept(tx, b, clause.CreateConcept)
   if ('UpsertConcept' in clause) return upsertConcept(tx, b, clause.UpsertConcept)
@@ -166,7 +169,7 @@ export function apply(
   if ('CreateActivity' in clause) return createRecord(tx, b, clause.CreateActivity, 'Activity')
   if ('RetractAssertion' in clause) {
     const { target, where_clauses, limit, expect_state } = clause.RetractAssertion
-    for (const id of select(target, where_clauses, limit, 'RETRACT').ids) {
+    for (const id of select(target, where_clauses, limit, 'RETRACT', 'retract_own').authorized(tx)) {
       if (expect_state !== null) {
         tx.expectAssertionStatus(id, scalarText(b, expect_state, 'EXPECT STATE'))
       }
@@ -194,7 +197,7 @@ export function apply(
   }
   if ('Archive' in clause) {
     const { target, where_clauses, limit, expect_state } = clause.Archive
-    for (const id of select(target, where_clauses, limit, 'ARCHIVE').ids) {
+    for (const id of select(target, where_clauses, limit, 'ARCHIVE', 'archive').authorized(tx)) {
       if (expect_state !== null) {
         tx.expectState(id, scalarText(b, expect_state, 'EXPECT STATE'))
       }
@@ -204,7 +207,7 @@ export function apply(
   }
   if ('Tombstone' in clause) {
     const { target, where_clauses, limit, expect_state } = clause.Tombstone
-    for (const id of select(target, where_clauses, limit, 'TOMBSTONE').ids) {
+    for (const id of select(target, where_clauses, limit, 'TOMBSTONE', 'tombstone').authorized(tx)) {
       if (expect_state !== null) {
         tx.expectState(id, scalarText(b, expect_state, 'EXPECT STATE'))
       }
@@ -214,7 +217,7 @@ export function apply(
   }
   if ('Update' in clause) {
     const { target, where_clauses, limit, expect_version, actions } = clause.Update
-    for (const id of select(target, where_clauses, limit, 'UPDATE').ids) {
+    for (const id of select(target, where_clauses, limit, 'UPDATE', 'update').authorized(tx)) {
       if (expect_version !== null) {
         tx.expectVersion(id, numberOf(b, expect_version, 'EXPECT VERSION'))
       }
@@ -242,15 +245,15 @@ export function apply(
           `references, which is not something to default into`,
       )
     }
-    for (const id of select(target, where_clauses, limit, 'PURGE').ids) {
+    for (const id of select(target, where_clauses, limit, 'PURGE', 'purge').authorized(tx)) {
       purge(tx, id)
     }
     return
   }
   if ('MergeConcept' in clause) {
     const { source, into, where_clauses, expect_version } = clause.MergeConcept
-    const sources = select(source, where_clauses, null, 'MERGE CONCEPT').ids
-    const targets = select(into, where_clauses, null, 'MERGE CONCEPT ... INTO').ids
+    const sources = select(source, where_clauses, null, 'MERGE CONCEPT', 'merge_identity').authorized(tx)
+    const targets = select(into, where_clauses, null, 'MERGE CONCEPT ... INTO', 'merge_identity').authorized(tx)
     return merge(tx, b, sources, targets, expect_version)
   }
 
@@ -290,6 +293,7 @@ function createConcept(tx: Transaction, b: Bindings, clause: ConceptCreate): voi
     .array('aliases')
     .filter((value): value is string => typeof value === 'string')
   const retention = fields.json('retention')
+  authorizeRetention(tx, retention)
   const extraName = fields.text('name')
   fields.rest('Concept')
 
@@ -315,7 +319,9 @@ function createConcept(tx: Transaction, b: Bindings, clause: ConceptCreate): voi
     retention,
     expires_at: expiresAt(retention),
   }
-  tx.stageNew(id, { kind: 'Concept', row })
+  const element: Element = { kind: 'Concept', row }
+  tx.authorizeCreated(element, 'create')
+  tx.stageNew(id, element)
 }
 
 function createRecord(
@@ -333,6 +339,7 @@ function createRecord(
   const facets = resolveFacets(tx, b, clause.set_facets)
   const structural = collectStructural(tx, b, clause.set_structural, CORE_STRUCTURAL[kind])
   const retention = fields.json('retention')
+  authorizeRetention(tx, retention)
   const envelope = { ...blank(id), facets, structural: structural.profile, retention, expires_at: expiresAt(retention) }
 
   let element: Element
@@ -422,7 +429,41 @@ function createRecord(
     }
   }
   fields.rest(kind)
+  // §17, §18: which epistemic-mutation permission a new Assertion needs depends
+  // on whom the claim is attributed to, and that is only knowable here. `assert`
+  // is the floor for writing any commitment; recording somebody else's claim or
+  // speaking as an actor each add their own on top of it.
+  if (element.kind === 'Assertion') {
+    tx.authorizeCreated(element, 'assert')
+    const extra = attributionPermission(tx, element.row.asserted_by_key)
+    if (extra !== 'assert') tx.authorizeCreated(element, extra)
+  } else {
+    tx.authorizeCreated(element, 'create')
+  }
   tx.stageNew(id, element)
+}
+
+/**
+ * Which epistemic-mutation permission a new Assertion needs, beyond `assert`.
+ *
+ * The three cases §17 keeps apart, decided by what Governance says about the
+ * writer rather than by what the command claims:
+ *
+ * ```text
+ * bound as this actor          assert                       one's own commitment
+ * bound as representing it     assert_as_actor              exercising its authority
+ * not bound to it at all       record_attributed_assertion  "X said P"
+ * ```
+ *
+ * The third is not impersonation and must stay ordinary: a Formation Agent that
+ * observed "Alice: I prefer dark mode" has to be able to store it as Alice's
+ * stated claim without thereby being able to act as Alice.
+ */
+function attributionPermission(tx: Transaction, actorKey: string): Permission {
+  if (actorKey === '') return 'assert'
+  const bound = tx.authority.bindingClassOf(actorKey)
+  if (bound === null) return 'record_attributed_assertion'
+  return bound === 'self' || bound === 'service_identity' ? 'assert' : 'assert_as_actor'
 }
 
 /**
@@ -456,6 +497,14 @@ function upsertConcept(tx: Transaction, b: Bindings, clause: ConceptUpsert): voi
       `${formatElementId(existing)} is a ${element.kind}, not a Concept`,
     )
   }
+  // An upsert is a create or an update and the caller cannot know which in
+  // advance, so each half is authorized as what it turned out to be. The
+  // command gate already asked for both; this asks about *this* element.
+  if (found === null) {
+    tx.authorizeCreated(element, 'create')
+  } else {
+    tx.authorizeElement(existing, 'update')
+  }
   const before = JSON.stringify(element.row)
 
   if (clause.set_attributes !== null) {
@@ -465,7 +514,7 @@ function upsertConcept(tx: Transaction, b: Bindings, clause: ConceptUpsert): voi
     for (const name of clause.unset_attributes) delete element.row.attributes[name]
   }
   if (clause.set_fields !== null) {
-    applyConceptFields(element.row, new Fields(assignments(b, clause.set_fields)))
+    applyConceptFields(tx, element.row, new Fields(assignments(b, clause.set_fields)))
   }
   for (const [symbolText, values] of Object.entries(resolveFacets(tx, b, clause.set_facets))) {
     element.row.facets[symbolText] = {
@@ -546,7 +595,9 @@ function createFromMatch(
     attributes: {},
     merged_into: '',
   }
-  tx.stageNew(id, { kind: 'Concept', row })
+  const element: Element = { kind: 'Concept', row }
+  tx.authorizeCreated(element, 'create')
+  tx.stageNew(id, element)
   return id
 }
 
@@ -588,7 +639,9 @@ function ensureProposition(
       tuple_key: key,
       attributes: {},
     }
-    tx.stageNew(id, { kind: 'Proposition', row })
+    const element: Element = { kind: 'Proposition', row }
+    tx.authorizeCreated(element, 'create')
+    tx.stageNew(id, element)
   } else {
     tx.load(id)
     if (clause.expect_version !== null) {
@@ -610,10 +663,38 @@ function ensureProposition(
  */
 function retract(tx: Transaction, id: ElementId): void {
   const element = requireKind(tx, id, 'Assertion')
+  requireStanding(tx, id, element.row, 'RETRACT')
   if (element.row.status === 'retracted') return
   element.row.status = 'retracted'
   element.row.retracted_at = tx.cx.at
   tx.markChanged(id, 'retract')
+}
+
+/**
+ * Whether this caller may record that the *source* withdrew a claim (§68).
+ *
+ * `RETRACT` and `SUPERSEDE` state something about the original actor: that it
+ * took its claim back. Only two kinds of caller can honestly say so — the one
+ * that wrote the record, and one an ActorBinding says represents the actor.
+ *
+ * A moderator who holds neither is not stuck: `ARCHIVE` and `TOMBSTONE` remove
+ * the Assertion from ordinary recall without claiming anybody recanted, which is
+ * the true statement available to it. Letting it retract instead would have the
+ * engine assert something about the source that never happened.
+ */
+function requireStanding(
+  tx: Transaction,
+  id: ElementId,
+  row: AssertionRow,
+  what: string,
+): void {
+  if (tx.mayRepresentAssertion(row)) return
+  throw errors.retractionNotAuthorized(
+    `${what} records that the source withdrew ${formatElementId(id)}, and this ` +
+      `Principal neither wrote it nor is bound to the actor it is attributed ` +
+      `to. ARCHIVE or TOMBSTONE excludes it from recall without claiming a ` +
+      `retraction that did not happen`,
+  )
 }
 
 /** `SUPERSEDE ... BY` — a later Assertion replaces an earlier one (§15.1). */
@@ -623,8 +704,11 @@ function supersede(tx: Transaction, id: ElementId, by: ElementId): void {
       `${formatElementId(id)} cannot supersede itself`,
     )
   }
+  tx.authorizeElement(id, 'supersede_own')
+  tx.authorizeElement(by, 'supersede_own')
   const older = requireKind(tx, id, 'Assertion')
   const newer = requireKind(tx, by, 'Assertion')
+  requireStanding(tx, id, older.row, 'SUPERSEDE')
   if (older.row.proposition_id !== newer.row.proposition_id) {
     // Supersession is a claim about the same Proposition; across two of them it
     // would silently retire a claim nobody revised.
@@ -653,6 +737,8 @@ function correct(tx: Transaction, id: ElementId, by: ElementId): void {
       `${formatElementId(id)} cannot correct itself`,
     )
   }
+  tx.authorizeElement(id, 'maintain')
+  tx.authorizeElement(by, 'maintain')
   const older = requireKind(tx, id, 'Evidence')
   const newer = requireKind(tx, by, 'Evidence')
   const olderId = formatElementId(id)
@@ -672,6 +758,7 @@ function correct(tx: Transaction, id: ElementId, by: ElementId): void {
 const ACTIVITY_TERMINAL = new Set(['completed', 'failed', 'aborted'])
 
 function transition(tx: Transaction, id: ElementId, to: string): void {
+  tx.authorizeElement(id, 'update')
   const element = requireKind(tx, id, 'Activity')
   if (ACTIVITY_TERMINAL.has(element.row.status)) {
     // Terminal topology freezes with the Activity (§22.3): re-opening a
@@ -1018,7 +1105,7 @@ class Fields {
 const PROTECTED_FIELDS = ['_system', 'governance', 'space_id', 'space_seq']
 
 /** The subset of Concept fields an `UPSERT` may rewrite. */
-function applyConceptFields(row: ConceptRow, fields: Fields): void {
+function applyConceptFields(tx: Transaction, row: ConceptRow, fields: Fields): void {
   const name = fields.text('name')
   if (name !== '') row.name = name
   const canonical = fields.text('canonical_id')
@@ -1029,6 +1116,7 @@ function applyConceptFields(row: ConceptRow, fields: Fields): void {
   }
   const retention = fields.json('retention')
   if (Object.keys(retention).length > 0) {
+    authorizeRetention(tx, retention)
     row.retention = retention
     row.expires_at = expiresAt(retention)
   }
@@ -1221,6 +1309,19 @@ function numberOf(b: Bindings, value: { Literal: unknown } | { Param: string }, 
     )
   }
   return resolved
+}
+
+/**
+ * Authorizes a `retention` block a creation carried.
+ *
+ * Setting how long an element is kept is a lifecycle decision under its own
+ * permission (§80), not a side effect of writing content. The `UPDATE` path
+ * refuses the field outright — retention is control-plane state, not a mutable
+ * content field — so this is the one route by which a KML statement can set it,
+ * and it is gated rather than free.
+ */
+function authorizeRetention(tx: Transaction, retention: JsonMap): void {
+  if (Object.keys(retention).length > 0) tx.require('manage_retention')
 }
 
 /** `retention.expires_at`, lifted out for the retention sweep (§34). */

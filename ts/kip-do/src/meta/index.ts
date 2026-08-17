@@ -169,7 +169,8 @@ function describe(
       authority_expires_at: cx.authority.earliestExpiry(),
       governance: {
         enforced:
-          'commands and reads; see DESCRIBE CAPABILITIES for the granularity',
+          'commands, reads and writes; see DESCRIBE CAPABILITIES for what is ' +
+          'covered',
         default_classification: cx.authority.defaultClassification(),
         policy:
           cx.authority.policy === null
@@ -335,8 +336,8 @@ function describe(
       permissions: held,
       families: byFamily,
       granularity:
-        'commands and reads are authorized per element; writes are authorized ' +
-        'at command scope only',
+        'per element, on reads and writes alike; this report is per Space, ' +
+        'because a per-element access report is an existence oracle',
       expires_at: cx.authority.earliestExpiry(),
     } as Json
   }

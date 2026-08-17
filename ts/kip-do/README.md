@@ -32,17 +32,17 @@ a number.
 `DESCRIBE CAPABILITIES` reports every gap with a reason. Two are worth naming
 here:
 
-- **Governance is enforced on commands and on reads; writes are still command
-  scope.** There are Principals, groups, Grants, Delegations, Policy versions and
-  Approvals. Every command is authorized before it runs, and every element a read
-  reaches is authorized again individually — an element outside the Grant is not
-  in the query universe at all, a masked field is invisible to `FILTER` as well as
-  to the projection, and an Assertion the caller may not read does not contribute
-  to a belief. What is *not* built is the same per-element check on the write
-  path: a Grant narrowed to a kind or a classification gates a mutation without
-  narrowing what that mutation may change. `DESCRIBE ACCESS` reports which is
-  which, because a half-built plane that does not say so is worse than an absent
-  one.
+- **Governance is enforced per element, on reads and on writes.** There are
+  Principals, groups, Grants, Delegations, Policy versions and Approvals. Every
+  command is authorized before it runs, and every element it reaches is
+  authorized again individually: an element outside the Grant is not in the query
+  universe at all, a masked field is invisible to `FILTER` as well as to the
+  projection, a sweep that reaches something it may not touch fails rather than
+  doing less, and a `RETRACT` needs the standing to say the source withdrew its
+  claim. What is not built yet is *writing* classification — labels are read for
+  every decision, and nothing sets one, so every element carries the Space
+  default. `DESCRIBE CAPABILITIES` names that gap rather than letting the word
+  "governance" imply it.
 - **`SEARCH`, in every mode.** No search index is built here. A keyword search
   over unsegmented text would silently disagree with the reference engine about
   which documents match, and a caller cannot tell a narrow index from a narrow

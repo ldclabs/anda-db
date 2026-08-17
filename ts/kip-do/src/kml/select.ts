@@ -23,6 +23,7 @@
 import { errors } from '../errors.js'
 import { compareElementId, formatElementId, type ElementId } from '../id.js'
 import type { JsonMap } from '../json.js'
+import type { Permission } from '../governance/index.js'
 import type { ElementRef, Scalar, WhereClause } from '../kip/ast.js'
 import { Context } from '../kql/context.js'
 import { solveAll } from '../kql/matching.js'
@@ -30,12 +31,41 @@ import { baseline } from '../projection/policy.js'
 import type { Transaction } from '../tx.js'
 import { handleId, parameter, scalar, type Bindings } from './value.js'
 
-/** What a clause's target names, once resolved. */
-export interface Targets {
-  /** The element ids, in the documented order. */
-  ids: ElementId[]
+/**
+ * What a clause's target names, once resolved.
+ *
+ * The ids are private and reachable only through {@link Targets.authorized}, so
+ * a clause cannot act on a selected element without having authorized it. A new
+ * clause that forgets is a compile error rather than an ungoverned sweep.
+ *
+ * **A sweep that reaches something it may not touch fails.** It does not quietly
+ * do less: an operation that reports success having skipped half its targets is
+ * the defect shape this project keeps finding, and here it would also be a
+ * disclosure — the caller could learn which elements exist outside its Grant by
+ * counting what a sweep changed.
+ */
+export class Targets {
   /** Whether the target was named directly rather than selected. */
-  direct: boolean
+  readonly direct: boolean
+  readonly #ids: readonly ElementId[]
+  readonly #permission: Permission
+
+  constructor(ids: readonly ElementId[], direct: boolean, permission: Permission) {
+    this.#ids = ids
+    this.direct = direct
+    this.#permission = permission
+  }
+
+  /** How many elements were selected, without handing any of them over. */
+  get size(): number {
+    return this.#ids.length
+  }
+
+  /** The elements, once every one of them has been authorized. */
+  authorized(tx: Transaction): ElementId[] {
+    for (const id of this.#ids) tx.authorizeElement(id, this.#permission)
+    return [...this.#ids]
+  }
 }
 
 /**
@@ -53,19 +83,19 @@ export function resolveTargets(
   request: JsonMap | undefined,
   operation: JsonMap | undefined,
   what: string,
+  permission: Permission,
 ): Targets {
+  const direct = (id: ElementId) => new Targets([id], true, permission)
   if (where === null) {
-    if ('Handle' in target) {
-      return { ids: [parse(handleId(b, target.Handle))], direct: true }
-    }
-    if ('Id' in target) return { ids: [parse(target.Id)], direct: true }
+    if ('Handle' in target) return direct(parse(handleId(b, target.Handle)))
+    if ('Id' in target) return direct(parse(target.Id))
     const value = parameter(b, target.Param)
     if (typeof value !== 'string') {
       throw errors.typeMismatch(
         `${what} needs an element id, got ${JSON.stringify(value)}`,
       )
     }
-    return { ids: [parse(value)], direct: true }
+    return direct(parse(value))
   }
 
   if (!('Handle' in target)) {
@@ -96,7 +126,7 @@ export function resolveTargets(
   // affected, not which, unless the runtime says which — and this one does.
   const ids = [...seen.values()].sort(compareElementId)
   const cap = limit === null ? null : count(b, limit, `${what} LIMIT`)
-  return { ids: cap === null ? ids : ids.slice(0, cap), direct: false }
+  return new Targets(cap === null ? ids : ids.slice(0, cap), false, permission)
 }
 
 function parse(text: string): ElementId {

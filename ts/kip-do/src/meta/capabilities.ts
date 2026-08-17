@@ -108,12 +108,11 @@ export function capabilities(): Json {
         // "governance: yes" and assumes its classification-scoped Grant narrows
         // what a query returns has been misled by this document, which is worse
         // than being told the plane is absent.
-        enforced: 'command scope, and element scope on the read path',
+        enforced: 'command scope, and element scope on reads and writes',
         meaning:
           'every KQL, KML and META command is authorized against the control ' +
-          'plane before it runs, and every element a read reaches is authorized ' +
-          'again individually. What a *write* touches is not yet checked per ' +
-          'element',
+          'plane before it runs, and every element a command reaches — read or ' +
+          'written — is authorized again individually',
         read_scope: {
           visibility:
             'an element outside the Grant is not in the query universe: not ' +
@@ -131,6 +130,30 @@ export function capabilities(): Json {
             'HISTORY and CHANGES narrow to the elements the caller may read',
           export:
             'a Capsule roots only on readable elements and carries the masked view',
+        },
+        write_scope: {
+          per_element:
+            'each element a clause touches is authorized on its own kind, type ' +
+            'and classification, so a narrowed Grant narrows what a mutation ' +
+            'may change and not only whether it may run',
+          sweeps:
+            'a selection block that reaches an element the caller may not touch ' +
+            'fails; it never quietly does less, which would report success ' +
+            'having done half the job and would leak what lies outside the Grant',
+          attribution:
+            'a new Assertion needs `assert`, plus `record_attributed_assertion` ' +
+            'or `assert_as_actor` depending on what an ActorBinding says about ' +
+            'the writer — never on what the command claims (§17)',
+          retraction:
+            'RETRACT and SUPERSEDE need standing: the caller wrote the record, ' +
+            'or a binding says it represents the actor. ARCHIVE and TOMBSTONE ' +
+            'are the honest alternative for anyone else',
+          retention:
+            'a `retention` block on a creation needs `manage_retention`; the ' +
+            'UPDATE path refuses the field outright',
+          protected_fields:
+            '`_system` and `governance` are refused by the parser, on the text ' +
+            'and pre-parsed paths alike, so no mutation can reach them',
         },
         records: [
           'Principals and Principal groups',
@@ -151,20 +174,6 @@ export function capabilities(): Json {
       grammar: { parser: parserVersion(), spec_revision: specRevision() },
     },
     unsupported: [
-      {
-        capability: 'write_scope_authorization',
-        detail:
-          'the per-element checks a mutation performs: authorizing each element ' +
-          'a clause touches, refining the Assertion permission from ' +
-          '`asserted_by`, and the standing a retraction needs',
-        reason:
-          'a write is authorized at command scope only. A Grant narrowed to a ' +
-          'kind, a type or a classification gates the statement and does not ' +
-          'narrow what that statement may change, so such a Grant is more ' +
-          'permissive on the write path than it reads. The read path does check ' +
-          'per element, and DESCRIBE ACCESS reports which is which rather than ' +
-          'letting a caller infer one granularity from the other',
-      },
       {
         capability: 'classification_writes',
         detail:
