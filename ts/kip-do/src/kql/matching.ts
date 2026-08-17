@@ -285,6 +285,18 @@ function scan(
     return id !== null && id.kind === kind ? [id] : []
   }
 
+  // At a past coordinate the indexes say nothing: they describe the present.
+  // The version log is reconstructed instead, and every narrowing this function
+  // would have pushed into SQL is re-applied by `checkMatcher` against the
+  // reconstructed row — including the default `state = active`, which is why
+  // dropping the SQL predicates here does not widen the answer.
+  if (cx.historical) {
+    return cx.reconstruct(kind).map((element) => ({
+      kind: element.kind,
+      seq: element.row.id,
+    }))
+  }
+
   for (const [field, value] of Object.entries(matcher)) {
     const column = columns[field]
     if (column === undefined) continue
@@ -545,27 +557,54 @@ function tupleCandidates(
   solution: Solution,
   b: ReadBindings,
 ): TupleRow[] {
-  const wheres = ['space = ?', 'state = ?']
-  const values: SqlStorageValue[] = [cx.space, State.ACTIVE]
-
+  // The narrowing is computed once and then either pushed into SQL or applied in
+  // JavaScript, so the present and historical paths cannot drift apart about
+  // what a tuple pattern matches. Splitting them into two independent filters is
+  // how a historical read would silently answer more than a present one.
   const subjectKey = pinnedKey(subject, solution, b)
-  if (subjectKey !== null) {
-    wheres.push('subject_key = ?')
-    values.push(subjectKey)
-  }
   const objectKey = pinnedKey(object, solution, b)
-  if (objectKey !== null) {
-    wheres.push('object_key = ?')
-    values.push(objectKey)
-  }
+  let predicateRef: string | null = null
   if (!('Variable' in predicate)) {
     const name =
       'Literal' in predicate ? predicate.Literal : parameterValue(b, predicate.Param)
     if (typeof name !== 'string') {
       throw errors.typeMismatch('a predicate must be a symbol string')
     }
+    predicateRef = resolveSymbol(cx, 'predicate', name)
+  }
+
+  if (cx.historical) {
+    return cx
+      .reconstruct('Proposition')
+      .map((element) => element.row as PropositionRow)
+      .filter(
+        (row) =>
+          row.state === State.ACTIVE &&
+          (subjectKey === null || row.subject_key === subjectKey) &&
+          (objectKey === null || row.object_key === objectKey) &&
+          (predicateRef === null || row.predicate_ref === predicateRef),
+      )
+      .map((row) => ({
+        seq: row.id,
+        subject: row.subject as Json,
+        object: row.object as Json,
+        predicate_ref: row.predicate_ref,
+      }))
+  }
+
+  const wheres = ['space = ?', 'state = ?']
+  const values: SqlStorageValue[] = [cx.space, State.ACTIVE]
+  if (subjectKey !== null) {
+    wheres.push('subject_key = ?')
+    values.push(subjectKey)
+  }
+  if (objectKey !== null) {
+    wheres.push('object_key = ?')
+    values.push(objectKey)
+  }
+  if (predicateRef !== null) {
     wheres.push('predicate_ref = ?')
-    values.push(resolveSymbol(cx, 'predicate', name))
+    values.push(predicateRef)
   }
 
   // The whole row rather than the four columns the tuple needs, so the element

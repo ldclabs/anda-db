@@ -300,8 +300,6 @@ describe('KQL', () => {
   it('refuses the read features it has not built', async () => {
     await withNexus('unsupported', (nexus) => {
       for (const command of [
-        'FIND(?c) WHERE { ?c CONCEPT {} } AS OF SEQ 1',
-        'FIND(?c) WHERE { ?c CONCEPT {} } FOR TIME "2026-01-01T00:00:00Z"',
         'FIND(?o) WHERE { ?p PROPOSITION (?s, "prefers"{1,3}, ?o) }',
       ]) {
         expect(() => nexus.query(command), command).toThrowError(

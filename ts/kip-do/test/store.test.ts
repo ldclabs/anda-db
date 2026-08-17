@@ -417,6 +417,7 @@ describe('the store', () => {
         lock: { packages: {} },
         created_at: at,
         tx_id: 'tx-1',
+        seq: 1,
       })
       store.appendSchemaEnv({
         space: 'space://a',
@@ -424,6 +425,7 @@ describe('the store', () => {
         lock: { packages: { 'kip://core': '2.0.0' } },
         created_at: at,
         tx_id: 'tx-2',
+        seq: 1,
       })
 
       // A transaction records which environment version it ran under, so an
@@ -437,6 +439,7 @@ describe('the store', () => {
           lock: {},
           created_at: at,
           tx_id: 'tx-3',
+        seq: 1,
         }),
       ).toThrowError(/UNIQUE/)
     })

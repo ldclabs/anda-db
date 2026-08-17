@@ -12,6 +12,7 @@ import { errors } from '../errors.js'
 import type { AuthContext, EffectiveAuthority } from '../governance/index.js'
 import type { Json, JsonMap } from '../json.js'
 import type {
+  AsOf,
   AggregationFunction,
   BoundValue,
   FindExpression,
@@ -22,6 +23,8 @@ import type {
 import type { SchemaEnvironment } from '../schema/index.js'
 import type { Store } from '../store/index.js'
 import { Context } from './context.js'
+import { coordinateFromToken } from '../store/index.js'
+import { normalizeTime } from '../time.js'
 import {
   kipLiteral,
   parameterValue,
@@ -51,21 +54,31 @@ export interface KqlContext {
   authority: EffectiveAuthority
   /** Who the caller is. */
   auth: AuthContext
+  /**
+   * The `read.snapshot_token` the request envelope carried, if it carried one.
+   *
+   * A second way to name the same coordinate, and the two may not disagree —
+   * see {@link bindCoordinate}.
+   */
+  snapshotToken?: string
+  /**
+   * The Schema Environment of a past coordinate (§144).
+   *
+   * A historical read resolves symbols through the environment that was in
+   * force *then*, never today's: reconstructing the past under today's schema
+   * answers a question nobody asked, and does it silently — a symbol that
+   * resolves differently now returns different elements rather than an error.
+   *
+   * Supplied as a resolver because only the Nexus can build an environment: it
+   * owns the installed package artifacts a lock resolves against. Required
+   * rather than defaulted to `env`, because that default would be the silent
+   * wrong answer above and nothing would report it.
+   */
+  environmentAt: (version: number) => SchemaEnvironment
 }
 
 /** Runs one KQL query and returns the result array. */
 export function executeKql(query: KqlQuery, cx: KqlContext): Json[] {
-  if (query.as_of !== null) {
-    throw errors.unsupportedCapability(
-      'AS OF is not implemented by this engine yet; see DESCRIBE CAPABILITIES',
-    )
-  }
-  if (query.for_time !== null) {
-    throw errors.unsupportedCapability(
-      'FOR TIME is not implemented by this engine yet; see DESCRIBE CAPABILITIES',
-    )
-  }
-  const context = new Context(cx.store, cx.env, cx.space, cx.authority, cx.auth)
   const b: ReadBindings = {
     request: cx.request ?? {},
     operation: cx.operation ?? {},
@@ -75,7 +88,24 @@ export function executeKql(query: KqlQuery, cx: KqlContext): Json[] {
     policy: policyFromSettings(epistemicSettings(query.epistemic, cx)),
   }
 
-  const solutions = solveAll(context, query.where_clauses, [new Map()], b)
+  const asOf = bindCoordinate(query, cx, b)
+  const env =
+    asOf === null ? cx.env : cx.environmentAt(cx.store.schemaVersionAt(cx.space, asOf))
+  const context = new Context(cx.store, env, cx.space, cx.authority, cx.auth, asOf)
+
+  // `FOR TIME` names the world time a claim has to apply at, so a projection in
+  // the same query answers about that instant rather than about now. A different
+  // axis from `AS OF` — what was *true* then, not what this Brain *held* then
+  // (§36.1) — and the two never default from each other.
+  const validAt = query.for_time === null ? null : time(cx, query.for_time, b)
+
+  const solutions = validAt === null
+    ? solveAll(context, query.where_clauses, [new Map()], b)
+    : restrictToValidTime(
+        context,
+        solveAll(context, query.where_clauses, [new Map()], b),
+        validAt,
+      )
   const expressions = query.find_clause.expressions
 
   if (expressions.some((e) => 'Aggregation' in e)) {
@@ -85,6 +115,113 @@ export function executeKql(query: KqlQuery, cx: KqlContext): Json[] {
   const ordered = sort(context, solutions, query.order_by, b)
   const rows = page(ordered, query, b)
   return rows.map((solution) => project(context, expressions, solution))
+}
+
+/**
+ * Resolves the one coordinate this read answers at.
+ *
+ * `AS OF` names one and the request envelope may carry a snapshot token. Both
+ * resolve to a Space sequence, and they may not disagree: a request pinned to
+ * one coordinate whose command named another would leave the answer's own
+ * `snapshot_seq` unable to say which it meant.
+ *
+ * A coordinate the Space has not reached is refused rather than rounded to the
+ * present. Rounding would answer a different question and say nothing about
+ * having done so, which is the worst available behaviour for a read whose whole
+ * point is *when*.
+ */
+export function bindCoordinate(
+  query: { as_of: AsOf | null },
+  cx: KqlContext,
+  b: ReadBindings,
+): number | null {
+  const fromToken =
+    cx.snapshotToken === undefined
+      ? null
+      : coordinateFromToken(cx.snapshotToken, cx.space).seq
+  const fromCommand = query.as_of === null ? null : resolveAsOf(query.as_of, cx, b)
+  if (fromToken !== null && fromCommand !== null && fromToken !== fromCommand) {
+    throw errors.invalidRequestEnvelope(
+      `this request is bound to snapshot ${fromToken} and its command reads ` +
+        `AS OF ${fromCommand}; one read answers at one coordinate`,
+    )
+  }
+  const seq = fromCommand ?? fromToken
+  if (seq === null) return null
+  const current = cx.store.currentSeq(cx.space)
+  if (seq > current) {
+    throw errors.historicalSnapshotUnavailable(
+      `this Space has reached sequence ${current}, so ${seq} names no ` +
+        `coordinate it can answer at; a future coordinate is refused rather ` +
+        `than rounded to the present`,
+    )
+  }
+  return seq
+}
+
+/** Resolves an `AS OF` coordinate to a Space sequence. */
+export function resolveAsOf(asOf: AsOf, cx: KqlContext, b: ReadBindings): number {
+  if ('Seq' in asOf) {
+    const value = scalarValue(asOf.Seq, b)
+    if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+      throw errors.typeMismatch('AS OF SEQ takes a non-negative sequence')
+    }
+    return value
+  }
+  if ('Tx' in asOf) {
+    const value = scalarValue(asOf.Tx, b)
+    if (typeof value !== 'string') {
+      throw errors.typeMismatch('AS OF TX takes a transaction id')
+    }
+    return cx.store.seqOfTransaction(cx.space, value)
+  }
+  const value = scalarValue(asOf.Time, b)
+  if (typeof value !== 'string') {
+    throw errors.typeMismatch('AS OF TIME takes an RFC 3339 timestamp')
+  }
+  return cx.store.seqAtTime(cx.space, normalizeTime(value, 'AS OF TIME'))
+}
+
+function time(cx: KqlContext, scalar: Scalar, b: ReadBindings): string {
+  void cx
+  const value = scalarValue(scalar, b)
+  if (typeof value !== 'string') {
+    throw errors.typeMismatch('FOR TIME takes an RFC 3339 timestamp')
+  }
+  return normalizeTime(value, 'FOR TIME')
+}
+
+/**
+ * Keeps only the solutions whose Assertions applied at a world time.
+ *
+ * `FOR TIME` filters on `valid_time`, the axis that says when a claim *applies*
+ * — never `asserted_at`, which says when somebody said it, and never the engine
+ * sequence, which says when this Brain recorded it (§36). A solution binding no
+ * Assertion is untouched: the clause narrows claims, and a Concept has no
+ * validity interval to be outside of.
+ */
+function restrictToValidTime(
+  cx: Context,
+  solutions: readonly Solution[],
+  at: string,
+): Solution[] {
+  return solutions.filter((solution) =>
+    [...solution.values()].every((binding) => {
+      if (binding.kind !== 'element' || binding.id.kind !== 'Assertion') return true
+      const view = cx.view(binding.id)
+      if (view === null) return true
+      const validTime = view.valid_time
+      const from = readInterval(validTime, 'from')
+      const until = readInterval(validTime, 'until')
+      return (from === '' || from <= at) && (until === '' || at < until)
+    }),
+  )
+}
+
+function readInterval(value: unknown, member: 'from' | 'until'): string {
+  if (value === null || typeof value !== 'object') return ''
+  const found = (value as Record<string, unknown>)[member]
+  return typeof found === 'string' ? found : ''
 }
 
 /**

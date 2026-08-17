@@ -379,6 +379,15 @@ export function slotToJson(
  */
 function assertionsAbout(cx: Context, proposition: ElementId): AssertionRow[] {
   const target = formatElementId(proposition)
+  // At a past coordinate the projection sees only the Assertions that existed
+  // then: a belief computed from today's commitments and reported under a past
+  // coordinate would be an answer to neither question.
+  if (cx.historical) {
+    return cx
+      .reconstruct('Assertion')
+      .map((element) => element.row as AssertionRow)
+      .filter((row) => row.proposition_id === target)
+  }
   const rows = cx.store.sql
     .exec<SqlRow>(
       `SELECT * FROM assertions WHERE space = ? AND proposition_id = ?
@@ -432,6 +441,20 @@ export function slotPropositions(
   subjectKey: string,
   predicateRef: string,
 ): ElementId[] {
+  if (cx.historical) {
+    return cx
+      .reconstruct('Proposition')
+      .filter((element) => {
+        const row = element.row as PropositionRow
+        return (
+          row.state === State.ACTIVE &&
+          row.subject_key === subjectKey &&
+          row.predicate_ref === predicateRef
+        )
+      })
+      .map((element) => ({ kind: 'Proposition', seq: element.row.id }) as ElementId)
+  }
+
   // The whole row, so each rival is remembered through the visibility check
   // rather than named by id alone. A rival this caller may not read must not
   // widen a functional predicate's conflict set: its Assertions would then be

@@ -97,11 +97,49 @@ export function capabilities(): Json {
         score_semantics: 'normalized_support_not_probability',
       },
       historical_read: {
-        // Every commit appends the row it wrote, so a past coordinate could be
-        // reconstructed rather than approximated — the log is here, the read
-        // path over it is not.
         retention: 'unbounded: every element version is kept',
-        available_through: ['HISTORY ELEMENT', 'HISTORY SPACE', 'CHANGES'],
+        available_through: [
+          'FIND ... AS OF SEQ | TX | TIME',
+          'read.snapshot_token',
+          'SNAPSHOT',
+          'DESCRIBE SCHEMA ENVIRONMENT AS OF',
+          'HISTORY ELEMENT',
+          'HISTORY SPACE',
+          'CHANGES',
+        ],
+        coordinate:
+          'one read answers at one coordinate; a request bound by a snapshot ' +
+          'token whose command names a different one is refused rather than ' +
+          'resolved, because the answer’s own snapshot_seq could not say which ' +
+          'it meant',
+        out_of_range:
+          'a coordinate the Space has not reached is refused, never rounded to ' +
+          'the present; a coordinate before anything existed is an empty Space ' +
+          'and not an error',
+        schema:
+          'symbols resolve through the Schema Environment in force at the ' +
+          'coordinate (§144), never today’s',
+        projection:
+          'a belief at a coordinate is projected from the Assertions of that ' +
+          'coordinate',
+        cost:
+          'the indexes describe the present, so a historical pattern ' +
+          'reconstructs candidates from the version log and re-checks every ' +
+          'constraint against the reconstructed row. Charged to the same query ' +
+          'budget, so it refuses rather than stalls',
+        authorization:
+          'a past coordinate is not a way around the present’s authorization: ' +
+          'the read is happening now, by this caller, and every reconstructed ' +
+          'element goes through the same visibility check',
+      },
+      valid_time: {
+        // A different axis from `AS OF`, and the two never default from each
+        // other: what was *true* then is not what this Brain *held* then.
+        for_time:
+          'FOR TIME narrows to the Assertions whose `valid_time` covers an ' +
+          'instant; it reads neither `asserted_at` nor the engine sequence',
+        applies_to:
+          'Assertions only — a Concept has no validity interval to be outside of',
       },
       governance: {
         // The granularity is named rather than implied. A caller that reads
@@ -267,13 +305,6 @@ export function capabilities(): Json {
           'by name rather than accepted and ignored. `retention.expires_at` is ' +
           'stored and indexed, so what is missing is the clause that sets it ' +
           'and the sweep that acts on it — not the column',
-      },
-      {
-        capability: 'historical_read',
-        detail: 'FIND ... AS OF SEQ | TX | TIME, FOR TIME, SNAPSHOT',
-        reason:
-          'the element version log is written and readable through HISTORY, ' +
-          'but the query path that reconstructs candidates from it is not built',
       },
       {
         capability: 'search',

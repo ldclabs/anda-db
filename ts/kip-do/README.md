@@ -23,11 +23,11 @@ than an absent one. It is recoverable from this branch's history.
 
 What works today: the storage layer, Schema Packages and symbol resolution,
 transactions and the KML mutation clauses, KQL, the Epistemic Projection, META,
-Capsule export and verification, and the Governance control plane at command
-scope. **56 of the 62 shared conformance cases pass**; the remaining 6 are all
-the historical read path (`AS OF`), and `test/conformance.test.ts` names them
-individually so closing the gap has to be acknowledged rather than absorbed into
-a number.
+Capsule export and verification, the Governance control plane, and the
+historical read path. **All 62 shared conformance cases pass** — the list in
+`test/conformance.test.ts` names what is not built rather than counting it, so
+closing the last gap meant deleting a name and a new one cannot hide inside a
+number that happens to match.
 
 `DESCRIBE CAPABILITIES` reports every gap with a reason. Two are worth naming
 here:
@@ -56,6 +56,13 @@ here:
   over unsegmented text would silently disagree with the reference engine about
   which documents match, and a caller cannot tell a narrow index from a narrow
   world.
+
+Reading the past works on both axes, and they are deliberately kept apart:
+`AS OF SEQ | TX | TIME` asks what this Brain *held* then, `FOR TIME` asks what
+was *true* then. One read answers at one coordinate — a request pinned by a
+`snapshot_token` whose command names a different one is refused — and symbols
+resolve through the Schema Environment that was in force at the coordinate
+rather than today's.
 
 A multi-tenant host authenticates its callers by overriding
 `KipDatabase.authenticate`, which returns the identity the *host observed* about

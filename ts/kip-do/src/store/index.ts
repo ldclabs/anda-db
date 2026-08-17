@@ -64,6 +64,14 @@ export {
 } from './store.js'
 
 export {
+  coordinateFromToken,
+  elementOfVersion,
+  snapshotJson,
+  snapshotToken,
+  type Coordinate,
+} from './history.js'
+
+export {
   GovernanceStore,
   actorKey,
   type ActorBindingDraft,

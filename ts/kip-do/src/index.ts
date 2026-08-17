@@ -88,6 +88,7 @@ export {
   SYSTEM_PRINCIPAL,
   Session,
   type NexusOptions,
+  type ReadOptions,
 } from './nexus.js'
 
 export * from './governance/index.js'

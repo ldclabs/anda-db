@@ -170,7 +170,7 @@ export const TABLE_SPECS: Readonly<Record<string, TableSpec>> = {
     json: new Set(['artifact']),
   },
   schema_envs: {
-    columns: ['space', 'version', 'lock', 'created_at', 'tx_id'],
+    columns: ['space', 'version', 'lock', 'created_at', 'tx_id', 'seq'],
     json: new Set(['lock']),
   },
   element_versions: {

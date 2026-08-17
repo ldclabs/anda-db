@@ -50,6 +50,7 @@ import type {
 import { parseKip, parserVersion, specRevision } from '../kip/parser.js'
 import { executeKml } from '../kml/index.js'
 import { Context } from '../kql/context.js'
+import { bindCoordinate, type KqlContext } from '../kql/index.js'
 import { kipLiteral, parameterValue, type ReadBindings } from '../kql/matching.js'
 import { baseline, forecast } from '../projection/policy.js'
 import {
@@ -62,7 +63,7 @@ import {
   type SchemaEnvironment,
   type SymbolKind,
 } from '../schema/index.js'
-import type { ChangeEntry, Store } from '../store/index.js'
+import { snapshotJson, type ChangeEntry, type Store } from '../store/index.js'
 import { capabilities, KIP_VERSION } from './capabilities.js'
 import { exportCapsule, verifyCapsule } from '../capsule/index.js'
 
@@ -84,6 +85,14 @@ export interface MetaContext {
   authority: EffectiveAuthority
   /** Who the caller is. */
   auth: AuthContext
+  /**
+   * The Schema Environment of a past coordinate (§144).
+   *
+   * `SNAPSHOT AS OF` and `DESCRIBE SCHEMA ENVIRONMENT AS OF` both answer about
+   * a coordinate, and both have to answer about the schema that was in force at
+   * it rather than today's.
+   */
+  environmentAt: (version: number) => SchemaEnvironment
 }
 
 /** Runs one META command. */
@@ -122,11 +131,14 @@ export function executeMeta(command: MetaCommand, cx: MetaContext): Json {
     return verifyCapsule(scalarValue(command.Verify.value, b))
   }
   if ('Snapshot' in command) {
-    // A SNAPSHOT token promises a coordinate can be read back. This engine
-    // cannot read one back yet, so it does not issue the promise.
-    throw errors.unsupportedCapability(
-      'SNAPSHOT issues a token that promises a past coordinate can be read ' +
-        'back; this engine has no historical read path, so it does not issue one',
+    // A SNAPSHOT token promises that a coordinate can be read back, so issuing
+    // one is only honest once the engine can honour it. It can now.
+    const seq = bindCoordinate(command.Snapshot, readContext(cx), b) ??
+      cx.store.currentSeq(cx.space)
+    return snapshotJson(
+      cx.space,
+      { seq },
+      cx.store.schemaVersionAt(cx.space, seq),
     )
   }
   // SEARCH. Refused by name and for its own reason: a keyword search over
@@ -211,16 +223,22 @@ function describe(
     return { ...row, id: undefined } as unknown as Json
   }
   if ('SchemaEnvironment' in target) {
-    if (target.SchemaEnvironment.as_of !== null) {
-      throw errors.unsupportedCapability(
-        'DESCRIBE SCHEMA ENVIRONMENT AS OF needs a historical read path, ' +
-          'which this engine has not built',
-      )
-    }
+    // §144: at a coordinate, the environment that was in force *then*. A
+    // historical answer under today's schema would describe a resolution that
+    // never happened.
+    const env =
+      target.SchemaEnvironment.as_of === null
+        ? cx.env
+        : cx.environmentAt(
+            cx.store.schemaVersionAt(
+              cx.space,
+              bindCoordinate(target.SchemaEnvironment, readContext(cx), b) ?? 0,
+            ),
+          )
     return {
-      version: cx.env.version,
-      lock: cx.env.lock as unknown as Json,
-      packages: cx.env.packageRefs(),
+      version: env.version,
+      lock: env.lock as unknown as Json,
+      packages: env.packageRefs(),
     } as Json
   }
   if ('Package' in target) {
@@ -604,6 +622,26 @@ function history(
 /** A read context, for the META paths that have to resolve an element. */
 function reader(cx: MetaContext): Context {
   return new Context(cx.store, cx.env, cx.space, cx.authority, cx.auth)
+}
+
+/**
+ * The KQL context a META command borrows to resolve a coordinate.
+ *
+ * `SNAPSHOT AS OF …` names a coordinate exactly as a query does, and it has to
+ * resolve to the same number: two spellings of "which coordinate is this" would
+ * eventually disagree about a transaction id or a future sequence.
+ */
+function readContext(cx: MetaContext): KqlContext {
+  return {
+    store: cx.store,
+    space: cx.space,
+    env: cx.env,
+    request: cx.request,
+    operation: cx.operation,
+    authority: cx.authority,
+    auth: cx.auth,
+    environmentAt: cx.environmentAt,
+  }
 }
 
 /**

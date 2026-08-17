@@ -31,6 +31,13 @@ import {
 } from './codec.js'
 import { applySchema } from './ddl.js'
 import { GovernanceStore } from './governance.js'
+import {
+  elementAt,
+  elementsAt,
+  schemaVersionAt,
+  seqAtTime,
+  seqOfTransaction,
+} from './history.js'
 import { elementReferences } from './references.js'
 import {
   State,
@@ -417,6 +424,31 @@ export class Store {
       )
       .toArray()
       .map((row) => decodeRow<ElementVersionRow>('element_versions', row))
+  }
+
+  /** One element as it stood at a coordinate, or `null` when it did not exist. */
+  elementAt(space: string, id: ElementId, seq: number): Element | null {
+    return elementAt(this.sql, space, id, seq)
+  }
+
+  /** Every element of one kind that existed in a Space at a coordinate. */
+  elementsAt(space: string, kind: ElementKind, seq: number): Element[] {
+    return elementsAt(this.sql, space, kind, seq)
+  }
+
+  /** Resolves `AS OF TX :tx` to the Space sequence that transaction produced. */
+  seqOfTransaction(space: string, txId: string): number {
+    return seqOfTransaction(this.sql, space, txId)
+  }
+
+  /** Resolves `AS OF TIME :t` to the last coordinate committed at or before it. */
+  seqAtTime(space: string, at: string): number {
+    return seqAtTime(this.sql, space, at)
+  }
+
+  /** The Schema Environment version that was in force at a coordinate (§144). */
+  schemaVersionAt(space: string, seq: number): number {
+    return schemaVersionAt(this.sql, space, seq)
   }
 
   /**

@@ -22,7 +22,7 @@ import {
   type AuthContext,
   type RequestContext,
 } from './governance/index.js'
-import { CognitiveNexus, type NexusOptions } from './nexus.js'
+import { CognitiveNexus, type NexusOptions, type ReadOptions } from './nexus.js'
 import {
   BUNDLED_PACKAGES,
   COGNITIVE_MEMORY,
@@ -108,6 +108,7 @@ export class KipDatabase<Env = KipDatabaseEnv> extends DurableObject<Env> {
     command: string,
     params: JsonMap = {},
     context?: RequestContext,
+    read?: ReadOptions,
   ): KipResult {
     try {
       const session = this.nexus.session(this.authenticate(context))
@@ -116,7 +117,7 @@ export class KipDatabase<Env = KipDatabaseEnv> extends DurableObject<Env> {
         return { receipt: session.mutate(parsed.Kml, params) }
       }
       if ('Kql' in parsed) {
-        return { result: session.find(parsed.Kql, params) as Json }
+        return { result: session.find(parsed.Kql, params, read ?? {}) as Json }
       }
       return { result: session.describe(command, params) }
     } catch (err) {
@@ -140,9 +141,10 @@ export class KipDatabase<Env = KipDatabaseEnv> extends DurableObject<Env> {
   executeKipBatch(
     commands: readonly { command: string; parameters?: JsonMap }[],
     context?: RequestContext,
+    read?: ReadOptions,
   ): KipResult[] {
     return commands.map((operation) =>
-      this.executeKip(operation.command, operation.parameters ?? {}, context),
+      this.executeKip(operation.command, operation.parameters ?? {}, context, read),
     )
   }
 
@@ -168,6 +170,7 @@ export class KipDatabase<Env = KipDatabaseEnv> extends DurableObject<Env> {
       operations?: { command?: string; parameters?: JsonMap }[]
       execution?: { mode?: string }
       context?: RequestContext
+      read?: ReadOptions
     }
     if (envelope.execution?.mode === 'atomic') {
       return this.envelope(
@@ -201,6 +204,7 @@ export class KipDatabase<Env = KipDatabaseEnv> extends DurableObject<Env> {
         parameters: operation.parameters,
       })),
       envelope.context,
+      envelope.read,
     )
     return this.envelope({ results }, statusFor(results))
   }

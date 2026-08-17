@@ -57,6 +57,15 @@ export class Context {
   /** Who the caller is. */
   readonly auth: AuthContext
   /**
+   * The past coordinate this read is bound to, or `null` for the present.
+   *
+   * Every read in this context answers at the same coordinate: a query whose
+   * patterns disagreed about *when* they were reading would join two different
+   * Brains together and report the result as one.
+   */
+  readonly asOf: number | null
+
+  /**
    * Whether `_system.origin` may be returned at all (§110).
    *
    * Space-scoped and decided once: engine origin is operational information
@@ -74,13 +83,20 @@ export class Context {
     space: string,
     authority: EffectiveAuthority,
     auth: AuthContext,
+    asOf: number | null = null,
   ) {
     this.store = store
     this.env = env
     this.space = space
     this.authority = authority
     this.auth = auth
+    this.asOf = asOf
     this.readOrigin = isPermittedRead(authority, auth)
+  }
+
+  /** Whether this read is bound to a past coordinate. */
+  get historical(): boolean {
+    return this.asOf !== null
   }
 
   /** Loads an element, or `null` when it is not in this caller's universe. */
@@ -90,7 +106,11 @@ export class Context {
     if (cached !== undefined) return cached
 
     this.spend('loads', 1)
-    const visible = this.admit(key, this.store.load(id))
+    const found =
+      this.asOf === null
+        ? this.store.load(id)
+        : this.store.elementAt(this.space, id, this.asOf)
+    const visible = this.admit(key, found)
     this.elements.set(key, visible)
     return visible
   }
@@ -124,6 +144,32 @@ export class Context {
    */
   readsWholeSpace(): boolean {
     return this.authority.readsWholeSpace(this.auth)
+  }
+
+  /**
+   * Every element of one kind that existed at this read's coordinate.
+   *
+   * Only meaningful for a historical read, and it is a scan by necessity: the
+   * indexes describe the present, and `{state: "active"}` today says nothing
+   * about what was active at sequence 41. Charged to the same budget as
+   * everything else, so a historical read of an enormous Space refuses rather
+   * than stalls.
+   *
+   * The elements are remembered on the way out, so a later `view` answers from
+   * the coordinate rather than re-reading the present. They still go through the
+   * visibility check: a past coordinate is not a way around the present's
+   * authorization, because the read is happening now, by this caller.
+   */
+  reconstruct(kind: ElementKind): Element[] {
+    if (this.asOf === null) return []
+    const elements = this.store.elementsAt(this.space, kind, this.asOf)
+    this.spend('scans', elements.length)
+    const visible: Element[] = []
+    for (const element of elements) {
+      const id = this.remember(element)
+      if (this.load(id) !== null) visible.push(element)
+    }
+    return visible
   }
 
   /**

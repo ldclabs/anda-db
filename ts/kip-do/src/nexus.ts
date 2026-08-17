@@ -197,6 +197,9 @@ export class CognitiveNexus {
         lock: lock as unknown as JsonMap,
         created_at: nowTime(),
         tx_id: '',
+        // The next coordinate, not the current one: nothing already committed
+        // was written under this environment.
+        seq: this.store.currentSeq(space) + 1,
       })
       const row = this.spaceRow(space)
       row.schema_environment_version = version
@@ -228,6 +231,30 @@ export class CognitiveNexus {
   environment(space = this.space): SchemaEnvironment {
     const row = this.store.schemaEnv(space)
     if (row === null) return SchemaEnvironment.coreOnly()
+    return SchemaEnvironment.resolve(
+      row.version,
+      lockFromJson(row.lock),
+      this.artifacts(),
+    )
+  }
+
+  /**
+   * A Space's Schema Environment at one version (§144).
+   *
+   * What a historical read resolves symbols through. Version 0 is the Core-only
+   * environment a Space has before it activates anything — an honest answer
+   * rather than a missing one, because a read at a coordinate before the first
+   * activation happened under exactly that.
+   */
+  environmentAt(space: string, version: number): SchemaEnvironment {
+    if (version === 0) return SchemaEnvironment.coreOnly()
+    const row = this.store.schemaEnv(space, version)
+    if (row === null) {
+      throw errors.historicalSchemaUnavailable(
+        `${space} has no Schema Environment version ${version}; the coordinate ` +
+          `cannot be resolved under the schema that was in force at it`,
+      )
+    }
     return SchemaEnvironment.resolve(
       row.version,
       lockFromJson(row.lock),
@@ -298,15 +325,15 @@ export class CognitiveNexus {
    * Reads take no transaction: a Durable Object is single-threaded, so nothing
    * can change underneath a query that has already started.
    */
-  query(command: string, params: JsonMap = {}): Json[] {
-    return this.systemSession().query(command, params)
+  query(command: string, params: JsonMap = {}, read: ReadOptions = {}): Json[] {
+    return this.systemSession().query(command, params, read)
   }
 
   /** Runs one parsed KQL query. */
   find(
     query: KqlQuery,
     params: JsonMap = {},
-    options: Partial<KqlContext> = {},
+    options: Partial<KqlContext> & ReadOptions = {},
   ): Json[] {
     return this.systemSession().find(query, params, options)
   }
@@ -381,6 +408,17 @@ export class CognitiveNexus {
  * control plane on every command, which is what makes a revocation take effect
  * for a session that started before it (§188, §245).
  */
+/**
+ * The `read` block of a request envelope (§85).
+ *
+ * A snapshot token binds a read to the coordinate a previous `SNAPSHOT`
+ * reported, which is how a caller makes several requests answer at one
+ * coordinate rather than at whatever each of them happens to find.
+ */
+export interface ReadOptions {
+  snapshot_token?: string
+}
+
 export class Session {
   readonly nexus: CognitiveNexus
   readonly auth: AuthContext
@@ -406,12 +444,12 @@ export class Session {
   }
 
   /** Parses and runs one KQL query, returning the bare result array. */
-  query(command: string, params: JsonMap = {}): Json[] {
+  query(command: string, params: JsonMap = {}, read: ReadOptions = {}): Json[] {
     const parsed: Command = parseKip(command)
     if (!('Kql' in parsed)) {
       throw errors.languageMismatch('this command is not a KQL query')
     }
-    return this.find(parsed.Kql, params)
+    return this.find(parsed.Kql, params, read)
   }
 
   /** Parses and runs one META command. */
@@ -428,6 +466,7 @@ export class Session {
       space,
       env: this.nexus.environment(space),
       request: params,
+      environmentAt: (version) => this.nexus.environmentAt(space, version),
       authority,
       auth: this.auth,
     }
@@ -441,16 +480,21 @@ export class Session {
   find(
     query: KqlQuery,
     params: JsonMap = {},
-    options: Partial<KqlContext> = {},
+    options: Partial<KqlContext> & ReadOptions = {},
   ): Json[] {
     const space = options.space ?? this.nexus.space
     const authority = this.effectiveAuthority(space)
-    this.gate(authority, kqlPermissions(query))
+    this.gate(
+      authority,
+      kqlPermissions(query, options.snapshot_token !== undefined),
+    )
     return executeKql(query, {
       store: this.nexus.store,
       space,
       env: this.nexus.environment(space),
       request: params,
+      environmentAt: (version) => this.nexus.environmentAt(space, version),
+      snapshotToken: options.snapshot_token,
       ...options,
       // After the spread: a caller may vary the Space or the parameters, and
       // must not be able to vary who it is by passing an `options` object.

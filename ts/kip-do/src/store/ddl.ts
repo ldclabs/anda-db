@@ -44,8 +44,13 @@ import { errors } from '../errors.js'
  * 2 — the Governance Control Plane's eight tables. Purely additive: every
  * cognitive table is unchanged, so an existing database gains the control plane
  * on the next construction and keeps everything it had.
+ *
+ * 3 — `schema_envs.seq`, the Space coordinate an activation took effect at. A
+ * historical read resolves symbols through the environment that was in force
+ * *then* (§144), and answering that from a timestamp would be guessing at a
+ * coordinate the engine can simply record.
  */
-export const SCHEMA_VERSION = 2
+export const SCHEMA_VERSION = 3
 
 /**
  * The `_system` envelope every element table repeats.
@@ -393,7 +398,12 @@ export const SCHEMA_STATEMENTS: readonly string[] = [
      version    INTEGER NOT NULL,
      lock       TEXT NOT NULL,
      created_at TEXT NOT NULL,
-     tx_id      TEXT NOT NULL DEFAULT ''
+     tx_id      TEXT NOT NULL DEFAULT '',
+     -- The first Space coordinate this environment could have applied to, so a
+     -- historical read resolves symbols through what was in force then (§144).
+     -- Recorded as "the next sequence" rather than the current one: everything
+     -- already committed was written under the environment before this.
+     seq        INTEGER NOT NULL DEFAULT 0
    )`,
   `CREATE UNIQUE INDEX IF NOT EXISTS idx_schema_envs_version
      ON schema_envs(space, version)`,
@@ -640,12 +650,37 @@ export function configureSql(sql: SqlStorage): void {
   sql.exec('PRAGMA foreign_keys = ON')
 }
 
+/**
+ * Columns added to tables that already exist in deployed databases.
+ *
+ * `CREATE TABLE IF NOT EXISTS` does nothing to a table that is already there,
+ * so a new column needs its own step. Applied only when absent, which is what
+ * makes re-running this after an interrupted migration safe — the only recovery
+ * a Durable Object gets, since construction is not a transaction.
+ */
+const ADDED_COLUMNS: readonly { table: string; column: string; definition: string }[] = [
+  { table: 'schema_envs', column: 'seq', definition: 'INTEGER NOT NULL DEFAULT 0' },
+]
+
+function addMissingColumns(sql: SqlStorage): void {
+  for (const { table, column, definition } of ADDED_COLUMNS) {
+    const present = sql
+      .exec<{ name: string }>(`PRAGMA table_info(${table})`)
+      .toArray()
+      .some((row) => row.name === column)
+    if (!present) {
+      sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`)
+    }
+  }
+}
+
 /** Applies the current schema. Safe to retry after an interrupted migration. */
 export function applySchema(sql: SqlStorage): void {
   configureSql(sql)
   for (const statement of SCHEMA_STATEMENTS) {
     sql.exec(statement)
   }
+  addMissingColumns(sql)
 
   const previous = metaGet(sql, 'schema_version')
   if (previous !== null && Number(previous) > SCHEMA_VERSION) {

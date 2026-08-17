@@ -51,10 +51,21 @@ import type { Permission } from './permission.js'
  */
 const FALLBACK: Permission[] = ['manage_policy']
 
-/** What a KQL query needs. */
-export function kqlPermissions(query: KqlQuery): Permission[] {
+/**
+ * What a KQL query needs.
+ *
+ * `boundToSnapshot` is not inferable from the AST and has to be passed: a read
+ * pinned by a `read.snapshot_token` is bound to a past coordinate exactly as one
+ * naming `AS OF` is, and it discloses the same thing. Reading the permission off
+ * the command alone would let the envelope buy a historical read for the price
+ * of an ordinary one.
+ */
+export function kqlPermissions(
+  query: KqlQuery,
+  boundToSnapshot = false,
+): Permission[] {
   const needed: Permission[] = ['read']
-  if (query.as_of !== null) needed.push('read_history')
+  if (query.as_of !== null || boundToSnapshot) needed.push('read_history')
   if (query.where_clauses.some(projectsBelief)) needed.push('project')
   return needed
 }

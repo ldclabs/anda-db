@@ -159,16 +159,9 @@ describe('KIP 2.0 conformance', () => {
     // whole suite is accounted for.
     expect(PASSED + UNBUILT.length).toBe(CASE_COUNT)
 
-    // Every remaining gap is the same one — `AS OF`, the historical read path.
-    // Listed by name rather than counted, so closing it has to be acknowledged
-    // here and a *new* gap cannot hide inside a number that happens to match.
-    expect(UNBUILT).toEqual([
-      'governance / and the content is gone from the past as well as from the present',
-      'history / the claim is active at the coordinate its transaction produced (seq 1)',
-      'history / and the earlier coordinate still says active: history is not rewritten',
-      'history / a coordinate before anything existed is empty, not an error',
-      'history / a coordinate the Space has not reached is refused, never rounded to the present',
-      'history / an unknown transaction names no coordinate',
-    ])
+    // Empty, and it is the list rather than a count that says so: a *new* gap
+    // cannot hide inside a number that happens to match, and closing the last
+    // one had to be acknowledged here by deleting its name.
+    expect(UNBUILT).toEqual([])
   })
 })

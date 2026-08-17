@@ -392,6 +392,16 @@ export interface SchemaEnvRow {
   lock: JsonMap
   created_at: string
   tx_id: string
+  /**
+   * The first Space coordinate this environment could have applied to (§144).
+   *
+   * "The next sequence" rather than the current one, and the difference is the
+   * whole point: everything already committed was written under the environment
+   * before this, so a read `AS OF` that coordinate must resolve symbols through
+   * the *older* one. Activating a Schema is not itself a cognitive transaction
+   * here, so the coordinate is recorded rather than derived from one.
+   */
+  seq: number
 }
 
 /** One historical version of one element (Spec §36, §78). */

@@ -53,8 +53,8 @@ describe('META', () => {
       expect(gaps).toContain('set_retention')
       expect(gaps).toContain('trust_model')
       expect(gaps).toContain('search')
-      expect(gaps).toContain('historical_read')
       expect(gaps).toContain('capsule_import')
+      expect(gaps).toContain('hop_quantifiers')
       // Every gap carries a reason, not just a name.
       for (const entry of report.unsupported) {
         expect(entry.reason.length, entry.capability).toBeGreaterThan(20)
@@ -220,11 +220,15 @@ describe('META', () => {
       expect(() => nexus.describe('DESCRIBE TRUST')).toThrowError(
         /would read as a judgement that nothing is trusted/,
       )
-      // A token that promises a coordinate can be read back is not issued
-      // while nothing can read one back.
-      expect(() => nexus.describe('SNAPSHOT')).toThrowError(
-        /does not issue one/,
-      )
+      // A token that promises a coordinate can be read back is only issued
+      // once the engine can honour it — and now it can, so it is issued and
+      // binds a later read to that coordinate.
+      const snapshot = nexus.describe('SNAPSHOT') as {
+        snapshot_seq: number
+        snapshot_token: string
+      }
+      expect(snapshot.snapshot_seq).toBe(nexus.store.currentSeq(nexus.space))
+      expect(snapshot.snapshot_token).toMatch(/^[0-9a-f]+$/)
       // Reporting an unchecked artifact as valid would cancel the point of
       // asking.
       expect(() =>
