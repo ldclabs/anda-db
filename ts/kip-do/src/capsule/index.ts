@@ -137,8 +137,14 @@ export function exportCapsule(
   }
 
   return {
-    format: 'KIP-Capsule',
-    format_version: '2.0-draft',
+    // The frame discriminator and version are the artifact's contract, not
+    // this engine's label for its own output: `anda_kip`'s `validate_frame`
+    // rejects any other `format` outright, so a Capsule written under a
+    // different name is one the reference engine will not open — which defeats
+    // the only thing a Capsule is for. Spec §37.6 and the Capsule design doc
+    // both spell it `KIP-Cognitive-Capsule` / `2.0`.
+    format: 'KIP-Cognitive-Capsule',
+    version: '2.0',
     payload,
     integrity: {
       content_digest: payloadDigest(payload),
@@ -260,11 +266,18 @@ function schemaDependencies(cx: MetaContext, refs: ReadonlySet<string>): Json {
   }
   return [...packages].sort().map((reference) => {
     const row = cx.store.packageByRef(reference)
+    // `package` and `version` split rather than one `package_ref`, because
+    // that is the shape `anda_kip`'s `SchemaDependency` requires: both are
+    // non-optional there, so a dependency spelled as a single ref fails to
+    // decode and takes the whole Capsule with it. Packages persist by exact
+    // version (§20.4), so the split is lossless.
+    const at = reference.lastIndexOf('@')
     return {
-      package_ref: reference,
+      package: at === -1 ? reference : reference.slice(0, at),
+      version: at === -1 ? '' : reference.slice(at + 1),
       // The digest this Nexus computed, not the one the artifact claims about
       // itself — a destination checking the wrong one learns nothing.
-      content_digest: row?.content_digest ?? null,
+      digest: row?.content_digest ?? null,
       installed_here: row !== null,
     }
   }) as Json

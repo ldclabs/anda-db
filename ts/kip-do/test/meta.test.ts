@@ -249,13 +249,23 @@ describe('Capsules', () => {
       const capsule = nexus.describe(
         'EXPORT CAPSULE :out WHERE { ?a ASSERTION {} }',
       ) as {
+        format: string
+        version: string
         payload: {
           manifest: { completeness: string }
           records: Record<string, unknown[]>
-          schema: { package_ref: string; content_digest: string }[]
+          schema: { package: string; version: string; digest: string }[]
         }
         integrity: { content_digest: string; proofs: unknown[] }
       }
+
+      // The frame discriminator is the artifact's contract, not this engine's
+      // label for its own output: `anda_kip::Capsule::validate_frame` rejects
+      // any other `format` outright, so getting this wrong makes every Capsule
+      // this engine writes unreadable by the reference engine — which is the
+      // only thing a Capsule is for.
+      expect(capsule.format).toBe('KIP-Cognitive-Capsule')
+      expect(capsule.version).toBe('2.0')
 
       // The closure follows references *outward* from the roots, which is why
       // rooting on the Assertion reaches the Proposition it is about, and the
@@ -267,9 +277,14 @@ describe('Capsules', () => {
       expect(capsule.payload.records.concepts).toHaveLength(2)
       expect(capsule.payload.manifest.completeness).toBe('referential_closure')
       // §240.47: the exact refs travel with the records, or the Capsule
-      // arrives meaning whatever the destination happens to call them.
-      expect(capsule.payload.schema.map((s) => s.package_ref)).toContain(CM)
-      expect(capsule.payload.schema[0]?.content_digest).toMatch(/^[0-9a-f]{64}$/)
+      // arrives meaning whatever the destination happens to call them. The
+      // split into `package` + `version` is the frame `anda_kip` decodes —
+      // both are required there, so a single `package_ref` would make the
+      // whole Capsule unreadable by the reference engine.
+      expect(
+        capsule.payload.schema.map((s) => `${s.package}@${s.version}`),
+      ).toContain(CM)
+      expect(capsule.payload.schema[0]?.digest).toMatch(/^[0-9a-f]{64}$/)
       // Unsigned, and it says so by carrying no proofs rather than by
       // implying provenance it cannot support.
       expect(capsule.integrity.proofs).toEqual([])
