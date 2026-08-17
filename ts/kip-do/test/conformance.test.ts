@@ -1,131 +1,167 @@
-import { env } from 'cloudflare:test'
+import { env, runInDurableObject } from 'cloudflare:test'
 import { describe, expect, it } from 'vitest'
-import fixtures from './conformance/fixtures.js'
-import {
-  type FixtureCase,
-  type Json,
-  canonical,
-  normalize,
-  validateFixture,
-} from './conformance/normalize.js'
-import { executeTestKip, type TestKipDatabase } from './worker.js'
+import { CognitiveNexus } from '../src/nexus.js'
+import { KipError } from '../src/errors.js'
+import type { Json, JsonMap } from '../src/json.js'
+import { parseKip } from '../src/kip/parser.js'
+import { COGNITIVE_MEMORY, type SchemaPackage } from '../src/schema/index.js'
+import { CASE_COUNT, FIXTURES, type Case, type Fixture } from './conformance/fixtures.generated.js'
+import { sameResult } from './conformance/normalize.js'
 
 /**
- * Runs the cross-engine conformance fixtures from `fixtures/kip-conformance/`.
+ * The cross-engine KIP 2.0 conformance suite.
  *
- * The same files drive `rs/anda_cognitive_nexus/tests/conformance.rs`. A case
- * that passes here and fails there — or the reverse — is a divergence between
- * the two KIP engines, which is exactly what this suite exists to surface.
+ * These are the same fixtures `rs/anda_cognitive_nexus/tests/conformance.rs`
+ * runs, byte for byte. A case that passes in one engine and fails in the other
+ * is a divergence report, which is the whole reason the fixtures are plain data
+ * rather than either engine's tests.
  *
- * Fixtures are bundled through `conformance/fixtures.ts` rather than read from
- * disk, because tests run inside workerd where there is no filesystem.
+ * Cases that exercise something this engine has not built are **reported, not
+ * silently skipped**: the summary below names them, so the gap has a size. A
+ * suite that quietly passed by skipping would say the two engines agree.
  */
-
-let counter = 0
-
-async function execute(
-  stub: DurableObjectStub<TestKipDatabase>,
-  command: string,
-): Promise<{ result?: Json; next_cursor?: string | null; error?: any }> {
-  return (await executeTestKip(stub, command)) as any
+async function runFixture(fixture: Fixture): Promise<Outcome[]> {
+  const stub = env.KIP_DB.getByName(`conf-${fixture.name}`)
+  return runInDurableObject(stub, (_instance, state) => {
+    const nexus = CognitiveNexus.connect(state.storage)
+    // The Cognitive Memory Profile is always available; a fixture may add
+    // packages of its own, which is how it declares the vocabulary its cases
+    // need without depending on what some other fixture installed.
+    nexus.activatePackages([
+      COGNITIVE_MEMORY,
+      ...((fixture.packages ?? []) as SchemaPackage[]),
+    ])
+    for (const setup of fixture.setup ?? []) nexus.execute(setup)
+    return fixture.cases.map((testCase) => runCase(nexus, testCase))
+  })
 }
 
-describe.each(fixtures)('$name', (raw) => {
-  const fixture = validateFixture(raw, raw.name)
+type Outcome =
+  | { kind: 'pass'; name: string }
+  | { kind: 'fail'; name: string; detail: string }
+  | { kind: 'unbuilt'; name: string; detail: string }
 
-  // One database per fixture: cases run in order and their effects accumulate,
-  // so a KML case can set up state a later KQL case queries.
-  const stubPromise = (async () => {
-    const stub = env.KIP_DB.getByName(`conformance-${fixture.name}-${counter++}`)
-    for (const command of fixture.setup ?? []) {
-      const response = await execute(stub, command)
-      if (response.error) {
-        throw new Error(
-          `setup failed for fixture "${fixture.name}": ` +
-            `${response.error.code} ${response.error.message}\n  ${command}`,
-        )
+/** Runs one command whichever language it is, and flattens the outcome. */
+function execute(
+  nexus: CognitiveNexus,
+  command: string,
+  params: JsonMap,
+): { result: Json } | { error: KipError } {
+  try {
+    const parsed = parseKip(command)
+    if ('Kql' in parsed) return { result: nexus.find(parsed.Kql, params) as Json }
+    if ('Meta' in parsed) return { result: nexus.describe(command, params) }
+    const outcome = nexus.mutate(parsed.Kml, params)
+    return { result: { handles: outcome.handles } as Json }
+  } catch (err) {
+    return { error: KipError.from(err) }
+  }
+}
+
+function runCase(nexus: CognitiveNexus, testCase: Case): Outcome {
+  const outcome = execute(
+    nexus,
+    testCase.command,
+    (testCase.params ?? {}) as JsonMap,
+  )
+  const expectedError = testCase.expect.error
+
+  if ('error' in outcome) {
+    // A capability this engine has not built is a different fact from a wrong
+    // answer, and the summary keeps them apart.
+    if (
+      outcome.error.code === 'UnsupportedCapability' &&
+      expectedError !== 'UnsupportedCapability'
+    ) {
+      return {
+        kind: 'unbuilt',
+        name: testCase.name,
+        detail: outcome.error.message,
       }
     }
-    return stub
-  })()
-
-  for (const testCase of fixture.cases) {
-    const skipReason = testCase.skip?.ts
-    const title = skipReason
-      ? `${testCase.name} [assertions skipped: ${skipReason}]`
-      : testCase.name
-
-    // A skipped case still executes; only its assertions are dropped. Cases
-    // accumulate state, so not running one would leave this engine's database
-    // in a different state from the other engine's and silently invalidate
-    // every later case.
-    it(title, async () => {
-      const stub = await stubPromise
-      const response = await execute(stub, testCase.command)
-      if (skipReason) return
-
-      if (testCase.expect.error) {
-        if (!response.error) {
-          throw new Error(
-            `expected ${testCase.expect.error.code} but the command succeeded ` +
-              `with ${JSON.stringify(response.result)}`,
-          )
+    if (expectedError === undefined) {
+      return {
+        kind: 'fail',
+        name: testCase.name,
+        detail: `expected a result, got ${outcome.error.code}: ${outcome.error.message}`,
+      }
+    }
+    return outcome.error.code === expectedError
+      ? { kind: 'pass', name: testCase.name }
+      : {
+          kind: 'fail',
+          name: testCase.name,
+          detail: `expected ${expectedError}, got ${outcome.error.code}: ${outcome.error.message}`,
         }
-        expect(response.error.code).toBe(testCase.expect.error.code)
-        if (testCase.expect.error.message) {
-          expect(response.error.message).toContain(testCase.expect.error.message)
+  }
+
+  if (expectedError !== undefined) {
+    return {
+      kind: 'fail',
+      name: testCase.name,
+      detail: `expected ${expectedError}, got a result: ${JSON.stringify(outcome.result)}`,
+    }
+  }
+  if (testCase.expect.result === undefined) {
+    return { kind: 'pass', name: testCase.name }
+  }
+  return sameResult(
+    outcome.result,
+    testCase.expect.result as Json,
+    testCase.ordered === true,
+  )
+    ? { kind: 'pass', name: testCase.name }
+    : {
+        kind: 'fail',
+        name: testCase.name,
+        detail: `expected ${JSON.stringify(testCase.expect.result)}, got ${JSON.stringify(outcome.result)}`,
+      }
+}
+
+/**
+ * Outcomes accumulated across the per-fixture tests.
+ *
+ * Each fixture runs exactly once: its cases share one accumulating database
+ * (a mutation case sets up state a later read case queries), so running a
+ * fixture twice would replay its setup against a Space that already has it.
+ */
+const UNBUILT: string[] = []
+let PASSED = 0
+
+describe('KIP 2.0 conformance', () => {
+  it('runs the same fixtures the reference engine runs', () => {
+    // A shrinking suite is a silent loss of coverage; the generator reads the
+    // fixture directory, so a bad path shows up here first.
+    expect(FIXTURES).toHaveLength(7)
+    expect(CASE_COUNT).toBe(62)
+  })
+
+  for (const fixture of FIXTURES) {
+    it(fixture.name, async () => {
+      const outcomes = await runFixture(fixture)
+      for (const outcome of outcomes) {
+        if (outcome.kind === 'pass') PASSED += 1
+        else if (outcome.kind === 'unbuilt') {
+          UNBUILT.push(`${fixture.name} / ${outcome.name}`)
         }
-        return
       }
-
-      if (response.error) {
-        throw new Error(
-          `expected a result but got ${response.error.code}: ${response.error.message}`,
-        )
-      }
-
-      const ordered = testCase.ordered ?? false
-      const actual = normalize(response.result as Json, ordered)
-      const wanted = normalize(testCase.expect.result as Json, ordered)
-      // Compare canonical encodings so a key-order difference between the
-      // engines is never mistaken for a semantic one.
-      expect(canonical(actual)).toBe(canonical(wanted))
-
-      if ('next_cursor' in testCase.expect) {
-        expect(response.next_cursor ?? null).toBe(
-          testCase.expect.next_cursor ?? null,
-        )
-      }
+      const failures = outcomes.filter((o) => o.kind === 'fail')
+      expect(
+        failures.map((f) => `${f.name}: ${'detail' in f ? f.detail : ''}`),
+        `${fixture.name} disagrees with the reference engine`,
+      ).toEqual([])
     })
   }
-})
 
-describe('fixture hygiene', () => {
-  it('bundles at least one fixture', () => {
-    // A bundling mistake would produce an empty, silently green suite.
-    expect(fixtures.length).toBeGreaterThan(0)
-  })
+  it('accounts for every case, as passed or as not built', () => {
+    // Nothing falls between the two: a case that fails for a reason other than
+    // "not built" already failed its fixture above, so reaching here means the
+    // whole suite is accounted for.
+    expect(PASSED + UNBUILT.length).toBe(CASE_COUNT)
 
-  it('validates every fixture and has no duplicate names', () => {
-    const names = new Set<string>()
-    for (const fixture of fixtures) {
-      validateFixture(fixture, fixture.name)
-      expect(names.has(fixture.name)).toBe(false)
-      names.add(fixture.name)
-    }
-  })
-
-  it('records a reason for every skip', () => {
-    // A bare `skip: {}` would quietly drop coverage.
-    for (const fixture of fixtures) {
-      for (const testCase of fixture.cases as FixtureCase[]) {
-        if (!testCase.skip) continue
-        const reasons = [testCase.skip.rust, testCase.skip.ts].filter(Boolean)
-        expect(
-          reasons.length,
-          `${fixture.name}/${testCase.name} has an empty skip`,
-        ).toBeGreaterThan(0)
-      }
-    }
+    // Empty, and it is the list rather than a count that says so: a *new* gap
+    // cannot hide inside a number that happens to match, and closing the last
+    // one had to be acknowledged here by deleting its name.
+    expect(UNBUILT).toEqual([])
   })
 })

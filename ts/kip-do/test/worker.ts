@@ -1,29 +1,41 @@
-import { KipDatabase, type KipResponse } from '../src/index.js'
+import {
+  KipDatabase,
+  mergeRequestContext,
+  principalAuth,
+  type AuthContext,
+  type RequestContext,
+} from '../src/index.js'
 
 /**
- * Test harness object. Uses the package's default tokenizer (SimpleTokenizer)
- * so the suite has no external dependency; the Chinese-segmentation tests
- * inject a stub tokenizer instead.
+ * Test harness object.
+ *
+ * The real class, not a stand-in: the engine's own tests reach into the object
+ * with `runInDurableObject` and build their own `CognitiveNexus`, but the HTTP
+ * surface has to be exercised as a host would deploy it.
  */
 export class TestKipDatabase extends KipDatabase {}
 
 /**
- * Calls the one RPC method used by tests without asking TypeScript to expand
- * Cloudflare's recursive Durable Object RPC mapped type over the whole class.
+ * A host that authenticates its callers, as a multi-tenant deployment would.
+ *
+ * The identity comes from `authenticate` and not from the request body — here
+ * a fixed Principal standing in for whatever the real host would observe about
+ * the connection. The envelope's context is still merged, because a declared
+ * purpose may narrow the session and can never widen it.
  */
-export function executeTestKip(
-  stub: DurableObjectStub<TestKipDatabase>,
-  command: string,
-): Promise<KipResponse> {
-  return (
-    stub as unknown as {
-      executeKip(command: string): Promise<KipResponse>
-    }
-  ).executeKip(command)
+export const TENANT_PRINCIPAL = 'kip:principal:tenant'
+
+export class TenantKipDatabase extends KipDatabase {
+  protected override authenticate(
+    context: RequestContext | undefined,
+  ): AuthContext {
+    return mergeRequestContext(principalAuth(TENANT_PRINCIPAL), context)
+  }
 }
 
 export interface Env {
   KIP_DB: DurableObjectNamespace<TestKipDatabase>
+  KIP_TENANT_DB: DurableObjectNamespace<TenantKipDatabase>
 }
 
 export default {

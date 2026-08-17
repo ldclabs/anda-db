@@ -1,930 +1,760 @@
 /**
- * The KIP engine for one Durable Object.
+ * The Cognitive Nexus: one KIP 2.0 engine over one Durable Object's SQLite.
  *
- * ## Why there is still a write lock
+ * This is the seam a host holds. It owns the Space registry, the Schema
+ * Environment, and the transaction boundary — and it is deliberately thin,
+ * because everything interesting lives in the layers below it.
  *
- * A Durable Object is single-threaded and globally unique, which removes most
- * of the coordination the Rust engine needs. It does *not* remove all of it.
- * Tokenization is an external service call, so a KML statement is
- * read → `await tokenize` → write. Awaiting opens the input gate, and another
- * KML statement can interleave in that window and invalidate the state the
- * first one read. The lock below closes exactly that window; the write itself
- * is atomic through `transactionSync`.
- *
- * If tokenization ever moves in-process, the lock can go: everything else in
- * a KML statement is synchronous.
- *
- * KQL and META take no lock — they never await mid-statement, so a query runs
- * to completion on a single consistent snapshot for free.
+ * The transaction boundary is the one thing it cannot delegate.
+ * `ctx.storage.transactionSync` gives real all-or-nothing commit, so a KML
+ * statement either lands whole or leaves nothing behind, shells included. The
+ * Rust engine has no equivalent and recovers by sweeping `pending` rows on
+ * open; this one gets the property from the platform.
  */
 
-import type {
-  Command,
-  DescribeTarget,
-  Json,
-  KqlQuery,
-  MetaCommand,
-  SearchCommand,
-  UpsertBlock,
-  WhereClause,
-} from './kip/ast.js'
+import { errors, KipError } from './errors.js'
 import {
-  parseKip,
-  parseKipAll,
-  parserVersion,
-  specRevision,
-} from './kip/parser.js'
+  EffectiveAuthority,
+  classify,
+  elevateAuthority,
+  principalClass,
+  quarantine,
+  release,
+  requirePermitted,
+  resolveApproval,
+  spaceResource,
+  systemAuth,
+  type AuthContext,
+  type Authorization,
+  type ElementGovernanceContext,
+  type Permission,
+} from './governance/index.js'
+import { kmlPermissions, kqlPermissions, metaPermissions } from './governance/gate.js'
+import { isAlwaysAudited } from './governance/index.js'
+import type { Json, JsonMap } from './json.js'
+import { parseKip } from './kip/parser.js'
+import type { ElementId } from './id.js'
+import type { Command, KmlStatement, KqlQuery } from './kip/ast.js'
+import { executeKml, type KmlContext } from './kml/index.js'
+import { executeKql, type KqlContext } from './kql/index.js'
+import { executeMeta, type MetaContext } from './meta/index.js'
 import {
-  type EntityID,
-  type JsonMap,
-  compareEntityID,
-  conceptID,
-  conceptNode,
-  formatEntityID,
-  propositionLink,
-} from './entity.js'
-import { KipError, internalError, notFound, referenceError } from './errors.js'
-import { KmlExecutor, conceptTokenKey, type TokenMap } from './exec/kml.js'
-import { KqlExecutor, collectClauseVars } from './exec/kql.js'
-import {
-  SolutionContext,
-  type BindingValue,
-  rowKeyOf,
-} from './exec/solution.js'
-import { BUNDLED_CAPSULES, capsuleHash } from './capsules.js'
-import { SCHEMA_VERSION, applySchema, metaGet, metaSet } from './schema.js'
-import { Store } from './store.js'
-import { ftsQuote } from './sql.js'
-import {
-  type Tokenizer,
-  type TokenizeResult,
-  extractJsonText,
-} from './tokenizer.js'
+  BUNDLED_PACKAGES,
+  CORE_PACKAGE,
+  CORE_PACKAGE_REF,
+  SchemaEnvironment,
+  emptyLock,
+  lockFromJson,
+  packageRefOf,
+  formatPackageRef,
+  parsePackage,
+  type SchemaLock,
+  type SchemaPackage,
+} from './schema/index.js'
+import { Store, type SpaceRow } from './store/index.js'
+import { canonicalJson } from './json.js'
+import { sha256Text } from './digest.js'
+import { normalizeTime, nowTime } from './time.js'
+import type { Outcome } from './tx.js'
 
-/** KIP response envelope. */
-export type KipResponse =
-  | { result: Json; next_cursor?: string | null }
-  | { error: ReturnType<KipError['toJSON']> }
+/** The Space a Nexus uses when the caller names none. */
+export const DEFAULT_SPACE = 'kip:space:default'
 
+/** The Principal a Nexus attributes its own bootstrap writes to. */
+export const SYSTEM_PRINCIPAL = 'kip:principal:system'
+
+/** Options a host may set when connecting. */
 export interface NexusOptions {
-  /** Segmentation authority for full-text search. */
-  tokenizer: Tokenizer
-  /** Injectable clock, for deterministic tests. */
-  now?: () => number
+  /** The Space every command runs in unless told otherwise. */
+  space?: string
+  /**
+   * Whether to install the bundled Schema Package artifacts.
+   *
+   * Installing is not activating (§240.18): a host still has to say which
+   * packages its Space resolves through.
+   */
+  installBundled?: boolean
 }
-
-/**
- * Version of all persistent state owned by the engine bootstrap.
- *
- * Capsule hashes make content changes self-versioning, so updating a bundled
- * `.kip` file cannot accidentally leave an existing Durable Object on the old
- * definitions. Capsule order is included because later capsules may depend on
- * earlier ones.
- */
-export const BOOTSTRAP_VERSION = [
-  `schema:${SCHEMA_VERSION}`,
-  ...BUNDLED_CAPSULES.map(
-    (capsule) => `capsule:${capsule.name}:${capsuleHash(capsule.source)}`,
-  ),
-].join('|')
-
-/** Transaction runner — `ctx.storage.transactionSync` in production. */
-export type TransactionRunner = <T>(fn: () => T) => T
 
 export class CognitiveNexus {
   readonly store: Store
-  private readonly kql: KqlExecutor
-  private readonly kml: KmlExecutor
-  private readonly tokenizer: Tokenizer
-  private readonly transact: TransactionRunner
-  /** Serializes KML statements across their `await` on the tokenizer. */
-  private writeChain: Promise<unknown> = Promise.resolve()
+  readonly space: string
+  private readonly storage: DurableObjectStorage
 
-  constructor(
-    private readonly sql: SqlStorage,
-    transact: TransactionRunner,
-    options: NexusOptions,
+  private constructor(
+    storage: DurableObjectStorage,
+    store: Store,
+    space: string,
   ) {
-    this.transact = transact
-    this.tokenizer = options.tokenizer
-    this.store = new Store(sql)
-    this.kql = new KqlExecutor(this.store)
-    this.kml = new KmlExecutor(this.store, options.now ?? (() => Date.now()))
+    this.storage = storage
+    this.store = store
+    this.space = space
   }
 
-  /** Creates tables and indexes. Idempotent; safe to retry after interruption. */
-  static bootstrap(sql: SqlStorage): void {
-    applySchema(sql)
-  }
+  /** Opens (or creates) the Nexus held by one Durable Object. */
+  static connect(
+    storage: DurableObjectStorage,
+    options: NexusOptions = {},
+  ): CognitiveNexus {
+    const store = new Store(storage.sql)
+    const space = options.space ?? DEFAULT_SPACE
+    const nexus = new CognitiveNexus(storage, store, space)
 
-  /**
-   * Applies the bundled bootstrap capsules.
-   *
-   * KIP is schema-first, so a database with no `$ConceptType` definitions
-   * cannot accept any write at all — this is what makes a fresh object
-   * usable. Each capsule is skipped when its content hash is unchanged *and*
-   * its anchor type exists; the anchor check is what repairs a database whose
-   * bootstrap was interrupted midway.
-   *
-   * Runs outside the tokenizer path: capsule concepts are indexed lazily by
-   * `reindexStale`, so bootstrap never blocks on a network round trip.
-   */
-  applyBundledCapsules(): void {
-    for (const capsule of BUNDLED_CAPSULES) {
-      const key = `capsule_hash:${capsule.name}`
-      const hash = capsuleHash(capsule.source)
-      const anchorPresent =
-        this.store.findConceptByTypeName(
-          capsule.anchorType,
-          capsule.anchorName,
-        ) !== null
-      if (metaGet(this.sql, key) === hash && anchorPresent) continue
-
-      // Capsules create the very nodes the protected-scope guard defends, so
-      // they run privileged. The flag is cleared in `finally` so a capsule
-      // that throws cannot leave the engine permissive.
-      this.kml.privileged = true
-      try {
-        // A capsule is a sequence of UPSERT blocks, which the grammar reads as
-        // one command; `parseKipAll` splits only where a genuinely new command
-        // starts, so a `{` inside a string can no longer cut a block in half.
-        for (const command of parseKipAll(capsule.source)) {
-          if (!('Kml' in command)) {
-            throw internalError(
-              `capsule ${capsule.name} contains a non-KML statement`,
-            )
-          }
-          this.transact(() =>
-            this.kml.execute(command.Kml, new Map(), 'bootstrap'),
-          )
+    storage.transactionSync(() => {
+      // A shell surviving a crash is impossible while every statement runs in
+      // a transaction; the sweep stays because the invariant is cheap to
+      // enforce and a surviving `pending` row would be invisible rather than
+      // obviously wrong.
+      store.sweepPending()
+      // Default deny would lock an embedded host out of its own database, so
+      // the system Principal exists and owns the default Space. That is not a
+      // bypass: the in-process host runs with owner authority *through* the
+      // authorization path, so a Space whose policy denies something denies it
+      // here too (§212).
+      store.governance.ensurePrincipal({
+        principal_id: SYSTEM_PRINCIPAL,
+        principal_class: principalClass.SYSTEM,
+        display_name: 'the engine itself',
+        auth_provider: 'engine',
+      })
+      if (store.space(space) === null) nexus.registerSpace(space)
+      if (options.installBundled !== false) {
+        for (const artifact of [CORE_PACKAGE, ...BUNDLED_PACKAGES]) {
+          nexus.installPackage(artifact, 'bundled')
         }
-      } finally {
-        this.kml.privileged = false
       }
-      metaSet(this.sql, key, hash)
-    }
+    })
+    return nexus
   }
 
-  /** Parses and executes one KIP command. Never throws. */
-  async execute(source: string): Promise<KipResponse> {
-    try {
-      return await this.run(parseKip(source))
-    } catch (err) {
-      return { error: KipError.from(err).toJSON() }
+  /** The Space registry row. */
+  spaceRow(space = this.space): SpaceRow {
+    const row = this.store.space(space)
+    if (row === null) {
+      throw errors.notFoundOrNotVisible(`no MemorySpace ${space}`)
     }
-  }
-
-  /**
-   * Runs an already-parsed command.
-   *
-   * `searchTokens` carries the one piece of async state a command may need —
-   * a tokenized SEARCH term — as an argument rather than as engine state. It
-   * has to travel with the command: `prime` awaits the tokenizer, which opens
-   * the Durable Object's input gate, so a field would be readable (and
-   * overwritable) by a concurrently arriving request.
-   */
-  async executeCommand(
-    command: Command,
-    searchTokens: string[] | null = null,
-  ): Promise<KipResponse> {
-    try {
-      if ('Kql' in command) {
-        const { result, cursor } = this.executeKql(command.Kql)
-        return { result, next_cursor: cursor }
-      }
-      if ('Kml' in command) {
-        return { result: await this.executeKml(command) }
-      }
-      if ('Meta' in command) {
-        const { result, cursor } = this.executeMeta(command.Meta, searchTokens)
-        return { result, next_cursor: cursor }
-      }
-      throw internalError(
-        `unhandled command: ${Object.keys(command).join(', ')}`,
-      )
-    } catch (err) {
-      return { error: KipError.from(err).toJSON() }
-    }
-  }
-
-  // -------------------------------------------------------------------
-  // KQL
-  // -------------------------------------------------------------------
-
-  private executeKql(query: KqlQuery): { result: Json; cursor: string | null } {
-    const ctx = new SolutionContext()
-    this.kql.executeWhere(query.where_clauses, ctx)
-    return this.project(query, ctx)
+    return row
   }
 
   /**
-   * FIND projection.
+   * Installs one Schema Package artifact.
    *
-   * Supports the single- and multi-variable plain forms and global
-   * aggregation. Cursors are numeric offsets over a deterministic order; see
-   * README "Known divergences" for how this differs from the Rust engine's
-   * five cursor schemes.
+   * Immutable by reference: the same `package_id@version` arriving with
+   * different content is an integrity error rather than an update (§240.4), so
+   * a re-install of identical bytes is a no-op and a changed one is refused.
    */
-  private project(
-    query: KqlQuery,
-    ctx: SolutionContext,
-  ): { result: Json; cursor: string | null } {
-    const expressions = query.find_clause.expressions
-    const vars = new Set<string>()
-    for (const expr of expressions) {
-      if ('Variable' in expr) vars.add(expr.Variable.var)
-      else vars.add(expr.Aggregation.var.var)
-    }
-
-    // A FIND column naming a variable that no clause mentions cannot be
-    // projected. The check is against the *clauses*, not the runtime tables:
-    // an unsatisfiable WHERE empties every table, and that is "no matches",
-    // not a malformed query.
-    const declared = new Set<string>()
-    collectClauseVars(query.where_clauses, declared)
-    for (const v of vars) {
-      if (!declared.has(v)) {
-        throw referenceError(`Unbound variable: ${JSON.stringify(v)}`)
-      }
-    }
-
-    // Global aggregation collapses the solution set to one row. Each
-    // aggregate is evaluated over the table covering *its own* variable, not
-    // over a join of all of them: `COUNT(?a)` with an unrelated `?b` in the
-    // WHERE would otherwise be multiplied by however many `?b` there are.
-    const aggregations = expressions.filter((e) => 'Aggregation' in e)
-    if (aggregations.length > 0 && aggregations.length === expressions.length) {
-      const row: Json[] = expressions.map((expr) => {
-        if (!('Aggregation' in expr)) throw internalError('mixed aggregation')
-        const own = ctx.find(expr.Aggregation.var.var)
-        return this.aggregate(
-          expr.Aggregation,
-          own ?? ctx.joinCovering([expr.Aggregation.var.var]),
+  installPackage(artifact: SchemaPackage, source: string): void {
+    const ref = formatPackageRef(packageRefOf(artifact))
+    const digest = sha256Text(canonicalJson(artifact))
+    const existing = this.store.packageByRef(ref)
+    if (existing !== null) {
+      if (existing.content_digest !== digest) {
+        throw errors.digestMismatch(
+          `${ref} is already installed with different content; a package ` +
+            `version identifies one canonical content forever`,
         )
-      })
-      return { result: row.length === 1 ? row[0]! : row, cursor: null }
-    }
-
-    const table = ctx.joinCovering([...vars])
-    if (aggregations.length > 0) {
-      throw referenceError(
-        'mixing aggregate and plain columns in FIND requires a grouping key, ' +
-          'which this engine does not yet implement',
-      )
-    }
-
-    // Group FIND expressions by variable, preserving first-appearance order.
-    // `FIND(?d.name, ?d.attributes.risk)` names one variable twice, which is a
-    // single column whose entries are `[name, risk]` pairs — not two columns.
-    // This mirrors `collect_find_items` in the Rust engine.
-    const items: { var: string; paths: string[][] }[] = []
-    for (const expr of expressions) {
-      if (!('Variable' in expr)) continue
-      const existing = items.find((i) => i.var === expr.Variable.var)
-      if (existing) existing.paths.push(expr.Variable.path)
-      else items.push({ var: expr.Variable.var, paths: [expr.Variable.path] })
-    }
-
-    // Materialize solution rows, deduplicated, then sort if ORDER BY asked.
-    type Row = { cells: BindingValue[]; sort: unknown[] }
-    const rows: Row[] = []
-    const seen = new Set<string>()
-    for (const row of table.rows) {
-      const cells = items.map((item) => {
-        const col = table.column(item.var)
-        return col === null ? ({ kind: 'null' } as BindingValue) : row[col]!
-      })
-      const key = rowKeyOf(cells)
-      if (seen.has(key)) continue
-      seen.add(key)
-
-      const sort = (query.order_by ?? []).map((order) => {
-        const col = table.column(order.variable.var)
-        return col === null
-          ? null
-          : this.kql.loadField(row[col]!, order.variable.path)
-      })
-      rows.push({ cells, sort })
-    }
-
-    const orderBy = query.order_by ?? []
-    if (orderBy.length > 0) {
-      rows.sort((a, b) => {
-        for (let i = 0; i < orderBy.length; i++) {
-          const av = a.sort[i]
-          const bv = b.sort[i]
-          // Absent keys sort last in both directions: a row with no value for
-          // the sort field is unranked, not "smallest", and burying it at the
-          // top of an ASC page would hide the rows the caller asked for.
-          const aNull = av === null || av === undefined
-          const bNull = bv === null || bv === undefined
-          if (aNull || bNull) {
-            if (aNull && bNull) continue
-            return aNull ? 1 : -1
-          }
-          const direction = orderBy[i]!.direction === 'Desc' ? -1 : 1
-          const cmp = direction * compareSortKeys(av, bv)
-          if (cmp !== 0) return cmp
-        }
-        return 0
-      })
-    }
-
-    const offset = parseOffsetCursor(query.cursor)
-    const limit = query.limit ?? rows.length
-    const page = rows.slice(offset, offset + limit)
-    const nextOffset = offset + page.length
-    const cursor = nextOffset < rows.length ? String(nextOffset) : null
-
-    /** Renders one item's value for one row: a bare value, or a tuple when
-     * the same variable was projected through several dot paths. */
-    const cell = (item: { paths: string[][] }, binding: BindingValue): Json => {
-      if (item.paths.length === 1) {
-        return this.renderColumn(binding, item.paths[0]!)
       }
-      return item.paths.map((path) => this.renderColumn(binding, path))
+      return
     }
-
-    // A single projected variable yields a flat list of values. Several yield
-    // one array *per column*, index-aligned across columns — the shape the
-    // Rust engine produces (`project_multi_var` pushes one `Json::Array` per
-    // FIND item). Returning rows instead would be a different wire shape for
-    // every multi-column query.
-    if (items.length === 1) {
-      const item = items[0]!
-      return {
-        result: page.map((row) => cell(item, row.cells[0]!)),
-        cursor,
-      }
-    }
-
-    const columns: Json[] = items.map((item, index) =>
-      page.map((row) => cell(item, row.cells[index]!)),
-    )
-    return { result: columns, cursor }
-  }
-
-  /** Renders one projected column: a full node when bare, a field otherwise. */
-  private renderColumn(binding: BindingValue, path: readonly string[]): Json {
-    if (binding.kind === 'null') return null
-    if (binding.kind === 'predicate') {
-      return path.length === 0 ? binding.name : null
-    }
-    if (path.length > 0) {
-      return (this.kql.loadField(binding, path) ?? null) as Json
-    }
-    const entity = binding.id
-    if (entity.kind === 'concept') {
-      const concept = this.store.getConcept(entity.id)
-      return concept ? (conceptNode(concept) as Json) : null
-    }
-    const row = this.store.getProposition(entity.id)
-    if (!row) return null
-    return (propositionLink(row, entity.predicate) ?? null) as Json
-  }
-
-  private aggregate(
-    agg: { func: string; var: { var: string; path: string[] }; distinct: boolean },
-    table: ReturnType<SolutionContext['joinCovering']>,
-  ): Json {
-    const col = table.column(agg.var.var)
-    if (col === null) return agg.func === 'Count' ? 0 : null
-
-    const values: unknown[] = []
-    const seen = new Set<string>()
-    for (const row of table.rows) {
-      const value = this.kql.loadField(row[col]!, agg.var.path)
-      if (value === null || value === undefined) continue
-      if (agg.distinct) {
-        const key = JSON.stringify(value)
-        if (seen.has(key)) continue
-        seen.add(key)
-      }
-      values.push(value)
-    }
-
-    switch (agg.func) {
-      case 'Count':
-        return values.length
-      case 'Sum':
-        return values.reduce<number>((s, v) => s + toNumber(v), 0)
-      case 'Avg':
-        return values.length === 0
-          ? null
-          : values.reduce<number>((s, v) => s + toNumber(v), 0) / values.length
-      case 'Min':
-        return values.length === 0
-          ? null
-          : (values.reduce((a, b) => (compareSortKeys(a, b) <= 0 ? a : b)) as Json)
-      case 'Max':
-        return values.length === 0
-          ? null
-          : (values.reduce((a, b) => (compareSortKeys(a, b) >= 0 ? a : b)) as Json)
-      default:
-        throw internalError(`unhandled aggregation: ${agg.func}`)
-    }
-  }
-
-  // -------------------------------------------------------------------
-  // KML
-  // -------------------------------------------------------------------
-
-  /**
-   * Runs a KML statement: resolve tokens, then apply atomically.
-   *
-   * The statement is queued on `writeChain` so the read → tokenize → write
-   * sequence is never interleaved with another mutation. The queue is a
-   * promise chain rather than a semaphore because ordering matters: two
-   * UPSERTs on the same concept must apply in arrival order.
-   */
-  private executeKml(command: Extract<Command, { Kml: unknown }>): Promise<Json> {
-    const run = async (): Promise<Json> => {
-      const tokenized = await this.resolveTokens(command.Kml)
-      return this.transact(() =>
-        this.kml.execute(command.Kml, tokenized.tokens, tokenized.version) as Json,
-      )
-    }
-    // Chain regardless of the previous statement's outcome, so one failure
-    // does not wedge every subsequent write.
-    const queued = this.writeChain.then(run, run)
-    this.writeChain = queued.catch(() => undefined)
-    return queued
+    const declared = artifact.integrity?.content_digest ?? ''
+    this.store.installPackage({
+      package_ref: ref,
+      package_id: packageRefOf(artifact).packageId,
+      version: artifact.manifest?.version ?? '',
+      content_digest: digest,
+      // Recorded, not verified: the artifact's own digest is computed under a
+      // canonicalization profile that is still a draft.
+      declared_digest: declared,
+      artifact: artifact as unknown as JsonMap,
+      installed_at: nowTime(),
+      source,
+    })
   }
 
   /**
-   * Pre-computes the tokens a statement will need.
+   * Activates a Schema Lock, minting a new environment version.
    *
-   * Only UPSERT introduces new searchable text; the other statements either
-   * remove rows or edit fields whose post-state is derivable from the AST.
-   * For anything not covered here the FTS row is left as-is and picked up by
-   * `reindexStale`, which is why `tok_ver` exists.
+   * An identical lock is not re-activated: every activation mints a version
+   * that transactions record (§144), and a restart is not a schema change.
    */
-  private async resolveTokens(
-    statement: Extract<Command, { Kml: unknown }>['Kml'],
-  ): Promise<{ tokens: TokenMap; version: string }> {
-    const pending = new Map<
-      string,
-      {
-        name: string
-        attributes: Record<string, unknown>
-        metadata: Record<string, unknown>
+  ensureSchema(lock: SchemaLock, space = this.space): SchemaEnvironment {
+    return this.storage.transactionSync(() => {
+      const current = this.store.schemaEnv(space)
+      if (
+        current !== null &&
+        canonicalJson(current.lock) === canonicalJson(lock)
+      ) {
+        return this.environment(space)
       }
-    >()
-
-    if ('Upsert' in statement) {
-      for (const block of statement.Upsert as UpsertBlock[]) {
-        for (const item of block.items) {
-          if (!('Concept' in item)) continue
-          const matcher = item.Concept.concept
-          if (!('Object' in matcher)) continue
-          const { type, name } = matcher.Object
-          const key = conceptTokenKey(type, name)
-          let projected = pending.get(key)
-          if (!projected) {
-            const existingId = this.store.findConceptByTypeName(type, name)
-            const existing =
-              existingId === null ? null : this.store.getConcept(existingId)
-            projected = {
-              name,
-              attributes: { ...(existing?.attributes ?? {}) },
-              metadata: { ...(existing?.metadata ?? {}) },
-            }
-            pending.set(key, projected)
-          }
-          projected.attributes = {
-            ...projected.attributes,
-            ...(item.Concept.set_attributes ?? {}),
-          }
-          projected.metadata = {
-            ...projected.metadata,
-            ...(block.metadata ?? {}),
-            ...(item.Concept.metadata ?? {}),
-          }
-        }
-      }
-    }
-
-    if (pending.size === 0) {
-      return { tokens: new Map(), version: this.tokenizerVersion() }
-    }
-
-    const keys = [...pending.keys()]
-    const texts = [...pending.values()].map((projected) =>
-      [
-        projected.name,
-        ...extractJsonText(projected.attributes),
-        ...extractJsonText(projected.metadata),
-      ].join(' '),
-    )
-    const result: TokenizeResult = await this.tokenizer.tokenize(texts)
-    const tokens: TokenMap = new Map()
-    for (let i = 0; i < keys.length; i++) {
-      tokens.set(keys[i]!, result.tokens[i] ?? [])
-    }
-    return { tokens, version: result.version }
+      // Resolving first is what stops a lock naming an uninstalled package
+      // from becoming the Space's environment: it fails here, not at the first
+      // symbol lookup somewhere unrelated.
+      const version = (current?.version ?? 0) + 1
+      const env = SchemaEnvironment.resolve(version, lock, this.artifacts())
+      this.store.appendSchemaEnv({
+        space,
+        version,
+        lock: lock as unknown as JsonMap,
+        created_at: nowTime(),
+        tx_id: '',
+        // The next coordinate, not the current one: nothing already committed
+        // was written under this environment.
+        seq: this.store.currentSeq(space) + 1,
+      })
+      const row = this.spaceRow(space)
+      row.schema_environment_version = version
+      this.store.putSpace(row)
+      return env
+    })
   }
 
-  // -------------------------------------------------------------------
-  // META
-  // -------------------------------------------------------------------
+  /** Activates exactly the named packages, installing them first if given. */
+  activatePackages(
+    artifacts: readonly (SchemaPackage | string)[],
+    space = this.space,
+  ): SchemaEnvironment {
+    const lock = emptyLock()
+    lock.packages['kip://core'] = '2.0.0'
+    lock.states['kip://core'] = 'active'
+    for (const source of artifacts) {
+      const artifact =
+        typeof source === 'string' ? parsePackage(source) : source
+      this.installPackage(artifact, 'host')
+      const ref = packageRefOf(artifact)
+      lock.packages[ref.packageId] = artifact.manifest?.version ?? ''
+      lock.states[ref.packageId] = 'active'
+    }
+    return this.ensureSchema(lock, space)
+  }
 
-  private executeMeta(
-    command: MetaCommand,
-    searchTokens: string[] | null,
-  ): {
-    result: Json
-    cursor: string | null
-  } {
-    if ('Describe' in command) {
-      return this.describe(command.Describe)
-    }
-    if ('Search' in command) {
-      return { result: this.search(command.Search, searchTokens), cursor: null }
-    }
-    if ('Export' in command) {
-      throw internalError(
-        'EXPORT is not implemented in this engine yet; see README "Coverage"',
-      )
-    }
-    throw internalError(
-      `unhandled META command: ${Object.keys(command).join(', ')}`,
+  /** The Space's current Schema Environment. */
+  environment(space = this.space): SchemaEnvironment {
+    const row = this.store.schemaEnv(space)
+    if (row === null) return SchemaEnvironment.coreOnly()
+    return SchemaEnvironment.resolve(
+      row.version,
+      lockFromJson(row.lock),
+      this.artifacts(),
     )
   }
 
   /**
-   * Every concept of one type, in id order.
+   * A Space's Schema Environment at one version (§144).
    *
-   * Batched through `getConcepts` rather than looked up one id at a time: a
-   * `DESCRIBE PRIMER` covers three whole categories, and the Durable Object
-   * serves them on its single thread.
+   * What a historical read resolves symbols through. Version 0 is the Core-only
+   * environment a Space has before it activates anything — an honest answer
+   * rather than a missing one, because a read at a coordinate before the first
+   * activation happened under exactly that.
    */
-  private conceptsOfType(type: string) {
-    const ids = this.store.conceptIdsByType(type)
-    const byId = this.store.getConcepts(ids)
-    return ids
-      .map((id) => byId.get(id))
-      .filter((c): c is NonNullable<typeof c> => !!c)
-  }
-
-  private describe(target: DescribeTarget): {
-    result: Json
-    cursor: string | null
-  } {
-    if (target === 'Primer') {
-      const conceptTypes = this.conceptsOfType('$ConceptType').map((c) => c.name)
-      const propositionTypes = this.conceptsOfType('$PropositionType').map(
-        (c) => c.name,
-      )
-      const domains = this.conceptsOfType('Domain').map((c) => ({
-        name: c.name,
-        attributes: c.attributes as Json,
-      }))
-
-      return {
-        result: {
-          engine: '@ldclabs/kip-do',
-          parser_version: parserVersion(),
-          spec_revision: specRevision(),
-          concept_types: conceptTypes,
-          proposition_types: propositionTypes,
-          domains,
-          // Out-of-band capability advert (KIP §5.2.1). This engine has no
-          // embedding store, so SEARCH degrades semantic/hybrid to keyword —
-          // the same posture the Rust engine advertises.
-          search_modes: ['keyword'],
-        },
-        cursor: null,
-      }
-    }
-    if (target === 'Domains') {
-      return {
-        result: this.conceptsOfType('Domain').map((c) => conceptNode(c)) as Json,
-        cursor: null,
-      }
-    }
-    if (typeof target === 'object') {
-      if ('ConceptTypes' in target) {
-        return this.typeNames('$ConceptType', target.ConceptTypes)
-      }
-      if ('PropositionTypes' in target) {
-        return this.typeNames('$PropositionType', target.PropositionTypes)
-      }
-      if ('ConceptType' in target) {
-        return {
-          result: this.typeDefinition('$ConceptType', target.ConceptType),
-          cursor: null,
-        }
-      }
-      if ('PropositionType' in target) {
-        return {
-          result: this.typeDefinition('$PropositionType', target.PropositionType),
-          cursor: null,
-        }
-      }
-    }
-    throw internalError(`unhandled DESCRIBE target: ${JSON.stringify(target)}`)
-  }
-
-  private typeNames(
-    metaType: string,
-    page: { limit: number | null; cursor: string | null },
-  ): { result: Json; cursor: string | null } {
-    const names = this.conceptsOfType(metaType)
-      .map((c) => c.name)
-      .sort()
-    const offset = parseOffsetCursor(page.cursor)
-    const limit = page.limit ?? names.length
-    const result = names.slice(offset, offset + limit)
-    const nextOffset = offset + result.length
-    return {
-      result,
-      cursor:
-        limit > 0 && nextOffset < names.length ? String(nextOffset) : null,
-    }
-  }
-
-  /**
-   * A type definition is returned as a `ConceptInfo`, not a full node: it
-   * carries identity and the declared schema, but not engine metadata, which
-   * describes the definition row rather than the type it defines.
-   */
-  private typeDefinition(metaType: string, name: string): Json {
-    const id = this.store.findConceptByTypeName(metaType, name)
-    if (id === null) throw notFound(`${metaType} ${JSON.stringify(name)} not found`)
-    const concept = this.store.requireConcept(id)
-    return {
-      id: formatEntityID(conceptID(concept.id)),
-      type: concept.type,
-      name: concept.name,
-      attributes: concept.attributes as Json,
-    }
-  }
-
-  /**
-   * `SEARCH` — keyword retrieval over the FTS index.
-   *
-   * The query goes through the *same* tokenizer as the write path. That is
-   * the whole point of the external service: a query tokenized differently
-   * from the index cannot match it, and the failure is silent (empty results,
-   * no error). Because tokenization is async and this method is sync, the
-   * caller must have resolved the tokens first; see `run`.
-   */
-  private search(command: SearchCommand, tokens: string[] | null): Json {
-    if (!tokens) {
-      throw internalError(
-        'SEARCH tokens were not resolved before execution; call execute() rather than executeCommand()',
+  environmentAt(space: string, version: number): SchemaEnvironment {
+    if (version === 0) return SchemaEnvironment.coreOnly()
+    const row = this.store.schemaEnv(space, version)
+    if (row === null) {
+      throw errors.historicalSchemaUnavailable(
+        `${space} has no Schema Environment version ${version}; the coordinate ` +
+          `cannot be resolved under the schema that was in force at it`,
       )
     }
-    const limit = Math.min(command.limit ?? 100, 100)
-    // Widen the candidate pool when a type filter will drop most hits, so a
-    // rare type is not starved by common ones ranking above it.
-    const topK = limit * (command.in_type ? 100 : 10)
-    const threshold = command.threshold ?? 0
-
-    if (tokens.length === 0) return []
-    const query = ftsQuote(tokens)
-
-    if (command.target === 'Concept') {
-      const hits = this.store.searchConcepts(query, topK)
-      // One batched load: with the x100 widening above, per-hit point
-      // lookups would be thousands of SELECTs on the object's single thread.
-      const byId = this.store.getConcepts(hits.map((hit) => hit.id))
-      const out: Json[] = []
-      for (const hit of hits) {
-        const concept = byId.get(hit.id)
-        if (!concept) continue
-        if (command.in_type && concept.type !== command.in_type) continue
-        const score = normalizeScore(hit.score)
-        if (score < threshold) continue
-        const node = conceptNode(concept)
-        ;(node.metadata as JsonMap) = {
-          ...(node.metadata as JsonMap),
-          _score: score,
-        }
-        out.push(node as Json)
-        if (out.length >= limit) break
-      }
-      return out
-    }
-
-    const hits = this.store.searchPropositions(
-      query,
-      topK,
-      command.in_type ?? undefined,
+    return SchemaEnvironment.resolve(
+      row.version,
+      lockFromJson(row.lock),
+      this.artifacts(),
     )
-    const byId = this.store.getPropositions([
-      ...new Set(hits.map((hit) => hit.id)),
+  }
+
+  private artifacts(): Map<string, SchemaPackage> {
+    const out = new Map<string, SchemaPackage>([
+      [CORE_PACKAGE_REF, CORE_PACKAGE],
     ])
-    const out: Json[] = []
-    for (const hit of hits) {
-      const row = byId.get(hit.id)
-      if (!row) continue
-      const link = propositionLink(row, hit.predicate)
-      if (!link) continue
-      const score = normalizeScore(hit.score)
-      if (score < threshold) continue
-      ;(link.metadata as JsonMap) = {
-        ...(link.metadata as JsonMap),
-        _score: score,
-      }
-      out.push(link as Json)
-      if (out.length >= limit) return out
+    for (const row of this.store.packages()) {
+      out.set(row.package_ref, row.artifact as unknown as SchemaPackage)
     }
     return out
   }
 
   /**
-   * Resolves the async state a command needs before its synchronous
-   * execution: today that is only a tokenized SEARCH term. The result is
-   * returned rather than stored, so two commands in flight over the same
-   * object cannot see each other's tokens.
+   * One authenticated caller's view of this Nexus.
+   *
+   * This is what a multi-tenant host executes through: it authenticates the
+   * caller itself, builds an {@link AuthContext} from what it *observed*, and
+   * every command run here is authorized against the control plane before it
+   * touches anything.
+   *
+   * A session holds identity, not authority. Authority is resolved from the
+   * control plane on each request, so a session that has been running since
+   * January does not still hold what January's Grants said (§188, §245).
    */
-  private async prime(command: Command): Promise<string[] | null> {
-    if ('Meta' in command && 'Search' in command.Meta) {
-      const result = await this.tokenizer.tokenize([command.Meta.Search.term])
-      return result.tokens[0] ?? []
-    }
-    return null
-  }
-
-  /** Tokenizer version the index was last built with. */
-  tokenizerVersion(): string {
-    return metaGet(this.sql, 'tokenizer_version') ?? 'unknown'
-  }
-
-  /** Version reported by the tokenizer service that would handle a request now. */
-  async liveTokenizerVersion(): Promise<string> {
-    const result = await this.tokenizer.tokenize([''])
-    return result.version
+  session(auth: AuthContext): Session {
+    return new Session(this, auth)
   }
 
   /**
-   * Re-tokenizes rows whose `tok_ver` does not match the live service.
+   * A session running as the engine itself.
    *
-   * Two things drive rows here: a proposition write (whose text is only
-   * knowable after the row exists, so it is never tokenized inline), and a
-   * `TOKENIZER_VERSION` bump, after which every previously indexed row holds
-   * tokens from an incomparable vocabulary.
-   *
-   * Call it from an alarm, not from the request path: it is a bounded batch
-   * precisely so it can be run repeatedly until it returns 0 without holding
-   * the object's single thread for long.
+   * The embedded case: one object, one owner, and the object *is* the owner. A
+   * host serving more than one caller must not use this — authenticate and go
+   * through {@link CognitiveNexus.session}, or every caller is the owner.
    */
-  async reindexStale(currentVersion: string, batch = 128): Promise<number> {
-    // Queued on the same chain as KML writes: the read → tokenize → write
-    // sequence crosses an `await`, and a mutation landing in that window
-    // would be clobbered by FTS tokens computed from its pre-write text —
-    // stamped with the current version, so the row would never self-heal.
-    const run = () => this.reindexStaleInner(currentVersion, batch)
-    const queued = this.writeChain.then(run, run)
-    this.writeChain = queued.catch(() => undefined)
-    return queued
+  systemSession(): Session {
+    return this.session(systemAuth())
   }
 
-  private async reindexStaleInner(
-    currentVersion: string,
-    batch: number,
-  ): Promise<number> {
-    let done = 0
-
-    const conceptIds = this.store.staleConceptIds(currentVersion, batch)
-    if (conceptIds.length > 0) {
-      const concepts = this.store.getConcepts(conceptIds)
-      const order: number[] = []
-      const texts: string[] = []
-      for (const id of conceptIds) {
-        const concept = concepts.get(id)
-        if (!concept) continue
-        order.push(id)
-        texts.push(
-          [
-            concept.name,
-            ...extractJsonText(concept.attributes),
-            ...extractJsonText(concept.metadata),
-          ].join(' '),
-        )
-      }
-      const result = await this.tokenizer.tokenize(texts)
-      this.transact(() => {
-        for (let i = 0; i < order.length; i++) {
-          this.store.setConceptFts(
-            order[i]!,
-            result.tokens[i] ?? [],
-            result.version,
-          )
-        }
-      })
-      metaSet(this.sql, 'tokenizer_version', result.version)
-      done += order.length
-    }
-
-    const remaining = batch - done
-    if (remaining <= 0) return done
-
-    const propIds = this.store.stalePropositionIds(currentVersion, remaining)
-    if (propIds.length > 0) {
-      const rows = this.store.getPropositions(propIds)
-      const links: { id: number; predicate: string }[] = []
-      const texts: string[] = []
-      for (const id of propIds) {
-        const row = rows.get(id)
-        if (!row) continue
-        for (const [predicate, props] of row.links) {
-          links.push({ id, predicate })
-          texts.push(
-            [
-              predicate,
-              ...extractJsonText(props.attributes),
-              ...extractJsonText(props.metadata),
-            ].join(' '),
-          )
-        }
-      }
-      const result = await this.tokenizer.tokenize(texts)
-      this.transact(() => {
-        const byRow = new Map<
-          number,
-          { predicate: string; tokens: readonly string[] }[]
-        >()
-        for (let i = 0; i < links.length; i++) {
-          const link = links[i]!
-          const entries = byRow.get(link.id)
-          const entry = {
-            predicate: link.predicate,
-            tokens: result.tokens[i] ?? [],
-          }
-          if (entries) entries.push(entry)
-          else byRow.set(link.id, [entry])
-        }
-        for (const [id, entries] of byRow) {
-          this.store.setPropositionFts(id, entries, result.version)
-        }
-      })
-      metaSet(this.sql, 'tokenizer_version', result.version)
-      done += new Set(links.map((link) => link.id)).size
-    }
-
-    return done
-  }
-
-  /** Public wrapper that primes async state before synchronous execution. */
-  async run(command: Command): Promise<KipResponse> {
-    let searchTokens: string[] | null
-    try {
-      searchTokens = await this.prime(command)
-    } catch (err) {
-      return { error: KipError.from(err).toJSON() }
-    }
-    return this.executeCommand(command, searchTokens)
-  }
-}
-
-// -----------------------------------------------------------------------
-// Helpers
-// -----------------------------------------------------------------------
-
-/**
- * Numeric offset cursor.
- *
- * A non-decimal token is rejected rather than silently treated as offset 0:
- * quietly restarting pagination hands the client duplicate pages, which is
- * worse than an error it can act on.
- */
-export function parseOffsetCursor(cursor: string | null | undefined): number {
-  if (cursor == null) return 0
-  if (!/^\d+$/.test(cursor)) {
-    throw new KipError(
-      'KIP_1001',
-      `invalid cursor ${JSON.stringify(cursor)}; expected a decimal offset`,
+  /** Parses and runs one KML statement, returning its receipt. */
+  execute(command: string, params: JsonMap = {}): Outcome {
+    const parsed: Command = parseKip(command)
+    if ('Kml' in parsed) return this.mutate(parsed.Kml, params)
+    throw errors.languageMismatch(
+      'this command is not a KML statement; a query has no receipt — use ' +
+        'query() for KQL and describe() for META',
     )
   }
-  return Number(cursor)
+
+  /**
+   * Parses and runs one META command.
+   *
+   * META is read-only by construction, with one exception the language makes
+   * explicit: `PREVIEW KML` runs the real dry-run path, which writes nothing.
+   */
+  describe(command: string, params: JsonMap = {}): Json {
+    return this.systemSession().describe(command, params)
+  }
+
+  /**
+   * Parses and runs one KQL query, returning the bare result array.
+   *
+   * Reads take no transaction: a Durable Object is single-threaded, so nothing
+   * can change underneath a query that has already started.
+   */
+  query(command: string, params: JsonMap = {}, read: ReadOptions = {}): Json[] {
+    return this.systemSession().query(command, params, read)
+  }
+
+  /** Runs one parsed KQL query. */
+  find(
+    query: KqlQuery,
+    params: JsonMap = {},
+    options: Partial<KqlContext> & ReadOptions = {},
+  ): Json[] {
+    return this.systemSession().find(query, params, options)
+  }
+
+  /** Runs one KML statement, all-or-nothing. */
+  mutate(
+    statement: KmlStatement,
+    params: JsonMap = {},
+    options: Partial<KmlContext> = {},
+  ): Outcome {
+    return this.systemSession().mutate(statement, params, options)
+  }
+
+  /** Runs a command and returns the failure instead of throwing it. */
+  tryExecute(
+    command: string,
+    params: JsonMap = {},
+  ): { ok: Outcome } | { error: KipError } {
+    try {
+      return { ok: this.execute(command, params) }
+    } catch (err) {
+      return { error: KipError.from(err) }
+    }
+  }
+
+  /**
+   * Runs `body` inside the object's transaction.
+   *
+   * Exposed for {@link Session}, which owns the command paths but not the
+   * storage handle. The boundary is the platform's: a clause that throws
+   * unwinds everything the statement wrote, shells included.
+   *
+   * @internal
+   */
+  transact<T>(body: () => T): T {
+    return this.storage.transactionSync(body)
+  }
+
+  private registerSpace(space: string): void {
+    this.store.createSpace({
+      space_id: space,
+      uri: '',
+      name: space,
+      description: 'A KIP 2.0 MemorySpace.',
+      owner_principal: SYSTEM_PRINCIPAL,
+      owners: [SYSTEM_PRINCIPAL],
+      status: 'active',
+      default_policy_id: '',
+      trust_policy_id: '',
+      // Never `public` by default: §95 forbids reading an absent
+      // classification as freely disclosable.
+      default_classification: 'internal',
+      audit_mode: 'standard',
+      created_at: nowTime(),
+      seq: 0,
+      schema_environment_version: 0,
+      policies: {} as Json as JsonMap,
+    })
+  }
 }
 
 /**
- * Maps a raw BM25 score into `[0, 1)`.
+ * One authenticated caller's view of a Nexus.
  *
- * Corpus-independent saturation, matching the shape the Rust engine uses
- * (`helper.rs:69-88`). The absolute values differ because FTS5's BM25 is
- * scaled differently from `anda_db`'s — a `THRESHOLD` calibrated against the
- * Rust engine does not carry over. See README "Known divergences".
+ * Every command runs through {@link Session.gate} first, which asks whether this
+ * Principal may do this *here at all*. That is Space scope and deliberately so:
+ * at this point no element has been read, and reading one to decide whether it
+ * may be read would be the disclosure the check exists to prevent. Per-element
+ * authorization happens where the elements are.
+ *
+ * The session caches identity and nothing else. Authority is resolved from the
+ * control plane on every command, which is what makes a revocation take effect
+ * for a session that started before it (§188, §245).
  */
-export function normalizeScore(raw: number): number {
-  const score = Math.max(raw, 0)
-  return score / (score + 2)
+/**
+ * The `read` block of a request envelope (§85).
+ *
+ * A snapshot token binds a read to the coordinate a previous `SNAPSHOT`
+ * reported, which is how a caller makes several requests answer at one
+ * coordinate rather than at whatever each of them happens to find.
+ */
+export interface ReadOptions {
+  snapshot_token?: string
 }
 
-function toNumber(value: unknown): number {
-  return typeof value === 'number' && Number.isFinite(value) ? value : 0
+export class Session {
+  readonly nexus: CognitiveNexus
+  readonly auth: AuthContext
+
+  constructor(nexus: CognitiveNexus, auth: AuthContext) {
+    this.nexus = nexus
+    this.auth = auth
+  }
+
+  /** What this Principal may do in a Space, resolved fresh. */
+  effectiveAuthority(space = this.nexus.space): EffectiveAuthority {
+    return EffectiveAuthority.resolve(this.nexus.store, space, this.auth)
+  }
+
+  /** Parses and runs one KML statement, returning its receipt. */
+  execute(command: string, params: JsonMap = {}): Outcome {
+    const parsed: Command = parseKip(command)
+    if ('Kml' in parsed) return this.mutate(parsed.Kml, params)
+    throw errors.languageMismatch(
+      'this command is not a KML statement; a query has no receipt — use ' +
+        'query() for KQL and describe() for META',
+    )
+  }
+
+  /** Parses and runs one KQL query, returning the bare result array. */
+  query(command: string, params: JsonMap = {}, read: ReadOptions = {}): Json[] {
+    const parsed: Command = parseKip(command)
+    if (!('Kql' in parsed)) {
+      throw errors.languageMismatch('this command is not a KQL query')
+    }
+    return this.find(parsed.Kql, params, read)
+  }
+
+  /** Parses and runs one META command. */
+  describe(command: string, params: JsonMap = {}): Json {
+    const parsed: Command = parseKip(command)
+    if (!('Meta' in parsed)) {
+      throw errors.languageMismatch('this command is not a META command')
+    }
+    const space = this.nexus.space
+    const authority = this.effectiveAuthority(space)
+    this.gate(authority, metaPermissions(parsed.Meta))
+    const cx: MetaContext = {
+      store: this.nexus.store,
+      space,
+      env: this.nexus.environment(space),
+      request: params,
+      environmentAt: (version) => this.nexus.environmentAt(space, version),
+      authority,
+      auth: this.auth,
+    }
+    // `PREVIEW KML` mints shells to allocate ids and then discards them, so it
+    // runs inside a transaction like any other mutation path — one that is
+    // simply never committed.
+    return this.nexus.transact(() => executeMeta(parsed.Meta, cx))
+  }
+
+  /** Runs one parsed KQL query. */
+  find(
+    query: KqlQuery,
+    params: JsonMap = {},
+    options: Partial<KqlContext> & ReadOptions = {},
+  ): Json[] {
+    const space = options.space ?? this.nexus.space
+    const authority = this.effectiveAuthority(space)
+    // Both spellings, because both reach `executeKql`: the envelope's
+    // `snapshot_token` and the context's own `snapshotToken`. Gating on one of
+    // them would let the other buy a historical read for the price of an
+    // ordinary one, which is the whole reason this argument exists.
+    const snapshotToken = options.snapshot_token ?? options.snapshotToken
+    this.gate(authority, kqlPermissions(query, snapshotToken !== undefined))
+    return executeKql(query, {
+      store: this.nexus.store,
+      space,
+      env: this.nexus.environment(space),
+      request: params,
+      environmentAt: (version) => this.nexus.environmentAt(space, version),
+      ...options,
+      snapshotToken,
+      // After the spread: a caller may vary the Space or the parameters, and
+      // must not be able to vary who it is by passing an `options` object.
+      authority,
+      auth: this.auth,
+    })
+  }
+
+  /** Runs one KML statement, all-or-nothing. */
+  mutate(
+    statement: KmlStatement,
+    params: JsonMap = {},
+    options: Partial<KmlContext> = {},
+  ): Outcome {
+    const space = options.space ?? this.nexus.space
+    const authority = this.effectiveAuthority(space)
+    this.gate(authority, kmlPermissions(statement))
+    const provenance = accessProvenance(statement, authority, this.auth)
+    const cx: KmlContext = {
+      store: this.nexus.store,
+      space,
+      env: this.nexus.environment(space),
+      // `_system.origin` records who the runtime *observed*, never what the
+      // content claimed (§26). It is the session's Principal, so an element
+      // written under a revoked identity stays attributable to it.
+      origin: options.origin ?? this.origin(),
+      request: params,
+      ...options,
+      // After the spread, for the same reason as the read path: identity is not
+      // one of the knobs an options object may turn.
+      authority,
+      auth: this.auth,
+    }
+    const outcome = this.nexus.transact(() => executeKml(statement, cx))
+    return provenance === null ? outcome : { ...outcome, governance: provenance }
+  }
+
+  /**
+   * What this Principal could do in a Space at a past instant (§176, §177).
+   *
+   * A historical answer, and nothing more: that a Principal could read something
+   * in January says nothing about whether it can today (§179). Reading it needs
+   * `read_governance_history`, which is separate from `read_audit` — one is what
+   * the control plane *was*, the other is what people *did*.
+   */
+  accessAsOf(at: string, space = this.nexus.space): Json {
+    const now = this.effectiveAuthority(space)
+    requirePermitted(
+      now.authorize('read_governance_history', spaceResource(), this.auth),
+    )
+    const then = EffectiveAuthority.resolveAt(
+      this.nexus.store,
+      space,
+      this.auth,
+      normalizeTime(at, 'AS OF'),
+    )
+    return {
+      at,
+      space_id: space,
+      principal_id: then.principal.principal_id,
+      groups: then.groups,
+      is_space_owner: then.isOwner,
+      permissions: then.permissionNames(this.auth),
+      policy:
+        then.policy === null
+          ? null
+          : `${then.policy.policy_id}@${then.policy.version}`,
+      // Said out loud rather than implied: reconstructing a whole historical
+      // delegation chain would need the delegator's historical Grants
+      // recursively, so this report does not claim a precision it lacks.
+      caveats: [
+        'Delegations are resolved against their delegator’s authority as it ' +
+          'stands now, not as it stood then',
+        'this is what the control plane said at that instant, and says nothing ' +
+          'about today',
+      ],
+    } as Json
+  }
+
+  /** Runs a command and returns the failure instead of throwing it. */
+  tryExecute(
+    command: string,
+    params: JsonMap = {},
+  ): { ok: Outcome } | { error: KipError } {
+    try {
+      return { ok: this.execute(command, params) }
+    } catch (err) {
+      return { error: KipError.from(err) }
+    }
+  }
+
+  /**
+   * Reads the Governance audit for a Space (§89, §172).
+   *
+   * Its own permission, because the audit says what everyone else did: a caller
+   * who may read a Space's cognition has not thereby earned the right to read
+   * who has been reading it.
+   */
+  readAudit(limit = 50, space = this.nexus.space) {
+    const authority = this.effectiveAuthority(space)
+    requirePermitted(authority.authorize('read_audit', spaceResource(), this.auth))
+    return this.nexus.store.governance.readAudit(space, limit)
+  }
+
+  /**
+   * Sets one element's classification (§93, §100).
+   *
+   * A Governance operation rather than a KML clause, because an element's
+   * `governance` block is not author-writable: the parser refuses it in every
+   * assignment. Raising a label needs `update` and lowering one needs
+   * `declassify` — it is disclosure that requires authority, not caution.
+   *
+   * Returns the label the element carried before.
+   */
+  classify(element: ElementId, label: string, space = this.nexus.space): string {
+    return this.nexus.transact(() =>
+      classify(this.governanceContext(space), element, label),
+    )
+  }
+
+  /**
+   * Raises or lowers how strongly one element may influence action.
+   *
+   * Raising is bounded by the element's authority lineage, so no chain of
+   * summarizing turns a descriptive note into an executable one (§127). Lowering
+   * is deliberately as easy as the permission itself: an incident response that
+   * had to wait for an approval would arrive late (§132).
+   *
+   * Returns the ceiling the element carried before.
+   */
+  elevateAuthority(element: ElementId, cls: string, space = this.nexus.space): string {
+    return this.nexus.transact(() =>
+      elevateAuthority(this.governanceContext(space), element, cls),
+    )
+  }
+
+  /**
+   * Holds an element out of ordinary use, pending review (§133).
+   *
+   * Not a retraction: it says this Brain does not currently allow ordinary use
+   * of the element, which is a statement about this Brain and not about whoever
+   * wrote it (§134).
+   */
+  quarantine(element: ElementId, reason: string, space = this.nexus.space): void {
+    this.nexus.transact(() =>
+      quarantine(this.governanceContext(space), element, reason),
+    )
+  }
+
+  /** Returns a quarantined element to ordinary use. */
+  releaseQuarantine(element: ElementId, space = this.nexus.space): void {
+    this.nexus.transact(() => release(this.governanceContext(space), element))
+  }
+
+  private governanceContext(space: string): ElementGovernanceContext {
+    return {
+      store: this.nexus.store,
+      space,
+      authority: this.effectiveAuthority(space),
+      auth: this.auth,
+    }
+  }
+
+  /** The `_system.origin` this session stamps on what it writes. */
+  private origin(): JsonMap {
+    return {
+      principal_id: this.auth.principal_id,
+      ...(this.auth.client === '' ? {} : { channel: this.auth.client }),
+    }
+  }
+
+  /**
+   * Requires every permission a command asks for, at Space scope.
+   *
+   * A policy may require independent approval for a whole command family —
+   * declassification, elevation, export — and a satisfied approval is what turns
+   * that into an allow. An unsatisfied one stays a refusal: `require_approval`
+   * is not a soft yes (§40).
+   */
+  private gate(authority: EffectiveAuthority, needed: readonly Permission[]): void {
+    const space = authority.space.space_id
+    const resource = spaceResource()
+    for (const permission of needed) {
+      const decision = resolveApproval(
+        this.nexus.store,
+        space,
+        resource,
+        authority.authorize(permission, resource, this.auth),
+        this.auth,
+      )
+      if (!isPermittedDecision(decision)) {
+        this.audit(authority, decision)
+        requirePermitted(decision)
+      }
+      if (decision.obligations.audit) this.audit(authority, decision)
+    }
+  }
+
+  /**
+   * Writes one decision to the Governance audit.
+   *
+   * Best effort by design at this layer: a denial that could not be logged is
+   * still a denial, and failing the request a second time over the log would turn
+   * an audit outage into an availability outage. An obligation that genuinely
+   * must not proceed unlogged is the caller's to enforce (§184).
+   */
+  private audit(authority: EffectiveAuthority, decision: Authorization): void {
+    try {
+      this.nexus.store.governance.recordDecision({
+        at: nowTime(),
+        space_id: authority.space.space_id,
+        principal_id: this.auth.principal_id,
+        delegation_chain: [...this.auth.delegation_chain],
+        operation: decision.permission,
+        decision: decision.decision,
+        reason: decision.reason,
+        policy_id: decision.policy_id,
+        policy_version: decision.policy_version,
+        authorities_used: [...decision.authorities_used],
+      })
+    } catch {
+      // See above: an audit failure does not become a second failure mode.
+    }
+  }
 }
 
-
-function compareSortKeys(a: unknown, b: unknown): number {
-  if (a === null || a === undefined) return b === null || b === undefined ? 0 : -1
-  if (b === null || b === undefined) return 1
-  if (typeof a === 'number' && typeof b === 'number') return a - b
-  return String(a) < String(b) ? -1 : String(a) > String(b) ? 1 : 0
+/**
+ * The access-decision provenance a high-impact receipt carries (§178).
+ *
+ * Only for high-impact statements. Attaching it to every commit would bury the
+ * cases that matter under the ones that do not, and the point of the record is
+ * that somebody reads it: an erasure, an export or a Governance change has to be
+ * explainable later in terms of the identity and policy that authorized it.
+ *
+ * It names the effective Principal, the delegation chain and the policy version,
+ * and deliberately not the Grants of anyone else.
+ */
+function accessProvenance(
+  statement: KmlStatement,
+  authority: EffectiveAuthority,
+  auth: AuthContext,
+): JsonMap | null {
+  const permissions = kmlPermissions(statement)
+  if (!permissions.some(isAlwaysAudited)) return null
+  return {
+    principal_id: auth.principal_id,
+    delegation_chain: [...auth.delegation_chain],
+    authentication_strength: auth.auth_strength,
+    purpose: { value: auth.purpose, assurance: auth.purpose_assurance },
+    policy:
+      authority.policy === null
+        ? null
+        : { id: authority.policy.policy_id, version: authority.policy.version },
+    operations: permissions,
+  } as unknown as JsonMap
 }
 
-export { compareEntityID, conceptID, formatEntityID }
-export type { EntityID, WhereClause }
+/** Whether a decision lets the operation proceed. */
+function isPermittedDecision(decision: Authorization): boolean {
+  return decision.decision === 'allow' || decision.decision === 'allow_with_constraints'
+}

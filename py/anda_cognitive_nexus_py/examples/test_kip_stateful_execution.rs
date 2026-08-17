@@ -1,240 +1,170 @@
+//! A file-backed round trip through the binding's Rust API.
+//!
+//! Run it with:
+//!
+//! ```bash
+//! cargo run -p anda_cognitive_nexus_py --example test_kip_stateful_execution
+//! ```
+//!
+//! The point is statefulness: the same database is written, read back, closed
+//! and re-opened, so this catches a Nexus that only works while its process is
+//! alive. It also shows the shape of a KIP 2.0 write — Concepts, a Proposition,
+//! and an Assertion that is the only thing claiming anything.
+
 use anda_cognitive_nexus_py::{create_kip_db, execute_kip, AndaDbConfig, StoreLocationType};
-use anda_kip::{Json, Map, Response};
-// Create basic concept types and medical knowledge capsule
-static MEDICAL_KNOWLEDGE_KML: &str = r#"
-    UPSERT {
-        // Define concept types
-        CONCEPT ?drug_type {
-            {type: "$ConceptType", name: "Drug"}
-            SET ATTRIBUTES {
-                description: "Pharmaceutical drug concept type"
-            }
-        }
+use anda_kip::{Json, Map, TopLevelStatus};
 
-        CONCEPT ?symptom_type {
-            {type: "$ConceptType", name: "Symptom"}
-            SET ATTRIBUTES {
-                description: "Medical symptom concept type"
+/// One attributed claim. The types come from the bundled cognitive-memory
+/// profile, which `create_kip_db` activates: in KIP 2.0 a type is an immutable
+/// Schema Package symbol, so there is no `$ConceptType` node to write first —
+/// and no way for a command to invent a type on its way to using it.
+///
+/// `:preference_name` is a request parameter, bound structurally into a value
+/// position rather than pasted into the text (§74, §88.2).
+static RECORD_A_PREFERENCE: &str = r#"
+    MUTATE {
+        CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
+        CREATE CONCEPT ?dark { TYPE "Preference" NAME :preference_name }
+        CREATE EVIDENCE ?said {
+            SET FIELDS {
+                evidence_class: "user_statement",
+                payload: "I prefer dark mode.",
+                observed_at: "2026-08-16T09:00:00Z"
             }
         }
-
-        // Define relation types
-        CONCEPT ?treats_relation {
-            {type: "$PropositionType", name: "treats"}
-            SET ATTRIBUTES {
-                description: "Drug treats symptom relationship"
-            }
+        ASSERT ?a (?alice, "prefers", ?dark) {
+            by: ?alice, mode: "stated", confidence: 0.9, evidence: ?said
         }
-
-        CONCEPT ?has_side_effect_relation {
-            {type: "$PropositionType", name: "has_side_effect"}
-            SET ATTRIBUTES {
-                description: "Drug has side effect relationship"
-            }
-        }
-
-        // Create symptom concepts
-        CONCEPT ?headache {
-            {type: "Symptom", name: "Headache"}
-            SET ATTRIBUTES {
-                severity_scale: "1-10",
-                description: "Pain in the head or neck area"
-            }
-        }
-
-        CONCEPT ?fever {
-            {type: "Symptom", name: "Fever"}
-            SET ATTRIBUTES {
-                normal_temp: "98.6°F (37°C)",
-                description: "Elevated body temperature"
-            }
-        }
-
-        CONCEPT ?stomach_irritation {
-            {type: "Symptom", name: "Stomach Irritation"}
-            SET ATTRIBUTES {
-                severity: "mild to moderate",
-                description: "Gastrointestinal discomfort"
-            }
-        }
-
-        // Create specific drug concepts
-        CONCEPT ?aspirin {
-            {type: "Drug", name: "Aspirin"}
-            SET ATTRIBUTES {
-                molecular_formula: "C9H8O4",
-                risk_level: 1,
-                description: "Common pain reliever and anti-inflammatory drug"
-            }
-            SET PROPOSITIONS {
-                ("treats", ?headache)
-                ("treats", ?fever)
-                ("has_side_effect", ?stomach_irritation)
-            }
-        }
-    }
-    WITH METADATA {
-        source: "KIP Demo Medical Knowledge",
-        author: "Demo System",
-        confidence: 0.95,
-        created_at: "2025-07-01T00:00:00Z"
     }
     "#;
 
-// Create a new hypothetical drug
-static NEW_DRUG_KML: &str = r#"
-    UPSERT {
-        CONCEPT ?brain_fog {
-            {type: "Symptom", name: :symptom_name}
-            SET ATTRIBUTES {
-                description: "Mental fatigue and lack of clarity",
-                cognitive_impact: "high"
-            }
+/// The same actor changed their mind. Nothing is rewritten: this records a
+/// second Assertion, because what somebody claimed in the past stays true
+/// about the past (§76).
+///
+/// `?alice` is not available here — a handle is local to the transaction that
+/// minted it — so the Person is named by the element id the first write
+/// returned, bound as the `:alice` parameter.
+static CHANGE_OF_MIND: &str = r#"
+    MUTATE {
+        CREATE CONCEPT ?light { TYPE "Preference" NAME "Light mode" }
+        ASSERT ?a (:alice, "prefers", ?light) {
+            by: :alice, mode: "stated", confidence: 0.7
         }
-
-        CONCEPT ?neural_bloom {
-            {type: "Symptom", name: "Neural Bloom"}
-            SET ATTRIBUTES {
-                description: "A rare side effect characterized by temporary burst of creative thoughts",
-                frequency: "rare",
-                severity: "mild"
-            }
-        }
-
-        CONCEPT ?cognizine {
-            {type: "Drug", name: "Cognizine"}
-            SET ATTRIBUTES {
-                molecular_formula: "C12H15N5O3",
-                risk_level: 2,
-                description: "A novel nootropic drug designed to enhance cognitive functions",
-                status: "experimental"
-            }
-            SET PROPOSITIONS {
-                ("treats", {type: "Symptom", name: "Brain Fog"})
-                ("has_side_effect", ?neural_bloom)
-            }
-        }
-    }
-    WITH METADATA {
-        source: "Experimental Drug Research",
-        confidence: 0.75,
-        status: "under_review"
     }
     "#;
 
-// cargo run --example test_kip_stateful_execution
 #[tokio::main]
 async fn main() {
     println!("--- Running Full Stateful KIP Execution Test ---");
 
-    // 1. Execute the first KML command from the demo to set up schema and initial data
-    println!("\n1. Executing Medical Knowledge KML...");
+    let store_location = "/tmp/anda_cognitive_nexus_py_test_db".to_string();
+    let path = std::path::Path::new(&store_location);
+    if path.is_file() {
+        panic!("store_location exists but is a file, not a directory: {store_location}");
+    }
+    std::fs::create_dir_all(path).expect("Failed to create store_location directory");
 
-    // Add db_config for local_file DB (as AndaDbConfig struct expects)
-    let db_config_local_file = AndaDbConfig {
+    let db_config = AndaDbConfig {
         store_location_type: StoreLocationType::LocalFile,
-        store_location: "/tmp/anda_cognitive_nexus_py_test_db".to_string(),
-        db_name: "test_medical_db".to_string(),
-        db_desc: Some("Local file DB for medical KIP test".to_string()),
+        store_location,
+        db_name: "test_preferences_db".to_string(),
+        db_desc: Some("Local file DB for the KIP binding example".to_string()),
         meta_cache_capacity: Some(10000),
     };
 
-    // Ensure store_location folder exists before calling create_kip_db
-    if let StoreLocationType::LocalFile = db_config_local_file.store_location_type {
-        use std::path::Path;
-        let path = Path::new(&db_config_local_file.store_location);
-        if path.exists() {
-            if path.is_file() {
-                panic!(
-                    "store_location exists but is a file, not a directory: {}",
-                    db_config_local_file.store_location
-                );
-            }
-        } else {
-            std::fs::create_dir_all(path).expect("Failed to create store_location directory");
-        }
-    }
-
-    // Create Nexus instance for local_file DB
-    let nexus_local_file = create_kip_db(db_config_local_file)
+    println!("\n1. Recording an attributed claim...");
+    let nexus = create_kip_db(db_config.clone())
         .await
-        .expect("Failed to create local_file Nexus");
+        .expect("Failed to create the local-file Nexus");
 
-    let (_, response2) = execute_kip(
-        nexus_local_file.as_ref(),
-        MEDICAL_KNOWLEDGE_KML.to_string(),
-        None,
+    let mut parameters = Map::new();
+    parameters.insert(
+        "preference_name".to_string(),
+        Json::String("Dark mode".to_string()),
+    );
+    let (_, response) = execute_kip(
+        nexus.as_ref(),
+        RECORD_A_PREFERENCE.to_string(),
+        Some(parameters),
         false,
     )
-    .await
-    .expect("Execution of medical_knowledge_kml (local_file) failed");
-    assert!(
-        matches!(response2, Response::Ok { .. }),
-        "Expected second KML execution to be Ok, but got {:?}",
-        response2
+    .await;
+    assert_eq!(
+        response.status,
+        TopLevelStatus::Succeeded,
+        "recording the claim failed: {:#?}",
+        response.results
     );
-    println!("Medical Knowledge KML executed successfully (local_file DB).");
-
-    // 2. Execute the second KML command from the demo to add more data
-    println!("\n2. Executing New Drug KML...");
-
-    let mut ql_parameters = Map::new();
-    ql_parameters.insert(
-        "symptom_name".to_string(),
-        Json::String("Brain Fog".to_string()),
+    let alice = response
+        .first_result()
+        .and_then(|result| result["handles"]["alice"].as_str())
+        .expect("the write reports the element each handle minted")
+        .to_string();
+    println!(
+        "Recorded {alice}. tx: {:?}",
+        response.receipt.and_then(|r| r.tx_id)
     );
 
-    let (_, response2) = execute_kip(
-        nexus_local_file.as_ref(),
-        NEW_DRUG_KML.to_string(),
-        Some(ql_parameters.clone()),
+    println!("\n2. Recording a change of mind...");
+    let mut parameters = Map::new();
+    parameters.insert("alice".to_string(), Json::String(alice));
+    let (_, response) = execute_kip(
+        nexus.as_ref(),
+        CHANGE_OF_MIND.to_string(),
+        Some(parameters),
         false,
     )
-    .await
-    .expect("Execution of new_drug_kml failed");
-    assert!(
-        matches!(response2, Response::Ok { .. }),
-        "Expected third KML execution to be Ok, but got {:?}",
-        response2
+    .await;
+    assert_eq!(
+        response.status,
+        TopLevelStatus::Succeeded,
+        "recording the second claim failed: {:#?}",
+        response.results
     );
-    println!("New Drug KML executed successfully (local_file DB).");
 
-    // 3. Execute a KQL query from the demo to verify the data
-    println!("\n3. Executing KQL Query to find all drugs...");
+    // Close and re-open: everything below reads what storage kept, not what a
+    // live process is holding.
+    nexus.close().await.expect("Failed to close the database");
+    let nexus = create_kip_db(db_config)
+        .await
+        .expect("Failed to re-open the local-file Nexus");
+
+    println!("\n3. Reading the claims back...");
+    // This asks who claimed what, and with how much confidence. It does not
+    // ask what is true: belief is projected from Assertions under a policy,
+    // and a raw read is not that projection.
     let query = r#"
-    FIND(?drug.name, ?drug.attributes.molecular_formula, ?drug.attributes.risk_level)
+    FIND(?thing.name, ?a.confidence, ?a.mode)
     WHERE {
-        ?drug {type: "Drug"}
+        ?p PROPOSITION (?person, "prefers", ?thing)
+        ?a ASSERTION {proposition: ?p}
     }
-    ORDER BY ?drug.attributes.risk_level ASC
+    ORDER BY ?a.confidence DESC
     "#;
-
-    let (_, query_response) =
-        execute_kip(nexus_local_file.as_ref(), query.to_string(), None, false)
-            .await
-            .expect("Execution of KQL query failed");
-
-    println!("Query Response: {:#?}", query_response);
-
-    // 4. Assert that the query was successful and returned the correct data
-    assert!(
-        matches!(query_response, Response::Ok { .. }),
-        "Expected KQL query to be Ok, but got {:?}",
-        query_response
+    let (_, response) = execute_kip(nexus.as_ref(), query.to_string(), None, false).await;
+    assert_eq!(
+        response.status,
+        TopLevelStatus::Succeeded,
+        "the read failed: {:#?}",
+        response.results
     );
 
-    if let Response::Ok { result, .. } = query_response {
-        let result_array = result.as_array().expect("Result should be an array");
-        assert_eq!(
-            result_array.len(),
-            2,
-            "Expected to find 2 drugs, but found {}",
-            result_array.len()
-        );
-        println!("Successfully found 2 drugs as expected.");
-    } else {
-        panic!("Query failed, expected Ok response");
-    }
+    let result = response.first_result().expect("the read returns a result");
+    println!("Query Response: {result:#}");
+    let rows = result.as_array().expect("a KQL result is an array");
+    assert_eq!(
+        rows.len(),
+        2,
+        "expected both claims to survive the restart, found {}",
+        rows.len()
+    );
+    // Nothing was overwritten by the change of mind: the earlier claim is
+    // still on the record, at the confidence it was made with.
+    assert_eq!(rows[0][0], Json::from("Dark mode"));
+    assert_eq!(rows[0][1], Json::from(0.9));
+    assert_eq!(rows[1][0], Json::from("Light mode"));
 
+    nexus.close().await.expect("Failed to close the database");
     println!("\n--- Full Stateful KIP Execution Test Passed ---");
 }

@@ -1,876 +1,1146 @@
-//! # Request/Response structures for JSON-based communication
+//! # The KIP 2.0 runtime envelope (Spec §70–§85)
 //!
-//! This module implements the standardized request-response model for all interactions
-//! with the Cognitive Nexus as defined in KIP specification section 6.
+//! JSON is the baseline logical request/response format, and the envelope is
+//! transport-neutral: MCP, HTTP, IPC, WebSocket or canister calls must all show
+//! equivalent KIP semantics (§70.1).
 //!
-//! LLM Agents send structured requests (typically encapsulated in Function Calling)
-//! containing KIP commands to the Cognitive Nexus, which returns structured JSON responses.
+//! Three identities that are routinely confused and must not be (§72):
+//!
+//! ```text
+//! request_id       one transport/execution attempt
+//! idempotency_key  one logical mutation intent
+//! tx_id            an engine-assigned transaction fact
+//! ```
+//!
+//! And two things this module refuses to let a caller blur:
+//!
+//! - a declared `language` label cannot downgrade a write into read-only
+//!   semantics — the parsed command is authoritative (§73.1);
+//! - `operations[]` is a batch, not a transaction, unless `execution.mode` says
+//!   `atomic` (§75.4).
+
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::borrow::Cow;
 
-use crate::{
-    CommandType, Json, Map,
-    error::KipError,
-    executor::{Executor, execute_kip, execute_readonly},
-    parser::{MAX_KIP_BATCH_COMMANDS, MAX_KIP_INPUT_LEN},
-};
+use crate::ast::{Command, CommandType, Json, Map};
+use crate::error::{ErrorObject, KipError, KipErrorCode};
+use crate::parser::{MAX_KIP_BATCH_COMMANDS, parse_kip, validate_command};
 
-/// A batch command carrying its own parameter map.
-///
-/// This is a named struct rather than an inline enum variant so that
-/// `#[serde(deny_unknown_fields)]` applies: an `#[serde(untagged)]` struct
-/// variant silently ignores unknown fields, so a misspelled key (`"params"`
-/// instead of `"parameters"`) used to deserialize into a valid-looking item
-/// with an *empty* map — and [`Request::iter_commands`] then quietly fell back
-/// to the shared parameters, substituting values the caller never asked for.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ParameterizedCommand {
-    /// The KIP command string
-    pub command: String,
+/// The protocol profile this crate speaks.
+pub const KIP_VERSION: &str = "2.0";
 
-    /// Optional independent parameters for this specific command.
-    /// These parameters override any shared parameters with the same key.
-    #[serde(default)]
-    pub parameters: Map<String, Json>,
-}
+// ---------------------------------------------------------------------------
+// Request
+// ---------------------------------------------------------------------------
 
-/// Represents a single command item in the batch `commands` array.
-///
-/// Each element in the `commands` array can be either:
-/// - A simple `String` (uses shared `parameters` from the parent Request)
-/// - An `Object` with `{command, parameters}` (independent parameters override shared ones)
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(untagged)]
-pub enum CommandItem {
-    /// A simple command string that uses shared parameters from the parent Request
-    Simple(String),
-
-    /// A command with its own independent parameters that override shared parameters
-    WithParams(ParameterizedCommand),
-}
-
-/// Defines the arguments for the `execute_kip` function, which is the standard interface
-/// for an LLM to interact with the Cognitive Nexus.
-///
-/// # Single Command Example
-/// ```json
-/// {
-///   "command": "FIND(?drug.name) WHERE { ?symptom {name: :symptom_name} (?drug, \"treats\", ?symptom) } LIMIT :limit",
-///   "parameters": {
-///     "symptom_name": "Headache",
-///     "limit": 10
-///   },
-///   "dry_run": false
-/// }
-/// ```
-///
-/// # Batch Execution Example
-/// ```json
-/// {
-///   "commands": [
-///     "DESCRIBE PRIMER",
-///     "FIND(?t.name) WHERE { ?t {type: \"$ConceptType\"} } LIMIT 50",
-///     {
-///       "command": "UPSERT { CONCEPT ?e { {type:\"Event\", name: :name} } }",
-///       "parameters": { "name": "MyEvent" }
-///     }
-///   ],
-///   "parameters": { "limit": 10 },
-///   "dry_run": false
-/// }
-/// ```
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+/// The KIP 2.0 request envelope (Spec §71).
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
-    /// The complete KIP command string (KQL, KML, or META).
-    /// It can include placeholders like `:param_name` for parameter substitution.
-    /// **Mutually exclusive with `commands`**.
-    #[serde(default)]
-    pub command: String,
+    /// The requested protocol profile; always `"2.0"` here.
+    pub kip: String,
+    /// One transport/execution attempt. Not an idempotency key, not a `tx_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// Which MemorySpace the request runs against.
+    ///
+    /// A Space is never inferred from conversation context (§5.5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space: Option<SpaceSelector>,
+    /// An explicit compatibility profile, e.g. `kip-1-compat`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility_profile: Option<String>,
+    /// How the operations relate to one another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<Execution>,
+    /// The read coordinate to bind this request to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read: Option<ReadBinding>,
+    /// Source material the runtime mints into Evidence (§71.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingest: Option<IngestContext>,
+    /// Space/schema preconditions for the whole request (§35.4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preconditions: Option<Preconditions>,
+    /// The operations to run; at least one.
+    pub operations: Vec<Operation>,
+    /// Request-level parameter bindings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<Map<String, Json>>,
+    /// Non-authoritative context: purpose, risk, locale, client.
+    ///
+    /// None of it grants identity, access, representation or authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<RequestContext>,
+    /// Fail-fast capability preconditions (§67).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires: Option<Map<String, Json>>,
+    /// Deadline and dry-run options.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<RequestOptions>,
+    /// Namespaced extensions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<Map<String, Json>>,
+}
 
-    /// An array of KIP commands for batch execution.
-    /// **Mutually exclusive with `command`**.
-    /// Each element can be a `String` (uses shared `parameters`) or an `Object` with
-    /// `{command, parameters}` (independent parameters override shared).
-    /// Commands execute sequentially; **execution stops on the first KML error**.
-    /// KQL, META, and syntax errors are recorded and execution continues.
-    #[serde(default)]
-    pub commands: Vec<CommandItem>,
-
-    /// An optional map of key-value pairs for parameter substitution.
-    /// Keys in this map correspond to placeholders in the `command` string.
-    /// For batch execution, these are shared parameters used by all commands
-    /// unless overridden by individual command parameters.
-    #[serde(default)]
-    pub parameters: Map<String, Json>,
-
-    /// If true, the command is validated for syntax and logic but not executed.
-    /// No changes will be persisted to the knowledge graph.
-    #[serde(default)]
-    pub dry_run: bool,
-
-    /// If true, only read-only commands (KQL and META) are allowed.
-    #[serde(default)]
-    pub readonly: bool,
+impl Default for Request {
+    fn default() -> Self {
+        Self {
+            kip: KIP_VERSION.to_string(),
+            request_id: None,
+            space: None,
+            compatibility_profile: None,
+            execution: None,
+            read: None,
+            ingest: None,
+            preconditions: None,
+            operations: Vec::new(),
+            parameters: None,
+            context: None,
+            requires: None,
+            options: None,
+            extensions: None,
+        }
+    }
 }
 
 impl Request {
-    /// Checks if this request uses batch commands mode
-    pub fn is_batch(&self) -> bool {
-        !self.commands.is_empty()
+    /// Builds a single-operation request from one command string.
+    pub fn single(command: impl Into<String>) -> Self {
+        Self {
+            operations: vec![Operation::new(command)],
+            ..Default::default()
+        }
     }
 
-    /// Returns an iterator over all commands in this request.
+    /// Whether this request asks for validation only (§69.3, §75).
+    pub fn is_dry_run(&self) -> bool {
+        self.options
+            .as_ref()
+            .and_then(|o| o.dry_run)
+            .unwrap_or(false)
+    }
+
+    /// The declared execution mode; a lone operation needs none.
+    pub fn execution_mode(&self) -> ExecutionMode {
+        self.execution
+            .as_ref()
+            .map(|e| e.mode)
+            .unwrap_or(ExecutionMode::Independent)
+    }
+
+    /// Checks every envelope invariant that does not need an engine.
     ///
-    /// For single command mode, yields one item with the command and shared parameters.
-    /// For batch mode, yields each command item with merged parameters
-    /// (command-specific parameters override shared parameters).
-    pub fn iter_commands(
-        &self,
-    ) -> impl Iterator<Item = (Cow<'_, str>, Cow<'_, Map<String, Json>>)> {
-        let shared_params = &self.parameters;
-        let single_command = &self.command;
-        let commands = &self.commands;
-
-        let is_batch = !commands.is_empty();
-
-        // For single command mode
-        let single_iter = if !is_batch {
-            Some(std::iter::once((
-                Cow::Borrowed(single_command.as_str()),
-                Cow::Borrowed(shared_params),
-            )))
-        } else {
-            None
-        };
-
-        // For batch mode
-        let batch_iter = if is_batch {
-            Some(commands.iter().map(move |item| match item {
-                CommandItem::Simple(cmd) => {
-                    (Cow::Borrowed(cmd.as_str()), Cow::Borrowed(shared_params))
-                }
-                CommandItem::WithParams(ParameterizedCommand {
-                    command,
-                    parameters,
-                }) => {
-                    if parameters.is_empty() {
-                        (
-                            Cow::Borrowed(command.as_str()),
-                            Cow::Borrowed(shared_params),
-                        )
-                    } else if shared_params.is_empty() {
-                        (Cow::Borrowed(command.as_str()), Cow::Borrowed(parameters))
-                    } else {
-                        // Merge parameters: command-specific overrides shared
-                        let mut merged = shared_params.clone();
-                        for (k, v) in parameters {
-                            merged.insert(k.clone(), v.clone());
-                        }
-                        (Cow::Borrowed(command.as_str()), Cow::Owned(merged))
-                    }
-                }
-            }))
-        } else {
-            None
-        };
-
-        single_iter
-            .into_iter()
-            .flatten()
-            .chain(batch_iter.into_iter().flatten())
-    }
-
-    /// Substitutes parameters into a command string
-    ///
-    /// Replaces `:key_name` placeholder tokens in the command with corresponding values
-    /// from the parameters map. Replacement is token-aware: placeholders inside quoted
-    /// strings are left untouched and later rejected by request validation.
-    ///
-    /// # Warning
-    /// Placeholders must occupy a full JSON value position (e.g., `name: :param`).
-    /// Do NOT embed placeholders inside quoted strings (e.g., `"Hello :name"`),
-    /// because string values will be JSON-serialized with quotes.
-    fn substitute_params(command: &str, parameters: &Map<String, Json>) -> String {
-        if parameters.is_empty() {
-            return command.to_string();
+    /// This is the structural gate: Governance, Schema resolution, snapshot
+    /// alignment and commit-time revalidation all remain runtime invariants.
+    pub fn validate(&self) -> Result<(), KipError> {
+        if self.kip != KIP_VERSION {
+            return Err(KipError::unsupported_protocol_version(format!(
+                "this runtime speaks KIP {KIP_VERSION}, the request declares {:?}",
+                self.kip
+            )));
+        }
+        if self.operations.is_empty() {
+            return Err(KipError::invalid_request_envelope(
+                "a request must carry at least one operation",
+            ));
+        }
+        if self.operations.len() > MAX_KIP_BATCH_COMMANDS {
+            return Err(KipError::resource_exhausted(format!(
+                "batch of {} operations exceeds maximum {MAX_KIP_BATCH_COMMANDS}",
+                self.operations.len()
+            )));
         }
 
-        let mut result = String::with_capacity(command.len());
-        let bytes = command.as_bytes();
-        let mut index = 0;
-        let mut in_string = false;
-        let mut escaped = false;
-        let mut in_line_comment = false;
+        validate_optional_non_empty(&self.request_id, "request_id")?;
+        validate_optional_non_empty(&self.compatibility_profile, "compatibility_profile")?;
 
-        while index < command.len() {
-            // Substitution re-emits the full value at every occurrence, so the
-            // output grows as `occurrences * value_len` with no relation to the
-            // input length. Stop once the result is already past the parser's
-            // input cap: the oversized string is rejected by
-            // `validate_parser_budget` anyway, and bailing here bounds the
-            // allocation instead of letting a small body expand without limit.
-            if result.len() > MAX_KIP_INPUT_LEN {
-                break;
+        if let Some(space) = &self.space {
+            if space.id.is_none() && space.uri.is_none() {
+                return Err(KipError::invalid_request_envelope(
+                    "space must identify a MemorySpace by `id`, `uri`, or both",
+                ));
             }
-
-            let ch = command[index..]
-                .chars()
-                .next()
-                .expect("valid char boundary");
-            let ch_len = ch.len_utf8();
-
-            if in_line_comment {
-                result.push_str(&command[index..index + ch_len]);
-                if ch == '\n' {
-                    in_line_comment = false;
-                }
-                index += ch_len;
-                continue;
-            }
-
-            if in_string {
-                result.push_str(&command[index..index + ch_len]);
-                if escaped {
-                    escaped = false;
-                } else if ch == '\\' {
-                    escaped = true;
-                } else if ch == '"' {
-                    in_string = false;
-                }
-                index += ch_len;
-                continue;
-            }
-
-            if ch == '/' && bytes.get(index + 1) == Some(&b'/') {
-                in_line_comment = true;
-                result.push(ch);
-                index += ch_len;
-                continue;
-            }
-
-            if ch == '"' {
-                in_string = true;
-                result.push(ch);
-                index += ch_len;
-                continue;
-            }
-
-            if ch == ':' {
-                let name_start = index + 1;
-                if name_start < command.len() && Self::is_identifier_start_byte(bytes[name_start]) {
-                    let mut name_end = name_start + 1;
-                    while name_end < command.len()
-                        && Self::is_identifier_continue_byte(bytes[name_end])
-                    {
-                        name_end += 1;
-                    }
-
-                    let name = &command[name_start..name_end];
-                    if let Some(value) = parameters.get(name) {
-                        result.push_str(&Self::parameter_replacement(value));
-                        index = name_end;
-                        continue;
-                    }
-                }
-            }
-
-            result.push_str(&command[index..index + ch_len]);
-            index += ch_len;
+            validate_optional_non_empty(&space.id, "space.id")?;
+            validate_optional_non_empty(&space.uri, "space.uri")?;
         }
 
-        result
-    }
-
-    fn is_identifier_start_byte(byte: u8) -> bool {
-        byte.is_ascii_alphabetic() || byte == b'_'
-    }
-
-    fn is_identifier_continue_byte(byte: u8) -> bool {
-        byte.is_ascii_alphanumeric() || byte == b'_'
-    }
-
-    fn parameter_replacement(value: &Json) -> String {
-        match value {
-            Json::Number(n) => n.to_string(),
-            Json::Bool(b) => b.to_string(),
-            Json::Null => "null".to_string(),
-            _ => serde_json::to_string(value).unwrap_or_else(|_| "null".to_string()),
+        if let Some(execution) = &self.execution {
+            validate_optional_non_empty(&execution.isolation, "execution.isolation")?;
+            validate_optional_non_empty(&execution.idempotency_key, "execution.idempotency_key")?;
         }
-    }
-
-    fn placeholder_usage_error(extra_hint: String) -> ErrorObject {
-        ErrorObject {
-            code: "KIP_1001".to_string(),
-            name: Some("InvalidSyntax".to_string()),
-            message: "Invalid parameter placeholder usage".to_string(),
-            hint: Some(extra_hint),
-            data: None,
+        if let Some(read) = &self.read {
+            validate_optional_non_empty(&read.snapshot_token, "read.snapshot_token")?;
         }
-    }
-
-    fn validate_placeholder_usage(
-        command: &str,
-        parameters: &Map<String, Json>,
-    ) -> Option<ErrorObject> {
-        if parameters.is_empty() {
-            return None;
+        if let Some(context) = &self.context {
+            validate_optional_non_empty(&context.purpose, "context.purpose")?;
+            validate_optional_non_empty(&context.risk, "context.risk")?;
+            validate_optional_non_empty(&context.locale, "context.locale")?;
+            validate_optional_non_empty(&context.client, "context.client")?;
+        }
+        if self
+            .options
+            .as_ref()
+            .and_then(|options| options.deadline_ms)
+            == Some(0)
+        {
+            return Err(KipError::invalid_request_envelope(
+                "options.deadline_ms must be greater than zero",
+            ));
         }
 
-        Self::find_placeholders_in_strings(command, parameters)
-            .err()
-            .map(Self::placeholder_usage_error)
-    }
-
-    fn validate_request_mode(&self) -> Option<ErrorObject> {
-        let has_command = !self.command.trim().is_empty();
-        let has_commands = !self.commands.is_empty();
-
-        if has_command && has_commands {
-            return Some(ErrorObject {
-                code: "KIP_1001".to_string(),
-                name: Some("InvalidSyntax".to_string()),
-                message: "Invalid request: `command` and `commands` are mutually exclusive"
-                    .to_string(),
-                hint: Some(
-                    "Provide either a single `command` string or a batch `commands` array, not both."
-                        .to_string(),
-                ),
-                data: None,
-            });
+        // A multi-operation request must say how its operations relate: whether
+        // earlier commits survive a later failure is not a detail to leave to
+        // an engine default (§75, §75.4).
+        if self.operations.len() > 1 && self.execution.is_none() {
+            return Err(KipError::invalid_request_envelope(
+                "a multi-operation request must declare execution.mode: independent, sequence \
+                 or atomic — operations[] is a batch, not a transaction",
+            ));
         }
 
-        if !has_command && !has_commands {
-            return Some(ErrorObject {
-                code: "KIP_1001".to_string(),
-                name: Some("InvalidSyntax".to_string()),
-                message: "Invalid request: missing KIP command".to_string(),
-                hint: Some(
-                    "Provide either a non-empty single `command` string or a non-empty batch `commands` array."
-                        .to_string(),
-                ),
-                data: None,
-            });
+        if let Some(execution) = &self.execution
+            && execution.mode == ExecutionMode::Atomic
+            && execution.on_error == Some(OnError::Continue)
+        {
+            return Err(KipError::invalid_request_envelope(
+                "an atomic transaction cannot continue past an error: it commits all or none",
+            ));
         }
 
-        // The batch length is attacker-controlled and drives the result
-        // vector's pre-allocation, so cap it here — before any command runs —
-        // in the same over-budget error class as the parser's length/depth
-        // guards.
-        if self.commands.len() > MAX_KIP_BATCH_COMMANDS {
-            return Some(
-                KipError::resource_exhausted(format!(
-                    "batch command count {} exceeds maximum {MAX_KIP_BATCH_COMMANDS}",
-                    self.commands.len()
-                ))
-                .into(),
-            );
-        }
-
-        None
-    }
-
-    /// Core implementation that checks for placeholders inside quoted strings.
-    ///
-    /// Returns a list of (parameter_name, position) for each placeholder found inside a quoted string.
-    fn find_placeholders_in_strings(
-        command: &str,
-        parameters: &Map<String, Json>,
-    ) -> Result<(), String> {
-        let mut warnings = Vec::new();
-
-        let mut chars = command.char_indices().peekable();
-        let mut in_string = false;
-        let mut escaped = false;
-        let mut in_line_comment = false;
-
-        while let Some((pos, ch)) = chars.next() {
-            if in_line_comment {
-                if ch == '\n' {
-                    in_line_comment = false;
+        let mut seen_ops: Vec<&str> = Vec::new();
+        for operation in &self.operations {
+            operation.validate()?;
+            if let Some(op_id) = &operation.op_id {
+                if seen_ops.contains(&op_id.as_str()) {
+                    return Err(KipError::invalid_request_envelope(format!(
+                        "op_id {op_id:?} is used by two operations in one request"
+                    )));
                 }
-                continue;
-            }
-
-            if in_string {
-                if escaped {
-                    escaped = false;
-                    continue;
-                }
-
-                if ch == '\\' {
-                    escaped = true;
-                    continue;
-                }
-
-                if ch == '"' {
-                    in_string = false;
-                    continue;
-                }
-
-                if ch == ':'
-                    && let Some((_, next_ch)) = chars.peek().copied()
-                    && next_ch.is_ascii()
-                    && Self::is_identifier_start_byte(next_ch as u8)
-                {
-                    let mut name = String::new();
-                    while let Some((_, ident_ch)) = chars.peek().copied() {
-                        if ident_ch.is_ascii() && Self::is_identifier_continue_byte(ident_ch as u8)
-                        {
-                            name.push(ident_ch);
-                            chars.next();
-                        } else {
-                            break;
-                        }
-                    }
-
-                    if parameters.contains_key(&name) {
-                        warnings.push((name, pos));
-                    }
-                }
-            } else if ch == '/' && chars.peek().is_some_and(|(_, next)| *next == '/') {
-                in_line_comment = true;
-            } else if ch == '"' {
-                in_string = true;
-                escaped = false;
+                seen_ops.push(op_id);
             }
         }
 
-        if warnings.is_empty() {
-            return Ok(());
+        if let Some(parameters) = &self.parameters {
+            for name in parameters.keys() {
+                validate_binding_name(name, "parameter")?;
+            }
+        }
+        if let Some(ingest) = &self.ingest {
+            ingest.validate()?;
         }
 
-        let param_names: Vec<_> = warnings.iter().map(|(n, _)| n.as_str()).collect();
-        Err(format!(
-            "Possible cause: placeholder(s) {:?} appear to be inside quoted strings. \
-                             Placeholders must occupy a full JSON value position, not be embedded \
-                             inside strings.",
-            param_names
-        ))
+        Ok(())
     }
 
-    /// Converts the request to a complete command string with parameter substitution
+    /// Parses and classifies every operation, enforcing the language contract.
     ///
-    /// Replaces all `:key_name` placeholders in the command with corresponding values
-    /// from the parameters map. If no parameters are provided, returns the original command.
+    /// A caller-supplied `language` that disagrees with the parsed command is
+    /// rejected rather than trusted: that label is exactly the lever an
+    /// injection would pull to get a write past a read-only path (§73.1, §88.3).
+    pub fn parse_operations(&self) -> Result<Vec<Command>, KipError> {
+        self.validate()?;
+        self.operations
+            .iter()
+            .map(|operation| operation.parse())
+            .collect()
+    }
+}
+
+/// Which MemorySpace a request runs against (Spec §5).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SpaceSelector {
+    /// The Space id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// The Space URI. When both are given they must resolve to the same Space.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+}
+
+/// How a request's operations relate to one another (Spec §75).
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Execution {
+    /// The execution mode.
+    pub mode: ExecutionMode,
+    /// What to do when an operation fails; meaningful mainly for `sequence`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_error: Option<OnError>,
+    /// The requested isolation guarantee. An unsupported stronger guarantee
+    /// must fail explicitly rather than silently downgrade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<String>,
+    /// One logical mutation intent (§34.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    /// Namespaced extensions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<Map<String, Json>>,
+}
+
+impl Execution {
+    /// An execution block declaring just a mode.
+    pub fn new(mode: ExecutionMode) -> Self {
+        Self {
+            mode,
+            on_error: None,
+            isolation: None,
+            idempotency_key: None,
+            extensions: None,
+        }
+    }
+}
+
+/// The three execution modes (Spec §75).
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum ExecutionMode {
+    /// Semantically independent; separate snapshots, separate transactions,
+    /// failure isolated per operation (§75.1).
+    #[default]
+    Independent,
+    /// Ordered; each state-changing operation commits separately and earlier
+    /// commits are **not** rolled back (§75.2).
+    Sequence,
+    /// One transaction, one snapshot, read-your-writes, all-or-none (§75.3).
+    Atomic,
+}
+
+impl ExecutionMode {
+    /// Whether the whole request commits or aborts as one unit.
+    pub fn is_transactional(&self) -> bool {
+        matches!(self, ExecutionMode::Atomic)
+    }
+}
+
+/// What a `sequence` run does after a failure (Spec §75.2).
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum OnError {
+    /// Stop at the first failure.
+    Stop,
+    /// Keep going. Illegal under `atomic`.
+    Continue,
+}
+
+/// Binds a request to a readable cognitive state coordinate (Spec §78).
+///
+/// A snapshot token is not an authority token; current Governance always applies.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ReadBinding {
+    /// An opaque runtime token. Clients must not parse or modify it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_token: Option<String>,
+    /// Namespaced extensions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<Map<String, Json>>,
+}
+
+/// Space and schema preconditions for the whole request (Spec §35.4).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Preconditions {
+    /// The Space commit sequence the request expects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_seq: Option<u64>,
+    /// The exact Schema Environment version the request expects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_environment_version: Option<u64>,
+    /// Namespaced extensions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<Map<String, Json>>,
+}
+
+/// One operation in a request (Spec §73).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Operation {
+    /// A request-local correlation id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op_id: Option<String>,
+    /// The declared language. Advisory only: the parsed command is
+    /// authoritative for security classification (§73.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<CommandType>,
+    /// The KIP command text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// A pre-parsed command, where the runtime advertises the capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ast: Option<Command>,
+    /// Operation-local parameter bindings.
     ///
-    /// # Note
-    /// This method only works for single command mode. For batch mode, use `iter_commands()`
-    /// or `execute()` instead.
-    ///
-    /// # Returns
-    /// - `Cow::Borrowed` if no parameters need substitution
-    /// - `Cow::Owned` if parameter substitution was performed
-    pub fn to_command(&self) -> Cow<'_, str> {
-        if self.parameters.is_empty() {
-            Cow::Borrowed(&self.command)
-        } else {
-            Cow::Owned(Self::substitute_params(&self.command, &self.parameters))
+    /// Parameters are structurally bound to complete value positions, never
+    /// string-interpolated: they are data, not code (§74, §88.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<Map<String, Json>>,
+    /// One logical mutation intent, scoped to this operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    /// Reserved operation-local options.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<OperationOptions>,
+    /// Namespaced extensions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<Map<String, Json>>,
+}
+
+/// Reserved operation-local options container.
+///
+/// KIP 2.0 defines no standard members here yet. Keeping the container typed
+/// prevents a misspelled future option from being silently accepted.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct OperationOptions {
+    /// Namespaced extensions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<Map<String, Json>>,
+}
+
+impl Operation {
+    /// Builds an operation from a command string.
+    pub fn new(command: impl Into<String>) -> Self {
+        Self {
+            command: Some(command.into()),
+            ..Default::default()
         }
     }
 
-    /// Marks this request as read-only.
-    ///
-    /// When set, [`Self::execute`] dispatches through `execute_readonly`, which
-    /// rejects KML commands (UPSERT/UPDATE/MERGE/DELETE) with `KIP_1001` so callers
-    /// can route untrusted or query-only traffic through a guaranteed non-mutating path.
-    pub fn readonly(&mut self) -> &mut Self {
-        self.readonly = true;
+    /// Names this operation for correlation in the response.
+    pub fn with_op_id(mut self, op_id: impl Into<String>) -> Self {
+        self.op_id = Some(op_id.into());
         self
     }
 
-    /// Executes the KIP command(s) using the provided executor
-    ///
-    /// For single command mode, executes the single command and returns its result.
-    /// For batch mode, executes commands sequentially and stops on the first KML error,
-    /// returning an array of per-command results collected up to that point.
-    ///
-    /// # Note
-    /// Common misuse patterns (like placeholders inside quoted strings) are detected
-    /// up front by [`Self::validate_placeholder_usage`], which reports them with a
-    /// recovery hint instead of letting the parser fail on the unsubstituted text.
-    pub async fn execute(&self, nexus: &impl Executor) -> (CommandType, Response) {
-        if let Some(error) = self.validate_request_mode() {
-            return (CommandType::Unknown, Response::err(error));
-        }
-
-        if self.is_batch() {
-            self.execute_batch(nexus).await
-        } else {
-            if let Some(error) = Self::validate_placeholder_usage(&self.command, &self.parameters) {
-                return (CommandType::Unknown, Response::err(error));
-            }
-
-            let command = self.to_command();
-            if self.readonly {
-                execute_readonly(nexus, &command, self.dry_run).await
-            } else {
-                execute_kip(nexus, &command, self.dry_run).await
-            }
-        }
+    /// Binds parameters for this operation.
+    pub fn with_parameters(mut self, parameters: Map<String, Json>) -> Self {
+        self.parameters = Some(parameters);
+        self
     }
 
-    /// Executes batch commands sequentially
-    ///
-    /// Commands are executed in order. Execution stops on the first KML error.
-    /// KQL, META, and syntax errors are included in the result array and do not stop execution.
-    async fn execute_batch(&self, nexus: &impl Executor) -> (CommandType, Response) {
-        let mut results = Vec::with_capacity(self.commands.len());
-        let mut command_type = CommandType::Unknown;
-
-        for (cmd, params) in self.iter_commands() {
-            if let Some(error) = Self::validate_placeholder_usage(&cmd, &params) {
-                results.push(Response::err(error));
-                continue;
+    /// Checks the operation's own shape.
+    pub fn validate(&self) -> Result<(), KipError> {
+        match (&self.command, &self.ast) {
+            (Some(command), None) if !command.trim().is_empty() => {}
+            (Some(_), None) => {
+                return Err(KipError::invalid_request_envelope(
+                    "an operation's command must not be empty",
+                ));
             }
-
-            let substituted = Self::substitute_params(&cmd, &params);
-            let (cmd_type, response) = if self.readonly {
-                execute_readonly(nexus, &substituted, self.dry_run).await
-            } else {
-                execute_kip(nexus, &substituted, self.dry_run).await
-            };
-            if command_type != CommandType::Kml && cmd_type != CommandType::Unknown {
-                command_type = cmd_type.clone();
+            (None, Some(_)) => {}
+            (Some(_), Some(_)) => {
+                return Err(KipError::invalid_request_envelope(
+                    "an operation carries either `command` text or a pre-parsed `ast`, never both",
+                ));
             }
-
-            match response {
-                Response::Ok { .. } => {
-                    results.push(response);
-                }
-                Response::Err { error, result } => {
-                    // Keep the partial result attached to the error: an
-                    // over-budget KQL error (KIP_4002) carries the page it did
-                    // manage to produce, and rebuilding the response without it
-                    // silently dropped that data.
-                    results.push(Response::Err { error, result });
-
-                    if !self.readonly && cmd_type == CommandType::Kml {
-                        // Stop on first write error.
-                        return (cmd_type, Response::ok(json!(results)));
-                    }
-                }
+            (None, None) => {
+                return Err(KipError::invalid_request_envelope(
+                    "an operation must carry either `command` text or a pre-parsed `ast`",
+                ));
             }
         }
 
-        (command_type, Response::ok(json!(results)))
+        validate_optional_non_empty(&self.op_id, "op_id")?;
+        validate_optional_non_empty(&self.idempotency_key, "operation.idempotency_key")?;
+
+        if let Some(parameters) = &self.parameters {
+            for name in parameters.keys() {
+                validate_binding_name(name, "parameter")?;
+            }
+        }
+        Ok(())
     }
-}
 
-/// Response structure from the Cognitive Nexus
-///
-/// All responses from the Cognitive Nexus are JSON objects with this structure.
-/// `result` must be present on success; `error` must be present on failure
-/// (optionally alongside a partial `result`).
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-#[serde(untagged)]
-pub enum Response {
-    /// Successful response containing the request results
-    ///
-    /// Must be present when the request succeeds.
-    Ok {
-        /// The internal structure is defined by the specific KIP request command.
-        result: Json,
+    /// Parses this operation into a command, enforcing the language contract.
+    pub fn parse(&self) -> Result<Command, KipError> {
+        self.validate()?;
 
-        /// Opaque pagination token after the last returned result.
-        ///
-        /// If present, the caller can pass it back to request the next page.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        next_cursor: Option<String>,
-    },
-
-    /// Error response containing structured error details
-    ///
-    /// Must be present when the request fails.
-    /// Contains detailed information about what went wrong.
-    Err {
-        /// Structured error object describing the failure.
-        error: ErrorObject,
-
-        /// Partial result data, if any, when an error occurs.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        result: Option<Json>,
-    },
-}
-
-/// Deserialization dispatches on the presence of `error` rather than relying
-/// on `#[serde(untagged)]` variant order: an error response that carries a
-/// partial `result` (`{"error": ..., "result": ...}`) would otherwise match
-/// the `Ok` variant first and silently drop the error.
-impl<'de> Deserialize<'de> for Response {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        use serde::de::Error;
-
-        let mut value = Json::deserialize(deserializer)?;
-        let obj = value
-            .as_object_mut()
-            .ok_or_else(|| D::Error::custom("KIP response must be a JSON object"))?;
-
-        // An explicit `"error": null` is the canonical JSON-RPC success shape;
-        // treat it as absent rather than as an (unparseable) error payload.
-        match obj.remove("error") {
-            None | Some(Json::Null) => {}
-            Some(error) => {
-                let error: ErrorObject = serde_json::from_value(error)
-                    .map_err(|err| D::Error::custom(format!("invalid `error` object: {err}")))?;
-                return Ok(Response::Err {
-                    error,
-                    result: obj.remove("result"),
-                });
+        let command = match (&self.command, &self.ast) {
+            (Some(text), _) => parse_kip(text)?,
+            (None, Some(ast)) => {
+                // A supplied AST skipped the parser, and with it every rule the
+                // grammar enforces while reading. Re-check them here, or the
+                // `ast` form becomes a way to hand an engine exactly the
+                // commands the text form exists to reject (§73).
+                validate_command(ast)?;
+                ast.clone()
             }
-        }
+            (None, None) => unreachable!("validate rejected the empty operation"),
+        };
 
-        let result = obj
-            .remove("result")
-            .ok_or_else(|| D::Error::custom("KIP response requires `result` or `error`"))?;
-        let next_cursor = match obj.remove("next_cursor") {
-            None | Some(Json::Null) => None,
-            Some(Json::String(cursor)) => Some(cursor),
-            Some(other) => {
-                return Err(D::Error::custom(format!(
-                    "`next_cursor` must be a string, got: {other}"
+        if let Some(declared) = self.language {
+            let actual = CommandType::from(&command);
+            if declared != actual {
+                return Err(KipError::language_mismatch(format!(
+                    "the operation declares {declared} but the command is {actual}"
                 )));
             }
-        };
-        Ok(Response::Ok {
-            result,
-            next_cursor,
-        })
+        }
+        Ok(command)
+    }
+}
+
+/// Non-authoritative request context (Spec §71).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RequestContext {
+    /// Why the caller is asking, e.g. `answer_user`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+    /// The caller's own risk assessment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<String>,
+    /// The caller's locale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locale: Option<String>,
+    /// The calling client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
+    /// Namespaced extensions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<Map<String, Json>>,
+}
+
+/// Request-level options (Spec §80.1).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RequestOptions {
+    /// Validation/preview mode. A dry run must not establish a durable commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dry_run: Option<bool>,
+    /// The client's execution window.
+    ///
+    /// Expiry is not proof that a transaction aborted (§80.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_ms: Option<u64>,
+    /// Namespaced extensions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<Map<String, Json>>,
+}
+
+/// Source material the runtime mints into Evidence (Spec §71.1).
+///
+/// The point is Evidence fidelity: observed payloads should reach Evidence from
+/// the transport envelope, not by an Agent re-typing them inside KML text
+/// (§88.12).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct IngestContext {
+    /// The Evidence entries to mint, each bound as a request parameter.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<IngestEvidence>,
+    /// Namespaced extensions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<Map<String, Json>>,
+}
+
+impl IngestContext {
+    /// Checks the ingest entries' shape.
+    pub fn validate(&self) -> Result<(), KipError> {
+        if self.evidence.is_empty() {
+            return Err(KipError::invalid_request_envelope(
+                "an ingest context must carry at least one Evidence entry",
+            ));
+        }
+        let mut seen: Vec<&str> = Vec::new();
+        for entry in &self.evidence {
+            entry.validate()?;
+            if seen.contains(&entry.key.as_str()) {
+                return Err(KipError::invalid_request_envelope(format!(
+                    "ingest key {:?} is claimed by two Evidence entries",
+                    entry.key
+                )));
+            }
+            seen.push(&entry.key);
+        }
+        Ok(())
+    }
+}
+
+/// One Evidence entry to mint inside the request's transaction scope.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct IngestEvidence {
+    /// The request-local binding name; commands cite it as `:key`.
+    pub key: String,
+    /// What kind of observation this is (§15.2).
+    pub evidence_class: String,
+    /// The inline payload, preserved without model rewriting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<Json>,
+    /// A runtime artifact handle carrying the payload bytes instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_artifact: Option<String>,
+    /// The payload's media type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
+    /// When the observation happened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<String>,
+    /// The semantic source actor — recorded as Evidence source, never as
+    /// Principal identity (§88.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_actor: Option<String>,
+    /// A retry-safe logical identity for the minted Evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_key: Option<String>,
+    /// Namespaced extensions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<Map<String, Json>>,
+}
+
+impl IngestEvidence {
+    /// Checks that the entry names a binding and carries exactly one payload.
+    pub fn validate(&self) -> Result<(), KipError> {
+        validate_binding_name(&self.key, "ingest key")?;
+        if self.evidence_class.trim().is_empty() {
+            return Err(KipError::invalid_request_envelope(
+                "an ingest Evidence entry must declare an evidence_class",
+            ));
+        }
+        validate_optional_non_empty(&self.payload_artifact, "ingest payload_artifact")?;
+        validate_optional_non_empty(&self.media_type, "ingest media_type")?;
+        validate_optional_non_empty(&self.observed_at, "ingest observed_at")?;
+        validate_optional_non_empty(&self.source_actor, "ingest source_actor")?;
+        validate_optional_non_empty(&self.client_key, "ingest client_key")?;
+        match (&self.payload, &self.payload_artifact) {
+            (Some(_), None) | (None, Some(_)) => Ok(()),
+            _ => Err(KipError::invalid_request_envelope(format!(
+                "ingest entry {:?} must declare exactly one of payload / payload_artifact",
+                self.key
+            ))),
+        }
+    }
+}
+
+fn validate_optional_non_empty(value: &Option<String>, what: &str) -> Result<(), KipError> {
+    if value.as_ref().is_some_and(|value| value.trim().is_empty()) {
+        Err(KipError::invalid_request_envelope(format!(
+            "{what} must not be empty"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+/// Parameter and ingest binding names share the identifier shape the grammar
+/// uses, so `:name` always resolves to something spellable in a command.
+fn validate_binding_name(name: &str, what: &str) -> Result<(), KipError> {
+    let mut chars = name.chars();
+    let valid = match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+            chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(KipError::invalid_identifier(format!(
+            "{what} {name:?} must match [A-Za-z_][A-Za-z0-9_]*"
+        )))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Response
+// ---------------------------------------------------------------------------
+
+/// The KIP 2.0 response envelope (Spec §81).
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct Response {
+    /// The protocol profile that produced this response.
+    pub kip: String,
+    /// Echoes the request's `request_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// The request-level outcome.
+    pub status: TopLevelStatus,
+    /// The execution mode that was actually used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<ResponseExecution>,
+    /// One entry per operation.
+    pub results: Vec<OperationResult>,
+    /// Request-level context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<ResponseContext>,
+    /// The snapshot coordinate the reads ran at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<SnapshotContext>,
+    /// The commit receipt, for a state-changing request (§33.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<Receipt>,
+    /// Non-fatal caveats. A required failure is an Error, never a Warning.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<Warning>,
+    /// A request-level pagination cursor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    /// A request-level error, when the request failed before its operations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ErrorObject>,
+    /// Namespaced extensions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<Map<String, Json>>,
+}
+
+impl Default for Response {
+    fn default() -> Self {
+        Self {
+            kip: KIP_VERSION.to_string(),
+            request_id: None,
+            status: TopLevelStatus::Succeeded,
+            execution: None,
+            results: Vec::new(),
+            context: None,
+            snapshot: None,
+            receipt: None,
+            warnings: Vec::new(),
+            next_cursor: None,
+            error: None,
+            extensions: None,
+        }
     }
 }
 
 impl Response {
-    /// Constructs a successful response wrapping `result`, with no pagination cursor.
+    /// A successful single-operation response carrying one result value.
     pub fn ok(result: Json) -> Self {
-        Self::Ok {
-            result,
-            next_cursor: None,
-        }
-    }
-
-    /// Constructs an error response from anything convertible into [`ErrorObject`]
-    /// (e.g. [`KipError`]). No partial result is attached; use the `Response::Err`
-    /// variant directly if you need to surface partial data alongside an error.
-    pub fn err(error: impl Into<ErrorObject>) -> Self {
-        Self::Err {
-            error: error.into(),
-            result: None,
-        }
-    }
-
-    /// Consumes the response and converts it into a `Result`, discarding the
-    /// pagination cursor and any partial result attached to an error.
-    ///
-    /// Returning [`ErrorObject`] by value is part of the public API. Boxing it
-    /// would silence Clippy's size warning but would break existing callers.
-    #[allow(clippy::result_large_err)]
-    pub fn into_result(self) -> Result<Json, ErrorObject> {
-        match self {
-            Self::Ok { result, .. } => Ok(result),
-            Self::Err { error, .. } => Err(error),
-        }
-    }
-}
-
-/// Structured error details for failed requests
-///
-/// Provides comprehensive error information following KIP Standard Error Codes.
-/// Error codes are divided into 4 categories:
-/// - **1xxx (Syntax Errors)**: Syntax errors where the code has incorrect format.
-/// - **2xxx (Schema Errors)**: Schema errors violating type definitions or data constraints.
-/// - **3xxx (Logic/Data Errors)**: Logic or data errors, such as referencing non-existent variables.
-/// - **4xxx (System Errors)**: System-level errors, such as timeouts or insufficient permissions.
-///
-/// The type is `#[non_exhaustive]`: build it with [`ErrorObject::new`] plus the
-/// `with_*` setters instead of a struct literal, so that a future field (as
-/// `name` was in 0.10.1) can be added without breaking downstream compilation.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct ErrorObject {
-    /// KIP Standard Error Code (e.g., "KIP_1001", "KIP_2001")
-    pub code: String,
-
-    /// Semantic error name matching the code (e.g., "InvalidSyntax",
-    /// "TypeMismatch") — spares the LLM from memorizing the code table.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-
-    /// Human-readable error message
-    ///
-    /// Provides detailed information about the error for debugging and user feedback.
-    pub message: String,
-
-    /// Recovery hint for the AI Agent
-    ///
-    /// Provides suggestions on how to fix the error.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hint: Option<String>,
-
-    /// Optional additional error data
-    ///
-    /// May contain structured data relevant to the specific error,
-    /// such as validation details or context information.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub data: Option<Json>,
-}
-
-impl ErrorObject {
-    /// Creates an error object from a KIP standard error code and message.
-    ///
-    /// `name` / `hint` / `data` are left unset; add them with [`Self::with_name`],
-    /// [`Self::with_hint`] and [`Self::with_data`]. Prefer converting from
-    /// [`KipError`] when the error already exists in that form — the conversion
-    /// fills in the matching `name` and `hint` for you.
-    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
-            code: code.into(),
-            name: None,
-            message: message.into(),
-            hint: None,
-            data: None,
+            results: vec![OperationResult::ok(result)],
+            ..Default::default()
         }
     }
 
-    /// Sets the semantic error name (e.g., `"InvalidSyntax"`).
-    pub fn with_name(mut self, name: impl Into<String>) -> Self {
-        self.name = Some(name.into());
+    /// A failed single-operation response.
+    pub fn failed(error: impl Into<ErrorObject>) -> Self {
+        let error = error.into();
+        Self {
+            status: TopLevelStatus::Failed,
+            results: vec![OperationResult::failed(error.clone())],
+            error: Some(error),
+            ..Default::default()
+        }
+    }
+
+    /// Builds a response from per-operation results, deriving the top-level
+    /// status from them.
+    ///
+    /// `partial` is a real outcome, not a rounding of `failed`: under
+    /// `sequence`, earlier commits are durable even when a later operation
+    /// failed (§75.2), and a caller that treats the whole request as failed
+    /// will re-issue writes that already landed.
+    pub fn from_results(results: Vec<OperationResult>) -> Self {
+        let status = TopLevelStatus::derive(&results);
+        Self {
+            status,
+            results,
+            ..Default::default()
+        }
+    }
+
+    /// Marks the outcome as unknown, the state §80.3 requires when a write may
+    /// have committed but the response path cannot establish whether it did.
+    pub fn outcome_unknown(error: impl Into<ErrorObject>) -> Self {
+        Self {
+            status: TopLevelStatus::OutcomeUnknown,
+            error: Some(error.into()),
+            ..Default::default()
+        }
+    }
+
+    /// Correlates this response with its request.
+    pub fn with_request_id(mut self, request_id: Option<String>) -> Self {
+        self.request_id = request_id;
         self
     }
 
-    /// Sets the recovery hint shown to the AI Agent.
-    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
-        self.hint = Some(hint.into());
-        self
-    }
-
-    /// Attaches structured error data.
-    pub fn with_data(mut self, data: Json) -> Self {
-        self.data = Some(data);
-        self
+    /// The first result's value, for the single-operation case.
+    pub fn first_result(&self) -> Option<&Json> {
+        self.results.first().and_then(|r| r.result.as_ref())
     }
 }
 
-// #[cfg(feature = "nightly")]
-// impl<E> From<E> for ErrorObject
-// where
-//     E: std::error::Error,
-// {
-//     default fn from(error: E) -> Self {
-//         ErrorObject {
-//             name: std::any::type_name::<E>()
-//                 .split("::")
-//                 .last()
-//                 .unwrap_or("Error")
-//                 .to_string(),
-//             message: error.to_string(),
-//             data: None,
-//         }
-//     }
-// }
-
-impl From<String> for ErrorObject {
-    fn from(message: String) -> Self {
-        ErrorObject {
-            code: "KIP_4003".to_string(),
-            name: Some("InternalError".to_string()),
-            message,
-            hint: Some("Contact system administrator or retry later.".to_string()),
-            data: None,
-        }
-    }
-}
-
-/// Conversion from serde_json::Error to ErrorObject
-///
-/// Handles JSON serialization/deserialization errors
-impl From<serde_json::Error> for ErrorObject {
-    fn from(error: serde_json::Error) -> Self {
-        ErrorObject {
-            code: "KIP_1001".to_string(),
-            name: Some("InvalidSyntax".to_string()),
-            message: error.to_string(),
-            hint: Some("Check JSON data format is valid.".to_string()),
-            data: None,
-        }
-    }
-}
-
-/// Conversion from KipError to ErrorObject
-///
-/// Maps internal KIP errors to the standardized error response format
-impl From<KipError> for ErrorObject {
-    fn from(error: KipError) -> Self {
-        let hint = error.hint().to_string();
-        ErrorObject {
-            code: error.code_str().to_string(),
-            name: Some(error.name().to_string()),
-            message: error.message,
-            hint: Some(hint),
-            data: None,
-        }
-    }
-}
-
-/// Display implementation for ErrorObject
-impl std::fmt::Display for ErrorObject {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(hint) = &self.hint {
-            write!(f, "[{}] {}, Hint: {}", self.code, self.message, hint)
-        } else {
-            write!(f, "[{}] {}", self.code, self.message)
-        }
-    }
-}
-
-/// Conversion from KipError to Response
-///
-/// Automatically wraps KIP errors in the appropriate response format
 impl From<KipError> for Response {
-    fn from(error: KipError) -> Self {
-        Response::Err {
-            error: error.into(),
-            result: None,
+    fn from(err: KipError) -> Self {
+        Response::failed(err)
+    }
+}
+
+/// The request-level outcome (Spec §82).
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TopLevelStatus {
+    /// Every operation succeeded.
+    #[default]
+    Succeeded,
+    /// Nothing succeeded.
+    Failed,
+    /// Some operations succeeded and some did not.
+    Partial,
+    /// A write may or may not have committed (§80.3).
+    OutcomeUnknown,
+}
+
+impl TopLevelStatus {
+    /// Derives the request-level status from its operation results.
+    pub fn derive(results: &[OperationResult]) -> Self {
+        if results.is_empty() {
+            return TopLevelStatus::Succeeded;
+        }
+        let succeeded = results
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.status,
+                    OperationStatus::Succeeded | OperationStatus::NoEffect
+                )
+            })
+            .count();
+        if succeeded == results.len() {
+            TopLevelStatus::Succeeded
+        } else if succeeded == 0 {
+            TopLevelStatus::Failed
+        } else {
+            TopLevelStatus::Partial
         }
     }
 }
 
-impl<E> From<Result<(Json, Option<String>), E>> for Response
-where
-    E: Into<ErrorObject>,
-{
-    fn from(result: Result<(Json, Option<String>), E>) -> Self {
-        match result {
-            Ok((result, next_cursor)) => Response::Ok {
-                result,
-                next_cursor,
-            },
-            Err(err) => Response::Err {
-                error: err.into(),
-                result: None,
-            },
+/// The per-operation outcome (Spec §83).
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationStatus {
+    /// The operation ran and produced its effect.
+    #[default]
+    Succeeded,
+    /// The operation ran and failed.
+    Failed,
+    /// The operation never ran.
+    Skipped,
+    /// The operation executed tentatively inside a transaction that then
+    /// aborted; no durable state resulted (§83.1).
+    RolledBack,
+    /// The operation ran and changed nothing (§32.8).
+    NoEffect,
+}
+
+/// The execution block echoed back on the response.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ResponseExecution {
+    /// The mode that was used.
+    pub mode: ExecutionMode,
+    /// The error policy that was used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_error: Option<OnError>,
+    /// The isolation that was actually provided.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<String>,
+    /// Namespaced extensions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<Map<String, Json>>,
+}
+
+/// One operation's outcome (Spec §81).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct OperationResult {
+    /// Echoes the operation's `op_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op_id: Option<String>,
+    /// What happened.
+    pub status: OperationStatus,
+    /// The result value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<Json>,
+    /// The coordinates and policies this result was produced under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<ResultContext>,
+    /// Non-fatal caveats about this result.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<Warning>,
+    /// Why it failed. Required when `status` is `failed`; absent on success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ErrorObject>,
+    /// The cursor to continue from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    /// Namespaced extensions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<Map<String, Json>>,
+}
+
+impl OperationResult {
+    /// A successful result.
+    pub fn ok(result: Json) -> Self {
+        Self {
+            status: OperationStatus::Succeeded,
+            result: Some(result),
+            ..Default::default()
         }
+    }
+
+    /// A failed result.
+    pub fn failed(error: impl Into<ErrorObject>) -> Self {
+        Self {
+            status: OperationStatus::Failed,
+            error: Some(error.into()),
+            ..Default::default()
+        }
+    }
+
+    /// A result that ran but changed nothing.
+    pub fn no_effect() -> Self {
+        Self {
+            status: OperationStatus::NoEffect,
+            ..Default::default()
+        }
+    }
+
+    /// A result that was tentatively executed and then rolled back.
+    pub fn rolled_back() -> Self {
+        Self {
+            status: OperationStatus::RolledBack,
+            ..Default::default()
+        }
+    }
+
+    /// Correlates this result with its operation.
+    pub fn with_op_id(mut self, op_id: Option<String>) -> Self {
+        self.op_id = op_id;
+        self
     }
 }
 
-impl<E> From<Result<Json, E>> for Response
-where
-    E: Into<ErrorObject>,
-{
-    fn from(result: Result<Json, E>) -> Self {
-        match result {
-            Ok(result) => Response::Ok {
-                result,
-                next_cursor: None,
-            },
-            Err(err) => Response::Err {
-                error: err.into(),
-                result: None,
-            },
+/// Request-level response context.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct ResponseContext {
+    /// The Space the request ran against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_id: Option<String>,
+    /// The Schema Environment version in force.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_environment_version: Option<u64>,
+    /// The compatibility profile that was applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility_profile_used: Option<String>,
+    /// Namespaced extensions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<Map<String, Json>>,
+}
+
+/// The coordinates and policies one result was produced under (Spec §50).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct ResultContext {
+    /// The Space this result came from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_id: Option<String>,
+    /// The snapshot coordinate the read ran at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_seq: Option<u64>,
+    /// The Schema Environment version used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_environment_version: Option<u64>,
+    /// Which Projection Policy produced any belief in this result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epistemic_policy: Option<PolicyIdentity>,
+    /// How a SEARCH result was produced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<SearchContext>,
+    /// The cursor this page was produced from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    /// Namespaced extensions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<Map<String, Json>>,
+}
+
+/// The string-or-integer wire form of a policy version.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(untagged)]
+pub enum PolicyVersion {
+    /// A semantic or otherwise textual policy version.
+    Text(String),
+    /// A monotonically increasing numeric policy version.
+    Integer(u64),
+}
+
+/// Identifies the policy a projection ran under.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct PolicyIdentity {
+    /// The policy id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// The policy version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<PolicyVersion>,
+}
+
+/// How a SEARCH result was produced (Spec §66, §79).
+///
+/// A lagging index must not be presented as transaction-snapshot-consistent
+/// when it is not, which is what `index_seq` versus `current_space_seq` makes
+/// visible.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct SearchContext {
+    /// The sequence the index reflects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_seq: Option<u64>,
+    /// The Space's current sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_space_seq: Option<u64>,
+    /// The consistency actually provided.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consistency: Option<String>,
+    /// The search mode used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<SearchMode>,
+    /// What the score means. A relevance score is not confidence (§2.10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score_semantics: Option<String>,
+    /// Namespaced extensions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<Map<String, Json>>,
+}
+
+/// The baseline SEARCH modes (Spec §66.3).
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchMode {
+    /// Lexical matching.
+    Keyword,
+    /// Embedding similarity.
+    Semantic,
+    /// Both.
+    Hybrid,
+}
+
+/// The snapshot coordinate a response was produced at (Spec §78).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct SnapshotContext {
+    /// The Space the snapshot belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_id: Option<String>,
+    /// The snapshot sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_seq: Option<u64>,
+    /// The Schema Environment version at that coordinate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_environment_version: Option<u64>,
+    /// An opaque token to bind later reads to the same coordinate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_token: Option<String>,
+    /// Namespaced extensions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<Map<String, Json>>,
+}
+
+/// The receipt for a state-changing request (Spec §33).
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct Receipt {
+    /// What the transaction did.
+    pub status: ReceiptStatus,
+    /// The engine-assigned transaction id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_id: Option<String>,
+    /// The Space that committed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_id: Option<String>,
+    /// The snapshot the transaction started from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_seq: Option<u64>,
+    /// The Space sequence the commit produced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_seq: Option<u64>,
+    /// When it committed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub committed_at: Option<String>,
+    /// The transaction class, e.g. `cognitive`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transaction_class: Option<String>,
+    /// A digest of the request that produced it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_digest: Option<String>,
+    /// A digest of the semantic plan that was executed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_plan_digest: Option<String>,
+    /// A digest of the result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_digest: Option<String>,
+    /// The Schema Environment version the commit ran under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_environment_version: Option<u64>,
+    /// A summary of what changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_summary: Option<Json>,
+    /// Signatures over the receipt (§33.3).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proofs: Vec<Json>,
+    /// Namespaced extensions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<Map<String, Json>>,
+}
+
+/// What a transaction did (Spec §33.2).
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ReceiptStatus {
+    /// The transaction committed durably.
+    Committed,
+    /// The transaction aborted; no durable state resulted.
+    Aborted,
+    /// The transaction ran and changed nothing.
+    NoEffect,
+    /// The transaction is still in flight.
+    Pending,
+    /// The outcome could not be established (§80.3).
+    Unknown,
+}
+
+/// A non-fatal caveat (Spec §81).
+///
+/// A required failure must be an Error, not a Warning.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(untagged)]
+pub enum Warning {
+    /// A bare message.
+    Message(String),
+    /// A coded warning.
+    Coded {
+        /// A stable warning code.
+        code: String,
+        /// The human-readable message.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        /// Structured detail.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<Json>,
+        /// Namespaced extensions.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        extensions: Option<Map<String, Json>>,
+    },
+}
+
+impl From<&str> for Warning {
+    fn from(message: &str) -> Self {
+        Warning::Message(message.to_string())
+    }
+}
+
+impl From<String> for Warning {
+    fn from(message: String) -> Self {
+        Warning::Message(message)
+    }
+}
+
+impl From<KipErrorCode> for Warning {
+    fn from(code: KipErrorCode) -> Self {
+        Warning::Coded {
+            code: code.name().to_string(),
+            message: None,
+            details: None,
+            extensions: None,
         }
     }
 }
@@ -878,1583 +1148,396 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Command, parse_kml, parse_kql};
-    use async_trait::async_trait;
-    use serde_json::json;
+    use crate::error::KipErrorCode;
 
     #[test]
-    fn test_to_command_empty_parameters() {
-        let request = Request {
-            command: "FIND(?drug) WHERE { ?drug {type: \"Drug\"} }".to_string(),
-            ..Default::default()
-        };
-
-        let result = request.to_command();
-        assert_eq!(result, "FIND(?drug) WHERE { ?drug {type: \"Drug\"} }");
-        assert!(matches!(result, Cow::Borrowed(_)));
-        assert!(parse_kql(&result).is_ok());
+    fn a_lone_operation_needs_no_execution_mode() {
+        let request = Request::single(r#"FIND(?x) WHERE { ?x {type: "T"} }"#);
+        assert!(request.validate().is_ok());
     }
 
     #[test]
-    fn test_to_command_substitutes_update_and_search_placeholders() {
-        // The spec's decay UPDATE with :factor / :now / :threshold placeholders.
-        let request = Request {
-            command: r#"
-            UPDATE ?link
-            SET METADATA {
-                confidence: CLAMP(MUL(?link.metadata.confidence, :factor), 0.0, 1.0),
-                decay_applied_at: :now
-            }
-            WHERE {
-                ?link (?s, ?p, ?o)
-                FILTER(?link.metadata.created_at < :threshold && ?link.metadata.confidence > 0.3)
-            }
-            LIMIT :limit
-            "#
-            .to_string(),
-            parameters: [
-                ("factor".to_string(), json!(0.9)),
-                ("now".to_string(), json!("2026-06-11T00:00:00Z")),
-                ("threshold".to_string(), json!("2026-05-11T00:00:00Z")),
-                ("limit".to_string(), json!(500)),
-            ]
-            .into_iter()
-            .collect(),
-            ..Default::default()
-        };
-
-        let substituted = request.to_command();
-        let command = crate::parse_kip(&substituted).unwrap();
-        match command {
-            Command::Kml(crate::KmlStatement::Update(update)) => {
-                assert_eq!(update.target, "link");
-                assert_eq!(update.limit, Some(500));
-            }
-            other => panic!("Expected UPDATE statement, got {other:?}"),
-        }
-
-        // SEARCH with :mode / :threshold / :limit placeholders.
-        let request = Request {
-            command: r#"SEARCH CONCEPT :term MODE :mode THRESHOLD :threshold LIMIT :limit"#
-                .to_string(),
-            parameters: [
-                ("term".to_string(), json!("headache relief")),
-                ("mode".to_string(), json!("semantic")),
-                ("threshold".to_string(), json!(0.75)),
-                ("limit".to_string(), json!(10)),
-            ]
-            .into_iter()
-            .collect(),
-            ..Default::default()
-        };
-
-        let substituted = request.to_command();
-        let command = crate::parse_kip(&substituted).unwrap();
-        match command {
-            Command::Meta(crate::MetaCommand::Search(search)) => {
-                assert_eq!(search.term, "headache relief");
-                assert_eq!(search.mode, Some(crate::SearchMode::Semantic));
-                assert_eq!(
-                    search.threshold,
-                    Some(crate::Number::from_f64(0.75).unwrap())
-                );
-                assert_eq!(search.limit, Some(10));
-            }
-            other => panic!("Expected SEARCH command, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_to_command_string_parameter() {
-        let mut parameters = Map::new();
-        parameters.insert(
-            "symptom_name".to_string(),
-            Json::String("Headache".to_string()),
-        );
-
-        let request = Request {
-            command: "FIND(?symptom) WHERE { ?symptom {name: :symptom_name} }".to_string(),
-            parameters,
-            ..Default::default()
-        };
-
-        let result = request.to_command();
-        assert_eq!(
-            result,
-            "FIND(?symptom) WHERE { ?symptom {name: \"Headache\"} }"
-        );
-        assert!(matches!(result, Cow::Owned(_)));
-        assert!(parse_kql(&result).is_ok());
-    }
-
-    #[test]
-    fn test_to_command_number_parameter() {
-        let mut parameters = Map::new();
-        parameters.insert(
-            "limit".to_string(),
-            Json::Number(serde_json::Number::from(10)),
-        );
-        parameters.insert(
-            "risk_level".to_string(),
-            Json::Number(serde_json::Number::from_f64(3.5).unwrap()),
-        );
-
-        let request = Request {
-            command: "FIND(?drug) WHERE { ?drug {type: \"Drug\"} FILTER(?drug.attributes.risk_level < :risk_level) } LIMIT :limit".to_string(),
-            parameters,
-            ..Default::default()
-        };
-
-        let result = request.to_command();
-        assert_eq!(
-            result,
-            "FIND(?drug) WHERE { ?drug {type: \"Drug\"} FILTER(?drug.attributes.risk_level < 3.5) } LIMIT 10"
-        );
-        assert!(parse_kql(&result).is_ok());
-    }
-
-    #[test]
-    fn test_to_command_object_parameter() {
-        let mut parameters = Map::new();
-        parameters.insert(
-            "metadata".to_string(),
-            json!({"confidence": 0.95, "source": "clinical_trial"}),
-        );
-
-        let request = Request {
-            command:
-                "UPSERT { CONCEPT ?drug { {type: \"Drug\", name: \"TestDrug\"} } WITH METADATA :metadata }"
-                    .to_string(),
-            parameters,
-            ..Default::default()
-        };
-
-        let result = request.to_command();
-        assert_eq!(
-            result,
-            "UPSERT { CONCEPT ?drug { {type: \"Drug\", name: \"TestDrug\"} } WITH METADATA {\"confidence\":0.95,\"source\":\"clinical_trial\"} }"
-        );
-
-        assert!(parse_kml(&result).is_ok());
-    }
-
-    #[test]
-    fn test_to_command_multiple_parameters() {
-        let mut parameters = Map::new();
-        parameters.insert(
-            "symptom_name".to_string(),
-            Json::String("Headache".to_string()),
-        );
-        parameters.insert(
-            "limit".to_string(),
-            Json::Number(serde_json::Number::from(5)),
-        );
-        parameters.insert("include_experimental".to_string(), Json::Bool(false));
-
-        let request = Request {
-            command: r#"
-                FIND(?drug.name)
-                WHERE {
-                    ?symptom{name: :symptom_name}
-                    (?drug, "treats", ?symptom)
-                    FILTER(?drug.attributes.experimental == :include_experimental)
-                }
-                LIMIT :limit
-            "#
-            .to_string(),
-            parameters,
-            ..Default::default()
-        };
-
-        let result = request.to_command();
-        let expected = r#"
-                FIND(?drug.name)
-                WHERE {
-                    ?symptom{name: "Headache"}
-                    (?drug, "treats", ?symptom)
-                    FILTER(?drug.attributes.experimental == false)
-                }
-                LIMIT 5
-            "#;
-        assert_eq!(result, expected);
-        assert!(parse_kql(&result).is_ok());
-    }
-
-    #[test]
-    fn test_to_command_same_parameter_multiple_times() {
-        let mut parameters = Map::new();
-        parameters.insert(
-            "drug_type".to_string(),
-            Json::String("Analgesic".to_string()),
-        );
-
-        let request = Request {
-            command:
-                "FIND(?drug1, ?drug2) WHERE { ?drug1 {type: :drug_type} ?drug2 {type: :drug_type} }"
-                    .to_string(),
-            parameters,
-            ..Default::default()
-        };
-
-        let result = request.to_command();
-        assert_eq!(
-            result,
-            "FIND(?drug1, ?drug2) WHERE { ?drug1 {type: \"Analgesic\"} ?drug2 {type: \"Analgesic\"} }"
-        );
-        assert!(parse_kql(&result).is_ok());
-    }
-
-    #[test]
-    fn test_to_command_parameter_name_prefix_collision() {
-        let mut parameters = Map::new();
-        parameters.insert("name".to_string(), Json::String("Short".to_string()));
-        parameters.insert("name_long".to_string(), Json::String("Long".to_string()));
-
-        let request = Request {
-            command: "FIND(?item) WHERE { ?item {name: :name_long} FILTER(?item.attributes.alias == :name) }"
-                .to_string(),
-            parameters,
-            ..Default::default()
-        };
-
-        let result = request.to_command();
-        assert_eq!(
-            result,
-            "FIND(?item) WHERE { ?item {name: \"Long\"} FILTER(?item.attributes.alias == \"Short\") }"
-        );
-        assert!(parse_kql(&result).is_ok());
-    }
-
-    #[test]
-    fn test_to_command_parameter_not_found() {
-        let mut parameters = Map::new();
-        parameters.insert(
-            "existing_param".to_string(),
-            Json::String("value".to_string()),
-        );
-
-        let request = Request {
-            command: "FIND(?item) WHERE { ?item{name: :missing_param} }".to_string(),
-            parameters,
-            ..Default::default()
-        };
-
-        let result = request.to_command();
-        // Non-existent parameters should remain unchanged
-        assert_eq!(result, "FIND(?item) WHERE { ?item{name: :missing_param} }");
-        assert!(parse_kql(&result).is_err());
-    }
-
-    #[test]
-    fn test_to_command_special_characters_in_string() {
-        let mut parameters = Map::new();
-        parameters.insert(
-            "special_name".to_string(),
-            Json::String("Drug with \"quotes\" and :symbols".to_string()),
-        );
-
-        let request = Request {
-            command: "FIND(?drug) WHERE { ?drug{name: :special_name} }".to_string(),
-            parameters,
-            ..Default::default()
-        };
-
-        let result = request.to_command();
-        assert_eq!(
-            result,
-            "FIND(?drug) WHERE { ?drug{name: \"Drug with \\\"quotes\\\" and :symbols\"} }"
-        );
-        assert!(parse_kql(&result).is_ok());
-    }
-
-    #[test]
-    fn test_to_command_ignores_placeholders_in_comments() {
-        let mut parameters = Map::new();
-        parameters.insert("name".to_string(), Json::String("Aspirin".to_string()));
-
-        let request = Request {
-            command: r#"
-                // Example placeholder :name and quoted text "Hello :name" stay as comments.
-                FIND(?drug)
-                WHERE { ?drug {name: :name} }
-            "#
-            .to_string(),
-            parameters,
-            ..Default::default()
-        };
-
-        let result = request.to_command();
-        assert!(result.contains("// Example placeholder :name"));
-        assert!(result.contains("quoted text \"Hello :name\""));
-        assert!(result.contains(r#"{name: "Aspirin"}"#));
-        assert!(parse_kql(&result).is_ok());
-    }
-
-    #[test]
-    fn test_to_command_complex_kip_example() {
-        // Test a complete example conforming to KIP specification
-        let mut parameters = Map::new();
-        parameters.insert(
-            "symptom_name".to_string(),
-            Json::String("Brain Fog".to_string()),
-        );
-        parameters.insert(
-            "confidence_threshold".to_string(),
-            Json::Number(serde_json::Number::from_f64(0.8).unwrap()),
-        );
-        parameters.insert(
-            "max_results".to_string(),
-            Json::Number(serde_json::Number::from(20)),
-        );
-
-        let request = Request {
-            command: r#"
-                FIND(?drug.name, ?drug.metadata.confidence)
-                WHERE {
-                    (?drug, "treats", {name: :symptom_name})
-                    FILTER(?drug.metadata.confidence > :confidence_threshold)
-                }
-                ORDER BY ?drug.metadata.confidence DESC
-                LIMIT :max_results
-            "#
-            .to_string(),
-            parameters,
-            ..Default::default()
-        };
-
-        let result = request.to_command();
-        let expected = r#"
-                FIND(?drug.name, ?drug.metadata.confidence)
-                WHERE {
-                    (?drug, "treats", {name: "Brain Fog"})
-                    FILTER(?drug.metadata.confidence > 0.8)
-                }
-                ORDER BY ?drug.metadata.confidence DESC
-                LIMIT 20
-            "#;
-        assert_eq!(result, expected);
-        assert!(parse_kql(expected).is_ok());
-    }
-
-    #[test]
-    fn test_response() {
-        let res = Response::ok(json!("Success"));
-        assert_eq!(
-            serde_json::to_string(&res).unwrap(),
-            r#"{"result":"Success"}"#
-        );
-        assert_eq!(
-            res,
-            serde_json::from_str(r#"{"result":"Success"}"#).unwrap()
-        );
-
-        let res = Response::Ok {
-            result: json!("Success"),
-            next_cursor: Some("abcdef".to_string()),
-        };
-        assert_eq!(
-            serde_json::to_string(&res).unwrap(),
-            r#"{"result":"Success","next_cursor":"abcdef"}"#
-        );
-
-        let res = Response::err(ErrorObject {
-            code: "KIP_4003".to_string(),
-            name: None,
-            message: "An error occurred".to_string(),
-            hint: Some("Contact system administrator.".to_string()),
-            data: Some(json!("Additional info")),
+    fn unknown_wire_fields_are_rejected_instead_of_silently_ignored() {
+        // `option` is a dangerous typo here: silently dropping it would turn a
+        // requested dry run into a durable write.
+        let bad_request = serde_json::json!({
+            "kip": "2.0",
+            "operations": [{"command": "ARCHIVE :x"}],
+            "option": {"dry_run": true}
         });
-        assert_eq!(
-            serde_json::to_string(&res).unwrap(),
-            r#"{"error":{"code":"KIP_4003","message":"An error occurred","hint":"Contact system administrator.","data":"Additional info"}}"#
-        );
+        assert!(serde_json::from_value::<Request>(bad_request).is_err());
+
+        let bad_operation = serde_json::json!({
+            "kip": "2.0",
+            "operations": [{
+                "command": "DESCRIBE PROTOCOL",
+                "paramters": {"x": 1}
+            }]
+        });
+        assert!(serde_json::from_value::<Request>(bad_operation).is_err());
+
+        let bad_operation_option = serde_json::json!({
+            "kip": "2.0",
+            "operations": [{
+                "command": "ARCHIVE :x",
+                "options": {"dry_run": true}
+            }]
+        });
+        assert!(serde_json::from_value::<Request>(bad_operation_option).is_err());
     }
 
     #[test]
-    fn request_readonly_builder_sets_flag_and_chains() {
+    fn optional_envelope_fields_must_not_be_empty_when_present() {
         let mut request = Request {
-            command: "DESCRIBE PRIMER".to_string(),
-            ..Default::default()
+            space: Some(SpaceSelector::default()),
+            ..Request::single("DESCRIBE PROTOCOL")
         };
-
-        let same = request.readonly();
-        same.dry_run = true;
-
-        assert!(request.readonly);
-        assert!(request.dry_run);
-    }
-
-    #[test]
-    fn response_into_result_and_from_result_cover_ok_and_error_paths() {
-        assert_eq!(
-            Response::ok(json!({"ok": true})).into_result().unwrap(),
-            json!({"ok": true})
-        );
-
-        let err = Response::err("failed".to_string())
-            .into_result()
-            .unwrap_err();
-        assert_eq!(err.code, "KIP_4003");
-        assert_eq!(err.message, "failed");
-
-        let ok_with_cursor: Response =
-            Result::<(Json, Option<String>), KipError>::Ok((json!([1, 2]), Some("c1".to_string())))
-                .into();
-        assert_eq!(
-            ok_with_cursor,
-            Response::Ok {
-                result: json!([1, 2]),
-                next_cursor: Some("c1".to_string())
-            }
-        );
-
-        let err_with_cursor: Response =
-            Result::<(Json, Option<String>), KipError>::Err(KipError::not_found("missing")).into();
-        assert!(
-            matches!(err_with_cursor, Response::Err { ref error, .. } if error.code == "KIP_3002")
-        );
-
-        let ok_plain: Response = Result::<Json, KipError>::Ok(json!("plain")).into();
-        assert_eq!(ok_plain, Response::ok(json!("plain")));
-
-        let err_plain: Response =
-            Result::<Json, KipError>::Err(KipError::invalid_syntax("bad")).into();
-        assert!(matches!(err_plain, Response::Err { ref error, .. } if error.code == "KIP_1001"));
-    }
-
-    #[test]
-    fn error_object_conversions_and_display_cover_all_branches() {
-        let from_string = ErrorObject::from("boom".to_string());
-        assert_eq!(from_string.code, "KIP_4003");
-        assert!(from_string.to_string().contains("Hint:"));
-
-        let json_error = serde_json::from_str::<Json>("{not json").unwrap_err();
-        let from_json = ErrorObject::from(json_error);
-        assert_eq!(from_json.code, "KIP_1001");
-        assert!(from_json.hint.unwrap().contains("JSON"));
-
-        let from_kip = ErrorObject::from(KipError::duplicate_exists("exists"));
-        assert_eq!(from_kip.code, "KIP_3003");
-        assert!(!from_kip.hint.unwrap().is_empty());
-
-        let without_hint = ErrorObject {
-            code: "KIP_TEST".to_string(),
-            name: None,
-            message: "message".to_string(),
-            hint: None,
-            data: None,
-        };
-        assert_eq!(without_hint.to_string(), "[KIP_TEST] message");
-
-        let response: Response = KipError::not_found("missing").into();
-        assert!(matches!(response, Response::Err { ref error, .. } if error.code == "KIP_3002"));
-    }
-
-    #[test]
-    fn test_command_item_deserialization() {
-        // Test simple string command
-        let simple: CommandItem = serde_json::from_str(r#""DESCRIBE PRIMER""#).unwrap();
-        assert!(matches!(simple, CommandItem::Simple(s) if s == "DESCRIBE PRIMER"));
-
-        // Test command with parameters
-        let with_params: CommandItem = serde_json::from_str(
-            r#"{"command": "FIND(?x) WHERE { ?x {name: :name} }", "parameters": {"name": "test"}}"#,
-        )
-        .unwrap();
-        match with_params {
-            CommandItem::WithParams(ParameterizedCommand {
-                command,
-                parameters,
-            }) => {
-                assert_eq!(command, "FIND(?x) WHERE { ?x {name: :name} }");
-                assert_eq!(
-                    parameters.get("name"),
-                    Some(&Json::String("test".to_string()))
-                );
-            }
-            _ => panic!("Expected WithParams variant"),
-        }
-
-        // Test command with empty parameters
-        let with_empty_params: CommandItem =
-            serde_json::from_str(r#"{"command": "DESCRIBE PRIMER", "parameters": {}}"#).unwrap();
-        match with_empty_params {
-            CommandItem::WithParams(ParameterizedCommand {
-                command,
-                parameters,
-            }) => {
-                assert_eq!(command, "DESCRIBE PRIMER");
-                assert!(parameters.is_empty());
-            }
-            _ => panic!("Expected WithParams variant"),
-        }
-    }
-
-    #[test]
-    fn test_batch_request_deserialization() {
-        let json_str = r#"{
-            "commands": [
-                "DESCRIBE PRIMER",
-                "FIND(?t.name) WHERE { ?t {type: \"$ConceptType\"} } LIMIT 50",
-                {
-                    "command": "UPSERT { CONCEPT ?e { {type:\"Event\", name: :name} } }",
-                    "parameters": { "name": "MyEvent" }
-                }
-            ],
-            "parameters": { "limit": 10 }
-        }"#;
-
-        let request: Request = serde_json::from_str(json_str).unwrap();
-        assert!(request.is_batch());
-        assert_eq!(request.commands.len(), 3);
-        assert_eq!(
-            request.parameters.get("limit"),
-            Some(&Json::Number(10.into()))
-        );
-
-        // Verify command items
-        assert!(matches!(&request.commands[0], CommandItem::Simple(s) if s == "DESCRIBE PRIMER"));
-        assert!(matches!(&request.commands[1], CommandItem::Simple(s) if s.contains("FIND")));
-        match &request.commands[2] {
-            CommandItem::WithParams(ParameterizedCommand {
-                command,
-                parameters,
-            }) => {
-                assert!(command.contains("UPSERT"));
-                assert_eq!(
-                    parameters.get("name"),
-                    Some(&Json::String("MyEvent".to_string()))
-                );
-            }
-            _ => panic!("Expected WithParams variant"),
-        }
-    }
-
-    #[test]
-    fn test_iter_commands_single_mode() {
-        let mut parameters = Map::new();
-        parameters.insert("name".to_string(), Json::String("test".to_string()));
-
-        let request = Request {
-            command: "FIND(?x) WHERE { ?x {name: :name} }".to_string(),
-            commands: vec![],
-            parameters: parameters.clone(),
-            ..Default::default()
-        };
-
-        assert!(!request.is_batch());
-        let items: Vec<_> = request.iter_commands().collect();
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].0.as_ref(), "FIND(?x) WHERE { ?x {name: :name} }");
-        assert_eq!(
-            items[0].1.get("name"),
-            Some(&Json::String("test".to_string()))
-        );
-    }
-
-    #[test]
-    fn test_iter_commands_batch_mode() {
-        let mut shared_params = Map::new();
-        shared_params.insert("limit".to_string(), Json::Number(10.into()));
-        shared_params.insert(
-            "shared".to_string(),
-            Json::String("shared_value".to_string()),
-        );
-
-        let mut cmd_params = Map::new();
-        cmd_params.insert("name".to_string(), Json::String("MyEvent".to_string()));
-        cmd_params.insert("shared".to_string(), Json::String("overridden".to_string()));
-
-        let request = Request {
-            command: String::new(),
-            commands: vec![
-                CommandItem::Simple("DESCRIBE PRIMER".to_string()),
-                CommandItem::WithParams(ParameterizedCommand {
-                    command: "FIND(?x) WHERE { ?x {type: :type} }".to_string(),
-                    parameters: Map::new(),
-                }),
-                CommandItem::WithParams(ParameterizedCommand {
-                    command: "UPSERT { CONCEPT ?e { {name: :name} } }".to_string(),
-                    parameters: cmd_params,
-                }),
-            ],
-            parameters: shared_params,
-            ..Default::default()
-        };
-
-        assert!(request.is_batch());
-        let items: Vec<_> = request.iter_commands().collect();
-        assert_eq!(items.len(), 3);
-
-        // First command uses shared params
-        assert_eq!(items[0].0.as_ref(), "DESCRIBE PRIMER");
-        assert_eq!(items[0].1.get("limit"), Some(&Json::Number(10.into())));
-
-        // Second command (with empty params) uses shared params
-        assert_eq!(items[1].0.as_ref(), "FIND(?x) WHERE { ?x {type: :type} }");
-        assert_eq!(items[1].1.get("limit"), Some(&Json::Number(10.into())));
-
-        // Third command has merged params (command-specific overrides shared)
-        assert_eq!(
-            items[2].0.as_ref(),
-            "UPSERT { CONCEPT ?e { {name: :name} } }"
-        );
-        assert_eq!(
-            items[2].1.get("name"),
-            Some(&Json::String("MyEvent".to_string()))
-        );
-        assert_eq!(items[2].1.get("limit"), Some(&Json::Number(10.into())));
-        // "shared" should be overridden
-        assert_eq!(
-            items[2].1.get("shared"),
-            Some(&Json::String("overridden".to_string()))
-        );
-    }
-
-    #[test]
-    fn test_batch_request_serialization() {
-        let mut cmd_params = Map::new();
-        cmd_params.insert("name".to_string(), Json::String("MyEvent".to_string()));
-
-        let mut shared_params = Map::new();
-        shared_params.insert("limit".to_string(), Json::Number(10.into()));
-
-        let request = Request {
-            command: String::new(),
-            commands: vec![
-                CommandItem::Simple("DESCRIBE PRIMER".to_string()),
-                CommandItem::WithParams(ParameterizedCommand {
-                    command: "UPSERT { CONCEPT ?e { {name: :name} } }".to_string(),
-                    parameters: cmd_params,
-                }),
-            ],
-            parameters: shared_params,
-            dry_run: true,
-            readonly: true,
-        };
-
-        let json_str = serde_json::to_string(&request).unwrap();
-        let parsed: Request = serde_json::from_str(&json_str).unwrap();
-
-        assert!(parsed.is_batch());
-        assert_eq!(parsed.commands.len(), 2);
-        assert!(parsed.dry_run);
-        assert!(parsed.readonly);
-    }
-
-    #[test]
-    fn test_single_command_mode_default() {
-        let request = Request {
-            command: "DESCRIBE PRIMER".to_string(),
-            ..Default::default()
-        };
-
-        assert!(!request.is_batch());
-        assert!(request.commands.is_empty());
-    }
-
-    #[test]
-    fn test_validate_placeholder_usage_valid() {
-        // Valid usage: placeholder at value position
-        let mut parameters = Map::new();
-        parameters.insert("name".to_string(), Json::String("John".to_string()));
-        parameters.insert("age".to_string(), Json::Number(25.into()));
-
-        let request = Request {
-            command: r#"SET ATTRIBUTES { name: :name, age: :age }"#.to_string(),
-            parameters,
-            ..Default::default()
-        };
-
-        let warnings = Request::find_placeholders_in_strings(&request.command, &request.parameters);
-        assert!(warnings.is_ok(), "Should have no warnings for valid usage");
-    }
-
-    #[test]
-    fn test_validate_placeholder_usage_invalid() {
-        // Invalid usage: placeholder inside quoted string
-        let mut parameters = Map::new();
-        parameters.insert("user_id".to_string(), Json::String("user123".to_string()));
-
-        let request = Request {
-            command: r#"SET ATTRIBUTES { summary: "Hello :user_id, welcome!" }"#.to_string(),
-            parameters,
-            ..Default::default()
-        };
-
-        let warnings = Request::find_placeholders_in_strings(&request.command, &request.parameters);
-        assert!(
-            warnings.unwrap_err().contains("user_id"),
-            "Should warn about 'user_id' placeholder"
-        );
-    }
-
-    #[test]
-    fn test_validate_placeholder_usage_mixed() {
-        // Mix of valid and invalid usages
-        let mut parameters = Map::new();
-        parameters.insert("name".to_string(), Json::String("John".to_string()));
-        parameters.insert("user_id".to_string(), Json::String("user123".to_string()));
-
-        let request = Request {
-            command: r#"SET ATTRIBUTES { name: :name, summary: "User :user_id joined" }"#
-                .to_string(),
-            parameters,
-            ..Default::default()
-        };
-
-        let warnings = Request::find_placeholders_in_strings(&request.command, &request.parameters);
-        assert!(
-            warnings.unwrap_err().contains("user_id"),
-            "Should warn about 'user_id' placeholder"
-        );
-    }
-
-    #[test]
-    fn test_validate_placeholder_usage_escaped_quotes() {
-        // Placeholder after escaped quote should be correctly detected
-        let mut parameters = Map::new();
-        parameters.insert("name".to_string(), Json::String("John".to_string()));
-
-        let request = Request {
-            command: r#"SET ATTRIBUTES { desc: "Say \"hello\" to :name" }"#.to_string(),
-            parameters,
-            ..Default::default()
-        };
-
-        let warnings = Request::find_placeholders_in_strings(&request.command, &request.parameters);
-        // :name is still inside the string (after escaped quotes)
-        assert!(
-            warnings.unwrap_err().contains("name"),
-            "Should warn about 'name' placeholder"
-        );
-    }
-
-    #[test]
-    fn test_validate_placeholder_usage_ignores_comments() {
-        let mut parameters = Map::new();
-        parameters.insert("name".to_string(), Json::String("John".to_string()));
-
-        let request = Request {
-            command: r#"
-                // This quoted comment mentions "Hello :name" but is ignored.
-                SET ATTRIBUTES { name: :name }
-            "#
-            .to_string(),
-            parameters,
-            ..Default::default()
-        };
-
-        let warnings = Request::find_placeholders_in_strings(&request.command, &request.parameters);
-        assert!(
-            warnings.is_ok(),
-            "Comments should not trigger placeholder warnings"
-        );
-    }
-
-    // --- Mock Executor for async execute tests ---
-
-    #[derive(Debug)]
-    struct MockExecutor;
-
-    #[async_trait]
-    impl Executor for MockExecutor {
-        async fn execute(&self, command: Command, _dry_run: bool) -> Response {
-            match command {
-                Command::Kql(query) => Response::Ok {
-                    result: json!({
-                        "type": "kql",
-                        "find_count": query.find_clause.expressions.len()
-                    }),
-                    next_cursor: None,
-                },
-                Command::Kml(_) => Response::ok(json!({"type": "kml", "upserted": 1})),
-                Command::Meta(_) => Response::ok(json!({"type": "meta"})),
-            }
-        }
-    }
-
-    #[derive(Debug)]
-    struct FailingExecutor;
-
-    #[async_trait]
-    impl Executor for FailingExecutor {
-        async fn execute(&self, _command: Command, _dry_run: bool) -> Response {
-            Response::err(ErrorObject {
-                code: "KIP_3001".to_string(),
-                name: None,
-                message: "Not found".to_string(),
-                hint: Some("Check that the referenced concept exists.".to_string()),
-                data: None,
-            })
-        }
-    }
-
-    #[derive(Debug)]
-    struct KmlFailingExecutor;
-
-    #[async_trait]
-    impl Executor for KmlFailingExecutor {
-        async fn execute(&self, command: Command, _dry_run: bool) -> Response {
-            match command {
-                Command::Kql(_) => Response::ok(json!({"type": "kql"})),
-                Command::Meta(_) => Response::ok(json!({"type": "meta"})),
-                Command::Kml(_) => Response::err(ErrorObject {
-                    code: "KIP_4002".to_string(),
-                    name: None,
-                    message: "Write failed".to_string(),
-                    hint: Some("Check write constraints before retrying.".to_string()),
-                    data: None,
-                }),
-            }
-        }
-    }
-
-    // --- Single command execute tests ---
-
-    #[tokio::test]
-    async fn test_execute_single_kql_command() {
-        let executor = MockExecutor;
-        let request = Request {
-            command: r#"FIND(?drug.name) WHERE { ?drug {type: "Drug"} } LIMIT 10"#.to_string(),
-            ..Default::default()
-        };
-
-        let (cmd_type, response) = request.execute(&executor).await;
-        assert_eq!(cmd_type, CommandType::Kql);
-        match response {
-            Response::Ok {
-                result,
-                next_cursor,
-            } => {
-                assert_eq!(result["type"], "kql");
-                assert_eq!(result["find_count"], 1);
-                assert!(next_cursor.is_none());
-            }
-            _ => panic!("Expected Ok response"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_execute_single_kml_command() {
-        let executor = MockExecutor;
-        let request = Request {
-            command: r#"UPSERT { CONCEPT ?d { {type: "Drug", name: "Aspirin"} } }"#.to_string(),
-            ..Default::default()
-        };
-
-        let (cmd_type, response) = request.execute(&executor).await;
-        assert_eq!(cmd_type, CommandType::Kml);
-        match response {
-            Response::Ok { result, .. } => {
-                assert_eq!(result["type"], "kml");
-                assert_eq!(result["upserted"], 1);
-            }
-            _ => panic!("Expected Ok response"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_execute_single_meta_command() {
-        let executor = MockExecutor;
-        let request = Request {
-            command: "DESCRIBE PRIMER".to_string(),
-            ..Default::default()
-        };
-
-        let (cmd_type, response) = request.execute(&executor).await;
-        assert_eq!(cmd_type, CommandType::Meta);
-        match response {
-            Response::Ok { result, .. } => {
-                assert_eq!(result["type"], "meta");
-            }
-            _ => panic!("Expected Ok response"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_execute_readonly_single_rejects_kml_after_builder() {
-        let executor = MockExecutor;
-        let mut request = Request {
-            command: r#"UPSERT { CONCEPT ?d { {type: "Drug", name: "Aspirin"} } }"#.to_string(),
-            ..Default::default()
-        };
-        request.readonly();
-
-        let (cmd_type, response) = request.execute(&executor).await;
-        assert_eq!(cmd_type, CommandType::Kml);
-        match response {
-            Response::Err { error, .. } => {
-                assert_eq!(error.code, "KIP_1001");
-                assert!(error.message.contains("read-only"));
-            }
-            _ => panic!("Expected readonly KML rejection"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_execute_single_command_with_params() {
-        let executor = MockExecutor;
-        let mut parameters = Map::new();
-        parameters.insert("name".to_string(), Json::String("Aspirin".to_string()));
-        parameters.insert("limit".to_string(), Json::Number(5.into()));
-
-        let request = Request {
-            command: r#"FIND(?drug) WHERE { ?drug {name: :name} } LIMIT :limit"#.to_string(),
-            parameters,
-            ..Default::default()
-        };
-
-        let (cmd_type, response) = request.execute(&executor).await;
-        assert_eq!(cmd_type, CommandType::Kql);
-        assert!(matches!(response, Response::Ok { .. }));
-    }
-
-    #[tokio::test]
-    async fn test_execute_search_command_with_params() {
-        let executor = MockExecutor;
-        let mut parameters = Map::new();
-        parameters.insert("term".to_string(), Json::String("aspirin".to_string()));
-        parameters.insert("type".to_string(), Json::String("Drug".to_string()));
-        parameters.insert("limit".to_string(), Json::Number(5.into()));
-
-        let request = Request {
-            command: r#"SEARCH CONCEPT :term WITH TYPE :type LIMIT :limit"#.to_string(),
-            parameters,
-            ..Default::default()
-        };
-
-        let (cmd_type, response) = request.execute(&executor).await;
-        assert_eq!(cmd_type, CommandType::Meta);
-        assert!(matches!(response, Response::Ok { .. }));
-    }
-
-    #[tokio::test]
-    async fn test_execute_single_command_syntax_error() {
-        let executor = MockExecutor;
-        let request = Request {
-            command: "INVALID COMMAND SYNTAX".to_string(),
-            ..Default::default()
-        };
-
-        let (cmd_type, response) = request.execute(&executor).await;
-        assert_eq!(cmd_type, CommandType::Unknown);
-        match response {
-            Response::Err { error, .. } => {
-                assert!(error.code.starts_with("KIP_1"));
-            }
-            _ => panic!("Expected Err response for syntax error"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_execute_single_command_syntax_error_with_placeholder_hint() {
-        let executor = MockExecutor;
-        let mut parameters = Map::new();
-        parameters.insert("name".to_string(), Json::String("test".to_string()));
-
-        let request = Request {
-            command: r#"FIND(?x) WHERE { ?x {name: "Hello :name"} }"#.to_string(),
-            parameters,
-            ..Default::default()
-        };
-
-        let (cmd_type, response) = request.execute(&executor).await;
-        assert_eq!(cmd_type, CommandType::Unknown);
-        match response {
-            Response::Err { error, .. } => {
-                assert!(error.code.starts_with("KIP_1"));
-                assert!(error.hint.as_ref().unwrap().contains("name"));
-            }
-            _ => panic!("Expected Err response"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_execute_single_command_executor_error() {
-        let executor = FailingExecutor;
-        let request = Request {
-            command: r#"FIND(?drug) WHERE { ?drug {type: "Drug"} }"#.to_string(),
-            ..Default::default()
-        };
-
-        let (cmd_type, response) = request.execute(&executor).await;
-        assert_eq!(cmd_type, CommandType::Kql);
-        match response {
-            Response::Err { error, .. } => {
-                assert_eq!(error.code, "KIP_3001");
-                assert_eq!(error.message, "Not found");
-            }
-            _ => panic!("Expected Err response from failing executor"),
-        }
-    }
-
-    // --- Batch command execute tests ---
-
-    #[tokio::test]
-    async fn test_execute_batch_all_success() {
-        let executor = MockExecutor;
-        let request = Request {
-            commands: vec![
-                CommandItem::Simple("DESCRIBE PRIMER".to_string()),
-                CommandItem::Simple(
-                    r#"FIND(?t.name) WHERE { ?t {type: "$ConceptType"} } LIMIT 50"#.to_string(),
-                ),
-            ],
-            ..Default::default()
-        };
-
-        let (cmd_type, response) = request.execute(&executor).await;
-        assert_eq!(cmd_type, CommandType::Kql);
-        match response {
-            Response::Ok { result, .. } => {
-                let arr = result.as_array().unwrap();
-                assert_eq!(arr.len(), 2);
-                // First result is META
-                assert_eq!(arr[0]["result"]["type"], "meta");
-                // Second result is KQL
-                assert_eq!(arr[1]["result"]["type"], "kql");
-            }
-            _ => panic!("Expected Ok response for batch"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_execute_batch_with_params() {
-        let executor = MockExecutor;
-        let mut shared_params = Map::new();
-        shared_params.insert("limit".to_string(), Json::Number(10.into()));
-
-        let mut cmd_params = Map::new();
-        cmd_params.insert("name".to_string(), Json::String("TestDrug".to_string()));
-
-        let request = Request {
-            commands: vec![
-                CommandItem::Simple("DESCRIBE PRIMER".to_string()),
-                CommandItem::WithParams(ParameterizedCommand {
-                    command: r#"UPSERT { CONCEPT ?d { {type: "Drug", name: :name} } }"#.to_string(),
-                    parameters: cmd_params,
-                }),
-            ],
-            parameters: shared_params,
-            ..Default::default()
-        };
-
-        let (cmd_type, response) = request.execute(&executor).await;
-        assert_eq!(cmd_type, CommandType::Kml);
-        match response {
-            Response::Ok { result, .. } => {
-                let arr = result.as_array().unwrap();
-                assert_eq!(arr.len(), 2);
-                assert_eq!(arr[0]["result"]["type"], "meta");
-                assert_eq!(arr[1]["result"]["type"], "kml");
-            }
-            _ => panic!("Expected Ok response for batch with params"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_execute_batch_continues_on_syntax_error() {
-        let executor = MockExecutor;
-        let request = Request {
-            commands: vec![
-                CommandItem::Simple("DESCRIBE PRIMER".to_string()),
-                CommandItem::Simple("INVALID SYNTAX HERE".to_string()),
-                CommandItem::Simple(r#"FIND(?t) WHERE { ?t {type: "$ConceptType"} }"#.to_string()),
-            ],
-            ..Default::default()
-        };
-
-        let (_cmd_type, response) = request.execute(&executor).await;
-        match response {
-            Response::Ok { result, .. } => {
-                let arr = result.as_array().unwrap();
-                // Syntax errors are recorded and later commands still execute.
-                assert_eq!(arr.len(), 3);
-                // First result is success
-                assert!(arr[0]["result"].is_object());
-                // Second result is error
-                assert!(arr[1]["error"].is_object());
-                assert!(
-                    arr[1]["error"]["code"]
-                        .as_str()
-                        .unwrap()
-                        .starts_with("KIP_1")
-                );
-                // Third command still executes
-                assert_eq!(arr[2]["result"]["type"], "kql");
-            }
-            _ => panic!("Expected Ok response wrapping batch results"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_execute_batch_continues_on_placeholder_syntax_error() {
-        let executor = MockExecutor;
-        let mut params = Map::new();
-        params.insert("name".to_string(), Json::String("test".to_string()));
-
-        let request = Request {
-            commands: vec![
-                CommandItem::WithParams(ParameterizedCommand {
-                    command: r#"FIND(?x) WHERE { ?x {name: "Hello :name"} }"#.to_string(),
-                    parameters: params,
-                }),
-                CommandItem::Simple("DESCRIBE PRIMER".to_string()),
-            ],
-            ..Default::default()
-        };
-
-        let (_cmd_type, response) = request.execute(&executor).await;
-        match response {
-            Response::Ok { result, .. } => {
-                let arr = result.as_array().unwrap();
-                assert_eq!(arr.len(), 2);
-                assert!(arr[0]["error"].is_object());
-                assert!(
-                    arr[0]["error"]["code"]
-                        .as_str()
-                        .unwrap()
-                        .starts_with("KIP_1")
-                );
-                assert_eq!(arr[1]["result"]["type"], "meta");
-            }
-            _ => panic!("Expected Ok response wrapping batch results"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_execute_batch_continues_on_non_kml_executor_error() {
-        let executor = FailingExecutor;
-        let request = Request {
-            commands: vec![
-                CommandItem::Simple(r#"FIND(?t) WHERE { ?t {type: "$ConceptType"} }"#.to_string()),
-                CommandItem::Simple("DESCRIBE PRIMER".to_string()),
-            ],
-            ..Default::default()
-        };
-
-        let (_cmd_type, response) = request.execute(&executor).await;
-        match response {
-            Response::Ok { result, .. } => {
-                let arr = result.as_array().unwrap();
-                // Non-KML executor errors are recorded and execution continues
-                assert_eq!(arr.len(), 2);
-                assert!(arr[0]["error"].is_object());
-                assert_eq!(arr[0]["error"]["code"], "KIP_3001");
-                assert!(arr[1]["error"].is_object());
-                assert_eq!(arr[1]["error"]["code"], "KIP_3001");
-            }
-            _ => panic!("Expected Ok response wrapping batch results"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_execute_batch_stops_on_kml_error() {
-        let executor = KmlFailingExecutor;
-        let request = Request {
-            commands: vec![
-                CommandItem::Simple("DESCRIBE PRIMER".to_string()),
-                CommandItem::Simple(
-                    r#"UPSERT { CONCEPT ?d { {type: "Drug", name: "NewDrug"} } }"#.to_string(),
-                ),
-                CommandItem::Simple(r#"FIND(?d) WHERE { ?d {type: "Drug"} } LIMIT 5"#.to_string()),
-            ],
-            ..Default::default()
-        };
-
-        let (cmd_type, response) = request.execute(&executor).await;
-        assert_eq!(cmd_type, CommandType::Kml);
-        match response {
-            Response::Ok { result, .. } => {
-                let arr = result.as_array().unwrap();
-                // KML errors stop batch execution immediately
-                assert_eq!(arr.len(), 2);
-                assert_eq!(arr[0]["result"]["type"], "meta");
-                assert!(arr[1]["error"].is_object());
-                assert_eq!(arr[1]["error"]["code"], "KIP_4002");
-            }
-            _ => panic!("Expected Ok response wrapping batch results"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_execute_readonly_batch_rejects_kml_and_continues() {
-        let executor = MockExecutor;
-        let request = Request {
-            commands: vec![
-                CommandItem::Simple("DESCRIBE PRIMER".to_string()),
-                CommandItem::Simple(
-                    r#"UPSERT { CONCEPT ?d { {type: "Drug", name: "NewDrug"} } }"#.to_string(),
-                ),
-                CommandItem::Simple(r#"FIND(?d) WHERE { ?d {type: "Drug"} } LIMIT 5"#.to_string()),
-            ],
-            readonly: true,
-            ..Default::default()
-        };
-
-        let (_cmd_type, response) = request.execute(&executor).await;
-        match response {
-            Response::Ok { result, .. } => {
-                let arr = result.as_array().unwrap();
-                assert_eq!(arr.len(), 3);
-                assert_eq!(arr[0]["result"]["type"], "meta");
-                assert!(arr[1]["error"].is_object());
-                assert_eq!(arr[1]["error"]["code"], "KIP_1001");
-                assert_eq!(arr[2]["result"]["type"], "kql");
-            }
-            _ => panic!("Expected Ok response wrapping readonly batch results"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_execute_batch_mixed_command_types() {
-        let executor = MockExecutor;
-        let request = Request {
-            commands: vec![
-                CommandItem::Simple("DESCRIBE PRIMER".to_string()),
-                CommandItem::Simple(r#"FIND(?d) WHERE { ?d {type: "Drug"} } LIMIT 5"#.to_string()),
-                CommandItem::Simple(
-                    r#"UPSERT { CONCEPT ?d { {type: "Drug", name: "NewDrug"} } }"#.to_string(),
-                ),
-            ],
-            ..Default::default()
-        };
-
-        let (cmd_type, response) = request.execute(&executor).await;
-        // KML takes precedence once encountered
-        assert_eq!(cmd_type, CommandType::Kml);
-        match response {
-            Response::Ok { result, .. } => {
-                let arr = result.as_array().unwrap();
-                assert_eq!(arr.len(), 3);
-                assert_eq!(arr[0]["result"]["type"], "meta");
-                assert_eq!(arr[1]["result"]["type"], "kql");
-                assert_eq!(arr[2]["result"]["type"], "kml");
-            }
-            _ => panic!("Expected Ok response"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_execute_batch_empty_commands() {
-        let executor = MockExecutor;
-        let request = Request {
-            commands: vec![],
-            ..Default::default()
-        };
-
-        // Empty commands with no single command is a request-shape error.
-        assert!(!request.is_batch());
-        let (cmd_type, response) = request.execute(&executor).await;
-        assert_eq!(cmd_type, CommandType::Unknown);
-        match response {
-            Response::Err { error, .. } => {
-                assert_eq!(error.code, "KIP_1001");
-                assert_eq!(error.message, "Invalid request: missing KIP command");
-            }
-            _ => panic!("Expected request error"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_execute_rejects_command_and_commands_together() {
-        let executor = MockExecutor;
-        let request = Request {
-            command: "DESCRIBE PRIMER".to_string(),
-            commands: vec![CommandItem::Simple("DESCRIBE DOMAINS".to_string())],
-            ..Default::default()
-        };
-
-        let (cmd_type, response) = request.execute(&executor).await;
-        assert_eq!(cmd_type, CommandType::Unknown);
-        match response {
-            Response::Err { error, .. } => {
-                assert_eq!(error.code, "KIP_1001");
-                assert_eq!(
-                    error.message,
-                    "Invalid request: `command` and `commands` are mutually exclusive"
-                );
-            }
-            _ => panic!("Expected request error"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_execute_batch_syntax_error_with_placeholder_hint() {
-        let executor = MockExecutor;
-        let mut params = Map::new();
-        params.insert("name".to_string(), Json::String("test".to_string()));
-
-        let request = Request {
-            commands: vec![
-                CommandItem::Simple("DESCRIBE PRIMER".to_string()),
-                CommandItem::WithParams(ParameterizedCommand {
-                    command: r#"FIND(?x) WHERE { ?x {name: "Hello :name"} }"#.to_string(),
-                    parameters: params,
-                }),
-            ],
-            ..Default::default()
-        };
-
-        let (_cmd_type, response) = request.execute(&executor).await;
-        match response {
-            Response::Ok { result, .. } => {
-                let arr = result.as_array().unwrap();
-                assert_eq!(arr.len(), 2);
-                // First succeeds
-                assert!(arr[0]["result"].is_object());
-                // Second has error with placeholder hint
-                let error = &arr[1]["error"];
-                assert!(error["code"].as_str().unwrap().starts_with("KIP_1"));
-                assert!(error["hint"].as_str().unwrap().contains("name"));
-            }
-            _ => panic!("Expected Ok response wrapping batch results"),
-        }
-    }
-
-    #[test]
-    fn test_response_serde_roundtrip_preserves_variants() {
-        // Ok with cursor
-        let ok = Response::Ok {
-            result: json!([1, 2]),
-            next_cursor: Some("abc".to_string()),
-        };
-        let s = serde_json::to_string(&ok).unwrap();
-        assert_eq!(serde_json::from_str::<Response>(&s).unwrap(), ok);
-
-        // Err without partial result
-        let err = Response::err(ErrorObject {
-            code: "KIP_2001".to_string(),
-            name: None,
-            message: "boom".to_string(),
-            hint: None,
-            data: None,
+        assert!(request.validate().is_err());
+
+        request.space = Some(SpaceSelector {
+            id: Some(" ".into()),
+            uri: None,
         });
-        let s = serde_json::to_string(&err).unwrap();
-        assert_eq!(serde_json::from_str::<Response>(&s).unwrap(), err);
+        assert!(request.validate().is_err());
 
-        // Err WITH partial result: must not deserialize into Ok (the
-        // `error` key wins over the presence of `result`).
-        let err_partial = Response::Err {
-            error: ErrorObject {
-                code: "KIP_2001".to_string(),
-                name: None,
-                message: "boom".to_string(),
-                hint: None,
-                data: None,
-            },
-            result: Some(json!([1, 2])),
-        };
-        let s = serde_json::to_string(&err_partial).unwrap();
-        let back: Response = serde_json::from_str(&s).unwrap();
-        assert_eq!(back, err_partial);
-        assert!(matches!(back, Response::Err { .. }));
-
-        // Neither `result` nor `error` is invalid.
-        assert!(serde_json::from_str::<Response>("{}").is_err());
-        // Non-object responses are invalid.
-        assert!(serde_json::from_str::<Response>("[1,2]").is_err());
-    }
-
-    #[test]
-    fn misspelled_safety_flags_are_rejected_instead_of_failing_open() {
-        // `readonly` and `dry_run` default to the UNSAFE value, so a typo used
-        // to silently downgrade a validate-only request into a committed write.
-        let body = r#"{"command":"DESCRIBE PRIMER","read_only":true,"dryRun":true}"#;
-        let err = serde_json::from_str::<Request>(body).unwrap_err();
-        assert!(
-            err.to_string().contains("unknown field"),
-            "expected an unknown-field rejection, got: {err}"
-        );
-
-        // The correctly spelled flags still deserialize.
-        let ok: Request =
-            serde_json::from_str(r#"{"command":"DESCRIBE PRIMER","readonly":true,"dry_run":true}"#)
-                .unwrap();
-        assert!(ok.readonly);
-        assert!(ok.dry_run);
-    }
-
-    #[test]
-    fn parameter_substitution_output_is_bounded() {
-        // Substitution re-emits the value at every occurrence, so a small body
-        // could expand without limit before the parser's length cap ever ran.
-        let occurrences = 2_000;
-        let command = ":p ".repeat(occurrences);
-        let value = "A".repeat(100_000);
-        let mut parameters = Map::new();
-        parameters.insert("p".to_string(), Json::String(value));
-
-        let out = Request::substitute_params(&command, &parameters);
-        assert!(
-            out.len() <= MAX_KIP_INPUT_LEN + 100_002,
-            "substitution expanded to {} bytes, expected it to stop near the {MAX_KIP_INPUT_LEN}-byte cap",
-            out.len()
-        );
-
-        // The truncated result is still rejected downstream rather than parsed.
-        let err = crate::parse_kip(&out).unwrap_err();
-        assert_eq!(err.code, crate::KipErrorCode::ResourceExhausted);
-    }
-
-    #[test]
-    fn misspelled_command_parameters_key_is_rejected_not_silently_swapped() {
-        // The untagged `WithParams` variant used to ignore unknown fields, so a
-        // typo'd `params` key produced an item with an EMPTY parameter map and
-        // `iter_commands` fell back to the SHARED parameters: this body wrote
-        // "Alice" where the request said "Bob".
-        let body = r#"{"commands":[{"command":"UPSERT { CONCEPT ?e { {type:\"Event\", name: :name} } }","params":{"name":"Bob"}}],"parameters":{"name":"Alice"}}"#;
-        let err = serde_json::from_str::<Request>(body).unwrap_err();
-        assert!(
-            err.to_string().contains("did not match any variant"),
-            "expected the typo'd key to be rejected, got: {err}"
-        );
-
-        // The correctly spelled key still deserializes and wins over the shared
-        // value, byte-identical wire shape.
-        let request: Request = serde_json::from_str(
-            r#"{"commands":[{"command":"UPSERT { CONCEPT ?e { {type:\"Event\", name: :name} } }","parameters":{"name":"Bob"}}],"parameters":{"name":"Alice"}}"#,
-        )
-        .unwrap();
-        let items: Vec<_> = request.iter_commands().collect();
-        assert_eq!(items.len(), 1);
-        let substituted = Request::substitute_params(&items[0].0, &items[0].1);
-        assert!(
-            substituted.contains(r#"name: "Bob""#),
-            "expected the per-command value to win, got: {substituted}"
-        );
-        assert!(!substituted.contains("Alice"));
-    }
-
-    #[test]
-    fn command_item_wire_shape_is_unchanged() {
-        // The named `ParameterizedCommand` must serialize exactly like the old
-        // inline variant, so existing clients keep round-tripping.
-        let item = CommandItem::WithParams(ParameterizedCommand {
-            command: "DESCRIBE PRIMER".to_string(),
-            parameters: [("a".to_string(), json!(1))].into_iter().collect(),
+        request.space = Some(SpaceSelector {
+            id: Some("space-1".into()),
+            uri: None,
         });
-        assert_eq!(
-            serde_json::to_string(&item).unwrap(),
-            r#"{"command":"DESCRIBE PRIMER","parameters":{"a":1}}"#
-        );
-        assert_eq!(
-            serde_json::to_string(&CommandItem::Simple("DESCRIBE PRIMER".to_string())).unwrap(),
-            r#""DESCRIBE PRIMER""#
-        );
-    }
-
-    #[tokio::test]
-    async fn oversized_batch_is_rejected_before_execution() {
-        let executor = MockExecutor;
-        let request = Request {
-            commands: vec![
-                CommandItem::Simple("DESCRIBE PRIMER".to_string());
-                MAX_KIP_BATCH_COMMANDS + 1
-            ],
+        request.options = Some(RequestOptions {
+            deadline_ms: Some(0),
             ..Default::default()
-        };
+        });
+        assert!(request.validate().is_err());
 
-        let (cmd_type, response) = request.execute(&executor).await;
-        assert_eq!(cmd_type, CommandType::Unknown);
-        match response {
-            Response::Err { error, .. } => {
-                assert_eq!(error.code, "KIP_4002");
-                assert!(error.message.contains("batch command count"));
-            }
-            other => panic!("Expected a resource-exhausted rejection, got {other:?}"),
-        }
-
-        // A batch exactly at the cap still runs.
-        let request = Request {
-            commands: vec![
-                CommandItem::Simple("DESCRIBE PRIMER".to_string());
-                MAX_KIP_BATCH_COMMANDS
-            ],
+        request.options = None;
+        request.context = Some(RequestContext {
+            purpose: Some(" ".into()),
             ..Default::default()
-        };
-        let (_, response) = request.execute(&executor).await;
-        match response {
-            Response::Ok { result, .. } => {
-                assert_eq!(result.as_array().unwrap().len(), MAX_KIP_BATCH_COMMANDS);
-            }
-            other => panic!("Expected the at-cap batch to execute, got {other:?}"),
-        }
+        });
+        assert!(request.validate().is_err());
     }
 
     #[test]
-    fn explicit_null_error_deserializes_as_success() {
-        // `{"result": ..., "error": null}` is the canonical JSON-RPC success
-        // shape; it used to hard-fail as an unparseable error payload.
-        let res: Response = serde_json::from_str(r#"{"result":"ok","error":null}"#).unwrap();
-        assert_eq!(res, Response::ok(json!("ok")));
+    fn policy_versions_accept_the_wire_schemas_text_and_integer_forms() {
+        let numeric: PolicyIdentity = serde_json::from_value(serde_json::json!({
+            "id": "projection-policy",
+            "version": 7
+        }))
+        .unwrap();
+        assert_eq!(numeric.version, Some(PolicyVersion::Integer(7)));
 
-        // Still a success when a null cursor rides along.
-        let res: Response =
-            serde_json::from_str(r#"{"result":[1,2],"error":null,"next_cursor":null}"#).unwrap();
-        assert_eq!(res, Response::ok(json!([1, 2])));
-
-        // A non-null error is still an error.
-        let res: Response =
-            serde_json::from_str(r#"{"error":{"code":"KIP_2001","message":"boom"}}"#).unwrap();
-        assert!(matches!(res, Response::Err { ref error, .. } if error.code == "KIP_2001"));
-    }
-
-    #[derive(Debug)]
-    struct PartialResultExecutor;
-
-    #[async_trait]
-    impl Executor for PartialResultExecutor {
-        async fn execute(&self, _command: Command, _dry_run: bool) -> Response {
-            Response::Err {
-                error: ErrorObject::new("KIP_4002", "materialization cap exceeded"),
-                result: Some(json!({"page": [1, 2, 3]})),
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn batch_preserves_partial_result_on_error() {
-        let executor = PartialResultExecutor;
-        let request = Request {
-            commands: vec![CommandItem::Simple(
-                r#"FIND(?d) WHERE { ?d {type: "Drug"} }"#.to_string(),
-            )],
-            ..Default::default()
-        };
-
-        let (_cmd_type, response) = request.execute(&executor).await;
-        match response {
-            Response::Ok { result, .. } => {
-                let arr = result.as_array().unwrap();
-                assert_eq!(arr.len(), 1);
-                assert_eq!(arr[0]["error"]["code"], "KIP_4002");
-                assert_eq!(
-                    arr[0]["result"],
-                    json!({"page": [1, 2, 3]}),
-                    "the partial page must survive the batch wrapper"
-                );
-            }
-            other => panic!("Expected Ok response wrapping batch results, got {other:?}"),
-        }
+        let textual: PolicyIdentity = serde_json::from_value(serde_json::json!({
+            "version": "7.1"
+        }))
+        .unwrap();
+        assert_eq!(textual.version, Some(PolicyVersion::Text("7.1".into())));
     }
 
     #[test]
-    fn error_object_builders_match_struct_literals() {
-        let built = ErrorObject::new("KIP_1001", "bad")
-            .with_name("InvalidSyntax")
-            .with_hint("fix it")
-            .with_data(json!({"at": 1}));
+    fn a_batch_must_say_how_its_operations_relate() {
+        // Spec §75.4: operations[] is not a transaction unless it says so.
+        let mut request = Request::single("DESCRIBE PROTOCOL");
+        request.operations.push(Operation::new("DESCRIBE PRIMER"));
+        let err = request.validate().expect_err("no execution mode");
+        assert_eq!(err.code, KipErrorCode::InvalidRequestEnvelope);
+
+        request.execution = Some(Execution::new(ExecutionMode::Independent));
+        assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn an_atomic_transaction_cannot_continue_past_an_error() {
+        let mut request = Request::single("ARCHIVE :a");
+        request.operations.push(Operation::new("ARCHIVE :b"));
+        request.execution = Some(Execution {
+            on_error: Some(OnError::Continue),
+            ..Execution::new(ExecutionMode::Atomic)
+        });
+        assert!(request.validate().is_err());
+
+        request.execution = Some(Execution {
+            on_error: Some(OnError::Continue),
+            ..Execution::new(ExecutionMode::Sequence)
+        });
+        assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn a_declared_language_cannot_relabel_a_write_as_a_read() {
+        // Spec §73.1 / §88.3: the parsed command is authoritative.
+        let operation = Operation {
+            language: Some(CommandType::Kql),
+            ..Operation::new(r#"TOMBSTONE :x"#)
+        };
+        let err = operation.parse().expect_err("mislabelled write");
+        assert_eq!(err.code, KipErrorCode::LanguageMismatch);
+
+        let honest = Operation {
+            language: Some(CommandType::Kml),
+            ..Operation::new(r#"TOMBSTONE :x"#)
+        };
+        assert!(honest.parse().unwrap().is_mutation());
+    }
+
+    #[test]
+    fn an_operation_carries_text_or_an_ast_but_never_both() {
+        let ast = parse_kip("DESCRIBE PROTOCOL").unwrap();
+        let both = Operation {
+            ast: Some(ast.clone()),
+            ..Operation::new("DESCRIBE PROTOCOL")
+        };
+        assert!(both.validate().is_err());
+
+        let neither = Operation::default();
+        assert!(neither.validate().is_err());
+
+        let ast_only = Operation {
+            ast: Some(ast),
+            ..Default::default()
+        };
         assert_eq!(
-            built,
-            ErrorObject {
-                code: "KIP_1001".to_string(),
-                name: Some("InvalidSyntax".to_string()),
-                message: "bad".to_string(),
-                hint: Some("fix it".to_string()),
-                data: Some(json!({"at": 1})),
-            }
+            ast_only.parse().unwrap(),
+            parse_kip("DESCRIBE PROTOCOL").unwrap()
         );
+    }
+
+    #[test]
+    fn a_pre_parsed_ast_gets_the_same_guards_as_command_text() {
+        // Spec §73: `ast` is an alternative encoding of the same operation, not
+        // a way around the rules the text form is rejected by.
+        let text = r#"UPDATE ?a SET FIELDS { confidence: 0.1 } WHERE { ?a ASSERTION {id: "A-1"} }"#;
+        assert!(parse_kip(text).is_err(), "the text form must be rejected");
+
+        let rewrite_immutable_payload = serde_json::json!({"Kml": {
+            "explicit_transaction": false,
+            "clauses": [{"Update": {
+                "target": {"Handle": "a"},
+                "expect_version": Json::Null,
+                "actions": [{"SetFields": [["confidence", {"Value": {"Number": 0.1}}]]}],
+                "where_clauses": [{"Assertion": {
+                    "variable": "a",
+                    "matcher": {"id": {"Literal": {"String": "A-1"}}}
+                }}],
+                "limit": Json::Null
+            }}]
+        }});
+        let write_engine_truth = serde_json::json!({"Kml": {
+            "explicit_transaction": false,
+            "clauses": [{"CreateConcept": {
+                "handle": "c", "type": Json::Null, "client_key": Json::Null, "name": Json::Null,
+                "set_fields": [["_system", {"Value": {"Number": 1}}]],
+                "set_attributes": Json::Null, "set_facets": [], "set_structural": Json::Null
+            }}]
+        }});
+        let unconfirmed_purge = serde_json::json!({"Kml": {
+            "explicit_transaction": false,
+            "clauses": [{"Purge": {
+                "target": {"Param": "x"}, "where_clauses": Json::Null, "limit": Json::Null,
+                "reference_policy": Json::Null, "confirm": ""
+            }}]
+        }});
+        let belief_as_an_export_selector = serde_json::json!({"Meta": {"ExportCapsule": {
+            "target": {"Param": "out"},
+            "where_clauses": [{"Belief": {"variable": "b", "target": {"Proposition": "p"}}}],
+            "options": Json::Null, "as_of": Json::Null
+        }}});
+
+        for ast in [
+            rewrite_immutable_payload,
+            write_engine_truth,
+            unconfirmed_purge,
+            belief_as_an_export_selector,
+        ] {
+            let operation = Operation {
+                ast: Some(serde_json::from_value(ast.clone()).expect("decodes")),
+                ..Default::default()
+            };
+            let err = operation
+                .parse()
+                .expect_err(&format!("must be rejected: {ast}"));
+            assert_eq!(err.code, KipErrorCode::InvalidSyntax);
+        }
+
+        // A tree that the parser would have produced still round-trips.
+        let honest = Operation {
+            ast: Some(parse_kip(r#"ARCHIVE :old"#).unwrap()),
+            ..Default::default()
+        };
+        assert!(honest.parse().unwrap().is_mutation());
+    }
+
+    #[test]
+    fn op_ids_must_be_unique_within_a_request() {
+        let mut request = Request::single("DESCRIBE PROTOCOL");
+        request.operations[0].op_id = Some("op-1".into());
+        request
+            .operations
+            .push(Operation::new("DESCRIBE PRIMER").with_op_id("op-1"));
+        request.execution = Some(Execution::new(ExecutionMode::Independent));
+        assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn parameter_names_must_be_spellable_in_a_command() {
+        let mut request = Request::single("DESCRIBE PROTOCOL");
+        let mut parameters = Map::new();
+        parameters.insert("2bad".into(), Json::from(1));
+        request.parameters = Some(parameters);
+        let err = request.validate().expect_err("bad parameter name");
+        assert_eq!(err.code, KipErrorCode::InvalidIdentifier);
+    }
+
+    #[test]
+    fn ingest_entries_carry_exactly_one_payload() {
+        let base = IngestEvidence {
+            key: "msg".into(),
+            evidence_class: "user_statement".into(),
+            ..Default::default()
+        };
+        assert!(base.validate().is_err());
+
+        let inline = IngestEvidence {
+            payload: Some(Json::from("I prefer dark mode.")),
+            ..base.clone()
+        };
+        assert!(inline.validate().is_ok());
+
+        let both = IngestEvidence {
+            payload: Some(Json::from("x")),
+            payload_artifact: Some("artifact-1".into()),
+            ..base.clone()
+        };
+        assert!(both.validate().is_err());
+
+        let duplicate = IngestContext {
+            evidence: vec![inline.clone(), inline],
+            extensions: None,
+        };
+        assert!(duplicate.validate().is_err());
+    }
+
+    #[test]
+    fn a_partial_batch_is_not_a_failed_batch() {
+        // Spec §75.2: under `sequence`, earlier commits are durable. Reporting
+        // the whole request as failed invites a caller to re-issue them.
+        let results = vec![
+            OperationResult::ok(Json::from(1)),
+            OperationResult::failed(KipError::not_found_or_not_visible("gone")),
+        ];
+        assert_eq!(TopLevelStatus::derive(&results), TopLevelStatus::Partial);
+
+        let all_ok = vec![
+            OperationResult::ok(Json::Null),
+            OperationResult::no_effect(),
+        ];
+        assert_eq!(TopLevelStatus::derive(&all_ok), TopLevelStatus::Succeeded);
+
+        let all_bad = vec![OperationResult::failed(KipError::internal_error("boom"))];
+        assert_eq!(TopLevelStatus::derive(&all_bad), TopLevelStatus::Failed);
+    }
+
+    #[test]
+    fn rolled_back_is_not_success() {
+        // Spec §83.1: it executed tentatively, but nothing durable resulted.
+        let results = vec![OperationResult::rolled_back()];
+        assert_eq!(TopLevelStatus::derive(&results), TopLevelStatus::Failed);
+    }
+
+    #[test]
+    fn the_envelope_round_trips_through_its_wire_shape() {
+        let request = Request {
+            request_id: Some("req-1".into()),
+            space: Some(SpaceSelector {
+                id: Some("space-1".into()),
+                uri: None,
+            }),
+            execution: Some(Execution {
+                idempotency_key: Some("logical-write-key".into()),
+                isolation: Some("serializable".into()),
+                ..Execution::new(ExecutionMode::Atomic)
+            }),
+            operations: vec![Operation::new(r#"ARCHIVE :x"#).with_op_id("op-1")],
+            options: Some(RequestOptions {
+                deadline_ms: Some(10_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["kip"], "2.0");
+        assert_eq!(json["execution"]["mode"], "atomic");
+        assert_eq!(json["operations"][0]["op_id"], "op-1");
+        let decoded: Request = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, request);
+
+        let response = Response {
+            receipt: Some(Receipt {
+                status: ReceiptStatus::Committed,
+                tx_id: Some("tx-9".into()),
+                space_seq: Some(4201),
+                snapshot_seq: Some(4200),
+                space_id: Some("space-1".into()),
+                committed_at: Some("2026-08-16T00:00:00Z".into()),
+                transaction_class: None,
+                request_digest: None,
+                semantic_plan_digest: None,
+                result_digest: None,
+                schema_environment_version: None,
+                change_summary: None,
+                proofs: vec![],
+                extensions: None,
+            }),
+            warnings: vec![Warning::Message("search index lagged".into())],
+            ..Response::ok(Json::from(true))
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["status"], "succeeded");
+        assert_eq!(json["receipt"]["status"], "committed");
+        assert_eq!(json["warnings"][0], "search index lagged");
+        let decoded: Response = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn an_error_response_carries_the_registry_shape() {
+        let response = Response::from(KipError::version_conflict("element changed"));
+        assert_eq!(response.status, TopLevelStatus::Failed);
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["error"]["code"], "VersionConflict");
+        assert_eq!(json["error"]["retry"]["class"], "requires_refresh");
+        assert_eq!(json["results"][0]["status"], "failed");
+    }
+
+    #[test]
+    fn a_lost_response_is_not_a_failed_write() {
+        // Spec §80.3: the client must look the transaction up, not re-mutate.
+        let response = Response::outcome_unknown(KipError::outcome_unknown("connection dropped"));
+        assert_eq!(response.status, TopLevelStatus::OutcomeUnknown);
+        assert_eq!(
+            response.error.unwrap().retry.unwrap().class,
+            crate::error::RetryClass::OutcomeLookupRequired
+        );
+    }
+
+    #[test]
+    fn an_over_sized_batch_is_rejected_before_execution() {
+        let mut request = Request::single("DESCRIBE PROTOCOL");
+        request.execution = Some(Execution::new(ExecutionMode::Independent));
+        for _ in 0..MAX_KIP_BATCH_COMMANDS {
+            request.operations.push(Operation::new("DESCRIBE PROTOCOL"));
+        }
+        let err = request.validate().expect_err("too many operations");
+        assert_eq!(err.code, KipErrorCode::ResourceExhausted);
+    }
+
+    #[test]
+    fn an_unknown_protocol_version_fails_fast() {
+        let request = Request {
+            kip: "1.0".into(),
+            ..Request::single("DESCRIBE PROTOCOL")
+        };
+        let err = request.validate().expect_err("wrong version");
+        assert_eq!(err.code, KipErrorCode::UnsupportedProtocolVersion);
     }
 }

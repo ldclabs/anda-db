@@ -1,101 +1,134 @@
-//! # `anda_cognitive_nexus`
+//! # anda_cognitive_nexus — a KIP 2.0 Cognitive Nexus on Anda DB
 //!
-//! A reference implementation of the **Knowledge Interaction Protocol (KIP)**
-//! [`Executor`](anda_kip::Executor) backed by [Anda DB][anda_db].
+//! `anda_kip` is the protocol half: it parses, classifies and validates. This
+//! crate is the engine behind [`anda_kip::Executor`] — everything that needs
+//! state.
 //!
-//! [anda_db]: https://crates.io/crates/anda_db
+//! ## The distinction the whole engine is built around
 //!
-//! The crate exposes a single high-level type, [`CognitiveNexus`], which
-//! manages a persistent knowledge graph of:
-//!
-//! - **Concept nodes** ([`Concept`]) — identified by `{type, name}`, carrying
-//!   `attributes` and `metadata`.
-//! - **Proposition links** ([`Proposition`]) — directed triples
-//!   `(subject, predicate, object)` where subject/object may themselves be
-//!   propositions (higher-order facts). Each row stores all of its
-//!   predicates in a single record to keep the link space compact.
-//!
-//! `CognitiveNexus` accepts the full KIP v1.0 Release Candidate grammar —
-//! KQL queries (`FIND … WHERE …`), KML mutations (`UPSERT` with
-//! `EXPECT VERSION` guards, `UPDATE`, `MERGE`, `DELETE …`) and META
-//! commands (`DESCRIBE …`, `SEARCH …` with retrieval modes and relevance
-//! thresholds, `EXPORT …` knowledge capsules) — and translates them into
-//! Anda DB collection operations using a small, well-defined index plan
-//! (BTree + BM25 over the `concepts` and `propositions` collections).
-//! Reserved `_` metadata (`_version`, `_updated_at`, `_merged_from`, the
-//! transient `_score`) is engine-maintained per KIP §2.11.
-//!
-//! ## Quick start
-//!
-//! ```rust,ignore
-//! use std::sync::Arc;
-//! use anda_db::database::{AndaDB, DBConfig};
-//! use anda_cognitive_nexus::CognitiveNexus;
-//! use object_store::memory::InMemory;
-//!
-//! # async fn run() -> Result<(), anda_kip::KipError> {
-//! let db = AndaDB::connect(Arc::new(InMemory::new()), DBConfig::default())
-//!     .await
-//!     .map_err(anda_cognitive_nexus::db_to_kip_error)?;
-//! let nexus = CognitiveNexus::connect(Arc::new(db), async |_| Ok(())).await?;
-//!
-//! // Run any KIP command via the [`anda_kip::Executor`] trait.
-//! use anda_kip::{parse_kml, parse_kql};
-//! nexus.execute_kml(parse_kml(r#"
-//!     UPSERT {
-//!         CONCEPT ?d { {type: "$ConceptType", name: "Drug"} }
-//!     }
-//! "#)?, false).await?;
-//! # Ok(()) }
+//! ```text
+//! a Proposition existing  ≠  the Proposition being true
 //! ```
 //!
-//! ## Module layout
+//! A Proposition is a truth-neutral tuple. An Assertion is one actor's
+//! commitment about it, carrying a stance, a mode, a confidence and its
+//! Evidence. What is *currently believed* is projected from those Assertions
+//! under a named policy and is never stored.
 //!
-//! - [`db`] — the [`CognitiveNexus`] type and KIP executor implementation.
-//! - [`entity`] — persisted graph data model
-//!   ([`Concept`], [`Proposition`], [`EntityID`], [`Properties`]).
-//! - `helper` — small extraction / sorting / error-mapping utilities
-//!   ([`extract_concept_field_value`], [`apply_order_by`],
-//!   [`db_to_kip_error`], …).
-//! - `types` — query-execution scaffolding ([`ConceptPK`],
-//!   [`PropositionPK`], [`EntityPK`], [`QueryContext`], [`TargetEntities`]).
+//! That is why the storage layer has an [`AssertionRow`](store::rows::AssertionRow)
+//! with a `confidence` column and a [`PropositionRow`](store::rows::PropositionRow)
+//! without one, and why correcting a claim writes a new Assertion plus a
+//! supersession link instead of updating the old row.
 //!
-//! See the technical reference at `docs/anda_cognitive_nexus.md` for the
-//! full storage layout, indexing strategy, and KIP semantics.
+//! Four more distinctions the code deliberately keeps apart, each of which a
+//! well-meaning simplification would collapse:
+//!
+//! ```text
+//! missing            ≠ false
+//! confidence         ≠ trust ≠ memory strength
+//! retention.expires_at ≠ valid_time.until
+//! Space              ≠ Domain
+//! ```
+//!
+//! A fifth distinction has its own module. In KIP 1.x, authoritative schema
+//! was graph state, so an ordinary write could change what a type meant. Here
+//! it is an immutable versioned artifact resolved through a per-Space
+//! [`SchemaEnvironment`](schema::SchemaEnvironment), and every persisted
+//! `schema_ref` names an exact version — which is why an element's meaning
+//! cannot drift when somebody publishes something.
+//!
+//! ## Status
+//!
+//! The KIP 2.0 engine is being built in stages. [`CognitiveNexus`] implements
+//! [`anda_kip::Executor`] and today runs:
+//!
+//! - **KML** — creation, `ENSURE`, `UPSERT`, `UPDATE`, `MERGE CONCEPT`, the
+//!   Assertion and Evidence lifecycles, retention and removal, each with an
+//!   optional `WHERE` selection block and `LIMIT`, inside real transactions
+//!   with handles, preconditions, receipts and dry runs;
+//! - **KQL** — element and tuple patterns, structural patterns, hop-quantified
+//!   path traversal, `FILTER`, `NOT` / `OPTIONAL` / `UNION`, projection by dot
+//!   path, aggregates, `ORDER BY`, paging, and both time axes: `FOR TIME` (what
+//!   was true then) and `AS OF` (what this Brain held then);
+//! - **BELIEF / BELIEF SLOT** — the [`Epistemic Projection`](projection),
+//!   under a named, versioned policy, with an explanation ledger;
+//! - **META** — `DESCRIBE`, `LIST`, `SEARCH`, `VALIDATE`, `PREVIEW`,
+//!   `HISTORY`, `CHANGES`, `SNAPSHOT`, plus `EXPORT CAPSULE` and
+//!   `VERIFY CAPSULE`; Capsule import is a host API
+//!   ([`CognitiveNexus::import_capsule`]);
+//! - **[Governance](governance)** — Principals, groups, Grants, Delegations,
+//!   ActorBindings, versioned Policies, approvals and an append-preserving
+//!   audit. Every command is authorized before it runs, under default deny,
+//!   and so is every element a read or a write touches. Classification joins
+//!   upward along derivation links, influence authority never amplifies along
+//!   them, quarantine holds cognition out of use without claiming its author
+//!   took it back, and `PURGE` erases content while leaving an identity stub.
+//!
+//! A caller reaches the engine through [`CognitiveNexus::session`], which binds
+//! an [`AuthContext`](governance::AuthContext) the *host* built from
+//! authenticated transport state — never from the request body, whose own
+//! `context` block is documented as non-authoritative because an Agent under
+//! prompt injection can write anything into it.
+//!
+//! An embedded host that simply executes against the [`CognitiveNexus`] runs as
+//! the system Principal, which owns the default Space. That is a real
+//! authorization through the same path, not a bypass; a host serving more than
+//! one caller must authenticate them and open a session each.
+//!
+//! `DESCRIBE CAPABILITIES` reports the gaps below as structured data, so an
+//! Agent can read what is missing instead of discovering it by triggering an
+//! error — or, worse, reading an absent feature as an absent fact.
+//!
+//! The projection is partial and says so in its own output: there is no trust
+//! model and no evidence-quality evaluation in this engine, so every eligible
+//! corroboration group counts equally, and every answer carries that warning
+//! rather than reading as a judgement it did not make.
+//!
+//! Not implemented yet, and reported as `UnsupportedCapability` rather than
+//! answered wrongly:
+//!
+//! ```text
+//! semantic / hybrid SEARCH       no embedding model
+//! SEARCH ... AS OF SEQ           the index reflects the present only
+//! Capsule signatures               nothing is signed
+//! the "restore" import mode        identity continuity is not modelled
+//! DESCRIBE TRUST                   no trust evaluation to report
+//! Space-level retention defaults   retention is set per element
+//! ```
+//!
+//! An engine that returned empty results for a read it cannot perform would be
+//! worse than one that says so: an Agent would read "no memories" as an answer
+//! about the world.
+//!
+//! The KIP 1.x engine that used to live here was removed rather than ported,
+//! because 2.0 is a different data model and a renamed 1.x engine would be a
+//! worse lie than an absent one.
 
-pub mod db;
-pub mod entity;
+#![doc(html_root_url = "https://docs.rs/anda_cognitive_nexus")]
 
-mod helper;
-mod types;
+pub mod capsule;
+pub mod error;
+pub mod governance;
+pub mod id;
+pub mod kml;
+pub mod kql;
+pub mod meta;
+pub mod nexus;
+pub mod profiles;
+pub mod projection;
+pub mod schema;
+pub mod store;
+pub mod term;
+pub mod time;
+pub mod tx;
+pub mod view;
 
-pub use db::*;
-pub use entity::*;
-pub use helper::*;
-pub use types::*;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use anda_db::database::{AndaDB, DBConfig};
-    use object_store::memory::InMemory;
-    use std::sync::Arc;
-
-    async fn build_future() {
-        let db = AndaDB::connect(Arc::new(InMemory::new()), DBConfig::default())
-            .await
-            .unwrap();
-
-        let _nexus = CognitiveNexus::connect(Arc::new(db), async |_nexus| Ok(()))
-            .await
-            .unwrap();
-    }
-    fn assert_send<T: Send>(_: &T) {}
-
-    #[tokio::test]
-    async fn test_async_send_lifetime() {
-        let fut = build_future();
-        assert_send(&fut); // 编译报错信息会更聚焦
-        fut.await;
-    }
-}
+pub use error::*;
+pub use id::*;
+pub use nexus::CognitiveNexus;
+pub use store::{
+    Element, Store, rows,
+    space::{JournalEntry, SpaceDraft},
+    write::{Row, WriteContext},
+};
+pub use term::*;

@@ -9,8 +9,7 @@ import CORPUS from './oracle/corpus.generated.js'
 import { parseKip } from '../src/kip/parser.js'
 import {
   KIP_ERROR_CODES,
-  KIP_ERROR_HINTS,
-  KIP_ERROR_NAMES,
+  KIP_ERROR_REGISTRY,
 } from '../src/errors.generated.js'
 
 /**
@@ -92,13 +91,14 @@ function engine(source: string): Outcome {
 describe('parser oracle', () => {
   it('has a corpus worth trusting', () => {
     // A shrinking corpus is a silent loss of coverage: the generator walks the
-    // Rust tests, so a bad path or a renamed directory shows up here first.
-    expect(CORPUS.length).toBeGreaterThan(700)
+    // Rust sources and tests, so a bad path or a renamed directory shows up
+    // here first.
+    expect(CORPUS.length).toBeGreaterThan(500)
     const accepted = CORPUS.filter((c) => 'ok' in reference(c)).length
-    expect(accepted).toBeGreaterThan(500)
+    expect(accepted).toBeGreaterThan(350)
     // Negative cases are the point of harvesting the Rust tests; without them
     // the oracle only proves the two parsers agree on valid input.
-    expect(CORPUS.length - accepted).toBeGreaterThan(100)
+    expect(CORPUS.length - accepted).toBeGreaterThan(150)
   })
 
   it('agrees with the reference grammar on every command in the corpus', () => {
@@ -140,20 +140,25 @@ describe('parser oracle', () => {
     }
   })
 
-  it('carries the reference taxonomy verbatim', () => {
-    // `src/errors.generated.ts` is produced by reading `error.rs` as text.
-    // The reference grammar reports the same table from the compiled enum, so
-    // comparing them catches both a stale checkout and a reader too naive for
-    // a change in how the Rust is written.
+  it('carries the reference registry verbatim', () => {
+    // `src/errors.generated.ts` is produced from this same catalog, so on its
+    // own this only proves the generator ran. What it does catch is a stale
+    // checkout: the committed table against the grammar the suite actually
+    // links, which is the pair that has to agree for `hint` and `retry` to
+    // mean the same thing on both engines.
     const catalog = JSON.parse(wasmErrorCatalog()) as {
       code: string
-      name: string
+      category: string
+      retry: string
       hint: string
     }[]
     expect(catalog.map((e) => e.code)).toEqual([...KIP_ERROR_CODES])
     for (const entry of catalog) {
-      expect(KIP_ERROR_NAMES[entry.code as never]).toBe(entry.name)
-      expect(KIP_ERROR_HINTS[entry.code as never]).toBe(entry.hint)
+      expect(KIP_ERROR_REGISTRY[entry.code as never]).toEqual({
+        category: entry.category,
+        retry: entry.retry,
+        hint: entry.hint,
+      })
     }
   })
 })

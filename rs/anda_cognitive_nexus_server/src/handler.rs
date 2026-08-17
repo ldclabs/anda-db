@@ -1,4 +1,4 @@
-use anda_kip::{ErrorObject, KipError, Request, Response};
+use anda_kip::{ErrorObject, KipError, KipErrorCode, Request, Response, TopLevelStatus};
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Request as HttpRequest, State},
@@ -13,7 +13,7 @@ use std::{sync::Arc, time::Duration};
 use tokio::sync::{Mutex, Semaphore};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
-use crate::nexus::{ListLogParams, ListLogsError, Nexus};
+use crate::nexus::{ListLogParams, ListLogsError, Nexus, RequestLanguages};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -174,7 +174,7 @@ pub async fn get_information(State(app): State<AppState>) -> impl IntoResponse {
     Json(info)
 }
 
-/// Maps a KIP error response onto an HTTP status.
+/// Maps a KIP error onto an HTTP status.
 ///
 /// A failed KIP execution used to be returned as HTTP 200, so a broken KML
 /// mutation or an internal graph error was indistinguishable from success to
@@ -182,34 +182,100 @@ pub async fn get_information(State(app): State<AppState>) -> impl IntoResponse {
 /// malformed `params` on the same endpoint already produced 400 and a bad key
 /// 401. The JSON body is unchanged, so existing clients keep parsing it.
 ///
-/// The mapping follows the KIP standard code ranges (1xxx syntax, 2xxx
-/// schema, 3xxx logic/data, 4xxx system). An unrecognized code is treated as
+/// KIP 2.0 replaced the numeric ranges with the named Core Error Registry
+/// (§87), where every code carries a category and a retry class. Codes whose
+/// HTTP meaning is more specific than their category are listed first; the
+/// rest fall back to the category. An unrecognized code is treated as
 /// internal: a code the server does not know cannot be proven client-caused.
 fn kip_error_status(error: &ErrorObject) -> StatusCode {
-    match error.code.as_str() {
-        // 1xxx / 2xxx: the submitted KQL/KML is malformed or violates the
-        // schema. 3001 references an undefined variable or handle.
-        "KIP_1001" | "KIP_1002" | "KIP_2001" | "KIP_2002" | "KIP_2003" | "KIP_3001" => {
-            StatusCode::BAD_REQUEST
+    use KipErrorCode::*;
+    let Some(code) = error.parsed_code() else {
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    };
+    match code {
+        // Existence-neutral by design (§86.4): "absent" and "forbidden" must
+        // not be distinguishable, so both answer 404.
+        NotFoundOrNotVisible | TransactionUnknown => StatusCode::NOT_FOUND,
+        Unauthenticated => StatusCode::UNAUTHORIZED,
+        // The request conflicts with state the client must re-read first. The
+        // epistemic rules land here too: an Assertion's payload is immutable,
+        // so the fix is to assert anew, not to acquire authority.
+        VersionConflict
+        | PreconditionFailed
+        | SerializationConflict
+        | IdempotencyConflict
+        | SchemaEnvironmentChanged
+        | IdentityConflict
+        | ClientKeyConflict
+        | IdentityMergeConflict
+        | ImportPreviewConflict
+        | ImmutableField
+        | EpistemicRevisionRequired
+        | EvidenceCorrectionRequired
+        | EvidenceCorrectionConflict
+        | SupersessionMismatch
+        | InvalidLifecycleTransition
+        | ActivityTerminal
+        | LegalHoldConflict => StatusCode::CONFLICT,
+        // The coordinate the client is holding is gone for good; retrying the
+        // same bytes cannot work.
+        HistoricalSnapshotUnavailable
+        | HistoricalSchemaUnavailable
+        | CursorExpired
+        | CursorInvalidated
+        | ChangeCursorExpired => StatusCode::GONE,
+        TransactionTooLarge | ArtifactTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+        RateLimited => StatusCode::TOO_MANY_REQUESTS,
+        ExecutionTimeout => StatusCode::REQUEST_TIMEOUT,
+        // This runtime does not implement it — a deliberate gap, not a bad
+        // request (see `DESCRIBE CAPABILITIES`).
+        UnsupportedCapability
+        | UnsupportedIsolation
+        | SearchModeUnsupported
+        | HistoricalSearchUnavailable => StatusCode::NOT_IMPLEMENTED,
+        SearchIndexUnavailable | ArtifactUnavailable | BlobUnavailable => {
+            StatusCode::SERVICE_UNAVAILABLE
         }
-        "KIP_3002" => StatusCode::NOT_FOUND,
-        // DuplicateExists / VersionConflict: retryable after re-reading.
-        "KIP_3003" | "KIP_3005" => StatusCode::CONFLICT,
-        // ImmutableTarget: modifying protected system nodes is prohibited.
-        "KIP_3004" => StatusCode::FORBIDDEN,
-        "KIP_4001" => StatusCode::REQUEST_TIMEOUT,
-        // ResourceExhausted: the recovery hint is client-side pagination.
-        "KIP_4002" => StatusCode::BAD_REQUEST,
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
+        // §80.3: the write may have committed. The client must look the
+        // transaction up rather than re-issue it, so this must not read as a
+        // clean client-side failure.
+        OutcomeUnknown | InternalError => StatusCode::INTERNAL_SERVER_ERROR,
+        other => match other.category() {
+            anda_kip::ErrorCategory::Governance => StatusCode::FORBIDDEN,
+            anda_kip::ErrorCategory::Transport | anda_kip::ErrorCategory::System => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+            // Syntax, protocol, schema, data, epistemic, history, search,
+            // artifact and resource: the request itself must change.
+            _ => StatusCode::BAD_REQUEST,
+        },
     }
 }
 
 /// The HTTP status for a KIP response, logging the ones that count as server
 /// failures so a 5xx in the access log is also visible in the service log.
+///
+/// A `partial` batch answers 207: under `sequence`, the operations that
+/// committed before the failure stay durable (§75.2), and reporting the whole
+/// request as an error invites a client to re-issue writes that already
+/// landed.
 fn kip_status(response: &Response) -> StatusCode {
-    match response {
-        Response::Ok { .. } => StatusCode::OK,
-        Response::Err { error, .. } => {
+    match response.status {
+        TopLevelStatus::Succeeded => StatusCode::OK,
+        TopLevelStatus::Partial => StatusCode::MULTI_STATUS,
+        _ => {
+            // An envelope failure reports at the request level; an ordinary
+            // operation failure reports on its own result and leaves the
+            // request-level slot empty.
+            let error = response.error.as_ref().or_else(|| {
+                response
+                    .results
+                    .iter()
+                    .find_map(|result| result.error.as_ref())
+            });
+            let Some(error) = error else {
+                return StatusCode::INTERNAL_SERVER_ERROR;
+            };
             let status = kip_error_status(error);
             if status.is_server_error() {
                 log::error!(
@@ -223,6 +289,12 @@ fn kip_status(response: &Response) -> StatusCode {
     }
 }
 
+/// A single-error response body, for the failures the HTTP layer itself
+/// produces before or around execution.
+fn error_response(code: KipErrorCode, message: impl Into<String>) -> Json<Response> {
+    Json(Response::failed(KipError::new(code, message)))
+}
+
 /// POST /kip
 ///
 /// Authentication runs in the router layer ([`build_router`]), before this
@@ -230,12 +302,9 @@ fn kip_status(response: &Response) -> StatusCode {
 pub async fn post_kip(
     State(app): State<AppState>,
     Json(req): Json<JsonRpcRequest>,
-) -> Result<Json<Response>, (StatusCode, Json<Response>)> {
+) -> Result<(StatusCode, Json<Response>), (StatusCode, Json<Response>)> {
     if app.admission.is_cancelled() {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(Response::err("server is shutting down".to_string())),
-        ));
+        return Err((StatusCode::SERVICE_UNAVAILABLE, shutting_down()));
     }
 
     match req.method.as_str() {
@@ -243,7 +312,10 @@ pub async fn post_kip(
             let params: Request = serde_json::from_value(req.params).map_err(|e| {
                 (
                     StatusCode::BAD_REQUEST,
-                    Json(Response::err(format!("invalid parameters: {}", e))),
+                    error_response(
+                        KipErrorCode::InvalidRequestEnvelope,
+                        format!("invalid parameters: {e}"),
+                    ),
                 )
             })?;
 
@@ -251,6 +323,8 @@ pub async fn post_kip(
             // started KIP execution (possibly a mid-write KML mutation)
             // continues to completion instead of being cancelled halfway.
             let nexus = app.nexus.clone();
+            let languages = RequestLanguages::of(&params);
+            let has_mutation = languages.has_mutation();
             let response = run_detached_with_timeout(
                 &app.admission,
                 &app.mutation_tasks,
@@ -258,7 +332,7 @@ pub async fn post_kip(
                 app.mutation_aborts.clone(),
                 app.request_timeout,
                 app.execution_timeout,
-                async move { nexus.execute_kip(params).await },
+                async move { nexus.execute_kip(params, &languages).await },
             )
             .await
             .map_err(|err| match err {
@@ -269,10 +343,7 @@ pub async fn post_kip(
                         timeout_secs = app.request_timeout.as_secs();
                         "response deadline exceeded; KIP execution continues in the background",
                     );
-                    timeout_error(
-                        "request processing exceeded the configured timeout; \
-                         the started KIP execution continues on the server",
-                    )
+                    abandoned_response(has_mutation)
                 }
                 DetachedError::Join(join_error) => {
                     log::error!(
@@ -280,26 +351,27 @@ pub async fn post_kip(
                         method = "execute_kip";
                         "KIP execution task failed: {join_error:?}",
                     );
+                    // The task was spawned, so a KML mutation may have run to
+                    // an arbitrary point before it died: §80.3 says the client
+                    // must look the outcome up, not re-issue the write.
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(Response::err(
-                            "KIP execution failed unexpectedly".to_string(),
-                        )),
+                        Json(Response::outcome_unknown(KipError::outcome_unknown(
+                            "the KIP execution task failed before reporting its outcome",
+                        ))),
                     )
                 }
-                DetachedError::ShuttingDown => (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(Response::err("server is shutting down".to_string())),
-                ),
+                DetachedError::ShuttingDown => (StatusCode::SERVICE_UNAVAILABLE, shutting_down()),
                 DetachedError::Busy => (
                     StatusCode::SERVICE_UNAVAILABLE,
-                    Json(Response::err(
-                        "server mutation capacity is exhausted".to_string(),
-                    )),
+                    error_response(
+                        KipErrorCode::ResourceExhausted,
+                        "server mutation capacity is exhausted",
+                    ),
                 ),
             })?;
             match kip_status(&response) {
-                StatusCode::OK => Ok(Json(response)),
+                status if status.is_success() => Ok((status, Json(response))),
                 status => Err((status, Json(response))),
             }
         }
@@ -307,7 +379,10 @@ pub async fn post_kip(
             let params: ListLogParams = serde_json::from_value(req.params).map_err(|e| {
                 (
                     StatusCode::BAD_REQUEST,
-                    Json(Response::err(format!("invalid parameters: {}", e))),
+                    error_response(
+                        KipErrorCode::InvalidRequestEnvelope,
+                        format!("invalid parameters: {e}"),
+                    ),
                 )
             })?;
 
@@ -326,16 +401,16 @@ pub async fn post_kip(
                 CancelSafeError::Timeout => {
                     timeout_error("request processing exceeded the configured timeout")
                 }
-                CancelSafeError::ShuttingDown => (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(Response::err("server is shutting down".to_string())),
-                ),
+                CancelSafeError::ShuttingDown => (StatusCode::SERVICE_UNAVAILABLE, shutting_down()),
             })?
             .map_err(|err| match err {
                 // Client input error: an undecodable cursor.
                 ListLogsError::InvalidCursor(e) => (
                     StatusCode::BAD_REQUEST,
-                    Json(Response::err(format!("invalid cursor: {}", e))),
+                    error_response(
+                        KipErrorCode::CursorInvalidated,
+                        format!("invalid cursor: {e}"),
+                    ),
                 ),
                 // Internal failure: log the details, return a generic
                 // message to the client.
@@ -346,19 +421,25 @@ pub async fn post_kip(
                     );
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(Response::err("failed to list logs".to_string())),
+                        error_response(KipErrorCode::InternalError, "failed to list logs"),
                     )
                 }
             })?;
 
-            Ok(Json(anda_kip::Response::Ok {
-                result: json!(logs),
-                next_cursor,
-            }))
+            Ok((
+                StatusCode::OK,
+                Json(Response {
+                    next_cursor,
+                    ..Response::ok(json!(logs))
+                }),
+            ))
         }
         _ => Err((
             StatusCode::BAD_REQUEST,
-            Json(Response::err(format!("unknown method: {}", req.method))),
+            error_response(
+                KipErrorCode::InvalidRequestEnvelope,
+                format!("unknown method: {}", req.method),
+            ),
         )),
     }
 }
@@ -390,8 +471,42 @@ pub async fn total_timeout(
 fn timeout_error(message: impl Into<String>) -> (StatusCode, Json<Response>) {
     (
         StatusCode::REQUEST_TIMEOUT,
-        Json(Response::err(KipError::execution_timeout(message.into()))),
+        error_response(KipErrorCode::ExecutionTimeout, message),
     )
+}
+
+/// The response for an execution whose *response* deadline elapsed while the
+/// execution itself kept running.
+///
+/// For a read that is a plain timeout: nothing was written, and re-sending the
+/// identical request is safe, which is what `ExecutionTimeout`'s registered
+/// retry class says. For a mutation it is §80.3's unknown outcome — the write
+/// may still commit — and answering with a `safe_same_request` class would be
+/// an invitation to commit the same cognition twice.
+fn abandoned_response(has_mutation: bool) -> (StatusCode, Json<Response>) {
+    if has_mutation {
+        (
+            StatusCode::REQUEST_TIMEOUT,
+            Json(Response::outcome_unknown(KipError::outcome_unknown(
+                "the response deadline elapsed while the mutation was still running; it may \
+                 still commit. Look the transaction up instead of re-issuing it",
+            ))),
+        )
+    } else {
+        timeout_error(
+            "request processing exceeded the configured timeout; \
+             the started KIP execution continues on the server",
+        )
+    }
+}
+
+/// The body for a request refused because the process is draining.
+///
+/// `InternalError` rather than a bespoke code: its registered retry class is
+/// `safe_same_request`, which is exactly right here — nothing was executed, so
+/// re-sending the identical envelope to another instance is safe.
+fn shutting_down() -> Json<Response> {
+    error_response(KipErrorCode::InternalError, "server is shutting down")
 }
 
 /// Rewrites extractor-level rejections (e.g. the body-limit 413, which axum
@@ -410,9 +525,10 @@ pub async fn normalize_rejections(
     {
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
-            Json(Response::err(
-                "request body exceeds the configured size limit".to_string(),
-            )),
+            error_response(
+                KipErrorCode::ResourceExhausted,
+                "request body exceeds the configured size limit",
+            ),
         )
             .into_response();
     }
@@ -433,7 +549,7 @@ async fn require_api_key(
     if !authorize_api_key(api_key.as_deref(), request.headers()) {
         return Err((
             StatusCode::UNAUTHORIZED,
-            Json(Response::err("invalid API key".to_string())),
+            error_response(KipErrorCode::Unauthenticated, "invalid API key"),
         ));
     }
     Ok(next.run(request).await)
@@ -520,9 +636,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let nexus = Nexus::connect(Arc::new(db), "uuc56-gyb".to_string(), 8 * 1024)
-            .await
-            .unwrap();
+        let nexus = Nexus::connect(Arc::new(db), &[], 8 * 1024).await.unwrap();
         let state = AppState {
             name: "test".to_string(),
             version: "0.0.0".to_string(),
@@ -603,7 +717,7 @@ mod tests {
         );
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let body: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["error"]["code"], "KIP_4001");
+        assert_eq!(body["error"]["code"], "ExecutionTimeout");
         assert_eq!(
             body["error"]["message"],
             "request processing exceeded the configured timeout"
@@ -915,30 +1029,57 @@ mod tests {
     /// or 5xx alert can act on — client-caused to 4xx, internal to 5xx.
     #[test]
     fn kip_error_classes_map_to_meaningful_statuses() {
-        let status = |code: KipErrorCode| {
-            kip_error_status(&ErrorObject::new(code.code(), "boom".to_string()))
-        };
+        let status = |code: KipErrorCode| kip_error_status(&ErrorObject::new(code, "boom"));
 
         for code in [
             KipErrorCode::InvalidSyntax,
             KipErrorCode::InvalidIdentifier,
+            KipErrorCode::InvalidRequestEnvelope,
+            KipErrorCode::LanguageMismatch,
+            KipErrorCode::SchemaSymbolNotFound,
             KipErrorCode::TypeMismatch,
             KipErrorCode::ConstraintViolation,
-            KipErrorCode::InvalidValueType,
             KipErrorCode::ReferenceError,
             KipErrorCode::ResourceExhausted,
+            KipErrorCode::ResultLimitExceeded,
+            KipErrorCode::CapsuleValidationFailed,
         ] {
-            assert_eq!(
-                status(code),
-                StatusCode::BAD_REQUEST,
-                "code: {}",
-                code.code()
-            );
+            assert_eq!(status(code), StatusCode::BAD_REQUEST, "code: {code}");
         }
-        assert_eq!(status(KipErrorCode::NotFound), StatusCode::NOT_FOUND);
-        assert_eq!(status(KipErrorCode::DuplicateExists), StatusCode::CONFLICT);
+        assert_eq!(
+            status(KipErrorCode::NotFoundOrNotVisible),
+            StatusCode::NOT_FOUND
+        );
         assert_eq!(status(KipErrorCode::VersionConflict), StatusCode::CONFLICT);
-        assert_eq!(status(KipErrorCode::ImmutableTarget), StatusCode::FORBIDDEN);
+        // The epistemic rules are conflicts with recorded state, not authority
+        // failures: the fix is a new Assertion, not a bigger permission.
+        assert_eq!(status(KipErrorCode::ImmutableField), StatusCode::CONFLICT);
+        assert_eq!(
+            status(KipErrorCode::EpistemicRevisionRequired),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            status(KipErrorCode::Unauthenticated),
+            StatusCode::UNAUTHORIZED
+        );
+        for code in [
+            KipErrorCode::NotAuthorized,
+            KipErrorCode::ProtectedSystemField,
+            KipErrorCode::PurgeDenied,
+        ] {
+            assert_eq!(status(code), StatusCode::FORBIDDEN, "code: {code}");
+        }
+        assert_eq!(status(KipErrorCode::CursorExpired), StatusCode::GONE);
+        // A gap this engine declares (`DESCRIBE CAPABILITIES`) is not a
+        // malformed request.
+        assert_eq!(
+            status(KipErrorCode::UnsupportedCapability),
+            StatusCode::NOT_IMPLEMENTED
+        );
+        assert_eq!(
+            status(KipErrorCode::RateLimited),
+            StatusCode::TOO_MANY_REQUESTS
+        );
         assert_eq!(
             status(KipErrorCode::ExecutionTimeout),
             StatusCode::REQUEST_TIMEOUT
@@ -947,41 +1088,142 @@ mod tests {
             status(KipErrorCode::InternalError),
             StatusCode::INTERNAL_SERVER_ERROR
         );
+        // §80.3: a write whose fate is unknown must not read as a clean
+        // client-side failure.
+        assert_eq!(
+            status(KipErrorCode::OutcomeUnknown),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
         // An unknown code cannot be proven client-caused.
         assert_eq!(
-            kip_error_status(&ErrorObject::new("KIP_9999", "boom".to_string())),
+            kip_error_status(&ErrorObject {
+                code: "SomeFutureCode".to_string(),
+                message: "boom".to_string(),
+                ..Default::default()
+            }),
             StatusCode::INTERNAL_SERVER_ERROR
         );
     }
 
-    /// A failed KIP execution must not answer HTTP 200; the JSON body shape
-    /// stays exactly the same so existing clients keep parsing it.
+    /// Abandoning the response is not abandoning the execution. A read may be
+    /// re-sent as-is; a mutation that is still running must be looked up, not
+    /// re-issued (§80.3).
+    #[test]
+    fn an_abandoned_mutation_is_reported_as_an_unknown_outcome() {
+        let (status, Json(read)) = abandoned_response(false);
+        assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(read.status, TopLevelStatus::Failed);
+        assert_eq!(
+            read.error.as_ref().and_then(|error| error.parsed_code()),
+            Some(KipErrorCode::ExecutionTimeout)
+        );
+
+        let (status, Json(write)) = abandoned_response(true);
+        assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(write.status, TopLevelStatus::OutcomeUnknown);
+        assert_eq!(
+            write.error.as_ref().and_then(|error| error.retry),
+            Some(anda_kip::RetryInfo::new(
+                anda_kip::RetryClass::OutcomeLookupRequired
+            ))
+        );
+    }
+
+    /// A failed KIP execution must not answer HTTP 200; the JSON body is the
+    /// standard response envelope in every case.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_failed_kip_execution_is_not_http_200() {
         let app = test_app(None).await;
 
         let (status, body) = post_json(
             &app,
-            r#"{"method":"execute_kip","params":{"command":"THIS IS NOT KIP"}}"#,
+            r#"{"method":"execute_kip","params":{"kip":"2.0","operations":[{"command":"THIS IS NOT KIP"}]}}"#,
             None,
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
-        assert!(
-            body["error"]["code"].as_str().unwrap().starts_with("KIP_"),
+        assert_eq!(body["status"], "failed", "body: {body}");
+        // A single-operation failure reports on its own result; the
+        // request-level slot is for envelope failures.
+        assert_eq!(
+            body["results"][0]["error"]["code"], "InvalidSyntax",
             "body: {body}"
         );
-        assert!(body["error"]["message"].is_string(), "body: {body}");
+        assert!(
+            body["results"][0]["error"]["hint"].is_string(),
+            "body: {body}"
+        );
 
         // A successful execution still answers 200 with the same shape.
         let (status, body) = post_json(
             &app,
-            r#"{"method":"execute_kip","params":{"command":"DESCRIBE PRIMER"}}"#,
+            r#"{"method":"execute_kip","params":{"kip":"2.0","operations":[{"command":"DESCRIBE PRIMER"}]}}"#,
             None,
         )
         .await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["status"], "succeeded", "body: {body}");
         assert!(body.get("error").is_none(), "body: {body}");
+
+        // An envelope the protocol rejects never reaches the engine.
+        let (status, body) = post_json(
+            &app,
+            r#"{"method":"execute_kip","params":{"kip":"1.0","operations":[{"command":"DESCRIBE PRIMER"}]}}"#,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert_eq!(
+            body["error"]["code"], "UnsupportedProtocolVersion",
+            "body: {body}"
+        );
+    }
+
+    /// A batch is not a transaction (§75.4): when one operation of a
+    /// `sequence` fails after another committed, the request is `partial`, and
+    /// answering 4xx would invite the client to re-issue a durable write.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_partial_batch_answers_207_rather_than_an_error() {
+        let app = test_app(None).await;
+        let (status, body) = post_json(
+            &app,
+            r#"{"method":"execute_kip","params":{"kip":"2.0",
+                "execution":{"mode":"sequence","on_error":"continue"},
+                "operations":[
+                    {"command":"DESCRIBE PRIMER"},
+                    {"command":"THIS IS NOT KIP"}
+                ]}}"#,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::MULTI_STATUS, "body: {body}");
+        assert_eq!(body["status"], "partial", "body: {body}");
+        assert_eq!(body["results"][0]["status"], "succeeded", "body: {body}");
+        assert_eq!(body["results"][1]["status"], "failed", "body: {body}");
+    }
+
+    /// `atomic` needs one transaction and one snapshot across the batch. This
+    /// server runs operations one at a time, so it refuses rather than
+    /// silently downgrading to `sequence`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn atomic_execution_is_refused_rather_than_downgraded() {
+        let app = test_app(None).await;
+        let (status, body) = post_json(
+            &app,
+            r#"{"method":"execute_kip","params":{"kip":"2.0",
+                "execution":{"mode":"atomic"},
+                "operations":[
+                    {"command":"ARCHIVE :a"},
+                    {"command":"ARCHIVE :b"}
+                ]}}"#,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "body: {body}");
+        assert_eq!(
+            body["error"]["code"], "UnsupportedCapability",
+            "body: {body}"
+        );
     }
 
     /// Authentication must run before the body is parsed: an anonymous caller

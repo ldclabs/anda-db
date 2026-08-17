@@ -1,0 +1,721 @@
+/**
+ * # Transactions
+ *
+ * A KML statement is one atomic cognitive transition (Spec §2), and three of
+ * its properties are the reason this module exists rather than each clause
+ * writing directly.
+ *
+ * **A mutation block is declarative, not sequential** (§21–§24). Forward
+ * references are legal, and they have to be: `Evidence.generated_by → Activity`
+ * and `Activity.outputs → Evidence` is a legitimate structural cycle, so a
+ * define-before-use ordering would make atomic provenance formation impossible.
+ * Planning therefore happens in two phases — declare every handle, then
+ * interpret every clause with all handles known.
+ *
+ * **An element's version increments once per transaction** (§44), no matter how
+ * many clauses touched it. A transaction is one externally visible state
+ * transition, and `EXPECT VERSION`, audit and the change stream all read that
+ * counter. So versions are assigned here, at commit, not by each write.
+ *
+ * **A no-effect final state changes nothing.** Writing the same value back
+ * would burn a version and emit a change record for a transition that did not
+ * happen.
+ *
+ * ## What this engine gives you that the Rust one does not
+ *
+ * `ctx.storage.transactionSync` is a real transaction: a clause that throws
+ * rolls the whole statement back, shells included. The Rust engine has no
+ * write-ahead log and recovers by sweeping `pending` elements on open. Shells
+ * still exist here, because a row id is only assigned by inserting and a
+ * forward reference needs the id first — but they are no longer the recovery
+ * mechanism, and `sweepPending` is kept as a cheap invariant check rather than
+ * as the thing that makes a crash survivable.
+ *
+ * A Durable Object is also single-threaded, so there is no concurrent reader to
+ * observe a half-applied transaction and no lock to hold against one.
+ */
+
+import { errors } from './errors.js'
+import {
+  classification,
+  requirePermitted,
+  resourceOfElement,
+  spaceResource,
+  type AuthContext,
+  type EffectiveAuthority,
+  type Permission,
+} from './governance/index.js'
+import {
+  formatElementId,
+  tryParseElementId,
+  type ElementId,
+  type ElementKind,
+} from './id.js'
+import type { Json, JsonMap } from './json.js'
+import type { SchemaEnvironment } from './schema/index.js'
+import {
+  State,
+  classificationOf,
+  type AssertionRow,
+  type ChangeEntry,
+  type ChangeOp,
+  type Element,
+  type Store,
+} from './store/index.js'
+import { nowTime } from './time.js'
+
+/**
+ * What an element was derived from, for the authority lineage.
+ *
+ * The *material* inputs — the ones whose content shaped this element — rather
+ * than every reference it happens to carry. An Assertion's Proposition is what
+ * it is *about*, not what it was derived from; its Evidence is.
+ */
+/**
+ * The element id a stored reference names, or `''` when it names none.
+ *
+ * A reference arrives either as a bare id string or as `{id: "C-1"}`, and both
+ * spellings are on disk: reading only one would make derivation links vanish for
+ * whichever form the writer happened to use.
+ */
+function referenceText(value: unknown): string {
+  if (typeof value === 'string') return value
+  if (value !== null && typeof value === 'object') {
+    const id = (value as { id?: unknown }).id
+    if (typeof id === 'string') return id
+  }
+  return ''
+}
+
+function materialInputs(element: Element): string[] {
+  const ids: string[] = []
+  const push = (value: unknown) => {
+    if (typeof value === 'string' && value !== '') ids.push(value)
+    else if (
+      value !== null &&
+      typeof value === 'object' &&
+      typeof (value as { id?: unknown }).id === 'string'
+    ) {
+      ids.push((value as { id: string }).id)
+    }
+  }
+  switch (element.kind) {
+    case 'Assertion':
+      for (const ref of element.row.evidence_refs) push(ref.evidence_id)
+      for (const ref of element.row.context_refs) push(ref)
+      break
+    case 'Evidence':
+      for (const ref of element.row.source_refs) push(ref)
+      push(element.row.generated_by)
+      break
+    case 'Activity':
+      for (const ref of element.row.inputs) push(ref)
+      break
+    default:
+      return []
+  }
+  return [...new Set(ids)]
+}
+
+/** One element this transaction will write. */
+interface Staged {
+  element: Element
+  isNew: boolean
+  /** Whether the final state differs from what was there before. */
+  changed: boolean
+  /** What the change record calls this. */
+  op: ChangeOp
+  /** The version the element had when this transaction first loaded it. */
+  baseVersion: number
+}
+
+/** What a committed (or previewed) transaction produced. */
+export interface Outcome {
+  status: 'committed' | 'no_effect'
+  tx_id: string
+  space_id: string
+  space_seq: number | null
+  snapshot_seq: number
+  committed_at: string | null
+  schema_environment_version: number
+  /** Every handle this mutation bound, mapped to the element it named. */
+  handles: Record<string, string>
+  /** One record per changed element. */
+  changes: ChangeEntry[]
+  warnings: string[]
+  /**
+   * The access decision that authorized this statement (§178).
+   *
+   * Present only on high-impact statements — an erasure, an export, a
+   * Governance change. Attaching it to every commit would bury the cases that
+   * matter under the ones that do not.
+   */
+  governance?: JsonMap
+}
+
+/** The engine truth stamped on everything one transaction writes. */
+export interface WriteContext {
+  tx_id: string
+  space: string
+  at: string
+  /**
+   * `_system.origin` — what the runtime observed, never a claim (§26).
+   *
+   * The Principal comes from the authenticated session and the channel from the
+   * transport, never from the command's content: content that could set this
+   * would be laundering provenance.
+   */
+  origin: JsonMap
+}
+
+/** The engine state one KML statement runs against. */
+export class Transaction {
+  readonly store: Store
+  readonly cx: WriteContext
+  /**
+   * The Schema Environment this transaction is bound to.
+   *
+   * Captured once at the start: a transaction evaluates against one consistent
+   * environment snapshot (§240.45), so an activation racing alongside cannot
+   * change what half of it means.
+   */
+  readonly env: SchemaEnvironment
+  /** Whether this run may become durable. */
+  readonly dryRun: boolean
+  /** The Space sequence the transaction started from. */
+  readonly snapshotSeq: number
+
+  private readonly handleMap = new Map<string, ElementId>()
+  private readonly staged = new Map<string, Staged>()
+  private readonly shells: ElementId[] = []
+  private readonly warnings: string[] = []
+
+  /**
+   * What the caller may do here, resolved once for the whole transaction.
+   *
+   * Resolved before the statement starts rather than per clause: a Grant
+   * revoked halfway through a `MUTATE` must not leave half of it applied, and
+   * one transaction is one decision about who is writing.
+   */
+  readonly authority: EffectiveAuthority
+  /** Who the caller is. */
+  readonly auth: AuthContext
+
+  constructor(
+    store: Store,
+    space: string,
+    env: SchemaEnvironment,
+    origin: JsonMap,
+    dryRun: boolean,
+    authority: EffectiveAuthority,
+    auth: AuthContext,
+  ) {
+    this.store = store
+    this.env = env
+    this.dryRun = dryRun
+    this.authority = authority
+    this.auth = auth
+    this.snapshotSeq = store.currentSeq(space)
+    this.cx = {
+      // Provisional until commit: a dry run never advances the Space clock, so
+      // the id it reports must not claim a coordinate it did not take.
+      tx_id: `tx-${space}-${this.snapshotSeq + 1}-${nowTime()}`,
+      space,
+      at: nowTime(),
+      origin,
+    }
+  }
+
+  /**
+   * Authorizes one permission over an element this transaction will touch.
+   *
+   * The command gate already asked whether the caller may do this *here*; this
+   * asks whether it may do it to *that*. The two are different questions
+   * whenever a Grant is scoped to a kind, a type or a classification, and
+   * answering only the first is how a narrowed Grant turns into an unnarrowed
+   * one.
+   *
+   * The element is read through {@link load}, so the classification judged is
+   * the one it had when this transaction first saw it. Nothing a KML statement
+   * can write changes that — the `governance` block is not author-writable —
+   * so there is no window where a clause could relabel an element and then act
+   * on the new label.
+   */
+  authorizeElement(id: ElementId, permission: Permission): void {
+    requirePermitted(
+      this.authority.authorize(permission, resourceOfElement(this.load(id)), this.auth),
+    )
+  }
+
+  /**
+   * Authorizes a permission over an element this transaction is about to
+   * create, judged on the element as it will be written.
+   *
+   * The id is the one this transaction minted and nothing has committed yet, so
+   * a Grant narrowed to specific elements cannot be satisfied by an element that
+   * does not exist. Judging on kind and type is what such a Grant can actually
+   * be about.
+   */
+  authorizeCreated(element: Element, permission: Permission): void {
+    const resource = resourceOfElement(element)
+    resource.element_id = ''
+    if (resource.classification === '') {
+      resource.classification = this.authority.defaultClassification()
+    }
+    requirePermitted(this.authority.authorize(permission, resource, this.auth))
+  }
+
+  /**
+   * Authorizes a permission over an element that does not exist yet.
+   *
+   * A creation has no element to read a classification off, so it is judged at
+   * the Space default — which is what the element will carry. A Grant narrowed
+   * to Concepts must not be a way to create Evidence.
+   */
+  authorizeNew(kind: ElementKind, schemaRef: string, permission: Permission): void {
+    requirePermitted(
+      this.authority.authorize(
+        permission,
+        {
+          kind: kind.toLowerCase(),
+          schema_ref: schemaRef,
+          classification: this.authority.defaultClassification(),
+          element_id: '',
+        },
+        this.auth,
+      ),
+    )
+  }
+
+  /** Authorizes a permission that is about the Space rather than an element. */
+  require(permission: Permission): void {
+    requirePermitted(this.authority.authorize(permission, spaceResource(), this.auth))
+  }
+
+  /**
+   * Whether this caller may withdraw or supersede one Assertion (§67, §68).
+   *
+   * Two ways to hold that authority, and administrative dislike is neither:
+   *
+   * ```text
+   * the caller wrote it              withdrawing one's own record
+   * the caller represents the actor  an ActorBinding says so
+   * ```
+   *
+   * A moderator who holds neither may exclude the Assertion from recall with
+   * `ARCHIVE` or `TOMBSTONE`, but must not record it as *the source having
+   * retracted* — that would be the engine stating something about the source
+   * that never happened, which is the dishonesty §68 exists to forbid.
+   */
+  mayRepresentAssertion(row: AssertionRow): boolean {
+    const wroteIt = row.origin.principal_id === this.auth.principal_id
+    return wroteIt || this.authority.isBoundToActor(row.asserted_by_key)
+  }
+
+  /** Records a non-fatal caveat. */
+  warn(message: string): void {
+    this.warnings.push(message)
+  }
+
+  /** The handles bound so far, in wire form. */
+  handles(): Record<string, string> {
+    return Object.fromEntries(
+      [...this.handleMap].map(([name, id]) => [name, formatElementId(id)]),
+    )
+  }
+
+  /** The element a handle names, or `null` when it names none. */
+  handle(name: string): ElementId | null {
+    return this.handleMap.get(name) ?? null
+  }
+
+  /**
+   * Declares a handle and mints the element it will name.
+   *
+   * The id has to exist before any clause is interpreted, because a clause may
+   * reference a handle a later clause declares.
+   *
+   * A handle may be declared exactly once (§25): two clauses binding `?x` leave
+   * every reference to it ambiguous, and picking either one would be a guess.
+   */
+  declare(name: string, kind: ElementKind): ElementId {
+    this.requireFreeHandle(name)
+    const id = this.mint(kind)
+    this.handleMap.set(name, id)
+    return id
+  }
+
+  /** Mints an element with no handle — an anonymous `ENSURE PROPOSITION`. */
+  mint(kind: ElementKind): ElementId {
+    const id = this.store.reserve(kind, this.cx.space)
+    this.shells.push(id)
+    return id
+  }
+
+  /**
+   * Binds a handle to an element that already has an id.
+   *
+   * Used by the clauses whose target cannot be minted up front — `UPSERT` may
+   * resolve to an existing Concept and `ENSURE` to an existing tuple — so their
+   * handles are bound during interpretation rather than declaration.
+   */
+  bindExisting(name: string, id: ElementId): void {
+    this.requireFreeHandle(name)
+    this.handleMap.set(name, id)
+  }
+
+  private requireFreeHandle(name: string): void {
+    if (this.handleMap.has(name)) {
+      throw errors.duplicateLocalHandle(
+        `?${name} is declared more than once in this mutation block`,
+      )
+    }
+  }
+
+  /** Stages a newly created element's final row. */
+  stageNew(id: ElementId, element: Element, op: ChangeOp = 'create'): void {
+    this.staged.set(formatElementId(id), {
+      element,
+      isNew: true,
+      changed: true,
+      op,
+      baseVersion: 0,
+    })
+  }
+
+  /**
+   * Loads an existing element for modification, or returns the staged copy.
+   *
+   * Read-your-writes inside the transaction (§27): a clause that reads an
+   * element another clause already changed sees the change, because both are
+   * the same staged row.
+   */
+  load(id: ElementId): Element {
+    const key = formatElementId(id)
+    const found = this.staged.get(key)
+    if (found !== undefined) return found.element
+
+    const element = this.store.load(id)
+    if (element === null) {
+      throw errors.notFoundOrNotVisible(`no element ${key}`)
+    }
+    if (element.row.space !== this.cx.space) {
+      throw errors.notFoundOrNotVisible(`${key} lives in another MemorySpace`)
+    }
+    this.staged.set(key, {
+      element,
+      isNew: false,
+      changed: false,
+      op: 'update',
+      baseVersion: element.row.version,
+    })
+    return element
+  }
+
+  /**
+   * The Concept type of a staged element, when this transaction staged one.
+   *
+   * Endpoint validation has to see the transaction's own writes: a Proposition
+   * whose subject was created by an earlier clause of the same block would
+   * otherwise look untyped.
+   */
+  stagedConceptType(id: ElementId): string | null {
+    const staged = this.staged.get(formatElementId(id))
+    if (staged?.element.kind !== 'Concept') return null
+    const ref = staged.element.row.schema_ref
+    return ref === '' ? null : ref
+  }
+
+  /**
+   * Marks a staged element as actually changed.
+   *
+   * Separate from {@link load} because loading is not modifying: a clause that
+   * reads an element and decides to do nothing must not burn a version.
+   */
+  markChanged(id: ElementId, op: ChangeOp): void {
+    const staged = this.staged.get(formatElementId(id))
+    if (staged === undefined) return
+    staged.changed = true
+    if (!staged.isNew) staged.op = op
+  }
+
+  /**
+   * Checks an `EXPECT VERSION` guard against the pre-transaction version.
+   *
+   * The comparison is against the version the element had when the transaction
+   * started, not a value this transaction produced: a guard is a statement
+   * about what the caller believed, and the caller could not have seen a
+   * version that does not exist yet.
+   */
+  expectVersion(id: ElementId, expected: number): void {
+    this.load(id)
+    const staged = this.staged.get(formatElementId(id))
+    const actual = staged?.isNew === true ? 0 : (staged?.baseVersion ?? 0)
+    if (actual !== expected) {
+      throw errors.versionConflict(
+        `${formatElementId(id)} is at version ${actual}, not the expected ` +
+          `${expected}; re-read it and decide again`,
+      )
+    }
+  }
+
+  /** Checks an `EXPECT STATE` guard against the engine state. */
+  expectState(id: ElementId, expected: string): void {
+    const actual = this.load(id).row.state
+    if (actual !== expected) {
+      throw errors.preconditionFailed(
+        `${formatElementId(id)} is in state ${JSON.stringify(actual)}, not ` +
+          `the expected ${JSON.stringify(expected)}`,
+      )
+    }
+  }
+
+  /**
+   * Checks an `EXPECT STATE` guard against an Assertion's lifecycle status.
+   *
+   * Distinct from {@link expectState}, which reads the *engine* state: an
+   * Assertion can be epistemically retracted while its record is perfectly
+   * active, and confusing the two would let a guard pass on the wrong question.
+   */
+  expectAssertionStatus(id: ElementId, expected: string): void {
+    const element = this.load(id)
+    if (element.kind !== 'Assertion') {
+      throw errors.structuralReferenceInvalid(
+        `${formatElementId(id)} is not an Assertion`,
+      )
+    }
+    if (element.row.status !== expected) {
+      throw errors.preconditionFailed(
+        `${formatElementId(id)} is ${JSON.stringify(element.row.status)}, ` +
+          `not the expected ${JSON.stringify(expected)}`,
+      )
+    }
+  }
+
+  /**
+   * Commits everything staged, or reports what a dry run would have done.
+   *
+   * A dry run never establishes a durable cognitive commit (§69.3): it takes no
+   * Space sequence and journals nothing. The caller runs it inside a
+   * transaction it rolls back, so the shells go with it.
+   */
+  commit(idempotencyKey: string): Outcome {
+    const pending = [...this.staged.entries()].filter(
+      ([, staged]) => staged.changed,
+    )
+    const versionOf = (staged: Staged) =>
+      staged.isNew ? 1 : staged.baseVersion + 1
+
+    if (this.dryRun) {
+      // A dry run leaves nothing behind. The caller usually wraps this in a
+      // transaction it rolls back, but PREVIEW does not — and a shell that
+      // survives is an id nobody can reach and nothing will reuse.
+      this.discardShells()
+      return this.outcome(
+        'no_effect',
+        null,
+        null,
+        pending.map(([id, staged]) => ({
+          id,
+          kind: staged.element.kind,
+          op: staged.op,
+          version: versionOf(staged),
+        })),
+      )
+    }
+
+    if (pending.length === 0) {
+      // No sequence is taken, because nothing happened: a Space clock that
+      // ticks for a no-op makes every `CHANGES SINCE` cursor report a change
+      // that is not there.
+      return this.outcome('no_effect', null, null, [])
+    }
+
+    this.propagateGovernance(pending)
+
+    const seq = this.store.nextSeq(this.cx.space)
+    const committedAt = nowTime()
+    const changes: ChangeEntry[] = []
+    const written = new Set<string>()
+
+    for (const [id, staged] of pending) {
+      const version = versionOf(staged)
+      const row = staged.element.row
+      row.space = this.cx.space
+      row.version = version
+      row.seq = seq
+      row.updated_at = committedAt
+      row.updated_tx = this.cx.tx_id
+      row.origin = this.cx.origin
+      if (staged.isNew) {
+        row.created_at = committedAt
+        row.created_tx = this.cx.tx_id
+      }
+      if (row.state === '' || row.state === State.PENDING) {
+        row.state = State.ACTIVE
+      }
+      changes.push(this.store.put(staged.element, staged.op, this.cx.tx_id))
+      written.add(id)
+    }
+
+    // A shell nobody staged is a handle that was declared and never filled in —
+    // a planning bug rather than data, so it is removed instead of committed
+    // half-formed.
+    this.discardUnwritten(written)
+
+    this.store.putTransaction({
+      tx_id: this.cx.tx_id,
+      space: this.cx.space,
+      seq,
+      snapshot_seq: this.snapshotSeq,
+      committed_at: committedAt,
+      status: 'committed',
+      transaction_class: 'cognitive',
+      idempotency_key: idempotencyKey,
+      request_digest: '',
+      semantic_plan_digest: '',
+      result_digest: '',
+      schema_environment_version: this.env.version,
+      result: { handles: this.handles() } as Json,
+      changes,
+    })
+
+    return this.outcome('committed', seq, committedAt, changes)
+  }
+
+  /**
+   * Carries classification and authority lineage onto derived elements.
+   *
+   * At commit rather than per clause: a mutation block is declarative, so an
+   * Activity may list its outputs *after* the clause that created them, and a
+   * per-clause walk would miss exactly the inputs that arrived later (§21–§24).
+   *
+   * Two things travel along those links, in opposite directions:
+   *
+   * ```text
+   * classification   joins upward    the output is at least as restricted
+   * authority        recorded        the ceiling it may later be raised to
+   * ```
+   *
+   * Classification is applied here because it has to be right the moment the
+   * element becomes readable — *read secret Evidence, summarize, write public
+   * summary* is an exfiltration path if the summary lands public even briefly
+   * (§98, §242). Authority is only *recorded*, because everything is created at
+   * the bottom of the ladder and so cannot exceed anything; the lineage is what
+   * an elevation reads when somebody asks to raise it (§127).
+   */
+  private propagateGovernance(pending: [string, Staged][]): void {
+    const derived = this.derivations()
+    for (const [key, staged] of pending) {
+      if (!staged.isNew) continue
+      const inputs = derived.get(key) ?? []
+      if (inputs.length === 0) continue
+
+      const block: JsonMap = { ...staged.element.row.governance }
+      const fallback = this.authority.defaultClassification()
+      const own = classificationOf(staged.element)
+      let joined = own === '' ? fallback : own
+      for (const input of inputs) {
+        joined = classification.join(joined, this.classificationOfInput(input))
+      }
+      // Only stated when it says something the Space default does not: an
+      // element labelled with the default carries no label, which is what keeps
+      // "states none" and "states the default" the same element.
+      if (joined !== fallback) block.classification = joined
+      block.authority_lineage = inputs
+      staged.element.row.governance = block
+    }
+  }
+
+  /**
+   * The material inputs of every new element this transaction stages (§99).
+   *
+   * Two directions, because derivation is recorded from both ends: an element's
+   * own citations, and — walking the other way — the inputs of any Activity that
+   * lists it as an output. A summarizer that records `Activity{inputs: [E-1],
+   * outputs: [E-2]}` has said E-2 came from E-1 without E-2 mentioning E-1.
+   */
+  private derivations(): Map<string, string[]> {
+    const out = new Map<string, string[]>()
+    const add = (target: string, inputs: readonly string[]) => {
+      const found = out.get(target) ?? []
+      for (const input of inputs) {
+        if (input !== target && !found.includes(input)) found.push(input)
+      }
+      out.set(target, found)
+    }
+    for (const [key, staged] of this.staged) {
+      add(key, materialInputs(staged.element))
+    }
+    for (const staged of this.staged.values()) {
+      if (staged.element.kind !== 'Activity') continue
+      const inputs = staged.element.row.inputs.map(referenceText).filter((v) => v !== '')
+      for (const output of staged.element.row.outputs.map(referenceText)) {
+        if (output !== '') add(output, inputs)
+      }
+    }
+    return out
+  }
+
+  /**
+   * The classification of one derivation input.
+   *
+   * Read from the staging map *and* the store. Reading only the staged ones
+   * makes propagation work inside a single `MUTATE` and stop working the moment
+   * the Evidence was written earlier — which is the ordinary case, and the
+   * failure is silent.
+   *
+   * An input that is not there at all reads as the Space default rather than as
+   * unclassified: §95 forbids letting absence mean `public`.
+   */
+  private classificationOfInput(reference: string): string {
+    const fallback = this.authority.defaultClassification()
+    const id = tryParseElementId(reference)
+    if (id === null) return fallback
+    const staged = this.staged.get(formatElementId(id))
+    const element = staged?.element ?? this.store.load(id)
+    if (element === null) return fallback
+    const label = classificationOf(element)
+    return label === '' ? fallback : label
+  }
+
+  /**
+   * Removes the shells this run minted.
+   *
+   * Called on the paths that do not commit. `transactionSync` would roll them
+   * back anyway; doing it explicitly keeps a `PREVIEW` that runs outside one
+   * from leaving rubbish behind.
+   */
+  discardShells(): void {
+    this.discardUnwritten(new Set())
+  }
+
+  private discardUnwritten(written: ReadonlySet<string>): void {
+    for (const id of this.shells) {
+      if (!written.has(formatElementId(id))) {
+        this.store.removeShell(id)
+      }
+    }
+    this.shells.length = 0
+  }
+
+  private outcome(
+    status: 'committed' | 'no_effect',
+    seq: number | null,
+    committedAt: string | null,
+    changes: ChangeEntry[],
+  ): Outcome {
+    return {
+      status,
+      tx_id: this.cx.tx_id,
+      space_id: this.cx.space,
+      space_seq: seq,
+      snapshot_seq: this.snapshotSeq,
+      committed_at: committedAt,
+      schema_environment_version: this.env.version,
+      handles: this.handles(),
+      changes,
+      warnings: this.warnings,
+    }
+  }
+}

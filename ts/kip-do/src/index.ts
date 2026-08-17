@@ -1,28 +1,150 @@
 /**
- * `@ldclabs/kip-do` — a KIP knowledge graph on SQLite-backed Durable Objects.
+ * `@ldclabs/kip-do` — a KIP 2.0 knowledge graph on SQLite-backed Durable
+ * Objects. One Cognitive Nexus per Durable Object.
  *
- * One KIP database per Durable Object. See README.md for deployment and for
- * the list of known divergences from the Rust reference engine.
+ * The engine is being rebuilt for KIP 2.0. The 1.x executor was deleted rather
+ * than ported: 2.0 is a different data model — a Proposition existing is not
+ * the Proposition being true — and a renamed 1.x engine would have been a
+ * worse lie than an absent one. It is recoverable from the branch history.
+ *
+ * What is exported here is what exists. As each stage lands, its surface
+ * joins this list; nothing is re-exported ahead of the code that implements it.
  */
-
-export { KipDatabase, type KipDatabaseEnv } from './durable-object.js'
-export {
-  CognitiveNexus,
-  normalizeScore,
-  parseOffsetCursor,
-  type KipResponse,
-  type NexusOptions,
-  type TransactionRunner,
-} from './nexus.js'
 
 export {
   KipError,
   KIP_ERROR_CODES,
-  KIP_ERROR_HINTS,
-  KIP_ERROR_NAMES,
+  KIP_ERROR_REGISTRY,
+  errors,
+  type ErrorFactories,
+  type KipErrorCategory,
   type KipErrorCode,
   type KipErrorJSON,
+  type KipErrorSpec,
+  type KipRetryClass,
+  type RetryInfo,
 } from './errors.js'
+
+export {
+  digestParts,
+  sha256Hex,
+  sha256Text,
+} from './digest.js'
+
+export {
+  ELEMENT_KINDS,
+  UNREACHABLE_SEQ,
+  compareElementId,
+  elementId,
+  elementIdEquals,
+  formatElementId,
+  kindOfTag,
+  parseElementId,
+  parseElementIdOfKind,
+  tagOf,
+  tryParseElementId,
+  type ElementId,
+  type ElementKind,
+} from './id.js'
+
+export {
+  TIME_MAX,
+  TIME_MIN,
+  formatTime,
+  normalizeTime,
+  nowTime,
+  parseTime,
+  type Timestamp,
+} from './time.js'
+
+export {
+  DT_BOOLEAN,
+  DT_NULL,
+  DT_NUMBER,
+  DT_STRING,
+  endpointFromJson,
+  endpointKey,
+  endpointLocal,
+  endpointToJson,
+  literalFromObject,
+  literalFromScalar,
+  literalToJson,
+  localRef,
+  tupleKey,
+  type Endpoint,
+  type Literal,
+} from './term.js'
+
+export {
+  KipDatabase,
+  type KipDatabaseEnv,
+  type KipResponse,
+  type KipResult,
+} from './durable-object.js'
+
+export {
+  CognitiveNexus,
+  DEFAULT_SPACE,
+  SYSTEM_PRINCIPAL,
+  Session,
+  type NexusOptions,
+  type ReadOptions,
+} from './nexus.js'
+
+export * from './governance/index.js'
+
+export {
+  Transaction,
+  executeKml,
+  tryExecuteKml,
+  type KmlContext,
+  type Outcome,
+  type WriteContext,
+} from './kml/index.js'
+
+export {
+  Context as KqlContextState,
+  executeKql,
+  type KqlContext,
+} from './kql/index.js'
+
+export { readPath, render } from './view.js'
+
+export {
+  KIP_VERSION,
+  capabilities,
+  executeMeta,
+  type MetaContext,
+} from './meta/index.js'
+
+export { exportCapsule, verifyCapsule } from './capsule/index.js'
+
+export {
+  BASELINE_ID,
+  BASELINE_VERSION,
+  baseline,
+  beliefToJson,
+  forecast,
+  policyFromSettings,
+  project,
+  slotToJson,
+  type Belief,
+  type Policy,
+} from './projection/index.js'
+
+export * from './schema/index.js'
+
+export * from './store/index.js'
+
+export {
+  canonicalJson,
+  isJsonArray,
+  isJsonMap,
+  jsonEquals,
+  parseJson,
+  type Json,
+  type JsonMap,
+} from './json.js'
 
 export {
   parseKip,
@@ -32,24 +154,6 @@ export {
   specRevision,
 } from './kip/parser.js'
 export type * from './kip/ast.js'
-
-export {
-  compareEntityID,
-  conceptID,
-  conceptNode,
-  formatEntityID,
-  parseEntityID,
-  propositionID,
-  propositionLink,
-  tryParseEntityID,
-  type Concept,
-  type ConceptID,
-  type EntityID,
-  type JsonMap,
-  type LinkProperties,
-  type Proposition,
-  type PropositionID,
-} from './entity.js'
 
 export {
   AlinkTokenizer,
@@ -62,18 +166,11 @@ export {
 } from './tokenizer.js'
 
 export {
-  SCHEMA_STATEMENTS,
-  SCHEMA_VERSION,
-  applySchema,
-  metaGet,
-  metaSet,
-} from './schema.js'
-
-export { Store } from './store.js'
-export {
   MAX_BOUND_PARAMS,
   MAX_VALUE_BYTES,
   checkParamCount,
   checkValueSize,
+  encodeJson,
+  ftsQuote,
   idSet,
 } from './sql.js'

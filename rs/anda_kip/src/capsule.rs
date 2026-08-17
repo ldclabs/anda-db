@@ -1,229 +1,510 @@
-//! # KIP Genesis Capsules
+//! # Cognitive Capsule (Spec §37–§41)
 //!
-//! Static, version-controlled KIP source for the Bootstrapping Model defined in
-//! the KIP specification. Loading these capsules brings a fresh Cognitive Nexus
-//! up to a self-describing state where every legal concept type and proposition
-//! predicate is itself a queryable concept node.
+//! A Cognitive Capsule is a portable, immutable, inspectable artifact carrying
+//! cognitive state or state changes between systems and Spaces.
 //!
-//! - [`GENESIS_KIP`] defines the meta-types `$ConceptType` / `$PropositionType`,
-//!   the `Domain` type, and the `CoreSchema` core domain.
-//! - The `*_KIP` concept-type constants define the standard concept types
-//!   (`Person`, `Event`, `Insight`, `Preference`, `Commitment`, `SleepTask`,
-//!   and the Experience-learning triad `Experience` / `ExperienceStep` /
-//!   `Skill` added in KIP v1.0-RC11).
-//! - The `*_PROP_KIP` constants define the shared predicates that used to ride
-//!   along inside `Event.kip` (`involves`, `mentions`, `consolidated_to`,
-//!   `derived_from` — now widened to Experience) plus the Experience-specific
-//!   relations (`has_step`, `caused_by`, `derived_insight`, `compiled_to`).
-//!   They ship as standalone capsules and must be loaded *after* the concept
-//!   types they reference.
-//! - [`PERSON_SELF_KIP`] / [`PERSON_SYSTEM_KIP`] materialize the system actors
-//!   `$self` (waking persona) and `$system` (sleeping persona).
+//! The invariant the whole design hangs on:
 //!
-//! The string constants below name the well-known concept type / predicate names
-//! that executors must guard against accidental modification (see the protected
-//! scope rules in KIP §4.2.4 and `KIP_3004`).
+//! ```text
+//! Capsule bytes  ≠  destination mutation authority
+//! ```
+//!
+//! A valid signature proves that a signer attested to a content digest and
+//! scope. It proves nothing about truth, safety, utility, trust, authority, or
+//! whether the cognition applies at the destination (§37.8). Which is why these
+//! types model the artifact and never apply it: importing runs
+//! `VERIFY → VALIDATE → PREVIEW → Governance analysis → Import Plan → atomic
+//! Import Transaction` (§41.2), and every step of that belongs to the engine.
+//!
+//! Record payloads are carried as JSON rather than as closed structs: which
+//! fields a record has is the active Schema Packages' decision, and the
+//! destination validates them against its own environment (§39.5, §41.3). The
+//! *frame* — manifest, source, schema dependencies, external refs, blobs,
+//! handling, integrity — is normative, so that is typed.
 
-/// The absolute root type of all knowledge concepts.
-pub static META_CONCEPT_TYPE: &str = "$ConceptType";
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
-/// The absolute root type of all knowledge propositions.
-pub static META_PROPOSITION_TYPE: &str = "$PropositionType";
+use crate::ast::{Json, Map};
+use crate::error::{KipError, KipErrorCode};
 
-/// The agent itself: {type: "Person", name: "$self"}
-pub static META_SELF_NAME: &str = "$self";
+/// The `format` discriminator of a native Capsule.
+pub const CAPSULE_FORMAT: &str = "KIP-Cognitive-Capsule";
 
-/// The system itself: {type: "Person", name: "$system"}
-pub static META_SYSTEM_NAME: &str = "$system";
+/// The Capsule format version this crate writes.
+pub const CAPSULE_VERSION: &str = "2.0";
 
-/// The type identifier for domain entities.
-pub static DOMAIN_TYPE: &str = "Domain";
+/// A portable Cognitive Capsule (Spec §37.6).
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct Capsule {
+    /// Always [`CAPSULE_FORMAT`] for a native Capsule.
+    pub format: String,
+    /// The Capsule format version.
+    pub version: String,
+    /// Everything the Capsule carries.
+    pub payload: CapsulePayload,
+    /// The digest and proofs over [`Capsule::payload`].
+    pub integrity: CapsuleIntegrity,
+}
 
-/// The type identifier for event entities.
-pub static EVENT_TYPE: &str = "Event";
+impl Capsule {
+    /// Creates a Capsule frame in this crate's format and version.
+    pub fn new(payload: CapsulePayload, integrity: CapsuleIntegrity) -> Self {
+        Self {
+            format: CAPSULE_FORMAT.to_string(),
+            version: CAPSULE_VERSION.to_string(),
+            payload,
+            integrity,
+        }
+    }
 
-/// The type identifier for person entities.
-pub static PERSON_TYPE: &str = "Person";
+    /// Checks the frame invariants this crate can decide without a destination.
+    ///
+    /// This is the cheap structural gate, not `VALIDATE CAPSULE`: Schema
+    /// legality, identity resolution and Governance all need an engine and a
+    /// destination Space.
+    pub fn validate_frame(&self) -> Result<(), KipError> {
+        if self.format != CAPSULE_FORMAT {
+            return Err(KipError::capsule_validation_failed(format!(
+                "expected format {CAPSULE_FORMAT:?}, found {:?}",
+                self.format
+            )));
+        }
+        if self.integrity.content_digest.trim().is_empty() {
+            return Err(KipError::new(
+                KipErrorCode::CapsuleValidationFailed,
+                "a Capsule must carry a content digest: portable artifact identity is \
+                 cryptographic, not positional",
+            ));
+        }
+        if self.payload.manifest.kind == CapsuleKind::Delta {
+            let source = &self.payload.source;
+            if source.base_seq.is_none() || source.target_seq.is_none() {
+                return Err(KipError::new(
+                    KipErrorCode::CapsuleValidationFailed,
+                    "a delta Capsule must declare base_seq and target_seq: delta application \
+                     requires base/checkpoint compatibility",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
 
-/// The type identifier for Insight entities.
-pub static INSIGHT_TYPE: &str = "Insight";
+/// What a Capsule carries (Spec §37.6).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct CapsulePayload {
+    /// What kind of Capsule this is and how complete it claims to be.
+    pub manifest: CapsuleManifest,
+    /// Where it came from.
+    pub source: CapsuleSource,
+    /// The Schema Packages its records were written against.
+    ///
+    /// Embedded packages may be used validation-only and MUST NOT auto-activate
+    /// at the destination (§41.3).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub schema: Vec<SchemaDependency>,
+    /// The cognitive records themselves.
+    #[serde(default)]
+    pub records: CapsuleRecords,
+    /// Dependencies deliberately left out, named rather than dangling (§40.1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external_refs: Vec<ExternalRef>,
+    /// Content-addressed blobs the records reference.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blobs: Vec<BlobRef>,
+    /// What the source asks of anyone handling this Capsule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handling: Option<CapsuleHandling>,
+    /// Namespaced extensions.
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    pub extensions: Map<String, Json>,
+}
 
-/// The type identifier for event entities.
-pub static SLEEP_TASK_TYPE: &str = "SleepTask";
+/// The two baseline Capsule kinds (Spec §37.3).
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum CapsuleKind {
+    /// Selected cognitive state at one source snapshot (§37.4).
+    #[default]
+    Snapshot,
+    /// Ordered changes over one source lineage between two sequences (§37.5).
+    Delta,
+}
 
-/// The type identifier for preference entities.
-pub static PREFERENCE_TYPE: &str = "Preference";
+/// What the Capsule claims about itself (Spec §37.6).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct CapsuleManifest {
+    /// Snapshot or delta.
+    pub kind: CapsuleKind,
+    /// When the Capsule was produced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    /// How complete the selection is, e.g. `selection_complete`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completeness: Option<String>,
+    /// What the Capsule closes over (§40.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closure: Option<Json>,
+}
 
-/// The type identifier for commitment entities (prospective memory).
-pub static COMMITMENT_TYPE: &str = "Commitment";
+/// Where a Capsule came from (Spec §37.6, §37.5).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct CapsuleSource {
+    /// The source Nexus.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nexus_id: Option<String>,
+    /// The source Space.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_ref: Option<String>,
+    /// The pinned source snapshot a snapshot Capsule was exported at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_seq: Option<u64>,
+    /// The lower bound of a delta Capsule's lineage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_seq: Option<u64>,
+    /// The upper bound of a delta Capsule's lineage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_seq: Option<u64>,
+    /// Which Schema Environment version the records were written under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_environment_version: Option<u64>,
+}
 
-/// The type identifier for experience entities (goal-directed trajectories).
-pub static EXPERIENCE_TYPE: &str = "Experience";
+/// One Schema Package a Capsule depends on (Spec §20.11).
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct SchemaDependency {
+    /// The package path, e.g. `kip://profiles/cognitive-memory`.
+    pub package: String,
+    /// The exact version; packages persist by exact version (§20.4).
+    pub version: String,
+    /// The package artifact digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+}
 
-/// The type identifier for the ordered steps inside an [`EXPERIENCE_TYPE`].
-pub static EXPERIENCE_STEP_TYPE: &str = "ExperienceStep";
+/// The cognitive records a Capsule carries, grouped by Core kind.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct CapsuleRecords {
+    /// Concept records.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub concepts: Vec<Json>,
+    /// Proposition records.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub propositions: Vec<Json>,
+    /// Assertion records.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assertions: Vec<Json>,
+    /// Evidence records.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<Json>,
+    /// Activity records.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub activities: Vec<Json>,
+}
 
-/// The type identifier for skill entities (procedural memory).
-pub static SKILL_TYPE: &str = "Skill";
+impl CapsuleRecords {
+    /// The total number of records carried.
+    pub fn len(&self) -> usize {
+        self.concepts.len()
+            + self.propositions.len()
+            + self.assertions.len()
+            + self.evidence.len()
+            + self.activities.len()
+    }
 
-/// The predicate type for domain membership relationships.
-pub static BELONGS_TO_DOMAIN_TYPE: &str = "belongs_to_domain";
+    /// Whether the Capsule carries no records at all.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
 
-/// The predicate type linking an Event or Experience to a participating Person.
-pub static INVOLVES_TYPE: &str = "involves";
+/// What kind of thing an omitted dependency was (Spec §40.1).
+///
+/// [`ExternalRefKind::Redacted`] and [`ExternalRefKind::Unavailable`] must stay
+/// distinguishable where policy permits: one means the source withheld it, the
+/// other means the source does not have it (§40.2).
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalRefKind {
+    /// An element in the source Space that was not included.
+    SourceElement,
+    /// A cross-system canonical identity.
+    CanonicalIdentity,
+    /// A semantic locator rather than an identity.
+    SemanticLocator,
+    /// An artifact outside any Nexus.
+    ExternalArtifact,
+    /// The source intentionally withheld it.
+    Redacted,
+    /// The source does not possess or provide it.
+    Unavailable,
+}
 
-/// The predicate type linking an Event or Experience to a referenced concept.
-pub static MENTIONS_TYPE: &str = "mentions";
+/// A dependency the Capsule names but does not carry (Spec §40.1).
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ExternalRef {
+    /// The capsule-local reference this stands in for.
+    #[serde(rename = "ref")]
+    pub reference: String,
+    /// What kind of omission this is.
+    pub kind: ExternalRefKind,
+    /// Whatever identity the source can safely disclose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<Json>,
+    /// Why it was omitted, where policy permits saying.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
 
-/// The predicate type linking an Event or Experience to knowledge extracted
-/// from it.
-pub static CONSOLIDATED_TO_TYPE: &str = "consolidated_to";
+/// A content-addressed blob a Capsule references (Spec §41.5).
+///
+/// Import MUST NOT automatically fetch arbitrary URLs; network access is a
+/// separate runtime authority.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct BlobRef {
+    /// The capsule-local reference used by the records.
+    #[serde(rename = "ref")]
+    pub reference: String,
+    /// The content digest that identifies the bytes.
+    pub digest: String,
+    /// The blob's media type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
+    /// The size in bytes, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    /// Where the bytes may be fetched from, subject to separate authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locator: Option<String>,
+}
 
-/// The inverse provenance predicate type of [`CONSOLIDATED_TO_TYPE`].
-pub static DERIVED_FROM_TYPE: &str = "derived_from";
+/// What the source asks of anyone handling this Capsule (Spec §37.6).
+///
+/// A request, not an enforcement mechanism: the destination applies its own
+/// trust, classification, authority, Schema and Governance policy (§39.5).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct CapsuleHandling {
+    /// How the source classified this content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_classification: Option<String>,
+    /// Handling requirements the source asks for.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requirements: Vec<Json>,
+}
 
-/// The predicate type linking an Experience to one of its steps.
-pub static HAS_STEP_TYPE: &str = "has_step";
+/// The digest and proofs over a Capsule payload (Spec §37.6).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct CapsuleIntegrity {
+    /// The canonical content digest, e.g. `sha256:...`.
+    pub content_digest: String,
+    /// Signatures and other proofs over that digest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proofs: Vec<CapsuleProof>,
+}
 
-/// The predicate type asserting causality between two experience steps
-/// (effect → cause).
-pub static CAUSED_BY_TYPE: &str = "caused_by";
+/// One proof over a Capsule's content digest (Spec §37.8).
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct CapsuleProof {
+    /// The proof kind, e.g. `signature`.
+    #[serde(rename = "type")]
+    pub proof_type: String,
+    /// The cryptographic suite used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suite: Option<String>,
+    /// How to obtain the verification key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_method: Option<String>,
+    /// The proof value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
 
-/// The predicate type linking an Experience to an Insight extracted from it.
-pub static DERIVED_INSIGHT_TYPE: &str = "derived_insight";
+/// How a Capsule is brought into a destination Space (Spec §39).
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum ImportMode {
+    /// Read-only simulation; no destination cognitive state is created (§39.1).
+    Preview,
+    /// Imports into a quarantined review state rather than ordinary Recall
+    /// state (§39.2).
+    Isolate,
+    /// Merges another source's cognition under destination identity and
+    /// Governance policy (§39.3).
+    Merge,
+    /// Restores the same Brain/owner lineage under stronger identity checks
+    /// (§39.4).
+    Restore,
+}
 
-/// The predicate type linking an Experience to the Skill compiled from it.
-pub static COMPILED_TO_TYPE: &str = "compiled_to";
+impl ImportMode {
+    /// Whether this mode can create durable destination state.
+    pub fn is_durable(&self) -> bool {
+        !matches!(self, ImportMode::Preview)
+    }
 
-/// The genesis capsule containing the initial state of the Cognitive Nexus.
-pub static GENESIS_KIP: &str = include_str!("../capsules/Genesis.kip");
+    /// Whether this mode may map a source `$self` onto the destination `$self`.
+    ///
+    /// Only a verified restore may, and only when Governance has verified same
+    /// owner, same Brain identity, backup lineage and explicit restore
+    /// authority (§38.4, §38.5). Ordinary Agent-to-Agent sharing maps source
+    /// self to the *source Agent's* semantic identity instead.
+    pub fn may_map_self(&self) -> bool {
+        matches!(self, ImportMode::Restore)
+    }
+}
 
-/// The Event type definition capsule.
-pub static EVENT_KIP: &str = include_str!("../capsules/Event.kip");
+/// The identity resolution order an import should follow (Spec §38.2).
+///
+/// Conservative on purpose: a source element id must never automatically become
+/// the destination local primary id (§38.1), and equal names are not equal
+/// identities (§38.3).
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityResolution {
+    /// A prior verified import mapping.
+    PriorImportMapping,
+    /// A trusted `canonical_id`.
+    TrustedCanonicalId,
+    /// A mapping a human or policy explicitly approved.
+    ApprovedMapping,
+    /// A portable identity the Schema defines.
+    SchemaPortableIdentity,
+    /// Nothing matched; create a new Concept.
+    CreateNew,
+}
 
-/// The Insight type definition capsule.
-pub static INSIGHT_KIP: &str = include_str!("../capsules/Insight.kip");
+impl IdentityResolution {
+    /// The resolution steps in the order §38.2 recommends trying them.
+    pub const ORDER: &'static [IdentityResolution] = &[
+        IdentityResolution::PriorImportMapping,
+        IdentityResolution::TrustedCanonicalId,
+        IdentityResolution::ApprovedMapping,
+        IdentityResolution::SchemaPortableIdentity,
+        IdentityResolution::CreateNew,
+    ];
+}
 
-/// The Person type definition capsule.
-pub static PERSON_KIP: &str = include_str!("../capsules/Person.kip");
-
-/// The Preference type definition capsule.
-pub static PREFERENCE_KIP: &str = include_str!("../capsules/Preference.kip");
-
-/// The Commitment type definition capsule (prospective memory:
-/// promises, reminders, follow-ups, deadlines).
-pub static COMMITMENT_KIP: &str = include_str!("../capsules/Commitment.kip");
-
-/// The SleepTask type definition capsule.
-pub static SLEEP_TASK_KIP: &str = include_str!("../capsules/SleepTask.kip");
-
-/// The Experience type definition capsule (goal-directed trajectory,
-/// KIP v1.0-RC11).
-pub static EXPERIENCE_KIP: &str = include_str!("../capsules/Experience.kip");
-
-/// The ExperienceStep type definition capsule (one ordered unit of a
-/// trajectory, KIP v1.0-RC11).
-pub static EXPERIENCE_STEP_KIP: &str = include_str!("../capsules/ExperienceStep.kip");
-
-/// The Skill type definition capsule (procedural memory, KIP v1.0-RC11).
-pub static SKILL_KIP: &str = include_str!("../capsules/Skill.kip");
-
-/// The `involves` predicate capsule: Event | Experience → Person.
-pub static INVOLVES_PROP_KIP: &str = include_str!("../capsules/involves.kip");
-
-/// The `mentions` predicate capsule: Event | Experience → any concept.
-pub static MENTIONS_PROP_KIP: &str = include_str!("../capsules/mentions.kip");
-
-/// The `consolidated_to` predicate capsule: Event | Experience → semantic
-/// knowledge.
-pub static CONSOLIDATED_TO_PROP_KIP: &str = include_str!("../capsules/consolidated_to.kip");
-
-/// The `derived_from` predicate capsule: consolidated knowledge or Skill →
-/// source evidence.
-pub static DERIVED_FROM_PROP_KIP: &str = include_str!("../capsules/derived_from.kip");
-
-/// The `has_step` predicate capsule: Experience → ExperienceStep.
-pub static HAS_STEP_PROP_KIP: &str = include_str!("../capsules/has_step.kip");
-
-/// The `caused_by` predicate capsule: ExperienceStep → ExperienceStep.
-pub static CAUSED_BY_PROP_KIP: &str = include_str!("../capsules/caused_by.kip");
-
-/// The `derived_insight` predicate capsule: Experience → Insight.
-pub static DERIVED_INSIGHT_PROP_KIP: &str = include_str!("../capsules/derived_insight.kip");
-
-/// The `compiled_to` predicate capsule: Experience → Skill.
-pub static COMPILED_TO_PROP_KIP: &str = include_str!("../capsules/compiled_to.kip");
-
-/// The $self capsule representing the agent itself (should replace $self_reserved_principal_id).
-pub static PERSON_SELF_KIP: &str = include_str!("../capsules/persons/self.kip");
-
-/// The $system capsule representing the system itself.
-pub static PERSON_SYSTEM_KIP: &str = include_str!("../capsules/persons/system.kip");
+/// A capsule-local reference map, from `ref` to whatever the caller resolved it
+/// to. Kept ordered so an import plan renders deterministically.
+pub type CapsuleRefMap = BTreeMap<String, String>;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parse_kip;
 
-    /// Every bundled capsule must parse. Listing them by name here is what
-    /// makes a newly added `.kip` file that was never wired into a `*_KIP`
-    /// constant visible: the test below cross-checks this list against the
-    /// `capsules/` directory.
-    const ALL_CAPSULES: &[(&str, &str)] = &[
-        ("Genesis.kip", GENESIS_KIP),
-        ("Event.kip", EVENT_KIP),
-        ("Insight.kip", INSIGHT_KIP),
-        ("Person.kip", PERSON_KIP),
-        ("Preference.kip", PREFERENCE_KIP),
-        ("Commitment.kip", COMMITMENT_KIP),
-        ("SleepTask.kip", SLEEP_TASK_KIP),
-        ("Experience.kip", EXPERIENCE_KIP),
-        ("ExperienceStep.kip", EXPERIENCE_STEP_KIP),
-        ("Skill.kip", SKILL_KIP),
-        ("involves.kip", INVOLVES_PROP_KIP),
-        ("mentions.kip", MENTIONS_PROP_KIP),
-        ("consolidated_to.kip", CONSOLIDATED_TO_PROP_KIP),
-        ("derived_from.kip", DERIVED_FROM_PROP_KIP),
-        ("has_step.kip", HAS_STEP_PROP_KIP),
-        ("caused_by.kip", CAUSED_BY_PROP_KIP),
-        ("derived_insight.kip", DERIVED_INSIGHT_PROP_KIP),
-        ("compiled_to.kip", COMPILED_TO_PROP_KIP),
-        ("persons/self.kip", PERSON_SELF_KIP),
-        ("persons/system.kip", PERSON_SYSTEM_KIP),
-    ];
-
-    #[test]
-    fn test_capsule() {
-        for (name, source) in ALL_CAPSULES {
-            let parsed =
-                parse_kip(source).unwrap_or_else(|err| panic!("Failed to parse {name}: {err}"));
-            println!("{name}: {parsed:#?}");
-        }
+    fn snapshot() -> Capsule {
+        Capsule::new(
+            CapsulePayload {
+                manifest: CapsuleManifest {
+                    kind: CapsuleKind::Snapshot,
+                    created_at: Some("2026-08-13T15:00:00Z".into()),
+                    completeness: Some("selection_complete".into()),
+                    closure: Some(serde_json::json!({"semantic": "closed"})),
+                },
+                source: CapsuleSource {
+                    nexus_id: Some("nexus:source-A".into()),
+                    space_ref: Some("space:project-kip".into()),
+                    snapshot_seq: Some(8123),
+                    ..Default::default()
+                },
+                schema: vec![SchemaDependency {
+                    package: "kip://core".into(),
+                    version: "2.0.0".into(),
+                    digest: Some("sha256:abc".into()),
+                }],
+                records: CapsuleRecords {
+                    concepts: vec![serde_json::json!({"ref": "c:1", "name": "Alice"})],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            CapsuleIntegrity {
+                content_digest: "sha256:abc".into(),
+                proofs: vec![],
+            },
+        )
     }
 
-    /// Guards against a capsule file landing in `capsules/` without a matching
-    /// `*_KIP` constant — the failure mode that silently leaves a predicate
-    /// undefined in a freshly bootstrapped nexus.
     #[test]
-    fn every_capsule_file_is_bundled() {
-        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/capsules");
-        let mut found: Vec<String> = Vec::new();
-        for entry in std::fs::read_dir(dir).expect("capsules dir") {
-            let entry = entry.expect("dir entry");
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if entry.file_type().expect("file type").is_dir() {
-                for sub in std::fs::read_dir(entry.path()).expect("capsules subdir") {
-                    let sub = sub.expect("dir entry");
-                    found.push(format!("{name}/{}", sub.file_name().to_string_lossy()));
-                }
-            } else if name.ends_with(".kip") {
-                found.push(name);
-            }
-        }
-        found.sort();
+    fn a_capsule_round_trips_through_its_wire_shape() {
+        let capsule = snapshot();
+        let json = serde_json::to_value(&capsule).unwrap();
+        assert_eq!(json["format"], CAPSULE_FORMAT);
+        assert_eq!(json["version"], "2.0");
+        assert_eq!(json["payload"]["manifest"]["kind"], "snapshot");
+        assert_eq!(json["payload"]["source"]["snapshot_seq"], 8123);
 
-        let mut bundled: Vec<String> = ALL_CAPSULES.iter().map(|(n, _)| n.to_string()).collect();
-        bundled.sort();
-        assert_eq!(found, bundled, "capsules/ and ALL_CAPSULES disagree");
+        let decoded: Capsule = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, capsule);
+        assert_eq!(decoded.payload.records.len(), 1);
+    }
+
+    #[test]
+    fn frame_validation_requires_a_content_digest() {
+        let mut capsule = snapshot();
+        capsule.integrity.content_digest = String::new();
+        let err = capsule.validate_frame().expect_err("no digest");
+        assert_eq!(err.code, KipErrorCode::CapsuleValidationFailed);
+
+        assert!(snapshot().validate_frame().is_ok());
+    }
+
+    #[test]
+    fn a_delta_capsule_must_declare_its_lineage() {
+        let mut capsule = snapshot();
+        capsule.payload.manifest.kind = CapsuleKind::Delta;
+        assert!(capsule.validate_frame().is_err());
+
+        capsule.payload.source.base_seq = Some(8000);
+        capsule.payload.source.target_seq = Some(8123);
+        assert!(capsule.validate_frame().is_ok());
+    }
+
+    #[test]
+    fn a_foreign_format_is_not_a_native_capsule() {
+        let mut capsule = snapshot();
+        capsule.format = "KIP-1.x-EXPORT".into();
+        // Spec migration invariant 14: a legacy export is not a native Capsule.
+        assert!(capsule.validate_frame().is_err());
+    }
+
+    #[test]
+    fn only_a_verified_restore_may_map_self() {
+        // Spec §38.4/§38.5: ordinary sharing must not carry a source `$self`
+        // onto the destination's own identity.
+        for mode in [ImportMode::Preview, ImportMode::Isolate, ImportMode::Merge] {
+            assert!(!mode.may_map_self(), "{mode:?} must not map $self");
+        }
+        assert!(ImportMode::Restore.may_map_self());
+    }
+
+    #[test]
+    fn preview_creates_no_durable_state() {
+        assert!(!ImportMode::Preview.is_durable());
+        assert!(ImportMode::Merge.is_durable());
+    }
+
+    #[test]
+    fn redacted_and_unavailable_stay_distinguishable() {
+        // Spec §40.2: collapsing these loses whether the source *had* the thing.
+        let redacted = serde_json::to_string(&ExternalRefKind::Redacted).unwrap();
+        let unavailable = serde_json::to_string(&ExternalRefKind::Unavailable).unwrap();
+        assert_eq!(redacted, r#""redacted""#);
+        assert_eq!(unavailable, r#""unavailable""#);
+        assert_ne!(redacted, unavailable);
+    }
+
+    #[test]
+    fn identity_resolution_tries_creation_last() {
+        assert_eq!(
+            IdentityResolution::ORDER.last(),
+            Some(&IdentityResolution::CreateNew)
+        );
+        assert_eq!(
+            IdentityResolution::ORDER.first(),
+            Some(&IdentityResolution::PriorImportMapping)
+        );
+        assert_eq!(IdentityResolution::ORDER.len(), 5);
     }
 }

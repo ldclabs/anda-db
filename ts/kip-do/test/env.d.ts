@@ -17,6 +17,14 @@ declare global {
   namespace Cloudflare {
     interface Env {
       KIP_DB: DurableObjectNamespace<import('./worker.js').TestKipDatabase>
+      /**
+       * A second object bound to a subclass that authenticates its callers, so
+       * the multi-tenant path is exercised as a host would deploy it rather
+       * than simulated by constructing a Session in-process.
+       */
+      KIP_TENANT_DB: DurableObjectNamespace<
+        import('./worker.js').TenantKipDatabase
+      >
     }
   }
 

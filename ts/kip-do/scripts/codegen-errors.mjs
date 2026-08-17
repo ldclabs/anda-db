@@ -1,16 +1,22 @@
 #!/usr/bin/env node
 /**
- * Generates `src/errors.generated.ts` from the Rust error taxonomy.
+ * Generates `src/errors.generated.ts` from the KIP 2.0 Core Error Registry.
  *
- * The codes, names and agent-facing recovery hints all live in
- * `rs/anda_kip/src/error.rs`. Hand-copying them into TypeScript produces a
- * table that compiles, passes tests, and is quietly wrong — a mismatched
- * `hint` breaks the agent's self-correction loop with nothing to detect it.
+ * The registry is `KipErrorCode` in `rs/anda_kip/src/error.rs`, and every entry
+ * carries four things an Agent acts on without reading prose: a stable code, a
+ * category, a retry class, and a recovery hint. Transcribing 79 of those by
+ * hand produces a table that compiles, passes tests, and is quietly wrong — a
+ * mismatched `hint` breaks the agent's self-correction loop and a widened
+ * `retry` class turns a lost write into a duplicated one, neither with a test
+ * to catch it.
  *
- * It reads `error.rs` directly rather than a compiled artifact, so
- * regenerating needs no Rust toolchain. `test/parser-oracle.test.ts` checks the
- * emitted table against the catalog the reference grammar reports at runtime,
- * which is what catches a change this reader is too naive to see.
+ * The source is `anda_kip_wasm::error_catalog()` in the vendored oracle rather
+ * than the Rust text: it enumerates `KipErrorCode::ALL`, so a code added to
+ * `anda_kip` appears here without anyone remembering to add it, and a code
+ * declared but left out of `ALL` cannot slip in either. The WASM module is
+ * committed, so regenerating still needs no Rust toolchain — but it is only as
+ * current as the last `pnpm run build:oracle-wasm`, which is the same artifact
+ * `test/parser-oracle.test.ts` compares the grammar against.
  *
  * Commit the output.
  */
@@ -20,84 +26,60 @@ import { fileURLToPath } from 'node:url'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const pkgRoot = dirname(here)
-const errorRs = join(pkgRoot, '..', '..', 'rs', 'anda_kip', 'src', 'error.rs')
-const source = readFileSync(errorRs, 'utf8')
+const vendor = join(pkgRoot, 'vendor', 'anda_kip_wasm')
 
-/**
- * Reads one `match self { Self::Variant => <string literal> }` table.
- *
- * Both arm shapes in `error.rs` are accepted: a bare literal, and a braced
- * block holding one literal (rustfmt wraps the long hints that way).
- */
-function readTable(fnName) {
-  const start = source.indexOf(`pub fn ${fnName}(&self)`)
-  if (start === -1) throw new Error(`${errorRs}: no fn ${fnName}`)
-  const body = source.slice(start, source.indexOf('\n    }\n', start))
+const wasm = await import(join(vendor, 'anda_kip_wasm.js'))
+await wasm.default({
+  module_or_path: readFileSync(join(vendor, 'anda_kip_wasm_bg.wasm')),
+})
 
-  const table = new Map()
-  const arm = /Self::(\w+)\s*=>\s*(\{\s*)?"/g
-  let m
-  while ((m = arm.exec(body)) !== null) {
-    const [literal, end] = readRustString(body, arm.lastIndex - 1)
-    table.set(m[1], literal)
-    arm.lastIndex = end
-  }
-  if (table.size === 0) throw new Error(`${errorRs}: fn ${fnName} matched no arms`)
-  return table
-}
+/** @type {{code: string, name: string, category: string, retry: string, hint: string}[]} */
+const catalog = JSON.parse(wasm.error_catalog())
+if (catalog.length === 0) throw new Error('error_catalog() returned no entries')
 
-/** Scans a Rust string literal starting at the opening quote. */
-function readRustString(text, openQuote) {
-  let out = ''
-  let i = openQuote + 1
-  for (; i < text.length; i++) {
-    const ch = text[i]
-    if (ch === '\\') {
-      const next = text[++i]
-      out += next === 'n' ? '\n' : next === 't' ? '\t' : next
-      continue
-    }
-    if (ch === '"') break
-    out += ch
-  }
-  return [out, i + 1]
-}
-
-const codes = readTable('code')
-const names = readTable('name')
-const hints = readTable('hint')
-
-for (const variant of codes.keys()) {
-  for (const [what, table] of [['name', names], ['hint', hints]]) {
-    if (!table.has(variant)) {
-      throw new Error(`${errorRs}: ${variant} has a code but no ${what}`)
+const seen = new Set()
+for (const entry of catalog) {
+  for (const field of ['code', 'name', 'category', 'retry', 'hint']) {
+    if (typeof entry[field] !== 'string' || entry[field].length === 0) {
+      throw new Error(`catalog entry ${entry.code}: missing ${field}`)
     }
   }
+  // Two codes sharing a name would make `KipError.name` ambiguous on the wire.
+  if (seen.has(entry.code)) throw new Error(`duplicate code ${entry.code}`)
+  seen.add(entry.code)
 }
 
-const catalog = [...codes].map(([variant, code]) => ({
-  code,
-  name: names.get(variant),
-  hint: hints.get(variant),
-}))
-
-const version = /^version = "([^"]+)"/m.exec(
-  readFileSync(join(pkgRoot, '..', '..', 'rs', 'anda_kip', 'Cargo.toml'), 'utf8'),
-)?.[1]
-if (!version) throw new Error('anda_kip/Cargo.toml: no version')
+const version = wasm.parser_version()
+const categories = [...new Set(catalog.map((e) => e.category))].sort()
+const retries = [...new Set(catalog.map((e) => e.retry))].sort()
 
 const lit = (s) => JSON.stringify(s)
 
 const out = `/**
- * KIP error taxonomy — GENERATED FILE, DO NOT EDIT.
+ * The KIP 2.0 Core Error Registry — GENERATED FILE, DO NOT EDIT.
  *
- * Source of truth: \`rs/anda_kip/src/error.rs\`.
- * Regenerate with \`pnpm run codegen:errors\` after changing the Rust enum.
+ * Source of truth: \`KipErrorCode\` in \`rs/anda_kip/src/error.rs\`, read through
+ * \`anda_kip_wasm::error_catalog()\`.
+ * Regenerate with \`pnpm run codegen:errors\` after changing the Rust registry.
  *
  * Grammar version: ${version}
  */
 
-/** Every KIP error code, in the order the Rust enum declares them. */
+/** The coarse family an error belongs to (Spec §86.2). */
+export type KipErrorCategory =
+${categories.map((c) => `  | ${lit(c)}`).join('\n')}
+
+/** What kind of retry, if any, can make progress (Spec §86.3). */
+export type KipRetryClass =
+${retries.map((r) => `  | ${lit(r)}`).join('\n')}
+
+/**
+ * Every registered error code (Spec §87).
+ *
+ * KIP 2.0 codes are stable *names*, not the numbers 1.x used: an Agent
+ * switching on \`EpistemicRevisionRequired\` keeps working across protocol
+ * revisions in a way a renumbered \`KIP_3007\` would not.
+ */
 export type KipErrorCode =
 ${catalog.map((e) => `  | ${lit(e.code)}`).join('\n')}
 
@@ -105,17 +87,27 @@ export const KIP_ERROR_CODES: readonly KipErrorCode[] = [
 ${catalog.map((e) => `  ${lit(e.code)},`).join('\n')}
 ]
 
-/** Stable error name, e.g. \`"InvalidSyntax"\` for \`KIP_1001\`. */
-export const KIP_ERROR_NAMES: Readonly<Record<KipErrorCode, string>> = {
-${catalog.map((e) => `  ${e.code}: ${lit(e.name)},`).join('\n')}
+/** One registry entry. */
+export interface KipErrorSpec {
+  category: KipErrorCategory
+  retry: KipRetryClass
+  /**
+   * Agent-facing recovery instruction. This is what makes KIP errors
+   * self-correcting; it is part of the wire contract, not a developer comment.
+   */
+  hint: string
 }
 
-/**
- * Agent-facing recovery hint. This is what makes KIP errors self-correcting;
- * it is part of the wire contract, not a developer comment.
- */
-export const KIP_ERROR_HINTS: Readonly<Record<KipErrorCode, string>> = {
-${catalog.map((e) => `  ${e.code}: ${lit(e.hint)},`).join('\n')}
+export const KIP_ERROR_REGISTRY: Readonly<Record<KipErrorCode, KipErrorSpec>> = {
+${catalog
+  .map(
+    (e) => `  ${lit(e.code)}: {
+    category: ${lit(e.category)},
+    retry: ${lit(e.retry)},
+    hint: ${lit(e.hint)},
+  },`,
+  )
+  .join('\n')}
 }
 `
 

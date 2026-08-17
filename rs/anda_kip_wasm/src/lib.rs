@@ -17,28 +17,24 @@
 //! ABI stable across wasm-bindgen versions and makes the payload trivially
 //! inspectable when the two parsers disagree.
 
-use anda_kip::{Command, KipError, KipErrorCode, parse_kip};
+use anda_kip::{CommandType, ErrorObject, KipError, KipErrorCode, parse_kip};
 use wasm_bindgen::prelude::*;
 
 /// Semantic version of this grammar, reported so a differential run can say
 /// which revision it compared against.
 const PARSER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Renders a `KipError` as the same JSON envelope the engine uses on the
-/// wire, so a parse failure and an execution failure are indistinguishable to
-/// the client. `hint` is the spec's agent-facing recovery instruction and is
-/// what makes KIP errors self-correcting — dropping it here would silently
-/// degrade every syntax error the agent sees.
+/// Renders a `KipError` as the same JSON envelope the engine puts on the wire
+/// (§86.1), so a parse failure and an execution failure are indistinguishable
+/// to the client.
+///
+/// Every member matters downstream: `hint` is the spec's agent-facing recovery
+/// instruction and is what makes KIP errors self-correcting, and `retry` is
+/// what lets a client's recovery policy switch on the outcome instead of
+/// reading prose — `outcome_lookup_required` in particular must never be
+/// flattened into "it failed".
 fn error_json(err: &KipError) -> String {
-    serde_json::json!({
-        "error": {
-            "code": err.code_str(),
-            "name": err.name(),
-            "message": err.message,
-            "hint": err.hint(),
-        }
-    })
-    .to_string()
+    serde_json::json!({ "error": ErrorObject::from(err.clone()) }).to_string()
 }
 
 /// Parses a KIP command (KQL, KML or META) into its AST.
@@ -92,14 +88,7 @@ pub fn parse_batch(inputs_json: &str) -> String {
         .iter()
         .map(|input| match parse_kip(input) {
             Ok(command) => serde_json::json!({ "ok": command }),
-            Err(err) => serde_json::json!({
-                "error": {
-                    "code": err.code_str(),
-                    "name": err.name(),
-                    "message": err.message,
-                    "hint": err.hint(),
-                }
-            }),
+            Err(err) => serde_json::json!({ "error": ErrorObject::from(err) }),
         })
         .collect();
 
@@ -112,40 +101,28 @@ pub fn parser_version() -> String {
     PARSER_VERSION.to_string()
 }
 
-/// Every `KipErrorCode` variant. Listed explicitly because the enum has no
-/// iterator; a missing or misspelled variant is a compile error, which is the
-/// property that makes the generated TypeScript table trustworthy.
-const ALL_ERROR_CODES: &[KipErrorCode] = &[
-    KipErrorCode::InvalidSyntax,
-    KipErrorCode::InvalidIdentifier,
-    KipErrorCode::TypeMismatch,
-    KipErrorCode::ConstraintViolation,
-    KipErrorCode::InvalidValueType,
-    KipErrorCode::ReferenceError,
-    KipErrorCode::NotFound,
-    KipErrorCode::DuplicateExists,
-    KipErrorCode::ImmutableTarget,
-    KipErrorCode::VersionConflict,
-    KipErrorCode::ExecutionTimeout,
-    KipErrorCode::ResourceExhausted,
-    KipErrorCode::InternalError,
-];
-
 /// Dumps the complete KIP error taxonomy as JSON.
 ///
 /// `scripts/codegen-errors.mjs` turns this into `src/errors.generated.ts` so
 /// the TypeScript engine cannot drift from the Rust definitions. Transcribing
-/// 13 codes, names and agent-facing hints by hand is exactly the kind of task
-/// that looks done and is subtly wrong — and a wrong `hint` degrades the
-/// agent's self-correction loop silently, with no test to catch it.
+/// the registry's codes, categories, retry classes and agent-facing hints by
+/// hand is exactly the kind of task that looks done and is subtly wrong — a
+/// wrong `hint` degrades the agent's self-correction loop silently, and a wrong
+/// `retry` class turns a lost write into a duplicated one, neither with a test
+/// to catch it.
+///
+/// The registry is enumerated from [`KipErrorCode::ALL`], so a code added to
+/// `anda_kip` appears here without anyone remembering to add it.
 #[wasm_bindgen]
 pub fn error_catalog() -> String {
-    let entries: Vec<serde_json::Value> = ALL_ERROR_CODES
+    let entries: Vec<serde_json::Value> = KipErrorCode::ALL
         .iter()
         .map(|code| {
             serde_json::json!({
-                "code": code.code(),
+                "code": code.name(),
                 "name": code.name(),
+                "category": code.category().as_str(),
+                "retry": code.retry_class().as_str(),
                 "hint": code.hint(),
             })
         })
@@ -161,9 +138,7 @@ pub fn error_catalog() -> String {
 #[wasm_bindgen]
 pub fn parse_to_command_type(input: &str) -> String {
     match parse_kip(input) {
-        Ok(Command::Kql(_)) => "KQL".to_string(),
-        Ok(Command::Kml(_)) => "KML".to_string(),
-        Ok(Command::Meta(_)) => "META".to_string(),
+        Ok(command) => CommandType::from(&command).to_string(),
         Err(err) => error_json(&err),
     }
 }

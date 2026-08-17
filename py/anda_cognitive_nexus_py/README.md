@@ -4,6 +4,17 @@ This crate provides the official Python bindings for the Anda engine, allowing P
 
 This bridge is built using [`PyO3`](https://pyo3.rs/) and packaged using [`maturin`](https://www.maturin.rs/), enabling high-performance, in-process communication between Python and the core Rust engine.
 
+It speaks **KIP 2.0**. Two consequences for anyone porting 1.x code:
+
+- **A type is not graph state.** There is no `$ConceptType` node to write before
+  using a type: types come from an immutable Schema Package, and
+  `PyAndaDB.create` activates the bundled cognitive-memory profile (`Person`,
+  `Preference`, `Event`, `Experience`, …) in the default MemorySpace.
+- **`response` is the KIP 2.0 response envelope**, not a bare result:
+  `{"kip", "status", "results": [{"status", "result", "error"}], "receipt", …}`.
+  A command that fails reports on its own result entry; the request-level
+  `error` is for a failure of the envelope itself.
+
 ---
 
 ## Prerequisites
@@ -146,12 +157,33 @@ import asyncio
 async def main():
 	db = await anda.PyAndaDB.create(config)
 	try:
-		# Execute a KIP command (async), optionally with :name parameters
-		result = await db.execute_kip(
-			"FIND(?t.name) WHERE { ?t {type: :t} } LIMIT 10",
-			parameters={"t": "$ConceptType"},
+		# Record an attributed claim. The Proposition states the tuple; the
+		# Assertion is what commits to it, with a stance, a mode and a
+		# confidence. Nothing here says the claim is true.
+		await db.execute_kip("""
+			MUTATE {
+				CREATE CONCEPT ?alice { TYPE "Person" NAME :who }
+				CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark mode" }
+				ASSERT ?a (?alice, "prefers", ?dark) {
+					by: ?alice, mode: "stated", confidence: 0.9
+				}
+			}
+			""",
+			parameters={"who": "Alice"},
 		)
-		print(result)  # result is a Python dict, not a JSON string
+
+		# Read the claims back — who claimed what, with how much confidence.
+		result = await db.execute_kip(
+			"""
+			FIND(?person.name, ?thing.name, ?a.confidence)
+			WHERE {
+				?p PROPOSITION (?person, "prefers", ?thing)
+				?a ASSERTION {proposition: ?p}
+			}
+			ORDER BY ?a.confidence DESC
+			"""
+		)
+		print(result["response"]["results"][0]["result"])
 	finally:
 		# Flush pending data to storage; required for file-backed stores.
 		await db.close()
@@ -161,4 +193,8 @@ asyncio.run(main())
 
 **Notes:**
 - `StoreLocationType` and other enums are exposed as Python classes, not as `enum.Enum`. Use `anda.StoreLocationType.InMem` (not a string or dict).
+- Parameters are bound structurally into value positions, never interpolated
+  into the command text — `:who` is data, not code.
+- A read returns raw claims. What is *currently believed* is projected from
+  Assertions under a policy (`BELIEF` / `BELIEF SLOT`) and is never stored.
 - See the Python tests in `tests_py/` for more usage examples.

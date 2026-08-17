@@ -6,9 +6,14 @@
  *
  * `scripts/codegen-errors.mjs` turns this into `src/errors.generated.ts` so
  * the TypeScript engine cannot drift from the Rust definitions. Transcribing
- * 13 codes, names and agent-facing hints by hand is exactly the kind of task
- * that looks done and is subtly wrong — and a wrong `hint` degrades the
- * agent's self-correction loop silently, with no test to catch it.
+ * the registry's codes, categories, retry classes and agent-facing hints by
+ * hand is exactly the kind of task that looks done and is subtly wrong — a
+ * wrong `hint` degrades the agent's self-correction loop silently, and a wrong
+ * `retry` class turns a lost write into a duplicated one, neither with a test
+ * to catch it.
+ *
+ * The registry is enumerated from [`KipErrorCode::ALL`], so a code added to
+ * `anda_kip` appears here without anyone remembering to add it.
  */
 export function error_catalog(): string;
 
@@ -32,7 +37,10 @@ export function parse(input: string): string;
  * than to the number of statements.
  *
  * Input is a JSON array of strings; output is a JSON array of the same
- * envelopes [`parse`] returns, positionally aligned with the input.
+ * envelopes [`parse`] returns, positionally aligned with the input. A
+ * payload that does not decode as an array of strings yields a one-element
+ * array carrying the decode error, so the output is an array in every case
+ * and a consumer's `.map` never explodes on a bare object.
  */
 export function parse_batch(inputs_json: string): string;
 

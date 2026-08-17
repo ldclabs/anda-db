@@ -19,7 +19,7 @@
  * vocabularies from different versions are not comparable.
  */
 
-import { executionTimeout, internalError } from './errors.js'
+import { errors } from './errors.js'
 
 /** Batch cap enforced by the service (`MAX_TEXTS_PER_BATCH`). */
 export const MAX_TEXTS_PER_BATCH = 256
@@ -99,7 +99,7 @@ export class AlinkTokenizer implements Tokenizer {
       // tokenized by two different vocabularies, which silently defeats the
       // staleness check that drives re-indexing.
       if (version !== null && result.version !== version) {
-        throw internalError(
+        throw errors.internalError(
           `tokenizer version changed mid-batch (${version} -> ${result.version}); ` +
             `retry the write so every row is stamped with one version`,
         )
@@ -131,18 +131,18 @@ export class AlinkTokenizer implements Tokenizer {
         // Only the deadline is a timeout; DNS, refused connections and reset
         // streams are service failures and must not masquerade as one.
         if (controller.signal.aborted) {
-          throw executionTimeout(
+          throw errors.executionTimeout(
             `tokenizer request timed out after ${this.#timeoutMs}ms`,
           )
         }
-        throw internalError(
+        throw errors.internalError(
           `tokenizer request failed: ${(err as Error).message}`,
         )
       }
 
       if (!response.ok) {
         const body = await response.text().catch(() => '')
-        throw internalError(
+        throw errors.internalError(
           `tokenizer returned ${response.status}: ${body.slice(0, 200)}`,
         )
       }
@@ -152,7 +152,7 @@ export class AlinkTokenizer implements Tokenizer {
         // Without a version there is no way to detect stale index rows later,
         // so an unversioned response is treated as a broken deployment rather
         // than silently accepted.
-        throw internalError(
+        throw errors.internalError(
           'tokenizer response is missing the X-Tokenizer-Version header',
         )
       }
@@ -162,11 +162,11 @@ export class AlinkTokenizer implements Tokenizer {
         payload = (await response.json()) as typeof payload
       } catch (err) {
         if (controller.signal.aborted) {
-          throw executionTimeout(
+          throw errors.executionTimeout(
             `tokenizer response body timed out after ${this.#timeoutMs}ms`,
           )
         }
-        throw internalError(
+        throw errors.internalError(
           `tokenizer response is not valid JSON: ${(err as Error).message}`,
         )
       }
@@ -174,7 +174,7 @@ export class AlinkTokenizer implements Tokenizer {
         !Array.isArray(payload.tokens) ||
         payload.tokens.length !== texts.length
       ) {
-        throw internalError(
+        throw errors.internalError(
           `tokenizer returned ${payload.tokens?.length ?? 0} token lists for ` +
             `${texts.length} texts`,
         )

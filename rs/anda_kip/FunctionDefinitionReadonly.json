@@ -1,16 +1,16 @@
 {
   "name": "execute_kip_readonly",
-  "description": "Executes one or more read-only KIP (Knowledge Interaction Protocol) commands (e.g. FIND, SEARCH, DESCRIBE, EXPORT) against the Cognitive Nexus to query from your persistent memory.",
+  "description": "Executes read-only KIP 2.0 (Knowledge Interaction Protocol) commands against your Cognitive Nexus — your persistent memory. Accepts KQL (FIND) and META (DESCRIBE / LIST / SEARCH / VERIFY / VALIDATE / PREVIEW / HISTORY / CHANGES / SNAPSHOT / EXPORT CAPSULE). State-changing KML is rejected here regardless of how it is labelled. Ground before you read precisely: SEARCH finds candidates, then read them by exact id. A SEARCH miss is not evidence of absence, and a SEARCH score is not confidence.",
   "parameters": {
     "type": "object",
     "properties": {
       "command": {
         "type": "string",
-        "description": "A single complete read-only KIP command (FIND / SEARCH / DESCRIBE / EXPORT). Mutually exclusive with commands."
+        "description": "A single complete read-only KIP 2.0 command (FIND / DESCRIBE / LIST / SEARCH / VERIFY / VALIDATE / PREVIEW / HISTORY / CHANGES / SNAPSHOT / EXPORT CAPSULE). Mutually exclusive with operations."
       },
-      "commands": {
+      "operations": {
         "type": "array",
-        "description": "An array of read-only KIP commands (FIND / SEARCH / DESCRIBE / EXPORT) for batch execution (reduces round-trips). Commands are executed sequentially; per-command errors are returned inline without aborting the batch. KML commands (UPSERT / UPDATE / MERGE / DELETE) are rejected by this endpoint.",
+        "description": "Several read-only KIP commands in one round-trip. Each is evaluated independently and per-operation errors are returned inline.",
         "items": {
           "oneOf": [
             {
@@ -19,13 +19,17 @@
             {
               "type": "object",
               "properties": {
+                "op_id": {
+                  "type": "string",
+                  "description": "A request-local name so this operation's result can be correlated in the response."
+                },
                 "command": {
                   "type": "string",
-                  "description": "A complete read-only KIP command with parameters scoped to this command."
+                  "description": "A complete read-only KIP command."
                 },
                 "parameters": {
                   "type": "object",
-                  "description": "Optional parameters for this command. These override shared parameters with the same keys."
+                  "description": "Parameters scoped to this operation. They override shared parameters with the same keys."
                 }
               },
               "required": [
@@ -36,13 +40,24 @@
           ]
         }
       },
+      "read": {
+        "type": "object",
+        "description": "Bind every operation to one readable cognitive state coordinate, so a multi-step read sees a consistent world.",
+        "properties": {
+          "snapshot_token": {
+            "type": "string",
+            "description": "An opaque token from an earlier response. Do not parse or modify it. It is a coordinate, not an authority: current permissions always apply."
+          }
+        },
+        "additionalProperties": false
+      },
       "parameters": {
         "type": "object",
-        "description": "An optional JSON object of key-value pairs used for safe substitution of placeholders in the command string(s). Placeholders should start with ':' (e.g., :name, :limit). IMPORTANT: A placeholder must occupy a complete KIP value position (e.g., name: :name, LIMIT :limit, or SEARCH CONCEPT :term). Do not embed placeholders inside quoted strings (e.g., \"Hello :name\"), because substitution uses JSON serialization."
+        "description": "Values bound into the command's :placeholders. Binding is structural, never string interpolation: a placeholder must occupy a complete KIP value position (name: :name, LIMIT :limit, SEARCH CONCEPT :term). Do not embed one inside a quoted string such as \"Hello :name\". Parameter names match [A-Za-z_][A-Za-z0-9_]*."
       },
       "dry_run": {
         "type": "boolean",
-        "description": "If set to true, the command(s) will only be validated for syntactical and logical correctness without being executed."
+        "description": "Validate the command(s) without executing them."
       }
     },
     "oneOf": [
@@ -53,7 +68,7 @@
       },
       {
         "required": [
-          "commands"
+          "operations"
         ]
       }
     ],

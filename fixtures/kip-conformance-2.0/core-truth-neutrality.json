@@ -1,0 +1,49 @@
+{
+  "name": "core-truth-neutrality",
+  "description": "The distinction the version exists for: a Proposition existing is not the Proposition being true. A tuple carries no confidence, the same tuple resolves to one Proposition, and a raw read reports claims rather than beliefs.",
+  "setup": [
+    "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 }\n  }\n}"
+  ],
+  "cases": [
+    {
+      "name": "a Proposition carries no confidence",
+      "command": "FIND(?p.confidence) WHERE { ?p PROPOSITION (?s, \"prefers\", ?o) }",
+      "expect": { "result": [null] }
+    },
+    {
+      "name": "the Assertion about it does",
+      "command": "FIND(?a.confidence, ?a.stance, ?a.mode) WHERE { ?a ASSERTION {} }",
+      "expect": { "result": [[0.9, "support", "stated"]] }
+    },
+    {
+      "name": "a local predicate name is persisted as its exact symbol",
+      "command": "FIND(?p.predicate_ref) WHERE { ?p PROPOSITION (?s, \"prefers\", ?o) }",
+      "expect": { "result": ["kip://profiles/cognitive-memory@2.0.0/prefers"] }
+    },
+    {
+      "name": "a Concept's type is persisted as its exact symbol",
+      "command": "FIND(?c.schema_ref) WHERE { ?c CONCEPT {name: \"Alice\"} }",
+      "expect": { "result": ["kip://profiles/cognitive-memory@2.0.0/Person"] }
+    },
+    {
+      "name": "ENSURE resolves the same tuple rather than duplicating it",
+      "command": "FIND(COUNT(?p)) WHERE { ?p PROPOSITION (?s, \"prefers\", ?o) }",
+      "expect": { "result": [1] }
+    },
+    {
+      "name": "a new element starts at version 1",
+      "command": "FIND(?c._system.version) WHERE { ?c CONCEPT {name: \"Alice\"} }",
+      "expect": { "result": [1] }
+    },
+    {
+      "name": "an unknown type is refused, never invented",
+      "command": "CREATE CONCEPT ?x { TYPE \"Spaceship\" NAME \"Enterprise\" }",
+      "expect": { "error": "SchemaSymbolNotFound" }
+    },
+    {
+      "name": "an Assertion's epistemic payload cannot be edited",
+      "command": "UPDATE ?a SET FIELDS { confidence: 0.1 } WHERE { ?a ASSERTION {} }",
+      "expect": { "error": "InvalidSyntax" }
+    }
+  ]
+}

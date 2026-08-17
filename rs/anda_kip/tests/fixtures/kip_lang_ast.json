@@ -1,0 +1,2899 @@
+{
+ "source": "@ldclabs/kip-lang 2.0.0 — lower(parse(command).ast)",
+ "note": "Regenerate with tests/fixtures/README.md; every entry must decode to the same anda_kip AST.",
+ "cases": [
+  {
+   "command": "FIND(?belief.status, ?timezone)\nWHERE {\n  ?person {type: \"Person\", key: \"alice\"}\n  ?belief BELIEF (?person, \"timezone\", ?timezone)\n}\nWITH EPISTEMIC {purpose: \"answer_user\", risk: \"low\", explanation: \"summary\"}\nLIMIT 10",
+   "ast": {
+    "Kql": {
+     "find_clause": {
+      "expressions": [
+       {
+        "Variable": {
+         "var": "belief",
+         "path": [
+          {
+           "Field": "status"
+          }
+         ]
+        }
+       },
+       {
+        "Variable": {
+         "var": "timezone",
+         "path": []
+        }
+       }
+      ]
+     },
+     "where_clauses": [
+      {
+       "Concept": {
+        "variable": "person",
+        "matcher": {
+         "type": {
+          "Literal": {
+           "String": "Person"
+          }
+         },
+         "key": {
+          "Literal": {
+           "String": "alice"
+          }
+         }
+        }
+       }
+      },
+      {
+       "Belief": {
+        "variable": "belief",
+        "target": {
+         "Tuple": {
+          "subject": {
+           "Variable": "person"
+          },
+          "predicate": {
+           "Atom": {
+            "Literal": "timezone"
+           }
+          },
+          "object": {
+           "Variable": "timezone"
+          }
+         }
+        }
+       }
+      }
+     ],
+     "as_of": null,
+     "for_time": null,
+     "epistemic": {
+      "purpose": {
+       "Value": {
+        "String": "answer_user"
+       }
+      },
+      "risk": {
+       "Value": {
+        "String": "low"
+       }
+      },
+      "explanation": {
+       "Value": {
+        "String": "summary"
+       }
+      }
+     },
+     "order_by": null,
+     "limit": {
+      "Literal": {
+       "Number": 10
+      }
+     },
+     "cursor": null
+    }
+   }
+  },
+  {
+   "command": "ASSERT (:alice, \"prefers\", :dark_mode) {\n  by: :alice,              // REQUIRED semantic actor → asserted_by\n  mode: \"stated\",          // REQUIRED: observed|stated|inferred|predicted|hypothetical|imported\n  confidence: 0.95,        // optional [0,1]: strength of THIS stance, not truth probability\n  evidence: :msg,          // optional: Evidence ref or array (runtime-ingested preferred)\n  stance: \"support\",       // optional, default support (support|reject|uncertain)\n  at: :time,               // optional → asserted_at (default: engine transaction time)\n  valid: {from: :t1, until: :t2},   // optional → valid_time (world-valid interval)\n  key: :client_key         // optional retry-safe identity\n}",
+   "ast": {
+    "Kml": {
+     "explicit_transaction": false,
+     "clauses": [
+      {
+       "EnsureProposition": {
+        "handle": "#assert0#proposition",
+        "subject": {
+         "Param": "alice"
+        },
+        "predicate": {
+         "Literal": "prefers"
+        },
+        "object": {
+         "Param": "dark_mode"
+        },
+        "expect_version": null
+       }
+      },
+      {
+       "CreateAssertion": {
+        "handle": "#assert0",
+        "client_key": {
+         "Param": "client_key"
+        },
+        "set_fields": [
+         [
+          "proposition",
+          {
+           "Handle": "#assert0#proposition"
+          }
+         ],
+         [
+          "asserted_by",
+          {
+           "Param": "alice"
+          }
+         ],
+         [
+          "mode",
+          {
+           "Value": {
+            "String": "stated"
+           }
+          }
+         ],
+         [
+          "stance",
+          {
+           "Value": {
+            "String": "support"
+           }
+          }
+         ],
+         [
+          "confidence",
+          {
+           "Value": {
+            "Number": 0.95
+           }
+          }
+         ],
+         [
+          "asserted_at",
+          {
+           "Param": "time"
+          }
+         ],
+         [
+          "valid_time",
+          {
+           "Object": [
+            [
+             "from",
+             {
+              "Param": "t1"
+             }
+            ],
+            [
+             "until",
+             {
+              "Param": "t2"
+             }
+            ]
+           ]
+          }
+         ]
+        ],
+        "set_facets": [],
+        "set_structural": [
+         {
+          "field": {
+           "Name": "evidence"
+          },
+          "value": {
+           "Param": "msg"
+          },
+          "options": {
+           "role": {
+            "Value": {
+             "String": "support"
+            }
+           }
+          }
+         }
+        ]
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "command": "ASSERT ?a (:alice, \"timezone\", \"+01:00\") {   // the handle ?a is optional\n  by: :alice, mode: \"stated\", evidence: :e2\n} SUPERSEDING :old_assertion",
+   "ast": {
+    "Kml": {
+     "explicit_transaction": false,
+     "clauses": [
+      {
+       "EnsureProposition": {
+        "handle": "a#proposition",
+        "subject": {
+         "Param": "alice"
+        },
+        "predicate": {
+         "Literal": "timezone"
+        },
+        "object": {
+         "Literal": {
+          "String": "+01:00"
+         }
+        },
+        "expect_version": null
+       }
+      },
+      {
+       "CreateAssertion": {
+        "handle": "a",
+        "client_key": null,
+        "set_fields": [
+         [
+          "proposition",
+          {
+           "Handle": "a#proposition"
+          }
+         ],
+         [
+          "asserted_by",
+          {
+           "Param": "alice"
+          }
+         ],
+         [
+          "mode",
+          {
+           "Value": {
+            "String": "stated"
+           }
+          }
+         ],
+         [
+          "stance",
+          {
+           "Value": {
+            "String": "support"
+           }
+          }
+         ]
+        ],
+        "set_facets": [],
+        "set_structural": [
+         {
+          "field": {
+           "Name": "evidence"
+          },
+          "value": {
+           "Param": "e2"
+          },
+          "options": {
+           "role": {
+            "Value": {
+             "String": "support"
+            }
+           }
+          }
+         }
+        ]
+       }
+      },
+      {
+       "SupersedeAssertion": {
+        "target": {
+         "Param": "old_assertion"
+        },
+        "by": {
+         "Handle": "a"
+        },
+        "expect_state": null
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "command": "MUTATE {\n  ENSURE PROPOSITION ?p (:alice, \"prefers\", :dark_mode)\n  CREATE ASSERTION ?a {\n    CLIENT KEY :a_key\n    SET FIELDS { proposition: ?p, asserted_by: :alice, stance: \"support\", mode: \"stated\",\n                 confidence: 0.95, asserted_at: :time, valid_time: {from: :t1, until: :t2} }\n    SET STRUCTURAL { (\"evidence\", :msg) {role: \"support\"} (\"evidence\", :counter) {role: \"challenge\"} }\n  }\n}",
+   "ast": {
+    "Kml": {
+     "explicit_transaction": true,
+     "clauses": [
+      {
+       "EnsureProposition": {
+        "handle": "p",
+        "subject": {
+         "Param": "alice"
+        },
+        "predicate": {
+         "Literal": "prefers"
+        },
+        "object": {
+         "Param": "dark_mode"
+        },
+        "expect_version": null
+       }
+      },
+      {
+       "CreateAssertion": {
+        "handle": "a",
+        "client_key": {
+         "Param": "a_key"
+        },
+        "set_fields": [
+         [
+          "proposition",
+          {
+           "Handle": "p"
+          }
+         ],
+         [
+          "asserted_by",
+          {
+           "Param": "alice"
+          }
+         ],
+         [
+          "stance",
+          {
+           "Value": {
+            "String": "support"
+           }
+          }
+         ],
+         [
+          "mode",
+          {
+           "Value": {
+            "String": "stated"
+           }
+          }
+         ],
+         [
+          "confidence",
+          {
+           "Value": {
+            "Number": 0.95
+           }
+          }
+         ],
+         [
+          "asserted_at",
+          {
+           "Param": "time"
+          }
+         ],
+         [
+          "valid_time",
+          {
+           "Object": [
+            [
+             "from",
+             {
+              "Param": "t1"
+             }
+            ],
+            [
+             "until",
+             {
+              "Param": "t2"
+             }
+            ]
+           ]
+          }
+         ]
+        ],
+        "set_facets": [],
+        "set_structural": [
+         {
+          "field": {
+           "Name": "evidence"
+          },
+          "value": {
+           "Param": "msg"
+          },
+          "options": {
+           "role": {
+            "Value": {
+             "String": "support"
+            }
+           }
+          }
+         },
+         {
+          "field": {
+           "Name": "evidence"
+          },
+          "value": {
+           "Param": "counter"
+          },
+          "options": {
+           "role": {
+            "Value": {
+             "String": "challenge"
+            }
+           }
+          }
+         }
+        ]
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "command": "CREATE EVIDENCE ?e {\n  CLIENT KEY :e_key\n  SET FIELDS { evidence_class: \"tool_result\", payload: :payload, observed_at: :time }\n  SET STRUCTURAL { (\"source\", :actor) }\n}",
+   "ast": {
+    "Kml": {
+     "explicit_transaction": false,
+     "clauses": [
+      {
+       "CreateEvidence": {
+        "handle": "e",
+        "client_key": {
+         "Param": "e_key"
+        },
+        "set_fields": [
+         [
+          "evidence_class",
+          {
+           "Value": {
+            "String": "tool_result"
+           }
+          }
+         ],
+         [
+          "payload",
+          {
+           "Param": "payload"
+          }
+         ],
+         [
+          "observed_at",
+          {
+           "Param": "time"
+          }
+         ]
+        ],
+        "set_facets": [],
+        "set_structural": [
+         {
+          "field": {
+           "Name": "source"
+          },
+          "value": {
+           "Param": "actor"
+          },
+          "options": null
+         }
+        ]
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "command": "CREATE CONCEPT ?exp {                       // historically distinct thing\n  TYPE \"Experience\"\n  CLIENT KEY :exp_key\n  NAME \"Deploy v2 failure\"\n  SET ATTRIBUTES { goal: :goal, outcome_status: \"failure\" }\n  SET FACET \"MnemonicState\" { memory_strength: 0.8, salience: 0.9 }\n  SET STRUCTURAL { (\"has_step\", :s0) {index: 0} (\"has_step\", :s1) {index: 1} }\n}",
+   "ast": {
+    "Kml": {
+     "explicit_transaction": false,
+     "clauses": [
+      {
+       "CreateConcept": {
+        "handle": "exp",
+        "type": {
+         "Name": "Experience"
+        },
+        "client_key": {
+         "Param": "exp_key"
+        },
+        "name": {
+         "Literal": {
+          "String": "Deploy v2 failure"
+         }
+        },
+        "set_fields": null,
+        "set_attributes": [
+         [
+          "goal",
+          {
+           "Param": "goal"
+          }
+         ],
+         [
+          "outcome_status",
+          {
+           "Value": {
+            "String": "failure"
+           }
+          }
+         ]
+        ],
+        "set_facets": [
+         {
+          "facet": {
+           "Name": "MnemonicState"
+          },
+          "values": [
+           [
+            "memory_strength",
+            {
+             "Value": {
+              "Number": 0.8
+             }
+            }
+           ],
+           [
+            "salience",
+            {
+             "Value": {
+              "Number": 0.9
+             }
+            }
+           ]
+          ]
+         }
+        ],
+        "set_structural": [
+         {
+          "field": {
+           "Name": "has_step"
+          },
+          "value": {
+           "Param": "s0"
+          },
+          "options": {
+           "index": {
+            "Value": {
+             "Number": 0
+            }
+           }
+          }
+         },
+         {
+          "field": {
+           "Name": "has_step"
+          },
+          "value": {
+           "Param": "s1"
+          },
+          "options": {
+           "index": {
+            "Value": {
+             "Number": 1
+            }
+           }
+          }
+         }
+        ]
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "command": "UPSERT CONCEPT ?proj {                      // stable identity-bearing Concept\n  MATCH { type: \"Project\", key: \"kip-2\" }   // identity = id/key; name-only upsert is forbidden\n  EXPECT VERSION :v                         // optional; 0 = create-only\n  SET FIELDS { name: \"KIP 2.0\" }\n}",
+   "ast": {
+    "Kml": {
+     "explicit_transaction": false,
+     "clauses": [
+      {
+       "UpsertConcept": {
+        "handle": "proj",
+        "match": {
+         "type": {
+          "Literal": {
+           "String": "Project"
+          }
+         },
+         "key": {
+          "Literal": {
+           "String": "kip-2"
+          }
+         }
+        },
+        "expect_version": {
+         "Param": "v"
+        },
+        "set_fields": [
+         [
+          "name",
+          {
+           "Value": {
+            "String": "KIP 2.0"
+           }
+          }
+         ]
+        ],
+        "set_attributes": null,
+        "set_facets": [],
+        "unset_attributes": null,
+        "unset_facets": [],
+        "set_structural": null,
+        "unset_structural": null
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "command": "MUTATE {\n  CREATE EVIDENCE ?e {\n    CLIENT KEY :e_key\n    SET FIELDS { evidence_class: \"user_statement\", payload: :payload, observed_at: :time }\n    SET STRUCTURAL { (\"source\", :alice) }\n  }\n  ASSERT ?a (:alice, \"timezone\", \"+01:00\") { by: :alice, mode: \"stated\", evidence: ?e }\n    SUPERSEDING :a_old\n  CREATE ACTIVITY ?rev {\n    SET FIELDS { activity_class: \"belief_revision\", status: \"completed\" }\n    SET STRUCTURAL { (\"inputs\", :a_old) (\"inputs\", ?e) (\"outputs\", ?a) }\n  }\n}",
+   "ast": {
+    "Kml": {
+     "explicit_transaction": true,
+     "clauses": [
+      {
+       "CreateEvidence": {
+        "handle": "e",
+        "client_key": {
+         "Param": "e_key"
+        },
+        "set_fields": [
+         [
+          "evidence_class",
+          {
+           "Value": {
+            "String": "user_statement"
+           }
+          }
+         ],
+         [
+          "payload",
+          {
+           "Param": "payload"
+          }
+         ],
+         [
+          "observed_at",
+          {
+           "Param": "time"
+          }
+         ]
+        ],
+        "set_facets": [],
+        "set_structural": [
+         {
+          "field": {
+           "Name": "source"
+          },
+          "value": {
+           "Param": "alice"
+          },
+          "options": null
+         }
+        ]
+       }
+      },
+      {
+       "EnsureProposition": {
+        "handle": "a#proposition",
+        "subject": {
+         "Param": "alice"
+        },
+        "predicate": {
+         "Literal": "timezone"
+        },
+        "object": {
+         "Literal": {
+          "String": "+01:00"
+         }
+        },
+        "expect_version": null
+       }
+      },
+      {
+       "CreateAssertion": {
+        "handle": "a",
+        "client_key": null,
+        "set_fields": [
+         [
+          "proposition",
+          {
+           "Handle": "a#proposition"
+          }
+         ],
+         [
+          "asserted_by",
+          {
+           "Param": "alice"
+          }
+         ],
+         [
+          "mode",
+          {
+           "Value": {
+            "String": "stated"
+           }
+          }
+         ],
+         [
+          "stance",
+          {
+           "Value": {
+            "String": "support"
+           }
+          }
+         ]
+        ],
+        "set_facets": [],
+        "set_structural": [
+         {
+          "field": {
+           "Name": "evidence"
+          },
+          "value": {
+           "Handle": "e"
+          },
+          "options": {
+           "role": {
+            "Value": {
+             "String": "support"
+            }
+           }
+          }
+         }
+        ]
+       }
+      },
+      {
+       "SupersedeAssertion": {
+        "target": {
+         "Param": "a_old"
+        },
+        "by": {
+         "Handle": "a"
+        },
+        "expect_state": null
+       }
+      },
+      {
+       "CreateActivity": {
+        "handle": "rev",
+        "client_key": null,
+        "set_fields": [
+         [
+          "activity_class",
+          {
+           "Value": {
+            "String": "belief_revision"
+           }
+          }
+         ],
+         [
+          "status",
+          {
+           "Value": {
+            "String": "completed"
+           }
+          }
+         ]
+        ],
+        "set_facets": [],
+        "set_structural": [
+         {
+          "field": {
+           "Name": "inputs"
+          },
+          "value": {
+           "Param": "a_old"
+          },
+          "options": null
+         },
+         {
+          "field": {
+           "Name": "inputs"
+          },
+          "value": {
+           "Handle": "e"
+          },
+          "options": null
+         },
+         {
+          "field": {
+           "Name": "outputs"
+          },
+          "value": {
+           "Handle": "a"
+          },
+          "options": null
+         }
+        ]
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "command": "UPDATE ?m EXPECT VERSION :v\nSET FACET \"MnemonicState\" {\n  memory_strength: CLAMP(MUL(?m.facets[\"MnemonicState\"].memory_strength, :decay), 0, 1)\n}\nWHERE {\n  ?m {type: \"Experience\"}\n  FILTER(?m.facets[\"MnemonicState\"].memory_strength > 0)\n}\nLIMIT :n",
+   "ast": {
+    "Kml": {
+     "explicit_transaction": false,
+     "clauses": [
+      {
+       "Update": {
+        "target": {
+         "Handle": "m"
+        },
+        "expect_version": {
+         "Param": "v"
+        },
+        "actions": [
+         {
+          "SetFacet": {
+           "facet": {
+            "Name": "MnemonicState"
+           },
+           "values": [
+            [
+             "memory_strength",
+             {
+              "Expr": {
+               "Function": {
+                "func": "Clamp",
+                "args": [
+                 {
+                  "Function": {
+                   "func": "Mul",
+                   "args": [
+                    {
+                     "Variable": {
+                      "var": "m",
+                      "path": [
+                       {
+                        "Field": "facets"
+                       },
+                       {
+                        "Key": "MnemonicState"
+                       },
+                       {
+                        "Field": "memory_strength"
+                       }
+                      ]
+                     }
+                    },
+                    {
+                     "Param": "decay"
+                    }
+                   ]
+                  }
+                 },
+                 {
+                  "Number": 0
+                 },
+                 {
+                  "Number": 1
+                 }
+                ]
+               }
+              }
+             }
+            ]
+           ]
+          }
+         }
+        ],
+        "where_clauses": [
+         {
+          "Concept": {
+           "variable": "m",
+           "matcher": {
+            "type": {
+             "Literal": {
+              "String": "Experience"
+             }
+            }
+           }
+          }
+         },
+         {
+          "Filter": {
+           "expression": {
+            "Comparison": {
+             "left": {
+              "Variable": {
+               "var": "m",
+               "path": [
+                {
+                 "Field": "facets"
+                },
+                {
+                 "Key": "MnemonicState"
+                },
+                {
+                 "Field": "memory_strength"
+                }
+               ]
+              }
+             },
+             "operator": "GreaterThan",
+             "right": {
+              "Literal": {
+               "Number": 0
+              }
+             }
+            }
+           }
+          }
+         }
+        ],
+        "limit": {
+         "Param": "n"
+        }
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "command": "UPDATE :concept_id\nUNSET ATTRIBUTES {obsolete, \"legacy-field\"}\nUNSET FACET \"MnemonicState\" {salience}\nUNSET STRUCTURAL { (\"has_step\", :wrong_step) }",
+   "ast": {
+    "Kml": {
+     "explicit_transaction": false,
+     "clauses": [
+      {
+       "Update": {
+        "target": {
+         "Param": "concept_id"
+        },
+        "expect_version": null,
+        "actions": [
+         {
+          "UnsetAttributes": [
+           "obsolete",
+           "legacy-field"
+          ]
+         },
+         {
+          "UnsetFacet": {
+           "facet": {
+            "Name": "MnemonicState"
+           },
+           "fields": [
+            "salience"
+           ]
+          }
+         },
+         {
+          "UnsetStructural": [
+           {
+            "field": {
+             "Name": "has_step"
+            },
+            "value": {
+             "Param": "wrong_step"
+            }
+           }
+          ]
+         }
+        ],
+        "where_clauses": null,
+        "limit": null
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "command": "SEARCH CONCEPT :term\nWITH TYPE :type\nMODE \"hybrid\"\nTHRESHOLD :threshold\nLIMIT :limit",
+   "ast": {
+    "Meta": {
+     "Search": {
+      "target": "Concept",
+      "term": {
+       "Param": "term"
+      },
+      "with_type": {
+       "Param": "type"
+      },
+      "with_predicate": null,
+      "mode": {
+       "Literal": {
+        "String": "hybrid"
+       }
+      },
+      "threshold": {
+       "Param": "threshold"
+      },
+      "as_of_seq": null,
+      "limit": {
+       "Param": "limit"
+      },
+      "cursor": null
+     }
+    }
+   }
+  },
+  {
+   "command": "FIND(?x) WHERE { ?x {type: \"T\"} }",
+   "ast": {
+    "Kql": {
+     "find_clause": {
+      "expressions": [
+       {
+        "Variable": {
+         "var": "x",
+         "path": []
+        }
+       }
+      ]
+     },
+     "where_clauses": [
+      {
+       "Concept": {
+        "variable": "x",
+        "matcher": {
+         "type": {
+          "Literal": {
+           "String": "T"
+          }
+         }
+        }
+       }
+      }
+     ],
+     "as_of": null,
+     "for_time": null,
+     "epistemic": null,
+     "order_by": null,
+     "limit": null,
+     "cursor": null
+    }
+   }
+  },
+  {
+   "command": "FIND(?a.confidence, COUNT(DISTINCT ?p)) WHERE { ?p (?s, \"a\"|\"b\"{1,3}, ?o) ?a ASSERTION {proposition: ?p} FILTER(?a.confidence >= 0.5 && !IS_NULL(?s)) NOT { ?x {type: \"Y\"} } OPTIONAL { ?e EVIDENCE {evidence_class: \"message\"} } UNION { ?z {type: \"Z\"} } } AS OF TX :tx FOR TIME :t WITH EPISTEMIC {explain: \"full\", n: [1,:p]} ORDER BY ?a.confidence DESC, ?p LIMIT :l CURSOR :c",
+   "ast": {
+    "Kql": {
+     "find_clause": {
+      "expressions": [
+       {
+        "Variable": {
+         "var": "a",
+         "path": [
+          {
+           "Field": "confidence"
+          }
+         ]
+        }
+       },
+       {
+        "Aggregation": {
+         "func": "Count",
+         "var": {
+          "var": "p",
+          "path": []
+         },
+         "distinct": true
+        }
+       }
+      ]
+     },
+     "where_clauses": [
+      {
+       "Proposition": {
+        "variable": "p",
+        "matcher": {
+         "Tuple": {
+          "subject": {
+           "Variable": "s"
+          },
+          "predicate": {
+           "Path": [
+            {
+             "predicate": {
+              "Literal": "a"
+             },
+             "hops": null
+            },
+            {
+             "predicate": {
+              "Literal": "b"
+             },
+             "hops": {
+              "min": 1,
+              "max": 3
+             }
+            }
+           ]
+          },
+          "object": {
+           "Variable": "o"
+          }
+         }
+        }
+       }
+      },
+      {
+       "Assertion": {
+        "variable": "a",
+        "matcher": {
+         "proposition": {
+          "Variable": "p"
+         }
+        }
+       }
+      },
+      {
+       "Filter": {
+        "expression": {
+         "Logical": {
+          "left": {
+           "Comparison": {
+            "left": {
+             "Variable": {
+              "var": "a",
+              "path": [
+               {
+                "Field": "confidence"
+               }
+              ]
+             }
+            },
+            "operator": "GreaterEqual",
+            "right": {
+             "Literal": {
+              "Number": 0.5
+             }
+            }
+           }
+          },
+          "operator": "And",
+          "right": {
+           "Not": {
+            "Function": {
+             "func": "IsNull",
+             "args": [
+              {
+               "Variable": {
+                "var": "s",
+                "path": []
+               }
+              }
+             ]
+            }
+           }
+          }
+         }
+        }
+       }
+      },
+      {
+       "Not": [
+        {
+         "Concept": {
+          "variable": "x",
+          "matcher": {
+           "type": {
+            "Literal": {
+             "String": "Y"
+            }
+           }
+          }
+         }
+        }
+       ]
+      },
+      {
+       "Optional": [
+        {
+         "Evidence": {
+          "variable": "e",
+          "matcher": {
+           "evidence_class": {
+            "Literal": {
+             "String": "message"
+            }
+           }
+          }
+         }
+        }
+       ]
+      },
+      {
+       "Union": [
+        {
+         "Concept": {
+          "variable": "z",
+          "matcher": {
+           "type": {
+            "Literal": {
+             "String": "Z"
+            }
+           }
+          }
+         }
+        }
+       ]
+      }
+     ],
+     "as_of": {
+      "Tx": {
+       "Param": "tx"
+      }
+     },
+     "for_time": {
+      "Param": "t"
+     },
+     "epistemic": {
+      "explain": {
+       "Value": {
+        "String": "full"
+       }
+      },
+      "n": {
+       "Array": [
+        {
+         "Value": {
+          "Number": 1
+         }
+        },
+        {
+         "Param": "p"
+        }
+       ]
+      }
+     },
+     "order_by": [
+      {
+       "variable": {
+        "var": "a",
+        "path": [
+         {
+          "Field": "confidence"
+         }
+        ]
+       },
+       "direction": "Desc",
+       "aggregation": null
+      },
+      {
+       "variable": {
+        "var": "p",
+        "path": []
+       },
+       "direction": "Asc",
+       "aggregation": null
+      }
+     ],
+     "limit": {
+      "Param": "l"
+     },
+     "cursor": {
+      "Param": "c"
+     }
+    }
+   }
+  },
+  {
+   "command": "FIND(?b, ?slot) WHERE { ?b BELIEF (id: \"P-1\") ?slot BELIEF SLOT (:alice, \"timezone\") ?c BELIEF (?s, :pred, ?o) }",
+   "ast": {
+    "Kql": {
+     "find_clause": {
+      "expressions": [
+       {
+        "Variable": {
+         "var": "b",
+         "path": []
+        }
+       },
+       {
+        "Variable": {
+         "var": "slot",
+         "path": []
+        }
+       }
+      ]
+     },
+     "where_clauses": [
+      {
+       "Belief": {
+        "variable": "b",
+        "target": {
+         "Id": {
+          "Literal": {
+           "String": "P-1"
+          }
+         }
+        }
+       }
+      },
+      {
+       "BeliefSlot": {
+        "variable": "slot",
+        "subject": {
+         "Param": "alice"
+        },
+        "predicate": {
+         "Literal": "timezone"
+        }
+       }
+      },
+      {
+       "Belief": {
+        "variable": "c",
+        "target": {
+         "Tuple": {
+          "subject": {
+           "Variable": "s"
+          },
+          "predicate": {
+           "Atom": {
+            "Param": "pred"
+           }
+          },
+          "object": {
+           "Variable": "o"
+          }
+         }
+        }
+       }
+      }
+     ],
+     "as_of": null,
+     "for_time": null,
+     "epistemic": null,
+     "order_by": null,
+     "limit": null,
+     "cursor": null
+    }
+   }
+  },
+  {
+   "command": "ASSERT ?a (:alice, \"prefers\", :dark) { by: :alice, mode: \"stated\", stance: \"reject\", confidence: 0.5, at: :now, valid: {from: :f}, evidence: [:e1, \"E-2\"], key: \"k1\" } SUPERSEDING :old",
+   "ast": {
+    "Kml": {
+     "explicit_transaction": false,
+     "clauses": [
+      {
+       "EnsureProposition": {
+        "handle": "a#proposition",
+        "subject": {
+         "Param": "alice"
+        },
+        "predicate": {
+         "Literal": "prefers"
+        },
+        "object": {
+         "Param": "dark"
+        },
+        "expect_version": null
+       }
+      },
+      {
+       "CreateAssertion": {
+        "handle": "a",
+        "client_key": {
+         "Literal": {
+          "String": "k1"
+         }
+        },
+        "set_fields": [
+         [
+          "proposition",
+          {
+           "Handle": "a#proposition"
+          }
+         ],
+         [
+          "asserted_by",
+          {
+           "Param": "alice"
+          }
+         ],
+         [
+          "mode",
+          {
+           "Value": {
+            "String": "stated"
+           }
+          }
+         ],
+         [
+          "stance",
+          {
+           "Value": {
+            "String": "reject"
+           }
+          }
+         ],
+         [
+          "confidence",
+          {
+           "Value": {
+            "Number": 0.5
+           }
+          }
+         ],
+         [
+          "asserted_at",
+          {
+           "Param": "now"
+          }
+         ],
+         [
+          "valid_time",
+          {
+           "Object": [
+            [
+             "from",
+             {
+              "Param": "f"
+             }
+            ]
+           ]
+          }
+         ]
+        ],
+        "set_facets": [],
+        "set_structural": [
+         {
+          "field": {
+           "Name": "evidence"
+          },
+          "value": {
+           "Param": "e1"
+          },
+          "options": {
+           "role": {
+            "Value": {
+             "String": "support"
+            }
+           }
+          }
+         },
+         {
+          "field": {
+           "Name": "evidence"
+          },
+          "value": {
+           "Value": {
+            "String": "E-2"
+           }
+          },
+          "options": {
+           "role": {
+            "Value": {
+             "String": "support"
+            }
+           }
+          }
+         }
+        ]
+       }
+      },
+      {
+       "SupersedeAssertion": {
+        "target": {
+         "Param": "old"
+        },
+        "by": {
+         "Handle": "a"
+        },
+        "expect_state": null
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "command": "ASSERT (:a, \"p\", :b) { by: :me, mode: \"stated\" }",
+   "ast": {
+    "Kml": {
+     "explicit_transaction": false,
+     "clauses": [
+      {
+       "EnsureProposition": {
+        "handle": "#assert0#proposition",
+        "subject": {
+         "Param": "a"
+        },
+        "predicate": {
+         "Literal": "p"
+        },
+        "object": {
+         "Param": "b"
+        },
+        "expect_version": null
+       }
+      },
+      {
+       "CreateAssertion": {
+        "handle": "#assert0",
+        "client_key": null,
+        "set_fields": [
+         [
+          "proposition",
+          {
+           "Handle": "#assert0#proposition"
+          }
+         ],
+         [
+          "asserted_by",
+          {
+           "Param": "me"
+          }
+         ],
+         [
+          "mode",
+          {
+           "Value": {
+            "String": "stated"
+           }
+          }
+         ],
+         [
+          "stance",
+          {
+           "Value": {
+            "String": "support"
+           }
+          }
+         ]
+        ],
+        "set_facets": [],
+        "set_structural": null
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "command": "MUTATE { CREATE CONCEPT ?c { TYPE \"Person\" CLIENT KEY \"k\" NAME \"Alice\" SET FIELDS {a: 1} SET ATTRIBUTES {b: [1,:p]} SET FACET \"F\" {x: 1} SET STRUCTURAL { (\"rel\", ?c) {index: 0} } } UPSERT CONCEPT ?d { MATCH {key: \"kk\"} EXPECT VERSION :v UNSET ATTRIBUTES {a, \"b\"} UNSET FACET \"F\" {x} UNSET STRUCTURAL { (\"rel\", ?c) } } }",
+   "ast": {
+    "Kml": {
+     "explicit_transaction": true,
+     "clauses": [
+      {
+       "CreateConcept": {
+        "handle": "c",
+        "type": {
+         "Name": "Person"
+        },
+        "client_key": {
+         "Literal": {
+          "String": "k"
+         }
+        },
+        "name": {
+         "Literal": {
+          "String": "Alice"
+         }
+        },
+        "set_fields": [
+         [
+          "a",
+          {
+           "Value": {
+            "Number": 1
+           }
+          }
+         ]
+        ],
+        "set_attributes": [
+         [
+          "b",
+          {
+           "Array": [
+            {
+             "Value": {
+              "Number": 1
+             }
+            },
+            {
+             "Param": "p"
+            }
+           ]
+          }
+         ]
+        ],
+        "set_facets": [
+         {
+          "facet": {
+           "Name": "F"
+          },
+          "values": [
+           [
+            "x",
+            {
+             "Value": {
+              "Number": 1
+             }
+            }
+           ]
+          ]
+         }
+        ],
+        "set_structural": [
+         {
+          "field": {
+           "Name": "rel"
+          },
+          "value": {
+           "Handle": "c"
+          },
+          "options": {
+           "index": {
+            "Value": {
+             "Number": 0
+            }
+           }
+          }
+         }
+        ]
+       }
+      },
+      {
+       "UpsertConcept": {
+        "handle": "d",
+        "match": {
+         "key": {
+          "Literal": {
+           "String": "kk"
+          }
+         }
+        },
+        "expect_version": {
+         "Param": "v"
+        },
+        "set_fields": null,
+        "set_attributes": null,
+        "set_facets": [],
+        "unset_attributes": [
+         "a",
+         "b"
+        ],
+        "unset_facets": [
+         {
+          "facet": {
+           "Name": "F"
+          },
+          "fields": [
+           "x"
+          ]
+         }
+        ],
+        "set_structural": null,
+        "unset_structural": [
+         {
+          "field": {
+           "Name": "rel"
+          },
+          "value": {
+           "Handle": "c"
+          }
+         }
+        ]
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "command": "UPDATE :t SET FACET \"MnemonicState\" { memory_strength: CLAMP(MUL(:t, 0.9), 0, 1) }",
+   "ast": {
+    "Kml": {
+     "explicit_transaction": false,
+     "clauses": [
+      {
+       "Update": {
+        "target": {
+         "Param": "t"
+        },
+        "expect_version": null,
+        "actions": [
+         {
+          "SetFacet": {
+           "facet": {
+            "Name": "MnemonicState"
+           },
+           "values": [
+            [
+             "memory_strength",
+             {
+              "Expr": {
+               "Function": {
+                "func": "Clamp",
+                "args": [
+                 {
+                  "Function": {
+                   "func": "Mul",
+                   "args": [
+                    {
+                     "Param": "t"
+                    },
+                    {
+                     "Number": 0.9
+                    }
+                   ]
+                  }
+                 },
+                 {
+                  "Number": 0
+                 },
+                 {
+                  "Number": 1
+                 }
+                ]
+               }
+              }
+             }
+            ]
+           ]
+          }
+         }
+        ],
+        "where_clauses": null,
+        "limit": null
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "command": "TRANSITION ACTIVITY :act TO \"succeeded\" SET FIELDS {ended_at: :now} SET STRUCTURAL { (\"outputs\", :o) } EXPECT STATE \"running\"",
+   "ast": {
+    "Kml": {
+     "explicit_transaction": false,
+     "clauses": [
+      {
+       "TransitionActivity": {
+        "target": {
+         "Param": "act"
+        },
+        "to": {
+         "Literal": {
+          "String": "succeeded"
+         }
+        },
+        "set_fields": [
+         [
+          "ended_at",
+          {
+           "Param": "now"
+          }
+         ]
+        ],
+        "set_structural": [
+         {
+          "field": {
+           "Name": "outputs"
+          },
+          "value": {
+           "Param": "o"
+          },
+          "options": null
+         }
+        ],
+        "expect_state": {
+         "Literal": {
+          "String": "running"
+         }
+        }
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "command": "PURGE :x WHERE { ?x {type: \"T\"} } LIMIT 5 REFERENCE POLICY \"detach\" CONFIRM \"PURGE\"",
+   "ast": {
+    "Kml": {
+     "explicit_transaction": false,
+     "clauses": [
+      {
+       "Purge": {
+        "target": {
+         "Param": "x"
+        },
+        "where_clauses": [
+         {
+          "Concept": {
+           "variable": "x",
+           "matcher": {
+            "type": {
+             "Literal": {
+              "String": "T"
+             }
+            }
+           }
+          }
+         }
+        ],
+        "limit": {
+         "Literal": {
+          "Number": 5
+         }
+        },
+        "reference_policy": {
+         "Literal": {
+          "String": "detach"
+         }
+        },
+        "confirm": "PURGE"
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "command": "MERGE CONCEPT :js INTO :javascript WHERE { ?js {type: \"T\"} } EXPECT VERSION 2",
+   "ast": {
+    "Kml": {
+     "explicit_transaction": false,
+     "clauses": [
+      {
+       "MergeConcept": {
+        "source": {
+         "Param": "js"
+        },
+        "into": {
+         "Param": "javascript"
+        },
+        "where_clauses": [
+         {
+          "Concept": {
+           "variable": "js",
+           "matcher": {
+            "type": {
+             "Literal": {
+              "String": "T"
+             }
+            }
+           }
+          }
+         }
+        ],
+        "expect_version": {
+         "Literal": {
+          "Number": 2
+         }
+        }
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "command": "SET RETENTION :x { retention_class: \"short\", expires_at: :t } WHERE { ?x {type: \"T\"} } LIMIT 3 EXPECT VERSION 1",
+   "ast": {
+    "Kml": {
+     "explicit_transaction": false,
+     "clauses": [
+      {
+       "SetRetention": {
+        "target": {
+         "Param": "x"
+        },
+        "values": [
+         [
+          "retention_class",
+          {
+           "Value": {
+            "String": "short"
+           }
+          }
+         ],
+         [
+          "expires_at",
+          {
+           "Param": "t"
+          }
+         ]
+        ],
+        "where_clauses": [
+         {
+          "Concept": {
+           "variable": "x",
+           "matcher": {
+            "type": {
+             "Literal": {
+              "String": "T"
+             }
+            }
+           }
+          }
+         }
+        ],
+        "limit": {
+         "Literal": {
+          "Number": 3
+         }
+        },
+        "expect_version": {
+         "Literal": {
+          "Number": 1
+         }
+        }
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "command": "RETRACT ASSERTION ?a WHERE { ?a ASSERTION {id: \"A-1\"} } LIMIT 1 EXPECT STATE \"active\"",
+   "ast": {
+    "Kml": {
+     "explicit_transaction": false,
+     "clauses": [
+      {
+       "RetractAssertion": {
+        "target": {
+         "Handle": "a"
+        },
+        "where_clauses": [
+         {
+          "Assertion": {
+           "variable": "a",
+           "matcher": {
+            "id": {
+             "Literal": {
+              "String": "A-1"
+             }
+            }
+           }
+          }
+         }
+        ],
+        "limit": {
+         "Literal": {
+          "Number": 1
+         }
+        },
+        "expect_state": {
+         "Literal": {
+          "String": "active"
+         }
+        }
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "command": "CORRECT EVIDENCE :old BY :new EXPECT STATE \"active\"",
+   "ast": {
+    "Kml": {
+     "explicit_transaction": false,
+     "clauses": [
+      {
+       "CorrectEvidence": {
+        "target": {
+         "Param": "old"
+        },
+        "by": {
+         "Param": "new"
+        },
+        "expect_state": {
+         "Literal": {
+          "String": "active"
+         }
+        }
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "command": "ARCHIVE :x WHERE { ?x {type: \"T\"} } LIMIT 2 EXPECT STATE \"active\"",
+   "ast": {
+    "Kml": {
+     "explicit_transaction": false,
+     "clauses": [
+      {
+       "Archive": {
+        "target": {
+         "Param": "x"
+        },
+        "where_clauses": [
+         {
+          "Concept": {
+           "variable": "x",
+           "matcher": {
+            "type": {
+             "Literal": {
+              "String": "T"
+             }
+            }
+           }
+          }
+         }
+        ],
+        "limit": {
+         "Literal": {
+          "Number": 2
+         }
+        },
+        "expect_state": {
+         "Literal": {
+          "String": "active"
+         }
+        }
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "command": "TOMBSTONE :x",
+   "ast": {
+    "Kml": {
+     "explicit_transaction": false,
+     "clauses": [
+      {
+       "Tombstone": {
+        "target": {
+         "Param": "x"
+        },
+        "where_clauses": null,
+        "limit": null,
+        "expect_state": null
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "command": "ENSURE PROPOSITION ?p (:a, :pred, \"lit\") EXPECT VERSION 4",
+   "ast": {
+    "Kml": {
+     "explicit_transaction": false,
+     "clauses": [
+      {
+       "EnsureProposition": {
+        "handle": "p",
+        "subject": {
+         "Param": "a"
+        },
+        "predicate": {
+         "Param": "pred"
+        },
+        "object": {
+         "Literal": {
+          "String": "lit"
+         }
+        },
+        "expect_version": {
+         "Literal": {
+          "Number": 4
+         }
+        }
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "command": "DESCRIBE PRIMER MODE \"full\"",
+   "ast": {
+    "Meta": {
+     "Describe": {
+      "Primer": {
+       "mode": {
+        "Literal": {
+         "String": "full"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "command": "DESCRIBE PROTOCOL",
+   "ast": {
+    "Meta": {
+     "Describe": "Protocol"
+    }
+   }
+  },
+  {
+   "command": "DESCRIBE EXECUTION CONTEXT",
+   "ast": {
+    "Meta": {
+     "Describe": "ExecutionContext"
+    }
+   }
+  },
+  {
+   "command": "DESCRIBE CAPABILITIES",
+   "ast": {
+    "Meta": {
+     "Describe": "Capabilities"
+    }
+   }
+  },
+  {
+   "command": "DESCRIBE SPACE \"s\"",
+   "ast": {
+    "Meta": {
+     "Describe": {
+      "Space": {
+       "value": {
+        "Literal": {
+         "String": "s"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "command": "DESCRIBE SCHEMA ENVIRONMENT AS OF SEQ 1",
+   "ast": {
+    "Meta": {
+     "Describe": {
+      "SchemaEnvironment": {
+       "as_of": {
+        "Seq": {
+         "Literal": {
+          "Number": 1
+         }
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "command": "DESCRIBE PACKAGE :p",
+   "ast": {
+    "Meta": {
+     "Describe": {
+      "Package": {
+       "Param": "p"
+      }
+     }
+    }
+   }
+  },
+  {
+   "command": "DESCRIBE TYPE \"T\"",
+   "ast": {
+    "Meta": {
+     "Describe": {
+      "Type": {
+       "Literal": {
+        "String": "T"
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "command": "DESCRIBE PREDICATE \"p\"",
+   "ast": {
+    "Meta": {
+     "Describe": {
+      "Predicate": {
+       "Literal": {
+        "String": "p"
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "command": "DESCRIBE FACET \"F\"",
+   "ast": {
+    "Meta": {
+     "Describe": {
+      "Facet": {
+       "Literal": {
+        "String": "F"
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "command": "DESCRIBE STRUCTURAL FIELD \"sf\"",
+   "ast": {
+    "Meta": {
+     "Describe": {
+      "StructuralField": {
+       "Literal": {
+        "String": "sf"
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "command": "DESCRIBE COMPATIBILITY FROM \"1\" TO \"2\"",
+   "ast": {
+    "Meta": {
+     "Describe": {
+      "Compatibility": {
+       "from": {
+        "Literal": {
+         "String": "1"
+        }
+       },
+       "to": {
+        "Literal": {
+         "String": "2"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "command": "DESCRIBE ERROR \"InvalidSyntax\"",
+   "ast": {
+    "Meta": {
+     "Describe": {
+      "Error": {
+       "Literal": {
+        "String": "InvalidSyntax"
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "command": "DESCRIBE TRANSACTION \"tx\"",
+   "ast": {
+    "Meta": {
+     "Describe": {
+      "Transaction": {
+       "Literal": {
+        "String": "tx"
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "command": "DESCRIBE TRANSACTION BY IDEMPOTENCY KEY \"k\"",
+   "ast": {
+    "Meta": {
+     "Describe": {
+      "TransactionByIdempotencyKey": {
+       "Literal": {
+        "String": "k"
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "command": "DESCRIBE SNAPSHOT AS OF TIME \"t\"",
+   "ast": {
+    "Meta": {
+     "Describe": {
+      "Snapshot": {
+       "as_of": {
+        "Time": {
+         "Literal": {
+          "String": "t"
+         }
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "command": "DESCRIBE CAPSULE :c",
+   "ast": {
+    "Meta": {
+     "Describe": {
+      "Capsule": {
+       "Param": "c"
+      }
+     }
+    }
+   }
+  },
+  {
+   "command": "DESCRIBE EPISTEMIC POLICY \"p\"",
+   "ast": {
+    "Meta": {
+     "Describe": {
+      "EpistemicPolicy": {
+       "value": {
+        "Literal": {
+         "String": "p"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "command": "DESCRIBE PROJECTION CAPABILITY",
+   "ast": {
+    "Meta": {
+     "Describe": "ProjectionCapability"
+    }
+   }
+  },
+  {
+   "command": "DESCRIBE TRUST \"t\"",
+   "ast": {
+    "Meta": {
+     "Describe": {
+      "Trust": {
+       "value": {
+        "Literal": {
+         "String": "t"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "command": "DESCRIBE ACCESS WITH {operation: \"update\", n: :p}",
+   "ast": {
+    "Meta": {
+     "Describe": {
+      "Access": {
+       "with": {
+        "operation": {
+         "Value": {
+          "String": "update"
+         }
+        },
+        "n": {
+         "Param": "p"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "command": "LIST SPACES LIMIT 5 CURSOR :c",
+   "ast": {
+    "Meta": {
+     "List": {
+      "target": "Spaces",
+      "status": null,
+      "limit": {
+       "Literal": {
+        "Number": 5
+       }
+      },
+      "cursor": {
+       "Param": "c"
+      }
+     }
+    }
+   }
+  },
+  {
+   "command": "LIST SCHEMA PACKAGES STATUS \"active\"",
+   "ast": {
+    "Meta": {
+     "List": {
+      "target": "SchemaPackages",
+      "status": {
+       "Literal": {
+        "String": "active"
+       }
+      },
+      "limit": null,
+      "cursor": null
+     }
+    }
+   }
+  },
+  {
+   "command": "LIST TYPES",
+   "ast": {
+    "Meta": {
+     "List": {
+      "target": "Types",
+      "status": null,
+      "limit": null,
+      "cursor": null
+     }
+    }
+   }
+  },
+  {
+   "command": "LIST PREDICATES",
+   "ast": {
+    "Meta": {
+     "List": {
+      "target": "Predicates",
+      "status": null,
+      "limit": null,
+      "cursor": null
+     }
+    }
+   }
+  },
+  {
+   "command": "LIST FACETS",
+   "ast": {
+    "Meta": {
+     "List": {
+      "target": "Facets",
+      "status": null,
+      "limit": null,
+      "cursor": null
+     }
+    }
+   }
+  },
+  {
+   "command": "LIST STRUCTURAL FIELDS",
+   "ast": {
+    "Meta": {
+     "List": {
+      "target": "StructuralFields",
+      "status": null,
+      "limit": null,
+      "cursor": null
+     }
+    }
+   }
+  },
+  {
+   "command": "LIST EPISTEMIC POLICIES",
+   "ast": {
+    "Meta": {
+     "List": {
+      "target": "EpistemicPolicies",
+      "status": null,
+      "limit": null,
+      "cursor": null
+     }
+    }
+   }
+  },
+  {
+   "command": "SEARCH CONCEPT \"x\" WITH TYPE \"T\" WITH PREDICATE \"p\" MODE \"hybrid\" THRESHOLD 0.5 AS OF SEQ 3 LIMIT 2 CURSOR :c",
+   "ast": {
+    "Meta": {
+     "Search": {
+      "target": "Concept",
+      "term": {
+       "Literal": {
+        "String": "x"
+       }
+      },
+      "with_type": {
+       "Literal": {
+        "String": "T"
+       }
+      },
+      "with_predicate": {
+       "Literal": {
+        "String": "p"
+       }
+      },
+      "mode": {
+       "Literal": {
+        "String": "hybrid"
+       }
+      },
+      "threshold": {
+       "Literal": {
+        "Number": 0.5
+       }
+      },
+      "as_of_seq": {
+       "Literal": {
+        "Number": 3
+       }
+      },
+      "limit": {
+       "Literal": {
+        "Number": 2
+       }
+      },
+      "cursor": {
+       "Param": "c"
+      }
+     }
+    }
+   }
+  },
+  {
+   "command": "SEARCH COGNITION :term",
+   "ast": {
+    "Meta": {
+     "Search": {
+      "target": "Cognition",
+      "term": {
+       "Param": "term"
+      },
+      "with_type": null,
+      "with_predicate": null,
+      "mode": null,
+      "threshold": null,
+      "as_of_seq": null,
+      "limit": null,
+      "cursor": null
+     }
+    }
+   }
+  },
+  {
+   "command": "VERIFY CAPSULE :a",
+   "ast": {
+    "Meta": {
+     "Verify": {
+      "target": "Capsule",
+      "value": {
+       "Param": "a"
+      }
+     }
+    }
+   }
+  },
+  {
+   "command": "VERIFY SCHEMA PACKAGE :a",
+   "ast": {
+    "Meta": {
+     "Verify": {
+      "target": "SchemaPackage",
+      "value": {
+       "Param": "a"
+      }
+     }
+    }
+   }
+  },
+  {
+   "command": "VERIFY RECEIPT :a",
+   "ast": {
+    "Meta": {
+     "Verify": {
+      "target": "Receipt",
+      "value": {
+       "Param": "a"
+      }
+     }
+    }
+   }
+  },
+  {
+   "command": "VERIFY BLOB :a",
+   "ast": {
+    "Meta": {
+     "Verify": {
+      "target": "Blob",
+      "value": {
+       "Param": "a"
+      }
+     }
+    }
+   }
+  },
+  {
+   "command": "VERIFY CHECKPOINT :a",
+   "ast": {
+    "Meta": {
+     "Verify": {
+      "target": "Checkpoint",
+      "value": {
+       "Param": "a"
+      }
+     }
+    }
+   }
+  },
+  {
+   "command": "VALIDATE KQL :a",
+   "ast": {
+    "Meta": {
+     "Validate": {
+      "target": "Kql",
+      "value": {
+       "Param": "a"
+      },
+      "options": null
+     }
+    }
+   }
+  },
+  {
+   "command": "VALIDATE KML :a",
+   "ast": {
+    "Meta": {
+     "Validate": {
+      "target": "Kml",
+      "value": {
+       "Param": "a"
+      },
+      "options": null
+     }
+    }
+   }
+  },
+  {
+   "command": "VALIDATE CAPSULE :a",
+   "ast": {
+    "Meta": {
+     "Validate": {
+      "target": "Capsule",
+      "value": {
+       "Param": "a"
+      },
+      "options": null
+     }
+    }
+   }
+  },
+  {
+   "command": "VALIDATE SCHEMA PACKAGE :a",
+   "ast": {
+    "Meta": {
+     "Validate": {
+      "target": "SchemaPackage",
+      "value": {
+       "Param": "a"
+      },
+      "options": null
+     }
+    }
+   }
+  },
+  {
+   "command": "VALIDATE IMPORT PLAN :a WITH {strict: true}",
+   "ast": {
+    "Meta": {
+     "Validate": {
+      "target": "ImportPlan",
+      "value": {
+       "Param": "a"
+      },
+      "options": {
+       "strict": {
+        "Value": {
+         "Bool": true
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "command": "PREVIEW KML :a",
+   "ast": {
+    "Meta": {
+     "Preview": {
+      "Kml": {
+       "Param": "a"
+      }
+     }
+    }
+   }
+  },
+  {
+   "command": "PREVIEW IMPORT CAPSULE :a INTO \"s\"",
+   "ast": {
+    "Meta": {
+     "Preview": {
+      "ImportCapsule": {
+       "capsule": {
+        "Param": "a"
+       },
+       "into": {
+        "Literal": {
+         "String": "s"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "command": "HISTORY ELEMENT \"E\" FROM SEQ 1 TO SEQ 2 LIMIT 3 CURSOR :c",
+   "ast": {
+    "Meta": {
+     "History": {
+      "Element": {
+       "value": {
+        "Literal": {
+         "String": "E"
+        }
+       },
+       "from_seq": {
+        "Literal": {
+         "Number": 1
+        }
+       },
+       "to_seq": {
+        "Literal": {
+         "Number": 2
+        }
+       },
+       "limit": {
+        "Literal": {
+         "Number": 3
+        }
+       },
+       "cursor": {
+        "Param": "c"
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "command": "HISTORY SPACE",
+   "ast": {
+    "Meta": {
+     "History": {
+      "Space": {
+       "from_seq": null,
+       "to_seq": null,
+       "limit": null,
+       "cursor": null
+      }
+     }
+    }
+   }
+  },
+  {
+   "command": "CHANGES SINCE :c LIMIT 9",
+   "ast": {
+    "Meta": {
+     "Changes": {
+      "Since": {
+       "cursor": {
+        "Param": "c"
+       },
+       "limit": {
+        "Literal": {
+         "Number": 9
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "command": "CHANGES AFTER SEQ 3",
+   "ast": {
+    "Meta": {
+     "Changes": {
+      "AfterSeq": {
+       "seq": {
+        "Literal": {
+         "Number": 3
+        }
+       },
+       "limit": null
+      }
+     }
+    }
+   }
+  },
+  {
+   "command": "SNAPSHOT",
+   "ast": {
+    "Meta": {
+     "Snapshot": {
+      "as_of": null
+     }
+    }
+   }
+  },
+  {
+   "command": "SNAPSHOT AS OF SEQ 1",
+   "ast": {
+    "Meta": {
+     "Snapshot": {
+      "as_of": {
+       "Seq": {
+        "Literal": {
+         "Number": 1
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "command": "EXPORT CAPSULE :out WHERE { ?c {type: \"T\"} (?c, \"p\", ?o) } WITH {redact: true} AS OF TX :tx",
+   "ast": {
+    "Meta": {
+     "ExportCapsule": {
+      "target": {
+       "Param": "out"
+      },
+      "where_clauses": [
+       {
+        "Concept": {
+         "variable": "c",
+         "matcher": {
+          "type": {
+           "Literal": {
+            "String": "T"
+           }
+          }
+         }
+        }
+       },
+       {
+        "Proposition": {
+         "variable": null,
+         "matcher": {
+          "Tuple": {
+           "subject": {
+            "Variable": "c"
+           },
+           "predicate": {
+            "Atom": {
+             "Literal": "p"
+            }
+           },
+           "object": {
+            "Variable": "o"
+           }
+          }
+         }
+        }
+       }
+      ],
+      "options": {
+       "redact": {
+        "Value": {
+         "Bool": true
+        }
+       }
+      },
+      "as_of": {
+       "Tx": {
+        "Param": "tx"
+       }
+      }
+     }
+    }
+   }
+  }
+ ]
+}

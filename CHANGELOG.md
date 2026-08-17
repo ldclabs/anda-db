@@ -2,6 +2,231 @@
 
 All notable changes to this workspace are documented in this file.
 
+## [KIP 2.0] — 2026-08-16
+
+`anda_kip` 0.12.0.
+
+KIP 2.0 in `rs/anda_kip`. This is a rewrite, not an upgrade: 1.x and 2.0 are
+semantically different protocols, so the old API is gone rather than deprecated.
+
+`anda_cognitive_nexus`, `anda_cognitive_nexus_server` and `anda_kip_wasm` have
+since been ported (see below); `py/anda_cognitive_nexus_py` and `ts/kip-do` are
+still KIP 1.x and do not build against this protocol.
+
+### Why it is a rewrite
+
+KIP 1.x kept meaning, belief, evidence, provenance, retention and governance in
+one self-describing graph, where a Proposition carried `metadata.confidence`, an
+`author` string and an `access_level`. KIP 2.0 separates those planes, and
+everything else follows from one line:
+
+```text
+a Proposition existing  ≠  the Proposition being true
+```
+
+A Proposition is now a truth-neutral tuple. An Assertion is one actor's
+commitment about it — stance, mode, confidence, Evidence, valid time. What is
+*currently believed* is projected from those Assertions and never stored, which
+is why correcting a claim records a new Assertion with `SUPERSEDING` instead of
+rewriting the old one.
+
+### Added
+
+- **Three new grammars** implementing `v2/grammar/KIP-2.0-{KQL,KML,META}.ebnf`.
+  KQL gains `ASSERTION` / `EVIDENCE` / `ACTIVITY` / `STRUCTURAL` patterns,
+  `BELIEF` and `BELIEF SLOT` projections, raw predicate paths with alternation
+  and hop quantifiers, `AS OF SEQ|TX|TIME` and `FOR TIME` as independent axes,
+  and `WITH EPISTEMIC`. KML gains `CREATE CONCEPT/EVIDENCE/ASSERTION/ACTIVITY`,
+  `UPSERT CONCEPT`, `ENSURE PROPOSITION`, the `ASSERT` sugar, `UPDATE`,
+  `RETRACT` / `SUPERSEDE` / `CORRECT`, `TRANSITION ACTIVITY`, `SET RETENTION`,
+  `ARCHIVE` / `TOMBSTONE` / `PURGE`, non-destructive `MERGE CONCEPT`, and
+  `SET`/`UNSET` for fields, attributes, facets and structural references. META
+  gains the full `DESCRIBE` / `LIST` / `SEARCH` / `VERIFY` / `VALIDATE` /
+  `PREVIEW` / `HISTORY` / `CHANGES` / `SNAPSHOT` / `EXPORT CAPSULE` families.
+  Keywords are now ASCII case-insensitive and contextual — `by`, `mode`, `key`,
+  `type` and `status` are all legal field names, as the spec's own examples
+  require — while `true` / `false` / `null` and `id` stay case-sensitive.
+- **Schema-independent validation at parse time**, so a command that would ask
+  an engine to corrupt the epistemic record never reaches one: `UPSERT CONCEPT`
+  must match `id` or `key` (a name is mutable and duplicable); an `UPDATE` may
+  not rewrite immutable Assertion, Evidence or Proposition payload; structural
+  mutation reaches Concept topology only; `_system`, `governance`, `space_id`
+  and `space_seq` are never author-writable; `ENSURE PROPOSITION (id: ...)` is
+  rejected because `(id: ...)` is match-only; `ASSERT` requires `by` and `mode`,
+  neither of which has a safe default; an update expression may read only the
+  element being updated; local handles must be unique and resolvable.
+- **`ast`** — a closed executable AST matching `exec-ast.ts` from
+  `@ldclabs/kip-lang` field for field under serde's externally-tagged encoding,
+  so the Rust and TypeScript implementations can be differentially tested.
+- **`error`** — the 79-code Core Error Registry (§87) with categories and retry
+  classes. `outcome_lookup_required` is the one to wire into client recovery: a
+  lost response is not proof a write failed, and re-issuing it is how duplicate
+  cognition gets created.
+- **`request`** — the 2.0 envelope (§71–§85): `operations[]` with per-operation
+  parameters and idempotency keys, `execution.mode` of
+  `independent`/`sequence`/`atomic`, ingestion contexts that mint Evidence from
+  the transport rather than from model-generated command text, snapshot
+  binding, preconditions, receipts, and the `partial` top-level status that
+  keeps a half-committed `sequence` from being reported as a total failure.
+- **`types`** — the Core data model (§6–§19) with no universal metadata bag.
+- **`capsule`** — portable Cognitive Capsules (§37–§41), import modes, identity
+  resolution order, and the `redacted` vs `unavailable` distinction.
+- **`executor::execute_request`** — runs `independent` and `sequence`, and
+  refuses `atomic` rather than emulating it.
+- **A differential test against `@ldclabs/kip-lang`** —
+  `tests/fixtures/kip_lang_ast.json` holds 76 command → AST pairs produced by
+  the reference TypeScript implementation, covering every KQL pattern family,
+  every KML mutation family and every META statement family. `anda_kip` decodes
+  all of them to byte-identical trees, in both directions. Plus
+  `tests/syntax_docs.rs`, which parses every executable example in the bundled
+  `KIPSyntax.md`.
+
+### Changed
+
+- **`Response` is a struct, not an enum**: `{status, results[], receipt,
+  warnings, ...}` per §81, with `succeeded` / `failed` / `partial` /
+  `outcome_unknown` at the top level.
+- **`execute_readonly` rejects writes by parsed semantics**, and now reports
+  `ReadonlyViolation` instead of borrowing the syntax-error code.
+- **A declared operation `language` can no longer relabel a write as a read** —
+  a mismatch is `LanguageMismatch` (§73.1, §88.3).
+- **Bundled prompts and tool schemas rewritten for 2.0**: `SPECIFICATION.md` and
+  `KIPSyntax.md` are copies of the v2 documents; `SelfInstructions.md`,
+  `SystemInstructions.md`, `FunctionDefinition.json` and
+  `FunctionDefinitionReadonly.json` are new, and `KIP_SYNTAX` is exported
+  alongside the existing statics.
+
+### Removed
+
+- **The genesis capsules** (`capsules/*.kip`, `GENESIS_KIP`, `PERSON_KIP`, the
+  `*_PROP_KIP` predicate sources, `META_CONCEPT_TYPE` and friends). KIP 2.0
+  Schema is immutable Package state; a schema graph node is not authoritative
+  Schema (§103.9), and these files are 1.x `UPSERT` scripts the 2.0 parser
+  cannot read. `capsule.rs` now models Cognitive Capsules instead.
+- **`ConceptNode` / `PropositionLink` / `Entity` / `UpsertResult` and the
+  `metadata.*` constants**, superseded by the five Core element kinds.
+- **The numeric `KIP_xxxx` error codes**, superseded by the named registry.
+
+### Downstream ports
+
+- **`anda_cognitive_nexus` was rewritten, not migrated.** The 1.x engine that
+  lived here is deleted; 2.0 is a different data model, and a renamed 1.x engine
+  would have been a worse lie than an absent one. The new engine implements
+  `Executor` over nine `anda_db` collections and runs KML transactions, KQL
+  reads, the Epistemic Projection, the META families, and Cognitive Capsule
+  export/verification. What it deliberately does **not** do — Capsule import,
+  Governance, trust and evidence-quality evaluation, `AS OF`, hop quantifiers,
+  `UPDATE`/`PURGE`/`MERGE CONCEPT`, semantic `SEARCH`, Capsule signatures,
+  atomic batches — is reported by `DESCRIBE CAPABILITIES` as structured data
+  with a reason, and refused rather than answered wrongly. The crate now ships
+  the baseline cognitive-memory profile as `profiles/cognitive-memory-2.0.0.json`
+  (`profiles::COGNITIVE_MEMORY`), vendored verbatim from the spec repository,
+  and `CognitiveNexus::ensure_schema` activates a Schema Lock only when it
+  differs from the one already in force.
+- **Both time axes now answer.** `AS OF SEQ | TX | TIME` reads the Space at a
+  past coordinate, and `SNAPSHOT` issues a token a later request binds to
+  through `read.snapshot_token`. This needed state the engine did not keep: a
+  row is updated in place, so version 3 overwrites version 2 and version 2 is
+  gone. Every commit now appends the complete row it wrote to a version log —
+  in the same commit as the row, because a history written afterwards can be
+  missing exactly the write a crash interrupted, and a history with a hole
+  answers wrongly instead of refusing. A historical pattern cannot use the
+  indexes (they describe the present), so it reconstructs its candidates from
+  that log and re-checks every constraint against the element as it stood;
+  the cost is charged to the same query budget. `AS OF` resolves symbols
+  through the Schema Environment that was in force *then* (§144), the
+  projection sees only the Assertions of its coordinate, and a request bound to
+  one coordinate whose command names another is refused rather than silently
+  preferring one. `SEARCH ... AS OF SEQ` stays unsupported: the index reflects
+  the present, and reporting today's matches as if they were then's is the one
+  answer worse than none.
+- **Hop-quantified paths traverse.** `(?a, "leads_to"{1,3}, ?b)` walks the raw
+  Proposition graph, from whichever end is pinned — including by an earlier
+  pattern in the same block, which is what made `Context::bound` real rather
+  than a field nothing wrote. Binding a variable to a multi-hop path is
+  refused: the walk is not a Proposition, and naming one of the tuples it
+  crossed would name a claim the query never asked about. A path reports
+  reachability, never belief (§45).
+- **Capsule import performs the semantic merge.** Identity resolves in the
+  spec's order (§38.2) — a prior import of the same artifact, a trusted
+  `canonical_id`, then a Proposition's own tuple — and the mapping lives on the
+  elements as their `client_key`, so a re-import after a restart resolves to
+  what the first import created rather than duplicating it. Every reference is
+  rewritten onto destination ids; a Capsule citing something it does not carry
+  is refused whole. The source's Space-local `key` stays at the source (§5.3),
+  the epistemic payload arrives unchanged, and what *this* runtime observed —
+  the import — is stamped into engine origin (§27). Import is a host API
+  (`CognitiveNexus::import_capsule`), not a command: KML has no import clause
+  and META is read-only, so no prompt decides that a Space accepts another
+  Brain's cognition. Two bugs surfaced on the way: an `EvidenceRef` spells its
+  target `evidence_id`, so citations were being written through unrewritten,
+  and the derived `evidence_ids` index column came out empty for the same
+  reason.
+- **The mutation path selects what it acts on.** `UPDATE` and `MERGE CONCEPT`
+  are implemented, and `WHERE` selection blocks with `LIMIT` now work on
+  `UPDATE`, `RETRACT ASSERTION`, `SET RETENTION`, `ARCHIVE` and `TOMBSTONE`.
+  Three decisions a second engine has to match, all pinned by
+  `fixtures/kip-conformance-2.0/mutation-selection.json`: a selection block
+  reads the state the **transaction started from**, so a sweep cannot act on
+  what the same `MUTATE` just created (clause order carries no mutation
+  semantics, §24); `LIMIT` cuts in **ascending element id**, which §52.7 permits
+  a runtime to document and which makes a bounded sweep repeatable; and a block
+  that matches nothing is a `no_effect`, not an error — `UPDATE` never creates.
+  `UPDATE`'s reach is enforced against the element the engine loaded, not
+  against what the command looked like, because `UPDATE :A-7` names an id and
+  only the engine knows what wears it: an Assertion answers
+  `EpistemicRevisionRequired`, Evidence `EvidenceCorrectionRequired`, an
+  Activity `InvalidLifecycleTransition`, each naming the ritual that *is* legal.
+  `MERGE CONCEPT` is non-destructive (§11.1) — the source keeps its state and
+  gains `merged_into`, cycles and re-pointing are refused — and a new write
+  canonicalizes a merged reference to the survivor (§11.3), without rewriting
+  the history that referred to it (§11.2). `PURGE` remains refused: erasure is a
+  Governance decision this engine cannot make.
+- **Two defects surfaced by that work**: `UPSERT CONCEPT` parsed
+  `UNSET FACET` / `SET STRUCTURAL` / `UNSET STRUCTURAL` and silently dropped
+  them (both clause families now run through one applier), and a structural
+  reference written from a `:parameter` was stored as a bare id string rather
+  than `{"id": …}`, so the edge existed but no `STRUCTURAL (…)` pattern could
+  follow it. A Facet's local name now also resolves in a dot path —
+  `?m.facets["MnemonicState"].salience` — on both the read and the write side,
+  instead of quietly reading `null` outside its canonical `kip://…` spelling.
+- **`anda_cognitive_nexus_server` speaks the 2.0 envelope.** `execute_kip`'s
+  `params` is now the KIP 2.0 request envelope rather than a bare command:
+  `{"kip": "2.0", "operations": [{"command": "..."}]}`. Execution goes through
+  `execute_request`, so `independent` and `sequence` batches run and `atomic` is
+  refused with `UnsupportedCapability` instead of being downgraded. HTTP status
+  mapping follows the named registry (§87) — including `207` for a `partial`
+  batch, whose earlier commits are durable, and `501` for a capability this
+  runtime declares it lacks. The `$self` genesis KML and `SELF_PRINCIPAL_ID` are
+  **removed**: a `Person` is not a Principal (§88.1), Principals are Governance
+  state, and this runtime has no Governance plane. In their place, the server
+  installs and activates the bundled cognitive-memory profile in the default
+  Space, extensible with `SCHEMA_PACKAGE` / `--schema-package`. The `kip_logs`
+  audit document records `languages` (classified from the parsed commands, never
+  from the advisory `operation.language`) and the response's status, `tx_id` and
+  errors; the size cap now also bounds `ingest` payloads and client-supplied
+  correlation metadata. A mutation that overruns its *response* deadline now
+  answers `outcome_unknown` instead of `ExecutionTimeout`: the execution is
+  deliberately not cancelled, so it may still commit, and `ExecutionTimeout`'s
+  registered retry class (`safe_same_request`) would have invited the client to
+  write the same cognition twice.
+- **`anda_kip_wasm` reports the 2.0 error shape.** `error_catalog()` enumerates
+  `KipErrorCode::ALL` with each code's category, retry class and hint, so a code
+  added to `anda_kip` cannot be missed by the generated TypeScript table, and
+  parse failures carry the full `ErrorObject` — `retry` included, because
+  flattening `outcome_lookup_required` into "it failed" is how a lost write
+  becomes a duplicated one. `ts/kip-do` consumes this and has not been migrated:
+  its `scripts/codegen-errors.mjs` reads the 1.x shape of `error.rs` and will
+  need to be rewritten with the rest of that package.
+- **`py/anda_cognitive_nexus_py` builds a 2.0 envelope.** `execute_kip` wraps
+  the command in a single-operation request, binds parameters as request-level
+  bindings, and returns `(CommandType, Response)` instead of a `Result` whose
+  `Err` never happened — a KIP failure is an answer with a code, a hint and a
+  retry class, and flattening it into a Python string throws away everything
+  the caller needs to recover. `create_kip_db` activates the bundled
+  cognitive-memory profile, so `$ConceptType` bootstrapping is gone: a type is
+  a Schema Package symbol now, not something a write can invent.
+
 ## [KIP v1.0-RC11] — 2026-08-14
 
 `anda_kip` 0.11.1 · `anda_cognitive_nexus` 0.11.1 · `@ldclabs/kip-do` 0.12.2.

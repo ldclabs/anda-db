@@ -1,7 +1,7 @@
 {
   "name": "@ldclabs/kip-do",
   "version": "0.12.2",
-  "description": "KIP (Knowledge Interaction Protocol) knowledge graph engine on SQLite-backed Cloudflare Durable Objects \u2014 one KIP database per Durable Object.",
+  "description": "KIP 2.0 (Knowledge Interaction Protocol) Cognitive Nexus on SQLite-backed Cloudflare Durable Objects \u2014 one Nexus per Durable Object.",
   "keywords": [
     "kip",
     "knowledge-graph",
@@ -44,9 +44,10 @@
     "test:conformance": "vitest run conformance",
     "test:oracle": "vitest run parser-oracle",
     "codegen:errors": "node scripts/codegen-errors.mjs",
-    "codegen:capsules": "node scripts/codegen-capsules.mjs",
     "codegen:oracle-corpus": "node scripts/codegen-oracle-corpus.mjs",
-    "prepublishOnly": "pnpm run codegen:errors && pnpm run codegen:capsules && pnpm run build",
+    "codegen:profiles": "node scripts/codegen-profiles.mjs",
+    "codegen:fixtures": "node scripts/codegen-fixtures.mjs",
+    "prepublishOnly": "pnpm run codegen:errors && pnpm run codegen:profiles && pnpm run build",
     "ncu": "npx npm-check-updates -u"
   },
   "devDependencies": {
@@ -60,6 +61,6 @@
     "node": ">=20"
   },
   "dependencies": {
-    "@ldclabs/kip-lang": "^0.4.0"
+    "@ldclabs/kip-lang": "^2.0.1"
   }
 }

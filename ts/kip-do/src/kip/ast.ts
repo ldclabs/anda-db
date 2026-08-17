@@ -1,16 +1,17 @@
 /**
- * The executable KIP AST this engine runs.
+ * The executable KIP 2.0 AST this engine runs.
  *
- * The definitions live in `@ldclabs/kip-lang`, which produces them: `lower`
- * is what collapses a syntax tree into these shapes, so the types and the code
+ * The definitions live in `@ldclabs/kip-lang`, which produces them: `lower` is
+ * what collapses a syntax tree into these shapes, so the types and the code
  * that builds them cannot drift apart. They are re-exported under their local
  * names — kip-lang prefixes the ones that collide with a syntax-tree node —
  * so `src/exec/` imports its AST from one place.
  *
  * There are no runtime narrowing helpers here on purpose. `lower` closes every
- * enum before the executor sees it, so a `switch` over these tags is total and
- * TypeScript checks it; the old `tagOf`/`isUnit` pair existed only because the
- * AST used to arrive as untyped JSON.
+ * enum before the executor sees it: an unknown filter function, a predicate
+ * path where an exact predicate is required, an UPDATE expression reading a
+ * foreign variable, `ASSERT` sugar still un-desugared — all are rejected there.
+ * A `switch` over these tags is therefore total, and TypeScript checks it.
  *
  * The shape is the wire form of `anda_kip`'s Rust AST (serde's default
  * externally-tagged encoding), which is what lets `test/parser-oracle.test.ts`
@@ -18,42 +19,94 @@
  */
 
 export type {
-  Json,
-  KipValue,
+  // Root
   Command,
+  BoundValue,
+  KipValue,
+  Scalar,
+  // `SymbolRef` upstream. Renamed because the schema layer's `SymbolRef` is
+  // the resolved canonical symbol, and this is the unresolved slot a command
+  // writes one into — two different things one name away from each other.
+  SymbolRef as SymbolSlot,
+  ElementRef,
+  // Shared terms
+  DotPathVar,
+  PathStep,
+  PredAtom,
+  PredTerm,
+  PredPathAtom,
+  HopRange,
+  ExecTerm as Term,
+  ObjectMatcher,
+  MatchValue,
+  PropositionMatcher,
+  // KQL
   KqlQuery,
   FindClause,
-  DotPathVar,
   FindExpression,
   AggregationFunction,
+  AsOf,
   OrderByItem,
   OrderDirection,
   ExecWhereClause as WhereClause,
-  ExecConceptMatcher as ConceptMatcher,
-  PropositionMatcher,
-  TargetTerm,
-  PredTerm,
+  BeliefTarget,
   FilterExpression,
   FilterOperand,
+  FilterFunction,
   ComparisonOperator,
   LogicalOperator,
-  FilterFunction,
-  KmlStatement,
-  ExecUpsertBlock as UpsertBlock,
-  UpsertItem,
-  ExecConceptBlock as ConceptBlock,
-  SetProposition,
-  ExecPropositionBlock as PropositionBlock,
-  ExecUpdateStatement as UpdateStatement,
-  UpdateValue,
+  // KML
+  ExecKmlStatement as KmlStatement,
+  ExecMutationClause as MutationClause,
+  ConceptCreate,
+  ConceptUpsert,
+  RecordCreate,
+  EnsureProposition,
+  FacetAssignment,
+  FacetUnset,
+  StructuralEdge,
+  ExecStructuralRemoval as StructuralRemoval,
+  Assignments,
+  MutationValue,
   UpdateExpr,
   UpdateFunction,
-  ExecMergeStatement as MergeStatement,
-  ExecDeleteStatement as DeleteStatement,
+  ExecUpdateStatement as UpdateStatement,
+  ExecUpdateAction as UpdateAction,
+  RetractAssertion,
+  SupersedeAssertion,
+  CorrectEvidence,
+  TransitionActivity,
+  SetRetention,
+  RemovalStatement,
+  ExecPurgeStatement as PurgeStatement,
+  MergeConcept,
+  // META
   MetaCommand,
   DescribeTarget,
+  ListCommand,
+  ListTarget,
   SearchCommand,
   SearchTarget,
-  SearchMode,
-  ExportCommand,
+  VerifyTarget,
+  ValidateCommand,
+  ValidateTarget,
+  PreviewCommand,
+  HistoryCommand,
+  ChangesCommand,
+  ExportCapsuleCommand,
 } from '@ldclabs/kip-lang'
+
+import type { PropositionMatcher } from '@ldclabs/kip-lang'
+
+/**
+ * `(subject, predicate, object)` — the structural form of a Proposition.
+ *
+ * kip-lang builds this type but does not export it by name, so it is recovered
+ * from the matcher that carries it. Deriving it beats redeclaring it: a field
+ * added upstream arrives here, and one renamed upstream fails to compile
+ * instead of quietly describing a shape that no longer exists.
+ */
+export type PropositionTriple = Extract<
+  PropositionMatcher,
+  { Tuple: unknown }
+>['Tuple']

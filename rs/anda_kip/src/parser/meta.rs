@@ -1,641 +1,615 @@
+//! META — introspection, grounding, verification, history and export
+//! (Spec §63–§69).
+//!
+//! META is semantically read-only: syntax acceptance never implies access, and
+//! nothing here can change durable state.
+
 use nom::{
     Parser,
     branch::alt,
-    combinator::{cut, map, map_res, opt, value},
-    error::context,
+    combinator::{cut, map, opt, value},
     sequence::preceded,
 };
-use std::str::FromStr;
 
-use super::common::*;
-use super::json::parse_number;
-use super::kql::{parse_cursor_clause, parse_limit_clause, parse_where_block};
-use crate::ast::*;
+use super::common::{
+    Flavor, VResult, bound_object, element_ref, fail, opt_after, scalar, where_block, word, words,
+    ws,
+};
+use super::kql::as_of_clause;
+use crate::ast::{
+    ChangesCommand, DescribeTarget, ExportCapsuleCommand, HistoryCommand, ListCommand, ListTarget,
+    MetaCommand, PreviewCommand, Scalar, SearchCommand, SearchTarget, ValidateCommand,
+    ValidateTarget, VerifyTarget,
+};
 
-// --- Top Level META Parser ---
-
+/// Parses one META command.
 pub fn parse_meta_command(input: &str) -> VResult<'_, MetaCommand> {
-    context(
-        "META command: DESCRIBE ... | SEARCH ... | EXPORT ...",
-        alt((
-            map(parse_describe_command, MetaCommand::Describe),
-            map(parse_search_command, MetaCommand::Search),
-            map(parse_export_command, MetaCommand::Export),
-        )),
-    )
+    alt((
+        map(describe, MetaCommand::Describe),
+        map(list, MetaCommand::List),
+        map(search, MetaCommand::Search),
+        verify,
+        map(validate, MetaCommand::Validate),
+        map(preview, MetaCommand::Preview),
+        map(history, MetaCommand::History),
+        map(changes, MetaCommand::Changes),
+        snapshot,
+        map(export_capsule, MetaCommand::ExportCapsule),
+    ))
     .parse(input)
 }
 
-// --- DESCRIBE ---
+// ---------------------------------------------------------------------------
+// DESCRIBE
+// ---------------------------------------------------------------------------
 
-fn parse_describe_command(input: &str) -> VResult<'_, DescribeTarget> {
-    preceded(
-        ws(keyword("DESCRIBE")),
-        ws(alt((
-            context(
-                "DESCRIBE PRIMER",
-                value(DescribeTarget::Primer, ws(word("PRIMER"))),
-            ),
-            context(
-                "DESCRIBE DOMAINS",
-                value(DescribeTarget::Domains, ws(word("DOMAINS"))),
-            ),
-            context(
-                "DESCRIBE CONCEPT TYPES",
-                map(
-                    preceded(
-                        ws(keywords(&["CONCEPT", "TYPES"])),
-                        (opt(ws(parse_limit_clause)), opt(ws(parse_cursor_clause))),
-                    ),
-                    |(limit, cursor)| DescribeTarget::ConceptTypes { limit, cursor },
-                ),
-            ),
-            context(
-                "DESCRIBE CONCEPT TYPE \"<TypeName>\"",
-                map(
-                    preceded(keywords(&["CONCEPT", "TYPE"]), ws(quoted_string)),
-                    DescribeTarget::ConceptType,
-                ),
-            ),
-            context(
-                "DESCRIBE PROPOSITION TYPES",
-                map(
-                    preceded(
-                        ws(keywords(&["PROPOSITION", "TYPES"])),
-                        (opt(ws(parse_limit_clause)), opt(ws(parse_cursor_clause))),
-                    ),
-                    |(limit, cursor)| DescribeTarget::PropositionTypes { limit, cursor },
-                ),
-            ),
-            context(
-                "DESCRIBE PROPOSITION TYPE \"<predicate>\"",
-                map(
-                    preceded(keywords(&["PROPOSITION", "TYPE"]), ws(quoted_string)),
-                    DescribeTarget::PropositionType,
-                ),
-            ),
-        ))),
-    )
-    .parse(input)
-}
-
-// --- SEARCH ---
-fn parse_search_command(input: &str) -> VResult<'_, SearchCommand> {
-    context(
-        "SEARCH CONCEPT|PROPOSITION \"<term>\" [WITH TYPE \"<Type>\"] [MODE \"keyword\"|\"semantic\"|\"hybrid\"] [THRESHOLD <0.0-1.0>] [LIMIT N]",
+fn describe(input: &str) -> VResult<'_, DescribeTarget> {
+    let (input, _) = ws(word("DESCRIBE")).parse(input)?;
+    cut(alt((
+        // Multi-word targets first: `SCHEMA ENVIRONMENT` and `STRUCTURAL FIELD`
+        // would otherwise be read as a one-word target with a stray operand.
         map(
-            preceded(
-                ws(keyword("SEARCH")),
-                (
-                    ws(alt((
-                        value(SearchTarget::Concept, keyword("CONCEPT")),
-                        value(SearchTarget::Proposition, keyword("PROPOSITION")),
-                    ))),
-                    ws(quoted_string),
-                    opt(preceded(keywords(&["WITH", "TYPE"]), ws(quoted_string))),
-                    opt(preceded(keyword("MODE"), cut(ws(parse_search_mode)))),
-                    opt(preceded(
-                        keyword("THRESHOLD"),
-                        cut(ws(parse_search_threshold)),
-                    )),
-                    opt(ws(parse_limit_clause)),
-                ),
-            ),
-            |(target, term, in_type, mode, threshold, limit)| SearchCommand {
-                target,
-                term,
-                in_type,
-                mode,
-                threshold,
-                limit,
-            },
+            preceded(ws(words(&["SCHEMA", "ENVIRONMENT"])), opt(ws(as_of_clause))),
+            |as_of| DescribeTarget::SchemaEnvironment { as_of },
         ),
-    )
-    .parse(input)
-}
-
-fn parse_search_mode(input: &str) -> VResult<'_, SearchMode> {
-    context(
-        "SEARCH MODE: \"keyword\" | \"semantic\" | \"hybrid\"",
-        map_res(quoted_string, |s| SearchMode::from_str(&s)),
-    )
-    .parse(input)
-}
-
-fn parse_search_threshold(input: &str) -> VResult<'_, Number> {
-    context(
-        "SEARCH THRESHOLD: a number between 0.0 and 1.0",
-        map_res(parse_number, |n| {
-            let v = n.as_f64().unwrap_or(-1.0);
-            if (0.0..=1.0).contains(&v) {
-                Ok(n)
-            } else {
-                Err(format!("THRESHOLD must be between 0.0 and 1.0, got {n}"))
-            }
+        map(
+            preceded(ws(words(&["EXECUTION", "CONTEXT"])), nothing),
+            |_| DescribeTarget::ExecutionContext,
+        ),
+        map(
+            preceded(ws(words(&["STRUCTURAL", "FIELD"])), cut(ws(scalar))),
+            DescribeTarget::StructuralField,
+        ),
+        map(
+            preceded(ws(words(&["EPISTEMIC", "POLICY"])), opt(ws(scalar))),
+            |value| DescribeTarget::EpistemicPolicy { value },
+        ),
+        map(
+            preceded(ws(words(&["PROJECTION", "CAPABILITY"])), nothing),
+            |_| DescribeTarget::ProjectionCapability,
+        ),
+        map(
+            preceded(ws(word("PRIMER")), opt_after(&["MODE"], ws(scalar))),
+            |mode| DescribeTarget::Primer { mode },
+        ),
+        value(DescribeTarget::Protocol, ws(word("PROTOCOL"))),
+        value(DescribeTarget::Capabilities, ws(word("CAPABILITIES"))),
+        map(preceded(ws(word("SPACE")), opt(ws(scalar))), |value| {
+            DescribeTarget::Space { value }
         }),
-    )
-    .parse(input)
-}
-
-// --- EXPORT ---
-fn parse_export_command(input: &str) -> VResult<'_, ExportCommand> {
-    context(
-        "EXPORT ?target WHERE { ... } [LIMIT N] [CURSOR \"<token>\"]",
+        map(
+            preceded(ws(word("PACKAGE")), cut(ws(scalar))),
+            DescribeTarget::Package,
+        ),
+        map(
+            preceded(ws(word("TYPE")), cut(ws(scalar))),
+            DescribeTarget::Type,
+        ),
+        map(
+            preceded(ws(word("PREDICATE")), cut(ws(scalar))),
+            DescribeTarget::Predicate,
+        ),
+        map(
+            preceded(ws(word("FACET")), cut(ws(scalar))),
+            DescribeTarget::Facet,
+        ),
         map(
             preceded(
-                ws(keyword("EXPORT")),
+                ws(word("COMPATIBILITY")),
                 cut((
-                    ws(variable),
-                    parse_where_block,
-                    opt(ws(parse_limit_clause)),
-                    opt(ws(parse_cursor_clause)),
+                    preceded(ws(word("FROM")), cut(ws(scalar))),
+                    preceded(ws(word("TO")), cut(ws(scalar))),
                 )),
             ),
-            |(target, where_clauses, limit, cursor)| ExportCommand {
-                target,
-                where_clauses,
+            |(from, to)| DescribeTarget::Compatibility { from, to },
+        ),
+        map(
+            preceded(ws(word("ERROR")), cut(ws(scalar))),
+            DescribeTarget::Error,
+        ),
+        describe_transaction,
+        map(
+            preceded(ws(word("SNAPSHOT")), opt(ws(as_of_clause))),
+            |as_of| DescribeTarget::Snapshot { as_of },
+        ),
+        map(
+            preceded(ws(word("CAPSULE")), cut(ws(scalar))),
+            DescribeTarget::Capsule,
+        ),
+        map(preceded(ws(word("TRUST")), opt(ws(scalar))), |value| {
+            DescribeTarget::Trust { value }
+        }),
+        map(
+            preceded(ws(word("ACCESS")), opt_after(&["WITH"], ws(bound_object))),
+            |with| DescribeTarget::Access { with },
+        ),
+    )))
+    .parse(input)
+}
+
+fn describe_transaction(input: &str) -> VResult<'_, DescribeTarget> {
+    let (input, _) = ws(word("TRANSACTION")).parse(input)?;
+    cut(alt((
+        map(
+            preceded(ws(words(&["BY", "IDEMPOTENCY", "KEY"])), cut(ws(scalar))),
+            DescribeTarget::TransactionByIdempotencyKey,
+        ),
+        map(ws(scalar), DescribeTarget::Transaction),
+    )))
+    .parse(input)
+}
+
+/// A target that takes no operand still has to consume nothing successfully.
+fn nothing(input: &str) -> VResult<'_, ()> {
+    Ok((input, ()))
+}
+
+// ---------------------------------------------------------------------------
+// LIST
+// ---------------------------------------------------------------------------
+
+fn list(input: &str) -> VResult<'_, ListCommand> {
+    let (input, _) = ws(word("LIST")).parse(input)?;
+    let (input, (target, status)) = cut(alt((
+        map(
+            preceded(
+                ws(words(&["SCHEMA", "PACKAGES"])),
+                opt_after(&["STATUS"], ws(scalar)),
+            ),
+            |status| (ListTarget::SchemaPackages, status),
+        ),
+        map(ws(words(&["STRUCTURAL", "FIELDS"])), |_| {
+            (ListTarget::StructuralFields, None)
+        }),
+        map(ws(words(&["EPISTEMIC", "POLICIES"])), |_| {
+            (ListTarget::EpistemicPolicies, None)
+        }),
+        map(ws(word("SPACES")), |_| (ListTarget::Spaces, None)),
+        map(ws(word("TYPES")), |_| (ListTarget::Types, None)),
+        map(ws(word("PREDICATES")), |_| (ListTarget::Predicates, None)),
+        map(ws(word("FACETS")), |_| (ListTarget::Facets, None)),
+    )))
+    .parse(input)?;
+
+    let (input, (limit, cursor)) = paging(input)?;
+    Ok((
+        input,
+        ListCommand {
+            target,
+            status,
+            limit,
+            cursor,
+        },
+    ))
+}
+
+/// `paging_clauses = LIMIT v [ CURSOR v ] | CURSOR v`
+fn paging(input: &str) -> VResult<'_, (Option<Scalar>, Option<Scalar>)> {
+    let (input, limit) = opt_after(&["LIMIT"], ws(scalar)).parse(input)?;
+    let (input, cursor) = opt_after(&["CURSOR"], ws(scalar)).parse(input)?;
+    Ok((input, (limit, cursor)))
+}
+
+// ---------------------------------------------------------------------------
+// SEARCH
+// ---------------------------------------------------------------------------
+
+fn search(input: &str) -> VResult<'_, SearchCommand> {
+    let (input, _) = ws(word("SEARCH")).parse(input)?;
+    let (input, target) = cut(ws(alt((
+        value(SearchTarget::Concept, word("CONCEPT")),
+        value(SearchTarget::Proposition, word("PROPOSITION")),
+        value(SearchTarget::Assertion, word("ASSERTION")),
+        value(SearchTarget::Evidence, word("EVIDENCE")),
+        value(SearchTarget::Activity, word("ACTIVITY")),
+        value(SearchTarget::Cognition, word("COGNITION")),
+    ))))
+    .parse(input)?;
+
+    let (input, term) = cut(ws(scalar)).parse(input)?;
+    let (input, with_type) = opt_after(&["WITH", "TYPE"], ws(scalar)).parse(input)?;
+    let (input, with_predicate) = opt_after(&["WITH", "PREDICATE"], ws(scalar)).parse(input)?;
+    let (input, mode) = opt_after(&["MODE"], ws(scalar)).parse(input)?;
+    let (input, threshold) = opt_after(&["THRESHOLD"], ws(scalar)).parse(input)?;
+    let (input, as_of_seq) = opt_after(&["AS", "OF", "SEQ"], ws(scalar)).parse(input)?;
+    let (input, (limit, cursor)) = paging(input)?;
+
+    Ok((
+        input,
+        SearchCommand {
+            target,
+            term,
+            with_type,
+            with_predicate,
+            mode,
+            threshold,
+            as_of_seq,
+            limit,
+            cursor,
+        },
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// VERIFY / VALIDATE / PREVIEW
+// ---------------------------------------------------------------------------
+
+fn verify(input: &str) -> VResult<'_, MetaCommand> {
+    let (input, _) = ws(word("VERIFY")).parse(input)?;
+    let (input, target) = cut(ws(alt((
+        value(VerifyTarget::SchemaPackage, words(&["SCHEMA", "PACKAGE"])),
+        value(VerifyTarget::Capsule, map(word("CAPSULE"), |_| ())),
+        value(VerifyTarget::Receipt, map(word("RECEIPT"), |_| ())),
+        value(VerifyTarget::Blob, map(word("BLOB"), |_| ())),
+        value(VerifyTarget::Checkpoint, map(word("CHECKPOINT"), |_| ())),
+    ))))
+    .parse(input)?;
+    let (input, value) = cut(ws(scalar)).parse(input)?;
+    Ok((input, MetaCommand::Verify { target, value }))
+}
+
+fn validate(input: &str) -> VResult<'_, ValidateCommand> {
+    let (input, _) = ws(word("VALIDATE")).parse(input)?;
+    let (input, target) = cut(ws(alt((
+        value(ValidateTarget::SchemaPackage, words(&["SCHEMA", "PACKAGE"])),
+        value(ValidateTarget::ImportPlan, words(&["IMPORT", "PLAN"])),
+        value(ValidateTarget::Kql, map(word("KQL"), |_| ())),
+        value(ValidateTarget::Kml, map(word("KML"), |_| ())),
+        value(ValidateTarget::Capsule, map(word("CAPSULE"), |_| ())),
+    ))))
+    .parse(input)?;
+    let (input, value) = cut(ws(scalar)).parse(input)?;
+    let (input, options) = opt_after(&["WITH"], ws(bound_object)).parse(input)?;
+    Ok((
+        input,
+        ValidateCommand {
+            target,
+            value,
+            options,
+        },
+    ))
+}
+
+fn preview(input: &str) -> VResult<'_, PreviewCommand> {
+    let (input, _) = ws(word("PREVIEW")).parse(input)?;
+    cut(alt((
+        map(
+            preceded(
+                ws(words(&["IMPORT", "CAPSULE"])),
+                cut((ws(scalar), preceded(ws(word("INTO")), cut(ws(scalar))))),
+            ),
+            |(capsule, into)| PreviewCommand::ImportCapsule { capsule, into },
+        ),
+        map(
+            preceded(ws(word("KML")), cut(ws(scalar))),
+            PreviewCommand::Kml,
+        ),
+    )))
+    .parse(input)
+}
+
+// ---------------------------------------------------------------------------
+// HISTORY / CHANGES / SNAPSHOT
+// ---------------------------------------------------------------------------
+
+fn history(input: &str) -> VResult<'_, HistoryCommand> {
+    let (input, _) = ws(word("HISTORY")).parse(input)?;
+
+    if let Ok((input, _)) = ws(word("SPACE")).parse(input) {
+        let (input, (from_seq, to_seq, limit, cursor)) = history_range(input)?;
+        return Ok((
+            input,
+            HistoryCommand::Space {
+                from_seq,
+                to_seq,
                 limit,
                 cursor,
             },
+        ));
+    }
+
+    let (input, _) = cut(ws(word("ELEMENT"))).parse(input)?;
+    let (input, value) = cut(ws(scalar)).parse(input)?;
+    let (input, (from_seq, to_seq, limit, cursor)) = history_range(input)?;
+    Ok((
+        input,
+        HistoryCommand::Element {
+            value,
+            from_seq,
+            to_seq,
+            limit,
+            cursor,
+        },
+    ))
+}
+
+type HistoryRange = (
+    Option<Scalar>,
+    Option<Scalar>,
+    Option<Scalar>,
+    Option<Scalar>,
+);
+
+fn history_range(input: &str) -> VResult<'_, HistoryRange> {
+    let (input, from_seq) = opt_after(&["FROM", "SEQ"], ws(scalar)).parse(input)?;
+    let (input, to_seq) = opt_after(&["TO", "SEQ"], ws(scalar)).parse(input)?;
+    let (input, (limit, cursor)) = paging(input)?;
+    Ok((input, (from_seq, to_seq, limit, cursor)))
+}
+
+fn changes(input: &str) -> VResult<'_, ChangesCommand> {
+    let (input, _) = ws(word("CHANGES")).parse(input)?;
+    cut(alt((
+        map(
+            (
+                preceded(ws(words(&["AFTER", "SEQ"])), cut(ws(scalar))),
+                opt_after(&["LIMIT"], ws(scalar)),
+            ),
+            |(seq, limit)| ChangesCommand::AfterSeq { seq, limit },
         ),
-    )
+        map(
+            (
+                preceded(ws(word("SINCE")), cut(ws(scalar))),
+                opt_after(&["LIMIT"], ws(scalar)),
+            ),
+            |(cursor, limit)| ChangesCommand::Since { cursor, limit },
+        ),
+    )))
     .parse(input)
+}
+
+fn snapshot(input: &str) -> VResult<'_, MetaCommand> {
+    let (input, _) = ws(word("SNAPSHOT")).parse(input)?;
+    let (input, as_of) = opt(ws(as_of_clause)).parse(input)?;
+    Ok((input, MetaCommand::Snapshot { as_of }))
+}
+
+// ---------------------------------------------------------------------------
+// EXPORT CAPSULE
+// ---------------------------------------------------------------------------
+
+fn export_capsule(input: &str) -> VResult<'_, ExportCapsuleCommand> {
+    let (input, _) = ws(words(&["EXPORT", "CAPSULE"])).parse(input)?;
+    let (input, target) = cut(ws(element_ref)).parse(input)?;
+    let (input, _) = cut(ws(word("WHERE"))).parse(input)?;
+    // BELIEF stays an interpretation primitive, not an export selector, so the
+    // selection uses the raw pattern flavor.
+    let (input, where_clauses) = cut(|i| where_block(i, Flavor::Exact)).parse(input)?;
+    let (input, options) = opt_after(&["WITH"], ws(bound_object)).parse(input)?;
+    let (input, as_of) = opt(ws(as_of_clause)).parse(input)?;
+
+    if where_clauses.is_empty() {
+        return fail(
+            input,
+            "at least one selection pattern: an unbounded EXPORT is not a Capsule",
+        );
+    }
+
+    Ok((
+        input,
+        ExportCapsuleCommand {
+            target,
+            where_clauses,
+            options,
+            as_of,
+        },
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::AsOf;
 
-    #[test]
-    fn test_parse_meta_command() {
-        // Test DESCRIBE commands
-        assert_eq!(
-            parse_meta_command("DESCRIBE PRIMER"),
-            Ok(("", MetaCommand::Describe(DescribeTarget::Primer)))
-        );
-        assert_eq!(
-            parse_meta_command("DESCRIBE DOMAINS"),
-            Ok(("", MetaCommand::Describe(DescribeTarget::Domains)))
-        );
-
-        // Test SEARCH commands
-        assert_eq!(
-            parse_meta_command("SEARCH CONCEPT \"aspirin\""),
-            Ok((
-                "",
-                MetaCommand::Search(SearchCommand {
-                    target: SearchTarget::Concept,
-                    term: "aspirin".to_string(),
-                    in_type: None,
-                    mode: None,
-                    threshold: None,
-                    limit: None,
-                })
-            ))
-        );
-
-        // Test with whitespace
-        assert_eq!(
-            parse_meta_command("  DESCRIBE   PRIMER  "),
-            Ok(("", MetaCommand::Describe(DescribeTarget::Primer)))
-        );
-
-        // Test invalid command
-        assert!(parse_meta_command("INVALID COMMAND").is_err());
+    fn meta(input: &str) -> MetaCommand {
+        let (rest, command) =
+            parse_meta_command(input).unwrap_or_else(|e| panic!("failed to parse {input:?}: {e}"));
+        assert!(rest.trim().is_empty(), "unconsumed input {rest:?}");
+        command
     }
 
     #[test]
-    fn test_parse_describe_command() {
-        // Test all DESCRIBE targets
+    fn describes_every_operandless_target() {
         assert_eq!(
-            parse_describe_command("DESCRIBE PRIMER"),
-            Ok(("", DescribeTarget::Primer))
+            meta("DESCRIBE PROTOCOL"),
+            MetaCommand::Describe(DescribeTarget::Protocol)
         );
         assert_eq!(
-            parse_describe_command("DESCRIBE DOMAINS"),
-            Ok(("", DescribeTarget::Domains))
+            meta("DESCRIBE EXECUTION CONTEXT"),
+            MetaCommand::Describe(DescribeTarget::ExecutionContext)
         );
         assert_eq!(
-            parse_describe_command("DESCRIBE CONCEPT TYPES"),
-            Ok((
-                "",
-                DescribeTarget::ConceptTypes {
-                    limit: None,
-                    cursor: None
-                }
-            ))
+            meta("DESCRIBE CAPABILITIES"),
+            MetaCommand::Describe(DescribeTarget::Capabilities)
         );
         assert_eq!(
-            parse_describe_command("DESCRIBE CONCEPT TYPES LIMIT 5"),
-            Ok((
-                "",
-                DescribeTarget::ConceptTypes {
-                    limit: Some(5),
-                    cursor: None
-                }
-            ))
+            meta("DESCRIBE PROJECTION CAPABILITY"),
+            MetaCommand::Describe(DescribeTarget::ProjectionCapability)
         );
-        assert_eq!(
-            parse_describe_command("DESCRIBE CONCEPT TYPES LIMIT 5 CURSOR \"abcdef\""),
-            Ok((
-                "",
-                DescribeTarget::ConceptTypes {
-                    limit: Some(5),
-                    cursor: Some("abcdef".to_string())
-                }
-            ))
-        );
-        assert_eq!(
-            parse_describe_command("DESCRIBE PROPOSITION TYPES"),
-            Ok((
-                "",
-                DescribeTarget::PropositionTypes {
-                    limit: None,
-                    cursor: None
-                }
-            ))
-        );
-        assert_eq!(
-            parse_describe_command("DESCRIBE PROPOSITION TYPES LIMIT 5"),
-            Ok((
-                "",
-                DescribeTarget::PropositionTypes {
-                    limit: Some(5),
-                    cursor: None
-                }
-            ))
-        );
-        assert_eq!(
-            parse_describe_command("DESCRIBE PROPOSITION TYPES LIMIT 5 CURSOR \"abcdef\""),
-            Ok((
-                "",
-                DescribeTarget::PropositionTypes {
-                    limit: Some(5),
-                    cursor: Some("abcdef".to_string())
-                }
-            ))
-        );
-        assert_eq!(
-            parse_describe_command("DESCRIBE CONCEPT TYPE \"Drug\""),
-            Ok(("", DescribeTarget::ConceptType("Drug".to_string())))
-        );
-        assert_eq!(
-            parse_describe_command("DESCRIBE PROPOSITION TYPE \"treats\""),
-            Ok(("", DescribeTarget::PropositionType("treats".to_string())))
-        );
-
-        // Test with whitespace
-        assert_eq!(
-            parse_describe_command("  DESCRIBE   PRIMER  "),
-            Ok(("", DescribeTarget::Primer))
-        );
-
-        // Test invalid DESCRIBE command
-        assert!(parse_describe_command("DESCRIBE INVALID").is_err());
     }
 
     #[test]
-    fn test_parse_search_command() {
-        // Basic search
+    fn optional_operands_stay_optional() {
         assert_eq!(
-            parse_search_command("SEARCH CONCEPT \"aspirin\""),
-            Ok((
-                "",
-                SearchCommand {
-                    target: SearchTarget::Concept,
-                    term: "aspirin".to_string(),
-                    in_type: None,
-                    mode: None,
-                    threshold: None,
-                    limit: None,
-                }
-            ))
+            meta("DESCRIBE SPACE"),
+            MetaCommand::Describe(DescribeTarget::Space { value: None })
         );
-
-        // Search with type
-        assert_eq!(
-            parse_search_command("SEARCH CONCEPT \"aspirin\" \n\n\nWITH TYPE \"Drug\" \nLIMIT  5"),
-            Ok((
-                "",
-                SearchCommand {
-                    target: SearchTarget::Concept,
-                    term: "aspirin".to_string(),
-                    in_type: Some("Drug".to_string()),
-                    mode: None,
-                    threshold: None,
-                    limit: Some(5),
-                }
-            ))
-        );
-
-        // Search with limit
-        assert_eq!(
-            parse_search_command("SEARCH PROPOSITION \"aspirin\" LIMIT 5"),
-            Ok((
-                "",
-                SearchCommand {
-                    target: SearchTarget::Proposition,
-                    term: "aspirin".to_string(),
-                    in_type: None,
-                    mode: None,
-                    threshold: None,
-                    limit: Some(5),
-                }
-            ))
-        );
-
-        // Search with type and limit
-        assert_eq!(
-            parse_search_command("SEARCH CONCEPT \"aspirin\" WITH TYPE \"Drug\" LIMIT 5"),
-            Ok((
-                "",
-                SearchCommand {
-                    target: SearchTarget::Concept,
-                    term: "aspirin".to_string(),
-                    in_type: Some("Drug".to_string()),
-                    mode: None,
-                    threshold: None,
-                    limit: Some(5),
-                }
-            ))
-        );
-
-        // Test with whitespace
-        assert_eq!(
-            parse_search_command("  SEARCH   CONCEPT   \"aspirin\"  "),
-            Ok((
-                "",
-                SearchCommand {
-                    target: SearchTarget::Concept,
-                    term: "aspirin".to_string(),
-                    in_type: None,
-                    mode: None,
-                    threshold: None,
-                    limit: None,
-                }
-            ))
-        );
-
-        // Test with special characters in search term
-        assert_eq!(
-            parse_search_command("SEARCH CONCEPT \"阿司匹林\""),
-            Ok((
-                "",
-                SearchCommand {
-                    target: SearchTarget::Concept,
-                    term: "阿司匹林".to_string(),
-                    in_type: None,
-                    mode: None,
-                    threshold: None,
-                    limit: None,
-                }
-            ))
-        );
-
-        // Test invalid search command
-        assert!(parse_search_command("SEARCH INVALID").is_err());
+        assert!(matches!(
+            meta(r#"DESCRIBE SPACE "space-1""#),
+            MetaCommand::Describe(DescribeTarget::Space { value: Some(_) })
+        ));
+        assert!(matches!(
+            meta("DESCRIBE TRUST"),
+            MetaCommand::Describe(DescribeTarget::Trust { value: None })
+        ));
+        assert!(matches!(
+            meta("DESCRIBE EPISTEMIC POLICY"),
+            MetaCommand::Describe(DescribeTarget::EpistemicPolicy { value: None })
+        ));
     }
 
     #[test]
-    fn test_parse_search_with_mode_and_threshold() {
-        // Associative recall probe from the spec
-        assert_eq!(
-            parse_search_command(
-                r#"SEARCH CONCEPT "headache relief" MODE "semantic" THRESHOLD 0.75 LIMIT 10"#
-            ),
-            Ok((
-                "",
-                SearchCommand {
-                    target: SearchTarget::Concept,
-                    term: "headache relief".to_string(),
-                    in_type: None,
-                    mode: Some(SearchMode::Semantic),
-                    threshold: Some(Number::from_f64(0.75).unwrap()),
-                    limit: Some(10),
-                }
-            ))
-        );
-
-        // Full option set with WITH TYPE
-        assert_eq!(
-            parse_search_command(
-                r#"SEARCH PROPOSITION "treats" WITH TYPE "treats" MODE "hybrid" THRESHOLD 0.5 LIMIT 5"#
-            ),
-            Ok((
-                "",
-                SearchCommand {
-                    target: SearchTarget::Proposition,
-                    term: "treats".to_string(),
-                    in_type: Some("treats".to_string()),
-                    mode: Some(SearchMode::Hybrid),
-                    threshold: Some(Number::from_f64(0.5).unwrap()),
-                    limit: Some(5),
-                }
-            ))
-        );
-
-        // Keyword mode without threshold
-        assert_eq!(
-            parse_search_command(r#"SEARCH CONCEPT "aspirin" MODE "keyword""#),
-            Ok((
-                "",
-                SearchCommand {
-                    target: SearchTarget::Concept,
-                    term: "aspirin".to_string(),
-                    in_type: None,
-                    mode: Some(SearchMode::Keyword),
-                    threshold: None,
-                    limit: None,
-                }
-            ))
-        );
-
-        // Invalid mode value
-        assert!(parse_meta_command(r#"SEARCH CONCEPT "x" MODE "fuzzy""#).is_err());
-        // Threshold out of range
-        assert!(parse_meta_command(r#"SEARCH CONCEPT "x" THRESHOLD 1.5"#).is_err());
-        assert!(parse_meta_command(r#"SEARCH CONCEPT "x" THRESHOLD -0.1"#).is_err());
+    fn multi_word_targets_win_over_their_prefixes() {
+        assert!(matches!(
+            meta("DESCRIBE SCHEMA ENVIRONMENT AS OF SEQ 42"),
+            MetaCommand::Describe(DescribeTarget::SchemaEnvironment {
+                as_of: Some(AsOf::Seq(_))
+            })
+        ));
+        assert!(matches!(
+            meta(r#"DESCRIBE STRUCTURAL FIELD "has_step""#),
+            MetaCommand::Describe(DescribeTarget::StructuralField(_))
+        ));
     }
 
     #[test]
-    fn test_parse_export_command() {
-        let input = r#"
-        EXPORT ?n
-        WHERE {
-            (?n, "belongs_to_domain", {type: "Domain", name: "Medical"})
-        }
-        LIMIT 500
-        "#;
+    fn a_transaction_is_named_directly_or_by_idempotency_key() {
+        assert!(matches!(
+            meta(r#"DESCRIBE TRANSACTION "tx-1""#),
+            MetaCommand::Describe(DescribeTarget::Transaction(_))
+        ));
+        assert!(matches!(
+            meta(r#"DESCRIBE TRANSACTION BY IDEMPOTENCY KEY "write-1""#),
+            MetaCommand::Describe(DescribeTarget::TransactionByIdempotencyKey(_))
+        ));
+    }
 
-        let result = parse_meta_command(input);
-        assert!(result.is_ok(), "Failed to parse: {result:?}");
-        let (_, command) = result.unwrap();
-        match command {
-            MetaCommand::Export(export) => {
-                assert_eq!(export.target, "n");
-                assert_eq!(export.where_clauses.len(), 1);
-                assert_eq!(export.limit, Some(500));
-                assert_eq!(export.cursor, None);
+    #[test]
+    fn describe_access_takes_an_input_block() {
+        let command = meta(r#"DESCRIBE ACCESS WITH { operation: "update", purpose: :why }"#);
+        let MetaCommand::Describe(DescribeTarget::Access { with: Some(with) }) = command else {
+            panic!("expected DESCRIBE ACCESS WITH");
+        };
+        assert_eq!(with.len(), 2);
+    }
+
+    #[test]
+    fn list_paging_accepts_either_spelling() {
+        let MetaCommand::List(command) = meta("LIST SCHEMA PACKAGES STATUS :s LIMIT 10 CURSOR :c")
+        else {
+            panic!("expected LIST");
+        };
+        assert_eq!(command.target, ListTarget::SchemaPackages);
+        assert!(command.status.is_some());
+        assert!(command.limit.is_some());
+        assert!(command.cursor.is_some());
+
+        let MetaCommand::List(cursor_only) = meta("LIST TYPES CURSOR :c") else {
+            panic!("expected LIST");
+        };
+        assert!(cursor_only.limit.is_none());
+        assert!(cursor_only.cursor.is_some());
+    }
+
+    #[test]
+    fn search_carries_its_whole_option_set() {
+        let MetaCommand::Search(command) = meta(
+            r#"SEARCH COGNITION "dark mode" WITH TYPE "Preference" WITH PREDICATE "prefers"
+               MODE "hybrid" THRESHOLD 0.7 AS OF SEQ 100 LIMIT 5 CURSOR :c"#,
+        ) else {
+            panic!("expected SEARCH");
+        };
+        assert_eq!(command.target, SearchTarget::Cognition);
+        assert!(command.with_type.is_some());
+        assert!(command.with_predicate.is_some());
+        assert!(command.mode.is_some());
+        assert!(command.threshold.is_some());
+        assert!(command.as_of_seq.is_some());
+    }
+
+    #[test]
+    fn verify_and_validate_keep_their_two_word_targets() {
+        assert!(matches!(
+            meta(r#"VERIFY SCHEMA PACKAGE :pkg"#),
+            MetaCommand::Verify {
+                target: VerifyTarget::SchemaPackage,
+                ..
             }
-            _ => panic!("Expected ExportCommand"),
-        }
+        ));
+        let MetaCommand::Validate(command) = meta(r#"VALIDATE IMPORT PLAN :plan"#) else {
+            panic!("expected VALIDATE");
+        };
+        assert_eq!(command.target, ValidateTarget::ImportPlan);
 
-        // EXPORT without LIMIT
-        let (_, command) = parse_meta_command(r#"EXPORT ?x WHERE { ?x {type: "Drug"} }"#).unwrap();
-        match command {
-            MetaCommand::Export(export) => {
-                assert_eq!(export.target, "x");
-                assert_eq!(export.limit, None);
-                assert_eq!(export.cursor, None);
+        let MetaCommand::Validate(with_options) =
+            meta(r#"VALIDATE KML :cmd WITH { strict: true }"#)
+        else {
+            panic!("expected VALIDATE");
+        };
+        assert!(with_options.options.is_some());
+    }
+
+    #[test]
+    fn preview_is_frozen_to_its_two_operand_forms() {
+        assert!(matches!(
+            meta(r#"PREVIEW KML :cmd"#),
+            MetaCommand::Preview(PreviewCommand::Kml(_))
+        ));
+        assert!(matches!(
+            meta(r#"PREVIEW IMPORT CAPSULE :c INTO "space-1""#),
+            MetaCommand::Preview(PreviewCommand::ImportCapsule { .. })
+        ));
+        assert!(parse_meta_command(r#"PREVIEW MERGE :a INTO :b"#).is_err());
+    }
+
+    #[test]
+    fn history_and_changes_page_independently() {
+        assert!(matches!(
+            meta(r#"HISTORY ELEMENT "C-1" FROM SEQ 1 TO SEQ 9 LIMIT 5"#),
+            MetaCommand::History(HistoryCommand::Element { .. })
+        ));
+        assert!(matches!(
+            meta("HISTORY SPACE LIMIT 5"),
+            MetaCommand::History(HistoryCommand::Space { .. })
+        ));
+        assert!(matches!(
+            meta("CHANGES SINCE :cursor LIMIT 100"),
+            MetaCommand::Changes(ChangesCommand::Since { .. })
+        ));
+        assert!(matches!(
+            meta("CHANGES AFTER SEQ 42"),
+            MetaCommand::Changes(ChangesCommand::AfterSeq { .. })
+        ));
+    }
+
+    #[test]
+    fn snapshot_takes_the_shared_history_coordinate() {
+        assert!(matches!(
+            meta("SNAPSHOT"),
+            MetaCommand::Snapshot { as_of: None }
+        ));
+        assert!(matches!(
+            meta(r#"SNAPSHOT AS OF TIME "2026-01-01T00:00:00Z""#),
+            MetaCommand::Snapshot {
+                as_of: Some(AsOf::Time(_))
             }
-            _ => panic!("Expected ExportCommand"),
-        }
-
-        // EXPORT with LIMIT and CURSOR (paginated continuation, KIP §5.3)
-        let (_, command) = parse_meta_command(
-            r#"EXPORT ?x WHERE { ?x {type: "Drug"} } LIMIT 100 CURSOR "abc123""#,
-        )
-        .unwrap();
-        match command {
-            MetaCommand::Export(export) => {
-                assert_eq!(export.target, "x");
-                assert_eq!(export.limit, Some(100));
-                assert_eq!(export.cursor, Some("abc123".to_string()));
-            }
-            _ => panic!("Expected ExportCommand"),
-        }
-
-        // EXPORT requires a WHERE block
-        assert!(parse_meta_command("EXPORT ?x LIMIT 10").is_err());
-        // EXPORT requires a target variable
-        assert!(parse_meta_command(r#"EXPORT WHERE { ?x {type: "Drug"} }"#).is_err());
+        ));
     }
 
     #[test]
-    fn test_search_limit_zero_is_rejected() {
-        // Like KQL/EXPORT/DESCRIBE, SEARCH must reject `LIMIT 0`: 0 is the
-        // engine's internal "no limit" sentinel and letting it through would
-        // silently mean "unlimited". Omit LIMIT for the engine default.
-        assert!(crate::parse_meta(r#"SEARCH CONCEPT "aspirin" LIMIT 0"#).is_err());
-        assert!(crate::parse_meta(r#"SEARCH PROPOSITION "treats" LIMIT 0"#).is_err());
-        // Positive limits (including large ones) still parse.
-        assert!(crate::parse_meta(r#"SEARCH CONCEPT "aspirin" LIMIT 1"#).is_ok());
-        assert!(
-            crate::parse_meta(r#"SEARCH CONCEPT "aspirin" LIMIT 18446744073709551615"#).is_ok()
-        );
-        // DESCRIBE keeps rejecting LIMIT 0 as before.
-        assert!(crate::parse_meta("DESCRIBE CONCEPT TYPES LIMIT 0").is_err());
+    fn export_selects_raw_state_and_never_belief() {
+        let MetaCommand::ExportCapsule(command) = meta(
+            r#"EXPORT CAPSULE :out WHERE { ?c CONCEPT {type: "Experience"} } WITH { redact: true } AS OF SEQ 7"#,
+        ) else {
+            panic!("expected EXPORT CAPSULE");
+        };
+        assert_eq!(command.where_clauses.len(), 1);
+        assert!(command.options.is_some());
+        assert!(command.as_of.is_some());
+
+        assert!(parse_meta_command(r#"EXPORT CAPSULE :out WHERE { ?b BELIEF (?p) }"#).is_err());
+        assert!(parse_meta_command(r#"EXPORT CAPSULE :out WHERE { }"#).is_err());
     }
 
     #[test]
-    fn test_limit_zero_error_message_is_actionable() {
-        // Once the LIMIT keyword matched, a bad operand must fail hard: the
-        // enclosing opt(...) must not swallow the error and degrade it to a
-        // misleading "Unexpected trailing content" report.
-        for input in [
-            r#"SEARCH CONCEPT "aspirin" LIMIT 0"#,
-            "DESCRIBE CONCEPT TYPES LIMIT 0",
-            r#"EXPORT ?x WHERE { ?x {type: "Drug"} } LIMIT 0"#,
-            r#"SEARCH CONCEPT "aspirin" LIMIT abc"#,
-        ] {
-            let err = crate::parse_meta(input).unwrap_err();
-            let msg = format!("{err:?}");
-            assert!(
-                msg.contains("positive integer"),
-                "error for {input:?} should explain the LIMIT operand: {msg}"
-            );
-            assert!(
-                !msg.contains("Unexpected trailing content"),
-                "error for {input:?} must not be reported as trailing content: {msg}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_keywords_accept_arbitrary_whitespace() {
-        // Newlines and tabs between multi-word keywords (DESCRIBE / CONCEPT TYPES / WITH TYPE)
-        // must be accepted just like a literal space.
+    fn meta_keywords_are_case_insensitive() {
         assert_eq!(
-            parse_describe_command("DESCRIBE\n  CONCEPT\tTYPES   LIMIT 10"),
-            Ok((
-                "",
-                DescribeTarget::ConceptTypes {
-                    limit: Some(10),
-                    cursor: None,
-                }
-            ))
+            meta("describe primer mode \"compact\""),
+            MetaCommand::Describe(DescribeTarget::Primer {
+                mode: Some(Scalar::Literal(crate::ast::KipValue::String(
+                    "compact".into()
+                )))
+            })
         );
-
-        assert_eq!(
-            parse_describe_command("DESCRIBE\nPROPOSITION\nTYPE\n\"treats\""),
-            Ok(("", DescribeTarget::PropositionType("treats".to_string())))
-        );
-
-        assert_eq!(
-            parse_search_command("SEARCH\nCONCEPT\n\"aspirin\"\nWITH\nTYPE\n\"Drug\"\nLIMIT\n5"),
-            Ok((
-                "",
-                SearchCommand {
-                    target: SearchTarget::Concept,
-                    term: "aspirin".to_string(),
-                    in_type: Some("Drug".to_string()),
-                    mode: None,
-                    threshold: None,
-                    limit: Some(5),
-                }
-            ))
-        );
-    }
-
-    #[test]
-    fn test_multi_word_keywords_require_a_trailing_word_boundary() {
-        // `keywords` only required whitespace *between* tokens, so the final
-        // token could swallow the next keyword: these all parsed as valid
-        // commands even though §5.1.3 spells them as separate tokens.
-        assert!(crate::parse_meta("DESCRIBE CONCEPT TYPESLIMIT 5").is_err());
-        assert!(crate::parse_meta("DESCRIBE PROPOSITION TYPESLIMIT 5").is_err());
-        assert!(crate::parse_meta(r#"DESCRIBE CONCEPT TYPESCURSOR "tok""#).is_err());
-        // A quoted string glued to the keyword is two tokens too.
-        assert!(crate::parse_meta(r#"SEARCH CONCEPT "a" WITH TYPE"Drug""#).is_err());
-        assert!(crate::parse_meta(r#"DESCRIBE CONCEPT TYPE"Drug""#).is_err());
-        // This one was already rejected; it must stay rejected.
-        assert!(crate::parse_meta("DESCRIBE CONCEPT TYPESX").is_err());
-
-        // The spaced spellings still parse.
-        assert!(crate::parse_meta("DESCRIBE CONCEPT TYPES LIMIT 5").is_ok());
-        assert!(crate::parse_meta("DESCRIBE PROPOSITION TYPES LIMIT 5").is_ok());
-        assert!(crate::parse_meta(r#"DESCRIBE CONCEPT TYPES CURSOR "tok""#).is_ok());
-        assert!(crate::parse_meta(r#"SEARCH CONCEPT "a" WITH TYPE "Drug""#).is_ok());
-        assert!(crate::parse_meta(r#"DESCRIBE CONCEPT TYPE "Drug""#).is_ok());
-    }
-
-    #[test]
-    fn test_cursor_operand_errors_are_pointed_and_reject_empty_tokens() {
-        // Like LIMIT, CURSOR must fail hard once its keyword matched: the
-        // enclosing opt(...) otherwise swallows the error and the leftover
-        // "CURSOR ..." text is reported as trailing content.
-        for input in [
-            "DESCRIBE CONCEPT TYPES CURSOR abc",
-            "DESCRIBE PROPOSITION TYPES CURSOR abc",
-            r#"EXPORT ?x WHERE { ?x {type: "Drug"} } CURSOR abc"#,
-            // An empty pagination token is meaningless and silently meant
-            // "start from the beginning".
-            r#"DESCRIBE CONCEPT TYPES CURSOR """#,
-            r#"EXPORT ?x WHERE { ?x {type: "Drug"} } CURSOR """#,
-        ] {
-            let err = crate::parse_meta(input).unwrap_err();
-            let msg = &err.message;
-            assert!(
-                msg.contains("non-empty quoted pagination token"),
-                "error for {input:?} should explain the CURSOR operand: {msg}"
-            );
-            assert!(
-                !msg.contains("Unexpected trailing content"),
-                "error for {input:?} must not be reported as trailing content: {msg}"
-            );
-        }
-
-        // A non-empty token still parses.
-        assert!(crate::parse_meta(r#"DESCRIBE CONCEPT TYPES CURSOR "abc""#).is_ok());
     }
 }

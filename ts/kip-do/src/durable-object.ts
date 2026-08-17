@@ -1,215 +1,271 @@
 /**
- * The Durable Object wrapper: one KIP database per object.
+ * The Durable Object a host deploys.
  *
- * `KipDatabase` is meant to be subclassed so an application can supply its
- * tokenizer binding and add its own RPC methods. The base class owns schema
- * setup, the JSON-RPC surface (`execute_kip`), and the re-index alarm.
+ * One Cognitive Nexus per object. The class is thin on purpose: it owns the
+ * request envelope and nothing else, because every decision worth making is
+ * made below it.
+ *
+ * The one decision it does own is which HTTP status a failure gets, and it is
+ * not cosmetic. A KIP error carries a retry class, and mapping the wrong status
+ * onto it tells a client's recovery policy to do the wrong thing — most
+ * expensively when a lost response is reported as a clean failure and the
+ * client writes again.
  */
 
 import { DurableObject } from 'cloudflare:workers'
+import { KipError, type KipErrorJSON } from './errors.js'
+import type { Json, JsonMap } from './json.js'
+import { parseKip } from './kip/parser.js'
 import {
-  BOOTSTRAP_VERSION,
-  CognitiveNexus,
-  type KipResponse,
-} from './nexus.js'
-import { KipError } from './errors.js'
-import { parseKipBatch } from './kip/parser.js'
-import { configureSql } from './schema.js'
-import { AlinkTokenizer, SimpleTokenizer, type Tokenizer } from './tokenizer.js'
+  mergeRequestContext,
+  systemAuth,
+  type AuthContext,
+  type RequestContext,
+} from './governance/index.js'
+import { CognitiveNexus, type NexusOptions, type ReadOptions } from './nexus.js'
+import {
+  BUNDLED_PACKAGES,
+  COGNITIVE_MEMORY,
+  type SchemaPackage,
+} from './schema/index.js'
+import type { Outcome } from './tx.js'
 
+/** The bindings a host gives the object. */
 export interface KipDatabaseEnv {
-  /**
-   * Binding for `cf-tokenizer`. A Container binding, a service binding, or
-   * anything else exposing `fetch`. When absent the database falls back to
-   * `SimpleTokenizer`, which is adequate for basic ASCII-oriented corpora but
-   * has no dictionary-based Chinese segmentation — so multilingual production
-   * deployments should bind the service.
-   */
-  TOKENIZER?: { fetch(input: RequestInfo, init?: RequestInit): Promise<Response> }
+  [key: string]: unknown
 }
 
-/** How often the re-index alarm runs while work remains. */
-const REINDEX_INTERVAL_MS = 30_000
+/** One operation's answer. */
+export interface KipResult {
+  result?: Json
+  receipt?: Outcome
+  error?: KipErrorJSON
+}
 
-/** Durable marker written only after schema and capsule bootstrap succeeds. */
-export const BOOTSTRAP_VERSION_KEY = '__kip_bootstrap_version'
+/** The response envelope (Spec §85). */
+export interface KipResponse {
+  kip: string
+  results: KipResult[]
+  error?: KipErrorJSON
+}
 
-export class KipDatabase<
-  Env extends KipDatabaseEnv = KipDatabaseEnv,
-> extends DurableObject<Env> {
+/**
+ * A KIP 2.0 Cognitive Nexus in one Durable Object.
+ *
+ * Subclass it and bind the subclass; the base class does not register itself.
+ *
+ * ```ts
+ * export class MyKipDatabase extends KipDatabase<Env> {}
+ * ```
+ */
+export class KipDatabase<Env = KipDatabaseEnv> extends DurableObject<Env> {
   protected readonly nexus: CognitiveNexus
-  #tokenizer?: Tokenizer
 
-  constructor(ctx: DurableObjectState, env: Env) {
+  constructor(ctx: DurableObjectState, env: Env, options: NexusOptions = {}) {
     super(ctx, env)
+    this.nexus = CognitiveNexus.connect(ctx.storage, options)
+    // A Space that has activated nothing resolves Core and nothing else, and
+    // Core declares no Concept types at all — so an object that skipped this
+    // would refuse every `CREATE CONCEPT` with a message about schema rather
+    // than about what the caller did. Activating the bundled profile is the
+    // default a host can override by subclassing.
+    this.nexus.activatePackages(this.packages())
+  }
 
-    this.nexus = new CognitiveNexus(
-      ctx.storage.sql,
-      // `transactionSync` gives the engine real atomicity: a KML statement
-      // either commits whole or rolls back. This is the capability the Rust
-      // engine lacks, and it is why the port needs no preflight pass.
-      (fn) => ctx.storage.transactionSync(fn),
-      // Resolved on first use, not here. `createTokenizer` is meant to be
-      // overridden, and a subclass's own field initializers do not run until
-      // after this constructor returns — calling it now would hand the
-      // override a half-built instance.
-      { tokenizer: { tokenize: (texts) => this.tokenizer().tokenize(texts) } },
-    )
-
-    // Connection-local settings must be applied before the first storage
-    // access: `PRAGMA foreign_keys` is a no-op once a transaction has begun.
-    configureSql(ctx.storage.sql)
-
-    const currentVersion = ctx.storage.kv.get<string>(
-      BOOTSTRAP_VERSION_KEY,
-    )
-    if (currentVersion === BOOTSTRAP_VERSION) {
-      return
-    }
-
-    // Schema and base capsules must be in place before any request is served.
-    // A Durable Object may be constructed again after every eviction, so the
-    // durable version marker avoids replaying all DDL and capsule checks on
-    // each wake-up. It is written last: an interrupted bootstrap leaves the
-    // old marker in place and is therefore retried safely next time.
-    CognitiveNexus.bootstrap(ctx.storage.sql)
-    this.nexus.applyBundledCapsules()
-    ctx.storage.kv.put(BOOTSTRAP_VERSION_KEY, BOOTSTRAP_VERSION)
+  /** The Schema Packages this object activates on construction. */
+  protected packages(): readonly SchemaPackage[] {
+    return BUNDLED_PACKAGES.length > 0 ? BUNDLED_PACKAGES : [COGNITIVE_MEMORY]
   }
 
   /**
-   * Override to supply a different segmentation authority.
+   * The identity one request runs as.
    *
-   * Called lazily on the first tokenization, so an override may safely read
-   * the subclass's own fields.
-   */
-  protected createTokenizer(env: Env): Tokenizer {
-    return env.TOKENIZER
-      ? new AlinkTokenizer(env.TOKENIZER)
-      : new SimpleTokenizer()
-  }
-
-  /** Memoized `createTokenizer(env)`. */
-  private tokenizer(): Tokenizer {
-    return (this.#tokenizer ??= this.createTokenizer(this.env))
-  }
-
-  /**
-   * Executes one KIP command.
+   * The default is the engine itself, which owns the default Space — the
+   * embedded case, where the object *is* the owner. A multi-tenant host
+   * overrides this: it authenticates the caller from what it observed about the
+   * connection and returns that Principal, and every command then gets exactly
+   * what the caller's Grants say.
    *
-   * Exposed as an RPC method so callers can use the typed stub directly
-   * rather than constructing HTTP requests.
+   * `context` is the envelope's non-authoritative block, and it is passed for
+   * one reason: a caller may *narrow* its session with a declared purpose and can
+   * never widen it (§12). Identity, authentication strength and delegation are
+   * the host's to decide — an override that read `principal_id` off the request
+   * body would make the whole plane decorative, because a request body is
+   * exactly what an Agent under prompt injection controls.
    */
-  async executeKip(command: string): Promise<KipResponse> {
-    this.scheduleReindex()
-    return this.nexus.execute(command)
+  protected authenticate(context: RequestContext | undefined): AuthContext {
+    return mergeRequestContext(systemAuth(), context)
   }
 
   /**
-   * Executes several commands, stopping at the first failure.
+   * Runs one command, whichever language it is.
    *
-   * Statements are *not* wrapped in one transaction: each is individually
-   * atomic, and a KIP request carrying multiple statements does not promise
-   * all-or-nothing across them. The response reports how many applied so a
-   * caller can resume rather than guess.
+   * The parsed semantics decide, never the caller's framing: a request that
+   * calls its command a query and sends a mutation runs as the mutation it is,
+   * or not at all.
    */
-  async executeKipBatch(commands: string[]): Promise<KipResponse[]> {
-    this.scheduleReindex()
-    const parsed = parseKipBatch(commands)
-    const out: KipResponse[] = []
-    for (const entry of parsed) {
-      if ('error' in entry) {
-        out.push({ error: entry.error.toJSON() })
-        break
+  executeKip(
+    command: string,
+    params: JsonMap = {},
+    context?: RequestContext,
+    read?: ReadOptions,
+  ): KipResult {
+    try {
+      const session = this.nexus.session(this.authenticate(context))
+      const parsed = parseKip(command)
+      if ('Kml' in parsed) {
+        return { receipt: session.mutate(parsed.Kml, params) }
       }
-      const response = await this.nexus.run(entry.ok)
-      out.push(response)
-      if ('error' in response) break
+      if ('Kql' in parsed) {
+        return { result: session.find(parsed.Kql, params, read ?? {}) as Json }
+      }
+      return { result: session.describe(command, params) }
+    } catch (err) {
+      return { error: KipError.from(err).toJSON() }
     }
-    return out
   }
 
-  /** JSON-RPC surface, matching `anda_cognitive_nexus_server`. */
+  /**
+   * Runs a batch, operation by operation.
+   *
+   * Each operation is atomic on its own; the batch is not. `execution.mode:
+   * "atomic"` would need one transaction across all of them, which this engine
+   * does not have — so a request asking for it is refused rather than run as a
+   * sequence that looks like one.
+   *
+   * The envelope's context is authenticated once and applies to every operation:
+   * a batch is one request, and letting operation two run as a different
+   * Principal from operation one would make the identity per-command state that
+   * a caller could vary.
+   */
+  executeKipBatch(
+    commands: readonly { command: string; parameters?: JsonMap }[],
+    context?: RequestContext,
+    read?: ReadOptions,
+  ): KipResult[] {
+    return commands.map((operation) =>
+      this.executeKip(operation.command, operation.parameters ?? {}, context, read),
+    )
+  }
+
   override async fetch(request: Request): Promise<Response> {
     if (request.method !== 'POST') {
-      return json({ error: 'method not allowed' }, 405)
+      return new Response('POST a KIP request', { status: 405 })
     }
-
-    let body: { method?: string; params?: unknown; id?: unknown }
+    let body: unknown
     try {
-      body = (await request.json()) as typeof body
+      body = await request.json()
     } catch {
-      return json({ error: 'invalid JSON body' }, 400)
+      return this.envelope(
+        { error: new KipError('InvalidRequestEnvelope', 'the body is not JSON').toJSON() },
+        400,
+      )
     }
-
-    if (body.method !== 'execute_kip') {
-      return json({ error: `unknown method ${String(body.method)}` }, 400)
-    }
-
-    const params = (body.params ?? {}) as {
-      command?: string
-      commands?: string[]
-    }
-
-    try {
-      if (Array.isArray(params.commands)) {
-        const result = await this.executeKipBatch(params.commands)
-        return json({ id: body.id ?? null, result })
-      }
-      if (typeof params.command === 'string') {
-        const result = await this.executeKip(params.command)
-        return json({ id: body.id ?? null, result })
-      }
-      return json({ error: 'params must carry `command` or `commands`' }, 400)
-    } catch (err) {
-      // The engine converts its own failures into KIP envelopes, so reaching
-      // here means something outside it broke. Still answer in the KIP shape
-      // rather than leaking a stack trace.
-      return json({ id: body.id ?? null, error: KipError.from(err).toJSON() }, 500)
-    }
+    return this.handle(body)
   }
 
-  /**
-   * Rebuilds search index rows whose tokenizer version is stale.
-   *
-   * Runs on an alarm rather than inline: tokenization is a network round trip
-   * and this object is single-threaded, so doing it on the write path would
-   * put every writer behind the tokenizer's latency.
-   */
-  override async alarm(): Promise<void> {
-    try {
-      const version = await this.nexus.liveTokenizerVersion()
-      const done = await this.nexus.reindexStale(version)
-      // Reschedule while work remains; stop cleanly when the index is current
-      // so an idle object can hibernate.
-      if (done > 0) {
-        await this.ctx.storage.setAlarm(Date.now() + REINDEX_INTERVAL_MS)
-      }
-    } catch {
-      // A tokenizer outage must not end the retry loop: workerd retries a
-      // throwing alarm only a bounded number of times, and on a quiet object
-      // nothing else would ever re-arm it — stale rows would stay
-      // unsearchable until the next write. Re-arm explicitly and let the
-      // next run resume where this one stopped.
-      await this.ctx.storage.setAlarm(Date.now() + REINDEX_INTERVAL_MS)
+  private handle(body: unknown): Response {
+    const envelope = (body ?? {}) as {
+      kip?: string
+      operations?: { command?: string; parameters?: JsonMap }[]
+      execution?: { mode?: string }
+      context?: RequestContext
+      read?: ReadOptions
     }
+    if (envelope.execution?.mode === 'atomic') {
+      return this.envelope(
+        {
+          error: new KipError(
+            'UnsupportedIsolation',
+            'this engine has no atomic batch: one transaction across several ' +
+              'operations is not implemented, and running them as a sequence ' +
+              'would look like one',
+          ).toJSON(),
+        },
+        400,
+      )
+    }
+    const operations = envelope.operations ?? []
+    if (operations.length === 0) {
+      return this.envelope(
+        {
+          error: new KipError(
+            'InvalidRequestEnvelope',
+            'a request needs at least one operation',
+          ).toJSON(),
+        },
+        400,
+      )
+    }
+
+    const results = this.executeKipBatch(
+      operations.map((operation) => ({
+        command: operation.command ?? '',
+        parameters: operation.parameters,
+      })),
+      envelope.context,
+      envelope.read,
+    )
+    return this.envelope({ results }, statusFor(results))
   }
 
-  private scheduleReindex(): void {
-    // Fire-and-forget: an alarm that fails to schedule delays re-indexing but
-    // must never fail the write that triggered it.
-    void this.ctx.storage.getAlarm().then((existing) => {
-      if (existing === null) {
-        return this.ctx.storage.setAlarm(Date.now() + REINDEX_INTERVAL_MS)
-      }
-      return undefined
-    }).catch(() => undefined)
+  private envelope(
+    partial: { results?: KipResult[]; error?: KipErrorJSON },
+    status: number,
+  ): Response {
+    const response: KipResponse = {
+      kip: '2.0',
+      results: partial.results ?? [],
+      ...(partial.error === undefined ? {} : { error: partial.error }),
+    }
+    return Response.json(response, { status })
   }
 }
 
-function json(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { 'content-type': 'application/json' },
-  })
+/**
+ * The status a batch's outcome gets.
+ *
+ * **Partial success is 207, not 500.** Earlier operations in a batch have
+ * already committed and are durable; reporting the whole request as a failure
+ * invites the client to re-send writes that landed.
+ */
+function statusFor(results: readonly KipResult[]): number {
+  const failed = results.filter((result) => result.error !== undefined)
+  if (failed.length === 0) return 200
+  if (failed.length < results.length) return 207
+  return statusForError(failed[0]?.error)
+}
+
+/**
+ * The status one error gets, from its retry class rather than its name.
+ *
+ * The retry class is what a client's recovery policy switches on, so the status
+ * has to agree with it — a `requires_authority` failure answered with 400 tells
+ * the client to rewrite a request that was fine.
+ */
+function statusForError(error: KipErrorJSON | undefined): number {
+  if (error === undefined) return 500
+  switch (error.retry.class) {
+    case 'requires_authority':
+      return 403
+    case 'requires_different_input':
+      return 400
+    case 'requires_refresh':
+    case 'requires_new_snapshot':
+      return 409
+    case 'requires_reacquire_artifact':
+      return 422
+    // The write may well have landed. 500 reads as "nothing happened", and a
+    // client acting on that writes again.
+    case 'outcome_lookup_required':
+      return 503
+    case 'safe_same_request':
+      return 503
+    default:
+      return error.category === 'governance'
+        ? 403
+        : error.category === 'system'
+          ? 500
+          : 400
+  }
 }
