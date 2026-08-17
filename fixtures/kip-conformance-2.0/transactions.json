@@ -1,0 +1,68 @@
+{
+  "name": "transactions",
+  "description": "A MUTATE block is one transaction, not a script that happens to run in order: everything in it commits or none of it does. A precondition that fails leaves the element exactly as the caller last saw it, and the two guards ask different questions — EXPECT VERSION about what the caller read, EXPECT STATE about the engine state, which is not an Assertion's epistemic status.",
+  "setup": [
+    "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" SET FIELDS {key: \"person:alice\"} }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 }\n  }\n}"
+  ],
+  "cases": [
+    {
+      "name": "a clause that fails undoes the clauses that already ran beside it",
+      "command": "MUTATE {\n  CREATE CONCEPT ?ok { TYPE \"Person\" NAME \"Rollback probe\" }\n  CREATE CONCEPT ?bad { TYPE \"Spaceship\" NAME \"Serenity\" }\n}",
+      "expect": {
+        "error": "SchemaSymbolNotFound"
+      }
+    },
+    {
+      "name": "so the clause that succeeded left nothing behind",
+      "command": "FIND(COUNT(?c)) WHERE { ?c CONCEPT {name: \"Rollback probe\"} }",
+      "expect": {
+        "result": [0]
+      }
+    },
+    {
+      "name": "a stale EXPECT VERSION refuses the write",
+      "command": "UPSERT CONCEPT ?p { MATCH {key: \"person:alice\"} EXPECT VERSION 99 SET FIELDS {name: \"Rewritten\"} }",
+      "expect": {
+        "error": "VersionConflict"
+      }
+    },
+    {
+      "name": "and the refused write changed nothing",
+      "command": "FIND(?c.name) WHERE { ?c CONCEPT {key: \"person:alice\"} }",
+      "expect": {
+        "result": ["Alice"]
+      }
+    },
+    {
+      "name": "a selection block that matches nothing is a no-op, not an error",
+      "command": "UPDATE ?c SET ATTRIBUTES { note: \"unreachable\" } WHERE { ?c CONCEPT {name: \"Nobody\"} }",
+      "expect": {}
+    },
+    {
+      "name": "EXPECT STATE on a retraction asks about the claim's standing, and refuses when it does not hold",
+      "command": "RETRACT ASSERTION ?a WHERE { ?a ASSERTION {} } EXPECT STATE \"retracted\"",
+      "expect": {
+        "error": "PreconditionFailed"
+      }
+    },
+    {
+      "name": "the claim it refused to touch is still active",
+      "command": "FIND(?a.lifecycle.status) WHERE { ?a ASSERTION {} }",
+      "expect": {
+        "result": ["active"]
+      }
+    },
+    {
+      "name": "a guard that holds lets the withdrawal through",
+      "command": "RETRACT ASSERTION ?a WHERE { ?a ASSERTION {} } EXPECT STATE \"active\"",
+      "expect": {}
+    },
+    {
+      "name": "and the claim is withdrawn rather than deleted",
+      "command": "FIND(?a.lifecycle.status, ?a.confidence) WHERE { ?a ASSERTION {} }",
+      "expect": {
+        "result": [["retracted", 0.9]]
+      }
+    }
+  ]
+}

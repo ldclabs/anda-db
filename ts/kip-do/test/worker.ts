@@ -4,6 +4,7 @@ import {
   principalAuth,
   type AuthContext,
   type RequestContext,
+  type SchemaPackage,
 } from '../src/index.js'
 
 /**
@@ -33,9 +34,33 @@ export class TenantKipDatabase extends KipDatabase {
   }
 }
 
+/**
+ * The object the conformance suite drives.
+ *
+ * The suite goes through this object's HTTP surface rather than calling the
+ * engine's methods, because the request envelope is part of what a second
+ * engine has to reproduce — Space selection, parameter binding, the result and
+ * receipt shapes, and how an error reaches the caller. A harness that called
+ * `nexus.find` directly would prove the two engines agree about everything
+ * except the layer a client actually talks to.
+ *
+ * The one thing it adds is a way to install a fixture's own vocabulary. A
+ * fixture declares the packages its cases need so it does not depend on what
+ * some other fixture happened to install, and there is no KML clause that
+ * installs a Schema Package — that is a host decision, deliberately out of
+ * reach of anything a command could say.
+ */
+export class ConformanceKipDatabase extends KipDatabase {
+  activateFixturePackages(packages: readonly SchemaPackage[]): void {
+    if (packages.length === 0) return
+    this.nexus.activatePackages([...this.packages(), ...packages])
+  }
+}
+
 export interface Env {
   KIP_DB: DurableObjectNamespace<TestKipDatabase>
   KIP_TENANT_DB: DurableObjectNamespace<TenantKipDatabase>
+  KIP_CONFORMANCE_DB: DurableObjectNamespace<ConformanceKipDatabase>
 }
 
 export default {

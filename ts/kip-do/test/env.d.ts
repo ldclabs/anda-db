@@ -25,6 +25,14 @@ declare global {
       KIP_TENANT_DB: DurableObjectNamespace<
         import('./worker.js').TenantKipDatabase
       >
+      /**
+       * The object the conformance suite drives through its HTTP surface, so
+       * the shared fixtures exercise the request envelope rather than the
+       * engine's methods.
+       */
+      KIP_CONFORMANCE_DB: DurableObjectNamespace<
+        import('./worker.js').ConformanceKipDatabase
+      >
     }
   }
 

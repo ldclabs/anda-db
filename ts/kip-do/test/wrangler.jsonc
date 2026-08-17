@@ -6,13 +6,18 @@
   "durable_objects": {
     "bindings": [
       { "name": "KIP_DB", "class_name": "TestKipDatabase" },
-      { "name": "KIP_TENANT_DB", "class_name": "TenantKipDatabase" }
+      { "name": "KIP_TENANT_DB", "class_name": "TenantKipDatabase" },
+      { "name": "KIP_CONFORMANCE_DB", "class_name": "ConformanceKipDatabase" }
     ]
   },
   "migrations": [
     {
       "tag": "v1",
-      "new_sqlite_classes": ["TestKipDatabase", "TenantKipDatabase"]
+      "new_sqlite_classes": [
+        "TestKipDatabase",
+        "TenantKipDatabase",
+        "ConformanceKipDatabase"
+      ]
     }
   ]
 }

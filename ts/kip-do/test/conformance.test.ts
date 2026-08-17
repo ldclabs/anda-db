@@ -1,10 +1,9 @@
 import { env, runInDurableObject } from 'cloudflare:test'
 import { describe, expect, it } from 'vitest'
-import { CognitiveNexus } from '../src/nexus.js'
-import { KipError } from '../src/errors.js'
+import type { KipResponse } from '../src/durable-object.js'
 import type { Json, JsonMap } from '../src/json.js'
-import { parseKip } from '../src/kip/parser.js'
-import { COGNITIVE_MEMORY, type SchemaPackage } from '../src/schema/index.js'
+import type { SchemaPackage } from '../src/schema/index.js'
+import type { ConformanceKipDatabase } from './worker.js'
 import { CASE_COUNT, FIXTURES, type Case, type Fixture } from './conformance/fixtures.generated.js'
 import { sameResult } from './conformance/normalize.js'
 
@@ -16,24 +15,42 @@ import { sameResult } from './conformance/normalize.js'
  * is a divergence report, which is the whole reason the fixtures are plain data
  * rather than either engine's tests.
  *
+ * Every case goes through the **request envelope**, the same way the reference
+ * harness builds a `Request` and hands it to the `Executor`. An earlier version
+ * of this file called `nexus.find` and `nexus.mutate` directly, which proved
+ * the two engines agreed about everything except the layer a client actually
+ * talks to — and the envelope is where this engine's own gaps turned out to be.
+ *
  * Cases that exercise something this engine has not built are **reported, not
  * silently skipped**: the summary below names them, so the gap has a size. A
  * suite that quietly passed by skipping would say the two engines agree.
  */
 async function runFixture(fixture: Fixture): Promise<Outcome[]> {
-  const stub = env.KIP_DB.getByName(`conf-${fixture.name}`)
-  return runInDurableObject(stub, (_instance, state) => {
-    const nexus = CognitiveNexus.connect(state.storage)
-    // The Cognitive Memory Profile is always available; a fixture may add
-    // packages of its own, which is how it declares the vocabulary its cases
-    // need without depending on what some other fixture installed.
-    nexus.activatePackages([
-      COGNITIVE_MEMORY,
-      ...((fixture.packages ?? []) as SchemaPackage[]),
-    ])
-    for (const setup of fixture.setup ?? []) nexus.execute(setup)
-    return fixture.cases.map((testCase) => runCase(nexus, testCase))
-  })
+  const stub = env.KIP_CONFORMANCE_DB.getByName(`conf-${fixture.name}`)
+
+  // A fixture may declare packages of its own, which is how it names the
+  // vocabulary its cases need without depending on what some other fixture
+  // installed. Installing one is a host decision, so it does not go through
+  // the envelope: no command can install a Schema Package, by design.
+  const packages = (fixture.packages ?? []) as SchemaPackage[]
+  if (packages.length > 0) {
+    await runInDurableObject(stub, (instance: ConformanceKipDatabase) =>
+      instance.activateFixturePackages(packages),
+    )
+  }
+
+  for (const setup of fixture.setup ?? []) {
+    const outcome = await post(stub, setup, {})
+    if ('error' in outcome) {
+      throw new Error(
+        `${fixture.name}: setup failed with ${outcome.error.code}: ${outcome.error.message}\n${setup}`,
+      )
+    }
+  }
+
+  const outcomes: Outcome[] = []
+  for (const testCase of fixture.cases) outcomes.push(await runCase(stub, testCase))
+  return outcomes
 }
 
 type Outcome =
@@ -41,26 +58,53 @@ type Outcome =
   | { kind: 'fail'; name: string; detail: string }
   | { kind: 'unbuilt'; name: string; detail: string }
 
-/** Runs one command whichever language it is, and flattens the outcome. */
-function execute(
-  nexus: CognitiveNexus,
+type Flat =
+  | { result: Json }
+  | { error: { code: string; message: string } }
+
+/**
+ * Sends one command as a single-operation KIP request and flattens the answer.
+ *
+ * A KML operation answers with a receipt rather than a result; no fixture
+ * asserts on a receipt's contents (they are engine truth — ids, sequences,
+ * timestamps), so it flattens to `null`, and what the case is really pinning is
+ * that the mutation was accepted at all.
+ */
+async function post(
+  stub: DurableObjectStub<ConformanceKipDatabase>,
   command: string,
   params: JsonMap,
-): { result: Json } | { error: KipError } {
-  try {
-    const parsed = parseKip(command)
-    if ('Kql' in parsed) return { result: nexus.find(parsed.Kql, params) as Json }
-    if ('Meta' in parsed) return { result: nexus.describe(command, params) }
-    const outcome = nexus.mutate(parsed.Kml, params)
-    return { result: { handles: outcome.handles } as Json }
-  } catch (err) {
-    return { error: KipError.from(err) }
+): Promise<Flat> {
+  const response = await stub.fetch('https://kip-conformance/', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      kip: '2.0',
+      operations: [{ command, parameters: params }],
+    }),
+  })
+  const envelope = (await response.json()) as KipResponse
+
+  // A malformed envelope fails at the top level; a command fails in its result.
+  if (envelope.error !== undefined) {
+    return { error: { code: envelope.error.code, message: envelope.error.message } }
   }
+  const first = envelope.results[0]
+  if (first === undefined) {
+    return { error: { code: 'InternalError', message: 'the response carried no result' } }
+  }
+  if (first.error !== undefined) {
+    return { error: { code: first.error.code, message: first.error.message } }
+  }
+  return { result: first.result === undefined ? null : first.result }
 }
 
-function runCase(nexus: CognitiveNexus, testCase: Case): Outcome {
-  const outcome = execute(
-    nexus,
+async function runCase(
+  stub: DurableObjectStub<ConformanceKipDatabase>,
+  testCase: Case,
+): Promise<Outcome> {
+  const outcome = await post(
+    stub,
     testCase.command,
     (testCase.params ?? {}) as JsonMap,
   )
@@ -132,8 +176,8 @@ describe('KIP 2.0 conformance', () => {
   it('runs the same fixtures the reference engine runs', () => {
     // A shrinking suite is a silent loss of coverage; the generator reads the
     // fixture directory, so a bad path shows up here first.
-    expect(FIXTURES).toHaveLength(7)
-    expect(CASE_COUNT).toBe(62)
+    expect(FIXTURES).toHaveLength(8)
+    expect(CASE_COUNT).toBe(71)
   })
 
   for (const fixture of FIXTURES) {
