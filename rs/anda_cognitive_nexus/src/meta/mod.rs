@@ -216,8 +216,19 @@ pub fn capabilities() -> Json {
                 "policies": "versioned, append-only",
                 "approvals": "multi-party, separation of duties",
                 "audit": "append-preserving: control-plane mutations and decisions",
-                "enforcement": "command scope: every KQL, KML and META command is \
-                                authorized before it runs",
+                "enforcement": "every KQL, KML and META command is authorized before it \
+                                runs, and every element a read touches is authorized again",
+                "element_scope": {
+                    // What per-element authorization actually does here.
+                    "visibility": "an element the caller may not read is outside the query \
+                                   universe: not matched, not counted, not ranked, not paged",
+                    "field_mask": "a Grant's `fields` narrows the view before FILTER and \
+                                   ORDER BY read it, so a mask cannot be probed by membership",
+                    "raw_origin": "`_system.origin` needs read_raw_origin; without it the \
+                                   member says it was withheld rather than disappearing",
+                    "counts": "withheld, with a reason, for a Principal whose read authority \
+                               is narrower than the Space"
+                },
                 "permission_registry": "DESCRIBE ACCESS"
             }
         },
@@ -247,21 +258,12 @@ pub fn capabilities() -> Json {
                            and every projection says so"
             },
             {
-                "capability": "governance_element_scope",
-                "detail": "per-element authorization: classification filtering, field \
-                           redaction, existence protection in counts and search",
-                "reason": "authorization runs at command scope, so a caller either may read \
-                           this Space or may not. Narrowing a Grant to a classification or a \
-                           field set is recorded and reported, and not yet applied per element"
-            },
-            {
-                "capability": "protected_element_governance_fields",
-                "detail": "an element's own `governance` and `retention` members",
-                "reason": "a KML write may still set them, so a caller who may create an \
-                           element may also label it. §50 makes those Governance state, \
-                           needing declassify and manage_retention rather than write \
-                           permission. Read a classification on an element as the author's \
-                           label, not as an enforced one"
+                "capability": "protected_retention_fields",
+                "detail": "an element's own `retention` member inside SET FIELDS",
+                "reason": "`governance` is refused by the protocol's own parser, but \
+                           `retention` is not, so a create or update may set an expiry \
+                           without the manage_retention permission that SET RETENTION asks \
+                           for. Legal holds are unimplemented for the same reason"
             },
             {
                 "capability": "trust_governance",

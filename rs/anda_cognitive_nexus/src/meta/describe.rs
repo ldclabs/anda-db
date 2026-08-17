@@ -25,11 +25,16 @@ pub async fn run(cx: &mut Context<'_>, target: &DescribeTarget) -> Result<Answer
             "score_semantics": "normalized_support_not_probability",
             "explanation": true,
             "implemented_stages": [
+                // Not a stage the projection performs so much as one it
+                // inherits: every Assertion it reads comes through the same
+                // authorization gate every other read does, so a claim the
+                // caller may not see contributes nothing to the belief.
+                "governance_visibility",
                 "semantic_grounding", "conflict_set_expansion", "lifecycle_eligibility",
                 "temporal_eligibility", "mode_eligibility", "corroboration_grouping",
                 "aggregation", "classification", "explanation"
             ],
-            "missing_stages": ["governance_visibility", "trust_evaluation", "evidence_quality"],
+            "missing_stages": ["trust_evaluation", "evidence_quality"],
         })),
         DescribeTarget::ExecutionContext => Answer::whole(execution_context(cx).await?),
         DescribeTarget::Primer { mode } => Answer::whole(primer(cx, mode.as_ref()).await?),
@@ -316,7 +321,24 @@ async fn primer(cx: &mut Context<'_>, mode: Option<&Scalar>) -> Result<Json, Kip
     Ok(primer)
 }
 
+/// How many elements of each kind the Space holds.
+///
+/// Only answered for a caller whose read authority reaches the whole Space
+/// (§106). A count is a fact about elements a narrower Principal may not
+/// discover, and a Space-wide number is exactly the leak §103 lists — so a
+/// restricted caller is told that the number is being withheld, and why,
+/// rather than being handed a smaller one that reads as the whole truth.
+///
+/// Answered from the authority rather than by counting what survives the
+/// filter, because producing the number and then hiding it is one accident
+/// away from returning it.
 async fn counts(cx: &mut Context<'_>) -> Result<Json, KipError> {
+    if !cx.authority.reads_whole_space(cx.auth) {
+        return Ok(serde_json::json!({
+            "withheld": "this Principal's read authority is narrower than the Space, and a \
+                         Space-wide count would report elements it may not discover",
+        }));
+    }
     let mut counts = serde_json::Map::new();
     for kind in [
         anda_kip::ElementKind::Concept,

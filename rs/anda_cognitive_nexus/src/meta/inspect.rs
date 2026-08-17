@@ -26,7 +26,6 @@ use super::Answer;
 use super::describe::{scalar_json, scalar_str, scalar_usize};
 use crate::id::ElementId;
 use crate::kql::Context;
-use crate::view;
 
 /// `SEARCH <KIND> :term` — grounding.
 pub async fn search(cx: &mut Context<'_>, command: &SearchCommand) -> Result<Answer, KipError> {
@@ -142,7 +141,12 @@ pub async fn search(cx: &mut Context<'_>, command: &SearchCommand) -> Result<Ans
             if element.space() != cx.space || !element.is_active() {
                 continue;
             }
-            let rendered = view::render(&element);
+            // The redacted view `load` cached, not a fresh render: a search
+            // snippet is a read, and a mask that hid a field from FIND must
+            // hide it from SEARCH too (§105).
+            let rendered = cx
+                .cached_view(id)
+                .unwrap_or_else(|| Json::Object(Default::default()));
             if let Some(expected) = &with_type
                 && rendered["schema_ref"].as_str() != Some(expected.as_str())
             {

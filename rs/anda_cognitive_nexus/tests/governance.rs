@@ -7,7 +7,7 @@
 //! cannot be reached by one Principal twice.
 
 use anda_cognitive_nexus::{
-    CognitiveNexus,
+    CognitiveNexus, ElementId,
     governance::{
         AuthContext, SYSTEM_PRINCIPAL, classification,
         rows::{
@@ -713,7 +713,7 @@ async fn a_read_grant_permits_reading_and_not_exporting() {
 
     let export = run_as(
         &session,
-        r#"EXPORT CAPSULE :out WHERE { ?c CONCEPT {type: "Person"} }"#,
+        r#"EXPORT CAPSULE ?c WHERE { ?c CONCEPT {type: "Person"} }"#,
     )
     .await;
     assert_eq!(error_code(&export), "NotAuthorized");
@@ -1027,7 +1027,7 @@ async fn a_delegation_cannot_confer_what_its_delegator_never_held() {
         error_code(
             &run_as(
                 &session,
-                r#"EXPORT CAPSULE :out WHERE { ?c CONCEPT {type: "Person"} }"#,
+                r#"EXPORT CAPSULE ?c WHERE { ?c CONCEPT {type: "Person"} }"#,
             )
             .await
         ),
@@ -1332,4 +1332,541 @@ async fn a_denied_operation_is_recorded_in_the_audit() {
         .expect("the denial is on record");
     assert_eq!(denial.principal_id, "kip:principal:stranger");
     assert_eq!(denial.operation, "read");
+}
+
+// ---------------------------------------------------------------------------
+// The read path, element by element
+// ---------------------------------------------------------------------------
+
+/// Seeds a Space with two Concepts at different classifications.
+///
+/// The labels are applied by a Governance operation, not by the KML that
+/// created the elements — `governance` is a protected field and the protocol's
+/// parser refuses it in any assignment. That refusal is asserted below in
+/// [`cognitive_content_cannot_label_itself`].
+async fn two_classified_concepts(nexus: &CognitiveNexus) {
+    let owner = nexus.system_session();
+    for (index, (name, label)) in [("Public Note", "public"), ("Secret Note", "secret")]
+        .into_iter()
+        .enumerate()
+    {
+        let command = format!(r#"CREATE CONCEPT ?c {{ TYPE "Person" NAME "{name}" }}"#);
+        let response = run_as(&owner, &command).await;
+        assert_eq!(response.status, TopLevelStatus::Succeeded, "{command}");
+        owner
+            .classify(
+                DEFAULT_SPACE,
+                ElementId::new(anda_kip::ElementKind::Concept, index as u64 + 1),
+                label,
+            )
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn cognitive_content_cannot_label_itself() {
+    // §50: security-critical labels are Governance state, and `anda_kip`
+    // enforces that in the parser — on the text path and on the pre-parsed AST
+    // path alike — so no engine check has to remember to.
+    let nexus = stocked("protected_fields").await;
+    let owner = nexus.system_session();
+    for command in [
+        r#"CREATE CONCEPT ?c { TYPE "Person" NAME "Alice"
+           SET FIELDS {governance: {classification: "public"}} }"#,
+        r#"UPDATE "C-1" SET FIELDS {governance: {classification: "public"}}"#,
+    ] {
+        let parsed = anda_kip::parse_kip(command);
+        assert!(parsed.is_err(), "{command} must not parse");
+        assert!(
+            parsed.unwrap_err().message.contains("governance"),
+            "and the refusal must name the field"
+        );
+    }
+
+    // The Governance operation is how it is done instead.
+    run_as(
+        &owner,
+        r#"CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }"#,
+    )
+    .await;
+    let previous = owner
+        .classify(
+            DEFAULT_SPACE,
+            ElementId::new(anda_kip::ElementKind::Concept, 1),
+            "secret",
+        )
+        .await
+        .unwrap();
+    assert_eq!(previous, "", "the element carried no label of its own");
+}
+
+#[tokio::test]
+async fn lowering_a_classification_needs_more_than_writing() {
+    // §100: declassification is a disclosure decision. Raising a label is
+    // ordinary, because caution should not need a ticket.
+    let nexus = stocked("declassify").await;
+    run_as(
+        &nexus.system_session(),
+        r#"CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }"#,
+    )
+    .await;
+    let element = ElementId::new(anda_kip::ElementKind::Concept, 1);
+
+    let writer = agent(nexus.governance(), "kip:principal:writer").await;
+    nexus
+        .governance()
+        .create_grant(
+            GrantDraft {
+                space_id: DEFAULT_SPACE.into(),
+                grantee_principal: writer.clone(),
+                actions: vec!["read".into(), "create".into(), "update".into()],
+                ..Default::default()
+            },
+            SYSTEM_PRINCIPAL,
+        )
+        .await
+        .unwrap();
+    let session = nexus.session(AuthContext::principal(&writer));
+
+    // Up is fine.
+    session
+        .classify(DEFAULT_SPACE, element, "secret")
+        .await
+        .unwrap();
+    // Down is not.
+    let err = session
+        .classify(DEFAULT_SPACE, element, "public")
+        .await
+        .unwrap_err();
+    assert_eq!(err.name(), "NotAuthorized");
+    assert!(err.message.contains("declassify"));
+}
+
+async fn grant_read(nexus: &CognitiveNexus, principal: &str, ceiling: &str) {
+    nexus
+        .governance()
+        .create_grant(
+            GrantDraft {
+                space_id: DEFAULT_SPACE.into(),
+                grantee_principal: principal.to_string(),
+                actions: vec!["read".into(), "search".into(), "discover".into()],
+                constraints: AuthorityConstraints {
+                    max_classification: ceiling.to_string(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            SYSTEM_PRINCIPAL,
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn an_element_above_the_ceiling_is_outside_the_query_universe() {
+    // §104: not matched, not counted, not ranked. Not "returned with a
+    // redaction marker" — its existence is the disclosure.
+    let nexus = stocked("classification_read").await;
+    two_classified_concepts(&nexus).await;
+    let reader = agent(nexus.governance(), "kip:principal:reader").await;
+    grant_read(&nexus, &reader, "public").await;
+    let session = nexus.session(AuthContext::principal(&reader));
+
+    let response = run_as(
+        &session,
+        r#"FIND(?c.name) WHERE { ?c CONCEPT {type: "Person"} }"#,
+    )
+    .await;
+    assert_eq!(response.status, TopLevelStatus::Succeeded);
+    let rows = response.first_result().unwrap().as_array().unwrap().clone();
+    assert_eq!(rows, vec![serde_json::json!("Public Note")]);
+
+    // The owner sees both, so the Space really does hold two.
+    let owner = run_as(
+        &nexus.system_session(),
+        r#"FIND(?c.name) WHERE { ?c CONCEPT {type: "Person"} }"#,
+    )
+    .await;
+    assert_eq!(owner.first_result().unwrap().as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn naming_a_hidden_element_by_id_answers_as_though_it_were_absent() {
+    // §107: existence-neutral. A distinguishable "exists but hidden" is the
+    // channel the whole check exists to close.
+    let nexus = stocked("existence_neutral").await;
+    two_classified_concepts(&nexus).await;
+    let reader = agent(nexus.governance(), "kip:principal:reader").await;
+    grant_read(&nexus, &reader, "public").await;
+    let session = nexus.session(AuthContext::principal(&reader));
+
+    let hidden = run_as(&session, r#"FIND(?c) WHERE { ?c CONCEPT {id: "C-2"} }"#).await;
+    let never_written = run_as(&session, r#"FIND(?c) WHERE { ?c CONCEPT {id: "C-99"} }"#).await;
+    assert_eq!(hidden.status, TopLevelStatus::Succeeded);
+    assert_eq!(hidden.first_result(), never_written.first_result());
+    assert_eq!(hidden.first_result().unwrap().as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn a_hidden_element_does_not_change_a_count() {
+    // §106: aggregation happens over authorized state.
+    let nexus = stocked("count_security").await;
+    two_classified_concepts(&nexus).await;
+    let reader = agent(nexus.governance(), "kip:principal:reader").await;
+    grant_read(&nexus, &reader, "public").await;
+    let session = nexus.session(AuthContext::principal(&reader));
+
+    let counted = run_as(
+        &session,
+        r#"FIND(COUNT(?c)) WHERE { ?c CONCEPT {type: "Person"} }"#,
+    )
+    .await;
+    assert_eq!(
+        counted.first_result().unwrap().as_array().unwrap()[0],
+        serde_json::json!(1)
+    );
+}
+
+#[tokio::test]
+async fn a_hidden_element_does_not_appear_in_search() {
+    // §105: search must not leak hidden memory through hits or hit counts.
+    let nexus = stocked("search_security").await;
+    two_classified_concepts(&nexus).await;
+    let reader = agent(nexus.governance(), "kip:principal:reader").await;
+    grant_read(&nexus, &reader, "public").await;
+    let session = nexus.session(AuthContext::principal(&reader));
+
+    let hits = run_as(&session, r#"SEARCH CONCEPT "Note""#).await;
+    assert_eq!(hits.status, TopLevelStatus::Succeeded);
+    let found = hits.first_result().unwrap()["hits"].clone();
+    let names: Vec<String> = found
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hit| {
+            hit["element"]["name"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    assert!(names.contains(&"Public Note".to_string()));
+    assert!(
+        !names.contains(&"Secret Note".to_string()),
+        "the secret one is not a hit, and not a hit count either"
+    );
+}
+
+#[tokio::test]
+async fn a_space_wide_count_is_withheld_from_a_narrower_principal() {
+    // §103: a total is a fact about elements this caller may not discover.
+    // Withheld with a reason beats a smaller number that reads as the truth.
+    let nexus = stocked("primer_counts").await;
+    two_classified_concepts(&nexus).await;
+    let reader = agent(nexus.governance(), "kip:principal:reader").await;
+    grant_read(&nexus, &reader, "public").await;
+
+    let restricted = run_as(
+        &nexus.session(AuthContext::principal(&reader)),
+        "DESCRIBE PRIMER",
+    )
+    .await;
+    let contents = restricted.first_result().unwrap()["contents"].clone();
+    assert!(contents["withheld"].is_string());
+    assert!(contents.get("concept").is_none());
+
+    let owner = run_as(&nexus.system_session(), "DESCRIBE PRIMER").await;
+    assert_eq!(
+        owner.first_result().unwrap()["contents"]["concept"],
+        serde_json::json!(2)
+    );
+}
+
+#[tokio::test]
+async fn a_field_mask_hides_a_value_from_the_filter_as_well_as_the_projection() {
+    // §109. If the mask only applied to the projection list, a FILTER would
+    // still answer the question through which rows come back.
+    let nexus = stocked("field_mask").await;
+    let owner = nexus.system_session();
+    run_as(
+        &owner,
+        r#"CREATE CONCEPT ?c { TYPE "Person" NAME "Alice"
+           SET ATTRIBUTES {nickname: "Al"} }"#,
+    )
+    .await;
+
+    let reader = agent(nexus.governance(), "kip:principal:reader").await;
+    nexus
+        .governance()
+        .create_grant(
+            GrantDraft {
+                space_id: DEFAULT_SPACE.into(),
+                grantee_principal: reader.clone(),
+                actions: vec!["read".into()],
+                constraints: AuthorityConstraints {
+                    fields: vec!["name".into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            SYSTEM_PRINCIPAL,
+        )
+        .await
+        .unwrap();
+    let session = nexus.session(AuthContext::principal(&reader));
+
+    let projected = run_as(
+        &session,
+        r#"FIND(?c.attributes.nickname) WHERE { ?c CONCEPT {type: "Person"} }"#,
+    )
+    .await;
+    assert_eq!(
+        projected.first_result().unwrap().as_array().unwrap()[0],
+        serde_json::json!(null),
+        "the masked field projects as absent"
+    );
+
+    let probed = run_as(
+        &session,
+        r#"FIND(?c.name) WHERE { ?c CONCEPT {type: "Person"}
+           FILTER(?c.attributes.nickname == "Al") }"#,
+    )
+    .await;
+    assert!(
+        probed
+            .first_result()
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "and cannot be probed by asking which rows have it"
+    );
+
+    // The name it was allowed to read still comes back.
+    let allowed = run_as(
+        &session,
+        r#"FIND(?c.name) WHERE { ?c CONCEPT {type: "Person"} }"#,
+    )
+    .await;
+    assert_eq!(
+        allowed.first_result().unwrap().as_array().unwrap()[0],
+        serde_json::json!("Alice")
+    );
+}
+
+#[tokio::test]
+async fn engine_origin_is_withheld_rather_than_erased() {
+    // §110: who wrote an element is operational information about the
+    // deployment. Dropping the member would claim no origin was recorded.
+    let nexus = stocked("raw_origin").await;
+    run_as(
+        &nexus.system_session(),
+        r#"CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }"#,
+    )
+    .await;
+    let reader = agent(nexus.governance(), "kip:principal:reader").await;
+    nexus
+        .governance()
+        .create_grant(
+            GrantDraft {
+                space_id: DEFAULT_SPACE.into(),
+                grantee_principal: reader.clone(),
+                actions: vec!["read".into()],
+                ..Default::default()
+            },
+            SYSTEM_PRINCIPAL,
+        )
+        .await
+        .unwrap();
+
+    let query = r#"FIND(?c._system.origin) WHERE { ?c CONCEPT {type: "Person"} }"#;
+    let ordinary = run_as(&nexus.session(AuthContext::principal(&reader)), query).await;
+    assert_eq!(
+        ordinary.first_result().unwrap().as_array().unwrap()[0]["redacted"],
+        "read_raw_origin"
+    );
+
+    let auditor = agent(nexus.governance(), "kip:principal:auditor").await;
+    nexus
+        .governance()
+        .create_grant(
+            GrantDraft {
+                space_id: DEFAULT_SPACE.into(),
+                grantee_principal: auditor.clone(),
+                actions: vec!["read".into(), "read_raw_origin".into()],
+                ..Default::default()
+            },
+            SYSTEM_PRINCIPAL,
+        )
+        .await
+        .unwrap();
+    let privileged = run_as(&nexus.session(AuthContext::principal(&auditor)), query).await;
+    assert_eq!(
+        privileged.first_result().unwrap().as_array().unwrap()[0]["principal_id"],
+        SYSTEM_PRINCIPAL
+    );
+}
+
+#[tokio::test]
+async fn a_hidden_assertion_contributes_nothing_to_a_belief() {
+    // The projection's governance-visibility stage, which it gets by reading
+    // through the same gate every other read uses.
+    let nexus = stocked("projection_visibility").await;
+    let owner = nexus.system_session();
+    let created = run_as(
+        &owner,
+        r#"MUTATE {
+            CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
+            CREATE CONCEPT ?dark { TYPE "Person" NAME "Dark Mode" }
+            ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
+            CREATE ASSERTION ?a {
+                SET FIELDS {proposition: ?p, asserted_by: ?alice,
+                            stance: "support", mode: "stated", confidence: 0.9}
+            }
+        }"#,
+    )
+    .await;
+    assert_eq!(created.status, TopLevelStatus::Succeeded);
+    owner
+        .classify(
+            DEFAULT_SPACE,
+            ElementId::new(anda_kip::ElementKind::Assertion, 1),
+            "secret",
+        )
+        .await
+        .unwrap();
+
+    let reader = agent(nexus.governance(), "kip:principal:reader").await;
+    nexus
+        .governance()
+        .create_grant(
+            GrantDraft {
+                space_id: DEFAULT_SPACE.into(),
+                grantee_principal: reader.clone(),
+                actions: vec!["read".into(), "project".into()],
+                constraints: AuthorityConstraints {
+                    max_classification: "internal".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            SYSTEM_PRINCIPAL,
+        )
+        .await
+        .unwrap();
+    let session = nexus.session(AuthContext::principal(&reader));
+
+    let belief = run_as(
+        &session,
+        r#"FIND(?b.status) WHERE { ?p PROPOSITION (?s, "prefers", ?o) ?b BELIEF (?p) }"#,
+    )
+    .await;
+    assert_eq!(
+        belief.status,
+        TopLevelStatus::Succeeded,
+        "{:?}",
+        belief.error
+    );
+    let rows = belief.first_result().unwrap().as_array().unwrap().clone();
+    assert!(
+        rows.is_empty() || rows.iter().all(|row| row == "insufficient"),
+        "silence, not a belief built from a claim this caller may not see: {rows:?}"
+    );
+
+    // The owner, who can see the Assertion, gets the belief it supports.
+    let owner_belief = run_as(
+        &owner,
+        r#"FIND(?b.status) WHERE { ?p PROPOSITION (?s, "prefers", ?o) ?b BELIEF (?p) }"#,
+    )
+    .await;
+    assert_eq!(
+        owner_belief.first_result().unwrap().as_array().unwrap()[0],
+        serde_json::json!("accepted")
+    );
+}
+
+#[tokio::test]
+async fn history_does_not_name_elements_the_caller_may_not_read() {
+    let nexus = stocked("history_security").await;
+    two_classified_concepts(&nexus).await;
+    let reader = agent(nexus.governance(), "kip:principal:reader").await;
+    nexus
+        .governance()
+        .create_grant(
+            GrantDraft {
+                space_id: DEFAULT_SPACE.into(),
+                grantee_principal: reader.clone(),
+                actions: vec!["read".into(), "read_history".into()],
+                constraints: AuthorityConstraints {
+                    max_classification: "public".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            SYSTEM_PRINCIPAL,
+        )
+        .await
+        .unwrap();
+    let session = nexus.session(AuthContext::principal(&reader));
+
+    let history = run_as(&session, "HISTORY SPACE").await;
+    assert_eq!(history.status, TopLevelStatus::Succeeded);
+    let entries = history.first_result().unwrap().as_array().unwrap().clone();
+    let named: Vec<String> = entries
+        .iter()
+        .flat_map(|entry| entry["changes"].as_array().cloned().unwrap_or_default())
+        .filter_map(|change| change["id"].as_str().map(str::to_string))
+        .collect();
+    assert!(named.contains(&"C-1".to_string()));
+    assert!(
+        !named.contains(&"C-2".to_string()),
+        "a change list is an existence channel"
+    );
+}
+
+#[tokio::test]
+async fn an_export_carries_only_what_the_caller_could_read() {
+    // §144. And the manifest already says `partial`, so a destination is not
+    // told it received a complete Space.
+    let nexus = stocked("export_redaction").await;
+    two_classified_concepts(&nexus).await;
+    let exporter = agent(nexus.governance(), "kip:principal:exporter").await;
+    nexus
+        .governance()
+        .create_grant(
+            GrantDraft {
+                space_id: DEFAULT_SPACE.into(),
+                grantee_principal: exporter.clone(),
+                actions: vec!["read".into(), "export".into()],
+                constraints: AuthorityConstraints {
+                    max_classification: "public".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            SYSTEM_PRINCIPAL,
+        )
+        .await
+        .unwrap();
+    let session = nexus.session(AuthContext::principal(&exporter));
+
+    let exported = run_as(
+        &session,
+        r#"EXPORT CAPSULE ?c WHERE { ?c CONCEPT {type: "Person"} }"#,
+    )
+    .await;
+    assert_eq!(
+        exported.status,
+        TopLevelStatus::Succeeded,
+        "{:?}",
+        exported.error
+    );
+    let capsule = exported.first_result().unwrap().clone();
+    let concepts = capsule["payload"]["records"]["concepts"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let names: Vec<&str> = concepts.iter().filter_map(|c| c["name"].as_str()).collect();
+    assert_eq!(names, vec!["Public Note"]);
 }

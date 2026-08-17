@@ -99,6 +99,36 @@ impl ResourceContext {
         self
     }
 
+    /// The resource one Cognitive Element presents to an authorization.
+    ///
+    /// Note what is *not* here: the element's name, attributes, confidence or
+    /// subject. Authorization reads the element's kind, type and classification
+    /// and nothing a cognitive writer controls the meaning of — which is the
+    /// storage-level shape of "cognitive content cannot grant authority" (§48).
+    pub fn of_element(element: &crate::store::Element) -> Self {
+        Self {
+            kind: element.kind().to_string(),
+            schema_ref: element.schema_ref().to_string(),
+            classification: element.classification().to_string(),
+            element_id: element.id().to_string(),
+        }
+    }
+
+    /// Whether this names nothing in particular — the Space as a whole.
+    ///
+    /// The two authorization layers ask different questions, and this is what
+    /// tells them apart. A command gate asks *may this Principal do this here
+    /// at all*, so a Grant narrowed to one classification still lets the query
+    /// run; the narrowing is then applied element by element, where there is
+    /// an element to apply it to. Judging the command against a null resource
+    /// would deny every scoped Grant its own commands.
+    pub fn is_space_scope(&self) -> bool {
+        self.kind.is_empty()
+            && self.schema_ref.is_empty()
+            && self.classification.is_empty()
+            && self.element_id.is_empty()
+    }
+
     /// A one-line description, for audit and for denial messages.
     fn label(&self) -> String {
         if !self.element_id.is_empty() {
@@ -128,6 +158,13 @@ pub struct Authorization {
     pub policy_version: u64,
     /// The Grants and Delegations that matched.
     pub authorities_used: Vec<String>,
+    /// Whether the authority that permitted this reaches everything.
+    ///
+    /// What a Space-wide answer — a count, a total — may be built from. A
+    /// permitted decision under a narrowed authority is still permitted; it
+    /// just cannot be the basis for a number that speaks for the whole Space
+    /// (§106).
+    pub unrestricted: bool,
     /// Why, in one line. Safe to return to the caller (§267).
     pub reason: String,
 }
@@ -175,6 +212,14 @@ impl Candidate {
     /// Only a tie-breaker: any candidate that reaches this point independently
     /// permits the operation, so the score decides which one's constraints the
     /// decision carries, never whether it is permitted.
+    /// Whether this authority narrows nothing at all.
+    fn is_unrestricted(&self) -> bool {
+        self.scope == AuthorityScope::default()
+            && self.constraints.fields.is_empty()
+            && self.constraints.max_classification.is_empty()
+            && self.constraints.max_results.is_none()
+    }
+
     fn restrictiveness(&self) -> usize {
         self.scope.kinds.len()
             + self.scope.schema_refs.len()
@@ -326,6 +371,7 @@ impl EffectiveAuthority {
             policy_id: policy_id.clone(),
             policy_version,
             authorities_used: Vec::new(),
+            unrestricted: false,
             reason: reason.to_string(),
         };
 
@@ -337,15 +383,17 @@ impl EffectiveAuthority {
         }
 
         // The classification a resource carries when it names none is the
-        // Space default, never `public` (§95).
-        let label = if resource.classification.is_empty() {
-            self.default_classification()
+        // Space default, never `public` (§95). Only for a resource that names
+        // something: a Space-scope check has no element to classify, and
+        // giving it the default would make every classification-narrowed Grant
+        // fail its own commands.
+        let resource = if resource.is_space_scope() || !resource.classification.is_empty() {
+            resource.clone()
         } else {
-            resource.classification.as_str()
-        };
-        let resource = ResourceContext {
-            classification: label.to_string(),
-            ..resource.clone()
+            ResourceContext {
+                classification: self.default_classification().to_string(),
+                ..resource.clone()
+            }
         };
 
         let statements = self.statements();
@@ -423,11 +471,13 @@ impl EffectiveAuthority {
                 policy_id,
                 policy_version,
                 authorities_used: vec![chosen.id],
+                unrestricted: false,
                 reason,
             };
         }
 
         let constrained = chosen.constraints != AuthorityConstraints::default();
+        let unrestricted = chosen.is_unrestricted();
         Authorization {
             decision: if constrained {
                 Decision::AllowWithConstraints
@@ -439,9 +489,41 @@ impl EffectiveAuthority {
             obligations,
             policy_id,
             policy_version,
+            unrestricted,
             authorities_used: vec![chosen.id],
             reason: format!("{permission} is granted over {}", resource.label()),
         }
+    }
+
+    /// Whether this caller may read one element, and under what narrowing.
+    ///
+    /// `None` means the element is outside this Principal's query universe
+    /// (§104): it does not appear in results, is not counted, does not affect
+    /// ranking, and asking for it by id answers the same as asking for one that
+    /// was never written. That last part is deliberate — a distinguishable
+    /// "exists but hidden" is the existence leak §103 is about.
+    pub fn may_read(
+        &self,
+        element: &crate::store::Element,
+        auth: &AuthContext,
+    ) -> Option<AuthorityConstraints> {
+        let resource = ResourceContext::of_element(element);
+        let decision = self.authorize(Permission::Read, &resource, auth);
+        decision.is_permitted().then_some(decision.constraints)
+    }
+
+    /// Whether this caller's authority reaches every element in the Space.
+    ///
+    /// A Space-wide count is only honest when it is: a caller whose Grant is
+    /// narrowed to one classification must not be told how many elements exist
+    /// outside it (§106). Answered from the authority rather than by scanning,
+    /// because the point is to avoid producing the number at all.
+    pub fn reads_whole_space(&self, auth: &AuthContext) -> bool {
+        if self.is_owner {
+            return true;
+        }
+        let decision = self.authorize(Permission::Read, &ResourceContext::default(), auth);
+        decision.is_permitted() && decision.unrestricted
     }
 
     /// Whether this Principal may speak as a semantic actor here (§14, §66).
@@ -544,7 +626,7 @@ impl EffectiveAuthority {
         {
             return false;
         }
-        scope_matches(&statement.resource, resource)
+        (resource.is_space_scope() || scope_matches(&statement.resource, resource))
             && conditions_hold(&statement.conditions, auth, now)
     }
 }
@@ -560,8 +642,9 @@ fn candidate_matches(
         .actions
         .iter()
         .any(|action| action == permission.as_str())
-        && scope_matches(&candidate.scope, resource)
-        && reaches_classification(&candidate.constraints, resource)
+        && (resource.is_space_scope()
+            || (scope_matches(&candidate.scope, resource)
+                && reaches_classification(&candidate.constraints, resource)))
         && conditions_hold(&candidate.conditions, auth, now)
 }
 

@@ -81,6 +81,12 @@ pub struct Context<'a> {
     pub authority: &'a EffectiveAuthority,
     /// Who the caller is.
     pub auth: &'a AuthContext,
+    /// Whether `_system.origin` may be returned at all (§110).
+    ///
+    /// Space-scoped and decided once: engine origin is operational information
+    /// about the deployment rather than about any one element, so a caller
+    /// either may see who writes here or may not.
+    pub read_origin: bool,
     budget: usize,
 }
 
@@ -109,6 +115,13 @@ impl<'a> Context<'a> {
             as_of: None,
             authority,
             auth,
+            read_origin: authority
+                .authorize(
+                    crate::governance::Permission::ReadRawOrigin,
+                    &crate::governance::ResourceContext::default(),
+                    auth,
+                )
+                .is_permitted(),
             budget: MAX_CANDIDATES,
         })
     }
@@ -135,6 +148,13 @@ impl<'a> Context<'a> {
     ///
     /// A bound read loads the version that was current at its coordinate, so
     /// every dot path, filter and sort key downstream reads the same past.
+    ///
+    /// **This is the read path's authorization choke point.** Every pattern in
+    /// [`matching`] reaches an element through here and skips what comes back
+    /// `None`, so an element this caller may not read is outside the query
+    /// universe for the whole query — not matched, not counted, not ranked, not
+    /// paginated over (§104). Putting the check anywhere later would mean each
+    /// new pattern had to remember to apply it.
     pub async fn load(&mut self, id: ElementId) -> Result<Option<Element>, KipError> {
         if let Some(cached) = self.loaded.get(&id) {
             return Ok(cached.clone());
@@ -143,11 +163,24 @@ impl<'a> Context<'a> {
             Some(seq) => self.store.element_at(&self.space, id, seq).await?,
             None => self.store.get_element(id).await.ok(),
         };
-        if let Some(element) = &element {
-            self.views.insert(id, crate::view::render(element));
-        }
+        let element = self.admit(element);
         self.loaded.insert(id, element.clone());
         Ok(element)
+    }
+
+    /// Applies the read decision to one loaded element, caching its view.
+    ///
+    /// Returns `None` for an element this caller may not read, and caches the
+    /// **redacted** view for one it may — so a `FILTER` or an `ORDER BY` on a
+    /// masked field sees what the projection would, rather than being able to
+    /// probe the value through row membership (§109).
+    pub(crate) fn admit(&mut self, element: Option<Element>) -> Option<Element> {
+        let element = element?;
+        let constraints = self.authority.may_read(&element, self.auth)?;
+        let mut view = crate::view::render(&element);
+        crate::governance::redact::apply(&mut view, &constraints, self.read_origin);
+        self.views.insert(element.id(), view);
+        Some(element)
     }
 
     /// The rendered view of an already-loaded element.
@@ -236,9 +269,14 @@ impl<'a> Context<'a> {
                 let id = element.id();
                 // Seed the cache: the historical row was just read, and
                 // re-reading it through `load` would answer from the present.
-                self.views.insert(id, crate::view::render(&element));
-                self.loaded.insert(id, Some(element));
-                ids.push(id);
+                // It still goes through `admit`, because a past coordinate is
+                // not a way around the present's authorization — the read is
+                // happening now, by this caller.
+                let admitted = self.admit(Some(element));
+                self.loaded.insert(id, admitted.clone());
+                if admitted.is_some() {
+                    ids.push(id);
+                }
             }
             return Ok(ids);
         }

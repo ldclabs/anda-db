@@ -686,6 +686,42 @@ impl Element {
     pub fn is_active(&self) -> bool {
         self.state() == state::ACTIVE
     }
+
+    /// The element's own Governance members (Spec §6.2).
+    pub fn governance(&self) -> &anda_kip::Json {
+        envelope!(self, governance)
+    }
+
+    /// The classification label this element carries, if it carries one.
+    ///
+    /// Empty means the element states none, which is **not** `public`: the
+    /// Space's default applies instead (§95). Resolving that default is the
+    /// authorization layer's job, because only it knows which Space the read
+    /// is running in.
+    pub fn classification(&self) -> &str {
+        self.governance()
+            .get("classification")
+            .and_then(anda_kip::Json::as_str)
+            .unwrap_or_default()
+    }
+
+    /// The exact Schema symbol this element is typed by, where it has one.
+    ///
+    /// A Proposition's predicate and an Evidence record's class play the same
+    /// role for authorization — they are what a Grant scoped to a schema
+    /// reference is scoped to — so they answer here rather than forcing every
+    /// caller to match on the kind first.
+    pub fn schema_ref(&self) -> &str {
+        match self {
+            Element::Concept(row) => &row.schema_ref,
+            Element::Proposition(row) => &row.predicate_ref,
+            Element::Evidence(row) => &row.evidence_class,
+            Element::Activity(row) => &row.activity_class,
+            // An Assertion is typed by the Proposition it is about, not by a
+            // symbol of its own.
+            Element::Assertion(_) => "",
+        }
+    }
 }
 
 impl Store {

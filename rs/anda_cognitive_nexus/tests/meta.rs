@@ -139,11 +139,10 @@ async fn capabilities_report_the_gaps_as_data_not_as_errors() {
         "historical_search",
         "semantic_search",
         "trust_model",
-        // Governance is enforced at command scope; what is still missing is
-        // the per-element half, and the gap list says exactly that rather
-        // than claiming the whole plane either way.
-        "governance_element_scope",
         "trust_governance",
+        // Command and element scope are both enforced now; retention is the
+        // element member a write can still set without asking.
+        "protected_retention_fields",
         "capsule_import_modes",
         "capsule_signatures",
     ] {

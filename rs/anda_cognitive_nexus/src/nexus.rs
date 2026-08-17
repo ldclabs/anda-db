@@ -315,6 +315,35 @@ impl Session {
     ) -> Result<EffectiveAuthority, KipError> {
         EffectiveAuthority::resolve(&self.nexus.store, space_id, &self.auth).await
     }
+
+    /// Sets one element's classification (§93, §100).
+    ///
+    /// A Governance operation rather than a KML clause, because an element's
+    /// `governance` block is not author-writable: the protocol's own parser
+    /// refuses it in every assignment. Raising a label needs `update` and
+    /// lowering one needs `declassify` — it is disclosure that requires
+    /// authority, not caution.
+    ///
+    /// Returns the label the element carried before.
+    pub async fn classify(
+        &self,
+        space_id: &str,
+        element: crate::id::ElementId,
+        classification: &str,
+    ) -> Result<String, KipError> {
+        let _guard = self.nexus.lock.write().await;
+        self.nexus.store.reopen_if_poisoned().await?;
+        let authority = self.authority(space_id, &self.auth).await?;
+        crate::governance::element::classify(
+            &self.nexus.store,
+            space_id,
+            element,
+            classification,
+            &authority,
+            &self.auth,
+        )
+        .await
+    }
 }
 
 #[async_trait]

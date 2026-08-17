@@ -90,7 +90,13 @@ pub async fn export(
         let Some(element) = cx.load(*id).await? else {
             continue;
         };
-        let rendered = view::render(&element);
+        // The redacted view, for the same reason SEARCH uses it: a field the
+        // caller may not read must not leave the Space in a Capsule either
+        // (§144). Elements it may not read at all were already dropped by
+        // `load`, which is what makes the manifest's `partial` honest.
+        let rendered = cx
+            .cached_view(*id)
+            .unwrap_or_else(|| view::render(&element));
         collect_schema_refs(&rendered, &mut schema_refs);
         match id.kind {
             ElementKind::Concept => records.concepts.push(rendered),

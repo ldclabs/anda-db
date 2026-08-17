@@ -52,6 +52,12 @@ pub struct EnvelopeMut<'a> {
     pub updated_tx: &'a mut String,
     /// Engine origin.
     pub origin: &'a mut Json,
+    /// The element's own Governance members.
+    ///
+    /// Here rather than only on each row because it is written by exactly one
+    /// generic path — an authorized Governance operation — and never by the
+    /// cognitive stamping below, which leaves it untouched.
+    pub governance: &'a mut Json,
 }
 
 /// A persisted row of one Core element kind.
@@ -88,6 +94,7 @@ macro_rules! impl_row {
                         created_tx: &mut self.created_tx,
                         updated_tx: &mut self.updated_tx,
                         origin: &mut self.origin,
+                        governance: &mut self.governance,
                     }
                 }
             }

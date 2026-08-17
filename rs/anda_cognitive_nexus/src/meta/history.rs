@@ -102,6 +102,9 @@ pub async fn history(cx: &mut Context<'_>, command: &HistoryCommand) -> Result<A
     let mut rows = journal(cx, Filter::And(filters)).await?;
     rows.retain(|row| row.seq >= from && row.seq <= to);
     rows.sort_by_key(|row| row.seq);
+    // Before the total is computed, so a page count cannot report entries the
+    // page itself will not contain (§104).
+    visible_changes(cx, &mut rows).await;
 
     let total = rows.len();
     let page: Vec<Json> = rows
@@ -151,6 +154,7 @@ pub async fn changes(cx: &mut Context<'_>, command: &ChangesCommand) -> Result<A
     )
     .await?;
     rows.sort_by_key(|row| row.seq);
+    visible_changes(cx, &mut rows).await;
 
     let last = rows.iter().take(limit).map(|row| row.seq).next_back();
     let more = rows.len() > limit;
@@ -216,6 +220,46 @@ async fn journal(cx: &Context<'_>, filter: Filter) -> Result<Vec<TransactionRow>
 }
 
 /// One journal entry, narrowed to one element when the caller asked about one.
+/// Drops the change records for elements this caller may not read.
+///
+/// A transaction's change list names element ids, so an unfiltered history is
+/// an existence channel for a Principal whose read authority is narrower than
+/// the Space (§103). Only restricted callers pay for the check: for one whose
+/// authority reaches the whole Space there is nothing to filter, and the whole
+/// journal is already theirs to read.
+///
+/// A change to an element that has since been erased disappears from a
+/// restricted caller's history, because there is nothing left to authorize
+/// against. That is the conservative direction, and it is why the check is
+/// skipped entirely for the unrestricted case rather than being applied
+/// uniformly and losing history for everyone.
+async fn visible_changes(cx: &mut Context<'_>, rows: &mut Vec<TransactionRow>) {
+    if cx.authority.reads_whole_space(cx.auth) {
+        return;
+    }
+    for row in rows.iter_mut() {
+        let mut kept = Vec::with_capacity(row.changes.len());
+        for change in &row.changes {
+            let Some(id) = change.get("id").and_then(Json::as_str) else {
+                // A change record with no element — a no-op entry — discloses
+                // nothing on its own.
+                kept.push(change.clone());
+                continue;
+            };
+            let Ok(parsed) = id.parse::<crate::id::ElementId>() else {
+                continue;
+            };
+            if matches!(cx.load(parsed).await, Ok(Some(_))) {
+                kept.push(change.clone());
+            }
+        }
+        row.changes = kept;
+    }
+    // A transaction whose every change is hidden is one this caller has no
+    // business knowing happened.
+    rows.retain(|row| !row.changes.is_empty());
+}
+
 fn entry(row: &TransactionRow, element: Option<&str>) -> Json {
     let changes: Vec<Json> = match element {
         Some(id) => row
