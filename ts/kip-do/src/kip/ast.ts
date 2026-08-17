@@ -24,7 +24,10 @@ export type {
   BoundValue,
   KipValue,
   Scalar,
-  SymbolRef,
+  // `SymbolRef` upstream. Renamed because the schema layer's `SymbolRef` is
+  // the resolved canonical symbol, and this is the unresolved slot a command
+  // writes one into — two different things one name away from each other.
+  SymbolRef as SymbolSlot,
   ElementRef,
   // Shared terms
   DotPathVar,

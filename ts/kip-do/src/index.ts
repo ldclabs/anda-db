@@ -75,6 +75,8 @@ export {
   type Literal,
 } from './term.js'
 
+export * from './schema/index.js'
+
 export * from './store/index.js'
 
 export {
