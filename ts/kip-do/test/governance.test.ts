@@ -1579,3 +1579,172 @@ describe('classification and influence authority', () => {
     })
   })
 })
+
+describe('erasure', () => {
+  const SETUP = `MUTATE {
+    CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
+    CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+    ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
+  }`
+
+  async function withNexus<T>(
+    name: string,
+    body: (nexus: CognitiveNexus) => T,
+  ): Promise<T> {
+    const stub = env.KIP_DB.getByName(`purge-${name}`)
+    return await runInDurableObject(stub, (_instance, state) => {
+      const nexus = CognitiveNexus.connect(state.storage)
+      nexus.activatePackages([COGNITIVE_MEMORY])
+      nexus.execute(SETUP)
+      return body(nexus)
+    })
+  }
+
+  it('refuses by default, and names how many rather than which', async () => {
+    await withNexus('default', (nexus) => {
+      // §103: the referring elements may be ones this caller cannot read, so a
+      // refusal must not become a way to enumerate them.
+      expect(() => nexus.execute('PURGE "C-1" CONFIRM "PURGE"')).toThrowError(
+        /1 element\(s\) still reference C-1/,
+      )
+      expect(() => nexus.execute('PURGE "C-1" CONFIRM "PURGE"')).not.toThrowError(
+        /P-1/,
+      )
+    })
+  })
+
+  it('refuses a reference policy it does not implement, rather than defaulting', async () => {
+    await withNexus('unknown-policy', (nexus) => {
+      // Defaulting would silently run a destructive operation under a policy
+      // the caller did not ask for.
+      expect(() =>
+        nexus.execute(
+          'PURGE "C-2" REFERENCE POLICY "delete_everything" CONFIRM "PURGE"',
+        ),
+      ).toThrowError(/is not a reference policy/)
+    })
+  })
+
+  it('leaves an identity stub rather than a hole', async () => {
+    await withNexus('stub', (nexus) => {
+      nexus.execute(
+        'PURGE "C-1" REFERENCE POLICY "tombstone_reference" CONFIRM "PURGE"',
+      )
+      const stub = nexus.store.load(parseElementId('C-1'))
+      // Deleting the row outright would break every reference to it — and a
+      // dangling reference does not say "this was erased", it says nothing.
+      expect(stub?.row.state).toBe('purged')
+      expect(stub?.row.governance.purged).toBe(true)
+      expect(stub?.row.governance.content_digest).toMatch(/^[0-9a-f]{64}$/)
+      expect((stub?.row as { name?: string }).name).toBe('')
+      // The reference still resolves — to a stub that says what happened.
+      expect(nexus.store.referrers(nexus.space, parseElementId('C-1'))).toHaveLength(1)
+    })
+  })
+
+  it('destroys the history, not only the current row', async () => {
+    await withNexus('history', (nexus) => {
+      expect(nexus.describe('HISTORY ELEMENT "C-2"')).toHaveLength(1)
+      nexus.execute('PURGE "C-2" REFERENCE POLICY "tombstone_reference" CONFIRM "PURGE"')
+      // An element scrubbed only in its current row stays fully readable
+      // through the version log, which would make the purge a purge in name
+      // only (§19.3).
+      const versions = nexus.describe('HISTORY ELEMENT "C-2"') as { op: string }[]
+      expect(versions.map((v) => v.op)).toEqual(['purge'])
+    })
+  })
+
+  it('does not walk past a legal hold', async () => {
+    await withNexus('legal-hold', (nexus) => {
+      const element = nexus.store.load(parseElementId('C-2'))
+      if (element === null) throw new Error('C-2 should exist')
+      element.row.retention = { legal_hold: true }
+      nexus.store.put(element, 'update', 'test')
+
+      // §163: the hold is checked before anything destructive is decided, and
+      // lifting it is a separate decision under its own permission.
+      expect(() =>
+        nexus.execute('PURGE "C-2" REFERENCE POLICY "tombstone_reference" CONFIRM "PURGE"'),
+      ).toThrowError(/under a legal hold/)
+    })
+  })
+
+  it('needs its own permission to place a legal hold', async () => {
+    await withNexus('hold-permission', (nexus) => {
+      const gov = nexus.store.governance
+      gov.ensurePrincipal({ principal_id: 'kip:principal:agent' })
+      gov.createGrant(
+        {
+          space_id: nexus.space,
+          grantee_principal: 'kip:principal:agent',
+          actions: ['create', 'read', 'manage_retention'],
+        },
+        SYSTEM_PRINCIPAL,
+      )
+      const session = nexus.session(principalAuth('kip:principal:agent'))
+
+      // An ordinary expiry is retention management…
+      expect(() =>
+        session.execute(`CREATE CONCEPT ?c {
+          TYPE "Person" NAME "Bob"
+          SET FIELDS { retention: {expires_at: "2030-01-01T00:00:00.000Z"} }
+        }`),
+      ).not.toThrow()
+
+      // …but a hold blocks erasure, so a writer that could set one could make
+      // its own content undeletable.
+      expect(() =>
+        session.execute(`CREATE CONCEPT ?c {
+          TYPE "Person" NAME "Carol"
+          SET FIELDS { retention: {legal_hold: true} }
+        }`),
+      ).toThrowError(/requires the legal_hold permission/)
+    })
+  })
+
+  it('authorizes every dependent before erasing any of them', async () => {
+    await withNexus('cascade', (nexus) => {
+      const gov = nexus.store.governance
+      gov.ensurePrincipal({ principal_id: 'kip:principal:agent' })
+      gov.createGrant(
+        {
+          space_id: nexus.space,
+          grantee_principal: 'kip:principal:agent',
+          actions: ['read'],
+        },
+        SYSTEM_PRINCIPAL,
+      )
+      gov.createGrant(
+        {
+          space_id: nexus.space,
+          grantee_principal: 'kip:principal:agent',
+          actions: ['purge'],
+          // The target, but not the Proposition that points at it.
+          scope: { elements: ['C-1'] },
+        },
+        SYSTEM_PRINCIPAL,
+      )
+      const session = nexus.session(principalAuth('kip:principal:agent'))
+
+      expect(() =>
+        session.execute(
+          'PURGE "C-1" REFERENCE POLICY "authorized_cascade" CONFIRM "PURGE"',
+        ),
+      ).toThrowError(/requires the purge permission/)
+      // A cascade that erased half and then refused would leave a graph nothing
+      // can describe, so nothing was erased.
+      expect(nexus.store.load(parseElementId('C-1'))?.row.state).toBe('active')
+      expect(nexus.store.load(parseElementId('P-1'))?.row.state).toBe('active')
+    })
+  })
+
+  it('erases the dependents when the cascade is authorized', async () => {
+    await withNexus('cascade-ok', (nexus) => {
+      nexus.execute(
+        'PURGE "C-1" REFERENCE POLICY "authorized_cascade" CONFIRM "PURGE"',
+      )
+      expect(nexus.store.load(parseElementId('C-1'))?.row.state).toBe('purged')
+      expect(nexus.store.load(parseElementId('P-1'))?.row.state).toBe('purged')
+    })
+  })
+})

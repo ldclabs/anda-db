@@ -51,7 +51,7 @@ describe('META', () => {
       // word: Governance is enforced at command scope, so the gaps that remain
       // are the element-scope ones, and they are listed as themselves.
       expect(gaps).toContain('set_retention')
-      expect(gaps).toContain('purge_reference_policies')
+      expect(gaps).toContain('trust_model')
       expect(gaps).toContain('search')
       expect(gaps).toContain('historical_read')
       expect(gaps).toContain('capsule_import')

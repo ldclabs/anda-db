@@ -231,22 +231,11 @@ export function apply(
   }
   if ('Purge' in clause) {
     const { target, where_clauses, limit, reference_policy } = clause.Purge
-    const policy =
-      reference_policy === null
-        ? 'deny_if_referenced'
-        : scalarText(b, reference_policy, 'REFERENCE POLICY')
-    if (policy !== 'deny_if_referenced') {
-      // §173: the other policies cascade or rewrite references, and neither is
-      // something to fall back to silently. 1.x's `DELETE ... DETACH` is
-      // exactly the default this refuses to be.
-      throw errors.constraintViolation(
-        `this engine implements the "deny_if_referenced" reference policy ` +
-          `only; ${JSON.stringify(policy)} would cascade or rewrite ` +
-          `references, which is not something to default into`,
-      )
-    }
+    const policy = referencePolicy(
+      reference_policy === null ? null : scalarText(b, reference_policy, 'REFERENCE POLICY'),
+    )
     for (const id of select(target, where_clauses, limit, 'PURGE', 'purge').authorized(tx)) {
-      purge(tx, id)
+      purge(tx, id, policy)
     }
     return
   }
@@ -858,18 +847,74 @@ function merge(
  * and a dangling reference does not say "this was erased" — it says nothing.
  * What is left is identity, provenance and a digest of what used to be there.
  */
-function purge(tx: Transaction, id: ElementId): void {
+function purge(tx: Transaction, id: ElementId, policy: ReferencePolicy): void {
   const named = formatElementId(id)
-  const referrers = tx.store.referrers(tx.cx.space, id)
-  if (referrers.length > 0) {
-    throw errors.purgeDenied(
-      `${named} is still referenced by ${referrers
-        .map((r) => `${formatElementId(r.from)} (${r.field})`)
-        .join(', ')}; erasing it would leave those references dangling. The ` +
-        `default reference policy refuses rather than cascading`,
+
+  // §163: a legal hold is exactly the thing purge must not walk past, and it is
+  // checked before anything destructive is decided. Lifting the hold is a
+  // separate Governance decision under its own permission.
+  if (hasLegalHold(tx.load(id))) {
+    throw errors.legalHoldConflict(
+      `${named} is under a legal hold; lifting the hold is a separate ` +
+        `Governance decision under its own permission`,
     )
   }
 
+  const referrers = tx.store.referrers(tx.cx.space, id)
+  if (policy === 'deny_if_referenced' && referrers.length > 0) {
+    // Names how many, not which: the referring elements may be ones this caller
+    // cannot read, and a purge refusal must not become a way to enumerate them
+    // (§103).
+    throw errors.purgeDenied(
+      `${referrers.length} element(s) still reference ${named}. Erasing a ` +
+        `referenced element leaves a history that points at nothing; choose ` +
+        `REFERENCE POLICY "tombstone_reference" to keep the identity stub, or ` +
+        `"authorized_cascade" to erase the dependents too`,
+    )
+  }
+  if (policy === 'authorized_cascade') {
+    // Each dependent is authorized and hold-checked on its own before any of
+    // them is touched. A cascade that erased half and then refused would leave
+    // a graph nothing can describe.
+    const dependents = [...new Set(referrers.map((r) => formatElementId(r.from)))]
+      .map(parseElementId)
+      .filter((dependent) => formatElementId(dependent) !== named)
+    for (const dependent of dependents) {
+      tx.authorizeElement(dependent, 'purge')
+      if (hasLegalHold(tx.load(dependent))) {
+        throw errors.legalHoldConflict(
+          `${formatElementId(dependent)} depends on ${named} and is under a ` +
+            `legal hold, so this cascade cannot complete`,
+        )
+      }
+    }
+    for (const dependent of dependents) scrub(tx, dependent)
+  }
+
+  scrub(tx, id)
+}
+
+/**
+ * Whether an element is held against erasure (§82, §163).
+ *
+ * A cognitive writer cannot set this: `legal_hold` in a `retention` block needs
+ * the `legal_hold` permission of its own, precisely so that content cannot make
+ * itself undeletable.
+ */
+function hasLegalHold(element: Element): boolean {
+  return element.row.retention.legal_hold === true
+}
+
+/**
+ * Replaces one element's content with its identity stub.
+ *
+ * The version log goes first. A crash between the two leaves an element whose
+ * current row still has its content and whose past does not, which is
+ * recoverable by purging again; the other order leaves a stub whose full
+ * contents are still readable through the history, which is not recoverable at
+ * all because nothing says to look (§19.3).
+ */
+function scrub(tx: Transaction, id: ElementId): void {
   const element = tx.load(id)
   const digest = sha256Text(canonicalJson(element.row))
   tx.store.purgeVersions(tx.cx.space, id)
@@ -890,6 +935,31 @@ function purge(tx: Transaction, id: ElementId): void {
   // empty name.
   element.row.governance = { purged: true, content_digest: digest }
   tx.markChanged(id, 'purge')
+}
+
+/**
+ * How a purge treats elements that still point at the target (§173).
+ *
+ * The default refuses, because in a cognitive history an Assertion, an Activity
+ * or an Experience may point at the target, and erasing the whole dependency
+ * chain falsifies history (§175). KIP 1.x made destructive cascade ordinary —
+ * `DELETE ... DETACH` — and 2.0 deliberately does not.
+ */
+export type ReferencePolicy =
+  | 'deny_if_referenced'
+  | 'tombstone_reference'
+  | 'authorized_cascade'
+
+/** Reads the `REFERENCE POLICY` clause; absent means the conservative one. */
+function referencePolicy(name: string | null): ReferencePolicy {
+  if (name === null || name === 'deny_if_referenced') return 'deny_if_referenced'
+  if (name === 'tombstone_reference' || name === 'authorized_cascade') return name
+  // Defaulting would silently run a destructive operation under a policy the
+  // caller did not ask for.
+  throw errors.constraintViolation(
+    `${JSON.stringify(name)} is not a reference policy; this engine ` +
+      `implements deny_if_referenced, tombstone_reference and authorized_cascade`,
+  )
 }
 
 // --- targets ----------------------------------------------------------------
@@ -1321,7 +1391,12 @@ function numberOf(b: Bindings, value: { Literal: unknown } | { Param: string }, 
  * and it is gated rather than free.
  */
 function authorizeRetention(tx: Transaction, retention: JsonMap): void {
-  if (Object.keys(retention).length > 0) tx.require('manage_retention')
+  if (Object.keys(retention).length === 0) return
+  tx.require('manage_retention')
+  // §163: a legal hold blocks erasure, so a cognitive writer that could set one
+  // could make its own content undeletable. Placing or lifting a hold is its
+  // own permission, above ordinary retention management.
+  if (Object.hasOwn(retention, 'legal_hold')) tx.require('legal_hold')
 }
 
 /** `retention.expires_at`, lifted out for the retention sweep (§34). */

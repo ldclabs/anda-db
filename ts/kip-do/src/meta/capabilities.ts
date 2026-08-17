@@ -40,7 +40,7 @@ export function capabilities(): Json {
         'TOMBSTONE',
         'UPDATE',
         'MERGE CONCEPT',
-        'PURGE (deny_if_referenced only)',
+        'PURGE, with all three reference policies',
         'selection blocks: WHERE and LIMIT on UPDATE, ARCHIVE, TOMBSTONE, ' +
           'RETRACT, PURGE and MERGE CONCEPT',
       ],
@@ -171,6 +171,27 @@ export function capabilities(): Json {
             'a state ordinary recall excludes, distinct from `archived` and ' +
             'claiming nothing about whether the source retracted anything',
         },
+        erasure: {
+          reference_policy:
+            'deny_if_referenced by default, plus tombstone_reference and ' +
+            'authorized_cascade; an unrecognized one is refused rather than ' +
+            'defaulted into a destructive operation the caller did not ask for',
+          legal_hold:
+            'checked before anything destructive is decided, and placing one ' +
+            'needs `legal_hold` rather than `manage_retention` — content that ' +
+            'could set its own hold could make itself undeletable',
+          order:
+            'the version log is destroyed before the row is scrubbed: the other ' +
+            'order leaves a stub whose full contents are still readable, with ' +
+            'nothing saying to look',
+          stub:
+            'identity, kind, Space, origin and a content digest survive; ' +
+            'deleting the row would leave references pointing at nothing, which ' +
+            'does not say "erased" — it says nothing',
+          refusal:
+            'a denial names how many elements still reference the target, never ' +
+            'which: the referrers may be ones the caller cannot read',
+        },
         propagation: {
           classification:
             'a derived element joins its inputs’ labels upward at commit, ' +
@@ -208,15 +229,6 @@ export function capabilities(): Json {
           'by name rather than accepted and ignored. `retention.expires_at` is ' +
           'stored and indexed, so what is missing is the clause that sets it ' +
           'and the sweep that acts on it — not the column',
-      },
-      {
-        capability: 'purge_reference_policies',
-        detail: 'REFERENCE POLICY "tombstone_reference" and "authorized_cascade"',
-        reason:
-          'PURGE implements "deny_if_referenced", the conservative default. ' +
-          'The other two rewrite or erase the elements that point at the ' +
-          'target, which is not something to fall back into silently — they ' +
-          'are refused by name',
       },
       {
         capability: 'historical_read',
