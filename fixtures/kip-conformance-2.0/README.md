@@ -1,12 +1,22 @@
 # KIP 2.0 cross-engine conformance fixtures
 
-Plain data, run by every engine that claims to implement KIP 2.0. Today that
-is `rs/anda_cognitive_nexus` (see `tests/conformance.rs`); `ts/kip-do` adopts
-these once it migrates off 1.x.
+Plain data, run by every engine that claims to implement KIP 2.0. Today that is
+both of them:
 
-The 1.x suite in `../kip-conformance/` is kept as-is until then, because
-`ts/kip-do` still runs it. The two are not related: KIP 2.0 is a different data
-model, so a "ported" 1.x case would assert 1.x semantics in 2.0 clothing.
+- `rs/anda_cognitive_nexus` — `tests/conformance.rs`, which reads this
+  directory directly;
+- `ts/kip-do` — `test/conformance.test.ts`, via
+  `test/conformance/fixtures.generated.ts`, inlined from these files by
+  `pnpm run codegen:fixtures`. Regenerate and commit after changing a fixture;
+  CI fails on the drift rather than letting the TypeScript engine quietly test
+  an older suite.
+
+The 1.x suite that used to live in `../kip-conformance/` is deleted. It was not
+ported: KIP 2.0 is a different data model, so a "ported" 1.x case would assert
+1.x semantics in 2.0 clothing.
+
+A case belongs here when a second engine must reproduce it. Behaviour that
+follows from one engine's storage layout belongs in that engine's own tests.
 
 ## Fixture shape
 

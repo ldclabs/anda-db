@@ -2,16 +2,25 @@
 
 All notable changes to this workspace are documented in this file.
 
-## [KIP 2.0] — 2026-08-16
+## [KIP 2.0] — 2026-08-17
 
-`anda_kip` 0.12.0.
+`anda_kip` 0.12.0, `anda_cognitive_nexus` 0.12.0,
+`anda_cognitive_nexus_server` 0.12.0, `@ldclabs/kip-do` 0.13.0.
 
-KIP 2.0 in `rs/anda_kip`. This is a rewrite, not an upgrade: 1.x and 2.0 are
+KIP 2.0 across the workspace. This is a rewrite, not an upgrade: 1.x and 2.0 are
 semantically different protocols, so the old API is gone rather than deprecated.
+Every downstream has been ported — `anda_cognitive_nexus`,
+`anda_cognitive_nexus_server`, `anda_kip_wasm`, `py/anda_cognitive_nexus_py`
+and `ts/kip-do`. Nothing in the workspace still speaks 1.x.
 
-`anda_cognitive_nexus`, `anda_cognitive_nexus_server` and `anda_kip_wasm` have
-since been ported (see below); `py/anda_cognitive_nexus_py` and `ts/kip-do` are
-still KIP 1.x and do not build against this protocol.
+The minor bump on `anda_cognitive_nexus` and `anda_cognitive_nexus_server`
+matters more than it looks: under cargo's 0.x rules a `0.11.1` would have been
+a compatible upgrade from the 1.x engine, so anyone pinning `"0.11"` would have
+been moved onto a different protocol without being asked.
+
+The workspace now declares `rust-version = "1.88"`, which is what let-chains in
+edition 2024 need. Without it an older toolchain reports a syntax error instead
+of a version mismatch.
 
 ### Why it is a rewrite
 
@@ -112,13 +121,16 @@ rewriting the old one.
 - **`anda_cognitive_nexus` was rewritten, not migrated.** The 1.x engine that
   lived here is deleted; 2.0 is a different data model, and a renamed 1.x engine
   would have been a worse lie than an absent one. The new engine implements
-  `Executor` over nine `anda_db` collections and runs KML transactions, KQL
-  reads, the Epistemic Projection, the META families, and Cognitive Capsule
-  export/verification. What it deliberately does **not** do — Capsule import,
-  Governance, trust and evidence-quality evaluation, `AS OF`, hop quantifiers,
-  `UPDATE`/`PURGE`/`MERGE CONCEPT`, semantic `SEARCH`, Capsule signatures,
-  atomic batches — is reported by `DESCRIBE CAPABILITIES` as structured data
-  with a reason, and refused rather than answered wrongly. The crate now ships
+  `Executor` over `anda_db` collections and runs KML transactions, KQL reads,
+  the Epistemic Projection, the META families, Cognitive Capsule
+  export/verification/import, the historical read path, and the full Governance
+  control plane. What it still does **not** do — trust and evidence-quality
+  evaluation, semantic and historical `SEARCH`, Capsule signatures, the Capsule
+  `restore` mode, Space-level retention defaults, atomic multi-operation
+  batches, grouped aggregation, `STRUCTURAL` over Core reference fields,
+  idempotent replay, and the permissions no gate yet asks for — is reported by
+  `DESCRIBE CAPABILITIES` as structured data with a reason, and refused rather
+  than answered wrongly. The crate now ships
   the baseline cognitive-memory profile as `profiles/cognitive-memory-2.0.0.json`
   (`profiles::COGNITIVE_MEMORY`), vendored verbatim from the spec repository,
   and `CognitiveNexus::ensure_schema` activates a Schema Lock only when it
@@ -198,8 +210,9 @@ rewriting the old one.
   mapping follows the named registry (§87) — including `207` for a `partial`
   batch, whose earlier commits are durable, and `501` for a capability this
   runtime declares it lacks. The `$self` genesis KML and `SELF_PRINCIPAL_ID` are
-  **removed**: a `Person` is not a Principal (§88.1), Principals are Governance
-  state, and this runtime has no Governance plane. In their place, the server
+  **removed**: a `Person` is not a Principal (§88.1), and Principals are
+  Governance control-plane state written through host APIs, never minted by
+  cognitive content. In their place, the server
   installs and activates the bundled cognitive-memory profile in the default
   Space, extensible with `SCHEMA_PACKAGE` / `--schema-package`. The `kip_logs`
   audit document records `languages` (classified from the parsed commands, never
@@ -215,9 +228,10 @@ rewriting the old one.
   added to `anda_kip` cannot be missed by the generated TypeScript table, and
   parse failures carry the full `ErrorObject` — `retry` included, because
   flattening `outcome_lookup_required` into "it failed" is how a lost write
-  becomes a duplicated one. `ts/kip-do` consumes this and has not been migrated:
-  its `scripts/codegen-errors.mjs` reads the 1.x shape of `error.rs` and will
-  need to be rewritten with the rest of that package.
+  becomes a duplicated one. `ts/kip-do` consumes this: its
+  `scripts/codegen-errors.mjs` now loads the vendored WASM and calls
+  `error_catalog()` rather than parsing `error.rs` as text, so a code added to
+  `anda_kip` reaches the TypeScript table without anyone remembering to add it.
 - **`py/anda_cognitive_nexus_py` builds a 2.0 envelope.** `execute_kip` wraps
   the command in a single-operation request, binds parameters as request-level
   bindings, and returns `(CommandType, Response)` instead of a `Result` whose
@@ -226,6 +240,66 @@ rewriting the old one.
   the caller needs to recover. `create_kip_db` activates the bundled
   cognitive-memory profile, so `$ConceptType` bootstrapping is gone: a type is
   a Schema Package symbol now, not something a write can invent.
+- **`ts/kip-do` was rewritten too, and is a sibling engine rather than a
+  binding.** The 1.x executor is deleted for the same reason the Rust one was.
+  Storage is SQLite inside a Durable Object instead of `anda_db`, and the
+  grammar is `@ldclabs/kip-lang` — a native TypeScript parser, not a port —
+  which means nothing structural forces the two engines to agree on what a
+  command means. `test/parser-oracle.test.ts` is what does: it loads `anda_kip`
+  compiled to WebAssembly and compares both directions over a generated corpus,
+  because a divergence here is the most expensive bug this project can have —
+  the same command succeeding on one deployment and failing on the other, or
+  worse, meaning two different things. That oracle found four real defects in
+  `kip-lang`, the worst being an out-of-range integer *rounded* rather than
+  rejected, which would have executed a command carrying a different number
+  than the one written. All are fixed upstream in 2.0.1.
+  The engine now runs Schema Packages, transactions and the KML clauses, KQL,
+  the Epistemic Projection, META, Capsule export and verification, the
+  Governance control plane at the same per-element granularity as the reference
+  engine, and the historical read path. It runs the same 62 shared conformance
+  cases from `fixtures/kip-conformance-2.0/`, inlined by a codegen step rather
+  than transcribed. Its gaps are named in `DESCRIBE CAPABILITIES` with reasons,
+  and the ones it shares with the reference engine say so.
+- **Both engines' capability documents were corrected.** Three gaps were real
+  but undeclared on the Rust side (`grouped_aggregation`,
+  `structural_core_fields`, `ungated_permissions`), and one was declared
+  backwards on both: `transactions.idempotency` reported `true` while neither
+  engine replays. A key is recorded and findable through
+  `DESCRIBE TRANSACTION BY IDEMPOTENCY KEY`, but the write path never looks it
+  up, so a resend re-executes. Both now report `recorded_not_replayed` and
+  carry an `idempotent_replay` gap, and both have a test pinning what a resend
+  actually does — the reference engine commits a duplicate, `ts/kip-do` trips a
+  unique index and fails. That asymmetry is named too. Reporting `true` here is
+  worse than reporting nothing: it is the field a retry policy reads before
+  deciding a resend is free.
+- **`ORDER BY` over an aggregate is refused instead of silently mis-answered.**
+  `rs/anda_cognitive_nexus` was dropping the aggregation and sorting by the
+  bare variable, which returns a plausible-looking answer to a question nobody
+  asked — the one failure mode this project refuses everywhere else.
+  `ts/kip-do` already refused it; now both do, and both declare it.
+- **`ts/kip-do` wrote Capsules the reference engine could not open.** Found by
+  putting the shared fixtures through the request envelope, which is where the
+  artifact actually shows. Two breaks, both fatal to the one thing a Capsule is
+  for: the frame said `format: "KIP-Capsule"` / `format_version: "2.0-draft"`
+  where §37.6 and `anda_kip::Capsule` say `KIP-Cognitive-Capsule` / `2.0` — and
+  `validate_frame` refuses any other `format` outright — and each schema
+  dependency was a single `package_ref`, where `anda_kip::SchemaDependency`
+  requires `package` and `version` as separate non-optional fields, so the
+  whole payload failed to decode. Both are now the canonical shape, pinned by a
+  test that says why. The remaining differences between the two engines'
+  Capsule payloads are additive (`installed_here`, `digest_profile`, empty
+  record arrays, `nexus_id`) and do not stop a decode, but they still have to
+  converge before a Capsule fixture can compare the artifacts byte for byte.
+- **The shared conformance suite grew a Transactions fixture**, and `ts/kip-do`
+  now runs the whole suite **through the request envelope** rather than by
+  calling `nexus.find` and `nexus.mutate`. The old harness proved the two
+  engines agreed about everything except the layer a client actually talks to.
+  71 cases across 8 fixtures, both engines.
+- **CI runs the TypeScript engine.** It previously ran neither its tests, its
+  conformance suite, nor the parser oracle, so the cross-engine agreement the
+  oracle exists to prove was checked only by whoever last remembered to run it.
+  The new job also regenerates the four generated files and fails on drift —
+  which is how the oracle corpus had quietly lost ten commands.
 
 ## [KIP v1.0-RC11] — 2026-08-14
 

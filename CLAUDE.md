@@ -31,14 +31,13 @@ rs/
 └── cf-tokenizer/                 # Stateless jieba segmentation HTTP service (own nested workspace)
 
 ts/
-└── kip-do/                       # @ldclabs/kip-do: KIP engine on SQLite-backed Durable Objects — still KIP 1.x
+└── kip-do/                       # @ldclabs/kip-do: KIP 2.0 engine on SQLite-backed Durable Objects
 
 py/
 └── anda_cognitive_nexus_py/      # Python binding crate, excluded from workspace by default
 
 fixtures/
-├── kip-conformance/              # KIP 1.x conformance fixtures (kept until ts/kip-do migrates)
-└── kip-conformance-2.0/          # KIP 2.0 cross-engine conformance fixtures
+└── kip-conformance-2.0/          # KIP 2.0 cross-engine fixtures (both engines run them)
 ```
 
 ## Working with AndaDB
@@ -180,6 +179,21 @@ cargo test --workspace --all-features
 cargo test -p anda_db --lib
 cargo run -p anda_db --example db_demo --features full
 ```
+
+`ts/kip-do` is the second KIP 2.0 engine and has its own suite, including the
+shared conformance fixtures and a differential parser oracle against
+`anda_kip` compiled to WASM:
+
+```bash
+make test-ts
+```
+
+`make test-full` runs both halves. The generated files under `ts/kip-do`
+(`errors.generated.ts`, `profiles.generated.ts`, `fixtures.generated.ts`,
+`corpus.generated.ts`) are committed; regenerate them with `pnpm run codegen`
+after changing their sources, or CI will fail on the drift.
+
+The workspace MSRV is 1.88 (let-chains in edition 2024).
 
 The Python binding under `py/anda_cognitive_nexus_py` is not part of the default
 Rust workspace member list.

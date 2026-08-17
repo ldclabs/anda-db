@@ -23,21 +23,21 @@ rs/
 ├── anda_db_utils/                # Shared utilities
 ├── anda_object_store/            # Metadata and encrypted object-store wrappers
 ├── anda_kip/                     # Knowledge Interaction Protocol — KIP 2.0
-├── anda_cognitive_nexus/         # Reference KIP memory graph runtime — still KIP 1.x, not yet ported
+├── anda_cognitive_nexus/         # Reference KIP 2.0 Cognitive Nexus runtime
 ├── anda_db_server/               # HTTP server for core database APIs
-├── anda_cognitive_nexus_server/  # HTTP/JSON-RPC server for Cognitive Nexus — still KIP 1.x
+├── anda_cognitive_nexus_server/  # HTTP/JSON-RPC server for Cognitive Nexus — KIP 2.0
 ├── anda_db_shard_proxy/          # Shard proxy for multi-tenant deployments
-├── anda_kip_wasm/                # WASM wrapper of the KIP parser, test oracle for ts/kip-do — still KIP 1.x
+├── anda_kip_wasm/                # WASM wrapper of the KIP parser, test oracle for ts/kip-do — KIP 2.0
 └── cf-tokenizer/                 # Stateless jieba segmentation HTTP service (own nested workspace)
 
 ts/
-└── kip-do/                       # @ldclabs/kip-do: KIP engine on SQLite-backed Durable Objects
+└── kip-do/                       # @ldclabs/kip-do: KIP 2.0 engine on SQLite-backed Durable Objects
 
 py/
 └── anda_cognitive_nexus_py/      # Python binding crate, excluded from workspace by default
 
 fixtures/
-└── kip-conformance/              # Cross-engine KIP conformance fixtures (Rust + TS both run them)
+└── kip-conformance-2.0/          # KIP 2.0 cross-engine fixtures (both engines run them)
 ```
 
 ## Working with AndaDB
@@ -179,6 +179,21 @@ cargo test --workspace --all-features
 cargo test -p anda_db --lib
 cargo run -p anda_db --example db_demo --features full
 ```
+
+`ts/kip-do` is the second KIP 2.0 engine and has its own suite, including the
+shared conformance fixtures and a differential parser oracle against
+`anda_kip` compiled to WASM:
+
+```bash
+make test-ts
+```
+
+`make test-full` runs both halves. The generated files under `ts/kip-do`
+(`errors.generated.ts`, `profiles.generated.ts`, `fixtures.generated.ts`,
+`corpus.generated.ts`) are committed; regenerate them with `pnpm run codegen`
+after changing their sources, or CI will fail on the drift.
+
+The workspace MSRV is 1.88 (let-chains in edition 2024).
 
 The Python binding under `py/anda_cognitive_nexus_py` is not part of the default
 Rust workspace member list.
