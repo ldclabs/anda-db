@@ -53,6 +53,7 @@ pub mod decision;
 pub mod element;
 pub mod gate;
 pub mod permission;
+pub mod purge;
 pub mod redact;
 pub mod rows;
 pub mod store;

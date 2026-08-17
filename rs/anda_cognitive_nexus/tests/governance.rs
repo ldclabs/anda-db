@@ -2301,3 +2301,511 @@ async fn representing_the_actor_is_the_other_way_to_withdraw_a_claim() {
         "representation authority is the other way to hold this"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Classification propagation, authority ceilings, quarantine
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_claim_built_on_secret_evidence_is_not_public_by_being_a_summary() {
+    // §98, and the §242 fixture: read secret Evidence → summarize → write
+    // public summary is an exfiltration path if the summary lands public even
+    // briefly. The join happens at commit, so it is right the moment the
+    // element becomes readable.
+    let nexus = stocked("classification_propagation").await;
+    let owner = nexus.system_session();
+    run_as(
+        &owner,
+        r#"CREATE EVIDENCE ?e { SET FIELDS {evidence_class: "Document", payload: "the secret"} }"#,
+    )
+    .await;
+    owner
+        .classify(
+            DEFAULT_SPACE,
+            ElementId::new(anda_kip::ElementKind::Evidence, 1),
+            "secret",
+        )
+        .await
+        .unwrap();
+
+    let derived = run_as(
+        &owner,
+        r#"MUTATE {
+            CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
+            CREATE CONCEPT ?dark { TYPE "Person" NAME "Dark Mode" }
+            ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
+            CREATE ASSERTION ?a {
+                SET FIELDS {proposition: ?p, asserted_by: ?alice, stance: "support",
+                            mode: "inferred", confidence: 0.6}
+                SET STRUCTURAL {("evidence", {id: "E-1"}) {role: "support"}}
+            }
+        }"#,
+    )
+    .await;
+    assert_eq!(
+        derived.status,
+        TopLevelStatus::Succeeded,
+        "{:?}",
+        derived.error
+    );
+
+    let labels = run_as(
+        &owner,
+        r#"FIND(?a.governance.classification) WHERE { ?a ASSERTION {} }"#,
+    )
+    .await;
+    assert_eq!(
+        labels.first_result().unwrap().as_array().unwrap()[0],
+        serde_json::json!("secret"),
+        "the Assertion inherited its Evidence's classification"
+    );
+
+    // And a reader capped below it does not see the Assertion at all.
+    let reader = agent(nexus.governance(), "kip:principal:reader").await;
+    grant_read(&nexus, &reader, "internal").await;
+    let seen = run_as(
+        &nexus.session(AuthContext::principal(&reader)),
+        r#"FIND(?a) WHERE { ?a ASSERTION {} }"#,
+    )
+    .await;
+    assert!(seen.first_result().unwrap().as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn an_activitys_outputs_inherit_from_its_inputs() {
+    // The general shape of "this was produced from that" — the link a
+    // summarizer or a consolidation actually leaves behind (§99).
+    let nexus = stocked("activity_propagation").await;
+    let owner = nexus.system_session();
+    run_as(
+        &owner,
+        r#"CREATE EVIDENCE ?e { SET FIELDS {evidence_class: "Document", payload: "raw"} }"#,
+    )
+    .await;
+    owner
+        .classify(
+            DEFAULT_SPACE,
+            ElementId::new(anda_kip::ElementKind::Evidence, 1),
+            "sensitive",
+        )
+        .await
+        .unwrap();
+
+    let response = run_as(
+        &owner,
+        r#"MUTATE {
+            CREATE EVIDENCE ?summary { SET FIELDS {evidence_class: "Document", payload: "gist"} }
+            CREATE ACTIVITY ?act {
+                SET FIELDS {activity_class: "Consolidation", status: "completed"}
+                SET STRUCTURAL {("inputs", {id: "E-1"}) ("outputs", ?summary)}
+            }
+        }"#,
+    )
+    .await;
+    assert_eq!(
+        response.status,
+        TopLevelStatus::Succeeded,
+        "{:?}",
+        response.error
+    );
+
+    let labels = run_as(
+        &owner,
+        r#"FIND(?e.id, ?e.governance.classification) WHERE { ?e EVIDENCE {} } ORDER BY ?e.id"#,
+    )
+    .await;
+    let rows = labels.first_result().unwrap().as_array().unwrap().clone();
+    assert_eq!(rows[1][1], serde_json::json!("sensitive"), "{rows:?}");
+}
+
+#[tokio::test]
+async fn a_summary_of_a_descriptive_skill_cannot_be_elevated_past_it() {
+    // §127, and the §243 fixture. Transformation does not raise authority, so
+    // no chain of summarizing turns a note into an executable procedure.
+    let nexus = stocked("non_amplification").await;
+    let owner = nexus.system_session();
+    run_as(
+        &owner,
+        r#"MUTATE {
+            CREATE EVIDENCE ?imported { SET FIELDS {evidence_class: "Document", payload: "a skill"} }
+            CREATE EVIDENCE ?summary { SET FIELDS {evidence_class: "Document", payload: "the gist"} }
+            CREATE ACTIVITY ?act {
+                SET FIELDS {activity_class: "Consolidation", status: "completed"}
+                SET STRUCTURAL {("inputs", ?imported) ("outputs", ?summary)}
+            }
+        }"#,
+    )
+    .await;
+    let imported = ElementId::new(anda_kip::ElementKind::Evidence, 1);
+    let summary = ElementId::new(anda_kip::ElementKind::Evidence, 2);
+
+    // The summary records what it came from.
+    let lineage = run_as(
+        &owner,
+        r#"FIND(?e.governance.authority_lineage) WHERE { ?e EVIDENCE {} } ORDER BY ?e.id"#,
+    )
+    .await;
+    let rows = lineage.first_result().unwrap().as_array().unwrap().clone();
+    assert_eq!(rows[1], serde_json::json!(["E-1"]));
+
+    // Raising it past its input is refused, and the refusal says why.
+    let err = owner
+        .elevate_authority(DEFAULT_SPACE, summary, "behavioral")
+        .await
+        .unwrap_err();
+    assert_eq!(err.name(), "NotAuthorized");
+    assert!(err.message.contains("derived from"), "{}", err.message);
+
+    // Elevate what it was derived from, and the summary may follow.
+    owner
+        .elevate_authority(DEFAULT_SPACE, imported, "behavioral")
+        .await
+        .unwrap();
+    assert_eq!(
+        owner
+            .elevate_authority(DEFAULT_SPACE, summary, "behavioral")
+            .await
+            .unwrap(),
+        "descriptive"
+    );
+}
+
+#[tokio::test]
+async fn elevating_authority_needs_its_own_permission() {
+    // §123: cognitive content cannot set its own effective authority, and
+    // writing is not elevating.
+    let nexus = stocked("elevation_permission").await;
+    run_as(
+        &nexus.system_session(),
+        r#"CREATE EVIDENCE ?e { SET FIELDS {evidence_class: "Document", payload: "x"} }"#,
+    )
+    .await;
+    let writer = agent(nexus.governance(), "kip:principal:writer").await;
+    grant(
+        &nexus,
+        &writer,
+        &["read", "create", "update"],
+        AuthorityScope::default(),
+    )
+    .await;
+    let err = nexus
+        .session(AuthContext::principal(&writer))
+        .elevate_authority(
+            DEFAULT_SPACE,
+            ElementId::new(anda_kip::ElementKind::Evidence, 1),
+            "advisory",
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.name(), "NotAuthorized");
+    assert!(err.message.contains("elevate_authority"));
+}
+
+#[tokio::test]
+async fn a_downgrade_does_not_wait_for_anything() {
+    // §132: Governance may reduce authority immediately when a source is
+    // compromised. An incident response that had to wait would arrive late.
+    let nexus = stocked("downgrade").await;
+    let owner = nexus.system_session();
+    run_as(
+        &owner,
+        r#"CREATE EVIDENCE ?e { SET FIELDS {evidence_class: "Document", payload: "x"} }"#,
+    )
+    .await;
+    let element = ElementId::new(anda_kip::ElementKind::Evidence, 1);
+    owner
+        .elevate_authority(DEFAULT_SPACE, element, "executable")
+        .await
+        .unwrap();
+    assert_eq!(
+        owner
+            .elevate_authority(DEFAULT_SPACE, element, "descriptive")
+            .await
+            .unwrap(),
+        "executable"
+    );
+
+    let audit = nexus
+        .governance()
+        .read_audit(DEFAULT_SPACE, 50)
+        .await
+        .unwrap();
+    assert!(
+        audit
+            .iter()
+            .any(|entry| entry.operation == "downgrade_authority"),
+        "and the historical elevation record stays auditable"
+    );
+}
+
+#[tokio::test]
+async fn quarantine_removes_an_element_from_use_without_claiming_a_retraction() {
+    // §133, §134, and the §240 fixture from the other side: this says local
+    // Governance does not allow ordinary use, which is a statement about this
+    // Brain rather than about whoever wrote the element.
+    let nexus = stocked("quarantine").await;
+    let owner = nexus.system_session();
+    run_as(
+        &owner,
+        r#"CREATE CONCEPT ?c { TYPE "Person" NAME "Suspicious" }"#,
+    )
+    .await;
+    let element = ElementId::new(anda_kip::ElementKind::Concept, 1);
+
+    owner
+        .quarantine(DEFAULT_SPACE, element, "suspected memory poisoning")
+        .await
+        .unwrap();
+
+    let recalled = run_as(
+        &owner,
+        r#"FIND(?c.name) WHERE { ?c CONCEPT {type: "Person"} }"#,
+    )
+    .await;
+    assert!(
+        recalled
+            .first_result()
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "ordinary recall excludes it"
+    );
+
+    // A reviewer who asks for it by state still sees it, and sees why.
+    let held = run_as(
+        &owner,
+        r#"FIND(?c.name, ?c.governance.quarantine_reason)
+           WHERE { ?c CONCEPT {type: "Person", state: "quarantined"} }"#,
+    )
+    .await;
+    let rows = held.first_result().unwrap().as_array().unwrap().clone();
+    assert_eq!(rows[0][0], serde_json::json!("Suspicious"));
+    assert_eq!(rows[0][1], serde_json::json!("suspected memory poisoning"));
+
+    owner
+        .release_quarantine(DEFAULT_SPACE, element)
+        .await
+        .unwrap();
+    assert_eq!(
+        run_as(
+            &owner,
+            r#"FIND(?c.name) WHERE { ?c CONCEPT {type: "Person"} }"#
+        )
+        .await
+        .first_result()
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn releasing_something_that_was_archived_is_refused() {
+    // Otherwise release becomes a way to revive an element that left recall for
+    // an entirely different reason.
+    let nexus = stocked("release_guard").await;
+    let owner = nexus.system_session();
+    run_as(
+        &owner,
+        r#"CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }"#,
+    )
+    .await;
+    run_as(&owner, r#"ARCHIVE "C-1""#).await;
+    let err = owner
+        .release_quarantine(
+            DEFAULT_SPACE,
+            ElementId::new(anda_kip::ElementKind::Concept, 1),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.name(), "InvalidLifecycleTransition");
+}
+
+#[tokio::test]
+async fn quarantine_needs_its_own_permission() {
+    let nexus = stocked("quarantine_permission").await;
+    run_as(
+        &nexus.system_session(),
+        r#"CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }"#,
+    )
+    .await;
+    let keeper = agent(nexus.governance(), "kip:principal:keeper").await;
+    grant(
+        &nexus,
+        &keeper,
+        &["read", "archive", "tombstone"],
+        AuthorityScope::default(),
+    )
+    .await;
+    let err = nexus
+        .session(AuthContext::principal(&keeper))
+        .quarantine(
+            DEFAULT_SPACE,
+            ElementId::new(anda_kip::ElementKind::Concept, 1),
+            "because",
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.name(), "NotAuthorized");
+    assert!(err.message.contains("quarantine"));
+}
+
+// ---------------------------------------------------------------------------
+// Erasure
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn purging_needs_the_purge_permission_and_not_merely_tombstone() {
+    // §271: logical removal is not erasure.
+    let nexus = stocked("purge_permission").await;
+    run_as(
+        &nexus.system_session(),
+        r#"CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }"#,
+    )
+    .await;
+    let keeper = agent(nexus.governance(), "kip:principal:keeper").await;
+    grant(
+        &nexus,
+        &keeper,
+        &["read", "archive", "tombstone"],
+        AuthorityScope::default(),
+    )
+    .await;
+    let session = nexus.session(AuthContext::principal(&keeper));
+    assert_eq!(
+        error_code(&run_as(&session, r#"PURGE "C-1" CONFIRM "PURGE""#).await),
+        "NotAuthorized"
+    );
+    assert_eq!(
+        run_as(&session, r#"TOMBSTONE "C-1""#).await.status,
+        TopLevelStatus::Succeeded
+    );
+}
+
+#[tokio::test]
+async fn a_cognitive_writer_cannot_place_a_legal_hold_to_evade_deletion() {
+    // §163 names this attack by its shape.
+    let nexus = stocked("legal_hold_authority").await;
+    let custodian = agent(nexus.governance(), "kip:principal:custodian").await;
+    grant(
+        &nexus,
+        &custodian,
+        &["read", "create", "manage_retention"],
+        AuthorityScope::default(),
+    )
+    .await;
+    let session = nexus.session(AuthContext::principal(&custodian));
+
+    let held = run_as(
+        &session,
+        r#"CREATE CONCEPT ?c { TYPE "Person" NAME "Alice"
+           SET FIELDS {retention: {legal_hold: true}} }"#,
+    )
+    .await;
+    assert_eq!(error_code(&held), "NotAuthorized");
+    assert!(held.error.as_ref().unwrap().message.contains("legal_hold"));
+
+    // Ordinary retention, without a hold, is what manage_retention covers.
+    assert_eq!(
+        run_as(
+            &session,
+            r#"CREATE CONCEPT ?c { TYPE "Person" NAME "Alice"
+               SET FIELDS {retention: {retention_class: "standard"}} }"#,
+        )
+        .await
+        .status,
+        TopLevelStatus::Succeeded
+    );
+}
+
+#[tokio::test]
+async fn an_authorized_cascade_erases_the_dependents_the_default_refuses_to_orphan() {
+    let nexus = stocked("cascade").await;
+    let owner = nexus.system_session();
+    let created = run_as(
+        &owner,
+        r#"MUTATE {
+            CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
+            CREATE CONCEPT ?dark { TYPE "Person" NAME "Dark Mode" }
+            ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
+        }"#,
+    )
+    .await;
+    assert_eq!(created.status, TopLevelStatus::Succeeded);
+    let alice = ElementId::new(anda_kip::ElementKind::Concept, 1);
+
+    // The Proposition points at Alice, so the conservative default refuses.
+    assert_eq!(
+        error_code(&run_as(&owner, r#"PURGE "C-1" CONFIRM "PURGE""#).await),
+        "PurgeDenied"
+    );
+
+    let cascaded = run_as(
+        &owner,
+        r#"PURGE "C-1" REFERENCE POLICY "authorized_cascade" CONFIRM "PURGE""#,
+    )
+    .await;
+    assert_eq!(
+        cascaded.status,
+        TopLevelStatus::Succeeded,
+        "{:?}",
+        cascaded.error
+    );
+    let _ = alice;
+
+    let purged = run_as(
+        &owner,
+        r#"FIND(?e.id) WHERE { ?e CONCEPT {state: "purged"} }"#,
+    )
+    .await;
+    assert_eq!(
+        purged.first_result().unwrap().as_array().unwrap().len(),
+        1,
+        "the Concept itself"
+    );
+    let proposition = nexus
+        .store
+        .get_element(ElementId::new(anda_kip::ElementKind::Proposition, 1))
+        .await
+        .unwrap();
+    assert_eq!(
+        proposition.state(),
+        "purged",
+        "and the Proposition that depended on it"
+    );
+}
+
+#[tokio::test]
+async fn every_erasure_leaves_a_receipt_in_the_governance_audit() {
+    // §164: retain only a minimal non-sensitive deletion receipt — enough to
+    // audit the erasure, and nothing of what was erased.
+    let nexus = stocked("purge_audit").await;
+    let owner = nexus.system_session();
+    run_as(
+        &owner,
+        r#"CREATE EVIDENCE ?e { SET FIELDS {evidence_class: "Document", payload: "the secret"} }"#,
+    )
+    .await;
+    run_as(&owner, r#"PURGE "E-1" CONFIRM "PURGE""#).await;
+
+    let audit = nexus
+        .governance()
+        .read_audit(DEFAULT_SPACE, 50)
+        .await
+        .unwrap();
+    let receipt = audit
+        .iter()
+        .find(|entry| entry.operation == "purge")
+        .expect("the erasure is on record");
+    assert_eq!(receipt.resource, "E-1");
+    assert!(receipt.record["content_digest"].is_string());
+    assert!(
+        !serde_json::to_string(&receipt.record)
+            .unwrap()
+            .contains("the secret"),
+        "and the receipt carries none of what it erased"
+    );
+}

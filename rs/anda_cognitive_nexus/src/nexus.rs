@@ -249,7 +249,25 @@ impl CognitiveNexus {
     ) -> Result<crate::capsule::ImportReport, KipError> {
         let _guard = self.lock.write().await;
         self.store.reopen_if_poisoned().await?;
-        crate::capsule::import(self, capsule, space_id, false, AuthContext::system()).await
+        crate::capsule::import(self, capsule, space_id, false, AuthContext::system(), false).await
+    }
+
+    /// Imports a Capsule into quarantine rather than into recall (§39.2).
+    ///
+    /// The `isolate` mode, for cognition whose sender, schema or contents have
+    /// not been reviewed: the records land durably and auditably, a reviewer
+    /// with the right permission can read them, and nothing recalls, projects
+    /// or acts on them until somebody releases each one. That is the honest
+    /// answer to "should I accept this?" — accept it where it cannot do
+    /// anything, and decide afterwards.
+    pub async fn import_capsule_isolated(
+        &self,
+        capsule: &anda_kip::Capsule,
+        space_id: &str,
+    ) -> Result<crate::capsule::ImportReport, KipError> {
+        let _guard = self.lock.write().await;
+        self.store.reopen_if_poisoned().await?;
+        crate::capsule::import(self, capsule, space_id, false, AuthContext::system(), true).await
     }
 
     /// The Space a request runs against.
@@ -314,6 +332,78 @@ impl Session {
         space_id: &str,
     ) -> Result<EffectiveAuthority, KipError> {
         EffectiveAuthority::resolve(&self.nexus.store, space_id, &self.auth).await
+    }
+
+    /// Raises or lowers how strongly one element may influence action.
+    ///
+    /// Raising is bounded by the element's authority lineage, so no chain of
+    /// summarizing turns a descriptive note into an executable one (§127).
+    /// Lowering is deliberately as easy as the permission itself: an incident
+    /// response that had to wait for an approval would arrive late (§132).
+    ///
+    /// Returns the ceiling the element carried before.
+    pub async fn elevate_authority(
+        &self,
+        space_id: &str,
+        element: crate::id::ElementId,
+        class: &str,
+    ) -> Result<String, KipError> {
+        let _guard = self.nexus.lock.write().await;
+        self.nexus.store.reopen_if_poisoned().await?;
+        let authority = self.authority(space_id, &self.auth).await?;
+        crate::governance::element::elevate_authority(
+            &self.nexus.store,
+            space_id,
+            element,
+            class,
+            &authority,
+            &self.auth,
+        )
+        .await
+    }
+
+    /// Holds an element out of ordinary use, pending review (§133).
+    ///
+    /// Not a retraction: it says this Brain does not currently allow ordinary
+    /// use of the element, which is a statement about this Brain and not about
+    /// whoever wrote it (§134).
+    pub async fn quarantine(
+        &self,
+        space_id: &str,
+        element: crate::id::ElementId,
+        reason: &str,
+    ) -> Result<(), KipError> {
+        let _guard = self.nexus.lock.write().await;
+        self.nexus.store.reopen_if_poisoned().await?;
+        let authority = self.authority(space_id, &self.auth).await?;
+        crate::governance::element::quarantine(
+            &self.nexus.store,
+            space_id,
+            element,
+            reason,
+            &authority,
+            &self.auth,
+        )
+        .await
+    }
+
+    /// Returns a quarantined element to ordinary use.
+    pub async fn release_quarantine(
+        &self,
+        space_id: &str,
+        element: crate::id::ElementId,
+    ) -> Result<(), KipError> {
+        let _guard = self.nexus.lock.write().await;
+        self.nexus.store.reopen_if_poisoned().await?;
+        let authority = self.authority(space_id, &self.auth).await?;
+        crate::governance::element::release(
+            &self.nexus.store,
+            space_id,
+            element,
+            &authority,
+            &self.auth,
+        )
+        .await
     }
 
     /// Sets one element's classification (§93, §100).

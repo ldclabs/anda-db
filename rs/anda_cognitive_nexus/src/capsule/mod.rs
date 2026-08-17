@@ -35,7 +35,6 @@ pub mod merge;
 
 use crate::id::ElementId;
 use crate::kql::Context;
-use crate::store::Element;
 use crate::view;
 
 /// The format tag this engine writes and accepts.
@@ -172,7 +171,7 @@ async fn expand(
             let Some(element) = cx.load(id).await? else {
                 continue;
             };
-            for referenced in references(&element) {
+            for referenced in element.references() {
                 if seen.insert(referenced) {
                     next.push(referenced);
                 }
@@ -185,55 +184,6 @@ async fn expand(
         frontier = next;
     }
     Ok(seen)
-}
-
-/// Every local element one element points at.
-fn references(element: &Element) -> Vec<ElementId> {
-    fn local(value: &Json) -> Option<ElementId> {
-        match crate::term::Endpoint::from_json(value) {
-            Ok(crate::term::Endpoint::Local(id)) => Some(id),
-            _ => None,
-        }
-    }
-
-    let mut out = Vec::new();
-    match element {
-        Element::Concept(row) => {
-            for refs in row.structural.values() {
-                if let Some(items) = refs.as_array() {
-                    out.extend(items.iter().filter_map(local));
-                }
-            }
-        }
-        Element::Proposition(row) => {
-            out.extend(local(&row.subject));
-            out.extend(local(&row.object));
-        }
-        Element::Assertion(row) => {
-            if let Ok(id) = row.proposition_id.parse() {
-                out.push(id);
-            }
-            out.extend(local(&row.asserted_by));
-            out.extend(
-                row.evidence_ids
-                    .iter()
-                    .filter_map(|id| id.parse::<ElementId>().ok()),
-            );
-            out.extend(row.context_refs.iter().filter_map(local));
-        }
-        Element::Evidence(row) => {
-            if let Ok(id) = row.generated_by.parse() {
-                out.push(id);
-            }
-            out.extend(row.source_refs.iter().filter_map(local));
-        }
-        Element::Activity(row) => {
-            out.extend(row.inputs.iter().filter_map(local));
-            out.extend(row.outputs.iter().filter_map(local));
-            out.extend(row.associated_actors.iter().filter_map(local));
-        }
-    }
-    out
 }
 
 fn collect_schema_refs(rendered: &Json, into: &mut BTreeSet<String>) {
@@ -349,6 +299,7 @@ pub async fn import(
     space_id: &str,
     dry_run: bool,
     auth: crate::governance::AuthContext,
+    isolate: bool,
 ) -> Result<ImportReport, KipError> {
     capsule.validate_frame()?;
     let mut report = ImportReport::default();
@@ -422,7 +373,16 @@ pub async fn import(
     if dry_run {
         return merge::preview(&nexus.store, capsule, space_id, &digest, report).await;
     }
-    merge::merge(&nexus.store, capsule, space_id, &digest, report, auth).await
+    merge::merge(
+        &nexus.store,
+        capsule,
+        space_id,
+        &digest,
+        report,
+        auth,
+        isolate,
+    )
+    .await
 }
 
 /// Parses a Capsule artifact.

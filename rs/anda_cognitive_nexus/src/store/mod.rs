@@ -548,6 +548,48 @@ impl Store {
         })
     }
 
+    /// Every element in a Space that points at one element.
+    ///
+    /// A full scan of the Space rather than an index intersection, because the
+    /// reference paths are not all indexed — Profile structural fields and an
+    /// Assertion's context have no key column — and an incomplete answer here
+    /// would let a destructive operation leave a dangling reference behind.
+    /// Purge is documented as exceptional; paying a scan for it is the right
+    /// trade against getting it wrong.
+    pub async fn referrers(
+        &self,
+        space_id: &str,
+        target: ElementId,
+    ) -> Result<Vec<ElementId>, KipError> {
+        let mut found = Vec::new();
+        for kind in [
+            ElementKind::Concept,
+            ElementKind::Proposition,
+            ElementKind::Assertion,
+            ElementKind::Evidence,
+            ElementKind::Activity,
+        ] {
+            let collection = self.elements(kind);
+            let ids = collection
+                .query_all_ids(eq_field("space", Fv::Text(space_id.to_string())))
+                .await
+                .map_err(db_error)?;
+            for row_id in ids {
+                let id = ElementId::new(kind, row_id);
+                if id == target {
+                    continue;
+                }
+                let Ok(element) = self.get_element(id).await else {
+                    continue;
+                };
+                if element.references().contains(&target) {
+                    found.push(id);
+                }
+            }
+        }
+        Ok(found)
+    }
+
     /// Whether an element exists at all.
     pub async fn contains(&self, id: ElementId) -> bool {
         self.elements(id.kind).contains(id.seq)
@@ -690,6 +732,99 @@ impl Element {
     /// The element's own Governance members (Spec §6.2).
     pub fn governance(&self) -> &anda_kip::Json {
         envelope!(self, governance)
+    }
+
+    /// The storage-lifecycle hook (Spec §19.1).
+    pub fn retention(&self) -> &anda_kip::Json {
+        envelope!(self, retention)
+    }
+
+    /// Every local element this one points at.
+    ///
+    /// The complete set, including the reference paths no index covers —
+    /// Profile structural fields and an Assertion's context. A purge planner
+    /// and a Capsule closure both need *all* of them: a walker that missed one
+    /// would let a destructive operation leave a dangling reference behind, or
+    /// let an export ship a graph with a broken edge.
+    pub fn references(&self) -> Vec<ElementId> {
+        fn local(value: &anda_kip::Json) -> Option<ElementId> {
+            match crate::term::Endpoint::from_json(value) {
+                Ok(crate::term::Endpoint::Local(id)) => Some(id),
+                _ => None,
+            }
+        }
+        fn structural(map: &anda_db_schema::Map<String, anda_kip::Json>, out: &mut Vec<ElementId>) {
+            for refs in map.values() {
+                if let Some(items) = refs.as_array() {
+                    out.extend(items.iter().filter_map(local));
+                }
+            }
+        }
+
+        let mut out = Vec::new();
+        match self {
+            Element::Concept(row) => structural(&row.structural, &mut out),
+            Element::Proposition(row) => {
+                out.extend(local(&row.subject));
+                out.extend(local(&row.object));
+                structural(&row.structural, &mut out);
+            }
+            Element::Assertion(row) => {
+                if let Ok(id) = row.proposition_id.parse() {
+                    out.push(id);
+                }
+                out.extend(local(&row.asserted_by));
+                out.extend(
+                    row.evidence_ids
+                        .iter()
+                        .filter_map(|id| id.parse::<ElementId>().ok()),
+                );
+                out.extend(row.context_refs.iter().filter_map(local));
+                structural(&row.structural, &mut out);
+            }
+            Element::Evidence(row) => {
+                if let Ok(id) = row.generated_by.parse() {
+                    out.push(id);
+                }
+                out.extend(row.source_refs.iter().filter_map(local));
+                out.extend(
+                    row.corrects
+                        .iter()
+                        .chain(row.corrected_by.iter())
+                        .filter_map(|id| id.parse::<ElementId>().ok()),
+                );
+                structural(&row.structural, &mut out);
+            }
+            Element::Activity(row) => {
+                out.extend(row.inputs.iter().filter_map(local));
+                out.extend(row.outputs.iter().filter_map(local));
+                out.extend(row.associated_actors.iter().filter_map(local));
+                structural(&row.structural, &mut out);
+            }
+        }
+        out
+    }
+
+    /// The engine-level state, for the authorized paths that change it.
+    pub(crate) fn state_mut(&mut self) -> &mut String {
+        match self {
+            Element::Concept(row) => &mut row.state,
+            Element::Proposition(row) => &mut row.state,
+            Element::Assertion(row) => &mut row.state,
+            Element::Evidence(row) => &mut row.state,
+            Element::Activity(row) => &mut row.state,
+        }
+    }
+
+    /// The same block, for the authorized paths that change it.
+    pub(crate) fn governance_mut(&mut self) -> &mut anda_kip::Json {
+        match self {
+            Element::Concept(row) => &mut row.governance,
+            Element::Proposition(row) => &mut row.governance,
+            Element::Assertion(row) => &mut row.governance,
+            Element::Evidence(row) => &mut row.governance,
+            Element::Activity(row) => &mut row.governance,
+        }
     }
 
     /// The classification label this element carries, if it carries one.

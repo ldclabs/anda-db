@@ -62,6 +62,33 @@ impl Store {
         Ok(())
     }
 
+    /// Destroys every recorded version of one element.
+    ///
+    /// The half of a purge that is easy to forget and fatal to skip: every
+    /// commit appends the whole row it wrote, so an element scrubbed only in
+    /// its current row stays fully readable through `AS OF`. Returns how many
+    /// versions were destroyed, so a purge receipt can say what it cost.
+    ///
+    /// Rows are removed rather than scrubbed, unlike the element itself: a
+    /// version entry has no identity anything refers to, so there is nothing
+    /// for a stub to keep resolvable.
+    pub async fn purge_versions(&self, space_id: &str, id: ElementId) -> Result<usize, KipError> {
+        let collection = self.element_versions();
+        let ids = collection
+            .query_all_ids(Filter::And(vec![
+                Box::new(eq_field("space", Fv::Text(space_id.to_string()))),
+                Box::new(eq_field("element", Fv::Text(id.to_string()))),
+            ]))
+            .await
+            .map_err(db_error)?;
+        let mut destroyed = 0;
+        for row_id in &ids {
+            collection.remove(*row_id).await.map_err(db_error)?;
+            destroyed += 1;
+        }
+        Ok(destroyed)
+    }
+
     /// One element as it stood at a coordinate, or `None` when it did not
     /// exist yet.
     pub async fn element_at(

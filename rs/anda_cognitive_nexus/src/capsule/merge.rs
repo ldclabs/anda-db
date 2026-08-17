@@ -78,6 +78,7 @@ pub async fn merge(
     digest: &str,
     mut report: ImportReport,
     auth: AuthContext,
+    isolate: bool,
 ) -> Result<ImportReport, KipError> {
     let records = collect(capsule)?;
 
@@ -132,7 +133,14 @@ pub async fn merge(
             reused += 1;
             continue;
         }
-        let element = build(record, id, space_id, digest, &mapping)?;
+        let mut element = build(record, id, space_id, digest, &mapping)?;
+        if isolate {
+            // §176: an isolate import lands in quarantine rather than in
+            // ordinary recall. The records are durable and auditable and a
+            // reviewer can read them; nothing recalls, projects or acts on them
+            // until somebody releases them.
+            *element.state_mut() = crate::store::rows::state::QUARANTINED.to_string();
+        }
         tx.stage_new(id, element, "import");
         *counts.entry(record.kind.to_string()).or_default() += 1;
     }

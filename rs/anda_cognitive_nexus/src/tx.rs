@@ -370,6 +370,163 @@ impl Transaction {
         wrote_it || self.authority.is_bound_to_actor(&row.asserted_by_key)
     }
 
+    /// Carries classification and authority lineage onto derived elements.
+    ///
+    /// Runs at commit rather than per clause because a mutation block is
+    /// declarative: an Activity may list its outputs after the clause that
+    /// created them, so the derivation links only all exist once planning is
+    /// finished (§21–§24).
+    ///
+    /// Two things travel along those links, in opposite directions:
+    ///
+    /// ```text
+    /// classification   joins upward    the output is at least as restricted
+    /// authority        recorded        the ceiling it may later be raised to
+    /// ```
+    ///
+    /// Classification is applied here because it must be right the moment the
+    /// element becomes readable — *read secret Evidence, summarize, write
+    /// public summary* is an exfiltration path if the summary lands public even
+    /// briefly (§98, and the §242 fixture). Authority is only *recorded* here,
+    /// because everything is created at the bottom of the ladder and cannot
+    /// exceed anything; the lineage is what
+    /// [`elevate_authority`](crate::governance::element::elevate_authority)
+    /// reads when somebody asks to raise it.
+    async fn propagate_governance(&mut self) -> Result<(), KipError> {
+        let sources = self.material_inputs();
+        for (id, inputs) in sources {
+            let Some(staged) = self.staged.get(&id) else {
+                continue;
+            };
+            if !staged.is_new {
+                continue;
+            }
+            let inherited = self.join_classification(&inputs).await?;
+            let Some(staged) = self.staged.get(&id) else {
+                continue;
+            };
+            let own = staged.row.classification().to_string();
+            let default = self.authority.default_classification().to_string();
+            let effective = if own.is_empty() { &default } else { &own };
+            let raised = crate::governance::classification::join(effective, &inherited).to_string();
+
+            let Some(staged) = self.staged.get_mut(&id) else {
+                continue;
+            };
+            let envelope = staged.row.governance_mut();
+            let mut block = envelope
+                .as_object()
+                .cloned()
+                .unwrap_or_else(serde_json::Map::new);
+            if raised != default {
+                block.insert("classification".to_string(), Json::from(raised.as_str()));
+            }
+            if !inputs.is_empty() {
+                block.insert(
+                    crate::governance::element::LINEAGE_KEY.to_string(),
+                    Json::Array(inputs.iter().map(|id| Json::from(id.to_string())).collect()),
+                );
+            }
+            if !block.is_empty() {
+                *envelope = Json::Object(block);
+            }
+        }
+        Ok(())
+    }
+
+    /// The material inputs of every new element this transaction stages (§99).
+    ///
+    /// Deliberately conservative about what counts: an Assertion's cited
+    /// Evidence and context, an Evidence record's sources, an Activity's
+    /// inputs, and — walking the other way — the inputs of any Activity that
+    /// lists the element as an output. §99 allows a policy to distinguish a
+    /// material content dependency from a control input, and says that when it
+    /// is uncertain the restrictive reading wins. This engine has no such
+    /// policy, so it takes the restrictive reading throughout.
+    fn material_inputs(&self) -> Vec<(ElementId, Vec<ElementId>)> {
+        let local = |value: &Json| -> Option<ElementId> {
+            crate::term::Endpoint::from_json(value)
+                .ok()
+                .and_then(|endpoint| endpoint.local())
+        };
+        let mut by_output: BTreeMap<ElementId, BTreeSet<ElementId>> = BTreeMap::new();
+        for (id, staged) in &self.staged {
+            let mut inputs: BTreeSet<ElementId> = BTreeSet::new();
+            match &staged.row {
+                Element::Assertion(row) => {
+                    for reference in &row.evidence_ids {
+                        if let Ok(id) = reference.parse::<ElementId>() {
+                            inputs.insert(id);
+                        }
+                    }
+                    inputs.extend(row.context_refs.iter().filter_map(local));
+                }
+                Element::Evidence(row) => {
+                    inputs.extend(row.source_refs.iter().filter_map(local));
+                }
+                Element::Activity(row) => {
+                    inputs.extend(row.inputs.iter().filter_map(local));
+                }
+                _ => {}
+            }
+            by_output.entry(*id).or_default().extend(inputs);
+        }
+        // An Activity's outputs inherit from its inputs, which is the general
+        // shape of "this was produced from that" — the link a summarizer or a
+        // consolidation actually leaves behind.
+        for staged in self.staged.values() {
+            if let Element::Activity(row) = &staged.row {
+                let inputs: Vec<ElementId> = row.inputs.iter().filter_map(local).collect();
+                for output in row.outputs.iter().filter_map(local) {
+                    by_output
+                        .entry(output)
+                        .or_default()
+                        .extend(inputs.iter().copied());
+                }
+            }
+        }
+        by_output
+            .into_iter()
+            .map(|(id, inputs)| {
+                let mut inputs: Vec<ElementId> = inputs.into_iter().collect();
+                inputs.retain(|input| *input != id);
+                (id, inputs)
+            })
+            .filter(|(_, inputs)| !inputs.is_empty())
+            .collect()
+    }
+
+    /// The join of the classifications of a set of inputs.
+    ///
+    /// Inputs come from two places and both matter: an element this same
+    /// transaction staged, and one that was already committed. Reading only the
+    /// staged ones would make propagation work inside a single `MUTATE` and
+    /// silently stop working the moment the Evidence was written earlier — which
+    /// is the ordinary case.
+    ///
+    /// An input that is not there at all is read as the Space default rather
+    /// than as unclassified: §95 forbids letting absence mean `public`.
+    async fn join_classification(&self, inputs: &[ElementId]) -> Result<String, KipError> {
+        let default = self.authority.default_classification().to_string();
+        let mut joined = default.clone();
+        for input in inputs {
+            let label = match self.staged.get(input) {
+                Some(staged) => staged.row.classification().to_string(),
+                None => match self.store.get_element(*input).await {
+                    Ok(element) => element.classification().to_string(),
+                    Err(_) => String::new(),
+                },
+            };
+            let label = if label.is_empty() {
+                default.clone()
+            } else {
+                label
+            };
+            joined = crate::governance::classification::join(&joined, &label).to_string();
+        }
+        Ok(joined)
+    }
+
     /// Marks a staged element as actually changed.
     ///
     /// Separate from [`Self::load`] because loading is not modifying: a clause
@@ -441,6 +598,8 @@ impl Transaction {
                 warnings: self.warnings,
             });
         }
+
+        self.propagate_governance().await?;
 
         // Nothing this transaction touched keeps its shell state, and the
         // version rule is applied here so that a clause touching one element

@@ -40,6 +40,19 @@ pub mod state {
     /// says *where the identity went*, which is what lets a reader follow
     /// `merged_into` instead of concluding the Concept was retired.
     pub const MERGED: &str = "merged";
+    /// Held out of ordinary use by Governance, pending review (§133).
+    ///
+    /// Distinct from `archived`, and the distinction is the point (§134).
+    /// Archiving says *this is no longer in ordinary recall*; quarantine says
+    /// *local Governance does not currently allow ordinary use of this*. Both
+    /// leave the element readable to an authorized reviewer, and neither says
+    /// the original actor took anything back.
+    pub const QUARANTINED: &str = "quarantined";
+    /// Physically erased, with only an identity stub left (§19.3).
+    ///
+    /// The row survives so that references keep resolving and provenance-root
+    /// identity survives byte destruction; its content does not.
+    pub const PURGED: &str = "purged";
     /// Minted by an in-flight transaction and not yet committed.
     ///
     /// Not a KIP state: it exists because `anda_db` assigns element ids at

@@ -84,10 +84,27 @@
       "expect": {}
     },
     {
-      "name": "PURGE is refused: erasure is a Governance decision, not a mutation",
-      "command": "PURGE ?m WHERE { ?m CONCEPT {type: \"Experience\"} } CONFIRM \"PURGE\"",
+      "name": "PURGE refuses by default while anything still references the target",
+      "command": "PURGE ?alice WHERE { ?alice CONCEPT {key: \"person:alice\"} } CONFIRM \"PURGE\"",
       "expect": {
-        "error": "UnsupportedCapability"
+        "error": "PurgeDenied"
+      }
+    },
+    {
+      "name": "an unreferenced element erases, leaving an identity stub rather than a hole",
+      "command": "PURGE ?e WHERE { ?e CONCEPT {name: \"Third\", state: \"archived\"} } CONFIRM \"PURGE\"",
+      "expect": {}
+    },
+    {
+      "name": "the stub keeps identity and a digest, and carries none of the content",
+      "command": "FIND(?e.name, ?e.governance.purged) WHERE { ?e CONCEPT {state: \"purged\"} }",
+      "expect": {
+        "result": [
+          [
+            null,
+            true
+          ]
+        ]
       }
     }
   ]

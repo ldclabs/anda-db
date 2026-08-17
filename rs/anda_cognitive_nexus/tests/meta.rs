@@ -140,15 +140,19 @@ async fn capabilities_report_the_gaps_as_data_not_as_errors() {
         "semantic_search",
         "trust_model",
         "trust_governance",
-        "legal_hold",
-        "capsule_import_modes",
+        "capsule_restore_mode",
         "capsule_signatures",
+        "retention_policy",
     ] {
         assert!(unsupported.contains(&expected), "missing {expected}");
     }
     assert!(
         caps["supported"]["governance"]["default_deny"] == json!(true),
         "and what is enforced is reported as supported"
+    );
+    assert_eq!(
+        caps["supported"]["lifecycle"]["purge"]["default_reference_policy"], "deny_if_referenced",
+        "a destructive default has to be the conservative one, and has to say so"
     );
     // Each gap says why, not just that.
     for entry in caps["unsupported"].as_array().unwrap() {

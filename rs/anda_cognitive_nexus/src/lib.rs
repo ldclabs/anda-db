@@ -58,7 +58,11 @@
 //!   ([`CognitiveNexus::import_capsule`]);
 //! - **[Governance](governance)** — Principals, groups, Grants, Delegations,
 //!   ActorBindings, versioned Policies, approvals and an append-preserving
-//!   audit. Every command is authorized before it runs, under default deny.
+//!   audit. Every command is authorized before it runs, under default deny,
+//!   and so is every element a read or a write touches. Classification joins
+//!   upward along derivation links, influence authority never amplifies along
+//!   them, quarantine holds cognition out of use without claiming its author
+//!   took it back, and `PURGE` erases content while leaving an identity stub.
 //!
 //! A caller reaches the engine through [`CognitiveNexus::session`], which binds
 //! an [`AuthContext`](governance::AuthContext) the *host* built from
@@ -86,17 +90,11 @@
 //! ```text
 //! semantic / hybrid SEARCH       no embedding model
 //! SEARCH ... AS OF SEQ           the index reflects the present only
-//! Capsule signatures, the "isolate" and "restore" import modes
-//! DESCRIBE TRUST                 no trust evaluation to report
-//! PURGE                          erasure also needs legal holds and a
-//!                                reference policy for derived content
+//! Capsule signatures               nothing is signed
+//! the "restore" import mode        identity continuity is not modelled
+//! DESCRIBE TRUST                   no trust evaluation to report
+//! Space-level retention defaults   retention is set per element
 //! ```
-//!
-//! Governance is enforced at **command** scope: a caller either may read this
-//! Space or may not. A Grant narrowed to a classification, a field set or a
-//! result cap is stored and reported faithfully and is not yet applied per
-//! element — so `DESCRIBE CAPABILITIES` lists that as a gap rather than letting
-//! a constrained Grant look like a filter it is not.
 //!
 //! An engine that returned empty results for a read it cannot perform would be
 //! worse than one that says so: an Agent would read "no memories" as an answer

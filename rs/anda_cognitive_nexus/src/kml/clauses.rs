@@ -150,18 +150,7 @@ pub async fn apply(
             .await
         }
         MutationClause::MergeConcept(c) => merge_concept(store, tx, c, request, operation).await,
-        // PURGE is physical erasure, and the decision to erase is a Governance
-        // one: a legal hold, a reference policy and an authorization all have
-        // to be evaluated before bytes go away. This engine has no Governance
-        // plane, so it cannot make that decision — and an engine that erased
-        // anyway, on the grounds that the caller asked, would be exactly the
-        // failure the confirmation ritual exists to prevent.
-        MutationClause::Purge(_) => Err(KipError::unsupported_capability(
-            "PURGE physically erases an element, which needs the Governance plane this engine \
-             does not have: legal holds, the REFERENCE POLICY and the authority to erase are all \
-             Governance decisions. ARCHIVE and TOMBSTONE remove an element from recall without \
-             erasing it",
-        )),
+        MutationClause::Purge(c) => purge(store, tx, c, request, operation).await,
     }
 }
 
@@ -709,6 +698,72 @@ fn attribution_permission(tx: &Transaction, actor_key: &str) -> Permission {
     }
 }
 
+/// `PURGE` — physical erasure (§170–§177).
+///
+/// The one clause that runs outside the transaction it was planned in. Every
+/// other mutation stages a row and commits once; a purge destroys the version
+/// log as well, and doing that inside a transaction that might still abort
+/// would mean a rolled-back statement had already erased history.
+async fn purge(
+    store: &Store,
+    tx: &mut Transaction,
+    clause: &anda_kip::PurgeStatement,
+    request: Option<&Map<String, Json>>,
+    operation: Option<&Map<String, Json>>,
+) -> Result<(), KipError> {
+    let (targets, policy) = {
+        let b = bindings(tx, request, operation);
+        let policy = clause
+            .reference_policy
+            .as_ref()
+            .map(|scalar| b.scalar_str(scalar, "REFERENCE POLICY"))
+            .transpose()?;
+        let targets = select::targets(
+            store,
+            tx,
+            "PURGE",
+            Permission::Purge,
+            &clause.target,
+            clause.where_clauses.as_ref(),
+            clause.limit.as_ref(),
+            &b,
+        )
+        .await?;
+        (
+            targets,
+            crate::governance::purge::ReferencePolicy::parse(policy.as_deref())?,
+        )
+    };
+
+    let ids = targets.authorized(tx).await?;
+    if tx.dry_run {
+        // A preview must compute the effect without performing it, and there is
+        // no such thing as a reversible erasure to perform and undo.
+        for id in &ids {
+            tx.warn(format!(
+                "PURGE would erase {id} and every recorded version of it"
+            ));
+        }
+        return Ok(());
+    }
+    for id in ids {
+        let report = crate::governance::purge::purge(
+            store,
+            &tx.cx.space,
+            id,
+            policy,
+            &tx.authority,
+            &tx.auth,
+        )
+        .await?;
+        tx.warn(format!(
+            "purged {id}: {} historical version(s) destroyed",
+            report.versions_destroyed
+        ));
+    }
+    Ok(())
+}
+
 /// Refuses a retention block written by a caller who may not set one.
 ///
 /// `SET RETENTION` asks for `manage_retention`; `SET FIELDS {retention: …}`
@@ -718,7 +773,25 @@ fn require_retention_authority(tx: &Transaction, retention: &Json) -> Result<(),
     if retention.is_null() {
         return Ok(());
     }
-    tx.require(Permission::ManageRetention)
+    tx.require(Permission::ManageRetention)?;
+    require_legal_hold_authority(tx, retention)
+}
+
+/// Refuses a legal hold written by a caller who may not place one.
+///
+/// §163 names this attack by its shape: a cognitive writer must not be able to
+/// evade deletion by setting `legal_hold = true`. Placing a hold blocks erasure
+/// for everyone, so it is its own permission rather than part of retention
+/// management.
+fn require_legal_hold_authority(tx: &Transaction, retention: &Json) -> Result<(), KipError> {
+    let held = retention
+        .get("legal_hold")
+        .and_then(Json::as_bool)
+        .unwrap_or(false);
+    if !held {
+        return Ok(());
+    }
+    tx.require(Permission::LegalHold)
 }
 
 async fn ensure_proposition(
@@ -1303,6 +1376,7 @@ async fn set_retention(
     // *record* stops being retained, never when the claim stops applying —
     // that is `valid_time.until`, on an Assertion, and nothing here touches it.
     let retention = Json::Object(values);
+    require_legal_hold_authority(tx, &retention)?;
     let expires = expires_at(&retention)?;
     for id in targets.authorized(tx).await? {
         if let Some(expected) = expected {

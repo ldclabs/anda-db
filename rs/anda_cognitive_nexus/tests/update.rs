@@ -835,17 +835,74 @@ async fn upsert_applies_every_action_it_accepts() {
 /// The one selection-bearing form that stays refused, and the refusal says why
 /// rather than reading as an unimplemented corner.
 #[tokio::test]
-async fn purge_is_refused_because_erasure_is_a_governance_decision() {
-    let (nexus, _) = seeded("purge").await;
+async fn purge_refuses_by_default_while_the_target_is_still_referenced() {
+    // §173, §175: in a cognitive history an Assertion, an Activity or an
+    // Experience may point at the target, and erasing the dependency chain
+    // falsifies history. KIP 1.x made destructive cascade ordinary; 2.0 does
+    // not, and the default reference policy is where that shows.
+    let (nexus, created) = seeded("purge").await;
+    let alice = handle(&created, "alice");
     let error = err(
         &nexus,
-        r#"PURGE ?m WHERE { ?m CONCEPT {type: "Experience"} } CONFIRM "PURGE""#,
+        &format!(r#"PURGE "{alice}" REFERENCE POLICY "deny_if_referenced" CONFIRM "PURGE""#),
     )
     .await;
-    assert_eq!(error.code, "UnsupportedCapability", "{error:?}");
+    assert_eq!(error.code, "PurgeDenied", "{error:?}");
     assert!(
-        error.message.contains("Governance"),
-        "the refusal must say what is missing: {}",
+        error.message.contains("reference"),
+        "the refusal must say why: {}",
         error.message
     );
+}
+
+#[tokio::test]
+async fn purging_an_unreferenced_element_leaves_an_identity_stub() {
+    // §19.3: a stub so audit and provenance-root identity survive byte
+    // destruction. Deleting the row would break every reference to it, and a
+    // dangling reference does not say "this was erased" — it says nothing.
+    let (nexus, created) = seeded("purge_stub").await;
+    let third = handle(&created, "e3");
+    let receipt = ok(&nexus, &format!(r#"PURGE "{third}" CONFIRM "PURGE""#)).await;
+    assert!(receipt.is_object());
+
+    let stub = rows(
+        &ok(
+            &nexus,
+            r#"FIND(?e.id, ?e.name, ?e.governance.purged) WHERE { ?e CONCEPT {state: "purged"} }"#,
+        )
+        .await,
+    )
+    .clone();
+    assert_eq!(stub.len(), 1);
+    assert_eq!(stub[0][0], serde_json::json!(third.to_string()));
+    assert_eq!(stub[0][1], Json::Null, "the content is gone");
+    assert_eq!(stub[0][2], serde_json::json!(true));
+
+    // And the history goes with it: a purge that left the version log behind
+    // would leave the element fully readable through AS OF.
+    let past = rows(
+        &ok(
+            &nexus,
+            r#"FIND(?e.name) WHERE { ?e CONCEPT {type: "Experience"} } AS OF SEQ 1"#,
+        )
+        .await,
+    )
+    .clone();
+    assert!(
+        !past.iter().any(|name| name == "Third"),
+        "the erased element must not reappear at a past coordinate: {past:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_legal_hold_stops_a_purge_that_is_otherwise_authorized() {
+    let (nexus, created) = seeded("legal_hold").await;
+    let third = handle(&created, "e3");
+    ok(
+        &nexus,
+        &format!(r#"SET RETENTION "{third}" {{ legal_hold: true }}"#),
+    )
+    .await;
+    let error = err(&nexus, &format!(r#"PURGE "{third}" CONFIRM "PURGE""#)).await;
+    assert_eq!(error.code, "LegalHoldConflict", "{error:?}");
 }

@@ -175,7 +175,7 @@ pub fn capabilities() -> Json {
                 // The import itself is a host operation: KML has no import
                 // clause and META is read-only, so a command cannot decide
                 // that this Space accepts another Brain's cognition.
-                "import_modes": ["preview", "merge"],
+                "import_modes": ["preview", "merge", "isolate"],
                 "identity_resolution": ["prior import", "canonical_id", "proposition tuple"]
             },
             "execution_modes": ["independent", "sequence"],
@@ -190,6 +190,21 @@ pub fn capabilities() -> Json {
                 "cost": "a historical read scans the version log for its Space"
             },
             "search_modes": ["keyword"],
+            "lifecycle": {
+                "states": ["active", "archived", "quarantined", "tombstoned", "merged", "purged"],
+                // Quarantine is not retraction and not archival: it says this
+                // Brain does not currently allow ordinary use, which is a
+                // statement about the Brain rather than about the source.
+                "quarantine": "excluded from ordinary recall, readable by a reviewer",
+                "purge": {
+                    "reference_policies": [
+                        "deny_if_referenced", "tombstone_reference", "authorized_cascade"
+                    ],
+                    "default_reference_policy": "deny_if_referenced",
+                    "leaves": "an identity stub carrying a content digest",
+                    "destroys": "every recorded version of the element"
+                }
+            },
             "transactions": {
                 "atomic_visibility": "in_process",
                 "idempotency": true,
@@ -268,24 +283,18 @@ pub fn capabilities() -> Json {
                            and every projection says so"
             },
             {
-                "capability": "legal_hold",
-                "detail": "`retention.legal_hold` blocking erasure",
-                "reason": "the permission exists in the registry and nothing reads the flag \
-                           yet, because the operation it would block — PURGE — is itself \
-                           unimplemented"
-            },
-            {
                 "capability": "trust_governance",
                 "detail": "DESCRIBE TRUST",
                 "reason": "the trust policy binding is Governance state, but this engine \
                            evaluates no source trust, so there is no trust judgement to report"
             },
             {
-                "capability": "capsule_import_modes",
-                "detail": "the \"isolate\" and \"restore\" import modes (§39.2, §39.4)",
-                "reason": "isolate needs a quarantine state ordinary recall excludes, and restore \
-                           needs owner and lineage verification; neither is implemented. \
-                           \"merge\" is what this engine performs"
+                "capability": "capsule_restore_mode",
+                "detail": "the \"restore\" import mode (§39.4)",
+                "reason": "restore is same-Brain recovery, whose whole point is mapping a source \
+                           autobiographical self onto the destination's. That mapping is the one \
+                           thing a Capsule import must never do by resemblance, and verifying it \
+                           needs identity continuity this engine does not model"
             },
             {
                 "capability": "capsule_signatures",
@@ -294,12 +303,11 @@ pub fn capabilities() -> Json {
                            source is a claim a destination cannot check"
             },
             {
-                "capability": "physical_purge",
-                "detail": "PURGE",
-                "reason": "the purge permission is authorized, but erasure also needs legal \
-                           holds and the REFERENCE POLICY for content derived from what is \
-                           being erased, and neither is implemented. ARCHIVE and TOMBSTONE \
-                           remove an element from recall without erasing it"
+                "capability": "retention_policy",
+                "detail": "Space-level retention defaults by kind, type or classification (§162)",
+                "reason": "retention is set per element and enforced per element; a Space cannot \
+                           yet declare that raw Experiences expire in 90 days and audit records \
+                           in 7 years"
             }
         ]
     })

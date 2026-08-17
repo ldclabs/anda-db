@@ -93,6 +93,9 @@ pub struct ElementEnvelope {
 }
 
 /// The Governance members carried on an element (Spec §31.1).
+///
+/// Author-unwritable by construction: `governance` is in the parser's protected
+/// field list, so these arrive only from an authorized Governance operation.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct GovernanceState {
     /// A policy-defined classification label, e.g. `private`.
@@ -101,6 +104,27 @@ pub struct GovernanceState {
     /// The policy this element is evaluated under.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_ref: Option<String>,
+    /// How strongly this element may influence action (§31.3).
+    ///
+    /// A ceiling, not a truth score: a memory can be certainly true and still
+    /// be `descriptive`. Absent means the runtime's default, which §31.4 makes
+    /// the bottom of the ladder for anything imported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_influence_authority: Option<String>,
+    /// What this element was derived from, for authority non-amplification.
+    ///
+    /// §31.5: transformation, summarization and compilation MUST NOT erase
+    /// authority-relevant origin lineage. This is where a runtime records it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authority_lineage: Vec<String>,
+    /// Runtime-specific Governance members.
+    ///
+    /// Flattened rather than dropped: a runtime records things here that this
+    /// crate has no name for — why an element is quarantined, what a purged
+    /// stub digests to — and silently discarding them on the way through the
+    /// wire shape would make an element's own Governance block lie by omission.
+    #[serde(flatten, default, skip_serializing_if = "Map::is_empty")]
+    pub extensions: Map<String, Json>,
 }
 
 /// The storage-lifecycle hook (Spec §19.1).
