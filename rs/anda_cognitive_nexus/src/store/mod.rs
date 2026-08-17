@@ -606,15 +606,18 @@ pub(crate) fn full_row_fields<T: serde::Serialize>(
     schema: Arc<anda_db_schema::Schema>,
     row: &T,
 ) -> Result<std::collections::BTreeMap<String, Fv>, KipError> {
-    let document = anda_db_schema::Document::try_from(schema.clone(), row).map_err(schema_error)?;
+    let mut document =
+        anda_db_schema::Document::try_from(schema.clone(), row).map_err(schema_error)?;
     let mut fields = std::collections::BTreeMap::new();
     for entry in schema.iter() {
         // `_id` is the update's target, not one of its assignments.
         if entry.name() == "_id" {
             continue;
         }
-        if let Some(value) = document.get_field(entry.name()) {
-            fields.insert(entry.name().to_string(), value.clone());
+        // Moved out rather than cloned: the document is dropped at the end of
+        // this function, and a row carries whole JSON blobs.
+        if let Some(value) = document.remove_field(entry.name()) {
+            fields.insert(entry.name().to_string(), value);
         }
     }
     Ok(fields)

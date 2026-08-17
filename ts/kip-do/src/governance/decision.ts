@@ -292,6 +292,14 @@ export class EffectiveAuthority {
   readonly policy: GovernancePolicyRow | null
   /** The Space's ActorBindings for this Principal. */
   readonly bindings: ActorBindingRow[]
+  /**
+   * The bound Policy's statements, parsed once.
+   *
+   * `authorize` runs per element on the read path, and re-reading these out of
+   * their stored JSON there would rebuild the whole Policy once per candidate —
+   * this module promises one control-plane load, not ten thousand.
+   */
+  private readonly parsedStatements: PolicyStatement[]
   private readonly candidates: Candidate[]
 
   private constructor(parts: {
@@ -309,6 +317,7 @@ export class EffectiveAuthority {
     this.isOwner = parts.isOwner
     this.policy = parts.policy
     this.bindings = parts.bindings
+    this.parsedStatements = (parts.policy?.statements ?? []).map(asStatement)
     this.candidates = parts.candidates
   }
 
@@ -858,8 +867,8 @@ export class EffectiveAuthority {
     return candidate === null ? [] : [candidate]
   }
 
-  private statements(): PolicyStatement[] {
-    return (this.policy?.statements ?? []).map(asStatement)
+  private statements(): readonly PolicyStatement[] {
+    return this.parsedStatements
   }
 
   /**

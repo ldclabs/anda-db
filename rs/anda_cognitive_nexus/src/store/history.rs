@@ -26,7 +26,7 @@ use anda_kip::{ElementKind, Json, KipError, KipErrorCode};
 use std::collections::BTreeMap;
 
 use super::rows::*;
-use super::{Element, Store, eq_field};
+use super::{Element, Store, eq_field, eq_fields};
 use crate::error::db_error;
 use crate::id::ElementId;
 use crate::store::write::WriteContext;
@@ -73,31 +73,35 @@ impl Store {
     /// version entry has no identity anything refers to, so there is nothing
     /// for a stub to keep resolvable.
     pub async fn purge_versions(&self, space_id: &str, id: ElementId) -> Result<usize, KipError> {
-        let collection = self.element_versions();
-        let ids = collection
-            .query_all_ids(Filter::And(vec![
-                Box::new(eq_field("space", Fv::Text(space_id.to_string()))),
-                Box::new(eq_field("element", Fv::Text(id.to_string()))),
-            ]))
-            .await
-            .map_err(db_error)?;
-        let mut destroyed = 0;
-        for row_id in &ids {
-            collection.remove(*row_id).await.map_err(db_error)?;
-            destroyed += 1;
-        }
-        Ok(destroyed)
+        let ids = self.version_ids(space_id, id).await?;
+        self.remove_versions(&ids).await?;
+        Ok(ids.len())
     }
 
-    /// Counts the historical versions a staged purge will destroy at commit.
-    pub async fn version_count(&self, space_id: &str, id: ElementId) -> Result<usize, KipError> {
+    /// Destroys exactly the version rows a staged purge counted.
+    ///
+    /// Takes the ids rather than re-deriving them, so the number a purge
+    /// receipt reports and the rows it erases cannot come apart.
+    pub async fn remove_versions(&self, ids: &[u64]) -> Result<(), KipError> {
+        let collection = self.element_versions();
+        for row_id in ids {
+            collection.remove(*row_id).await.map_err(db_error)?;
+        }
+        Ok(())
+    }
+
+    /// Every version row of one element.
+    pub(crate) async fn version_ids(
+        &self,
+        space_id: &str,
+        id: ElementId,
+    ) -> Result<Vec<u64>, KipError> {
         self.element_versions()
-            .query_all_ids(Filter::And(vec![
-                Box::new(eq_field("space", Fv::Text(space_id.to_string()))),
-                Box::new(eq_field("element", Fv::Text(id.to_string()))),
+            .query_all_ids(eq_fields(&[
+                ("space", Fv::Text(space_id.to_string())),
+                ("element", Fv::Text(id.to_string())),
             ]))
             .await
-            .map(|ids| ids.len())
             .map_err(db_error)
     }
 

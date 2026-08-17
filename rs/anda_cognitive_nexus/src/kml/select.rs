@@ -74,13 +74,13 @@ impl Targets {
     /// Only for the statements that must bind exactly one operand and want to
     /// say so precisely; it discloses a count of elements the caller could
     /// already read, because the solver filtered them.
+    ///
+    /// No `is_empty` companion on purpose: "bound nothing" is not a question
+    /// any clause asks, and adding the method to satisfy the shape would put
+    /// back a disclosure surface with no caller.
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.ids.len()
-    }
-
-    /// Whether the block bound nothing.
-    pub fn is_empty(&self) -> bool {
-        self.ids.is_empty()
     }
 }
 

@@ -516,10 +516,10 @@ impl Executor for Session {
                     Ok(authority) => authority,
                     Err(err) => return Response::from(err),
                 };
-                let decisions = match self
-                    .gate(&authority, &auth, gate::kml_permissions(&statement))
-                    .await
-                {
+                // No approval guard here: the exclusive write lock above
+                // already serializes everything that could spend an approval.
+                let base = base_authorizations(&authority, &auth, gate::kml_permissions(&statement));
+                let decisions = match self.gate(&authority, &auth, base).await {
                     Ok(decisions) => decisions,
                     Err(err) => return Response::from(err),
                 };
@@ -533,11 +533,7 @@ impl Executor for Session {
                     &auth,
                 )
                 .await;
-                if response.status == anda_kip::TopLevelStatus::Succeeded
-                    && let Err(err) = self.consume_approvals(&decisions).await
-                {
-                    return Response::from(err);
-                }
+                let response = self.settle(response, &decisions).await;
                 // A poison event costs no further command: the next mutation
                 // would be rejected outright, so recovery happens here rather
                 // than being deferred to the caller's next attempt.
@@ -554,13 +550,9 @@ impl Executor for Session {
                     Ok(authority) => authority,
                     Err(err) => return Response::from(err),
                 };
-                let permissions = gate::kql_permissions(&query);
-                let _approval_guard = if needs_approval(&authority, &auth, &permissions) {
-                    Some(self.nexus.approval_lock.lock().await)
-                } else {
-                    None
-                };
-                let decisions = match self.gate(&authority, &auth, permissions).await {
+                let base = base_authorizations(&authority, &auth, gate::kql_permissions(&query));
+                let _approval_guard = self.approval_guard(&base).await;
+                let decisions = match self.gate(&authority, &auth, base).await {
                     Ok(decisions) => decisions,
                     Err(err) => return Response::from(err),
                 };
@@ -574,12 +566,7 @@ impl Executor for Session {
                     &auth,
                 )
                 .await;
-                if response.status == anda_kip::TopLevelStatus::Succeeded
-                    && let Err(err) = self.consume_approvals(&decisions).await
-                {
-                    return Response::from(err);
-                }
-                response
+                self.settle(response, &decisions).await
             }
             Command::Meta(command) => {
                 // META is semantically read-only (§63.2), so it shares the
@@ -589,13 +576,9 @@ impl Executor for Session {
                     Ok(authority) => authority,
                     Err(err) => return Response::from(err),
                 };
-                let permissions = gate::meta_permissions(&command);
-                let _approval_guard = if needs_approval(&authority, &auth, &permissions) {
-                    Some(self.nexus.approval_lock.lock().await)
-                } else {
-                    None
-                };
-                let decisions = match self.gate(&authority, &auth, permissions).await {
+                let base = base_authorizations(&authority, &auth, gate::meta_permissions(&command));
+                let _approval_guard = self.approval_guard(&base).await;
+                let decisions = match self.gate(&authority, &auth, base).await {
                     Ok(decisions) => decisions,
                     Err(err) => return Response::from(err),
                 };
@@ -609,30 +592,27 @@ impl Executor for Session {
                     &auth,
                 )
                 .await;
-                if response.status == anda_kip::TopLevelStatus::Succeeded
-                    && let Err(err) = self.consume_approvals(&decisions).await
-                {
-                    return Response::from(err);
-                }
-                response
+                self.settle(response, &decisions).await
             }
         }
     }
 }
 
-fn needs_approval(
+/// The Space-scope decision for each permission a command needs.
+///
+/// Resolved once and then read twice — by the approval guard and by the gate.
+/// `EffectiveAuthority::authorize` re-parses every statement of the governing
+/// policy on each call, so asking it the same question twice is not free.
+fn base_authorizations(
     authority: &EffectiveAuthority,
     auth: &AuthContext,
-    permissions: &[Permission],
-) -> bool {
+    permissions: Vec<Permission>,
+) -> Vec<Authorization> {
     let resource = ResourceContext::default();
-    permissions.iter().any(|permission| {
-        authority
-            .authorize(*permission, &resource, auth)
-            .obligations
-            .approvals_required
-            > 0
-    })
+    permissions
+        .into_iter()
+        .map(|permission| authority.authorize(permission, &resource, auth))
+        .collect()
 }
 
 impl Session {
@@ -654,11 +634,11 @@ impl Session {
         &self,
         authority: &EffectiveAuthority,
         auth: &AuthContext,
-        needed: Vec<Permission>,
+        needed: Vec<Authorization>,
     ) -> Result<Vec<Authorization>, KipError> {
-        let mut decisions = Vec::new();
-        for permission in needed {
-            let resource = ResourceContext::default();
+        let resource = ResourceContext::default();
+        let mut decisions = Vec::with_capacity(needed.len());
+        for base in needed {
             // A policy may require independent approval for a whole command
             // family — declassification, elevation, export — and a satisfied
             // approval is what turns that into an allow. An unsatisfied one
@@ -667,13 +647,12 @@ impl Session {
                 &self.nexus.store,
                 &authority.space.space_id,
                 &resource,
-                authority.authorize(permission, &resource, auth),
+                base,
                 auth,
             )
             .await?;
             if !decision.is_permitted() {
                 self.audit(authority, auth, &decision).await;
-                return decision.into_result().map(|_| Vec::new());
             }
             let decision = decision.into_result()?;
             if decision.obligations.audit {
@@ -684,11 +663,39 @@ impl Session {
         Ok(decisions)
     }
 
-    async fn consume_approvals(&self, decisions: &[Authorization]) -> Result<(), KipError> {
-        for decision in decisions {
-            crate::governance::approval::consume(&self.nexus.store, decision).await?;
+    /// Serializes the commands that could otherwise spend one approval twice.
+    ///
+    /// Only the read paths need it: a KML statement already runs under the
+    /// exclusive write lock, and taking a second lock under it would only add
+    /// a way to deadlock.
+    async fn approval_guard(
+        &self,
+        base: &[Authorization],
+    ) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        if base
+            .iter()
+            .all(|decision| decision.obligations.approvals_required == 0)
+        {
+            return None;
         }
-        Ok(())
+        Some(self.nexus.approval_lock.lock().await)
+    }
+
+    /// Spends the approvals a command carried, once it has actually succeeded.
+    ///
+    /// A failed attempt leaves them unspent: an approval buys one completed
+    /// operation, not one try at it.
+    async fn settle(&self, response: Response, decisions: &[Authorization]) -> Response {
+        if response.status != anda_kip::TopLevelStatus::Succeeded {
+            return response;
+        }
+        for decision in decisions {
+            if let Err(err) = crate::governance::approval::consume(&self.nexus.store, decision).await
+            {
+                return Response::from(err);
+            }
+        }
+        response
     }
 
     /// Writes one decision to the Governance audit.

@@ -29,6 +29,7 @@ import {
 import { isJsonMap, type Json, type JsonMap } from '../json.js'
 import type {
   BeliefTarget,
+  Scalar,
   MatchValue,
   ObjectMatcher,
   PredAtom,
@@ -36,6 +37,7 @@ import type {
   Term,
   WhereClause,
 } from '../kip/ast.js'
+import { kipValue as kipLiteral } from '../kml/value.js'
 import { formatSymbolRef } from '../schema/index.js'
 import { State, type PropositionRow, type SqlRow } from '../store/index.js'
 import { decodeRow } from '../store/codec.js'
@@ -448,36 +450,6 @@ function literalOf(
       : (bound.value as Json)
   }
   return undefined
-}
-
-/** A `KipValue` as plain JSON. */
-function kipLiteral(value: Parameters<typeof kipLiteralImpl>[0]): Json {
-  return kipLiteralImpl(value)
-}
-
-function kipLiteralImpl(
-  value:
-    | 'Null'
-    | { Bool: boolean }
-    | { Number: number }
-    | { String: string }
-    | { Array: unknown[] }
-    | { Object: Record<string, unknown> },
-): Json {
-  if (value === 'Null') return null
-  if ('Bool' in value) return value.Bool
-  if ('Number' in value) return value.Number
-  if ('String' in value) return value.String
-  if ('Array' in value) {
-    return (value.Array as Parameters<typeof kipLiteralImpl>[0][]).map(
-      kipLiteralImpl,
-    )
-  }
-  return Object.fromEntries(
-    Object.entries(
-      value.Object as Record<string, Parameters<typeof kipLiteralImpl>[0]>,
-    ).map(([k, v]) => [k, kipLiteralImpl(v)]),
-  )
 }
 
 /** Resolves a schema symbol a matcher wrote as a local name. */
@@ -962,3 +934,8 @@ export function readVariable(
 }
 
 export { kipLiteral }
+
+/** Evaluates a `parameter | literal` slot. */
+export function scalarValue(scalar: Scalar, b: ReadBindings): Json {
+  return 'Param' in scalar ? parameterValue(b, scalar.Param) : kipLiteral(scalar.Literal)
+}

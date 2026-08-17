@@ -259,7 +259,26 @@ pub struct EffectiveAuthority {
     pub policy: Option<GovernancePolicyRow>,
     /// The Space's ActorBindings for this Principal.
     pub bindings: Vec<ActorBindingRow>,
+    /// The bound Policy's statements, parsed once.
+    ///
+    /// `authorize` runs per element on the read path, and re-reading these out
+    /// of JSON there would deserialize the whole Policy once per candidate —
+    /// the module promises one control-plane load, not ten thousand.
+    statements: Vec<PolicyStatement>,
     candidates: Vec<Candidate>,
+}
+
+/// Reads a Policy's statements, dropping any this engine cannot parse.
+fn statements_of(policy: Option<&GovernancePolicyRow>) -> Vec<PolicyStatement> {
+    policy
+        .map(|policy| {
+            policy
+                .statements
+                .iter()
+                .filter_map(|value| serde_json::from_value(value.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 impl EffectiveAuthority {
@@ -355,6 +374,7 @@ impl EffectiveAuthority {
             principal,
             groups,
             is_owner,
+            statements: statements_of(policy.as_ref()),
             policy,
             bindings,
             candidates,
@@ -438,6 +458,7 @@ impl EffectiveAuthority {
             principal,
             groups,
             is_owner,
+            statements: statements_of(policy.as_ref()),
             policy,
             bindings,
             candidates,
@@ -497,7 +518,7 @@ impl EffectiveAuthority {
         // The owner is not locked out by it — a host holds the control plane
         // directly and can publish a new policy version — but nothing that
         // arrives through a request can talk past a deny.
-        for statement in &statements {
+        for statement in statements {
             if statement.effect == "deny"
                 && self.statement_matches(statement, permission, &resource, auth, &now)
             {
@@ -525,7 +546,7 @@ impl EffectiveAuthority {
             }
         }
         let mut obligations = self.baseline_obligations(permission);
-        for statement in &statements {
+        for statement in statements {
             if statement.effect != "allow"
                 || !self.statement_matches(statement, permission, &resource, auth, &now)
             {
@@ -694,17 +715,8 @@ impl EffectiveAuthority {
         held.into_iter().collect()
     }
 
-    fn statements(&self) -> Vec<PolicyStatement> {
-        self.policy
-            .as_ref()
-            .map(|policy| {
-                policy
-                    .statements
-                    .iter()
-                    .filter_map(|value| serde_json::from_value(value.clone()).ok())
-                    .collect()
-            })
-            .unwrap_or_default()
+    fn statements(&self) -> &[PolicyStatement] {
+        &self.statements
     }
 
     /// The obligations that hold before any policy is consulted.

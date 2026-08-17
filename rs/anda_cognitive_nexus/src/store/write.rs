@@ -17,10 +17,8 @@
 //! optimistic-concurrency primitive KIP has (§81), and it compares against this
 //! counter.
 
-use anda_db::collection::Collection;
-use anda_db_schema::{Fv, Json};
+use anda_db_schema::Json;
 use anda_kip::{ElementKind, KipError};
-use std::collections::BTreeMap;
 
 use super::{Store, rows::*};
 use crate::error::db_error;
@@ -194,7 +192,7 @@ impl Store {
         cx.stamp_update(row);
         let id = *row.envelope_mut().id;
         let collection = self.elements(R::KIND);
-        let fields = row_fields(&collection, row)?;
+        let fields = super::full_row_fields(collection.schema(), row)?;
         collection.update(id, fields).await.map_err(db_error)?;
         Ok(*row.envelope_mut().version)
     }
@@ -207,7 +205,7 @@ impl Store {
     pub(crate) async fn put_row<R: Row>(&self, row: &R) -> Result<(), KipError> {
         let collection = self.elements(R::KIND);
         let id = row.id();
-        let fields = row_fields(&collection, row)?;
+        let fields = super::full_row_fields(collection.schema(), row)?;
         collection.update(id, fields).await.map_err(db_error)?;
         Ok(())
     }
@@ -248,24 +246,6 @@ impl Store {
         }
         Ok(())
     }
-}
-
-/// Serializes a row into the field map `Collection::update` expects.
-fn row_fields<R: Row>(collection: &Collection, row: &R) -> Result<BTreeMap<String, Fv>, KipError> {
-    let schema = collection.schema();
-    let document = anda_db_schema::Document::try_from(schema.clone(), row)
-        .map_err(crate::error::schema_error)?;
-    let mut fields = BTreeMap::new();
-    for entry in schema.iter() {
-        // `_id` is the update's target, not one of its assignments.
-        if entry.name() == "_id" {
-            continue;
-        }
-        if let Some(value) = document.get_field(entry.name()) {
-            fields.insert(entry.name().to_string(), value.clone());
-        }
-    }
-    Ok(fields)
 }
 
 #[cfg(test)]

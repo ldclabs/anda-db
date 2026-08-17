@@ -26,8 +26,7 @@ import { Context } from './context.js'
 import { coordinateFromToken } from '../store/index.js'
 import { normalizeTime } from '../time.js'
 import {
-  kipLiteral,
-  parameterValue,
+  scalarValue,
   readVariable,
   solveAll,
   type ReadBindings,
@@ -97,7 +96,7 @@ export function executeKql(query: KqlQuery, cx: KqlContext): Json[] {
   // the same query answers about that instant rather than about now. A different
   // axis from `AS OF` — what was *true* then, not what this Brain *held* then
   // (§36.1) — and the two never default from each other.
-  const validAt = query.for_time === null ? null : time(cx, query.for_time, b)
+  const validAt = query.for_time === null ? null : time(query.for_time, b)
 
   const solutions = validAt === null
     ? solveAll(context, query.where_clauses, [new Map()], b)
@@ -185,8 +184,7 @@ export function resolveAsOf(asOf: AsOf, cx: KqlContext, b: ReadBindings): number
   return cx.store.seqAtTime(cx.space, normalizeTime(value, 'AS OF TIME'))
 }
 
-function time(cx: KqlContext, scalar: Scalar, b: ReadBindings): string {
-  void cx
+function time(scalar: Scalar, b: ReadBindings): string {
   const value = scalarValue(scalar, b)
   if (typeof value !== 'string') {
     throw errors.typeMismatch('FOR TIME takes an RFC 3339 timestamp')
@@ -456,17 +454,12 @@ function count(scalar: Scalar, b: ReadBindings, what: string): number {
   return value
 }
 
-function scalarValue(scalar: Scalar, b: ReadBindings): Json {
-  return 'Param' in scalar
-    ? parameterValue(b, scalar.Param)
-    : kipLiteral(scalar.Literal)
-}
-
 export { Context, LIMITS } from './context.js'
 export { evaluateFilter } from './filter.js'
 export {
   parameterValue,
   readVariable,
+  scalarValue,
   solveAll,
   type ReadBindings,
 } from './matching.js'

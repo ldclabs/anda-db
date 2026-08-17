@@ -18,6 +18,7 @@ import {
   classify,
   consumeResolvedApprovals,
   elevateAuthority,
+  isPermitted,
   principalClass,
   quarantine,
   release,
@@ -323,12 +324,7 @@ export class CognitiveNexus {
 
   /** Parses and runs one KML statement, returning its receipt. */
   execute(command: string, params: JsonMap = {}): Outcome {
-    const parsed: Command = parseKip(command)
-    if ('Kml' in parsed) return this.mutate(parsed.Kml, params)
-    throw errors.languageMismatch(
-      'this command is not a KML statement; a query has no receipt — use ' +
-        'query() for KQL and describe() for META',
-    )
+    return this.systemSession().execute(command, params)
   }
 
   /**
@@ -374,11 +370,7 @@ export class CognitiveNexus {
     command: string,
     params: JsonMap = {},
   ): { ok: Outcome } | { error: KipError } {
-    try {
-      return { ok: this.execute(command, params) }
-    } catch (err) {
-      return { error: KipError.from(err) }
-    }
+    return this.systemSession().tryExecute(command, params)
   }
 
   /**
@@ -736,7 +728,7 @@ export class Session {
         authority.authorize(permission, resource, this.auth),
         this.auth,
       )
-      if (!isPermittedDecision(decision)) {
+      if (!isPermitted(decision.decision)) {
         this.audit(authority, decision)
       }
       const permitted = requirePermitted(decision)
@@ -810,9 +802,4 @@ function accessProvenance(
         : { id: authority.policy.policy_id, version: authority.policy.version },
     operations: permissions,
   } as unknown as JsonMap
-}
-
-/** Whether a decision lets the operation proceed. */
-function isPermittedDecision(decision: Authorization): boolean {
-  return decision.decision === 'allow' || decision.decision === 'allow_with_constraints'
 }

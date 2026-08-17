@@ -507,20 +507,28 @@ export function asConditions(value: unknown): AuthorityConditions {
   }
 }
 
+/**
+ * Reads `max_results`, treating anything that is not a non-negative integer as
+ * the tightest cap there is.
+ *
+ * Fails closed rather than open: a bound the reader cannot make sense of must
+ * not widen the authority it was written to narrow. Matches
+ * `lenient_max_results` in the Rust engine.
+ */
+function asMaxResults(value: unknown): number | null {
+  if (value === undefined || value === null) return null
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) {
+    return value
+  }
+  return 0
+}
+
 /** Reads an {@link AuthorityConstraints} from a stored value. */
 export function asConstraints(value: unknown): AuthorityConstraints {
   const raw = (value ?? {}) as Record<string, unknown>
-  const maxResults = raw.max_results
   return {
     fields: strings(raw.fields),
-    max_results:
-      maxResults === undefined || maxResults === null
-        ? null
-        : typeof maxResults === 'number' &&
-            Number.isSafeInteger(maxResults) &&
-            maxResults >= 0
-          ? maxResults
-          : 0,
+    max_results: asMaxResults(raw.max_results),
     max_influence_authority: text(raw.max_influence_authority),
     max_classification: text(raw.max_classification),
     export: flag(raw.export),
@@ -679,6 +687,20 @@ export function tightenConstraints(
   }
 }
 
+/**
+ * Whether a child ceiling stays under a parent one.
+ *
+ * An empty parent states no ceiling and contains anything; an empty child is
+ * unbounded, which no stated parent contains.
+ */
+function withinCeiling(
+  parent: string,
+  child: string,
+  rank: (name: string) => number,
+): boolean {
+  return parent === '' || (child !== '' && rank(child) <= rank(parent))
+}
+
 /** Whether `child` stays inside every constraint imposed by `parent`. */
 export function constraintsContain(
   parent: AuthorityConstraints,
@@ -687,21 +709,19 @@ export function constraintsContain(
   const boundedNumber =
     parent.max_results === null ||
     (child.max_results !== null && child.max_results <= parent.max_results)
-  const boundedAuthority =
-    parent.max_influence_authority === '' ||
-    (child.max_influence_authority !== '' &&
-      authority.rank(child.max_influence_authority) <=
-        authority.rank(parent.max_influence_authority))
-  const boundedClassification =
-    parent.max_classification === '' ||
-    (child.max_classification !== '' &&
-      classification.rank(child.max_classification) <=
-        classification.rank(parent.max_classification))
   return (
     narrows(parent.fields, child.fields) &&
     boundedNumber &&
-    boundedAuthority &&
-    boundedClassification &&
+    withinCeiling(
+      parent.max_influence_authority,
+      child.max_influence_authority,
+      authority.rank,
+    ) &&
+    withinCeiling(
+      parent.max_classification,
+      child.max_classification,
+      classification.rank,
+    ) &&
     (parent.export || !child.export)
   )
 }

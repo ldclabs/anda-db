@@ -389,47 +389,72 @@ impl GovernanceStore {
         Ok(out)
     }
 
+    /// The record a resource carried at an instant, and how it got that way.
+    ///
+    /// The selection rule — newest entry at or before the coordinate, ties
+    /// broken by row id — is what makes "who was suspended then" deterministic,
+    /// so it is written once here rather than per record type. Each caller
+    /// supplies only what its own three outcomes mean.
+    async fn record_at<T: serde::de::DeserializeOwned>(
+        &self,
+        resource: &str,
+        operations: &[&str],
+        at: &str,
+        noun: &str,
+    ) -> Result<Historical<T>, KipError> {
+        let rows = self.history_of(resource, operations).await?;
+        let has_history = !rows.is_empty();
+        let latest = rows
+            .into_iter()
+            .filter(|row| row.at.as_str() <= at)
+            .max_by(|a, b| (a.at.as_str(), a._id).cmp(&(b.at.as_str(), b._id)));
+        match latest {
+            Some(row) => serde_json::from_value(row.record)
+                .map(Historical::At)
+                .map_err(|err| KipError::internal_error(format!("historical {noun}: {err}"))),
+            None if has_history => Ok(Historical::NotYet),
+            None => Ok(Historical::NoHistory),
+        }
+    }
+
     /// The Principal record that was current at an instant.
     pub async fn principal_at(
         &self,
         principal_id: &str,
         at: &str,
     ) -> Result<Option<PrincipalRow>, KipError> {
-        let rows = self
-            .history_of(principal_id, &["create_principal", "set_principal_status"])
-            .await?;
-        let has_history = !rows.is_empty();
-        let latest = rows
-            .into_iter()
-            .filter(|row| row.at.as_str() <= at)
-            .max_by(|a, b| (a.at.as_str(), a._id).cmp(&(b.at.as_str(), b._id)));
-        match latest {
-            Some(row) => serde_json::from_value(row.record)
-                .map(Some)
-                .map_err(|err| KipError::internal_error(format!("historical Principal: {err}"))),
-            None if has_history => Ok(None),
-            None => self.find_principal(principal_id).await,
+        match self
+            .record_at(
+                principal_id,
+                &["create_principal", "set_principal_status"],
+                at,
+                "Principal",
+            )
+            .await?
+        {
+            Historical::At(row) => Ok(Some(row)),
+            Historical::NotYet => Ok(None),
+            Historical::NoHistory => self.find_principal(principal_id).await,
         }
     }
 
     /// The MemorySpace governance record that was current at an instant.
     pub async fn space_at(&self, current: &SpaceRow, at: &str) -> Result<SpaceRow, KipError> {
-        let rows = self
-            .history_of(&current.space_id, &["create_space", "put_space"])
-            .await?;
-        let has_history = !rows.is_empty();
-        let latest = rows
-            .into_iter()
-            .filter(|row| row.at.as_str() <= at)
-            .max_by(|a, b| (a.at.as_str(), a._id).cmp(&(b.at.as_str(), b._id)));
-        match latest {
-            Some(row) => serde_json::from_value(row.record)
-                .map_err(|err| KipError::internal_error(format!("historical MemorySpace: {err}"))),
-            None if has_history => Err(KipError::not_found_or_not_visible(format!(
+        match self
+            .record_at(
+                &current.space_id,
+                &["create_space", "put_space"],
+                at,
+                "MemorySpace",
+            )
+            .await?
+        {
+            Historical::At(row) => Ok(row),
+            Historical::NotYet => Err(KipError::not_found_or_not_visible(format!(
                 "MemorySpace {:?} did not exist at {at}",
                 current.space_id
             ))),
-            None => Ok(current.clone()),
+            Historical::NoHistory => Ok(current.clone()),
         }
     }
 
@@ -1313,6 +1338,21 @@ impl GovernanceStore {
 }
 
 /// One control-plane mutation, as the audit log records it.
+/// What a point-in-time lookup found.
+///
+/// `NotYet` and `NoHistory` are kept apart because they are different answers:
+/// the first means the resource did not exist at that instant, the second that
+/// nothing about it was ever recorded — a Nexus predating the audit trail,
+/// where the live row is the best truth available.
+enum Historical<T> {
+    /// The record that was current at the coordinate.
+    At(T),
+    /// The resource has a history, and it starts after the coordinate.
+    NotYet,
+    /// Nothing was ever recorded about this resource.
+    NoHistory,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct MutationEntry {
     /// The Governance verb, e.g. `create_grant`.

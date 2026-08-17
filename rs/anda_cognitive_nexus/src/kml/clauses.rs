@@ -30,7 +30,7 @@ use std::collections::BTreeMap;
 
 use super::select::{self, Targets};
 use super::update;
-use super::value::{Bindings, assignments_to_json, reference, structural_value};
+use super::value::{Bindings, assignments_to_json, structural_value};
 use crate::governance::Permission;
 use crate::id::ElementId;
 use crate::schema::{EndpointFacts, Intent};
@@ -179,11 +179,6 @@ pub struct Applied {
     pub changed: bool,
 }
 
-/// Reads a `SymbolRef` slot — a quoted symbol or a parameter — to a local name.
-pub fn symbol_of(b: &Bindings<'_>, symbol: &AstSymbolRef) -> Result<String, KipError> {
-    symbol_name(b, symbol)
-}
-
 /// Resolves a Profile structural field name to its exact schema symbol.
 ///
 /// A Concept carries no Core structural fields — every one it has is
@@ -223,7 +218,7 @@ const CORE_STRUCTURAL_FIELDS: &[&str] = &[
 ];
 
 /// Reads a `SymbolRef` slot — a quoted symbol or a parameter — to a local name.
-fn symbol_name(b: &Bindings<'_>, symbol: &AstSymbolRef) -> Result<String, KipError> {
+pub(super) fn symbol_name(b: &Bindings<'_>, symbol: &AstSymbolRef) -> Result<String, KipError> {
     match symbol {
         AstSymbolRef::Name(name) => Ok(name.clone()),
         AstSymbolRef::Param(name) => match b.param(name)? {
@@ -292,16 +287,6 @@ impl Fields {
             names.join(", ")
         )))
     }
-}
-
-/// Builds the Facets map, resolving each Facet symbol to its exact reference.
-async fn facets_of(
-    tx: &Transaction,
-    b: &Bindings<'_>,
-    assignments: &[anda_kip::FacetAssignment],
-    carrier: ElementKind,
-) -> Result<Map<String, Json>, KipError> {
-    apply_facets(tx, b, assignments, carrier, None).await
 }
 
 /// Builds the Facets map, optionally letting each member read the element being
@@ -463,7 +448,7 @@ async fn create_concept(
     let extra_name = fields.text("name")?;
     fields.rest("Concept")?;
 
-    let facets = facets_of(tx, &b, &clause.set_facets, ElementKind::Concept).await?;
+    let facets = apply_facets(tx, &b, &clause.set_facets, ElementKind::Concept, None).await?;
     // A Concept has no Core structural fields; every one is Profile-defined.
     let structural = collect_structural(tx, &b, clause.set_structural.as_ref(), &[])?.profile;
 
@@ -516,7 +501,7 @@ async fn create_record(
             .transpose()?
             .unwrap_or_default(),
     );
-    let facets = facets_of(tx, &b, &clause.set_facets, kind).await?;
+    let facets = apply_facets(tx, &b, &clause.set_facets, kind, None).await?;
     let mut structural =
         collect_structural(tx, &b, clause.set_structural.as_ref(), core_fields(kind))?;
     let retention = fields.json("retention");
@@ -1806,9 +1791,4 @@ async fn facts_for(
         }
         _ => EndpointFacts::Unresolved,
     })
-}
-
-/// Builds the persisted reference form for an element id.
-pub fn element_reference(id: ElementId) -> Json {
-    reference(id)
 }

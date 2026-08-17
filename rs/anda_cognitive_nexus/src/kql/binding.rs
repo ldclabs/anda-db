@@ -18,7 +18,6 @@
 //! distinction a filter like `IS_ELEMENT(?x)` exists to ask about.
 
 use anda_kip::{ElementKind, Json};
-use std::collections::BTreeMap;
 
 use crate::id::ElementId;
 
@@ -112,6 +111,19 @@ impl Solutions {
     /// A table over several variables.
     pub fn table(vars: Vec<String>, rows: Vec<Vec<Binding>>) -> Self {
         Self { vars, rows }
+    }
+
+    /// The column layout alone, with no rows.
+    ///
+    /// [`Solutions::get`] reads a row a caller already holds and needs nothing
+    /// but `vars` to find the column. Passing this instead of a full clone is
+    /// what lets a `retain` or a `sort_by` closure read columns without
+    /// deep-copying the entire working set to release the mutable borrow.
+    pub fn header(&self) -> Self {
+        Self {
+            vars: self.vars.clone(),
+            rows: Vec::new(),
+        }
     }
 
     /// Whether any solution survives.
@@ -308,16 +320,6 @@ impl Solutions {
         Solutions { vars, rows }
     }
 
-    /// Restricts to rows a predicate accepts.
-    pub fn retain(&mut self, mut keep: impl FnMut(&Solutions, &[Binding]) -> bool) {
-        let snapshot = self.clone();
-        self.rows.retain(|row| keep(&snapshot, row));
-    }
-
-    /// One row as a variable map, for projection and ordering.
-    pub fn row_map(&self, row: &[Binding]) -> BTreeMap<String, Binding> {
-        self.vars.iter().cloned().zip(row.iter().cloned()).collect()
-    }
 }
 
 /// Whether two bindings of the same variable agree.

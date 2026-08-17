@@ -32,11 +32,10 @@
 
 pub mod policy;
 
-use anda_kip::{AssertionMode, AssertionStatus, BeliefStatus, Json, KipError, Map};
+use anda_kip::{AssertionMode, BeliefStatus, Json, KipError, Map};
 
 use crate::id::ElementId;
 use crate::kql::Context;
-use crate::schema::{Intent, SymbolKind};
 use crate::store::Element;
 use crate::store::rows::AssertionRow;
 pub use policy::Policy;
@@ -196,8 +195,8 @@ impl Context<'_> {
             .collect_candidates(proposition, policy, at, &mut ledger)
             .await?;
 
-        let (support, support_groups) = aggregate(&candidates, false, policy);
-        let (opposition, opposition_groups) = aggregate(&candidates, true, policy);
+        let (support, support_groups) = aggregate(&candidates, false);
+        let (opposition, opposition_groups) = aggregate(&candidates, true);
         ledger.support_groups = support_groups;
         ledger.opposition_groups = opposition_groups;
 
@@ -387,10 +386,6 @@ impl Context<'_> {
         if !functional {
             return Ok(vec![]);
         }
-        let _ =
-            self.env
-                .resolve_symbol(SymbolKind::PredicateType, &row.predicate_ref, Intent::Read);
-
         let mut rivals = self
             .slot_propositions(&row.subject_key, &row.predicate_ref)
             .await?;
@@ -456,7 +451,7 @@ impl Context<'_> {
 ///
 /// A group contributes its strongest member, not the sum of its members —
 /// saying something twice does not make it truer.
-fn aggregate(candidates: &[Candidate], opposing: bool, policy: &Policy) -> (f64, usize) {
+fn aggregate(candidates: &[Candidate], opposing: bool) -> (f64, usize) {
     let side: Vec<&Candidate> = candidates
         .iter()
         .filter(|candidate| {
@@ -514,13 +509,11 @@ fn aggregate(candidates: &[Candidate], opposing: bool, policy: &Policy) -> (f64,
         - groups
             .iter()
             .fold(1.0, |acc, (_, c)| acc * (1.0 - c.clamp(0.0, 1.0)));
-    let _ = policy;
     (score, groups.len())
 }
 
 /// Stage 13: belief-state classification (§68–§73).
 fn classify(support: f64, opposition: f64, ledger: &Ledger, policy: &Policy) -> BeliefStatus {
-    let has_material = support >= policy.material || opposition >= policy.material;
     let engaged =
         ledger.support_groups > 0 || ledger.opposition_groups > 0 || !ledger.uncertain.is_empty();
 
@@ -539,10 +532,8 @@ fn classify(support: f64, opposition: f64, ledger: &Ledger, policy: &Policy) -> 
     if support >= policy.material && opposition >= policy.material {
         return BeliefStatus::Contested;
     }
-    if has_material {
-        return BeliefStatus::Uncertain;
-    }
-    // Somebody engaged, but nothing reached materiality.
+    // Either something reached materiality without settling the question, or
+    // somebody engaged and nothing did. Both are the same answer.
     BeliefStatus::Uncertain
 }
 
@@ -622,24 +613,6 @@ fn bound_to_json(
     })
 }
 
-/// The lifecycle statuses that keep an Assertion out of a current projection.
-pub fn is_historical(status: AssertionStatus) -> bool {
-    !matches!(status, AssertionStatus::Active)
-}
-
-/// A grouped view for tests and callers that want the counts.
-pub fn group_counts(belief: &Belief) -> (usize, usize) {
-    (
-        belief.ledger.support_groups,
-        belief.ledger.opposition_groups,
-    )
-}
-
-/// The exclusion reasons recorded for one projection.
-pub fn exclusions(belief: &Belief) -> Vec<(String, &'static str)> {
-    belief.ledger.excluded.clone()
-}
-
 impl Belief {
     /// The policy identity, for the result context.
     pub fn policy_identity(&self) -> anda_kip::PolicyIdentity {
@@ -667,13 +640,12 @@ mod tests {
         // Spec §94: saying the same thing three times is one voice repeated.
         // Counting it three times is how a memory system talks itself into
         // certainty.
-        let policy = Policy::baseline();
         let repeated = vec![
             candidate("actor:alice", &[], "support", 0.6),
             candidate("actor:alice", &[], "support", 0.6),
             candidate("actor:alice", &[], "support", 0.6),
         ];
-        let (score, groups) = aggregate(&repeated, false, &policy);
+        let (score, groups) = aggregate(&repeated, false);
         assert_eq!(groups, 1);
         assert!((score - 0.6).abs() < 1e-9, "got {score}");
 
@@ -683,7 +655,7 @@ mod tests {
             candidate("actor:bob", &[], "support", 0.6),
             candidate("actor:carol", &[], "support", 0.6),
         ];
-        let (score, groups) = aggregate(&independent, false, &policy);
+        let (score, groups) = aggregate(&independent, false);
         assert_eq!(groups, 3);
         assert!(score > 0.9, "got {score}");
     }
@@ -692,12 +664,11 @@ mod tests {
     fn shared_evidence_merges_groups_that_look_independent() {
         // Spec §19, §21: two actors relaying one observation are not two
         // observations, and manufactured corroboration is built exactly there.
-        let policy = Policy::baseline();
         let echo = vec![
             candidate("actor:alice", &["E-1"], "support", 0.6),
             candidate("actor:bob", &["E-1"], "support", 0.6),
         ];
-        let (score, groups) = aggregate(&echo, false, &policy);
+        let (score, groups) = aggregate(&echo, false);
         assert_eq!(groups, 1, "one observation, relayed twice");
         assert!((score - 0.6).abs() < 1e-9);
 
@@ -707,20 +678,19 @@ mod tests {
             candidate("actor:bob", &["E-1"], "support", 0.6),
             candidate("actor:carol", &["E-2"], "support", 0.6),
         ];
-        assert_eq!(aggregate(&mixed, false, &policy).1, 2);
+        assert_eq!(aggregate(&mixed, false).1, 2);
     }
 
     #[test]
     fn a_bridging_assertion_collapses_two_groups() {
         // Alice and Bob look independent until Carol turns out to have cited
         // both of their sources — at which point they never were.
-        let policy = Policy::baseline();
         let bridged = vec![
             candidate("actor:alice", &["E-1"], "support", 0.5),
             candidate("actor:bob", &["E-2"], "support", 0.5),
             candidate("actor:carol", &["E-1", "E-2"], "support", 0.5),
         ];
-        assert_eq!(aggregate(&bridged, false, &policy).1, 1);
+        assert_eq!(aggregate(&bridged, false).1, 1);
     }
 
     #[test]

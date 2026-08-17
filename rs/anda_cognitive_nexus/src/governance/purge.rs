@@ -40,8 +40,7 @@ use anda_kip::{Json, KipError};
 use std::collections::BTreeSet;
 
 use super::Permission;
-use super::auth::AuthContext;
-use super::decision::{EffectiveAuthority, ResourceContext};
+use super::decision::ResourceContext;
 use super::store::MutationEntry;
 use crate::id::ElementId;
 use crate::store::{Element, Store};
@@ -91,36 +90,6 @@ pub struct PurgeReport {
     pub versions_destroyed: usize,
 }
 
-/// Erases one element as a standalone Governance transaction.
-pub async fn purge(
-    store: &Store,
-    space_id: &str,
-    id: ElementId,
-    policy: ReferencePolicy,
-    authority: &EffectiveAuthority,
-    auth: &AuthContext,
-) -> Result<PurgeReport, KipError> {
-    let mut tx = Transaction::begin(
-        store,
-        space_id,
-        engine_origin(auth),
-        false,
-        authority.clone(),
-        auth.clone(),
-    )
-    .await?;
-    let report = match stage(store, &mut tx, id, policy).await {
-        Ok(report) => report,
-        Err(error) => {
-            tx.abort().await;
-            return Err(error);
-        }
-    };
-    tx.commit(crate::store::space::JournalEntry::default())
-        .await?;
-    Ok(report)
-}
-
 /// Stages erasure inside an existing KML transaction.
 pub async fn stage(
     store: &Store,
@@ -129,12 +98,9 @@ pub async fn stage(
     policy: ReferencePolicy,
 ) -> Result<PurgeReport, KipError> {
     let space_id = tx.cx.space.clone();
-    let element = store.get_element(id).await?;
-    if element.space() != space_id {
-        return Err(KipError::not_found_or_not_visible(format!(
-            "{id} does not live in {space_id}"
-        )));
-    }
+    // `Transaction::load` is the one reader that also enforces the Space, so
+    // going through it here replaces a separate fetch and its own check.
+    let element = tx.load(id).await?.clone();
     let resource = ResourceContext::of_element(&element);
     tx.authorize_element(id, Permission::Read).await?;
     // §167 lists purging critical Evidence among the operations a policy may
@@ -196,8 +162,7 @@ pub async fn stage(
     for target in targets {
         let element = tx.load(target).await?.clone();
         let digest = crate::store::schema::content_digest(&crate::view::render(&element));
-        report.versions_destroyed += store.version_count(&space_id, target).await?;
-        tx.stage_purge(target, stub(element, &digest)).await?;
+        report.versions_destroyed += tx.stage_purge(target, stub(element, &digest)).await?;
         report.purged.push(target.to_string());
 
         tx.defer_governance_audit(MutationEntry {
@@ -303,14 +268,6 @@ fn purge_marker(digest: &str) -> Json {
     })
 }
 
-fn engine_origin(auth: &AuthContext) -> Json {
-    serde_json::json!({
-        "principal_id": auth.principal_id,
-        "channel": "governance",
-    })
-}
-
-/// The engine origin a Governance write stamps.
 #[cfg(test)]
 mod tests {
     use super::*;

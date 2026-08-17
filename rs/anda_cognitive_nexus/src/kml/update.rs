@@ -203,7 +203,7 @@ async fn unset_facet(
     operation: Option<&Map<String, Json>>,
 ) -> Result<Applied, KipError> {
     let b = bindings(tx, request, operation);
-    let name = super::clauses::symbol_of(&b, &unset.facet)?;
+    let name = super::clauses::symbol_name(&b, &unset.facet)?;
     let symbol = tx.env.resolve_symbol(
         crate::schema::SymbolKind::Facet,
         &name,

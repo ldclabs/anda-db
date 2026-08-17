@@ -336,19 +336,13 @@ function commit(
   // author would misreport who reclassified it.
   row.origin = { principal_id: cx.auth.principal_id, channel: 'governance' }
   const change = cx.store.put(element, op as never, txId)
-  cx.store.putTransaction({
+  cx.store.putGovernanceTransaction({
     tx_id: txId,
     space: cx.space,
     seq,
     snapshot_seq: seq - 1,
     committed_at: at,
-    status: 'committed',
-    transaction_class: 'governance',
-    idempotency_key: '',
-    request_digest: '',
-    semantic_plan_digest: '',
-    result_digest: '',
-    schema_environment_version: cx.store.space(cx.space)?.schema_environment_version ?? 0,
+    schema_environment_version: cx.authority.space.schema_environment_version,
     result: { element: formatElementId({ kind: element.kind, seq: row.id }), op },
     changes: [change],
   })

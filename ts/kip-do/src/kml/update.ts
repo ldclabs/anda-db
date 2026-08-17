@@ -71,7 +71,6 @@ export function requireUpdatable(id: ElementId, element: Element): void {
 export function applyAction(
   tx: Transaction,
   b: Bindings,
-  id: ElementId,
   element: Element,
   action: UpdateAction,
 ): void {
@@ -194,7 +193,6 @@ export function applyAction(
       )
     }
   }
-  void id
 }
 
 /** Merges a Facet's members rather than replacing the Facet (§59). */

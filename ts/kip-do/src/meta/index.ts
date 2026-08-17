@@ -51,7 +51,7 @@ import { parseKip, parserVersion, specRevision } from '../kip/parser.js'
 import { executeKml } from '../kml/index.js'
 import { Context } from '../kql/context.js'
 import { bindCoordinate, type KqlContext } from '../kql/index.js'
-import { kipLiteral, parameterValue, type ReadBindings } from '../kql/matching.js'
+import { scalarValue, type ReadBindings } from '../kql/matching.js'
 import { baseline, forecast } from '../projection/policy.js'
 import {
   conceptTypeDef,
@@ -105,7 +105,7 @@ export function executeMeta(command: MetaCommand, cx: MetaContext): Json {
 
   if ('Describe' in command) return describe(command.Describe, cx, b)
   if ('List' in command) return list(command.List, cx, b)
-  if ('Validate' in command) return validate(command.Validate, cx, b)
+  if ('Validate' in command) return validate(command.Validate, b)
   if ('Preview' in command) {
     if (!('Kml' in command.Preview)) {
       throw errors.unsupportedCapability(
@@ -478,11 +478,7 @@ function list(command: ListCommand, cx: MetaContext, b: ReadBindings): Json {
  * resolve. It does not promise a write will commit: the state it would act on
  * can change, and this engine's Governance plane does not exist to consult.
  */
-function validate(
-  command: ValidateCommand,
-  cx: MetaContext,
-  b: ReadBindings,
-): Json {
+function validate(command: ValidateCommand, b: ReadBindings): Json {
   const source = scalarValue(command.value, b)
   switch (command.target) {
     case 'Kql':
@@ -524,7 +520,6 @@ function validate(
           'engine has not built',
       )
   }
-  void cx
 }
 
 /**
@@ -717,12 +712,6 @@ function changes(
 }
 
 // --- small helpers ----------------------------------------------------------
-
-function scalarValue(scalar: Scalar, b: ReadBindings): Json {
-  return 'Param' in scalar
-    ? parameterValue(b, scalar.Param)
-    : kipLiteral(scalar.Literal)
-}
 
 function text(scalar: Scalar, b: ReadBindings, what: string): string {
   const value = scalarValue(scalar, b)

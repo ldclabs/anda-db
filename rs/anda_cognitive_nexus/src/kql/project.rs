@@ -35,6 +35,15 @@ impl Context<'_> {
         limit: Option<usize>,
         cursor: Option<usize>,
     ) -> Result<Projected, KipError> {
+        // Every row this engine returns leaves through here, so the cap an
+        // authority carries is merged in at this one place rather than by each
+        // output path — an aggregate is still output, and a `max_results: 0`
+        // authority caps it at nothing just as it caps a row list.
+        let limit = match (limit, self.governed_limit()) {
+            (Some(requested), Some(governed)) => Some(requested.min(governed)),
+            (requested, governed) => requested.or(governed),
+        };
+
         let aggregates: Vec<&FindExpression> = find
             .expressions
             .iter()
@@ -49,14 +58,10 @@ impl Context<'_> {
                 ));
             }
             let row = self.aggregate_row(&solutions, find)?;
-            // An aggregate is one row, so `LIMIT` has nothing to page — but a
-            // `max_results: 0` authority still caps it at nothing, the same way
-            // the JavaScript engine caps its aggregate output.
-            let rows = if self.governed_limit() == Some(0) {
-                Vec::new()
-            } else {
-                vec![row]
-            };
+            // An aggregate is one row, so `LIMIT` has nothing to page; it can
+            // only be suppressed entirely.
+            let mut rows = vec![row];
+            rows.truncate(limit.unwrap_or(usize::MAX));
             return Ok(Projected {
                 rows,
                 next_cursor: None,
@@ -134,7 +139,7 @@ impl Context<'_> {
         solutions: &mut Solutions,
         order_by: Option<&Vec<OrderByItem>>,
     ) -> Result<(), KipError> {
-        let snapshot = solutions.clone();
+        let snapshot = solutions.header();
         let keys: Vec<(anda_kip::DotPathVar, OrderDirection)> = order_by
             .map(|items| {
                 items
@@ -144,11 +149,24 @@ impl Context<'_> {
             })
             .unwrap_or_default();
 
-        solutions.rows.sort_by(|left, right| {
-            for (path, direction) in &keys {
-                let a = self.read_variable(&snapshot, left, path);
-                let b = self.read_variable(&snapshot, right, path);
-                let ordering = compare_json(&a, &b);
+        // Each row's sort keys are resolved once, not once per comparison:
+        // reading one is a view lookup plus a dot-path walk, and a comparison
+        // sort asks for them O(n log n) times.
+        let mut decorated: Vec<(Vec<Json>, Vec<Binding>)> = solutions
+            .rows
+            .drain(..)
+            .map(|row| {
+                let resolved = keys
+                    .iter()
+                    .map(|(path, _)| self.read_variable(&snapshot, &row, path))
+                    .collect();
+                (resolved, row)
+            })
+            .collect();
+
+        decorated.sort_by(|(left_keys, left), (right_keys, right)| {
+            for (index, (_, direction)) in keys.iter().enumerate() {
+                let ordering = compare_json(&left_keys[index], &right_keys[index]);
                 if ordering != Ordering::Equal {
                     return match direction {
                         OrderDirection::Asc => ordering,
@@ -160,6 +178,8 @@ impl Context<'_> {
             // two pages of the same query can overlap or skip rows.
             compare_rows(left, right)
         });
+
+        solutions.rows = decorated.into_iter().map(|(_, row)| row).collect();
         Ok(())
     }
 

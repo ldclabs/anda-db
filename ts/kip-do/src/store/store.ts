@@ -488,6 +488,35 @@ export class Store {
     this.sql.exec(sql, ...values)
   }
 
+  /**
+   * Journals a Governance write as a committed transaction.
+   *
+   * The fields a Governance write never carries — the idempotency key and the
+   * three request digests — are filled in here, so a caller states only what
+   * is actually its own. Mirrors `JournalEntry` in the Rust engine, where the
+   * same constants live in one struct default.
+   */
+  putGovernanceTransaction(entry: {
+    tx_id: string
+    space: string
+    seq: number
+    snapshot_seq: number
+    committed_at: string
+    schema_environment_version: number
+    result: Json
+    changes: TransactionRow['changes']
+  }): void {
+    this.putTransaction({
+      ...entry,
+      status: 'committed',
+      transaction_class: 'governance',
+      idempotency_key: '',
+      request_digest: '',
+      semantic_plan_digest: '',
+      result_digest: '',
+    })
+  }
+
   transaction(txId: string): TransactionRow | null {
     const row = this.sql
       .exec<SqlRow>('SELECT * FROM transactions WHERE tx_id = ?', txId)

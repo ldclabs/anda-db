@@ -12,13 +12,13 @@
 //! whole reason the protocol has parameters instead of interpolation.
 
 use anda_kip::{
-    BoundValue, ElementRef, Json, KipError, KipValue, Map, MutationValue, Number, Scalar, Term,
+    BoundValue, ElementRef, Json, KipError, Map, MutationValue, Number, Scalar, Term,
     UpdateExpr, UpdateFunction,
 };
 use std::collections::BTreeMap;
 
 use crate::id::ElementId;
-use crate::term::{Endpoint, Literal};
+use crate::term::Endpoint;
 
 /// What a mutation may substitute into its values.
 pub struct Bindings<'a> {
@@ -331,14 +331,6 @@ fn finite(value: f64) -> Result<Json, KipError> {
         .ok_or_else(|| KipError::type_mismatch(format!("{value} is not a finite KIP number")))
 }
 
-/// Reads a Literal out of an endpoint, for schema endpoint checking.
-pub fn literal_of(endpoint: &Endpoint) -> Option<&Literal> {
-    match endpoint {
-        Endpoint::Literal(literal) => Some(literal),
-        _ => None,
-    }
-}
-
 /// Converts a [`KipValue`] assignment map into plain JSON.
 pub fn assignments_to_json(
     bindings: &Bindings<'_>,
@@ -352,15 +344,10 @@ pub fn assignments_to_json(
     Ok(map)
 }
 
-/// Converts a bare [`KipValue`] to JSON.
-pub fn kip_value_to_json(value: &KipValue) -> Json {
-    Json::from(value.clone())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anda_kip::{DotPathVar, ElementKind, PathStep};
+    use anda_kip::{DotPathVar, ElementKind, KipValue, PathStep};
     use serde_json::json;
 
     fn map(value: Json) -> Map<String, Json> {

@@ -612,22 +612,21 @@ impl AuthorityConstraints {
 
     /// Whether `other` stays inside every constraint imposed by this one.
     pub fn contains(&self, other: &Self) -> bool {
-        let bounded_results = self.max_results.is_none()
-            || other
-                .max_results
-                .is_some_and(|child| child <= self.max_results.unwrap_or(u64::MAX));
-        let bounded_authority = self.max_influence_authority.is_empty()
-            || (!other.max_influence_authority.is_empty()
-                && crate::governance::authority::rank(&other.max_influence_authority)
-                    <= crate::governance::authority::rank(&self.max_influence_authority));
-        let bounded_classification = self.max_classification.is_empty()
-            || (!other.max_classification.is_empty()
-                && crate::governance::classification::rank(&other.max_classification)
-                    <= crate::governance::classification::rank(&self.max_classification));
+        let bounded_results = self
+            .max_results
+            .is_none_or(|parent| other.max_results.is_some_and(|child| child <= parent));
         narrows(&self.fields, &other.fields)
             && bounded_results
-            && bounded_authority
-            && bounded_classification
+            && within_ceiling(
+                &self.max_influence_authority,
+                &other.max_influence_authority,
+                crate::governance::authority::rank,
+            )
+            && within_ceiling(
+                &self.max_classification,
+                &other.max_classification,
+                crate::governance::classification::rank,
+            )
             && (self.export || !other.export)
     }
 }
@@ -692,6 +691,14 @@ impl PolicyObligations {
 // ---------------------------------------------------------------------------
 // Set helpers
 // ---------------------------------------------------------------------------
+
+/// Whether a child ceiling stays under a parent one.
+///
+/// An empty parent states no ceiling and contains anything; an empty child is
+/// unbounded, which no stated parent contains.
+fn within_ceiling(parent: &str, child: &str, rank: fn(&str) -> u8) -> bool {
+    parent.is_empty() || (!child.is_empty() && rank(child) <= rank(parent))
+}
 
 /// Whether `child` stays inside `parent`, where empty means "unrestricted".
 fn narrows(parent: &[String], child: &[String]) -> bool {

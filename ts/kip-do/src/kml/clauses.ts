@@ -24,6 +24,7 @@ import {
   parseElementIdOfKind,
   type ElementId,
   type ElementKind,
+  elementIdEquals,
 } from '../id.js'
 import { isJsonMap, jsonEquals, type Json, type JsonMap } from '../json.js'
 import type {
@@ -226,7 +227,7 @@ export function apply(
       const element = tx.load(id)
       requireUpdatable(id, element)
       const before = JSON.stringify(element.row)
-      for (const action of actions) applyAction(tx, b, id, element, action)
+      for (const action of actions) applyAction(tx, b, element, action)
       if (JSON.stringify(element.row) !== before) tx.markChanged(id, 'update')
     }
     return
@@ -690,7 +691,7 @@ function requireStanding(
 
 /** `SUPERSEDE ... BY` — a later Assertion replaces an earlier one (§15.1). */
 function supersede(tx: Transaction, id: ElementId, by: ElementId): void {
-  if (formatElementId(id) === formatElementId(by)) {
+  if (elementIdEquals(id, by)) {
     throw errors.supersessionMismatch(
       `${formatElementId(id)} cannot supersede itself`,
     )
@@ -723,7 +724,7 @@ function supersede(tx: Transaction, id: ElementId, by: ElementId): void {
 
 /** `CORRECT ... BY` — a later observation corrects an earlier one (§20). */
 function correct(tx: Transaction, id: ElementId, by: ElementId): void {
-  if (formatElementId(id) === formatElementId(by)) {
+  if (elementIdEquals(id, by)) {
     throw errors.evidenceCorrectionConflict(
       `${formatElementId(id)} cannot correct itself`,
     )
@@ -812,7 +813,7 @@ function merge(
   }
   const source = sources[0] as ElementId
   const target = targets[0] as ElementId
-  if (formatElementId(source) === formatElementId(target)) {
+  if (elementIdEquals(source, target)) {
     throw errors.identityMergeConflict(
       `${formatElementId(source)} cannot be merged into itself`,
     )

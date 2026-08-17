@@ -43,7 +43,6 @@ use crate::store::rows::*;
 use crate::store::space::JournalEntry;
 use crate::store::write::{Row, WriteContext};
 use crate::store::{Element, Store};
-use crate::time;
 
 /// The engine state one KML statement runs against.
 pub struct Transaction {
@@ -71,7 +70,9 @@ pub struct Transaction {
     staged: BTreeMap<ElementId, Staged>,
     shells: Vec<ElementId>,
     warnings: Vec<String>,
-    purges: BTreeSet<ElementId>,
+    /// The version rows each staged purge will destroy at commit, read when the
+    /// stub was staged so the receipt and the erasure cannot disagree.
+    purges: BTreeMap<ElementId, Vec<u64>>,
     approval_decisions: Vec<Authorization>,
     governance_audit: Vec<MutationEntry>,
 }
@@ -84,6 +85,12 @@ struct Staged {
     changed: bool,
     /// What the change record calls this.
     op: &'static str,
+    /// Whether the row carries its own envelope through the write.
+    ///
+    /// Ordinarily the writer stamps who the runtime observed (§26). A purge
+    /// stub is the exception, and says so here rather than having the generic
+    /// writer recognize it by the name of its operation.
+    keep_origin: bool,
 }
 
 impl Transaction {
@@ -109,7 +116,7 @@ impl Transaction {
             staged: BTreeMap::new(),
             shells: Vec::new(),
             warnings: Vec::new(),
-            purges: BTreeSet::new(),
+            purges: BTreeMap::new(),
             approval_decisions: Vec::new(),
             governance_audit: Vec::new(),
         })
@@ -249,19 +256,27 @@ impl Transaction {
                 is_new: true,
                 changed: true,
                 op,
+                keep_origin: false,
             },
         );
     }
 
     /// Stages an identity stub and defers destruction of its old versions.
-    pub async fn stage_purge(&mut self, id: ElementId, row: Element) -> Result<(), KipError> {
+    ///
+    /// Returns how many versions the commit will destroy, read here rather than
+    /// again at commit so the number a purge receipt reports is the number of
+    /// rows actually erased.
+    pub async fn stage_purge(&mut self, id: ElementId, row: Element) -> Result<usize, KipError> {
         self.load(id).await?;
+        let versions = self.store.version_ids(&self.cx.space, id).await?;
         let staged = self.staged.get_mut(&id).expect("loaded above");
         staged.row = row;
         staged.changed = true;
         staged.op = "purge";
-        self.purges.insert(id);
-        Ok(())
+        staged.keep_origin = true;
+        let destroyed = versions.len();
+        self.purges.insert(id, versions);
+        Ok(destroyed)
     }
 
     /// Defers spending approvals until this transaction commits successfully.
@@ -294,6 +309,7 @@ impl Transaction {
                     is_new: false,
                     changed: false,
                     op: "update",
+                    keep_origin: false,
                 },
             );
         }
@@ -317,8 +333,9 @@ impl Transaction {
         id: ElementId,
         permission: Permission,
     ) -> Result<(), KipError> {
-        let element = self.load(id).await?.clone();
-        let resource = ResourceContext::of_element(&element);
+        // `of_element` returns owned strings, so the borrow of `self` ends with
+        // this statement and no clone of the row is needed to release it.
+        let resource = ResourceContext::of_element(self.load(id).await?);
         self.authority
             .authorize(permission, &resource, &self.auth)
             .into_result()
@@ -645,11 +662,18 @@ impl Transaction {
             } else {
                 staged.row.version().saturating_add(1)
             };
-            if self.purges.contains(&id) {
-                self.store.purge_versions(&self.cx.space, id).await?;
+            if let Some(versions) = self.purges.get(&id) {
+                self.store.remove_versions(versions).await?;
             }
-            self.write(id, staged.row, version, staged.op, staged.is_new)
-                .await?;
+            self.write(
+                id,
+                staged.row,
+                version,
+                staged.op,
+                staged.is_new,
+                staged.keep_origin,
+            )
+            .await?;
             changes.push(change_record(id, staged.op, version));
             written += 1;
         }
@@ -731,6 +755,7 @@ impl Transaction {
         version: u64,
         op: &str,
         is_new: bool,
+        keep_origin: bool,
     ) -> Result<(), KipError> {
         macro_rules! put {
             ($row:expr) => {{
@@ -746,7 +771,7 @@ impl Transaction {
                 // identity stub is that an auditor can still say something was
                 // here and who wrote it — and the version log that would
                 // otherwise answer that has just been destroyed.
-                if op != "purge" {
+                if !keep_origin {
                     row.origin = self.cx.origin.clone();
                 }
                 if is_new {
@@ -872,9 +897,7 @@ fn none_if_empty(value: String) -> Option<String> {
 }
 
 fn now_ms() -> u64 {
-    time::parse(&time::now())
-        .map(|at| at.timestamp_millis().max(0) as u64)
-        .unwrap_or_default()
+    anda_db::unix_ms()
 }
 
 impl Store {

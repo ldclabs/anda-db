@@ -16,8 +16,20 @@ use anda_kip::{
     LogicalOperator,
 };
 
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
+
 use super::Context;
 use super::binding::{Binding, Solutions};
+
+/// How many distinct `REGEX` patterns stay compiled.
+///
+/// A cap rather than an unbounded map: patterns can come from `:parameters`, so
+/// the set is caller-controlled and must not grow without limit.
+const MAX_CACHED_REGEXES: usize = 256;
+
+static REGEX_CACHE: LazyLock<Mutex<HashMap<String, regex::Regex>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// One operand's value in one row.
 enum Value {
@@ -38,7 +50,7 @@ impl Context<'_> {
         // cannot be evaluated at all is a query bug, and reporting it once is
         // more useful than failing on whichever row happened to be first.
         let mut failure: Option<KipError> = None;
-        let snapshot = solutions.clone();
+        let snapshot = solutions.header();
         solutions.rows.retain(|row| {
             if failure.is_some() {
                 return false;
@@ -264,11 +276,28 @@ fn call(func: FilterFunction, args: &[Value]) -> Result<bool, KipError> {
         FilterFunction::StartsWith => text(0)?.starts_with(&text(1)?),
         FilterFunction::EndsWith => text(0)?.ends_with(&text(1)?),
         FilterFunction::Regex => {
+            // Compiled once per distinct pattern rather than once per row: the
+            // pattern is almost always a literal, and compiling it is more
+            // expensive than the match it enables.
             let pattern = text(1)?;
-            let regex = regex::Regex::new(&pattern).map_err(|err| {
-                KipError::invalid_syntax(format!("REGEX pattern {pattern:?} is invalid: {err}"))
-            })?;
-            regex.is_match(&text(0)?)
+            let subject = text(0)?;
+            let mut cache = REGEX_CACHE.lock().unwrap_or_else(|err| err.into_inner());
+            let regex = match cache.get(&pattern) {
+                Some(regex) => regex.clone(),
+                None => {
+                    let regex = regex::Regex::new(&pattern).map_err(|err| {
+                        KipError::invalid_syntax(format!(
+                            "REGEX pattern {pattern:?} is invalid: {err}"
+                        ))
+                    })?;
+                    if cache.len() >= MAX_CACHED_REGEXES {
+                        cache.clear();
+                    }
+                    cache.insert(pattern, regex.clone());
+                    regex
+                }
+            };
+            regex.is_match(&subject)
         }
         FilterFunction::In => {
             let needle = single(0)?.to_json();

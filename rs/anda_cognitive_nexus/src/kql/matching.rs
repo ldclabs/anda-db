@@ -366,7 +366,7 @@ impl Context<'_> {
     ) -> Result<Solutions, KipError> {
         let name = match field {
             AstSymbolRef::Name(name) => name.clone(),
-            AstSymbolRef::Param(param) => match self.param(param)? {
+            AstSymbolRef::Param(param) => match self.param_ref(param)? {
                 Json::String(text) => text,
                 other => {
                     return Err(KipError::type_mismatch(format!(
@@ -451,7 +451,7 @@ impl Context<'_> {
     fn classify(&mut self, value: &MatchValue) -> Result<Slot, KipError> {
         Ok(match value {
             MatchValue::Variable(name) => Slot::Bind(name.clone()),
-            MatchValue::Param(name) => Slot::Value(self.param(name)?),
+            MatchValue::Param(name) => Slot::Value(self.param_ref(name)?),
             MatchValue::Literal(literal) => Slot::Value(Json::from(literal.clone())),
             MatchValue::Array(items) => {
                 let mut values = Vec::new();
@@ -496,12 +496,12 @@ impl Context<'_> {
 
     fn endpoint_slot(&mut self, term: &Term) -> Result<EndpointSlot, KipError> {
         Ok(match term {
-            Term::Variable(name) => match self.bound_endpoint(name) {
-                Some(endpoint) => EndpointSlot::Fixed(endpoint),
-                None => EndpointSlot::Bind(name.clone()),
-            },
+            // Narrowing on what an earlier pattern pinned is the `known`
+            // solution set's job, applied by `seeds`; a variable is always an
+            // open slot at this point.
+            Term::Variable(name) => EndpointSlot::Bind(name.clone()),
             Term::Param(name) => {
-                let value = self.param(name)?;
+                let value = self.param_ref(name)?;
                 EndpointSlot::Fixed(endpoint_of(&value)?)
             }
             Term::Literal(literal) => {
@@ -840,7 +840,7 @@ impl Context<'_> {
                     .resolve_symbol(SymbolKind::PredicateType, name, Intent::Read)?
                     .to_string(),
             ]),
-            PredAtom::Param(name) => match self.param(name)? {
+            PredAtom::Param(name) => match self.param_ref(name)? {
                 Json::String(text) => PredicateSlot::Fixed(vec![
                     self.env
                         .resolve_symbol(SymbolKind::PredicateType, &text, Intent::Read)?
@@ -862,7 +862,7 @@ impl Context<'_> {
     ) -> Result<ElementId, KipError> {
         let value = match scalar {
             Scalar::Literal(literal) => Json::from(literal.clone()),
-            Scalar::Param(name) => self.param(name)?,
+            Scalar::Param(name) => self.param_ref(name)?,
         };
         match value {
             Json::String(text) => ElementId::parse_kind(&text, kind),

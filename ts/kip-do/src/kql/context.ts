@@ -22,7 +22,7 @@
 
 import { errors } from '../errors.js'
 import type { AuthContext, EffectiveAuthority } from '../governance/index.js'
-import { redactView, spaceResource } from '../governance/index.js'
+import { isPermitted, redactView, spaceResource } from '../governance/index.js'
 import { formatElementId, type ElementId, type ElementKind } from '../id.js'
 import type { JsonMap } from '../json.js'
 import type { SchemaEnvironment } from '../schema/index.js'
@@ -244,6 +244,7 @@ export class Context {
 }
 
 function isPermittedRead(authority: EffectiveAuthority, auth: AuthContext): boolean {
-  const decision = authority.authorize('read_raw_origin', spaceResource(), auth)
-  return decision.decision === 'allow' || decision.decision === 'allow_with_constraints'
+  return isPermitted(
+    authority.authorize('read_raw_origin', spaceResource(), auth).decision,
+  )
 }

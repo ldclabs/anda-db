@@ -62,8 +62,6 @@ pub struct Context<'a> {
     /// Elements loaded so far, so one query reads each row once.
     loaded: BTreeMap<ElementId, Option<Element>>,
     views: BTreeMap<ElementId, Json>,
-    /// Variables already bound, so a later pattern can narrow on them.
-    pub bound: BTreeMap<String, crate::term::Endpoint>,
     /// The policy `BELIEF` projects under.
     pub policy: crate::projection::Policy,
     /// The world time a projection is evaluated at.
@@ -109,7 +107,6 @@ impl<'a> Context<'a> {
             operation,
             loaded: BTreeMap::new(),
             views: BTreeMap::new(),
-            bound: BTreeMap::new(),
             policy: crate::projection::Policy::baseline(),
             at: crate::time::now(),
             projected: false,
@@ -133,11 +130,6 @@ impl<'a> Context<'a> {
     }
 
     /// Looks up a `:parameter`.
-    pub fn param(&self, name: &str) -> Result<Json, KipError> {
-        self.param_ref(name)
-    }
-
-    /// Looks up a `:parameter` without needing a mutable borrow.
     pub fn param_ref(&self, name: &str) -> Result<Json, KipError> {
         self.operation
             .and_then(|map| map.get(name))
@@ -235,11 +227,6 @@ impl<'a> Context<'a> {
             ))
         })?;
         Ok(())
-    }
-
-    /// An endpoint a variable is already fixed to, when one is.
-    pub fn bound_endpoint(&self, name: &str) -> Option<crate::term::Endpoint> {
-        self.bound.get(name).cloned()
     }
 
     /// Every active Concept in the Space, for patterns no index narrows.
@@ -603,7 +590,7 @@ async fn run(
     if let Some(for_time) = &query.for_time {
         let at = match &for_time {
             Scalar::Literal(literal) => Json::from(literal.clone()),
-            Scalar::Param(name) => cx.param(name)?,
+            Scalar::Param(name) => cx.param_ref(name)?,
         };
         let Json::String(at) = at else {
             return Err(KipError::type_mismatch(
@@ -615,7 +602,7 @@ async fn run(
         restrict_to_valid_time(&mut cx, &mut solutions, &at);
     }
 
-    let requested_limit = query
+    let limit = query
         .limit
         .as_ref()
         .map(|scalar| scalar_usize(&cx, scalar, "LIMIT"))
@@ -626,12 +613,10 @@ async fn run(
         .map(|scalar| scalar_usize(&cx, scalar, "CURSOR"))
         .transpose()?;
 
-    // ORDER BY and the projection both read fields off bound elements.
+    // ORDER BY and the projection both read fields off bound elements. The
+    // governed cap is merged in by `project`, after this — every element that
+    // could tighten it has been admitted by then.
     cx.warm(&solutions).await?;
-    let limit = match (requested_limit, cx.governed_limit()) {
-        (Some(requested), Some(governed)) => Some(requested.min(governed)),
-        (requested, governed) => requested.or(governed),
-    };
     let policy = cx.projected.then(|| cx.policy.identity());
     let projected = cx.project(
         solutions,
@@ -674,7 +659,7 @@ fn restrict_to_valid_time(cx: &mut Context<'_>, solutions: &mut Solutions, at: &
         .filter_map(|id| cx.cached_view(id).map(|view| (id, view)))
         .collect();
 
-    let snapshot = solutions.clone();
+    let snapshot = solutions.header();
     solutions.rows.retain(|row| {
         assertion_vars.iter().all(|var| {
             let Some(id) = snapshot.get(row, var).and_then(binding::Binding::element) else {
