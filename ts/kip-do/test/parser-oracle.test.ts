@@ -88,6 +88,35 @@ function engine(source: string): Outcome {
   }
 }
 
+/**
+ * Commands the two grammars are known to disagree about, each with the reason.
+ *
+ * A divergence is recorded here rather than tolerated silently, and the test
+ * below asserts every entry **still** diverges — so when upstream fixes one,
+ * this suite goes red and someone has to delete the entry rather than leave a
+ * stale exemption widening what the oracle ignores.
+ *
+ * Keep this list empty whenever possible. An entry is a promise to remove it.
+ */
+const KNOWN_DIVERGENCES: readonly { source: string; why: string }[] = [
+  {
+    source:
+      'UPDATE ?a SET FIELDS { evidence: :e } WHERE { ?a ASSERTION {id: "A-1"} }',
+    why:
+      "`anda_kip` rejects an Assertion's `evidence` at parse time, because an " +
+      'Assertion payload is immutable (§76) — the citation is part of the ' +
+      'commitment, not an annotation on it. `@ldclabs/kip-lang` 2.0.1 still ' +
+      'accepts it and leaves the refusal to the engine. Nothing is writable ' +
+      'either way: this engine answers `EpistemicRevisionRequired` from ' +
+      '`kml/update.ts`, which names the way round rather than the syntax. ' +
+      'The gap is which *code* a caller sees — InvalidSyntax against ' +
+      'EpistemicRevisionRequired — so it is a divergence in the answer, not ' +
+      'in what either engine permits. Fix belongs upstream in kip-lang.',
+  },
+]
+
+const KNOWN = new Set(KNOWN_DIVERGENCES.map((d) => d.source))
+
 describe('parser oracle', () => {
   it('has a corpus worth trusting', () => {
     // A shrinking corpus is a silent loss of coverage: the generator walks the
@@ -107,6 +136,7 @@ describe('parser oracle', () => {
     const overRejected: string[] = []
 
     for (const source of CORPUS) {
+      if (KNOWN.has(source)) continue
       const expected = reference(source)
       const actual = engine(source)
 
@@ -127,6 +157,24 @@ describe('parser oracle', () => {
       { astDiffers, overAccepted, overRejected },
       'the two KIP engines disagree about what these commands mean',
     ).toEqual({ astDiffers: [], overAccepted: [], overRejected: [] })
+  })
+
+  it('still diverges on every command the exemption list claims it does', () => {
+    // The exemption list is only safe while it is accurate. An entry upstream
+    // has fixed must be deleted, not left widening what the oracle skips.
+    const converged: string[] = []
+    for (const { source } of KNOWN_DIVERGENCES) {
+      const expected = reference(source)
+      const actual = engine(source)
+      const diverges =
+        'ok' in expected !== 'ok' in actual ||
+        ('ok' in expected && 'ok' in actual && !sameShape(expected.ok, actual.ok))
+      if (!diverges) converged.push(source)
+    }
+    expect(
+      converged,
+      'these no longer diverge — delete them from KNOWN_DIVERGENCES',
+    ).toEqual([])
   })
 
   it('rejects a parse failure with a KIP code, not a bare throw', () => {
