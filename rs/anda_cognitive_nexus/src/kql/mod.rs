@@ -33,7 +33,7 @@ use anda_kip::{
 use std::collections::BTreeMap;
 
 use crate::error::db_error;
-use crate::governance::{AuthContext, EffectiveAuthority};
+use crate::governance::{AuthContext, EffectiveAuthority, Permission, ResourceContext};
 use crate::id::ElementId;
 use crate::schema::SchemaEnvironment;
 use crate::store::{Element, Store, eq_field};
@@ -87,6 +87,7 @@ pub struct Context<'a> {
     /// about the deployment rather than about any one element, so a caller
     /// either may see who writes here or may not.
     pub read_origin: bool,
+    governed_limit: Option<usize>,
     budget: usize,
 }
 
@@ -122,6 +123,11 @@ impl<'a> Context<'a> {
                     auth,
                 )
                 .is_permitted(),
+            governed_limit: authority
+                .authorize(Permission::Read, &ResourceContext::default(), auth)
+                .constraints
+                .max_results
+                .map(|limit| limit as usize),
             budget: MAX_CANDIDATES,
         })
     }
@@ -177,6 +183,12 @@ impl<'a> Context<'a> {
     pub(crate) fn admit(&mut self, element: Option<Element>) -> Option<Element> {
         let element = element?;
         let constraints = self.authority.may_read(&element, self.auth)?;
+        if let Some(limit) = constraints.max_results.map(|limit| limit as usize) {
+            self.governed_limit = Some(
+                self.governed_limit
+                    .map_or(limit, |current| current.min(limit)),
+            );
+        }
         let mut view = crate::view::render(&element);
         crate::governance::redact::apply(&mut view, &constraints, self.read_origin);
         self.views.insert(element.id(), view);
@@ -186,6 +198,11 @@ impl<'a> Context<'a> {
     /// The rendered view of an already-loaded element.
     pub fn cached_view(&self, id: ElementId) -> Option<Json> {
         self.views.get(&id).cloned()
+    }
+
+    /// The tightest result cap carried by any authority used by this read.
+    pub fn governed_limit(&self) -> Option<usize> {
+        self.governed_limit
     }
 
     /// Loads every element a solution set mentions.
@@ -598,7 +615,7 @@ async fn run(
         restrict_to_valid_time(&mut cx, &mut solutions, &at);
     }
 
-    let limit = query
+    let requested_limit = query
         .limit
         .as_ref()
         .map(|scalar| scalar_usize(&cx, scalar, "LIMIT"))
@@ -611,6 +628,10 @@ async fn run(
 
     // ORDER BY and the projection both read fields off bound elements.
     cx.warm(&solutions).await?;
+    let limit = match (requested_limit, cx.governed_limit()) {
+        (Some(requested), Some(governed)) => Some(requested.min(governed)),
+        (requested, governed) => requested.or(governed),
+    };
     let policy = cx.projected.then(|| cx.policy.identity());
     let projected = cx.project(
         solutions,

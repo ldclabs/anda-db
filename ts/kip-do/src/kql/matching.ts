@@ -729,9 +729,51 @@ function structural(
   const field = formatSymbolRef(cx.env.resolveSymbol('StructuralField', name, 'read'))
 
   const out: Solution[] = []
+  if (cx.historical) {
+    for (const solution of incoming) {
+      const fixedSource = termEndpoint(clause.subject, solution, b)
+      const fixedId =
+        isJsonMap(fixedSource) && typeof fixedSource.id === 'string'
+          ? tryParseElementId(fixedSource.id)
+          : null
+      const sources =
+        fixedSource === null
+          ? cx.reconstruct('Concept').map((element) => ({
+              kind: element.kind,
+              seq: element.row.id,
+            } as ElementId))
+          : fixedId?.kind === 'Concept'
+            ? [fixedId]
+            : []
+
+      for (const src of sources) {
+        const view = cx.view(src)
+        const structural = view === null ? null : view.structural
+        const references = isJsonMap(structural) ? structural[field] : null
+        if (!Array.isArray(references)) continue
+        for (const reference of references) {
+          if (!isJsonMap(reference) || typeof reference.id !== 'string') continue
+          const dst = tryParseElementId(reference.id)
+          if (dst === null || cx.view(dst) === null) continue
+          let current: Solution | null = solution
+          current = bindTerm(current, clause.subject, { id: formatElementId(src) }, b)
+          if (current === null) continue
+          current = bindTerm(current, clause.object, reference as Json, b)
+          if (current === null) continue
+          if (clause.variable !== null) {
+            current = extend(current, clause.variable, symbolBinding(field))
+            if (current === null) continue
+          }
+          out.push(current)
+        }
+      }
+    }
+    return out
+  }
+
   for (const solution of incoming) {
     const wheres = ['space = ?', 'field = ?']
-    const values: SqlStorageValue[] = [cx.space, field]
+    const values: SqlStorageValue[] = [cx.space, `structural:${field}`]
     const from = termEndpoint(clause.subject, solution, b)
     if (isJsonMap(from) && typeof from.id === 'string') {
       wheres.push('from_id = ?')

@@ -395,11 +395,10 @@ export interface SchemaEnvRow {
   /**
    * The first Space coordinate this environment could have applied to (§144).
    *
-   * "The next sequence" rather than the current one, and the difference is the
-   * whole point: everything already committed was written under the environment
-   * before this, so a read `AS OF` that coordinate must resolve symbols through
-   * the *older* one. Activating a Schema is not itself a cognitive transaction
-   * here, so the coordinate is recorded rather than derived from one.
+   * The bootstrap environment first applies to the first cognitive coordinate;
+   * every later activation is a Governance transaction and owns this coordinate
+   * itself. In both cases, everything at an earlier coordinate resolves through
+   * the older environment.
    */
   seq: number
 }

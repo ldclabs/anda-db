@@ -7,6 +7,7 @@ import {
   ceilingOf,
   classification,
   conditionsContain,
+  constraintsContain,
   emptyConditions,
   emptyConstraints,
   emptyScope,
@@ -93,6 +94,279 @@ describe('the classification lattice', () => {
     expect(classification.join(classification.SECRET, classification.PUBLIC)).toBe(
       classification.SECRET,
     )
+  })
+})
+
+describe('review regressions', () => {
+  async function withRegression<T>(
+    name: string,
+    body: (nexus: CognitiveNexus) => T,
+  ): Promise<T> {
+    const stub = env.KIP_DB.getByName(`review-${name}`)
+    return await runInDurableObject(stub, (_instance, state) => {
+      const nexus = CognitiveNexus.connect(state.storage)
+      nexus.activatePackages([COGNITIVE_MEMORY])
+      return body(nexus)
+    })
+  }
+
+  it('requires delegation permission and attenuates every constraint', async () => {
+    await withRegression('delegation-attenuation', (nexus) => {
+      nexus.execute('CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }')
+      const gov = nexus.store.governance
+      for (const id of ['kip:principal:lead', 'kip:principal:sub']) {
+        gov.ensurePrincipal({ principal_id: id })
+      }
+      gov.createGrant(
+        {
+          space_id: nexus.space,
+          grantee_principal: 'kip:principal:lead',
+          actions: ['read'],
+          scope: { kinds: ['concept'] },
+          constraints: { fields: ['name'], max_results: 1 },
+          delegation_allowed: false,
+        },
+        SYSTEM_PRINCIPAL,
+      )
+      const forbidden = gov.createDelegation(
+        {
+          space_id: nexus.space,
+          delegator_principal: 'kip:principal:lead',
+          delegate_principal: 'kip:principal:sub',
+          actions: ['read'],
+          scope: { kinds: ['concept'] },
+          constraints: { fields: ['name'], max_results: 1 },
+        },
+        'kip:principal:lead',
+      )
+      const sub = nexus.session(principalAuth('kip:principal:sub'))
+      expect(() => sub.query('FIND(?c.name) WHERE { ?c CONCEPT {} }')).toThrowError(
+        /requires the read permission/,
+      )
+      gov.revokeDelegation(forbidden.id, 'kip:principal:lead')
+
+      gov.createGrant(
+        {
+          space_id: nexus.space,
+          grantee_principal: 'kip:principal:lead',
+          actions: ['read'],
+          scope: { kinds: ['concept'] },
+          constraints: { fields: ['name'], max_results: 1 },
+          delegation_allowed: true,
+        },
+        SYSTEM_PRINCIPAL,
+      )
+      gov.createDelegation(
+        {
+          space_id: nexus.space,
+          delegator_principal: 'kip:principal:lead',
+          delegate_principal: 'kip:principal:sub',
+          actions: ['read'],
+          scope: { kinds: ['concept'] },
+        },
+        'kip:principal:lead',
+      )
+      expect(() => sub.query('FIND(?c.name) WHERE { ?c CONCEPT {} }')).toThrowError(
+        /requires the read permission/,
+      )
+
+      gov.createDelegation(
+        {
+          space_id: nexus.space,
+          delegator_principal: 'kip:principal:lead',
+          delegate_principal: 'kip:principal:sub',
+          actions: ['read'],
+          scope: { kinds: ['concept'] },
+          constraints: { fields: ['name'], max_results: 1 },
+        },
+        'kip:principal:lead',
+      )
+      expect(sub.query('FIND(?c.name) WHERE { ?c CONCEPT {} }')).toEqual(['Alice'])
+    })
+  })
+
+  it('caps query rows and refuses an unavailable redaction obligation', async () => {
+    await withRegression('read-constraints', (nexus) => {
+      nexus.execute(`MUTATE {
+        CREATE CONCEPT ?a { TYPE "Person" NAME "Alice" }
+        CREATE CONCEPT ?b { TYPE "Person" NAME "Bob" }
+      }`)
+      const gov = nexus.store.governance
+      gov.ensurePrincipal({ principal_id: 'kip:principal:reader' })
+      gov.createGrant(
+        {
+          space_id: nexus.space,
+          grantee_principal: 'kip:principal:reader',
+          actions: ['read'],
+          constraints: { max_results: 1 },
+        },
+        SYSTEM_PRINCIPAL,
+      )
+      const reader = nexus.session(principalAuth('kip:principal:reader'))
+      expect(reader.query('FIND(?c.name) WHERE { ?c CONCEPT {} }')).toHaveLength(1)
+
+      gov.publishPolicy(
+        {
+          policy_id: 'kip:policy:redact',
+          space_id: nexus.space,
+          statements: [{
+            effect: 'allow',
+            actions: ['read'],
+            obligations: {
+              audit: false,
+              approvals_required: 0,
+              redaction_profile: 'safe-summary',
+            },
+          }],
+        },
+        SYSTEM_PRINCIPAL,
+      )
+      const space = nexus.spaceRow()
+      space.default_policy_id = 'kip:policy:redact'
+      nexus.store.putSpace(space)
+      expect(() => reader.query('FIND(?c.name) WHERE { ?c CONCEPT {} }')).toThrowError(
+        /redaction profile/,
+      )
+    })
+  })
+
+  it('enforces the influence-authority ceiling carried by a Grant', async () => {
+    await withRegression('authority-ceiling', (nexus) => {
+      nexus.execute('CREATE EVIDENCE ?e { SET FIELDS {evidence_class: "Document", payload: "x"} }')
+      const gov = nexus.store.governance
+      gov.ensurePrincipal({ principal_id: 'kip:principal:steward' })
+      gov.createGrant(
+        {
+          space_id: nexus.space,
+          grantee_principal: 'kip:principal:steward',
+          actions: ['read', 'elevate_authority'],
+          constraints: { max_influence_authority: 'descriptive' },
+        },
+        SYSTEM_PRINCIPAL,
+      )
+      const steward = nexus.session(principalAuth('kip:principal:steward'))
+      expect(() => steward.elevateAuthority(parseElementId('E-1'), 'behavioral')).toThrowError(
+        /ceiling/,
+      )
+      expect(ceilingOf(nexus.store.load(parseElementId('E-1'))!)).toBe('descriptive')
+    })
+  })
+
+  it('counts approvers globally and spends them only after success', async () => {
+    await withRegression('approval-lifecycle', (nexus) => {
+      const gov = nexus.store.governance
+      gov.publishPolicy(
+        {
+          policy_id: 'kip:policy:approval',
+          space_id: nexus.space,
+          statements: [{
+            effect: 'allow',
+            actions: ['export'],
+            obligations: {
+              audit: false,
+              approvals_required: 2,
+              redaction_profile: '',
+            },
+          }],
+        },
+        SYSTEM_PRINCIPAL,
+      )
+      const space = nexus.spaceRow()
+      space.default_policy_id = 'kip:policy:approval'
+      nexus.store.putSpace(space)
+      const digest = subjectDigest(nexus.space, 'export', spaceResource())
+      const approvals = [1, 2].map(() =>
+        gov.requestApproval(
+          {
+            space_id: nexus.space,
+            operation: 'export',
+            resource: 'the Space',
+            subject_digest: digest,
+            required: 1,
+          },
+          'kip:principal:requester',
+        ),
+      )
+      for (const approval of approvals) {
+        gov.approve(approval.id, 'kip:principal:one-reviewer')
+      }
+      expect(() =>
+        nexus.describe('EXPORT CAPSULE :out WHERE { ?c CONCEPT {} }', { out: 'x' }),
+      ).toThrowError(/independent approval/)
+
+      gov.publishPolicy(
+        {
+          policy_id: 'kip:policy:approval',
+          space_id: nexus.space,
+          statements: [{
+            effect: 'allow',
+            actions: ['update'],
+            obligations: {
+              audit: false,
+              approvals_required: 2,
+              redaction_profile: '',
+            },
+          }],
+        },
+        SYSTEM_PRINCIPAL,
+      )
+      const updateDigest = subjectDigest(nexus.space, 'update', spaceResource())
+      const second = gov.requestApproval(
+        {
+          space_id: nexus.space,
+          operation: 'update',
+          resource: 'the Space',
+          subject_digest: updateDigest,
+          required: 2,
+        },
+        'kip:principal:requester',
+      )
+      gov.approve(second.id, 'kip:principal:reviewer-a')
+      gov.approve(second.id, 'kip:principal:reviewer-b')
+      expect(() =>
+        nexus.execute('UPDATE "C-99" SET FIELDS { name: "nobody" }'),
+      ).toThrowError(/C-99|not found|visible/i)
+      expect(gov.findApproval(second.id)?.status).toBe('granted')
+    })
+  })
+
+  it('journals element Governance changes and reconstructs past Principal state', async () => {
+    const suspended = await withRegression('history-control', (nexus) => {
+      nexus.execute('CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }')
+      nexus.systemSession().classify(parseElementId('C-1'), 'secret')
+      const changes = nexus.describe('CHANGES AFTER SEQ 1') as {
+        changes: { id: string; op: string }[]
+      }
+      expect(changes.changes).toContainEqual(
+        expect.objectContaining({ id: 'C-1', op: 'classify' }),
+      )
+      return nexus.store.governance.setPrincipalStatus(
+        SYSTEM_PRINCIPAL,
+        govStatus.SUSPENDED,
+        SYSTEM_PRINCIPAL,
+      )
+    })
+    await tickPast('review-history-control', suspended.updated_at)
+    await withRegression('history-control', (nexus) => {
+      nexus.store.governance.setPrincipalStatus(
+        SYSTEM_PRINCIPAL,
+        govStatus.ACTIVE,
+        SYSTEM_PRINCIPAL,
+      )
+      const then = nexus.systemSession().accessAsOf(suspended.updated_at) as {
+        permissions: string[]
+      }
+      expect(then.permissions).toEqual([])
+    })
+  })
+
+  it('compares constraint sets as part of attenuation', () => {
+    expect(
+      constraintsContain(
+        { ...emptyConstraints(), fields: ['name'], max_results: 1 },
+        emptyConstraints(),
+      ),
+    ).toBe(false)
   })
 })
 
@@ -544,10 +818,11 @@ describe('the Governance store', () => {
         },
         'kip:principal:system',
       )
-      const entries = gov.readAudit('kip:space:default', 10)
+      const entries = gov
+        .readAudit('kip:space:default', 10)
+        .filter((entry) => entry.operation === 'create_grant')
       expect(entries).toHaveLength(1)
       expect(entries[0]?.entry_class).toBe('mutation')
-      expect(entries[0]?.operation).toBe('create_grant')
       // A whole record, not a diff: a chain with one missing link answers a
       // historical question wrongly instead of refusing (§175).
       expect((entries[0]?.record as { actions?: string[] })?.actions).toEqual([

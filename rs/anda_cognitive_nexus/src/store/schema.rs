@@ -190,7 +190,7 @@ impl Store {
         &self,
         space_id: &str,
         lock: SchemaLock,
-        tx_id: &str,
+        _tx_id: &str,
     ) -> Result<SchemaEnvironment, KipError> {
         let space = self.get_space(space_id).await?;
         let available = self.installed_packages().await?;
@@ -198,6 +198,18 @@ impl Store {
         // Resolve first: an environment that cannot be resolved must not
         // become the Space's current one.
         let environment = SchemaEnvironment::resolve(version, lock.clone(), &available)?;
+        let first_activation = version == 1 && space.seq == 0;
+        let context = if first_activation {
+            None
+        } else {
+            Some(
+                self.begin_transaction(
+                    space_id,
+                    serde_json::json!({"principal_id": "kip:principal:system", "channel": "governance"}),
+                )
+                .await?,
+            )
+        };
 
         let row = SchemaEnvRow {
             _id: 0,
@@ -207,16 +219,29 @@ impl Store {
                 KipError::internal_error(format!("a Schema Lock failed to encode: {err}"))
             })?,
             created_at: time::now(),
-            tx_id: tx_id.to_string(),
+            tx_id: context
+                .as_ref()
+                .map(|cx| cx.tx_id.clone())
+                .unwrap_or_default(),
         };
         self.schema_envs().add_from(&row).await.map_err(db_error)?;
 
-        let mut fields = BTreeMap::new();
-        fields.insert("schema_environment_version".to_string(), Fv::U64(version));
-        self.spaces()
-            .update(space._id, fields)
-            .await
-            .map_err(db_error)?;
+        let mut updated_space = self.get_space(space_id).await?;
+        updated_space.schema_environment_version = version;
+        self.put_space(&updated_space).await?;
+        if let Some(cx) = context {
+            self.journal(
+                &cx,
+                super::space::JournalEntry {
+                    status: "committed".to_string(),
+                    transaction_class: "governance".to_string(),
+                    schema_environment_version: version,
+                    result: serde_json::json!({"schema_environment_version": version}),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        }
 
         Ok(environment)
     }

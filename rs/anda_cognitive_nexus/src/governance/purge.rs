@@ -45,6 +45,7 @@ use super::decision::{EffectiveAuthority, ResourceContext};
 use super::store::MutationEntry;
 use crate::id::ElementId;
 use crate::store::{Element, Store};
+use crate::tx::Transaction;
 
 /// How a purge treats elements that still point at the target (§173).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,11 +91,7 @@ pub struct PurgeReport {
     pub versions_destroyed: usize,
 }
 
-/// Erases one element's content, leaving an identity stub.
-///
-/// `cascade` carries the elements an `authorized_cascade` already approved;
-/// under the other policies it is empty and referencing elements are either a
-/// refusal or left pointing at the stub.
+/// Erases one element as a standalone Governance transaction.
 pub async fn purge(
     store: &Store,
     space_id: &str,
@@ -103,6 +100,35 @@ pub async fn purge(
     authority: &EffectiveAuthority,
     auth: &AuthContext,
 ) -> Result<PurgeReport, KipError> {
+    let mut tx = Transaction::begin(
+        store,
+        space_id,
+        engine_origin(auth),
+        false,
+        authority.clone(),
+        auth.clone(),
+    )
+    .await?;
+    let report = match stage(store, &mut tx, id, policy).await {
+        Ok(report) => report,
+        Err(error) => {
+            tx.abort().await;
+            return Err(error);
+        }
+    };
+    tx.commit(crate::store::space::JournalEntry::default())
+        .await?;
+    Ok(report)
+}
+
+/// Stages erasure inside an existing KML transaction.
+pub async fn stage(
+    store: &Store,
+    tx: &mut Transaction,
+    id: ElementId,
+    policy: ReferencePolicy,
+) -> Result<PurgeReport, KipError> {
+    let space_id = tx.cx.space.clone();
     let element = store.get_element(id).await?;
     if element.space() != space_id {
         return Err(KipError::not_found_or_not_visible(format!(
@@ -110,18 +136,17 @@ pub async fn purge(
         )));
     }
     let resource = ResourceContext::of_element(&element);
-    authority
-        .authorize(Permission::Read, &resource, auth)
-        .into_result()?;
+    tx.authorize_element(id, Permission::Read).await?;
     // §167 lists purging critical Evidence among the operations a policy may
     // require independent approval for, and this is where such an approval is
     // consumed — bound to this element, and spent by using it.
-    super::approval::resolve(
+    let decision = super::approval::resolve(
         store,
-        space_id,
+        &space_id,
         &resource,
-        authority.authorize(Permission::Purge, &resource, auth),
-        auth,
+        tx.authority
+            .authorize(Permission::Purge, &resource, &tx.auth),
+        &tx.auth,
     )
     .await?
     .into_result()?;
@@ -135,7 +160,7 @@ pub async fn purge(
         )));
     }
 
-    let referrers = referrers_of(store, space_id, id).await?;
+    let referrers = referrers_of(store, &space_id, id).await?;
     let mut targets = vec![id];
     match policy {
         ReferencePolicy::DenyIfReferenced if !referrers.is_empty() => {
@@ -159,52 +184,37 @@ pub async fn purge(
                          cannot complete"
                     )));
                 }
-                authority
-                    .authorize(
-                        Permission::Purge,
-                        &ResourceContext::of_element(&element),
-                        auth,
-                    )
-                    .into_result()?;
+                tx.authorize_element(*referrer, Permission::Purge).await?;
             }
             targets.extend(referrers.iter().copied());
         }
         _ => {}
     }
 
+    tx.defer_approval(decision);
     let mut report = PurgeReport::default();
     for target in targets {
-        let element = store.get_element(target).await?;
-        let cx = store
-            .begin_transaction(space_id, engine_origin(auth))
-            .await?;
+        let element = tx.load(target).await?.clone();
         let digest = crate::store::schema::content_digest(&crate::view::render(&element));
-        // The history goes first. A crash between the two leaves an element
-        // whose current row still has its content and whose past does not,
-        // which is recoverable by purging again; the other order leaves a stub
-        // whose full contents are still readable through `AS OF`, which is not
-        // recoverable at all because nothing says to look.
-        report.versions_destroyed += store.purge_versions(space_id, target).await?;
-        stub(store, &cx, element, &digest).await?;
+        report.versions_destroyed += store.version_count(&space_id, target).await?;
+        tx.stage_purge(target, stub(element, &digest)).await?;
         report.purged.push(target.to_string());
 
-        store
-            .governance
-            .record_mutation(MutationEntry {
-                operation: "purge",
-                space_id: space_id.to_string(),
-                resource: target.to_string(),
-                principal_id: auth.principal_id.clone(),
-                // The receipt §164 permits: enough to audit the erasure, and
-                // nothing of what was erased.
-                record: serde_json::json!({
-                    "element": target.to_string(),
-                    "content_digest": digest,
-                    "reference_policy": policy.as_str(),
-                    "tx_id": cx.tx_id,
-                }),
-            })
-            .await?;
+        tx.defer_governance_audit(MutationEntry {
+            operation: "purge",
+            at: tx.cx.at.clone(),
+            space_id: space_id.to_string(),
+            resource: target.to_string(),
+            principal_id: tx.auth.principal_id.clone(),
+            // The receipt §164 permits: enough to audit the erasure, and
+            // nothing of what was erased.
+            record: serde_json::json!({
+                "element": target.to_string(),
+                "content_digest": digest,
+                "reference_policy": policy.as_str(),
+                "tx_id": tx.cx.tx_id,
+            }),
+        });
     }
     Ok(report)
 }
@@ -247,50 +257,41 @@ async fn referrers_of(
 /// `origin` is kept — it names the Principal that wrote the element, which is
 /// audit information about the deployment rather than the content being erased,
 /// and losing it would make the stub unattributable.
-async fn stub(
-    store: &Store,
-    cx: &crate::store::write::WriteContext,
-    element: Element,
-    digest: &str,
-) -> Result<(), KipError> {
+fn stub(element: Element, digest: &str) -> Element {
     macro_rules! erase {
-        ($ty:ident, $previous:expr $(, $extra:ident = $value:expr)?) => {{
+        ($variant:ident, $ty:ident, $previous:expr $(, $extra:ident = $value:expr)?) => {{
             let previous = *$previous;
-            let version = previous.version.saturating_add(1);
             let row = $ty {
                 _id: previous._id,
                 space: previous.space,
                 state: state::PURGED.to_string(),
-                version,
-                seq: cx.seq,
+                version: previous.version,
+                seq: previous.seq,
                 created_at: previous.created_at,
-                updated_at: cx.at.clone(),
+                updated_at: previous.updated_at,
                 created_tx: previous.created_tx,
-                updated_tx: cx.tx_id.clone(),
+                updated_tx: previous.updated_tx,
                 origin: previous.origin,
                 governance: purge_marker(digest),
                 $($extra: $value,)?
                 ..Default::default()
             };
-            store.put_row(&row).await?;
-            let id = ElementId::new(<$ty as crate::store::write::Row>::KIND, previous._id);
-            store.record_version(cx, id, version, "purge", &row).await?;
-            Ok(())
+            Element::$variant(Box::new(row))
         }};
     }
     use crate::store::rows::*;
     match element {
-        Element::Concept(row) => erase!(ConceptRow, row),
+        Element::Concept(row) => erase!(Concept, ConceptRow, row),
         // `tuple_key` is unique-indexed, so two purged Propositions would
         // collide on the empty string. The stub keeps a per-element placeholder
         // that carries none of the tuple it replaced.
         Element::Proposition(row) => {
             let placeholder = format!("purged:{}", row._id);
-            erase!(PropositionRow, row, tuple_key = placeholder)
+            erase!(Proposition, PropositionRow, row, tuple_key = placeholder)
         }
-        Element::Assertion(row) => erase!(AssertionRow, row),
-        Element::Evidence(row) => erase!(EvidenceRow, row),
-        Element::Activity(row) => erase!(ActivityRow, row),
+        Element::Assertion(row) => erase!(Assertion, AssertionRow, row),
+        Element::Evidence(row) => erase!(Evidence, EvidenceRow, row),
+        Element::Activity(row) => erase!(Activity, ActivityRow, row),
     }
 }
 
@@ -302,7 +303,6 @@ fn purge_marker(digest: &str) -> Json {
     })
 }
 
-/// The engine origin a Governance write stamps.
 fn engine_origin(auth: &AuthContext) -> Json {
     serde_json::json!({
         "principal_id": auth.principal_id,
@@ -310,6 +310,7 @@ fn engine_origin(auth: &AuthContext) -> Json {
     })
 }
 
+/// The engine origin a Governance write stamps.
 #[cfg(test)]
 mod tests {
     use super::*;

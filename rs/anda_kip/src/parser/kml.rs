@@ -45,6 +45,7 @@ const ASSERTION_IMMUTABLE: &[&str] = &[
     "confidence",
     "asserted_at",
     "valid_time",
+    "evidence",
     "evidence_refs",
 ];
 
@@ -1711,6 +1712,9 @@ mod tests {
     fn update_cannot_rewrite_immutable_epistemic_payload() {
         let bad = r#"UPDATE ?a SET FIELDS { confidence: 0.1 } WHERE { ?a ASSERTION {id: "A-1"} }"#;
         assert!(parse_kml_statement(bad).is_err());
+        let bad_evidence_alias =
+            r#"UPDATE ?a SET FIELDS { evidence: :e } WHERE { ?a ASSERTION {id: "A-1"} }"#;
+        assert!(parse_kml_statement(bad_evidence_alias).is_err());
 
         let bad_evidence =
             r#"UPDATE ?e SET FIELDS { payload: "x" } WHERE { ?e EVIDENCE {id: "E-1"} }"#;

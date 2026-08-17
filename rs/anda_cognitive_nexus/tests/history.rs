@@ -367,6 +367,26 @@ async fn a_historical_read_resolves_symbols_through_the_schema_of_its_time() {
     assert_eq!(environment["version"], json!(1));
 }
 
+#[tokio::test]
+async fn a_later_schema_activation_has_a_real_history_coordinate() {
+    let nexus = nexus("schema_activation_coordinate").await;
+    let (created, _) = commit(
+        &nexus,
+        r#"CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }"#,
+    )
+    .await;
+    assert_eq!(created, 1);
+    nexus
+        .activate_schema(DEFAULT_SPACE, SchemaLock::default())
+        .await
+        .unwrap();
+    let snapshot = ok(&nexus, "SNAPSHOT").await;
+    assert_eq!(snapshot["snapshot_seq"], json!(2));
+    assert_eq!(snapshot["schema_environment_version"], json!(2));
+    let before = ok(&nexus, "DESCRIBE SCHEMA ENVIRONMENT AS OF SEQ 1").await;
+    assert_eq!(before["version"], json!(1));
+}
+
 /// Belief is projected from the Assertions on record *at that coordinate*, so
 /// a claim made later does not leak into an earlier answer.
 #[tokio::test]

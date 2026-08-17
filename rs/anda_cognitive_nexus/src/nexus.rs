@@ -23,7 +23,7 @@ use anda_kip::{
 };
 use async_trait::async_trait;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::governance::rows::principal_class;
 use crate::governance::store::PrincipalDraft;
@@ -46,6 +46,7 @@ pub struct CognitiveNexus {
     /// The Space a request runs against when its envelope names none.
     default_space: String,
     lock: Arc<RwLock<()>>,
+    approval_lock: Arc<Mutex<()>>,
 }
 
 impl std::fmt::Debug for CognitiveNexus {
@@ -103,6 +104,7 @@ impl CognitiveNexus {
             store,
             default_space: DEFAULT_SPACE.to_string(),
             lock: Arc::new(RwLock::new(())),
+            approval_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -115,6 +117,7 @@ impl CognitiveNexus {
             store,
             default_space: DEFAULT_SPACE.to_string(),
             lock: Arc::new(RwLock::new(())),
+            approval_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -517,12 +520,13 @@ impl Executor for Session {
                     Ok(authority) => authority,
                     Err(err) => return Response::from(err),
                 };
-                if let Err(err) = self
+                let decisions = match self
                     .gate(&authority, &auth, gate::kml_permissions(&statement))
                     .await
                 {
-                    return Response::from(err);
-                }
+                    Ok(decisions) => decisions,
+                    Err(err) => return Response::from(err),
+                };
                 let response = crate::kml::execute(
                     &self.nexus.store,
                     &space,
@@ -533,6 +537,11 @@ impl Executor for Session {
                     &auth,
                 )
                 .await;
+                if response.status == anda_kip::TopLevelStatus::Succeeded
+                    && let Err(err) = self.consume_approvals(&decisions).await
+                {
+                    return Response::from(err);
+                }
                 // A poison event costs no further command: the next mutation
                 // would be rejected outright, so recovery happens here rather
                 // than being deferred to the caller's next attempt.
@@ -549,13 +558,17 @@ impl Executor for Session {
                     Ok(authority) => authority,
                     Err(err) => return Response::from(err),
                 };
-                if let Err(err) = self
-                    .gate(&authority, &auth, gate::kql_permissions(&query))
-                    .await
-                {
-                    return Response::from(err);
-                }
-                crate::kql::execute(
+                let permissions = gate::kql_permissions(&query);
+                let _approval_guard = if needs_approval(&authority, &auth, &permissions) {
+                    Some(self.nexus.approval_lock.lock().await)
+                } else {
+                    None
+                };
+                let decisions = match self.gate(&authority, &auth, permissions).await {
+                    Ok(decisions) => decisions,
+                    Err(err) => return Response::from(err),
+                };
+                let response = crate::kql::execute(
                     &self.nexus.store,
                     &space,
                     &query,
@@ -564,7 +577,13 @@ impl Executor for Session {
                     &authority,
                     &auth,
                 )
-                .await
+                .await;
+                if response.status == anda_kip::TopLevelStatus::Succeeded
+                    && let Err(err) = self.consume_approvals(&decisions).await
+                {
+                    return Response::from(err);
+                }
+                response
             }
             Command::Meta(command) => {
                 // META is semantically read-only (§63.2), so it shares the
@@ -574,13 +593,17 @@ impl Executor for Session {
                     Ok(authority) => authority,
                     Err(err) => return Response::from(err),
                 };
-                if let Err(err) = self
-                    .gate(&authority, &auth, gate::meta_permissions(&command))
-                    .await
-                {
-                    return Response::from(err);
-                }
-                crate::meta::execute(
+                let permissions = gate::meta_permissions(&command);
+                let _approval_guard = if needs_approval(&authority, &auth, &permissions) {
+                    Some(self.nexus.approval_lock.lock().await)
+                } else {
+                    None
+                };
+                let decisions = match self.gate(&authority, &auth, permissions).await {
+                    Ok(decisions) => decisions,
+                    Err(err) => return Response::from(err),
+                };
+                let response = crate::meta::execute(
                     &self.nexus.store,
                     &space,
                     &command,
@@ -589,10 +612,31 @@ impl Executor for Session {
                     &authority,
                     &auth,
                 )
-                .await
+                .await;
+                if response.status == anda_kip::TopLevelStatus::Succeeded
+                    && let Err(err) = self.consume_approvals(&decisions).await
+                {
+                    return Response::from(err);
+                }
+                response
             }
         }
     }
+}
+
+fn needs_approval(
+    authority: &EffectiveAuthority,
+    auth: &AuthContext,
+    permissions: &[Permission],
+) -> bool {
+    let resource = ResourceContext::default();
+    permissions.iter().any(|permission| {
+        authority
+            .authorize(*permission, &resource, auth)
+            .obligations
+            .approvals_required
+            > 0
+    })
 }
 
 impl Session {
@@ -615,7 +659,8 @@ impl Session {
         authority: &EffectiveAuthority,
         auth: &AuthContext,
         needed: Vec<Permission>,
-    ) -> Result<(), KipError> {
+    ) -> Result<Vec<Authorization>, KipError> {
+        let mut decisions = Vec::new();
         for permission in needed {
             let resource = ResourceContext::default();
             // A policy may require independent approval for a whole command
@@ -632,11 +677,20 @@ impl Session {
             .await?;
             if !decision.is_permitted() {
                 self.audit(authority, auth, &decision).await;
-                return decision.into_result().map(|_| ());
+                return decision.into_result().map(|_| Vec::new());
             }
+            let decision = decision.into_result()?;
             if decision.obligations.audit {
                 self.audit(authority, auth, &decision).await;
             }
+            decisions.push(decision);
+        }
+        Ok(decisions)
+    }
+
+    async fn consume_approvals(&self, decisions: &[Authorization]) -> Result<(), KipError> {
+        for decision in decisions {
+            crate::governance::approval::consume(&self.nexus.store, decision).await?;
         }
         Ok(())
     }

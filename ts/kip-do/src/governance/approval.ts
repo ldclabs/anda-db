@@ -16,9 +16,9 @@
  *
  * ## Consumed, not merely counted
  *
- * A satisfied approval is marked `consumed`, so the same two signatures cannot
- * authorize the operation twice. Re-running it needs a new approval — which is
- * the point of requiring one.
+ * A satisfied approval is marked `consumed` only after the authorized operation
+ * succeeds, so the same signatures cannot authorize it twice and a failed
+ * attempt does not spend them without use.
  *
  * @see rs/anda_cognitive_nexus/src/governance/approval.rs
  */
@@ -76,7 +76,7 @@ export function resolveApproval(
   const digest = subjectDigest(spaceId, decision.permission, resource)
   const granted = store.governance.grantedApprovals(spaceId, digest)
 
-  const approvers = granted.reduce((total, row) => total + row.approver_ids.length, 0)
+  const approvers = new Set(granted.flatMap((row) => row.approver_ids)).size
   if (approvers < decision.obligations.approvals_required) {
     // §246: one approval where two are required is not partial activation. The
     // decision stays `require_approval`, and the reason says how far along it is.
@@ -88,16 +88,27 @@ export function resolveApproval(
     }
   }
 
-  const used: string[] = []
-  for (const row of granted) {
-    store.governance.consumeApproval(row.id)
-    used.push(approvalId(row.id))
-  }
+  const used = granted.map((row) => approvalId(row.id))
   void auth
   return {
     ...decision,
     decision: 'allow_with_constraints',
     authorities_used: [...decision.authorities_used, ...used],
     reason: `${decision.permission} is approved by ${approvers} independent Principal(s)`,
+  }
+}
+
+/** Consumes the approvals carried by a decision after its operation succeeds. */
+export function consumeResolvedApprovals(
+  store: Store,
+  decision: Authorization,
+): void {
+  const seen = new Set<number>()
+  for (const authority of decision.authorities_used) {
+    if (!authority.startsWith('kip:approval:')) continue
+    const id = Number(authority.slice('kip:approval:'.length))
+    if (!Number.isSafeInteger(id) || id < 1 || seen.has(id)) continue
+    store.governance.consumeApproval(id)
+    seen.add(id)
   }
 }

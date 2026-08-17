@@ -19,7 +19,7 @@ import {
   type ElementId,
   type ElementKind,
 } from '../id.js'
-import type { JsonMap } from '../json.js'
+import type { Json, JsonMap } from '../json.js'
 import { idSet } from '../sql.js'
 import { nowTime } from '../time.js'
 import {
@@ -115,7 +115,15 @@ export class Store {
   createSpace(row: Omit<SpaceRow, 'id'>): SpaceRow {
     const { sql, values } = insertStatement('spaces', row)
     this.sql.exec(sql, ...values)
-    return { ...row, id: this.lastRowId() }
+    const stored = { ...row, id: this.lastRowId() }
+    this.governance.recordMutation({
+      operation: 'create_space',
+      at: stored.created_at,
+      space_id: stored.space_id,
+      resource: stored.space_id,
+      record: stored as unknown as Json,
+    })
+    return stored
   }
 
   /**
@@ -147,6 +155,13 @@ export class Store {
   putSpace(row: SpaceRow): void {
     const { sql, values } = updateStatement('spaces', row, row.id)
     this.sql.exec(sql, ...values)
+    this.governance.recordMutation({
+      operation: 'put_space',
+      at: nowTime(),
+      space_id: row.space_id,
+      resource: row.space_id,
+      record: row as unknown as Json,
+    })
   }
 
   // --- elements ----------------------------------------------------------

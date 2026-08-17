@@ -55,11 +55,12 @@ import {
   type Store,
 } from '../store/index.js'
 import { nowTime } from '../time.js'
-import { resolveApproval } from './approval.js'
+import { consumeResolvedApprovals, resolveApproval } from './approval.js'
 import type { AuthContext } from './auth.js'
 import {
   requirePermitted,
   resourceOfElement,
+  authorityCeiling,
   type EffectiveAuthority,
 } from './decision.js'
 import { authority, classification } from './lattice.js'
@@ -110,7 +111,7 @@ export function classify(
   const effective = current === '' ? cx.authority.defaultClassification() : current
   const lowering = classification.rank(label) < classification.rank(effective)
   const permission = lowering ? 'declassify' : 'update'
-  requirePermitted(
+  const decision = requirePermitted(
     resolveApproval(
       cx.store,
       cx.space,
@@ -125,6 +126,7 @@ export function classify(
     setMember(block, 'classification', label),
   )
   audit(cx, id, op, { from: current, to: label, version })
+  consumeResolvedApprovals(cx.store, decision)
   return current
 }
 
@@ -153,7 +155,7 @@ export function elevateAuthority(
   // §129: elevation is exactly the operation a policy asks for independent
   // approval on, and §246 requires that one approval of two is not partial
   // activation. That is decided here rather than by the caller.
-  requirePermitted(
+  const decision = requirePermitted(
     resolveApproval(
       cx.store,
       cx.space,
@@ -166,6 +168,13 @@ export function elevateAuthority(
   const current = ceilingOf(element)
   const raising = authority.rank(cls) > authority.rank(current)
   if (raising) {
+    const grantedCeiling = authorityCeiling(decision.constraints)
+    if (authority.rank(cls) > authority.rank(grantedCeiling)) {
+      throw errors.notAuthorized(
+        `${JSON.stringify(cls)} exceeds this Principal's influence-authority ` +
+          `ceiling ${JSON.stringify(grantedCeiling)}`,
+      )
+    }
     const bound = inheritedCeiling(cx, element)
     if (authority.rank(cls) > authority.rank(bound)) {
       throw errors.notAuthorized(
@@ -188,6 +197,7 @@ export function elevateAuthority(
     to: cls,
     version,
   })
+  consumeResolvedApprovals(cx.store, decision)
   return current
 }
 
@@ -207,7 +217,7 @@ export function quarantine(
 ): void {
   const element = readable(cx, id)
   const resource = resourceOfElement(element)
-  requirePermitted(
+  const decision = requirePermitted(
     resolveApproval(
       cx.store,
       cx.space,
@@ -220,6 +230,7 @@ export function quarantine(
     setMember(block, QUARANTINE_KEY, reason),
   )
   audit(cx, id, 'quarantine', { reason, version })
+  consumeResolvedApprovals(cx.store, decision)
 }
 
 /** Returns a quarantined element to ordinary use. */
@@ -232,8 +243,15 @@ export function release(cx: ElementGovernanceContext, id: ElementId): void {
         `archived or tombstoned for a different reason`,
     )
   }
-  requirePermitted(
-    cx.authority.authorize('quarantine', resourceOfElement(element), cx.auth),
+  const resource = resourceOfElement(element)
+  const decision = requirePermitted(
+    resolveApproval(
+      cx.store,
+      cx.space,
+      resource,
+      cx.authority.authorize('quarantine', resource, cx.auth),
+      cx.auth,
+    ),
   )
   // `release`, matching the reference engine: `HISTORY ELEMENT` returns this
   // verb, so a name only one engine uses is a wire divergence.
@@ -241,6 +259,7 @@ export function release(cx: ElementGovernanceContext, id: ElementId): void {
     setMember(block, QUARANTINE_KEY, null),
   )
   audit(cx, id, 'release_quarantine', { version })
+  consumeResolvedApprovals(cx.store, decision)
 }
 
 // ---------------------------------------------------------------------------
@@ -316,7 +335,23 @@ function commit(
   // this *is* a new version of the element, and attributing it to the original
   // author would misreport who reclassified it.
   row.origin = { principal_id: cx.auth.principal_id, channel: 'governance' }
-  cx.store.put(element, op as never, txId)
+  const change = cx.store.put(element, op as never, txId)
+  cx.store.putTransaction({
+    tx_id: txId,
+    space: cx.space,
+    seq,
+    snapshot_seq: seq - 1,
+    committed_at: at,
+    status: 'committed',
+    transaction_class: 'governance',
+    idempotency_key: '',
+    request_digest: '',
+    semantic_plan_digest: '',
+    result_digest: '',
+    schema_environment_version: cx.store.space(cx.space)?.schema_environment_version ?? 0,
+    result: { element: formatElementId({ kind: element.kind, seq: row.id }), op },
+    changes: [change],
+  })
   return row.version
 }
 

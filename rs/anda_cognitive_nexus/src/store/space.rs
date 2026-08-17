@@ -26,6 +26,7 @@ use std::collections::BTreeMap;
 
 use super::{Store, eq_field, eq_fields, rows::*};
 use crate::error::db_error;
+use crate::governance::store::MutationEntry;
 use crate::store::write::WriteContext;
 use crate::time;
 
@@ -98,7 +99,20 @@ impl Store {
             policies: Json::Null,
         };
         let id = self.spaces().add_from(&row).await.map_err(db_error)?;
-        Ok(SpaceRow { _id: id, ..row })
+        let row = SpaceRow { _id: id, ..row };
+        self.governance
+            .record_mutation(MutationEntry {
+                operation: "create_space",
+                at: row.created_at.clone(),
+                space_id: row.space_id.clone(),
+                resource: row.space_id.clone(),
+                record: serde_json::to_value(&row).map_err(|err| {
+                    KipError::internal_error(format!("a MemorySpace failed to encode: {err}"))
+                })?,
+                ..Default::default()
+            })
+            .await?;
+        Ok(row)
     }
 
     /// Looks a Space up by its id.
@@ -177,6 +191,17 @@ impl Store {
         let spaces = self.spaces();
         let fields = super::full_row_fields(spaces.schema(), row)?;
         spaces.update(row._id, fields).await.map_err(db_error)?;
+        self.governance
+            .record_mutation(MutationEntry {
+                operation: "put_space",
+                space_id: row.space_id.clone(),
+                resource: row.space_id.clone(),
+                record: serde_json::to_value(row).map_err(|err| {
+                    KipError::internal_error(format!("a MemorySpace failed to encode: {err}"))
+                })?,
+                ..Default::default()
+            })
+            .await?;
         Ok(())
     }
 

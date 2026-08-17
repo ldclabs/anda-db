@@ -87,6 +87,7 @@ export {
   DEFAULT_SPACE,
   SYSTEM_PRINCIPAL,
   Session,
+  type MutationOptions,
   type NexusOptions,
   type ReadOptions,
 } from './nexus.js'

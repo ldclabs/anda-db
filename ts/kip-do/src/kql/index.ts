@@ -109,11 +109,14 @@ export function executeKql(query: KqlQuery, cx: KqlContext): Json[] {
   const expressions = query.find_clause.expressions
 
   if (expressions.some((e) => 'Aggregation' in e)) {
-    return aggregate(context, expressions, solutions, b)
+    return capResults(
+      aggregate(context, expressions, solutions, b),
+      context.resultLimit(),
+    )
   }
 
   const ordered = sort(context, solutions, query.order_by, b)
-  const rows = page(ordered, query, b)
+  const rows = page(ordered, query, b, context.resultLimit())
   return rows.map((solution) => project(context, expressions, solution))
 }
 
@@ -413,11 +416,22 @@ function page(
   solutions: readonly Solution[],
   query: KqlQuery,
   b: ReadBindings,
+  governedLimit: number | null,
 ): Solution[] {
   const offset = query.cursor === null ? 0 : cursorOffset(query.cursor, b)
-  const limit = query.limit === null ? null : count(query.limit, b, 'LIMIT')
+  const requested = query.limit === null ? null : count(query.limit, b, 'LIMIT')
+  const limit =
+    requested === null
+      ? governedLimit
+      : governedLimit === null
+        ? requested
+        : Math.min(requested, governedLimit)
   const from = solutions.slice(offset)
   return limit === null ? from : from.slice(0, limit)
+}
+
+function capResults(rows: Json[], governedLimit: number | null): Json[] {
+  return governedLimit === null ? rows : rows.slice(0, governedLimit)
 }
 
 function cursorOffset(cursor: Scalar, b: ReadBindings): number {

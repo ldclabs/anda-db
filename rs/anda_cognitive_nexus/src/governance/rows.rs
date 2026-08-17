@@ -589,6 +589,27 @@ impl AuthorityConstraints {
             export: self.export && other.export,
         }
     }
+
+    /// Whether `other` stays inside every constraint imposed by this one.
+    pub fn contains(&self, other: &Self) -> bool {
+        let bounded_results = self.max_results.is_none()
+            || other
+                .max_results
+                .is_some_and(|child| child <= self.max_results.unwrap_or(u64::MAX));
+        let bounded_authority = self.max_influence_authority.is_empty()
+            || (!other.max_influence_authority.is_empty()
+                && crate::governance::authority::rank(&other.max_influence_authority)
+                    <= crate::governance::authority::rank(&self.max_influence_authority));
+        let bounded_classification = self.max_classification.is_empty()
+            || (!other.max_classification.is_empty()
+                && crate::governance::classification::rank(&other.max_classification)
+                    <= crate::governance::classification::rank(&self.max_classification));
+        narrows(&self.fields, &other.fields)
+            && bounded_results
+            && bounded_authority
+            && bounded_classification
+            && (self.export || !other.export)
+    }
 }
 
 /// One ordered rule in a Policy (§45).
@@ -791,6 +812,8 @@ mod tests {
         assert_eq!(effective.max_results, Some(10));
         assert_eq!(effective.fields, vec!["summary".to_string()]);
         assert!(!effective.export);
+        assert!(broad.contains(&narrow));
+        assert!(!narrow.contains(&AuthorityConstraints::default()));
     }
 
     #[test]

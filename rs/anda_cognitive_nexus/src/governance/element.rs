@@ -114,7 +114,7 @@ pub async fn classify(
     } else {
         Permission::Update
     };
-    super::approval::resolve(
+    let decision = super::approval::resolve(
         store,
         space_id,
         &resource,
@@ -136,6 +136,7 @@ pub async fn classify(
         auth,
     )
     .await?;
+    super::approval::consume(store, &decision).await?;
     Ok(current)
 }
 
@@ -164,7 +165,7 @@ pub async fn elevate_authority(
     // §129: elevation is exactly the operation a policy asks for independent
     // approval on, and §246 requires that one approval of two is not partial
     // activation. That is decided here rather than by the caller.
-    super::approval::resolve(
+    let decision = super::approval::resolve(
         store,
         space_id,
         &resource,
@@ -177,6 +178,12 @@ pub async fn elevate_authority(
     let current = ceiling_of(&element).to_string();
     let raising = authority::rank(class) > authority::rank(&current);
     if raising {
+        let granted_ceiling = super::decision::authority_ceiling(&decision.constraints);
+        if authority::rank(class) > authority::rank(granted_ceiling) {
+            return Err(KipError::not_authorized(format!(
+                "{class:?} exceeds this Principal's influence-authority ceiling {granted_ceiling:?}"
+            )));
+        }
         let bound = inherited_ceiling(store, &element).await?;
         if authority::rank(class) > authority::rank(&bound) {
             return Err(KipError::not_authorized(format!(
@@ -206,6 +213,7 @@ pub async fn elevate_authority(
         auth,
     )
     .await?;
+    super::approval::consume(store, &decision).await?;
     Ok(current)
 }
 
@@ -224,7 +232,7 @@ pub async fn quarantine(
 ) -> Result<(), KipError> {
     let element = readable(store, space_id, id, authority, auth).await?;
     let resource = ResourceContext::of_element(&element);
-    super::approval::resolve(
+    let decision = super::approval::resolve(
         store,
         space_id,
         &resource,
@@ -255,6 +263,7 @@ pub async fn quarantine(
         auth,
     )
     .await?;
+    super::approval::consume(store, &decision).await?;
     Ok(())
 }
 
@@ -274,13 +283,16 @@ pub async fn release(
             element.state()
         )));
     }
-    authority
-        .authorize(
-            Permission::Quarantine,
-            &ResourceContext::of_element(&element),
-            auth,
-        )
-        .into_result()?;
+    let resource = ResourceContext::of_element(&element);
+    let decision = super::approval::resolve(
+        store,
+        space_id,
+        &resource,
+        authority.authorize(Permission::Quarantine, &resource, auth),
+        auth,
+    )
+    .await?
+    .into_result()?;
     let patch = |governance: &Json| set_member(governance, QUARANTINE_KEY, Json::Null);
     let version = commit(
         store,
@@ -301,6 +313,7 @@ pub async fn release(
         auth,
     )
     .await?;
+    super::approval::consume(store, &decision).await?;
     Ok(())
 }
 
@@ -420,6 +433,25 @@ where
     let version = store.update(cx, &mut row).await?;
     let id = ElementId::new(R::KIND, row.id());
     store.record_version(cx, id, version, op, &row).await?;
+    let schema_environment_version = store.get_space(&cx.space).await?.schema_environment_version;
+    store
+        .journal(
+            cx,
+            crate::store::space::JournalEntry {
+                status: "committed".to_string(),
+                transaction_class: "governance".to_string(),
+                schema_environment_version,
+                result: serde_json::json!({"element": id.to_string(), "op": op}),
+                changes: vec![serde_json::json!({
+                    "id": id.to_string(),
+                    "kind": id.kind.to_string(),
+                    "op": op,
+                    "version": version,
+                })],
+                ..Default::default()
+            },
+        )
+        .await?;
     Ok(version)
 }
 
@@ -457,6 +489,7 @@ async fn audit(
         .governance
         .record_mutation(MutationEntry {
             operation,
+            at: crate::time::now(),
             space_id: space_id.to_string(),
             resource: id.to_string(),
             principal_id: auth.principal_id.clone(),

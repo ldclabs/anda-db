@@ -16,12 +16,13 @@
 //!
 //! ## Consumed, not merely counted
 //!
-//! A satisfied approval is marked `consumed`, so the same two signatures cannot
-//! authorize the operation twice. Re-running it needs a new approval — which is
-//! the point of requiring one.
+//! A satisfied approval is marked `consumed` only after the authorized
+//! operation succeeds, so the same signatures cannot authorize it twice and a
+//! failed attempt does not spend them without use.
 
 use anda_kip::KipError;
 use sha3::{Digest, Sha3_256};
+use std::collections::BTreeSet;
 
 use super::auth::AuthContext;
 use super::decision::{Authorization, ResourceContext};
@@ -72,7 +73,11 @@ pub async fn resolve(
         .granted_approvals(space_id, &digest)
         .await?;
 
-    let approvers: usize = granted.iter().map(|row| row.approver_ids.len()).sum();
+    let approvers = granted
+        .iter()
+        .flat_map(|row| row.approver_ids.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .len();
     if (approvers as u64) < decision.obligations.approvals_required {
         return Ok(Authorization {
             reason: format!(
@@ -83,11 +88,10 @@ pub async fn resolve(
         });
     }
 
-    let mut used = Vec::with_capacity(granted.len());
-    for row in &granted {
-        store.governance.consume_approval(row._id).await?;
-        used.push(super::store::approval_id(row._id));
-    }
+    let used: Vec<String> = granted
+        .iter()
+        .map(|row| super::store::approval_id(row._id))
+        .collect();
     let _ = auth;
     Ok(Authorization {
         decision: Decision::AllowWithConstraints,
@@ -98,6 +102,23 @@ pub async fn resolve(
         authorities_used: [decision.authorities_used, used].concat(),
         ..decision
     })
+}
+
+/// Consumes the approvals carried by a decision after its operation succeeds.
+pub async fn consume(store: &Store, decision: &Authorization) -> Result<(), KipError> {
+    let mut seen = BTreeSet::new();
+    for authority in &decision.authorities_used {
+        let Some(id) = authority
+            .strip_prefix("kip:approval:")
+            .and_then(|value| value.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        if seen.insert(id) {
+            store.governance.consume_approval(id).await?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

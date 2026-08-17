@@ -33,7 +33,10 @@ use anda_kip::{ElementKind, Json, KipError, Map, Receipt, ReceiptStatus};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::error::db_error;
-use crate::governance::{AuthContext, EffectiveAuthority, Permission, ResourceContext};
+use crate::governance::store::MutationEntry;
+use crate::governance::{
+    AuthContext, Authorization, EffectiveAuthority, Permission, ResourceContext,
+};
 use crate::id::ElementId;
 use crate::schema::SchemaEnvironment;
 use crate::store::rows::*;
@@ -68,6 +71,9 @@ pub struct Transaction {
     staged: BTreeMap<ElementId, Staged>,
     shells: Vec<ElementId>,
     warnings: Vec<String>,
+    purges: BTreeSet<ElementId>,
+    approval_decisions: Vec<Authorization>,
+    governance_audit: Vec<MutationEntry>,
 }
 
 /// One element this transaction will write.
@@ -103,6 +109,9 @@ impl Transaction {
             staged: BTreeMap::new(),
             shells: Vec::new(),
             warnings: Vec::new(),
+            purges: BTreeSet::new(),
+            approval_decisions: Vec::new(),
+            governance_audit: Vec::new(),
         })
     }
 
@@ -242,6 +251,27 @@ impl Transaction {
                 op,
             },
         );
+    }
+
+    /// Stages an identity stub and defers destruction of its old versions.
+    pub async fn stage_purge(&mut self, id: ElementId, row: Element) -> Result<(), KipError> {
+        self.load(id).await?;
+        let staged = self.staged.get_mut(&id).expect("loaded above");
+        staged.row = row;
+        staged.changed = true;
+        staged.op = "purge";
+        self.purges.insert(id);
+        Ok(())
+    }
+
+    /// Defers spending approvals until this transaction commits successfully.
+    pub fn defer_approval(&mut self, decision: Authorization) {
+        self.approval_decisions.push(decision);
+    }
+
+    /// Defers a Governance audit entry until this transaction commits.
+    pub fn defer_governance_audit(&mut self, entry: MutationEntry) {
+        self.governance_audit.push(entry);
     }
 
     /// Loads an existing element for modification, or returns the staged copy.
@@ -615,6 +645,9 @@ impl Transaction {
             } else {
                 staged.row.version().saturating_add(1)
             };
+            if self.purges.contains(&id) {
+                self.store.purge_versions(&self.cx.space, id).await?;
+            }
             self.write(id, staged.row, version, staged.op, staged.is_new)
                 .await?;
             changes.push(change_record(id, staged.op, version));
@@ -644,6 +677,12 @@ impl Transaction {
                 },
             )
             .await?;
+        for entry in std::mem::take(&mut self.governance_audit) {
+            self.store.governance.record_mutation(entry).await?;
+        }
+        for decision in &self.approval_decisions {
+            crate::governance::approval::consume(&self.store, decision).await?;
+        }
         self.store.flush(now_ms()).await?;
 
         Ok(Outcome {

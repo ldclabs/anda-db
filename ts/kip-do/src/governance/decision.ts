@@ -73,6 +73,7 @@ import {
   asScope,
   asStatement,
   conditionsContain,
+  constraintsContain,
   delegationId,
   emptyConditions,
   emptyConstraints,
@@ -214,7 +215,16 @@ export interface Authorization {
  * for the state it was protecting (§107, §267).
  */
 export function requirePermitted(decision: Authorization): Authorization {
-  if (isPermitted(decision.decision)) return decision
+  if (isPermitted(decision.decision)) {
+    if (decision.obligations.redaction_profile !== '') {
+      throw errors.notAuthorized(
+        `the policy requires redaction profile ${JSON.stringify(
+          decision.obligations.redaction_profile,
+        )}, which this engine cannot enforce`,
+      )
+    }
+    return decision
+  }
   if (decision.decision === 'require_approval') {
     throw errors.requiresApproval(
       `${decision.permission} requires an independent approval that has not ` +
@@ -233,6 +243,8 @@ interface Candidate {
   scope: AuthorityScope
   conditions: AuthorityConditions
   constraints: AuthorityConstraints
+  /** Whether this authority may originate a child Delegation. */
+  delegationAllowed: boolean
 }
 
 /** Whether this authority narrows nothing at all. */
@@ -339,23 +351,34 @@ export class EffectiveAuthority {
     at: string,
   ): EffectiveAuthority {
     const gov = store.governance
-    const space = requireSpace(store, spaceId)
-    const principal = requirePrincipal(store, auth.principal_id)
-    const groups = gov.groupsOfAt(auth.principal_id, at)
-    const isOwner = ownsSpace(space, auth.principal_id)
+    const space = gov.spaceAt(spaceId, at)
+    if (space === null) {
+      throw errors.notFoundOrNotVisible(`no MemorySpace ${spaceId} at ${at}`)
+    }
+    const principal = gov.principalAt(auth.principal_id, at)
+    if (principal === null) {
+      throw errors.unauthenticated(
+        `no Principal ${JSON.stringify(auth.principal_id)} existed at ${at}`,
+      )
+    }
+    const live = principal.status === govStatus.ACTIVE
+    const groups = live ? gov.groupsOfAt(auth.principal_id, at) : []
+    const isOwner = live && ownsSpace(space, auth.principal_id)
 
     const candidates: Candidate[] = []
-    for (const grant of gov.grantsAt(spaceId, auth.principal_id, groups, at)) {
-      candidates.push(candidateOfGrant(grant))
-    }
-    for (const delegation of gov.delegationsAt(spaceId, auth.principal_id, at)) {
-      const candidate = EffectiveAuthority.#resolveDelegation(
-        store,
-        spaceId,
-        delegation,
-        0,
-      )
-      if (candidate !== null) candidates.push(candidate)
+    if (live) {
+      for (const grant of gov.grantsAt(spaceId, auth.principal_id, groups, at)) {
+        candidates.push(candidateOfGrant(grant))
+      }
+      for (const delegation of gov.delegationsAt(spaceId, auth.principal_id, at)) {
+        const candidate = EffectiveAuthority.#resolveDelegation(
+          store,
+          spaceId,
+          delegation,
+          0,
+        )
+        if (candidate !== null) candidates.push(candidate)
+      }
     }
 
     return new EffectiveAuthority({
@@ -367,7 +390,7 @@ export class EffectiveAuthority {
         space.default_policy_id === ''
           ? null
           : gov.policyAt(space.default_policy_id, at),
-      bindings: gov.bindingsAt(auth.principal_id, spaceId, at),
+      bindings: live ? gov.bindingsAt(auth.principal_id, spaceId, at) : [],
       candidates,
     })
   }
@@ -436,6 +459,7 @@ export class EffectiveAuthority {
         scope: emptyScope(),
         conditions: emptyConditions(),
         constraints: { ...emptyConstraints(), export: true },
+        delegationAllowed: true,
       })
     }
     for (const candidate of this.candidates) {
@@ -458,6 +482,7 @@ export class EffectiveAuthority {
         scope: statement.resource,
         conditions: statement.conditions,
         constraints: statement.constraints,
+        delegationAllowed: false,
       })
     }
 
@@ -610,12 +635,15 @@ export class EffectiveAuthority {
     action: string,
     scope: AuthorityScope,
     conditions: AuthorityConditions,
+    constraints: AuthorityConstraints,
   ): boolean {
     return this.candidates.some(
       (candidate) =>
+        candidate.delegationAllowed &&
         candidate.actions.includes(action) &&
         scopeContains(candidate.scope, scope) &&
-        conditionsContain(candidate.conditions, conditions),
+        conditionsContain(candidate.conditions, conditions) &&
+        constraintsContain(candidate.constraints, constraints),
     )
   }
 
@@ -714,15 +742,62 @@ export class EffectiveAuthority {
     const conditions = asConditions(delegation.conditions)
     const constraints = asConstraints(delegation.constraints)
 
+    if (delegation.parent_delegation !== '') {
+      const parentId = rowIdOf(delegation.parent_delegation)
+      const linked = parentId === null ? null : store.governance.delegation(parentId)
+      if (
+        linked === null ||
+        linked.status !== govStatus.ACTIVE ||
+        linked.space_id !== spaceId ||
+        linked.delegate_principal !== delegation.delegator_principal ||
+        linked.may_redelegate !== 1
+      ) {
+        return null
+      }
+      const inherited = EffectiveAuthority.#resolveDelegation(
+        store,
+        spaceId,
+        linked,
+        depth + 1,
+      )
+      if (
+        inherited === null ||
+        !scopeContains(inherited.scope, scope) ||
+        !conditionsContain(inherited.conditions, conditions) ||
+        !constraintsContain(inherited.constraints, constraints)
+      ) {
+        return null
+      }
+      const actions = delegation.actions.filter(
+        (action) => isPermission(action) && inherited.actions.includes(action),
+      )
+      if (actions.length === 0) return null
+      return {
+        id: delegationId(delegation.id),
+        actions,
+        scope,
+        conditions,
+        constraints,
+        delegationAllowed: false,
+      }
+    }
+
     // §31: the delegated actions are what the delegator can actually confer
     // right now, not what the record says it once could.
     const actions = delegation.actions.filter((action) => {
       if (!isPermission(action)) return false
       if (parent.isOwner) return true
-      return parent.confersForDelegation(action, scope, conditions)
+      return parent.confersForDelegation(action, scope, conditions, constraints)
     })
     if (actions.length === 0) return null
-    return { id: delegationId(delegation.id), actions, scope, conditions, constraints }
+    return {
+      id: delegationId(delegation.id),
+      actions,
+      scope,
+      conditions,
+      constraints,
+      delegationAllowed: false,
+    }
   }
 
   /**
@@ -906,6 +981,7 @@ function candidateOfGrant(grant: GrantRow): Candidate {
     scope: asScope(grant.scope),
     conditions: asConditions(grant.conditions),
     constraints: asConstraints(grant.constraints),
+    delegationAllowed: grant.delegation_allowed === 1,
   }
 }
 

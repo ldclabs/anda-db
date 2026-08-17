@@ -89,6 +89,18 @@ impl Store {
         Ok(destroyed)
     }
 
+    /// Counts the historical versions a staged purge will destroy at commit.
+    pub async fn version_count(&self, space_id: &str, id: ElementId) -> Result<usize, KipError> {
+        self.element_versions()
+            .query_all_ids(Filter::And(vec![
+                Box::new(eq_field("space", Fv::Text(space_id.to_string()))),
+                Box::new(eq_field("element", Fv::Text(id.to_string()))),
+            ]))
+            .await
+            .map(|ids| ids.len())
+            .map_err(db_error)
+    }
+
     /// One element as it stood at a coordinate, or `None` when it did not
     /// exist yet.
     pub async fn element_at(

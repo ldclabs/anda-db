@@ -77,6 +77,7 @@ export class Context {
   private readonly elements = new Map<string, Element | null>()
   private readonly views = new Map<string, JsonMap>()
   private readonly reconstructed = new Map<ElementKind, Element[]>()
+  private governedResultLimit: number | null
 
   constructor(
     store: Store,
@@ -92,6 +93,11 @@ export class Context {
     this.authority = authority
     this.auth = auth
     this.asOf = asOf
+    this.governedResultLimit = authority.authorize(
+      'read',
+      spaceResource(),
+      auth,
+    ).constraints.max_results
     this.readOrigin = isPermittedRead(authority, auth)
   }
 
@@ -194,10 +200,21 @@ export class Context {
     if (element === null || element.row.space !== this.space) return null
     const constraints = this.authority.mayRead(element, this.auth)
     if (constraints === null) return null
+    if (constraints.max_results !== null) {
+      this.governedResultLimit =
+        this.governedResultLimit === null
+          ? constraints.max_results
+          : Math.min(this.governedResultLimit, constraints.max_results)
+    }
     const view = render(element)
     redactView(view, constraints, this.readOrigin)
     this.views.set(key, view)
     return element
+  }
+
+  /** The tightest result cap carried by an authority used by this read. */
+  resultLimit(): number | null {
+    return this.governedResultLimit
   }
 
   /** The SQL table one kind lives in. */

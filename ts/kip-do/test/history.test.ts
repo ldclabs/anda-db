@@ -180,6 +180,46 @@ describe('AS OF', () => {
       expect(nexus.query(`${FIND} AS OF SEQ 1`)).toEqual(['Alice'])
     })
   })
+
+  it('reconstructs STRUCTURAL edges instead of reading the current index', async () => {
+    await withNexus('historical-structural', (nexus) => {
+      nexus.execute(`MUTATE {
+        CREATE CONCEPT ?s1 { TYPE "ExperienceStep" NAME "Step one" SET ATTRIBUTES {step_kind: "action", summary: "one"} }
+        CREATE CONCEPT ?s2 { TYPE "ExperienceStep" NAME "Step two" SET ATTRIBUTES {step_kind: "action", summary: "two"} }
+        CREATE CONCEPT ?exp {
+          TYPE "Experience" NAME "Deploy"
+          SET ATTRIBUTES {goal: "ship", outcome_status: "success"}
+          SET STRUCTURAL { ("has_step", ?s1) }
+        }
+      }`)
+      nexus.execute(
+        `UPDATE "C-3"
+           SET STRUCTURAL { ("has_step", :new) }
+           UNSET STRUCTURAL { ("has_step", :old) }`,
+        { new: 'C-2', old: 'C-1' },
+      )
+      const find = `FIND(?step.name) WHERE {
+        ?exp CONCEPT {name: "Deploy"}
+        STRUCTURAL (?exp, "has_step", ?step)
+      }`
+      expect(nexus.query(find)).toEqual(['Step two'])
+      expect(nexus.query(`${find} AS OF SEQ 1`)).toEqual(['Step one'])
+    })
+  })
+
+  it('gives a later Schema activation its own snapshot coordinate', async () => {
+    await withNexus('schema-coordinate', (nexus) => {
+      nexus.execute('CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }')
+      const before = nexus.environment().version
+      nexus.activatePackages([])
+      const snapshot = nexus.describe('SNAPSHOT') as {
+        snapshot_seq: number
+        schema_environment_version: number
+      }
+      expect(snapshot.snapshot_seq).toBe(2)
+      expect(snapshot.schema_environment_version).toBe(before + 1)
+    })
+  })
 })
 
 describe('SNAPSHOT', () => {

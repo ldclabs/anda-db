@@ -183,7 +183,17 @@ impl Authorization {
     /// disclosure channel for the state it was protecting (§107, §267).
     pub fn into_result(self) -> Result<Self, KipError> {
         match self.decision {
-            Decision::Allow | Decision::AllowWithConstraints => Ok(self),
+            Decision::Allow | Decision::AllowWithConstraints
+                if self.obligations.redaction_profile.is_empty() =>
+            {
+                Ok(self)
+            }
+            Decision::Allow | Decision::AllowWithConstraints => {
+                Err(KipError::not_authorized(format!(
+                    "the policy requires redaction profile {:?}, which this engine cannot enforce",
+                    self.obligations.redaction_profile
+                )))
+            }
             Decision::RequireApproval => Err(KipError::requires_approval(format!(
                 "{} requires an independent approval that has not been recorded",
                 self.permission
@@ -204,6 +214,8 @@ struct Candidate {
     scope: AuthorityScope,
     conditions: AuthorityConditions,
     constraints: AuthorityConstraints,
+    /// Whether this authority may originate a child Delegation.
+    delegation_allowed: bool,
 }
 
 impl Candidate {
@@ -368,33 +380,43 @@ impl EffectiveAuthority {
         at: &str,
     ) -> Result<Self, KipError> {
         let governance = &store.governance;
-        let space = store.get_space(space_id).await?;
+        let current_space = store.get_space(space_id).await?;
+        let space = governance.space_at(&current_space, at).await?;
         let principal = governance
-            .find_principal(&auth.principal_id)
+            .principal_at(&auth.principal_id, at)
             .await?
             .ok_or_else(|| {
                 KipError::unauthenticated(format!(
-                    "no Principal {:?} is registered in this Nexus",
+                    "no Principal {:?} existed at {at}",
                     auth.principal_id
                 ))
             })?;
-        let groups = governance.groups_of_at(&auth.principal_id, at).await?;
-        let is_owner = space.owner_principal == auth.principal_id
-            || space.owners.iter().any(|owner| owner == &auth.principal_id);
+        let live = principal.status == status::ACTIVE;
+        let groups = if live {
+            governance.groups_of_at(&auth.principal_id, at).await?
+        } else {
+            Vec::new()
+        };
+        let is_owner = live
+            && (space.owner_principal == auth.principal_id
+                || space.owners.iter().any(|owner| owner == &auth.principal_id));
 
         let mut candidates = Vec::new();
-        for grant in governance
-            .grants_at(space_id, &auth.principal_id, &groups, at)
-            .await?
-        {
-            candidates.push(candidate_of_grant(&grant)?);
-        }
-        for delegation in governance
-            .delegations_at(space_id, &auth.principal_id, at)
-            .await?
-        {
-            if let Some(candidate) = resolve_delegation(store, space_id, &delegation, 0).await? {
-                candidates.push(candidate);
+        if live {
+            for grant in governance
+                .grants_at(space_id, &auth.principal_id, &groups, at)
+                .await?
+            {
+                candidates.push(candidate_of_grant(&grant)?);
+            }
+            for delegation in governance
+                .delegations_at(space_id, &auth.principal_id, at)
+                .await?
+            {
+                if let Some(candidate) = resolve_delegation(store, space_id, &delegation, 0).await?
+                {
+                    candidates.push(candidate);
+                }
             }
         }
 
@@ -403,9 +425,13 @@ impl EffectiveAuthority {
         } else {
             governance.policy_at(&space.default_policy_id, at).await?
         };
-        let bindings = governance
-            .bindings_at(&auth.principal_id, space_id, at)
-            .await?;
+        let bindings = if live {
+            governance
+                .bindings_at(&auth.principal_id, space_id, at)
+                .await?
+        } else {
+            Vec::new()
+        };
 
         Ok(Self {
             space,
@@ -490,6 +516,7 @@ impl EffectiveAuthority {
                     export: true,
                     ..Default::default()
                 },
+                delegation_allowed: true,
             });
         }
         for candidate in &self.candidates {
@@ -511,6 +538,7 @@ impl EffectiveAuthority {
                 scope: statement.resource.clone(),
                 conditions: statement.conditions.clone(),
                 constraints: statement.constraints.clone(),
+                delegation_allowed: false,
             });
         }
 
@@ -794,6 +822,7 @@ fn candidate_of_grant(grant: &GrantRow) -> Result<Candidate, KipError> {
         scope: parse_or_default(&grant.scope),
         conditions: parse_or_default(&grant.conditions),
         constraints: parse_or_default(&grant.constraints),
+        delegation_allowed: grant.delegation_allowed,
     })
 }
 
@@ -812,6 +841,54 @@ async fn resolve_delegation(
     if depth >= MAX_DELEGATION_DEPTH {
         return Ok(None);
     }
+    let scope: AuthorityScope = parse_or_default(&delegation.scope);
+    let conditions: AuthorityConditions = parse_or_default(&delegation.conditions);
+    let constraints: AuthorityConstraints = parse_or_default(&delegation.constraints);
+
+    if !delegation.parent_delegation.is_empty() {
+        let Some(parent_id) = super::store::row_id_of(&delegation.parent_delegation) else {
+            return Ok(None);
+        };
+        let Some(linked) = store.governance.delegation(parent_id).await? else {
+            return Ok(None);
+        };
+        if linked.status != status::ACTIVE
+            || linked.space_id != space_id
+            || linked.delegate_principal != delegation.delegator_principal
+            || !linked.may_redelegate
+        {
+            return Ok(None);
+        }
+        let Some(inherited) =
+            Box::pin(resolve_delegation(store, space_id, &linked, depth + 1)).await?
+        else {
+            return Ok(None);
+        };
+        if !inherited.scope.contains(&scope)
+            || !inherited.conditions.contains(&conditions)
+            || !inherited.constraints.contains(&constraints)
+        {
+            return Ok(None);
+        }
+        let actions: Vec<String> = delegation
+            .actions
+            .iter()
+            .filter(|action| inherited.actions.contains(action))
+            .cloned()
+            .collect();
+        if actions.is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(Candidate {
+            id: delegation_id(delegation._id),
+            actions,
+            scope,
+            conditions,
+            constraints,
+            delegation_allowed: false,
+        }));
+    }
+
     let parent = Box::pin(EffectiveAuthority::resolve_at_depth(
         store,
         space_id,
@@ -821,10 +898,6 @@ async fn resolve_delegation(
     ))
     .await?;
 
-    let scope: AuthorityScope = parse_or_default(&delegation.scope);
-    let conditions: AuthorityConditions = parse_or_default(&delegation.conditions);
-    let constraints: AuthorityConstraints = parse_or_default(&delegation.constraints);
-
     // §31: the delegated actions are what the delegator can actually confer
     // right now, not what the record says it once could.
     let actions: Vec<String> = delegation
@@ -833,12 +906,14 @@ async fn resolve_delegation(
         .filter(|action| {
             Permission::parse(action).is_ok_and(|permission| {
                 parent.candidates.iter().any(|candidate| {
-                    candidate
-                        .actions
-                        .iter()
-                        .any(|held| held == permission.as_str())
+                    candidate.delegation_allowed
+                        && candidate
+                            .actions
+                            .iter()
+                            .any(|held| held == permission.as_str())
                         && candidate.scope.contains(&scope)
                         && candidate.conditions.contains(&conditions)
+                        && candidate.constraints.contains(&constraints)
                 }) || parent.is_owner
             })
         })
@@ -853,6 +928,7 @@ async fn resolve_delegation(
         scope,
         conditions,
         constraints,
+        delegation_allowed: false,
     }))
 }
 
@@ -1021,6 +1097,7 @@ mod tests {
                 export: true,
                 ..Default::default()
             },
+            delegation_allowed: false,
         };
         let narrow = Candidate {
             id: "narrow".into(),
@@ -1035,6 +1112,7 @@ mod tests {
                 max_results: Some(5),
                 ..Default::default()
             },
+            delegation_allowed: false,
         };
         assert!(narrow.restrictiveness() > broad.restrictiveness());
     }

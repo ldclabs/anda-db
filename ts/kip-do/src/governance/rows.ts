@@ -510,9 +510,17 @@ export function asConditions(value: unknown): AuthorityConditions {
 /** Reads an {@link AuthorityConstraints} from a stored value. */
 export function asConstraints(value: unknown): AuthorityConstraints {
   const raw = (value ?? {}) as Record<string, unknown>
+  const maxResults = raw.max_results
   return {
     fields: strings(raw.fields),
-    max_results: typeof raw.max_results === 'number' ? raw.max_results : null,
+    max_results:
+      maxResults === undefined || maxResults === null
+        ? null
+        : typeof maxResults === 'number' &&
+            Number.isSafeInteger(maxResults) &&
+            maxResults >= 0
+          ? maxResults
+          : 0,
     max_influence_authority: text(raw.max_influence_authority),
     max_classification: text(raw.max_classification),
     export: flag(raw.export),
@@ -669,6 +677,33 @@ export function tightenConstraints(
     ),
     export: a.export && b.export,
   }
+}
+
+/** Whether `child` stays inside every constraint imposed by `parent`. */
+export function constraintsContain(
+  parent: AuthorityConstraints,
+  child: AuthorityConstraints,
+): boolean {
+  const boundedNumber =
+    parent.max_results === null ||
+    (child.max_results !== null && child.max_results <= parent.max_results)
+  const boundedAuthority =
+    parent.max_influence_authority === '' ||
+    (child.max_influence_authority !== '' &&
+      authority.rank(child.max_influence_authority) <=
+        authority.rank(parent.max_influence_authority))
+  const boundedClassification =
+    parent.max_classification === '' ||
+    (child.max_classification !== '' &&
+      classification.rank(child.max_classification) <=
+        classification.rank(parent.max_classification))
+  return (
+    narrows(parent.fields, child.fields) &&
+    boundedNumber &&
+    boundedAuthority &&
+    boundedClassification &&
+    (parent.export || !child.export)
+  )
 }
 
 /** The lower of two ranked names, treating empty as "no ceiling stated". */

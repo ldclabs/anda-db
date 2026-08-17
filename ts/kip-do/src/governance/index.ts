@@ -48,7 +48,11 @@ export {
   type ResourceContext,
 } from './decision.js'
 
-export { resolveApproval, subjectDigest } from './approval.js'
+export {
+  consumeResolvedApprovals,
+  resolveApproval,
+  subjectDigest,
+} from './approval.js'
 
 export { redactView } from './redact.js'
 
@@ -94,6 +98,7 @@ export {
   auditId,
   bindingId,
   conditionsContain,
+  constraintsContain,
   delegationId,
   emptyConditions,
   emptyConstraints,

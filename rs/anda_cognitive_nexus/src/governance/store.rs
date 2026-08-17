@@ -32,6 +32,7 @@ use std::sync::Arc;
 
 use super::rows::*;
 use crate::error::{db_error, reopen_error, schema_error};
+use crate::store::rows::SpaceRow;
 use crate::store::{Slot, eq_field, eq_fields, full_row_fields};
 use crate::time;
 
@@ -345,6 +346,7 @@ impl GovernanceStore {
         let row = PrincipalRow { _id: id, ..row };
         self.record_mutation(MutationEntry {
             operation: "create_principal",
+            at: row.created_at.clone(),
             resource: row.principal_id.clone(),
             record: json_of(&row)?,
             ..Default::default()
@@ -360,6 +362,67 @@ impl GovernanceStore {
             eq_field("principal_id", Fv::Text(id.to_string())),
         )
         .await
+    }
+
+    /// The Principal record that was current at an instant.
+    pub async fn principal_at(
+        &self,
+        principal_id: &str,
+        at: &str,
+    ) -> Result<Option<PrincipalRow>, KipError> {
+        let mut rows: Vec<GovernanceAuditRow> = self
+            .all_rows(
+                &self.audit.get(),
+                eq_field("operation", Fv::Text("create_principal".to_string())),
+            )
+            .await?;
+        rows.extend(
+            self.all_rows(
+                &self.audit.get(),
+                eq_field("operation", Fv::Text("set_principal_status".to_string())),
+            )
+            .await?,
+        );
+        let has_history = !rows.is_empty();
+        let latest = rows
+            .into_iter()
+            .filter(|row| row.resource == principal_id && row.at.as_str() <= at)
+            .max_by(|a, b| (a.at.as_str(), a._id).cmp(&(b.at.as_str(), b._id)));
+        match latest {
+            Some(row) => serde_json::from_value(row.record)
+                .map(Some)
+                .map_err(|err| KipError::internal_error(format!("historical Principal: {err}"))),
+            None if has_history => Ok(None),
+            None => self.find_principal(principal_id).await,
+        }
+    }
+
+    /// The MemorySpace governance record that was current at an instant.
+    pub async fn space_at(&self, current: &SpaceRow, at: &str) -> Result<SpaceRow, KipError> {
+        let rows: Vec<GovernanceAuditRow> = self
+            .all_rows(
+                &self.audit.get(),
+                eq_field("space_id", Fv::Text(current.space_id.clone())),
+            )
+            .await?;
+        let has_history = !rows.is_empty();
+        let latest = rows
+            .into_iter()
+            .filter(|row| {
+                row.resource == current.space_id
+                    && row.at.as_str() <= at
+                    && matches!(row.operation.as_str(), "create_space" | "put_space")
+            })
+            .max_by(|a, b| (a.at.as_str(), a._id).cmp(&(b.at.as_str(), b._id)));
+        match latest {
+            Some(row) => serde_json::from_value(row.record)
+                .map_err(|err| KipError::internal_error(format!("historical MemorySpace: {err}"))),
+            None if has_history => Err(KipError::not_found_or_not_visible(format!(
+                "MemorySpace {:?} did not exist at {at}",
+                current.space_id
+            ))),
+            None => Ok(current.clone()),
+        }
     }
 
     /// Moves a Principal to a new lifecycle status (§9).
@@ -387,6 +450,7 @@ impl GovernanceStore {
         self.put(&self.principals.get(), row._id, &row).await?;
         self.record_mutation(MutationEntry {
             operation: "set_principal_status",
+            at: row.updated_at.clone(),
             resource: row.principal_id.clone(),
             principal_id: actor.to_string(),
             record: json_of(&row)?,
@@ -438,6 +502,7 @@ impl GovernanceStore {
         };
         self.record_mutation(MutationEntry {
             operation: "put_group",
+            at: row.updated_at.clone(),
             resource: row.group_id.clone(),
             principal_id: actor.to_string(),
             record: json_of(&row)?,
@@ -585,6 +650,7 @@ impl GovernanceStore {
         let row = GrantRow { _id: id, ..row };
         self.record_mutation(MutationEntry {
             operation: "create_grant",
+            at: row.created_at.clone(),
             space_id: row.space_id.clone(),
             resource: grant_id(id),
             principal_id: actor.to_string(),
@@ -609,6 +675,7 @@ impl GovernanceStore {
         self.put(&self.grants.get(), id, &row).await?;
         self.record_mutation(MutationEntry {
             operation: "revoke_grant",
+            at: row.updated_at.clone(),
             space_id: row.space_id.clone(),
             resource: grant_id(id),
             principal_id: actor.to_string(),
@@ -821,6 +888,7 @@ impl GovernanceStore {
         let row = DelegationRow { _id: id, ..row };
         self.record_mutation(MutationEntry {
             operation: "create_delegation",
+            at: row.created_at.clone(),
             space_id: row.space_id.clone(),
             resource: delegation_id(id),
             principal_id: actor.to_string(),
@@ -845,6 +913,7 @@ impl GovernanceStore {
         self.put(&self.delegations.get(), id, &row).await?;
         self.record_mutation(MutationEntry {
             operation: "revoke_delegation",
+            at: row.updated_at.clone(),
             space_id: row.space_id.clone(),
             resource: delegation_id(id),
             principal_id: actor.to_string(),
@@ -919,6 +988,7 @@ impl GovernanceStore {
         let row = GovernancePolicyRow { _id: id, ..row };
         self.record_mutation(MutationEntry {
             operation: "publish_policy",
+            at: row.created_at.clone(),
             space_id: row.space_id.clone(),
             resource: row.policy_ref.clone(),
             principal_id: actor.to_string(),
@@ -1012,6 +1082,7 @@ impl GovernanceStore {
         let row = ApprovalRow { _id: id, ..row };
         self.record_mutation(MutationEntry {
             operation: "request_approval",
+            at: row.created_at.clone(),
             space_id: row.space_id.clone(),
             resource: approval_id(id),
             principal_id: actor.to_string(),
@@ -1071,6 +1142,7 @@ impl GovernanceStore {
         self.put(&self.approvals.get(), id, &row).await?;
         self.record_mutation(MutationEntry {
             operation: "approve",
+            at: row.updated_at.clone(),
             space_id: row.space_id.clone(),
             resource: approval_id(id),
             principal_id: approver.to_string(),
@@ -1095,6 +1167,7 @@ impl GovernanceStore {
         self.put(&self.approvals.get(), id, &row).await?;
         self.record_mutation(MutationEntry {
             operation: "consume_approval",
+            at: row.updated_at.clone(),
             space_id: row.space_id.clone(),
             resource: approval_id(id),
             principal_id: String::new(),
@@ -1142,7 +1215,11 @@ impl GovernanceStore {
         let row = GovernanceAuditRow {
             _id: 0,
             entry_class: "mutation".to_string(),
-            at: time::now(),
+            at: if entry.at.is_empty() {
+                time::now()
+            } else {
+                entry.at
+            },
             space_id: if entry.space_id.is_empty() {
                 ANY_SPACE.to_string()
             } else {
@@ -1232,6 +1309,8 @@ impl GovernanceStore {
 pub struct MutationEntry {
     /// The Governance verb, e.g. `create_grant`.
     pub operation: &'static str,
+    /// The instant the new record became current; empty uses the audit instant.
+    pub at: String,
     /// The Space it concerned; empty becomes `*`.
     pub space_id: String,
     /// What it acted on.

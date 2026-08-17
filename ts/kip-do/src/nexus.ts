@@ -16,6 +16,7 @@ import { errors, KipError } from './errors.js'
 import {
   EffectiveAuthority,
   classify,
+  consumeResolvedApprovals,
   elevateAuthority,
   principalClass,
   quarantine,
@@ -191,19 +192,40 @@ export class CognitiveNexus {
       // symbol lookup somewhere unrelated.
       const version = (current?.version ?? 0) + 1
       const env = SchemaEnvironment.resolve(version, lock, this.artifacts())
+      const snapshotSeq = this.store.currentSeq(space)
+      const firstActivation = current === null
+      const seq = firstActivation ? snapshotSeq + 1 : this.store.nextSeq(space)
+      const activatedAt = nowTime()
+      const txId = firstActivation ? '' : `tx-${space}-${seq}-${activatedAt}`
       this.store.appendSchemaEnv({
         space,
         version,
         lock: lock as unknown as JsonMap,
-        created_at: nowTime(),
-        tx_id: '',
-        // The next coordinate, not the current one: nothing already committed
-        // was written under this environment.
-        seq: this.store.currentSeq(space) + 1,
+        created_at: activatedAt,
+        tx_id: txId,
+        seq,
       })
       const row = this.spaceRow(space)
       row.schema_environment_version = version
       this.store.putSpace(row)
+      if (!firstActivation) {
+        this.store.putTransaction({
+          tx_id: txId,
+          space,
+          seq,
+          snapshot_seq: snapshotSeq,
+          committed_at: activatedAt,
+          status: 'committed',
+          transaction_class: 'governance',
+          idempotency_key: '',
+          request_digest: '',
+          semantic_plan_digest: '',
+          result_digest: '',
+          schema_environment_version: version,
+          result: { schema_environment_version: version },
+          changes: [],
+        })
+      }
       return env
     })
   }
@@ -342,7 +364,7 @@ export class CognitiveNexus {
   mutate(
     statement: KmlStatement,
     params: JsonMap = {},
-    options: Partial<KmlContext> = {},
+    options: MutationOptions = {},
   ): Outcome {
     return this.systemSession().mutate(statement, params, options)
   }
@@ -419,6 +441,14 @@ export interface ReadOptions {
   snapshot_token?: string
 }
 
+/** The execution knobs a caller may vary without changing engine truth. */
+export interface MutationOptions {
+  space?: string
+  operation?: JsonMap
+  idempotencyKey?: string
+  dryRun?: boolean
+}
+
 export class Session {
   readonly nexus: CognitiveNexus
   readonly auth: AuthContext
@@ -460,7 +490,7 @@ export class Session {
     }
     const space = this.nexus.space
     const authority = this.effectiveAuthority(space)
-    this.gate(authority, metaPermissions(parsed.Meta))
+    const decisions = this.gate(authority, metaPermissions(parsed.Meta))
     const cx: MetaContext = {
       store: this.nexus.store,
       space,
@@ -473,7 +503,11 @@ export class Session {
     // `PREVIEW KML` mints shells to allocate ids and then discards them, so it
     // runs inside a transaction like any other mutation path — one that is
     // simply never committed.
-    return this.nexus.transact(() => executeMeta(parsed.Meta, cx))
+    return this.nexus.transact(() => {
+      const result = executeMeta(parsed.Meta, cx)
+      this.consume(decisions)
+      return result
+    })
   }
 
   /** Runs one parsed KQL query. */
@@ -489,8 +523,11 @@ export class Session {
     // them would let the other buy a historical read for the price of an
     // ordinary one, which is the whole reason this argument exists.
     const snapshotToken = options.snapshot_token ?? options.snapshotToken
-    this.gate(authority, kqlPermissions(query, snapshotToken !== undefined))
-    return executeKql(query, {
+    const decisions = this.gate(
+      authority,
+      kqlPermissions(query, snapshotToken !== undefined),
+    )
+    const result = executeKql(query, {
       store: this.nexus.store,
       space,
       env: this.nexus.environment(space),
@@ -503,17 +540,19 @@ export class Session {
       authority,
       auth: this.auth,
     })
+    this.consume(decisions)
+    return result
   }
 
   /** Runs one KML statement, all-or-nothing. */
   mutate(
     statement: KmlStatement,
     params: JsonMap = {},
-    options: Partial<KmlContext> = {},
+    options: MutationOptions = {},
   ): Outcome {
     const space = options.space ?? this.nexus.space
     const authority = this.effectiveAuthority(space)
-    this.gate(authority, kmlPermissions(statement))
+    const decisions = this.gate(authority, kmlPermissions(statement))
     const provenance = accessProvenance(statement, authority, this.auth)
     const cx: KmlContext = {
       store: this.nexus.store,
@@ -522,15 +561,21 @@ export class Session {
       // `_system.origin` records who the runtime *observed*, never what the
       // content claimed (§26). It is the session's Principal, so an element
       // written under a revoked identity stays attributable to it.
-      origin: options.origin ?? this.origin(),
+      origin: this.origin(),
       request: params,
-      ...options,
+      operation: options.operation,
+      idempotencyKey: options.idempotencyKey,
+      dryRun: options.dryRun,
       // After the spread, for the same reason as the read path: identity is not
       // one of the knobs an options object may turn.
       authority,
       auth: this.auth,
     }
-    const outcome = this.nexus.transact(() => executeKml(statement, cx))
+    const outcome = this.nexus.transact(() => {
+      const committed = executeKml(statement, cx)
+      this.consume(decisions)
+      return committed
+    })
     return provenance === null ? outcome : { ...outcome, governance: provenance }
   }
 
@@ -676,9 +721,13 @@ export class Session {
    * that into an allow. An unsatisfied one stays a refusal: `require_approval`
    * is not a soft yes (§40).
    */
-  private gate(authority: EffectiveAuthority, needed: readonly Permission[]): void {
+  private gate(
+    authority: EffectiveAuthority,
+    needed: readonly Permission[],
+  ): Authorization[] {
     const space = authority.space.space_id
     const resource = spaceResource()
+    const decisions: Authorization[] = []
     for (const permission of needed) {
       const decision = resolveApproval(
         this.nexus.store,
@@ -689,9 +738,18 @@ export class Session {
       )
       if (!isPermittedDecision(decision)) {
         this.audit(authority, decision)
-        requirePermitted(decision)
       }
-      if (decision.obligations.audit) this.audit(authority, decision)
+      const permitted = requirePermitted(decision)
+      if (permitted.obligations.audit) this.audit(authority, permitted)
+      decisions.push(permitted)
+    }
+    return decisions
+  }
+
+  /** Spends approvals only after the operation they authorized succeeded. */
+  private consume(decisions: readonly Authorization[]): void {
+    for (const decision of decisions) {
+      consumeResolvedApprovals(this.nexus.store, decision)
     }
   }
 

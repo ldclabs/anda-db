@@ -906,3 +906,32 @@ async fn a_legal_hold_stops_a_purge_that_is_otherwise_authorized() {
     let error = err(&nexus, &format!(r#"PURGE "{third}" CONFIRM "PURGE""#)).await;
     assert_eq!(error.code, "LegalHoldConflict", "{error:?}");
 }
+
+#[tokio::test]
+async fn a_failed_multi_purge_erases_nothing() {
+    let (nexus, created) = seeded("purge_atomicity").await;
+    let first = handle(&created, "e1");
+    let held = handle(&created, "e3");
+    ok(
+        &nexus,
+        &format!(r#"SET RETENTION "{held}" {{ legal_hold: true }}"#),
+    )
+    .await;
+    let error = err(
+        &nexus,
+        &format!(
+            r#"MUTATE {{
+                PURGE "{first}" CONFIRM "PURGE"
+                PURGE "{held}" CONFIRM "PURGE"
+            }}"#
+        ),
+    )
+    .await;
+    assert_eq!(error.code, "LegalHoldConflict", "{error:?}");
+    let still_there = ok(
+        &nexus,
+        &format!(r#"FIND(?c.name) WHERE {{ ?c CONCEPT {{id: "{first}"}} }}"#),
+    )
+    .await;
+    assert_eq!(rows(&still_there), &vec![json!("First")]);
+}

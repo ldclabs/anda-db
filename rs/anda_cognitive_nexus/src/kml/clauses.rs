@@ -700,10 +700,10 @@ fn attribution_permission(tx: &Transaction, actor_key: &str) -> Permission {
 
 /// `PURGE` — physical erasure (§170–§177).
 ///
-/// The one clause that runs outside the transaction it was planned in. Every
-/// other mutation stages a row and commits once; a purge destroys the version
-/// log as well, and doing that inside a transaction that might still abort
-/// would mean a rolled-back statement had already erased history.
+/// The identity stub is staged like every other write. Destruction of the old
+/// version log is deferred until commit, after every clause and every purge
+/// target has passed validation; a statement that later refuses therefore
+/// erases nothing.
 async fn purge(
     store: &Store,
     tx: &mut Transaction,
@@ -747,18 +747,11 @@ async fn purge(
         return Ok(());
     }
     for id in ids {
-        let report = crate::governance::purge::purge(
-            store,
-            &tx.cx.space,
-            id,
-            policy,
-            &tx.authority,
-            &tx.auth,
-        )
-        .await?;
+        let report = crate::governance::purge::stage(store, tx, id, policy).await?;
         tx.warn(format!(
-            "purged {id}: {} historical version(s) destroyed",
-            report.versions_destroyed
+            "purge of {id} staged with {} identity stub(s) and {} historical version(s) scheduled for destruction",
+            report.purged.len(),
+            report.versions_destroyed,
         ));
     }
     Ok(())

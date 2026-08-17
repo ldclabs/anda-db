@@ -451,6 +451,63 @@ async fn one_principal_cannot_satisfy_a_two_party_approval() {
 }
 
 #[tokio::test]
+async fn one_principal_across_two_approval_rows_still_counts_once() {
+    let nexus = fresh("approval_rows").await;
+    let gov = nexus.governance();
+    let resource = anda_cognitive_nexus::governance::ResourceContext::default();
+    let digest = anda_cognitive_nexus::governance::approval::subject_digest(
+        DEFAULT_SPACE,
+        anda_cognitive_nexus::governance::Permission::Export,
+        &resource,
+    );
+    let reviewer = agent(gov, "kip:principal:reviewer").await;
+    for requester in ["kip:principal:requester-a", "kip:principal:requester-b"] {
+        let approval = gov
+            .request_approval(
+                ApprovalDraft {
+                    space_id: DEFAULT_SPACE.into(),
+                    operation: "export".into(),
+                    resource: "the Space".into(),
+                    subject_digest: digest.clone(),
+                    required: 1,
+                    ..Default::default()
+                },
+                requester,
+            )
+            .await
+            .unwrap();
+        gov.approve(approval._id, &reviewer, "").await.unwrap();
+    }
+    let decision = anda_cognitive_nexus::governance::Authorization {
+        decision: anda_cognitive_nexus::governance::Decision::RequireApproval,
+        permission: anda_cognitive_nexus::governance::Permission::Export,
+        constraints: AuthorityConstraints::default(),
+        obligations: anda_cognitive_nexus::governance::rows::PolicyObligations {
+            approvals_required: 2,
+            ..Default::default()
+        },
+        policy_id: String::new(),
+        policy_version: 0,
+        authorities_used: Vec::new(),
+        unrestricted: false,
+        reason: String::new(),
+    };
+    let resolved = anda_cognitive_nexus::governance::approval::resolve(
+        &nexus.store,
+        DEFAULT_SPACE,
+        &resource,
+        decision,
+        &AuthContext::system(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        resolved.decision,
+        anda_cognitive_nexus::governance::Decision::RequireApproval
+    );
+}
+
+#[tokio::test]
 async fn an_approval_is_bound_to_one_operation() {
     // Without the subject digest, an approval for purging one Evidence record
     // would authorize purging anything.
@@ -1034,6 +1091,44 @@ async fn a_delegation_cannot_confer_what_its_delegator_never_held() {
         "NotAuthorized",
         "the part it never held does not"
     );
+}
+
+#[tokio::test]
+async fn a_grant_that_forbids_delegation_cannot_be_forwarded() {
+    let nexus = stocked("delegation_disabled").await;
+    let gov = nexus.governance();
+    let lead = agent(gov, "kip:principal:lead").await;
+    let sub = agent(gov, "kip:principal:sub").await;
+    gov.create_grant(
+        GrantDraft {
+            space_id: DEFAULT_SPACE.into(),
+            grantee_principal: lead.clone(),
+            actions: vec!["read".into()],
+            delegation_allowed: false,
+            ..Default::default()
+        },
+        SYSTEM_PRINCIPAL,
+    )
+    .await
+    .unwrap();
+    gov.create_delegation(
+        DelegationDraft {
+            space_id: DEFAULT_SPACE.into(),
+            delegator_principal: lead,
+            delegate_principal: sub.clone(),
+            actions: vec!["read".into()],
+            ..Default::default()
+        },
+        SYSTEM_PRINCIPAL,
+    )
+    .await
+    .unwrap();
+    let response = run_as(
+        &nexus.session(AuthContext::principal(&sub)),
+        r#"FIND(?c) WHERE { ?c CONCEPT {} }"#,
+    )
+    .await;
+    assert_eq!(error_code(&response), "NotAuthorized");
 }
 
 #[tokio::test]
@@ -1653,6 +1748,96 @@ async fn a_field_mask_hides_a_value_from_the_filter_as_well_as_the_projection() 
         allowed.first_result().unwrap().as_array().unwrap()[0],
         serde_json::json!("Alice")
     );
+}
+
+#[tokio::test]
+async fn a_read_grants_max_results_caps_the_response() {
+    let nexus = stocked("max_results").await;
+    let owner = nexus.system_session();
+    run_as(
+        &owner,
+        r#"MUTATE {
+            CREATE CONCEPT ?a { TYPE "Person" NAME "Alice" }
+            CREATE CONCEPT ?b { TYPE "Person" NAME "Bob" }
+        }"#,
+    )
+    .await;
+    let reader = agent(nexus.governance(), "kip:principal:bounded-reader").await;
+    nexus
+        .governance()
+        .create_grant(
+            GrantDraft {
+                space_id: DEFAULT_SPACE.into(),
+                grantee_principal: reader.clone(),
+                actions: vec!["read".into()],
+                constraints: AuthorityConstraints {
+                    max_results: Some(1),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            SYSTEM_PRINCIPAL,
+        )
+        .await
+        .unwrap();
+    let response = run_as(
+        &nexus.session(AuthContext::principal(&reader)),
+        r#"FIND(?c.name) WHERE { ?c CONCEPT {} }"#,
+    )
+    .await;
+    assert_eq!(
+        response.first_result().unwrap().as_array().unwrap().len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn an_unavailable_redaction_profile_fails_closed() {
+    let nexus = stocked("redaction_obligation").await;
+    let reader = agent(nexus.governance(), "kip:principal:redacted-reader").await;
+    nexus
+        .governance()
+        .create_grant(
+            GrantDraft {
+                space_id: DEFAULT_SPACE.into(),
+                grantee_principal: reader.clone(),
+                actions: vec!["read".into()],
+                ..Default::default()
+            },
+            SYSTEM_PRINCIPAL,
+        )
+        .await
+        .unwrap();
+    nexus
+        .governance()
+        .publish_policy(
+            PolicyDraft {
+                policy_id: "kip:policy:redaction".into(),
+                space_id: DEFAULT_SPACE.into(),
+                statements: vec![PolicyStatement {
+                    effect: "allow".into(),
+                    actions: vec!["read".into()],
+                    obligations: anda_cognitive_nexus::governance::rows::PolicyObligations {
+                        redaction_profile: "safe-summary".into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            SYSTEM_PRINCIPAL,
+        )
+        .await
+        .unwrap();
+    let mut space = nexus.store.get_space(DEFAULT_SPACE).await.unwrap();
+    space.default_policy_id = "kip:policy:redaction".into();
+    nexus.store.put_space(&space).await.unwrap();
+    let response = run_as(
+        &nexus.session(AuthContext::principal(&reader)),
+        r#"FIND(?c) WHERE { ?c CONCEPT {} }"#,
+    )
+    .await;
+    assert_eq!(error_code(&response), "NotAuthorized");
 }
 
 #[tokio::test]
@@ -2502,6 +2687,73 @@ async fn elevating_authority_needs_its_own_permission() {
 }
 
 #[tokio::test]
+async fn element_governance_changes_join_the_transaction_journal() {
+    let nexus = stocked("governance_journal").await;
+    let owner = nexus.system_session();
+    run_as(
+        &owner,
+        r#"CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }"#,
+    )
+    .await;
+    owner
+        .classify(
+            DEFAULT_SPACE,
+            ElementId::new(anda_kip::ElementKind::Concept, 1),
+            "secret",
+        )
+        .await
+        .unwrap();
+    let response = run_as(&owner, "CHANGES AFTER SEQ 1").await;
+    let transactions = response.first_result().unwrap().as_array().unwrap();
+    assert!(transactions.iter().any(|transaction| {
+        transaction["changes"].as_array().is_some_and(|changes| {
+            changes
+                .iter()
+                .any(|change| change["id"] == "C-1" && change["op"] == "classify")
+        })
+    }));
+}
+
+#[tokio::test]
+async fn elevation_honours_the_grants_influence_ceiling() {
+    let nexus = stocked("elevation_ceiling").await;
+    run_as(
+        &nexus.system_session(),
+        r#"CREATE EVIDENCE ?e { SET FIELDS {evidence_class: "Document", payload: "x"} }"#,
+    )
+    .await;
+    let steward = agent(nexus.governance(), "kip:principal:steward").await;
+    nexus
+        .governance()
+        .create_grant(
+            GrantDraft {
+                space_id: DEFAULT_SPACE.into(),
+                grantee_principal: steward.clone(),
+                actions: vec!["read".into(), "elevate_authority".into()],
+                constraints: AuthorityConstraints {
+                    max_influence_authority: "descriptive".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            SYSTEM_PRINCIPAL,
+        )
+        .await
+        .unwrap();
+    let error = nexus
+        .session(AuthContext::principal(&steward))
+        .elevate_authority(
+            DEFAULT_SPACE,
+            ElementId::new(anda_kip::ElementKind::Evidence, 1),
+            "behavioral",
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.name(), "NotAuthorized");
+    assert!(error.message.contains("ceiling"));
+}
+
+#[tokio::test]
 async fn a_downgrade_does_not_wait_for_anything() {
     // §132: Governance may reduce authority immediately when a source is
     // compromised. An incident response that had to wait would arrive late.
@@ -3273,6 +3525,46 @@ async fn who_had_access_in_january_is_answerable_and_is_not_a_claim_about_today(
             .access_as_of(DEFAULT_SPACE, &while_granted)
             .await
             .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn historical_access_uses_the_principal_status_of_that_instant() {
+    let nexus = stocked("historical_principal_status").await;
+    let gov = nexus.governance();
+    let principal = agent(gov, "kip:principal:returning").await;
+    gov.create_grant(
+        GrantDraft {
+            space_id: DEFAULT_SPACE.into(),
+            grantee_principal: principal.clone(),
+            actions: vec!["read".into()],
+            ..Default::default()
+        },
+        SYSTEM_PRINCIPAL,
+    )
+    .await
+    .unwrap();
+    let suspended = gov
+        .set_principal_status(&principal, status::SUSPENDED, SYSTEM_PRINCIPAL)
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    gov.set_principal_status(&principal, status::ACTIVE, SYSTEM_PRINCIPAL)
+        .await
+        .unwrap();
+
+    let then = anda_cognitive_nexus::governance::EffectiveAuthority::resolve_at(
+        &nexus.store,
+        DEFAULT_SPACE,
+        &AuthContext::principal(&principal),
+        &suspended.updated_at,
+    )
+    .await
+    .unwrap();
+    assert!(
+        then.permission_names(&AuthContext::principal(&principal))
+            .is_empty(),
+        "the Principal was suspended at the requested instant"
     );
 }
 

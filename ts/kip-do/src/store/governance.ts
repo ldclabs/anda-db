@@ -75,6 +75,7 @@ import type { Json, JsonMap } from '../json.js'
 import { endpointKey } from '../term.js'
 import { nowTime } from '../time.js'
 import { decodeRow, insertStatement, updateStatement, type SqlRow } from './codec.js'
+import type { SpaceRow } from './rows.js'
 
 // ---------------------------------------------------------------------------
 // Drafts — what a caller supplies, as opposed to what is stored
@@ -232,6 +233,40 @@ export class GovernanceStore {
       'SELECT * FROM gov_principals WHERE principal_id = ?',
       principalId,
     )
+  }
+
+  /** The Principal record that was current at an instant. */
+  principalAt(principalId: string, at: string): PrincipalRow | null {
+    const history = this.many<GovernanceAuditRow>(
+      'gov_audit',
+      `SELECT * FROM gov_audit
+         WHERE resource = ?
+           AND operation IN ('create_principal', 'set_principal_status')
+         ORDER BY at DESC, id DESC`,
+      principalId,
+    )
+    const row = history.find((entry) => entry.at <= at)
+    if (row !== undefined) return row.record as unknown as PrincipalRow
+    return history.length === 0 ? this.findPrincipal(principalId) : null
+  }
+
+  /** The MemorySpace governance record that was current at an instant. */
+  spaceAt(spaceId: string, at: string): SpaceRow | null {
+    const history = this.many<GovernanceAuditRow>(
+      'gov_audit',
+      `SELECT * FROM gov_audit
+         WHERE resource = ?
+           AND operation IN ('create_space', 'put_space')
+         ORDER BY at DESC, id DESC`,
+      spaceId,
+    )
+    const row = history.find((entry) => entry.at <= at)
+    if (row !== undefined) return row.record as unknown as SpaceRow
+    if (history.length > 0) return null
+    const current = this.sql
+      .exec<SqlRow>('SELECT * FROM spaces WHERE space_id = ?', spaceId)
+      .toArray()[0]
+    return current === undefined ? null : decodeRow<SpaceRow>('spaces', current)
   }
 
   /**
