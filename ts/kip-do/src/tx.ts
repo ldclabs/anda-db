@@ -37,6 +37,7 @@
 
 import { errors } from './errors.js'
 import {
+  classification,
   requirePermitted,
   resourceOfElement,
   spaceResource,
@@ -46,6 +47,7 @@ import {
 } from './governance/index.js'
 import {
   formatElementId,
+  tryParseElementId,
   type ElementId,
   type ElementKind,
 } from './id.js'
@@ -53,6 +55,7 @@ import type { Json, JsonMap } from './json.js'
 import type { SchemaEnvironment } from './schema/index.js'
 import {
   State,
+  classificationOf,
   type AssertionRow,
   type ChangeEntry,
   type ChangeOp,
@@ -68,6 +71,22 @@ import { nowTime } from './time.js'
  * than every reference it happens to carry. An Assertion's Proposition is what
  * it is *about*, not what it was derived from; its Evidence is.
  */
+/**
+ * The element id a stored reference names, or `''` when it names none.
+ *
+ * A reference arrives either as a bare id string or as `{id: "C-1"}`, and both
+ * spellings are on disk: reading only one would make derivation links vanish for
+ * whichever form the writer happened to use.
+ */
+function referenceText(value: unknown): string {
+  if (typeof value === 'string') return value
+  if (value !== null && typeof value === 'object') {
+    const id = (value as { id?: unknown }).id
+    if (typeof id === 'string') return id
+  }
+  return ''
+}
+
 function materialInputs(element: Element): string[] {
   const ids: string[] = []
   const push = (value: unknown) => {
@@ -504,7 +523,7 @@ export class Transaction {
       return this.outcome('no_effect', null, null, [])
     }
 
-    this.recordAuthorityLineage(pending)
+    this.propagateGovernance(pending)
 
     const seq = this.store.nextSeq(this.cx.space)
     const committedAt = nowTime()
@@ -557,32 +576,99 @@ export class Transaction {
   }
 
   /**
-   * Records what each new element was derived from (§99, §127).
+   * Carries classification and authority lineage onto derived elements.
    *
    * At commit rather than per clause: a mutation block is declarative, so an
    * Activity may list its outputs *after* the clause that created them, and a
-   * per-clause walk would miss exactly the inputs that arrived later.
+   * per-clause walk would miss exactly the inputs that arrived later (§21–§24).
    *
-   * Material inputs are read from both the staging map and the store. Reading
-   * only the staged ones made propagation work inside one `MUTATE` and stop
-   * working the moment the Evidence had been written earlier — which is the
-   * ordinary case, and the failure is silent.
+   * Two things travel along those links, in opposite directions:
    *
-   * This records lineage; it does not enforce anything with it. Non-amplification
-   * is checked at elevation, and this engine has no elevation path — so what is
-   * here is the honest half: the record an elevation would need, kept from the
-   * moment it could still be known.
+   * ```text
+   * classification   joins upward    the output is at least as restricted
+   * authority        recorded        the ceiling it may later be raised to
+   * ```
+   *
+   * Classification is applied here because it has to be right the moment the
+   * element becomes readable — *read secret Evidence, summarize, write public
+   * summary* is an exfiltration path if the summary lands public even briefly
+   * (§98, §242). Authority is only *recorded*, because everything is created at
+   * the bottom of the ladder and so cannot exceed anything; the lineage is what
+   * an elevation reads when somebody asks to raise it (§127).
    */
-  private recordAuthorityLineage(pending: [string, Staged][]): void {
-    for (const [, staged] of pending) {
+  private propagateGovernance(pending: [string, Staged][]): void {
+    const derived = this.derivations()
+    for (const [key, staged] of pending) {
       if (!staged.isNew) continue
-      const inputs = materialInputs(staged.element)
+      const inputs = derived.get(key) ?? []
       if (inputs.length === 0) continue
-      staged.element.row.governance = {
-        ...staged.element.row.governance,
-        authority_lineage: inputs,
+
+      const block: JsonMap = { ...staged.element.row.governance }
+      const fallback = this.authority.defaultClassification()
+      const own = classificationOf(staged.element)
+      let joined = own === '' ? fallback : own
+      for (const input of inputs) {
+        joined = classification.join(joined, this.classificationOfInput(input))
+      }
+      // Only stated when it says something the Space default does not: an
+      // element labelled with the default carries no label, which is what keeps
+      // "states none" and "states the default" the same element.
+      if (joined !== fallback) block.classification = joined
+      block.authority_lineage = inputs
+      staged.element.row.governance = block
+    }
+  }
+
+  /**
+   * The material inputs of every new element this transaction stages (§99).
+   *
+   * Two directions, because derivation is recorded from both ends: an element's
+   * own citations, and — walking the other way — the inputs of any Activity that
+   * lists it as an output. A summarizer that records `Activity{inputs: [E-1],
+   * outputs: [E-2]}` has said E-2 came from E-1 without E-2 mentioning E-1.
+   */
+  private derivations(): Map<string, string[]> {
+    const out = new Map<string, string[]>()
+    const add = (target: string, inputs: readonly string[]) => {
+      const found = out.get(target) ?? []
+      for (const input of inputs) {
+        if (input !== target && !found.includes(input)) found.push(input)
+      }
+      out.set(target, found)
+    }
+    for (const [key, staged] of this.staged) {
+      add(key, materialInputs(staged.element))
+    }
+    for (const staged of this.staged.values()) {
+      if (staged.element.kind !== 'Activity') continue
+      const inputs = staged.element.row.inputs.map(referenceText).filter((v) => v !== '')
+      for (const output of staged.element.row.outputs.map(referenceText)) {
+        if (output !== '') add(output, inputs)
       }
     }
+    return out
+  }
+
+  /**
+   * The classification of one derivation input.
+   *
+   * Read from the staging map *and* the store. Reading only the staged ones
+   * makes propagation work inside a single `MUTATE` and stop working the moment
+   * the Evidence was written earlier — which is the ordinary case, and the
+   * failure is silent.
+   *
+   * An input that is not there at all reads as the Space default rather than as
+   * unclassified: §95 forbids letting absence mean `public`.
+   */
+  private classificationOfInput(reference: string): string {
+    const fallback = this.authority.defaultClassification()
+    const id = tryParseElementId(reference)
+    if (id === null) return fallback
+    const staged = this.staged.get(formatElementId(id))
+    const element = staged?.element ?? this.store.load(id)
+    if (element === null) return fallback
+    const label = classificationOf(element)
+    return label === '' ? fallback : label
   }
 
   /**

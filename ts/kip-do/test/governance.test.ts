@@ -27,7 +27,7 @@ import { parseElementId } from '../src/id.js'
 import type { Json } from '../src/json.js'
 import { CognitiveNexus, SYSTEM_PRINCIPAL } from '../src/nexus.js'
 import { COGNITIVE_MEMORY } from '../src/schema/index.js'
-import { Store } from '../src/store/index.js'
+import { Store, classificationOf } from '../src/store/index.js'
 
 /**
  * The Governance plane's storage and its lattices.
@@ -1392,6 +1392,190 @@ describe('the write path', () => {
           SET FIELDS { governance: {classification: "public"} }
         }`),
       ).toThrowError(/governance/i)
+    })
+  })
+})
+
+describe('classification and influence authority', () => {
+  async function withNexus<T>(
+    name: string,
+    body: (nexus: CognitiveNexus) => T,
+  ): Promise<T> {
+    const stub = env.KIP_DB.getByName(`class-${name}`)
+    return await runInDurableObject(stub, (_instance, state) => {
+      const nexus = CognitiveNexus.connect(state.storage)
+      nexus.activatePackages([COGNITIVE_MEMORY])
+      return body(nexus)
+    })
+  }
+
+  const labelOf = (nexus: CognitiveNexus, id: string): string => {
+    const element = nexus.store.load(parseElementId(id))
+    if (element === null) throw new Error(`${id} should exist`)
+    return classificationOf(element)
+  }
+
+  it('carries a secret input’s label onto what was derived from it', async () => {
+    await withNexus('derivation', (nexus) => {
+      const session = nexus.systemSession()
+      session.execute(`CREATE EVIDENCE ?e {
+        SET FIELDS { evidence_class: "Observation", content_digest: "sha256:x" }
+      }`)
+      session.classify(parseElementId('E-1'), 'secret')
+
+      // A summary that cited the secret Evidence. §98/§242: *read secret
+      // Evidence, summarize, write public summary* is an exfiltration path if
+      // the summary lands public even briefly, so the label joins upward at
+      // commit rather than being applied afterwards.
+      session.execute(`CREATE EVIDENCE ?s {
+        SET FIELDS { evidence_class: "Summary", content_digest: "sha256:y" }
+        SET STRUCTURAL { ("source", {id: "E-1"}) }
+      }`)
+      expect(labelOf(nexus, 'E-2')).toBe('secret')
+    })
+  })
+
+  it('joins upward through an Activity’s outputs as well as its inputs', async () => {
+    await withNexus('activity', (nexus) => {
+      const session = nexus.systemSession()
+      session.execute(`CREATE EVIDENCE ?e {
+        SET FIELDS { evidence_class: "Observation", content_digest: "sha256:x" }
+      }`)
+      session.classify(parseElementId('E-1'), 'sensitive')
+
+      // The output never mentions the input; the Activity says it came from
+      // there. A one-directional walk would miss exactly the link a summarizer
+      // leaves behind.
+      session.execute(`MUTATE {
+        CREATE EVIDENCE ?out {
+          SET FIELDS { evidence_class: "Summary", content_digest: "sha256:z" }
+        }
+        CREATE ACTIVITY ?a {
+          SET FIELDS { activity_class: "Consolidation" }
+          SET STRUCTURAL { ("inputs", {id: "E-1"}) ("outputs", ?out) }
+        }
+      }`)
+      expect(labelOf(nexus, 'E-2')).toBe('sensitive')
+    })
+  })
+
+  it('needs declassify to lower a label and only update to raise one', async () => {
+    await withNexus('direction', (nexus) => {
+      const gov = nexus.store.governance
+      gov.ensurePrincipal({ principal_id: 'kip:principal:agent' })
+      gov.createGrant(
+        {
+          space_id: nexus.space,
+          grantee_principal: 'kip:principal:agent',
+          actions: ['create', 'read', 'update'],
+        },
+        SYSTEM_PRINCIPAL,
+      )
+      const session = nexus.session(principalAuth('kip:principal:agent'))
+      session.execute('CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }')
+
+      // Raising is ordinary: an agent that notices it wrote something sensitive
+      // should be able to say so without a Governance ticket.
+      expect(session.classify(parseElementId('C-1'), 'secret')).toBe('')
+      expect(labelOf(nexus, 'C-1')).toBe('secret')
+
+      // Lowering is the direction that discloses, so it is the privileged one.
+      expect(() => session.classify(parseElementId('C-1'), 'public')).toThrowError(
+        /requires the declassify permission/,
+      )
+    })
+  })
+
+  it('refuses to raise a derived artifact past what it was derived from', async () => {
+    await withNexus('non-amplification', (nexus) => {
+      const session = nexus.systemSession()
+      session.execute(`CREATE EVIDENCE ?e {
+        SET FIELDS { evidence_class: "Skill", content_digest: "sha256:x" }
+      }`)
+      session.execute(`CREATE EVIDENCE ?s {
+        SET FIELDS { evidence_class: "Summary", content_digest: "sha256:y" }
+        SET STRUCTURAL { ("source", {id: "E-1"}) }
+      }`)
+
+      // The input is `descriptive`, the bottom of the ladder, so the summary
+      // cannot be raised above it however locally it was written (§127, §243).
+      expect(() =>
+        session.elevateAuthority(parseElementId('E-2'), 'behavioral'),
+      ).toThrowError(/Transformation does not raise authority/)
+
+      // Elevating the input first is the honest route, and then the derived
+      // artifact may follow.
+      session.elevateAuthority(parseElementId('E-1'), 'behavioral')
+      expect(session.elevateAuthority(parseElementId('E-2'), 'behavioral')).toBe(
+        'descriptive',
+      )
+    })
+  })
+
+  it('lets an incident response demote immediately, with no approval', async () => {
+    await withNexus('downgrade', (nexus) => {
+      const session = nexus.systemSession()
+      session.execute(`CREATE EVIDENCE ?e {
+        SET FIELDS { evidence_class: "Skill", content_digest: "sha256:x" }
+      }`)
+      session.elevateAuthority(parseElementId('E-1'), 'executable')
+      // §132: a demotion that had to wait for a Governance ticket would arrive
+      // late, which is the opposite of what the ceiling is for.
+      expect(session.elevateAuthority(parseElementId('E-1'), 'descriptive')).toBe(
+        'executable',
+      )
+    })
+  })
+
+  it('keeps quarantine apart from archival, and from retraction', async () => {
+    await withNexus('quarantine', (nexus) => {
+      const session = nexus.systemSession()
+      session.execute('CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }')
+      session.quarantine(parseElementId('C-1'), 'under review')
+
+      // Ordinary recall excludes it by construction: a pattern naming no state
+      // matches `active`.
+      expect(nexus.query('FIND(?c) WHERE { ?c CONCEPT {type: "Person"} }')).toEqual([])
+      // A reviewer that asks for it by state still sees it — §134: quarantine
+      // says *this Brain does not currently allow ordinary use*, not that the
+      // element was retired or that anybody took anything back.
+      expect(
+        nexus.query(
+          'FIND(?c.governance.quarantine_reason) WHERE { ?c CONCEPT {type: "Person", state: "quarantined"} }',
+        ),
+      ).toEqual(['under review'])
+
+      session.releaseQuarantine(parseElementId('C-1'))
+      expect(nexus.query('FIND(?c) WHERE { ?c CONCEPT {type: "Person"} }')).toHaveLength(1)
+    })
+  })
+
+  it('does not let release revive something archived for another reason', async () => {
+    await withNexus('release-guard', (nexus) => {
+      const session = nexus.systemSession()
+      session.execute('CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }')
+      session.execute('ARCHIVE "C-1"')
+      expect(() => session.releaseQuarantine(parseElementId('C-1'))).toThrowError(
+        /not quarantined/,
+      )
+    })
+  })
+
+  it('records a classification change in the version log and the audit', async () => {
+    await withNexus('records', (nexus) => {
+      const session = nexus.systemSession()
+      session.execute('CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }')
+      session.classify(parseElementId('C-1'), 'secret')
+
+      // The two logs answer different questions: the version log says what the
+      // element looked like, the audit says who decided that and why (§177).
+      const versions = nexus.describe('HISTORY ELEMENT "C-1"') as { op: string }[]
+      expect(versions.map((v) => v.op)).toEqual(['create', 'classify'])
+
+      const entries = session.readAudit()
+      const classified = entries.find((entry) => entry.operation === 'classify')
+      expect(classified?.resource).toBe('C-1')
+      expect((classified?.record as { to?: string })?.to).toBe('secret')
     })
   })
 })

@@ -155,6 +155,32 @@ export function capabilities(): Json {
             '`_system` and `governance` are refused by the parser, on the text ' +
             'and pre-parsed paths alike, so no mutation can reach them',
         },
+        element_operations: {
+          // Host APIs on a Session, not KML clauses: an element's `governance`
+          // block is not author-writable, and the parser refuses it in every
+          // assignment. These are the authorized ways it does change.
+          classify:
+            'raising a label needs `update`, lowering one needs `declassify` — ' +
+            'it is disclosure that requires authority, not caution',
+          elevate_authority:
+            'raising is bounded by the element’s recorded lineage, so no chain ' +
+            'of summarizing turns a descriptive note into an executable one; ' +
+            'lowering needs no approval, because a demotion that waited would ' +
+            'arrive late',
+          quarantine:
+            'a state ordinary recall excludes, distinct from `archived` and ' +
+            'claiming nothing about whether the source retracted anything',
+        },
+        propagation: {
+          classification:
+            'a derived element joins its inputs’ labels upward at commit, ' +
+            'walking an element’s own citations and, the other way, the inputs ' +
+            'of any Activity that lists it as an output',
+          authority:
+            'recorded as `authority_lineage`, not enforced at derivation: ' +
+            'everything is created at the bottom of the ladder, so the rule ' +
+            'holds until somebody asks to raise a ceiling',
+        },
         records: [
           'Principals and Principal groups',
           'ActorBindings',
@@ -174,17 +200,6 @@ export function capabilities(): Json {
       grammar: { parser: parserVersion(), spec_revision: specRevision() },
     },
     unsupported: [
-      {
-        capability: 'classification_writes',
-        detail:
-          'classify / declassify, influence-authority elevation, quarantine, ' +
-          'and the upward join of a derived element’s classification',
-        reason:
-          'a classification label is *read* for every authorization decision — ' +
-          'a Grant’s ceiling and scope both consult it — but nothing writes one ' +
-          'yet, so every element carries the Space default. `authority_lineage` ' +
-          'is recorded at commit, which is a record and not an enforcement',
-      },
       {
         capability: 'set_retention',
         detail: 'the SET RETENTION clause',

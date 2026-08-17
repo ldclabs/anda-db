@@ -39,10 +39,12 @@ here:
   universe at all, a masked field is invisible to `FILTER` as well as to the
   projection, a sweep that reaches something it may not touch fails rather than
   doing less, and a `RETRACT` needs the standing to say the source withdrew its
-  claim. What is not built yet is *writing* classification — labels are read for
-  every decision, and nothing sets one, so every element carries the Space
-  default. `DESCRIBE CAPABILITIES` names that gap rather than letting the word
-  "governance" imply it.
+  claim. Classification is enforced in both directions: a derived element joins
+  its inputs' labels upward at commit — so *read secret Evidence, summarize,
+  write public summary* is not an exfiltration path — while raising a label needs
+  only `update` and lowering one needs `declassify`, because it is disclosure
+  that requires authority rather than caution. `DESCRIBE CAPABILITIES` still
+  names what is left, rather than letting the word "governance" imply it.
 - **`SEARCH`, in every mode.** No search index is built here. A keyword search
   over unsegmented text would silently disagree with the reference engine about
   which documents match, and a caller cannot tell a narrow index from a narrow

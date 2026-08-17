@@ -15,18 +15,24 @@
 import { errors, KipError } from './errors.js'
 import {
   EffectiveAuthority,
+  classify,
+  elevateAuthority,
   principalClass,
+  quarantine,
+  release,
   requirePermitted,
   resolveApproval,
   spaceResource,
   systemAuth,
   type AuthContext,
   type Authorization,
+  type ElementGovernanceContext,
   type Permission,
 } from './governance/index.js'
 import { kmlPermissions, kqlPermissions, metaPermissions } from './governance/gate.js'
 import type { Json, JsonMap } from './json.js'
 import { parseKip } from './kip/parser.js'
+import type { ElementId } from './id.js'
 import type { Command, KmlStatement, KqlQuery } from './kip/ast.js'
 import { executeKml, type KmlContext } from './kml/index.js'
 import { executeKql, type KqlContext } from './kql/index.js'
@@ -502,6 +508,65 @@ export class Session {
     const authority = this.effectiveAuthority(space)
     requirePermitted(authority.authorize('read_audit', spaceResource(), this.auth))
     return this.nexus.store.governance.readAudit(space, limit)
+  }
+
+  /**
+   * Sets one element's classification (§93, §100).
+   *
+   * A Governance operation rather than a KML clause, because an element's
+   * `governance` block is not author-writable: the parser refuses it in every
+   * assignment. Raising a label needs `update` and lowering one needs
+   * `declassify` — it is disclosure that requires authority, not caution.
+   *
+   * Returns the label the element carried before.
+   */
+  classify(element: ElementId, label: string, space = this.nexus.space): string {
+    return this.nexus.transact(() =>
+      classify(this.governanceContext(space), element, label),
+    )
+  }
+
+  /**
+   * Raises or lowers how strongly one element may influence action.
+   *
+   * Raising is bounded by the element's authority lineage, so no chain of
+   * summarizing turns a descriptive note into an executable one (§127). Lowering
+   * is deliberately as easy as the permission itself: an incident response that
+   * had to wait for an approval would arrive late (§132).
+   *
+   * Returns the ceiling the element carried before.
+   */
+  elevateAuthority(element: ElementId, cls: string, space = this.nexus.space): string {
+    return this.nexus.transact(() =>
+      elevateAuthority(this.governanceContext(space), element, cls),
+    )
+  }
+
+  /**
+   * Holds an element out of ordinary use, pending review (§133).
+   *
+   * Not a retraction: it says this Brain does not currently allow ordinary use
+   * of the element, which is a statement about this Brain and not about whoever
+   * wrote it (§134).
+   */
+  quarantine(element: ElementId, reason: string, space = this.nexus.space): void {
+    this.nexus.transact(() =>
+      quarantine(this.governanceContext(space), element, reason),
+    )
+  }
+
+  /** Returns a quarantined element to ordinary use. */
+  releaseQuarantine(element: ElementId, space = this.nexus.space): void {
+    this.nexus.transact(() => release(this.governanceContext(space), element))
+  }
+
+  private governanceContext(space: string): ElementGovernanceContext {
+    return {
+      store: this.nexus.store,
+      space,
+      authority: this.effectiveAuthority(space),
+      auth: this.auth,
+    }
   }
 
   /** The `_system.origin` this session stamps on what it writes. */

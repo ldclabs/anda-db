@@ -53,6 +53,19 @@ export { resolveApproval, subjectDigest } from './approval.js'
 export { redactView } from './redact.js'
 
 export {
+  AUTHORITY_KEY,
+  LINEAGE_KEY,
+  QUARANTINE_KEY,
+  ceilingOf,
+  classify,
+  elevateAuthority,
+  lineageOf,
+  quarantine,
+  release,
+  type ElementGovernanceContext,
+} from './element.js'
+
+export {
   clausePermissions,
   kmlPermissions,
   kqlPermissions,
