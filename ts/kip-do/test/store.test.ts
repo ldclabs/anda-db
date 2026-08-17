@@ -120,9 +120,12 @@ describe('the store', () => {
     await withStore('schema', (store) => {
       // Construction applies the DDL; constructing again over the same storage
       // is the only recovery a Durable Object gets, since construction is not
-      // a transaction.
+      // a transaction. The object's own constructor already bootstrapped a
+      // Nexus here, so what this asserts is that re-opening changes nothing —
+      // not that the database is empty.
+      const before = store.spaces()
       const again = new Store(store.sql)
-      expect(again.spaces()).toEqual([])
+      expect(again.spaces()).toEqual(before)
     })
   })
 
@@ -443,8 +446,8 @@ describe('the store', () => {
     await withStore('packages', (store) => {
       const install = (digest: string) =>
         store.installPackage({
-          package_ref: 'kip://core@2.0.0',
-          package_id: 'kip://core',
+          package_ref: 'kip://example/only-here@2.0.0',
+          package_id: 'kip://example/only-here',
           version: '2.0.0',
           content_digest: digest,
           declared_digest: '',
@@ -457,7 +460,9 @@ describe('the store', () => {
       // same reference with different content is an integrity error, not an
       // update (§240.4).
       expect(() => install('bbbb')).toThrowError(/UNIQUE/)
-      expect(store.packageByRef('kip://core@2.0.0')?.content_digest).toBe('aaaa')
+      expect(
+        store.packageByRef('kip://example/only-here@2.0.0')?.content_digest,
+      ).toBe('aaaa')
     })
   })
 

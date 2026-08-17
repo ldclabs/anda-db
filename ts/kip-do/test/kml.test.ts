@@ -358,10 +358,23 @@ describe('KML', () => {
 
   it('reports a clause it has not built rather than reporting success', async () => {
     await withNexus('unsupported', (nexus) => {
-      const result = nexus.tryExecute(
-        'PURGE "C-1" CONFIRM "PURGE"',
-      )
+      // The clauses that are still refused are refused by name, so a caller
+      // learns what to do instead rather than watching a write report success
+      // and change nothing.
+      const result = nexus.tryExecute('SET RETENTION "C-1" { expires_at: "x" }')
       expect('error' in result && result.error.code).toBe('UnsupportedCapability')
+    })
+  })
+
+  it('refuses to erase something references still point at', async () => {
+    await withNexus('purge-denied', (nexus) => {
+      const first = nexus.execute(SETUP)
+      // The default reference policy refuses rather than cascading: a dangling
+      // reference does not say "this was erased", it says nothing.
+      const denied = nexus.tryExecute(
+        `PURGE "${first.handles.alice}" CONFIRM "PURGE"`,
+      )
+      expect('error' in denied && denied.error.code).toBe('PurgeDenied')
     })
   })
 

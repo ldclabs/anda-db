@@ -14,21 +14,36 @@ grammar's behaviour by a differential test.
 npm install @ldclabs/kip-do
 ```
 
-## Status: being rebuilt for KIP 2.0
+## Status
 
-The 1.x executor has been **deleted, not ported**. KIP 2.0 is a different data
-model — the whole point of the version is that *a Proposition existing is not
-the Proposition being true* — so a renamed 1.x engine would have been a worse
-lie than an absent one. It is recoverable from this branch's history.
+The 1.x executor was **deleted, not ported**. KIP 2.0 is a different data model
+— the whole point of the version is that *a Proposition existing is not the
+Proposition being true* — so a renamed 1.x engine would have been a worse lie
+than an absent one. It is recoverable from this branch's history.
 
-What ships today is the language boundary: the parser bridge, the KIP 2.0 error
-registry, the tokenizer client and the SQLite helpers. The executor and the
-Durable Object class return in later stages, in the order the Rust engine was
-rebuilt: storage, Schema Packages, KML, KQL, projection, META, Capsules,
-Governance.
+What works today: the storage layer, Schema Packages and symbol resolution,
+transactions and the KML mutation clauses, KQL, the Epistemic Projection, META,
+and Capsule export and verification. **56 of the 62 shared conformance cases
+pass**; the remaining 6 are all the historical read path (`AS OF`), and
+`test/conformance.test.ts` names them individually so closing the gap has to be
+acknowledged rather than absorbed into a number.
+
+Two things are deliberately absent, and `DESCRIBE CAPABILITIES` says so with a
+reason for each:
+
+- **The Governance control plane.** There are no Principals, Grants or
+  classifications, and every caller has the same authority. A half-built
+  Governance plane is worse than an absent one, because it looks like it is
+  enforcing something.
+- **`SEARCH`, in every mode.** No search index is built here. A keyword search
+  over unsegmented text would silently disagree with the reference engine about
+  which documents match, and a caller cannot tell a narrow index from a narrow
+  world.
 
 The Rust engine is the reference for all of it, and
-`fixtures/kip-conformance-2.0/` is the shared acceptance suite both engines run.
+`fixtures/kip-conformance-2.0/` is the shared acceptance suite both engines
+run — the same bytes, inlined into TypeScript because workerd has no
+filesystem.
 
 ## How the two engines are kept in step
 
@@ -55,16 +70,11 @@ The executor is TypeScript because it is the part that must change: it is
 written against SQL and `ctx.storage.sql`, not against `anda_db`'s B-Tree,
 BM25 and object-store layers.
 
-### Open divergences
-
-The oracle currently reports four commands the Rust grammar rejects and
-`@ldclabs/kip-lang@2.0.0` accepts. They are listed with their reasons in
-`KNOWN_DIVERGENCES` in `test/parser-oracle.test.ts`, and the test fails if one
-is silently fixed upstream so the list cannot rot. The first is the serious
-one: an integer past the representable range is **rounded rather than
-refused**, so the command executes with a different number than it says. This
-package cannot defend against that on its own — by the time it sees the lowered
-AST the digits are gone.
+The oracle currently reports no divergences in either direction across the
+whole corpus. The four it found on the way — the worst of which rounded an
+out-of-range integer instead of refusing it, so a command executed with a
+different number than it said — were fixed upstream in
+`@ldclabs/kip-lang@2.0.1`.
 
 ### The error registry
 
@@ -78,7 +88,75 @@ and retry classes produces a table that compiles, passes tests, and is quietly
 wrong — a mismatched `hint` breaks an agent's self-correction loop, and a
 widened `retry` class turns a lost write into a duplicated one.
 
+## Quick start
+
+```ts
+// src/index.ts
+import { KipDatabase } from '@ldclabs/kip-do'
+
+export class MyKipDatabase extends KipDatabase<Env> {}
+
+export interface Env {
+  KIP_DB: DurableObjectNamespace<MyKipDatabase>
+}
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const name = new URL(request.url).pathname.slice(1) || 'default'
+    return env.KIP_DB.getByName(name).fetch(request)
+  },
+}
+```
+
+```jsonc
+// wrangler.jsonc
+{
+  "name": "my-kip-app",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-01-01",
+  "durable_objects": {
+    "bindings": [{ "name": "KIP_DB", "class_name": "MyKipDatabase" }]
+  },
+  // `new_sqlite_classes` is required — the KV-backed backend has no SQL API.
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["MyKipDatabase"] }]
+}
+```
+
+Then `POST` a KIP request envelope:
+
+```json
+{
+  "kip": "2.0",
+  "operations": [
+    { "command": "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE ASSERTION ?a { SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 } }\n}" },
+    { "command": "FIND(?b.status) WHERE { ?p PROPOSITION (?s, \"prefers\", ?o) ?b BELIEF (?p) }" }
+  ]
+}
+```
+
+The second operation answers `["accepted"]` — not because the Proposition
+exists, but because an Assertion supports it and the projection's policy says
+that is enough. Delete the Assertion's support and the same Proposition
+projects as `insufficient`, which is the distinction the whole version is for.
+
+### The response status is not cosmetic
+
+A KIP error carries a retry class, and the HTTP status is mapped from *that*
+rather than from the error's name. Two cases matter:
+
+- **A partial batch is 207.** Earlier operations have already committed and are
+  durable; reporting the whole request as a failure invites the client to
+  re-send writes that landed.
+- **`outcome_lookup_required` is never 500.** The write may well have landed.
+  500 reads as "nothing happened", and a client acting on that writes again.
+
 ## Multilingual text and the tokenizer service
+
+**Nothing indexes yet.** `SEARCH` is refused in every mode, and the tokenizer
+client below ships ahead of the index it will feed. The reasoning is recorded
+here because it is what the eventual index has to be built against, and getting
+it wrong is not visible from the outside — a mis-segmented corpus returns
+plausible results for the wrong reason.
 
 Durable Object SQLite ships FTS5 with only the built-in tokenizers (`ascii`,
 `unicode61`, `porter`, `trigram`), and a Worker cannot load a C extension, so
@@ -137,6 +215,8 @@ throughput ceiling, and Durable Objects have no read replicas.
 ```bash
 pnpm install
 pnpm run codegen:errors          # regenerate the error registry from the oracle
+pnpm run codegen:profiles        # re-vendor the Schema Package artifacts
+pnpm run codegen:fixtures        # re-inline the shared conformance fixtures
 pnpm run codegen:oracle-corpus   # re-harvest the differential corpus
 pnpm run build:oracle-wasm       # rebuild the oracle from rs/anda_kip (needs wasm-pack)
 pnpm test                        # runs inside workerd via @cloudflare/vitest-pool-workers

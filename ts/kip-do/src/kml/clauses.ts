@@ -29,6 +29,8 @@ import type {
   ConceptCreate,
   ConceptUpsert,
   ElementRef,
+  Scalar,
+  WhereClause,
   EnsureProposition,
   FacetAssignment,
   MutationClause,
@@ -60,8 +62,12 @@ import {
   endpointToJson,
   tupleKey,
 } from '../term.js'
+import { canonicalJson } from '../json.js'
+import { sha256Text } from '../digest.js'
 import { normalizeTime } from '../time.js'
 import type { Transaction } from '../tx.js'
+import { resolveTargets } from './select.js'
+import { applyAction, requireUpdatable } from './update.js'
 import {
   assignments,
   bindings,
@@ -142,6 +148,12 @@ export function apply(
   operation: JsonMap | undefined,
 ): void {
   const b = bindings(tx, request, operation)
+  const select = (
+    target: ElementRef,
+    where: readonly WhereClause[] | null,
+    limit: Scalar | null,
+    what: string,
+  ) => resolveTargets(tx, b, target, where, limit, request, operation, what)
 
   if ('CreateConcept' in clause) return createConcept(tx, b, clause.CreateConcept)
   if ('UpsertConcept' in clause) return upsertConcept(tx, b, clause.UpsertConcept)
@@ -154,9 +166,13 @@ export function apply(
   if ('CreateActivity' in clause) return createRecord(tx, b, clause.CreateActivity, 'Activity')
   if ('RetractAssertion' in clause) {
     const { target, where_clauses, limit, expect_state } = clause.RetractAssertion
-    const id = directTarget(b, target, where_clauses, limit, 'RETRACT')
-    if (expect_state !== null) tx.expectAssertionStatus(id, scalarText(b, expect_state, 'EXPECT STATE'))
-    return retract(tx, id)
+    for (const id of select(target, where_clauses, limit, 'RETRACT').ids) {
+      if (expect_state !== null) {
+        tx.expectAssertionStatus(id, scalarText(b, expect_state, 'EXPECT STATE'))
+      }
+      retract(tx, id)
+    }
+    return
   }
   if ('SupersedeAssertion' in clause) {
     const { target, by, expect_state } = clause.SupersedeAssertion
@@ -178,15 +194,64 @@ export function apply(
   }
   if ('Archive' in clause) {
     const { target, where_clauses, limit, expect_state } = clause.Archive
-    const id = directTarget(b, target, where_clauses, limit, 'ARCHIVE')
-    if (expect_state !== null) tx.expectState(id, scalarText(b, expect_state, 'EXPECT STATE'))
-    return changeState(tx, id, State.ARCHIVED, 'archive')
+    for (const id of select(target, where_clauses, limit, 'ARCHIVE').ids) {
+      if (expect_state !== null) {
+        tx.expectState(id, scalarText(b, expect_state, 'EXPECT STATE'))
+      }
+      changeState(tx, id, State.ARCHIVED, 'archive')
+    }
+    return
   }
   if ('Tombstone' in clause) {
     const { target, where_clauses, limit, expect_state } = clause.Tombstone
-    const id = directTarget(b, target, where_clauses, limit, 'TOMBSTONE')
-    if (expect_state !== null) tx.expectState(id, scalarText(b, expect_state, 'EXPECT STATE'))
-    return changeState(tx, id, State.TOMBSTONED, 'tombstone')
+    for (const id of select(target, where_clauses, limit, 'TOMBSTONE').ids) {
+      if (expect_state !== null) {
+        tx.expectState(id, scalarText(b, expect_state, 'EXPECT STATE'))
+      }
+      changeState(tx, id, State.TOMBSTONED, 'tombstone')
+    }
+    return
+  }
+  if ('Update' in clause) {
+    const { target, where_clauses, limit, expect_version, actions } = clause.Update
+    for (const id of select(target, where_clauses, limit, 'UPDATE').ids) {
+      if (expect_version !== null) {
+        tx.expectVersion(id, numberOf(b, expect_version, 'EXPECT VERSION'))
+      }
+      const element = tx.load(id)
+      requireUpdatable(id, element)
+      const before = JSON.stringify(element.row)
+      for (const action of actions) applyAction(tx, b, id, element, action)
+      if (JSON.stringify(element.row) !== before) tx.markChanged(id, 'update')
+    }
+    return
+  }
+  if ('Purge' in clause) {
+    const { target, where_clauses, limit, reference_policy } = clause.Purge
+    const policy =
+      reference_policy === null
+        ? 'deny_if_referenced'
+        : scalarText(b, reference_policy, 'REFERENCE POLICY')
+    if (policy !== 'deny_if_referenced') {
+      // §173: the other policies cascade or rewrite references, and neither is
+      // something to fall back to silently. 1.x's `DELETE ... DETACH` is
+      // exactly the default this refuses to be.
+      throw errors.constraintViolation(
+        `this engine implements the "deny_if_referenced" reference policy ` +
+          `only; ${JSON.stringify(policy)} would cascade or rewrite ` +
+          `references, which is not something to default into`,
+      )
+    }
+    for (const id of select(target, where_clauses, limit, 'PURGE').ids) {
+      purge(tx, id)
+    }
+    return
+  }
+  if ('MergeConcept' in clause) {
+    const { source, into, where_clauses, expect_version } = clause.MergeConcept
+    const sources = select(source, where_clauses, null, 'MERGE CONCEPT').ids
+    const targets = select(into, where_clauses, null, 'MERGE CONCEPT ... INTO').ids
+    return merge(tx, b, sources, targets, expect_version)
   }
 
   // Everything below is a clause this stage has not built yet. Refusing by name
@@ -374,14 +439,13 @@ function upsertConcept(tx: Transaction, b: Bindings, clause: ConceptUpsert): voi
       'UPSERT CONCEPT needs a MATCH on a stable identity: {id: …} or {key: …}',
     )
   }
-  const existing = resolveIdentity(tx, b, matcher)
-  if (existing === null) {
-    throw errors.unsupportedCapability(
-      'UPSERT CONCEPT that has to create its target is not implemented by ' +
-        'this engine yet; see DESCRIBE CAPABILITIES',
-    )
-  }
-  tx.bindExisting(clause.handle, existing)
+  const found = resolveIdentity(tx, b, matcher)
+  // Nothing matched, so this is the "insert" half. The grammar gives UPSERT no
+  // TYPE slot, so a Concept created this way carries no `schema_ref`: the
+  // engine records what it was told rather than inventing a type, and an
+  // untyped Concept is honestly untyped rather than silently a Person.
+  const existing = found ?? createFromMatch(tx, b, clause.handle, matcher)
+  if (found !== null) tx.bindExisting(clause.handle, existing)
   if (clause.expect_version !== null) {
     tx.expectVersion(existing, numberOf(b, clause.expect_version, 'EXPECT VERSION'))
   }
@@ -447,6 +511,43 @@ function upsertConcept(tx: Transaction, b: Bindings, clause: ConceptUpsert): voi
   // no version bump, no change record, and a receipt that says `no_effect`
   // rather than claiming a transition that did not happen (§44).
   if (JSON.stringify(element.row) !== before) tx.markChanged(existing, 'update')
+}
+
+/** The insert half of an UPSERT: a Concept pinned to the identity it matched. */
+function createFromMatch(
+  tx: Transaction,
+  b: Bindings,
+  handle: string,
+  matcher: ObjectMatcher,
+): ElementId {
+  const id = tx.mint('Concept')
+  tx.bindExisting(handle, id)
+  const literal = (field: string): string => {
+    const value = matcher[field]
+    if (value === undefined) return ''
+    if ('Literal' in value) {
+      const resolved = kipValue(value.Literal)
+      return typeof resolved === 'string' ? resolved : ''
+    }
+    if ('Param' in value) {
+      const resolved = parameter(b, value.Param)
+      return typeof resolved === 'string' ? resolved : ''
+    }
+    return ''
+  }
+  const row: ConceptRow = {
+    ...blank(id),
+    client_key: '',
+    schema_ref: '',
+    key: literal('key'),
+    name: literal('name'),
+    canonical_id: literal('canonical_id'),
+    aliases: [],
+    attributes: {},
+    merged_into: '',
+  }
+  tx.stageNew(id, { kind: 'Concept', row })
+  return id
 }
 
 /**
@@ -601,6 +702,109 @@ function changeState(
   tx.markChanged(id, op)
 }
 
+/**
+ * `MERGE CONCEPT ... INTO` — consolidating two records of one thing.
+ *
+ * Non-destructive (§11.1): the source keeps every field it had, gains a
+ * `merged_into` forwarding pointer and the `merged` state. A reader that
+ * followed a reference to it can therefore tell a consolidated Concept from a
+ * retired one, which `archived` would not have said.
+ *
+ * A selection naming more than one of either side is refused rather than
+ * resolved: identity is not something to pick by description, and a merge that
+ * guessed which of two Concepts named "Alice" was meant would consolidate the
+ * wrong pair irreversibly.
+ */
+function merge(
+  tx: Transaction,
+  b: Bindings,
+  sources: readonly ElementId[],
+  targets: readonly ElementId[],
+  expectVersion: Scalar | null,
+): void {
+  if (sources.length !== 1 || targets.length !== 1) {
+    // Not a merge conflict — a selector problem. Identity is never chosen by
+    // description, and a merge that guessed which of two Concepts named
+    // "Alice" was meant would consolidate the wrong pair irreversibly.
+    throw errors.identitySelectorRequired(
+      `MERGE CONCEPT needs exactly one source and one target; this selection ` +
+        `named ${sources.length} and ${targets.length}. Name a stable ` +
+        `identity — {key: …} or {id: …} — rather than a description`,
+    )
+  }
+  const source = sources[0] as ElementId
+  const target = targets[0] as ElementId
+  if (formatElementId(source) === formatElementId(target)) {
+    throw errors.identityMergeConflict(
+      `${formatElementId(source)} cannot be merged into itself`,
+    )
+  }
+  if (expectVersion !== null) {
+    tx.expectVersion(source, numberOf(b, expectVersion, 'EXPECT VERSION'))
+  }
+
+  const from = requireKind(tx, source, 'Concept')
+  requireKind(tx, target, 'Concept')
+  if (from.row.merged_into !== '') {
+    // Re-pointing an already-merged Concept would make the forwarding chain
+    // say two different things about where the identity went.
+    throw errors.identityMergeConflict(
+      `${formatElementId(source)} was already merged into ${from.row.merged_into}`,
+    )
+  }
+  from.row.merged_into = formatElementId(target)
+  from.row.state = State.MERGED
+  tx.markChanged(source, 'merge')
+}
+
+/**
+ * `PURGE` — physical erasure, leaving an identity stub (§19.3, §170–§177).
+ *
+ * Two orderings matter and neither is arbitrary.
+ *
+ * **The version log goes first.** An element scrubbed only in its current row
+ * stays fully readable through `AS OF`, so erasing that way is erasure in name
+ * only; and doing it the other way round leaves, after a crash, a scrubbed stub
+ * with an intact history and nothing saying to look.
+ *
+ * **The row survives.** Deleting it would leave every reference to it dangling,
+ * and a dangling reference does not say "this was erased" — it says nothing.
+ * What is left is identity, provenance and a digest of what used to be there.
+ */
+function purge(tx: Transaction, id: ElementId): void {
+  const named = formatElementId(id)
+  const referrers = tx.store.referrers(tx.cx.space, id)
+  if (referrers.length > 0) {
+    throw errors.purgeDenied(
+      `${named} is still referenced by ${referrers
+        .map((r) => `${formatElementId(r.from)} (${r.field})`)
+        .join(', ')}; erasing it would leave those references dangling. The ` +
+        `default reference policy refuses rather than cascading`,
+    )
+  }
+
+  const element = tx.load(id)
+  const digest = sha256Text(canonicalJson(element.row))
+  tx.store.purgeVersions(tx.cx.space, id)
+
+  const row = element.row as unknown as Record<string, unknown>
+  for (const [field, empty] of [
+    ['name', ''], ['key', ''], ['canonical_id', ''], ['aliases', []],
+    ['attributes', {}], ['facets', {}], ['structural', {}], ['client_key', ''],
+    ['payload_inline', null], ['content_ref', ''], ['media_type', ''],
+    ['evidence_refs', []], ['context_refs', []], ['source_refs', []],
+    ['inputs', []], ['outputs', []], ['associated_actors', []],
+  ] as const) {
+    if (Object.hasOwn(row, field)) row[field] = empty
+  }
+  element.row.state = State.PURGED
+  // The stub says what it is and what it held, and nothing about the content
+  // itself. `purged: true` is what a reader checks instead of guessing from an
+  // empty name.
+  element.row.governance = { purged: true, content_digest: digest }
+  tx.markChanged(id, 'purge')
+}
+
 // --- targets ----------------------------------------------------------------
 
 /** Resolves an `ElementRef` — a handle, a parameter or a literal id. */
@@ -618,29 +822,6 @@ function refTarget(
     )
   }
   return parseElementId(value)
-}
-
-/**
- * Resolves the target of a clause that may instead carry a selection block.
- *
- * A selection block runs a KQL pattern, which this stage does not have. It is
- * refused by name rather than ignored: a sweep that silently acts on nothing
- * and reports success is worse than one that says it cannot run.
- */
-function directTarget(
-  b: Bindings,
-  target: ElementRef,
-  where: unknown,
-  limit: unknown,
-  what: string,
-): ElementId {
-  if (where !== null || limit !== null) {
-    throw errors.unsupportedCapability(
-      `${what} with a WHERE selection block is not implemented by this ` +
-        `engine yet; see DESCRIBE CAPABILITIES`,
-    )
-  }
-  return refTarget(b, target, what)
 }
 
 function requireHandle(tx: Transaction, name: string): ElementId {

@@ -46,6 +46,7 @@
     "codegen:errors": "node scripts/codegen-errors.mjs",
     "codegen:oracle-corpus": "node scripts/codegen-oracle-corpus.mjs",
     "codegen:profiles": "node scripts/codegen-profiles.mjs",
+    "codegen:fixtures": "node scripts/codegen-fixtures.mjs",
     "prepublishOnly": "pnpm run codegen:errors && pnpm run codegen:profiles && pnpm run build",
     "ncu": "npx npm-check-updates -u"
   },

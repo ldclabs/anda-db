@@ -52,6 +52,43 @@ import {
 } from './store/index.js'
 import { nowTime } from './time.js'
 
+/**
+ * What an element was derived from, for the authority lineage.
+ *
+ * The *material* inputs — the ones whose content shaped this element — rather
+ * than every reference it happens to carry. An Assertion's Proposition is what
+ * it is *about*, not what it was derived from; its Evidence is.
+ */
+function materialInputs(element: Element): string[] {
+  const ids: string[] = []
+  const push = (value: unknown) => {
+    if (typeof value === 'string' && value !== '') ids.push(value)
+    else if (
+      value !== null &&
+      typeof value === 'object' &&
+      typeof (value as { id?: unknown }).id === 'string'
+    ) {
+      ids.push((value as { id: string }).id)
+    }
+  }
+  switch (element.kind) {
+    case 'Assertion':
+      for (const ref of element.row.evidence_refs) push(ref.evidence_id)
+      for (const ref of element.row.context_refs) push(ref)
+      break
+    case 'Evidence':
+      for (const ref of element.row.source_refs) push(ref)
+      push(element.row.generated_by)
+      break
+    case 'Activity':
+      for (const ref of element.row.inputs) push(ref)
+      break
+    default:
+      return []
+  }
+  return [...new Set(ids)]
+}
+
 /** One element this transaction will write. */
 interface Staged {
   element: Element
@@ -357,6 +394,8 @@ export class Transaction {
       return this.outcome('no_effect', null, null, [])
     }
 
+    this.recordAuthorityLineage(pending)
+
     const seq = this.store.nextSeq(this.cx.space)
     const committedAt = nowTime()
     const changes: ChangeEntry[] = []
@@ -405,6 +444,35 @@ export class Transaction {
     })
 
     return this.outcome('committed', seq, committedAt, changes)
+  }
+
+  /**
+   * Records what each new element was derived from (§99, §127).
+   *
+   * At commit rather than per clause: a mutation block is declarative, so an
+   * Activity may list its outputs *after* the clause that created them, and a
+   * per-clause walk would miss exactly the inputs that arrived later.
+   *
+   * Material inputs are read from both the staging map and the store. Reading
+   * only the staged ones made propagation work inside one `MUTATE` and stop
+   * working the moment the Evidence had been written earlier — which is the
+   * ordinary case, and the failure is silent.
+   *
+   * This records lineage; it does not enforce anything with it. Non-amplification
+   * is checked at elevation, and this engine has no elevation path — so what is
+   * here is the honest half: the record an elevation would need, kept from the
+   * moment it could still be known.
+   */
+  private recordAuthorityLineage(pending: [string, Staged][]): void {
+    for (const [, staged] of pending) {
+      if (!staged.isNew) continue
+      const inputs = materialInputs(staged.element)
+      if (inputs.length === 0) continue
+      staged.element.row.governance = {
+        ...staged.element.row.governance,
+        authority_lineage: inputs,
+      }
+    }
   }
 
   /**

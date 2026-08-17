@@ -1,19 +1,13 @@
-import { DurableObject } from 'cloudflare:workers'
+import { KipDatabase } from '../src/index.js'
 
 /**
  * Test harness object.
  *
- * `wrangler.jsonc` names a SQLite-backed Durable Object class, and the workers
- * test pool boots the whole Worker before it runs any file — including the
- * parser tests, which touch no storage at all. So this class has to exist for
- * the suite to start.
- *
- * It is a placeholder while the KIP 2.0 engine is being rebuilt: the 1.x
- * `KipDatabase` was deleted with the rest of the 1.x executor, and the 2.0 one
- * does not exist yet. The engine's own tests will replace this with the real
- * class rather than adding a second one beside it.
+ * The real class, not a stand-in: the engine's own tests reach into the object
+ * with `runInDurableObject` and build their own `CognitiveNexus`, but the HTTP
+ * surface has to be exercised as a host would deploy it.
  */
-export class TestKipDatabase extends DurableObject {}
+export class TestKipDatabase extends KipDatabase {}
 
 export interface Env {
   KIP_DB: DurableObjectNamespace<TestKipDatabase>

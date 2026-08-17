@@ -76,6 +76,13 @@ export {
 } from './term.js'
 
 export {
+  KipDatabase,
+  type KipDatabaseEnv,
+  type KipResponse,
+  type KipResult,
+} from './durable-object.js'
+
+export {
   CognitiveNexus,
   DEFAULT_SPACE,
   SYSTEM_PRINCIPAL,
