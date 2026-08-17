@@ -38,6 +38,11 @@ export function capabilities(): Json {
         'TRANSITION ACTIVITY',
         'ARCHIVE',
         'TOMBSTONE',
+        'UPDATE',
+        'MERGE CONCEPT',
+        'PURGE (deny_if_referenced only)',
+        'selection blocks: WHERE and LIMIT on UPDATE, ARCHIVE, TOMBSTONE, ' +
+          'RETRACT, PURGE and MERGE CONCEPT',
       ],
       transaction: {
         // Not a claim about this engine's care, but about the platform: a
@@ -110,11 +115,22 @@ export function capabilities(): Json {
           'absent one, because it looks like it is enforcing something',
       },
       {
-        capability: 'selection_blocks',
-        detail: 'UPDATE / MERGE / PURGE / SET RETENTION, and WHERE on a removal',
+        capability: 'set_retention',
+        detail: 'the SET RETENTION clause',
         reason:
-          'the mutation clauses that select their targets with a pattern are ' +
-          'not built; they are refused by name rather than accepted and ignored',
+          'storage-lifecycle policy is not implemented; the clause is refused ' +
+          'by name rather than accepted and ignored. `retention.expires_at` is ' +
+          'stored and indexed, so what is missing is the clause that sets it ' +
+          'and the sweep that acts on it — not the column',
+      },
+      {
+        capability: 'purge_reference_policies',
+        detail: 'REFERENCE POLICY "tombstone_reference" and "authorized_cascade"',
+        reason:
+          'PURGE implements "deny_if_referenced", the conservative default. ' +
+          'The other two rewrite or erase the elements that point at the ' +
+          'target, which is not something to fall back into silently — they ' +
+          'are refused by name',
       },
       {
         capability: 'historical_read',

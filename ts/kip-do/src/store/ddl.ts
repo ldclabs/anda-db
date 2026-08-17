@@ -38,8 +38,14 @@
 
 import { errors } from '../errors.js'
 
-/** Bumped whenever the DDL below changes in a way that needs a migration. */
-export const SCHEMA_VERSION = 1
+/**
+ * Bumped whenever the DDL below changes in a way that needs a migration.
+ *
+ * 2 — the Governance Control Plane's eight tables. Purely additive: every
+ * cognitive table is unchanged, so an existing database gains the control plane
+ * on the next construction and keeps everything it had.
+ */
+export const SCHEMA_VERSION = 2
 
 /**
  * The `_system` envelope every element table repeats.
@@ -397,6 +403,230 @@ export const SCHEMA_STATEMENTS: readonly string[] = [
      k TEXT PRIMARY KEY,
      v TEXT NOT NULL
    ) WITHOUT ROWID`,
+
+  // === the Governance Control Plane ======================================
+  //
+  // Eight tables beside the cognitive ones, and the boundary between them is
+  // the security property: **no KML clause reaches these**. They are written
+  // through host APIs only, which is what keeps a prompt injection into
+  // ordinary memory formation off the control plane (§264).
+  //
+  // Three shapes repeat across all of them and each is load-bearing:
+  //
+  // - **`status` is a column, not a delete.** Revoking a Grant must stop it
+  //   authorizing future operations without rewriting the audit that says it
+  //   authorized a past one (§36), so every lookup filters on status and every
+  //   *historical* lookup ignores it and reads the timestamps instead.
+  // - **`created_at` / `revoked_at` bound a record in time.** `AS OF` over the
+  //   control plane is answered from these, which is why revocation stamps
+  //   `revoked_at` rather than only flipping `status`.
+  // - **`version` counts changes**, so a cached decision can be invalidated
+  //   (§187).
+
+  // --- Principals ---------------------------------------------------------
+  //
+  // A Principal is an authenticated execution identity, never a semantic
+  // Person: the bridge between the two is an ActorBinding, under Governance
+  // authority rather than by anyone writing a Proposition about it (§7, §14).
+  `CREATE TABLE IF NOT EXISTS gov_principals (
+     id              INTEGER PRIMARY KEY AUTOINCREMENT,
+     principal_id    TEXT NOT NULL,
+     principal_class TEXT NOT NULL DEFAULT '',
+     status          TEXT NOT NULL DEFAULT 'active',
+     display_name    TEXT NOT NULL DEFAULT '',
+     auth_provider   TEXT NOT NULL DEFAULT '',
+     auth_subject    TEXT NOT NULL DEFAULT '',
+     created_at      TEXT NOT NULL,
+     updated_at      TEXT NOT NULL DEFAULT '',
+     revoked_at      TEXT NOT NULL DEFAULT '',
+     version         INTEGER NOT NULL DEFAULT 1
+   )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_gov_principals_id
+     ON gov_principals(principal_id)`,
+
+  // --- Principal groups ---------------------------------------------------
+  //
+  // Membership is one current list on the row rather than a join table. "Which
+  // groups is this Principal in" is therefore a scan over the groups with
+  // `json_each`, not an index seek — acceptable because a deployment has few
+  // groups and every authorization asks the question once, and *correct*
+  // because the historical answer is replayed from the audit rather than from
+  // this list anyway (§177). A join table would give the live question an index
+  // and give the historical one a second thing to keep in step.
+  `CREATE TABLE IF NOT EXISTS gov_principal_groups (
+     id          INTEGER PRIMARY KEY AUTOINCREMENT,
+     group_id    TEXT NOT NULL,
+     name        TEXT NOT NULL DEFAULT '',
+     description TEXT NOT NULL DEFAULT '',
+     members     TEXT NOT NULL DEFAULT '[]',
+     status      TEXT NOT NULL DEFAULT 'active',
+     created_at  TEXT NOT NULL,
+     updated_at  TEXT NOT NULL DEFAULT '',
+     version     INTEGER NOT NULL DEFAULT 1
+   )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_gov_groups_id
+     ON gov_principal_groups(group_id)`,
+
+  // --- ActorBindings ------------------------------------------------------
+  //
+  // `actor_key` is an endpoint key and `actor_ref` is what the caller typed.
+  // Both are kept: the key is what `assertions.asserted_by_key` is compared
+  // against, and a binding stored in any other spelling would silently never
+  // match — the worst failure for a record whose whole job is to be found.
+  `CREATE TABLE IF NOT EXISTS gov_actor_bindings (
+     id            INTEGER PRIMARY KEY AUTOINCREMENT,
+     principal_id  TEXT NOT NULL,
+     actor_ref     TEXT NOT NULL DEFAULT '',
+     actor_key     TEXT NOT NULL DEFAULT '',
+     binding_class TEXT NOT NULL DEFAULT '',
+     assurance     TEXT NOT NULL DEFAULT '',
+     scope         TEXT NOT NULL DEFAULT '*',
+     status        TEXT NOT NULL DEFAULT 'active',
+     created_at    TEXT NOT NULL,
+     updated_at    TEXT NOT NULL DEFAULT '',
+     revoked_at    TEXT NOT NULL DEFAULT '',
+     version       INTEGER NOT NULL DEFAULT 1
+   )`,
+  `CREATE INDEX IF NOT EXISTS idx_gov_bindings_principal
+     ON gov_actor_bindings(principal_id, status)`,
+  `CREATE INDEX IF NOT EXISTS idx_gov_bindings_actor
+     ON gov_actor_bindings(actor_key, status)`,
+
+  // --- Grants -------------------------------------------------------------
+  //
+  // Exactly one Space per Grant, never a pattern: a Space is the authorization
+  // boundary and URI structure confers nothing (§22).
+  `CREATE TABLE IF NOT EXISTS gov_grants (
+     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+     space_id           TEXT NOT NULL,
+     grantee_principal  TEXT NOT NULL DEFAULT '',
+     grantee_group      TEXT NOT NULL DEFAULT '',
+     actions            TEXT NOT NULL DEFAULT '[]',
+     scope              TEXT NOT NULL DEFAULT '{}',
+     conditions         TEXT NOT NULL DEFAULT '{}',
+     constraints        TEXT NOT NULL DEFAULT '{}',
+     delegation_allowed INTEGER NOT NULL DEFAULT 0,
+     status             TEXT NOT NULL DEFAULT 'active',
+     granted_by         TEXT NOT NULL DEFAULT '',
+     created_at         TEXT NOT NULL,
+     updated_at         TEXT NOT NULL DEFAULT '',
+     revoked_at         TEXT NOT NULL DEFAULT '',
+     version            INTEGER NOT NULL DEFAULT 1
+   )`,
+  // The two grantee columns are indexed separately rather than together: a
+  // decision loads the Principal's own Grants and its groups' Grants and
+  // evaluates them as one standing, so neither lookup ever carries the other's
+  // key.
+  `CREATE INDEX IF NOT EXISTS idx_gov_grants_principal
+     ON gov_grants(space_id, grantee_principal, status)`,
+  `CREATE INDEX IF NOT EXISTS idx_gov_grants_group
+     ON gov_grants(space_id, grantee_group, status)`,
+
+  // --- Delegations --------------------------------------------------------
+  //
+  // A separate table from Grants because the two are *evaluated* differently: a
+  // Grant is checked against its own record, a Delegation against a record plus
+  // a live question — does the delegator still hold this? — whose answer can
+  // change without this row changing at all (§35).
+  `CREATE TABLE IF NOT EXISTS gov_delegations (
+     id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+     space_id             TEXT NOT NULL,
+     delegator_principal  TEXT NOT NULL,
+     delegate_principal   TEXT NOT NULL,
+     actions              TEXT NOT NULL DEFAULT '[]',
+     scope                TEXT NOT NULL DEFAULT '{}',
+     conditions           TEXT NOT NULL DEFAULT '{}',
+     constraints          TEXT NOT NULL DEFAULT '{}',
+     parent_delegation    TEXT NOT NULL DEFAULT '',
+     may_redelegate       INTEGER NOT NULL DEFAULT 0,
+     status               TEXT NOT NULL DEFAULT 'active',
+     created_at           TEXT NOT NULL,
+     updated_at           TEXT NOT NULL DEFAULT '',
+     revoked_at           TEXT NOT NULL DEFAULT '',
+     version              INTEGER NOT NULL DEFAULT 1
+   )`,
+  `CREATE INDEX IF NOT EXISTS idx_gov_delegations_delegate
+     ON gov_delegations(space_id, delegate_principal, status)`,
+  `CREATE INDEX IF NOT EXISTS idx_gov_delegations_delegator
+     ON gov_delegations(space_id, delegator_principal, status)`,
+
+  // --- Governance Policy versions -----------------------------------------
+  //
+  // Appended, never updated, exactly like the Schema Environment log: an audit
+  // has to answer *which policy version authorized this operation*, and
+  // rewriting a policy in place retroactively changes that answer (§46).
+  `CREATE TABLE IF NOT EXISTS gov_policies (
+     id          INTEGER PRIMARY KEY AUTOINCREMENT,
+     policy_ref  TEXT NOT NULL,
+     policy_id   TEXT NOT NULL,
+     version     INTEGER NOT NULL,
+     space_id    TEXT NOT NULL DEFAULT '*',
+     description TEXT NOT NULL DEFAULT '',
+     statements  TEXT NOT NULL DEFAULT '[]',
+     created_at  TEXT NOT NULL,
+     created_by  TEXT NOT NULL DEFAULT ''
+   )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_gov_policies_ref
+     ON gov_policies(policy_ref)`,
+  `CREATE INDEX IF NOT EXISTS idx_gov_policies_id
+     ON gov_policies(policy_id, version)`,
+
+  // --- Approvals ----------------------------------------------------------
+  //
+  // `subject_digest` binds an approval to one concrete operation. Without it an
+  // approval for "purge this one Evidence record" would authorize purging
+  // anything (§246).
+  `CREATE TABLE IF NOT EXISTS gov_approvals (
+     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+     space_id            TEXT NOT NULL,
+     operation           TEXT NOT NULL DEFAULT '',
+     resource            TEXT NOT NULL DEFAULT '',
+     subject_digest      TEXT NOT NULL DEFAULT '',
+     required            INTEGER NOT NULL DEFAULT 1,
+     approvals           TEXT NOT NULL DEFAULT '[]',
+     approver_ids        TEXT NOT NULL DEFAULT '[]',
+     allow_self_approval INTEGER NOT NULL DEFAULT 0,
+     status              TEXT NOT NULL DEFAULT 'pending',
+     requested_by        TEXT NOT NULL DEFAULT '',
+     created_at          TEXT NOT NULL,
+     updated_at          TEXT NOT NULL DEFAULT '',
+     expires_at          TEXT NOT NULL DEFAULT '',
+     version             INTEGER NOT NULL DEFAULT 1
+   )`,
+  `CREATE INDEX IF NOT EXISTS idx_gov_approvals_subject
+     ON gov_approvals(space_id, subject_digest, status)`,
+
+  // --- the Governance audit log -------------------------------------------
+  //
+  // Append-only, and it stores whole records rather than diffs for the same
+  // reason the element version log does: a diff chain with one missing link
+  // answers a historical question wrongly instead of refusing (§175). It is
+  // also what a Principal's *past* group membership is replayed from, since the
+  // group row only says who is in it now.
+  `CREATE TABLE IF NOT EXISTS gov_audit (
+     id               INTEGER PRIMARY KEY AUTOINCREMENT,
+     entry_class      TEXT NOT NULL DEFAULT '',
+     at               TEXT NOT NULL,
+     space_id         TEXT NOT NULL DEFAULT '*',
+     principal_id     TEXT NOT NULL DEFAULT '',
+     delegation_chain TEXT NOT NULL DEFAULT '[]',
+     operation        TEXT NOT NULL DEFAULT '',
+     resource         TEXT NOT NULL DEFAULT '',
+     decision         TEXT NOT NULL DEFAULT '',
+     reason           TEXT NOT NULL DEFAULT '',
+     policy_id        TEXT NOT NULL DEFAULT '',
+     policy_version   INTEGER NOT NULL DEFAULT 0,
+     authorities_used TEXT NOT NULL DEFAULT '[]',
+     approvals        TEXT NOT NULL DEFAULT '[]',
+     obligations      TEXT NOT NULL DEFAULT '{}',
+     record           TEXT NOT NULL DEFAULT 'null',
+     request_id       TEXT NOT NULL DEFAULT '',
+     tx_id            TEXT NOT NULL DEFAULT ''
+   )`,
+  `CREATE INDEX IF NOT EXISTS idx_gov_audit_space
+     ON gov_audit(space_id, id)`,
+  `CREATE INDEX IF NOT EXISTS idx_gov_audit_operation
+     ON gov_audit(operation, at)`,
 ]
 
 /**

@@ -30,6 +30,7 @@ import {
   type SqlRow,
 } from './codec.js'
 import { applySchema } from './ddl.js'
+import { GovernanceStore } from './governance.js'
 import { elementReferences } from './references.js'
 import {
   State,
@@ -68,9 +69,21 @@ export type ChangeOp =
 export class Store {
   readonly sql: SqlStorage
 
+  /**
+   * The Governance Control Plane's records.
+   *
+   * Reachable from here because they share one database and one transaction,
+   * and kept in their own object because they are a different plane: no KML
+   * clause resolves to anything on it, and nothing on it is an element. A
+   * `store.governance.createGrant(...)` reads as the host API it is, where a
+   * `store.createGrant(...)` would read as one more table.
+   */
+  readonly governance: GovernanceStore
+
   constructor(sql: SqlStorage) {
     this.sql = sql
     applySchema(sql)
+    this.governance = new GovernanceStore(sql)
   }
 
   // --- Spaces ------------------------------------------------------------

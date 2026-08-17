@@ -60,3 +60,16 @@ export {
   asProposition,
   type ChangeOp,
 } from './store.js'
+
+export {
+  GovernanceStore,
+  actorKey,
+  type ActorBindingDraft,
+  type ApprovalDraft,
+  type DelegationDraft,
+  type GrantDraft,
+  type GroupDraft,
+  type MutationEntry,
+  type PolicyDraft,
+  type PrincipalDraft,
+} from './governance.js'
