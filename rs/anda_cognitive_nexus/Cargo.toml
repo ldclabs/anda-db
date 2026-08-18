@@ -26,6 +26,9 @@ async-trait = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
+# The 1.x migration rewrites a production database at startup; that has to be
+# visible in the operator's log rather than inferred from a changed row count.
+log = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

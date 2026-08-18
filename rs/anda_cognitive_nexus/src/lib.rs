@@ -113,6 +113,7 @@ pub mod id;
 pub mod kml;
 pub mod kql;
 pub mod meta;
+pub mod migrate;
 pub mod nexus;
 pub mod profiles;
 pub mod projection;

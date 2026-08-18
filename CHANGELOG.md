@@ -277,6 +277,45 @@ rewriting the old one.
   bare variable, which returns a plausible-looking answer to a question nobody
   asked — the one failure mode this project refuses everywhere else.
   `ts/kip-do` already refused it; now both do, and both declare it.
+- **A KIP 1.x database now migrates itself on the first 2.0 start.** Before
+  this, pointing 0.12.0 at a 1.x directory failed — but only by accident.
+  `Schema::needs_upgrade` compares version numbers, both layouts derive to 0, so
+  the 2.0 schema was silently ignored and the collection kept the 1.x one; the
+  engine then failed building an index on a field the old schema never had.
+  Safe, and unreadable as a diagnosis.
+  `CognitiveNexus::connect` now detects the 1.x layout from the schema the
+  collection actually carries and migrates in three phases with a durable
+  staging area between them, so a crash resumes instead of losing: extract the
+  1.x rows verbatim into `kip_legacy_v1`, drop the two colliding collections,
+  then load them through the ordinary engine — real KML, real validation, real
+  Governance, because a migration that wrote rows directly would be the one
+  writer allowed to produce elements the engine would have refused. The 1.x
+  rows are kept afterwards.
+  The shape change is the substance. A 1.x Proposition row is a
+  multi-predicate edge; a 2.0 Proposition is one tuple, so one row fans out
+  into one Proposition per predicate, each with its own Assertion, because each
+  carried its own `confidence`. 1.x types and predicates were free strings with
+  no package to resolve against, so the migration reads the vocabulary off the
+  data and publishes `kip://legacy/nexus@1.0.0` (§8) — generated types are
+  open-attribute and generated predicates are never functional, since a
+  constraint invented here would be one the old data was never checked against
+  and its first act would be to reject the deployment's own history.
+  What it refuses to invent is the point (§2). Every migrated Assertion carries
+  `mode: "imported"`, the registered mode for *carried in from another system*.
+  `asserted_by` is a generated actor Concept standing for the engine, not a
+  fabricated speaker. Legacy `confidence` is carried onto the Assertion and
+  also preserved verbatim, because 1.x deployments used that field for truth,
+  staleness and importance and only the operator knows which (§13, §14). And
+  `access_level` stays a legacy attribute rather than becoming a
+  classification: 1.x's annotated where 2.0's enforces, and promoting one to
+  the other silently would either over- or under-protect every migrated
+  element (§21).
+  One consequence worth knowing: `ensure_schema` now retains the generated
+  package unless a caller deactivates it by name. A host activates its own
+  baseline lock on every start, that lock cannot name a package this engine
+  generated, and without the retention the next ordinary restart would orphan
+  every migrated element's `schema_ref` — the elements still there, nothing
+  able to read them.
 - **`ts/kip-do` wrote Capsules the reference engine could not open.** Found by
   putting the shared fixtures through the request envelope, which is where the
   artifact actually shows. Two breaks, both fatal to the one thing a Capsule is

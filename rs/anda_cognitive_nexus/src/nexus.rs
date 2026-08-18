@@ -65,6 +65,11 @@ impl CognitiveNexus {
     /// before returning: such an element belongs to no committed transaction
     /// and was never visible, so removing it is the whole of the recovery.
     pub async fn connect(db: Arc<anda_db::database::AndaDB>) -> Result<Self, KipError> {
+        // A KIP 1.x database occupies the two collection names this engine is
+        // about to open, with schemas that mean something else. Extract and
+        // clear it first, or `Store::open` fails building an index on a field
+        // the old schema never had — safe, but unreadable as a diagnosis.
+        crate::migrate::prepare(&db).await?;
         let store = Store::open(db).await?;
         store.sweep_pending().await?;
         store.install_core_package().await?;
@@ -101,12 +106,18 @@ impl CognitiveNexus {
             })
             .await?;
         store.adopt_unowned_spaces(SYSTEM_PRINCIPAL).await?;
-        Ok(Self {
+        let nexus = Self {
             store,
             default_space: DEFAULT_SPACE.to_string(),
             lock: Arc::new(RwLock::new(())),
             approval_lock: Arc::new(Mutex::new(())),
-        })
+        };
+        // Loading writes through the engine, so it has to come after Governance
+        // and Core are up. A failure here fails `connect`: a half-migrated
+        // brain that answers queries is worse than one that refuses to start,
+        // because the answers look ordinary.
+        crate::migrate::load(&nexus).await?;
+        Ok(nexus)
     }
 
     /// Wraps an already-open store, for a caller that has one.
@@ -226,6 +237,8 @@ impl CognitiveNexus {
     ) -> Result<SchemaEnvironment, KipError> {
         let _guard = self.lock.write().await;
         let current = self.store.schema_environment(space_id).await?;
+        let mut lock = lock;
+        crate::migrate::retain_legacy_package(&current.lock, &mut lock);
         if current.lock == lock {
             return Ok(current);
         }
