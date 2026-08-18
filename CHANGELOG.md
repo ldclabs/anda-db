@@ -310,6 +310,19 @@ rewriting the old one.
   classification: 1.x's annotated where 2.0's enforces, and promoting one to
   the other silently would either over- or under-protect every migrated
   element (§21).
+  `migrate::plan` is the dry run: it works out what the migration would do —
+  element counts after the fan-out, the vocabulary that would be published,
+  and what would block it — and writes nothing, not even the staging area,
+  because a dry run that staged would leave the database different for having
+  been asked. It reports the ambiguous legacy fields as an inventory rather
+  than as advice: §13 and §21 are unactionable in the abstract and become
+  actionable when an operator can see that *this* deployment has 2 tuples
+  carrying confidence between 0.25 and 0.90 and one `access_level` value.
+  A legacy `author` that names exactly one migrated Concept now becomes that
+  Concept's Assertion rather than the migration actor's — that is a speaker
+  the old system really did record, and dropping it would lose attribution the
+  data actually had. A name shared by two Concepts identifies neither, so it
+  is left alone rather than resolved by picking one (§12).
   One consequence worth knowing: `ensure_schema` now retains the generated
   package unless a caller deactivates it by name. A host activates its own
   baseline lock on every start, that lock cannot name a package this engine

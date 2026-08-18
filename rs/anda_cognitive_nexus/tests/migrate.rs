@@ -394,3 +394,259 @@ async fn an_interrupted_extract_is_redone_rather_than_resumed_half_way() {
     .await;
     assert_eq!(alice, json!([1]));
 }
+
+/// Opens the raw database without migrating, as a dry run does.
+async fn open_raw(store: Arc<InMemory>, name: &str) -> Arc<AndaDB> {
+    Arc::new(
+        AndaDB::connect(
+            store,
+            DBConfig {
+                name: name.to_string(),
+                description: "dry run".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn a_dry_run_reports_the_plan_and_writes_nothing() {
+    let store = write_v1("migrate_dry_run").await;
+    let db = open_raw(store.clone(), "migrate_dry_run").await;
+
+    let plan = anda_cognitive_nexus::migrate::plan(&db)
+        .await
+        .unwrap()
+        .expect("a 1.x database has a plan");
+
+    assert_eq!(plan.concepts, 3);
+    assert_eq!(plan.proposition_rows, 2);
+    // The fan-out: two predicates on one row plus one on the other.
+    assert_eq!(plan.propositions, 3);
+    assert_eq!(plan.assertions, 3);
+    assert!(plan.concept_types.contains("Spaceship"));
+    assert!(plan.predicates.contains("prefers"));
+    assert!(plan.predicates.contains("noted_by"));
+    assert!(plan.is_runnable(), "blockers: {:?}", plan.blockers);
+
+    // The inventory that makes §13/§21 actionable for *this* deployment.
+    let confidence = plan.confidence.expect("the fixture carries confidence");
+    assert_eq!(confidence.count, 2);
+    assert_eq!(confidence.min, 0.25);
+    assert_eq!(confidence.max, 0.9);
+    assert_eq!(plan.access_levels.get("private"), Some(&1));
+
+    // The report is readable rather than a struct dump.
+    let rendered = plan.to_string();
+    assert!(rendered.contains("nothing has been written"));
+    assert!(rendered.contains("No blockers"));
+
+    // And it left no trace: no staging, and the 1.x layout is untouched.
+    assert!(
+        !db.metadata().collections.contains(LEGACY_STAGING),
+        "a dry run must not stage"
+    );
+    let concepts = db
+        .open_collection("concepts".to_string(), async |_| Ok(()))
+        .await
+        .unwrap();
+    assert_eq!(concepts.len(), 3);
+    assert!(
+        concepts.schema().get_field("type").is_some(),
+        "the 1.x schema must still be in force after a dry run"
+    );
+    db.close().await.unwrap();
+
+    // The real migration still runs afterwards, unaffected by having been asked.
+    let nexus = open_v2(store, "migrate_dry_run").await;
+    let count = query(&nexus, r#"FIND(COUNT(?c)) WHERE { ?c CONCEPT {} }"#).await;
+    assert_eq!(count, json!([4]), "3 migrated concepts plus the actor");
+}
+
+#[tokio::test]
+async fn a_dry_run_names_what_would_block_it() {
+    let store = Arc::new(InMemory::new());
+    let db = AndaDB::connect(
+        store.clone(),
+        DBConfig {
+            name: "migrate_blocked".to_string(),
+            description: "a broken KIP 1.x database".to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let concepts = db
+        .open_or_create_collection(
+            V1Concept::schema().unwrap(),
+            CollectionConfig {
+                name: "concepts".to_string(),
+                description: "Concept nodes".to_string(),
+            },
+            async |c| {
+                c.create_btree_index_nx(&["type"]).await?;
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+    // A row with no type has no symbol to resolve to.
+    concepts
+        .add_from(&V1Concept {
+            _id: 0,
+            r#type: String::new(),
+            name: "Untyped".to_string(),
+            attributes: json!({}),
+            metadata: json!({}),
+        })
+        .await
+        .unwrap();
+    let propositions = db
+        .open_or_create_collection(
+            V1Proposition::schema().unwrap(),
+            CollectionConfig {
+                name: "propositions".to_string(),
+                description: "Proposition links".to_string(),
+            },
+            async |c| {
+                c.create_btree_index_nx(&["subject"]).await?;
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+    // An endpoint nothing provides.
+    propositions
+        .add_from(&V1Proposition {
+            _id: 0,
+            subject: "C:999".to_string(),
+            object: "C:1".to_string(),
+            predicates: json!(["dangles"]),
+            properties: json!({}),
+        })
+        .await
+        .unwrap();
+    concepts.flush(now_ms()).await.unwrap();
+    propositions.flush(now_ms()).await.unwrap();
+
+    let db = Arc::new(db);
+    let plan = anda_cognitive_nexus::migrate::plan(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!plan.is_runnable());
+    let blockers = plan.blockers.join("\n");
+    assert!(blockers.contains("has no type"), "{blockers}");
+    assert!(blockers.contains("C:999"), "{blockers}");
+    assert!(plan.to_string().contains("blocker(s)"));
+}
+
+#[tokio::test]
+async fn a_dry_run_on_a_migrated_database_has_nothing_to_report() {
+    let store = write_v1("migrate_dry_after").await;
+    let nexus = open_v2(store.clone(), "migrate_dry_after").await;
+    nexus.close().await.unwrap();
+
+    let db = open_raw(store, "migrate_dry_after").await;
+    assert!(
+        anda_cognitive_nexus::migrate::plan(&db)
+            .await
+            .unwrap()
+            .is_none(),
+        "a migrated database has no outstanding plan"
+    );
+}
+
+#[tokio::test]
+async fn an_unambiguous_legacy_author_becomes_the_speaker() {
+    // §12: a legacy `author` may be a speaker, a writer application, or
+    // bookkeeping. Mapping it is justified only when it names exactly one
+    // Concept — then the old system really did record who said it.
+    let store = Arc::new(InMemory::new());
+    let db = AndaDB::connect(
+        store.clone(),
+        DBConfig {
+            name: "migrate_author".to_string(),
+            description: "a KIP 1.x database".to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let concepts = db
+        .open_or_create_collection(
+            V1Concept::schema().unwrap(),
+            CollectionConfig {
+                name: "concepts".to_string(),
+                description: "Concept nodes".to_string(),
+            },
+            async |c| {
+                c.create_btree_index_nx(&["name"]).await?;
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+    for (name, kind) in [("Alice", "Person"), ("Dark", "Preference")] {
+        concepts
+            .add_from(&V1Concept {
+                _id: 0,
+                r#type: kind.to_string(),
+                name: name.to_string(),
+                attributes: json!({}),
+                metadata: json!({}),
+            })
+            .await
+            .unwrap();
+    }
+    let propositions = db
+        .open_or_create_collection(
+            V1Proposition::schema().unwrap(),
+            CollectionConfig {
+                name: "propositions".to_string(),
+                description: "Proposition links".to_string(),
+            },
+            async |c| {
+                c.create_btree_index_nx(&["subject"]).await?;
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+    propositions
+        .add_from(&V1Proposition {
+            _id: 0,
+            subject: "C:1".to_string(),
+            object: "C:2".to_string(),
+            predicates: json!(["prefers", "mentions"]),
+            properties: json!({
+                // Names exactly one Concept: a speaker the old system recorded.
+                "prefers": {"attributes": {}, "metadata": {"author": "Alice"}},
+                // Names nothing: stays the migration actor.
+                "mentions": {"attributes": {}, "metadata": {"author": "some-importer-v3"}},
+            }),
+        })
+        .await
+        .unwrap();
+    concepts.flush(now_ms()).await.unwrap();
+    propositions.flush(now_ms()).await.unwrap();
+    db.close().await.unwrap();
+
+    let nexus = open_v2(store, "migrate_author").await;
+    let speakers = query(
+        &nexus,
+        r#"FIND(?who.name) WHERE { ?a ASSERTION {asserted_by: ?who} } ORDER BY ?who.name"#,
+    )
+    .await;
+    let speakers = speakers.as_array().unwrap();
+    assert!(
+        speakers.contains(&json!("Alice")),
+        "a resolvable author becomes the speaker: {speakers:?}"
+    );
+    assert!(
+        speakers.contains(&json!("KIP 1.x migration")),
+        "an unresolvable one stays the migration actor: {speakers:?}"
+    );
+}

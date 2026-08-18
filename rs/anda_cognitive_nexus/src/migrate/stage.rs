@@ -167,6 +167,60 @@ pub(crate) async fn prepare(db: &Arc<AndaDB>) -> Result<(), KipError> {
     Ok(())
 }
 
+/// Reads a live 1.x layout without staging or changing anything.
+///
+/// This is what a dry run walks. It deliberately does not go through the
+/// staging area: staging is a write, and the whole point of a dry run is that
+/// an operator can point it at a production database and learn what would
+/// happen without that database becoming different for having been asked.
+pub(crate) async fn read_live_v1(
+    db: &Arc<AndaDB>,
+) -> Result<Option<(Vec<LegacyRow>, Vec<LegacyRow>)>, KipError> {
+    let collections = db.metadata().collections;
+    if !collections.contains(CONCEPTS) {
+        return Ok(None);
+    }
+    let concepts = db
+        .open_collection(CONCEPTS.to_string(), async |_| Ok(()))
+        .await
+        .map_err(db_error)?;
+    if !is_v1_concepts(&concepts.schema()) {
+        return Ok(None);
+    }
+
+    let mut concept_rows = Vec::new();
+    read_into(&concepts, kind::CONCEPT, &mut concept_rows).await?;
+
+    let mut proposition_rows = Vec::new();
+    if collections.contains(PROPOSITIONS) {
+        let propositions = db
+            .open_collection(PROPOSITIONS.to_string(), async |_| Ok(()))
+            .await
+            .map_err(db_error)?;
+        read_into(&propositions, kind::PROPOSITION, &mut proposition_rows).await?;
+    }
+    Ok(Some((concept_rows, proposition_rows)))
+}
+
+async fn read_into(
+    source: &Arc<anda_db::collection::Collection>,
+    kind: &str,
+    out: &mut Vec<LegacyRow>,
+) -> Result<(), KipError> {
+    for id in source.ids() {
+        let doc: Json = source.get_as(id).await.map_err(db_error)?;
+        let legacy_id = doc.get("_id").and_then(|v| v.as_u64()).unwrap_or(id);
+        out.push(LegacyRow {
+            _id: 0,
+            kind: kind.to_string(),
+            legacy_id,
+            doc,
+        });
+    }
+    out.sort_by_key(|row| row.legacy_id);
+    Ok(())
+}
+
 async fn copy_out(
     source: &Arc<anda_db::collection::Collection>,
     staging: &Arc<anda_db::collection::Collection>,

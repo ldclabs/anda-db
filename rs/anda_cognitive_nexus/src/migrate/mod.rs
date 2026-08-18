@@ -58,9 +58,11 @@
 
 mod convert;
 mod package;
+mod plan;
 mod stage;
 
 pub use package::{LEGACY_PACKAGE_ID, legacy_package_ref};
+pub use plan::{ConfidenceRange, MigrationPlan, plan};
 pub use stage::{LEGACY_STAGING, LegacyKind, LegacyRow};
 
 use anda_db::database::AndaDB;

@@ -137,7 +137,16 @@ pub(crate) async fn load(nexus: &CognitiveNexus) -> Result<(), KipError> {
 
     let actor = ensure_actor(nexus).await?;
     let concept_ids = load_concepts(nexus, &concepts, &vocabulary).await?;
-    let claims = load_propositions(nexus, &propositions, &vocabulary, &concept_ids, &actor).await?;
+    let speakers = unambiguous_speakers(&concepts, &concept_ids);
+    let claims = load_propositions(
+        nexus,
+        &propositions,
+        &vocabulary,
+        &concept_ids,
+        &actor,
+        &speakers,
+    )
+    .await?;
 
     stage::mark_complete(
         &staging,
@@ -249,6 +258,42 @@ fn concept_key(legacy_id: u64) -> String {
 
 fn proposition_key(legacy_id: u64, predicate: &str) -> String {
     format!("{MIGRATION_KEY_PREFIX}P:{legacy_id}:{predicate}")
+}
+
+/// The 1.x `author` strings that name exactly one migrated Concept.
+///
+/// §12 is blunt that a legacy `author` is ambiguous: it may be a semantic
+/// speaker, the application that wrote the row, or a bookkeeping actor. Mapping
+/// it is allowed only when justified, and never by inventing an ActorBinding.
+///
+/// The one case that clears that bar is an `author` matching exactly one
+/// Concept by name — then the old system did record who said it, and dropping
+/// that would lose attribution the data actually had. A name shared by two
+/// Concepts identifies neither, so it is left alone rather than resolved by
+/// picking one.
+fn unambiguous_speakers(
+    concepts: &[LegacyRow],
+    ids: &BTreeMap<u64, String>,
+) -> BTreeMap<String, String> {
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for row in concepts {
+        if let Some(name) = row.doc.get("name").and_then(Json::as_str) {
+            *counts.entry(name).or_default() += 1;
+        }
+    }
+    let mut speakers = BTreeMap::new();
+    for row in concepts {
+        let Some(name) = row.doc.get("name").and_then(Json::as_str) else {
+            continue;
+        };
+        if counts.get(name) != Some(&1) {
+            continue;
+        }
+        if let Some(id) = ids.get(&row.legacy_id) {
+            speakers.insert(name.to_string(), id.clone());
+        }
+    }
+    speakers
 }
 
 /// Creates every staged Concept that is not already there.
@@ -401,6 +446,7 @@ async fn load_propositions(
     vocabulary: &Vocabulary,
     concepts: &BTreeMap<u64, String>,
     actor: &str,
+    speakers: &BTreeMap<String, String>,
 ) -> Result<usize, KipError> {
     let mut created: BTreeMap<String, String> = BTreeMap::new();
     let mut assertions = 0usize;
@@ -462,7 +508,8 @@ async fn load_propositions(
         }
 
         for chunk in ready.chunks(BATCH) {
-            assertions += write_batch(nexus, chunk, vocabulary, actor, &mut created).await?;
+            assertions +=
+                write_batch(nexus, chunk, vocabulary, actor, speakers, &mut created).await?;
         }
         outstanding = deferred;
     }
@@ -476,6 +523,7 @@ async fn write_batch(
     chunk: &[Ready],
     vocabulary: &Vocabulary,
     actor: &str,
+    speakers: &BTreeMap<String, String>,
     created: &mut BTreeMap<String, String>,
 ) -> Result<usize, KipError> {
     let mut clauses = Vec::new();
@@ -510,6 +558,22 @@ async fn write_batch(
             format!("ak{index}"),
             json!(proposition_key(*legacy_id, predicate)),
         );
+        // A legacy `author` that names exactly one migrated Concept is a
+        // speaker the old system really did record; anything else stays the
+        // migration actor, and the string stays an attribute (§12).
+        let speaker = properties
+            .get("metadata")
+            .and_then(|m| m.get("author"))
+            .and_then(Json::as_str)
+            .and_then(|author| speakers.get(author))
+            .cloned();
+        let by = match speaker {
+            Some(id) => {
+                parameters.insert(format!("by{index}"), json!({"id": id}));
+                format!(":by{index}")
+            }
+            None => ":actor".to_string(),
+        };
         let confidence_clause = match confidence {
             Some(value) => {
                 parameters.insert(format!("cf{index}"), json!(value));
@@ -519,7 +583,7 @@ async fn write_batch(
         };
         clauses.push(format!(
             "CREATE ASSERTION ?a{index} {{ CLIENT KEY :ak{index} SET FIELDS {{ \
-             proposition: ?p{index}, asserted_by: :actor, stance: \"support\", \
+             proposition: ?p{index}, asserted_by: {by}, stance: \"support\", \
              mode: \"imported\"{confidence_clause} }} }}"
         ));
         assertions += 1;
