@@ -49,8 +49,14 @@ import { errors } from '../errors.js'
  * historical read resolves symbols through the environment that was in force
  * *then* (§144), and answering that from a timestamp would be guessing at a
  * coordinate the engine can simply record.
+ *
+ * 4 — `idx_concepts_key` widened from `(space, key)` to
+ * `(space, schema_ref, key)`, because §7.3 scopes key uniqueness to the type.
+ * A *narrowing* of what the database rejects, so it needs the rebuild in
+ * {@link REDEFINED_INDEXES}: the old index would go on refusing a `Preference`
+ * keyed the same as a `Person`.
  */
-export const SCHEMA_VERSION = 3
+export const SCHEMA_VERSION = 4
 
 /**
  * The `_system` envelope every element table repeats.
@@ -113,10 +119,14 @@ export const SCHEMA_STATEMENTS: readonly string[] = [
    )`,
   ...envelopeIndexes('concepts'),
   // The Space-local logical key is the immutable identity (§5.3), so this
-  // index *is* that rule and not an optimization. Partial: a Concept may have
-  // no key at all, and several such Concepts must not collide on `''`.
+  // index *is* that rule and not an optimization. Scoped to
+  // `(space, schema_ref, key)` as §7.3 requires: a Person and a Preference may
+  // both be keyed `alice` and they are two identities, which is what lets a 1.x
+  // database whose identity was `(type, name)` migrate those names into keys
+  // without merging unrelated Concepts. Partial: a Concept may have no key at
+  // all, and several such Concepts must not collide on `''`.
   `CREATE UNIQUE INDEX IF NOT EXISTS idx_concepts_key
-     ON concepts(space, key) WHERE key <> ''`,
+     ON concepts(space, schema_ref, key) WHERE key <> ''`,
   // `name` is mutable grounding state and duplicates are allowed (§5.2), so
   // this one is deliberately not unique.
   `CREATE INDEX IF NOT EXISTS idx_concepts_name ON concepts(space, name)`,
@@ -674,9 +684,38 @@ function addMissingColumns(sql: SqlStorage): void {
   }
 }
 
+/**
+ * Indexes whose *definition* changed under a name that already exists.
+ *
+ * `CREATE INDEX IF NOT EXISTS` matches on the name alone, so redefining one is
+ * silently a no-op on every database that already has it — the statement in
+ * {@link SCHEMA_STATEMENTS} would then describe an index the deployed database
+ * does not actually have. Each entry names a column the *current* definition
+ * indexes; an existing index missing it is the old one, and dropping it lets
+ * the `CREATE` below rebuild it.
+ *
+ * Keyed on the columns rather than on `schema_version` so that a database
+ * interrupted mid-migration converges on a re-run, like every other step here.
+ */
+const REDEFINED_INDEXES: readonly { index: string; column: string }[] = [
+  { index: 'idx_concepts_key', column: 'schema_ref' },
+]
+
+function dropRedefinedIndexes(sql: SqlStorage): void {
+  for (const { index, column } of REDEFINED_INDEXES) {
+    const columns = sql.exec<{ name: string }>(`PRAGMA index_info(${index})`).toArray()
+    // No rows means no such index yet — a fresh database, nothing to drop.
+    if (columns.length > 0 && !columns.some((row) => row.name === column)) {
+      sql.exec(`DROP INDEX ${index}`)
+    }
+  }
+}
+
 /** Applies the current schema. Safe to retry after an interrupted migration. */
 export function applySchema(sql: SqlStorage): void {
   configureSql(sql)
+  // Before the `CREATE`s, which would otherwise skip the stale definition.
+  dropRedefinedIndexes(sql)
   for (const statement of SCHEMA_STATEMENTS) {
     sql.exec(statement)
   }

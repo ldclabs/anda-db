@@ -16,8 +16,8 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 serde-pyobject = { workspace = true }
 
 # Anda
-anda_cognitive_nexus = { version = "0.12", path = "../../rs/anda_cognitive_nexus" }
-anda_kip = { version = "0.12", path = "../../rs/anda_kip" }
+anda_cognitive_nexus = { version = "0.13", path = "../../rs/anda_cognitive_nexus" }
+anda_kip = { version = "0.13", path = "../../rs/anda_kip" }
 anda_db = { version = "0.11", path = "../../rs/anda_db", features = ["full"] }
 anda_object_store = { version = "0.11", path = "../../rs/anda_object_store" }
 

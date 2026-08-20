@@ -112,12 +112,45 @@ impl CognitiveNexus {
             lock: Arc::new(RwLock::new(())),
             approval_lock: Arc::new(Mutex::new(())),
         };
-        // Loading writes through the engine, so it has to come after Governance
-        // and Core are up. A failure here fails `connect`: a half-migrated
-        // brain that answers queries is worse than one that refuses to start,
-        // because the answers look ordinary.
-        crate::migrate::load(&nexus).await?;
+        // A staged 1.x migration is finished here only when this Space already
+        // has a Schema Environment — meaning a previous run activated the
+        // host's packages and this is a restart, possibly one resuming an
+        // interrupted load.
+        //
+        // On a *first* start there is nothing but Core, and finishing now would
+        // decide the migration's vocabulary before the host has said what its
+        // vocabulary is: every legacy type would be minted as a duplicate
+        // symbol, and the host's `Person` and the migrated `Person` would
+        // become two names for one word that no query can tell apart. So it
+        // waits for `ensure_schema` instead.
+        //
+        // A failure here fails `connect`: a half-migrated brain that answers
+        // queries is worse than one that refuses to start, because the answers
+        // look ordinary.
+        if nexus
+            .store
+            .get_space(DEFAULT_SPACE)
+            .await?
+            .schema_environment_version
+            > 0
+        {
+            crate::migrate::load(&nexus).await?;
+        }
         Ok(nexus)
+    }
+
+    /// Finishes a staged KIP 1.x migration against the vocabulary now in force.
+    ///
+    /// A host that activates packages gets this for free from
+    /// [`Self::ensure_schema`]. This is for one that activates nothing and still
+    /// wants its 1.x rows converted — they will be, against a generated legacy
+    /// package, which is the best mapping available when nothing better has been
+    /// declared.
+    ///
+    /// Idempotent: a completed migration is a no-op, and an interrupted one
+    /// resumes from where it stopped.
+    pub async fn finish_migration(&self) -> Result<(), KipError> {
+        crate::migrate::load(self).await
     }
 
     /// Wraps an already-open store, for a caller that has one.
@@ -231,6 +264,26 @@ impl CognitiveNexus {
     /// invalidating clients' `preconditions.schema_environment_version` and
     /// filling `HISTORY` with schema changes that changed nothing.
     pub async fn ensure_schema(
+        &self,
+        space_id: &str,
+        lock: crate::schema::SchemaLock,
+    ) -> Result<SchemaEnvironment, KipError> {
+        self.activate_if_changed(space_id, lock).await?;
+        // A 1.x migration staged by `connect` waits for exactly this moment: the
+        // host has now said what its vocabulary is, so a legacy `Person` can be
+        // carried onto the host's `Person` instead of becoming a second symbol
+        // spelled the same way. Outside the write guard, because the load runs
+        // its KML through the ordinary engine — which takes that guard itself.
+        crate::migrate::load(self).await?;
+        self.store.schema_environment(space_id).await
+    }
+
+    /// Activates `lock` when it differs from the one in force, and nothing else.
+    ///
+    /// Separate from [`Self::ensure_schema`] because the migration load calls
+    /// it: going through `ensure_schema` there would re-enter the load that is
+    /// already running.
+    pub(crate) async fn activate_if_changed(
         &self,
         space_id: &str,
         lock: crate::schema::SchemaLock,

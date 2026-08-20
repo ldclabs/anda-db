@@ -252,15 +252,53 @@ export class Store {
       .map((row) => ({ kind, row: decodeRow<ElementRow>(table, row) }) as Element)
   }
 
-  /** The Concept holding a Space-local logical key, if one does. */
-  conceptByKey(space: string, key: string): ConceptRow | null {
-    const row = this.sql
-      .exec<SqlRow>(
-        'SELECT * FROM concepts WHERE space = ? AND "key" = ?',
-        space,
-        key,
+  /**
+   * The Concept holding a Space-local logical key, if one does.
+   *
+   * `schemaRef` narrows the lookup rather than filtering its result, because
+   * §7.3 scopes key uniqueness to `(space_id, schema_ref, key)`: a Person and a
+   * Preference both keyed `"alice"` are two identities, not a collision — which
+   * is also what makes the 1.x migration of `(type, name)` identity into a key
+   * collision-free.
+   *
+   * Without a declared type the key alone must still land on one Concept.
+   * Returning the first of several would be the arbitrary winner §51 forbids
+   * for names, arriving through `key` instead.
+   */
+  conceptByKey(
+    space: string,
+    schemaRef: string | null,
+    key: string,
+  ): ConceptRow | null {
+    // The empty string stores "no logical key", so it must never match —
+    // otherwise every keyless Concept in the Space would answer an upsert
+    // meant for one of them.
+    if (key === '') return null
+    const rows =
+      schemaRef === null
+        ? this.sql
+            .exec<SqlRow>(
+              'SELECT * FROM concepts WHERE space = ? AND "key" = ?',
+              space,
+              key,
+            )
+            .toArray()
+        : this.sql
+            .exec<SqlRow>(
+              'SELECT * FROM concepts WHERE space = ? AND schema_ref = ? AND "key" = ?',
+              space,
+              schemaRef,
+              key,
+            )
+            .toArray()
+    if (rows.length > 1) {
+      throw errors.identityConflict(
+        `the key ${JSON.stringify(key)} is carried by ${rows.length} Concepts ` +
+          'in this Space, so it does not name one on its own; add the type — ' +
+          'MATCH {type: …, key: …} — rather than letting the engine pick among them',
       )
-      .toArray()[0]
+    }
+    const row = rows[0]
     return row ? decodeRow<ConceptRow>('concepts', row) : null
   }
 

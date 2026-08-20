@@ -506,8 +506,17 @@ export const FIXTURES: readonly Fixture[] = [
       },
       {
         "name": "a duplicate of the same person, recorded separately",
-        "command": "UPSERT CONCEPT ?dup { MATCH {key: \"person:alice-duplicate\"} SET FIELDS {name: \"Alice\"} }",
+        "command": "UPSERT CONCEPT ?dup { MATCH {type: \"Person\", key: \"person:alice-duplicate\"} SET FIELDS {name: \"Alice\"} }",
         "expect": {}
+      },
+      {
+        "name": "the upsert created the type its MATCH declared",
+        "command": "FIND(?p.name) WHERE { ?p CONCEPT {type: \"Person\", key: \"person:alice-duplicate\"} }",
+        "expect": {
+          "result": [
+            "Alice"
+          ]
+        }
       },
       {
         "name": "a merge never picks an identity by description: two Concepts share the name",
@@ -520,6 +529,56 @@ export const FIXTURES: readonly Fixture[] = [
         "name": "named by stable identity instead, the merge consolidates them",
         "command": "MERGE CONCEPT ?source INTO ?target WHERE { ?source CONCEPT {key: \"person:alice-duplicate\"} ?target CONCEPT {key: \"person:alice\"} }",
         "expect": {}
+      },
+      {
+        "name": "a logical key is identity within its type",
+        "command": "UPSERT CONCEPT ?a { MATCH {type: \"Person\", key: \"shared:label\"} SET FIELDS {name: \"A person\"} }",
+        "expect": {}
+      },
+      {
+        "name": "so another type may carry the same key, and it is a second identity",
+        "command": "UPSERT CONCEPT ?b { MATCH {type: \"Preference\", key: \"shared:label\"} SET FIELDS {name: \"A preference\"} }",
+        "expect": {}
+      },
+      {
+        "name": "the key alone now names two Concepts, and is not resolved arbitrarily",
+        "command": "UPSERT CONCEPT ?c { MATCH {key: \"shared:label\"} SET FIELDS {name: \"?\"} }",
+        "expect": {
+          "error": "IdentityConflict"
+        }
+      },
+      {
+        "name": "an upsert declaring no type cannot create a Concept it would have to invent one for",
+        "command": "UPSERT CONCEPT ?x { MATCH {key: \"person:nobody\"} SET FIELDS {name: \"Nobody\"} }",
+        "expect": {
+          "error": "SchemaSymbolNotFound"
+        }
+      },
+      {
+        "name": "an upsert by id resolves only, so an id nothing carries is a failure and not a create",
+        "command": "UPSERT CONCEPT ?x { MATCH {type: \"Person\", id: \"C-99999\"} SET FIELDS {name: \"Nobody\"} }",
+        "expect": {
+          "error": "NotFoundOrNotVisible"
+        }
+      },
+      {
+        "name": "a MATCH member of the wrong type is refused rather than read as absent",
+        "command": "UPSERT CONCEPT ?x { MATCH {type: 42, key: \"person:nobody\"} SET FIELDS {name: \"Nobody\"} }",
+        "expect": {
+          "error": "TypeMismatch"
+        }
+      },
+      {
+        "name": "MATCH selects; it does not seed the Concept it creates",
+        "command": "UPSERT CONCEPT ?x { MATCH {type: \"Person\", key: \"person:unnamed\", name: \"Ignored\"} }",
+        "expect": {}
+      },
+      {
+        "name": "so grounding state arrives through SET FIELDS and nowhere else",
+        "command": "FIND(?p.key) WHERE { ?p CONCEPT {type: \"Person\", name: \"Ignored\"} }",
+        "expect": {
+          "result": []
+        }
       },
       {
         "name": "PURGE refuses by default while anything still references the target",
@@ -747,4 +806,4 @@ export const FIXTURES: readonly Fixture[] = [
 ] as unknown as Fixture[]
 
 /** The total number of cases, so a silent shrink is visible. */
-export const CASE_COUNT = 71
+export const CASE_COUNT = 80

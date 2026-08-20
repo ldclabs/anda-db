@@ -503,7 +503,7 @@ async fn an_upsert_resolves_identity_through_key_and_never_through_name() {
     let first = ok(
         &nexus,
         r#"UPSERT CONCEPT ?p {
-             MATCH {key: "person:alice"}
+             MATCH {type: "Person", key: "person:alice"}
              SET FIELDS {name: "Alice"}
              SET ATTRIBUTES {display_name: "Alice"}
            }"#,
@@ -547,12 +547,200 @@ async fn an_upsert_resolves_identity_through_key_and_never_through_name() {
     assert_eq!(row.version, 2, "an unchanged element keeps its version");
 }
 
+/// `MATCH {type: ...}` used to be parsed and then dropped, which is worse than
+/// rejecting it: the upsert created a Concept with an empty `schema_ref`, and
+/// `schema_ref` is fixed at creation — so no `{type: ...}` query could ever
+/// find it and no later write could repair it.
+#[tokio::test]
+async fn an_upsert_creates_the_type_its_match_declares() {
+    let nexus = nexus("upsert_type").await;
+    let created = ok(
+        &nexus,
+        r#"UPSERT CONCEPT ?p {
+             MATCH {type: "Person", key: "person:ada"}
+             SET FIELDS {name: "Ada"}
+           }"#,
+    )
+    .await;
+    let id = handle(&created, "p");
+
+    let Element::Concept(row) = nexus.store.get_element(id).await.unwrap() else {
+        panic!("must be a Concept");
+    };
+    assert_eq!(
+        row.schema_ref,
+        "kip://profiles/cognitive-memory@2.0.0/Person"
+    );
+
+    // The point of carrying the type: the Concept is reachable by it.
+    let found = ok(
+        &nexus,
+        r#"FIND(?p.name) WHERE { ?p CONCEPT {type: "Person", key: "person:ada"} }"#,
+    )
+    .await;
+    assert_eq!(found, json!(["Ada"]));
+
+    // A Concept whose key nothing else shares, for the bare-key case below.
+    let solo = handle(
+        &ok(
+            &nexus,
+            r#"UPSERT CONCEPT ?p {
+                 MATCH {type: "Person", key: "person:ada-only"}
+                 SET FIELDS {name: "Solo"}
+               }"#,
+        )
+        .await,
+        "p",
+    );
+
+    // A second upsert resolves the same Concept rather than minting another.
+    let again = ok(
+        &nexus,
+        r#"UPSERT CONCEPT ?p {
+             MATCH {type: "Person", key: "person:ada"}
+             SET FIELDS {name: "Ada L."}
+           }"#,
+    )
+    .await;
+    assert_eq!(handle(&again, "p"), id);
+
+    // §7.3 scopes key uniqueness to (space_id, schema_ref, key), so the same
+    // key under another type is a second identity rather than a collision —
+    // which is what keeps the 1.x migration of (type, name) identity into a
+    // key from merging unrelated Concepts.
+    let other = ok(
+        &nexus,
+        r#"UPSERT CONCEPT ?p {
+             MATCH {type: "Preference", key: "person:ada"}
+             SET FIELDS {name: "Dark"}
+           }"#,
+    )
+    .await;
+    assert_ne!(handle(&other, "p"), id);
+
+    // And now that two Concepts share the key, the key alone no longer names
+    // one. Answering with either would be the arbitrary winner §51 forbids for
+    // names, reaching the same outcome through `key`.
+    let ambiguous = run(
+        &nexus,
+        r#"UPSERT CONCEPT ?p { MATCH {key: "person:ada"} SET FIELDS {name: "?"} }"#,
+    )
+    .await;
+    assert_eq!(
+        ambiguous.error.as_ref().unwrap().code.as_str(),
+        "IdentityConflict"
+    );
+
+    // An UPSERT with no type cannot create: a Concept whose type nothing can
+    // later supply is not something this engine will mint.
+    let untyped = run(
+        &nexus,
+        r#"UPSERT CONCEPT ?p { MATCH {key: "person:grace"} SET FIELDS {name: "Grace"} }"#,
+    )
+    .await;
+    assert_eq!(
+        untyped.error.as_ref().unwrap().code.as_str(),
+        "SchemaSymbolNotFound"
+    );
+
+    // Resolving an unambiguous key still needs no type.
+    let resolved = ok(
+        &nexus,
+        r#"UPSERT CONCEPT ?p { MATCH {key: "person:ada-only"} SET FIELDS {name: "Solo"} }"#,
+    )
+    .await;
+    assert_eq!(handle(&resolved, "p"), solo);
+
+    // An upsert by id may not create, and a type that does not match the id is
+    // not a match — reported existence-neutrally either way (§86.4).
+    for command in [
+        r#"UPSERT CONCEPT ?p { MATCH {id: "C-9999"} SET FIELDS {name: "Nobody"} }"#,
+        r#"UPSERT CONCEPT ?p { MATCH {type: "Preference", id: :id} SET FIELDS {name: "Wrong"} }"#,
+    ] {
+        let request = Request {
+            parameters: Some(serde_json::Map::from_iter([(
+                "id".to_string(),
+                json!(id.to_string()),
+            )])),
+            ..Request::single(command)
+        };
+        let parsed = anda_kip::parse_kip(command).unwrap();
+        let response = nexus
+            .execute(parsed, &request, &request.operations[0])
+            .await;
+        assert_eq!(
+            response.error.as_ref().unwrap().code.as_str(),
+            "NotFoundOrNotVisible",
+            "{command}"
+        );
+    }
+}
+
+/// §7.3 scopes a logical key's uniqueness to `(space_id, schema_ref, key)`.
+/// Both halves matter: two Concepts of one type may not share a key, and two
+/// Concepts of different types may.
+#[tokio::test]
+async fn a_logical_key_is_identity_within_its_type() {
+    let nexus = nexus("key_identity").await;
+    ok(
+        &nexus,
+        r#"CREATE CONCEPT ?p { TYPE "Person" NAME "Ada" SET FIELDS {key: "alice"} }"#,
+    )
+    .await;
+
+    // Same type, same key, second Concept: the key would name two things.
+    let clash = run(
+        &nexus,
+        r#"CREATE CONCEPT ?p { TYPE "Person" NAME "Other" SET FIELDS {key: "alice"} }"#,
+    )
+    .await;
+    assert_eq!(
+        clash.error.as_ref().unwrap().code.as_str(),
+        "IdentityConflict"
+    );
+
+    // Including when both are minted by one transaction, which no store lookup
+    // would catch because neither is committed yet.
+    let together = run(
+        &nexus,
+        r#"MUTATE {
+             CREATE CONCEPT ?a { TYPE "Preference" NAME "One" SET FIELDS {key: "dark"} }
+             CREATE CONCEPT ?b { TYPE "Preference" NAME "Two" SET FIELDS {key: "dark"} }
+           }"#,
+    )
+    .await;
+    assert_eq!(
+        together.error.as_ref().unwrap().code.as_str(),
+        "IdentityConflict"
+    );
+
+    // A different type under the same key is a different identity, not a
+    // collision — this is what lets 1.x `(type, name)` identity migrate into a
+    // key without merging unrelated Concepts.
+    ok(
+        &nexus,
+        r#"CREATE CONCEPT ?p { TYPE "Preference" NAME "Alice" SET FIELDS {key: "alice"} }"#,
+    )
+    .await;
+
+    // An empty key stores "no logical key" and claims nothing, so any number of
+    // Concepts may carry one.
+    ok(
+        &nexus,
+        r#"MUTATE {
+             CREATE CONCEPT ?a { TYPE "Person" NAME "Nameless one" }
+             CREATE CONCEPT ?b { TYPE "Person" NAME "Nameless two" }
+           }"#,
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn an_expect_version_guard_stops_a_lost_update() {
     let nexus = nexus("expect_version").await;
     let created = ok(
         &nexus,
-        r#"UPSERT CONCEPT ?p { MATCH {key: "k"} SET FIELDS {name: "One"} }"#,
+        r#"UPSERT CONCEPT ?p { MATCH {type: "Person", key: "k"} SET FIELDS {name: "One"} }"#,
     )
     .await;
     let id = handle(&created, "p");

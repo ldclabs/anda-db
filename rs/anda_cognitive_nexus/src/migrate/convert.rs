@@ -126,6 +126,10 @@ pub(crate) async fn load(nexus: &CognitiveNexus) -> Result<(), KipError> {
     );
 
     let mut vocabulary = Vocabulary::scan(&concepts, &propositions);
+    // Hand every name the Space can already resolve to whoever declares it, so
+    // a 1.x `Person` becomes the host's `Person` rather than a second symbol
+    // spelled the same way. What is left has no owner and is declared below.
+    vocabulary.resolve(&nexus.store.schema_environment(DEFAULT_SPACE).await?);
     // The actor every migrated Assertion is attributed to needs a type, and no
     // type in the cognitive-memory profile means "the engine that imported
     // this". Generating one keeps the attribution honest without bending
@@ -200,7 +204,7 @@ async fn activate_legacy_package(
     );
     lock.states
         .insert(package_ref.package_id, crate::schema::PackageState::Active);
-    nexus.ensure_schema(DEFAULT_SPACE, lock).await?;
+    nexus.activate_if_changed(DEFAULT_SPACE, lock).await?;
     Ok(())
 }
 
@@ -344,10 +348,24 @@ async fn load_concepts(
                 &format!("a{index}"),
                 &mut parameters,
             );
+            // 1.x identity was `(type, name)`, and 2.0's equivalent is a `key`
+            // scoped to the type (§7.3, guide §9). Carrying it over is what
+            // keeps a host's own `UPSERT ... MATCH {type, key}` resolving the
+            // migrated Concept instead of minting a second one beside it.
+            //
+            // `name` stays too, because in 2.0 it is a display label and a 1.x
+            // name was both — dropping it would lose what the old system
+            // actually showed people.
+            let identity = if name.is_empty() {
+                String::new()
+            } else {
+                parameters.insert(format!("i{index}"), json!(name));
+                format!(" SET FIELDS {{ key: :i{index} }}")
+            };
 
             clauses.push(format!(
                 "CREATE CONCEPT ?{handle} {{ TYPE :t{index} NAME :n{index} \
-                 CLIENT KEY :k{index} SET ATTRIBUTES {attributes} }}"
+                 CLIENT KEY :k{index}{identity} SET ATTRIBUTES {attributes} }}"
             ));
         }
         let handles = mutate_handles(

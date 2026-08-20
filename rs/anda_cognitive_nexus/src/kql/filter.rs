@@ -187,6 +187,19 @@ fn operand_value(
     operand(cx, solutions, row, item)
 }
 
+/// Whether a binding carries no value.
+///
+/// Two spellings reach the same state and both have to answer yes. `Null` is an
+/// unbound variable — what `OPTIONAL` pads a row with. `Literal(Json::Null)` is
+/// what reading a dot path off an element produces when the member is absent,
+/// because §24 is open-world: "this Concept has no `last_metabolized_at`" is an
+/// answer, not a failure. Matching only the first would make `IS_NULL` over a
+/// dot path permanently false — which is the one question the open-world read
+/// exists to let a caller ask.
+fn is_null(binding: &Binding) -> bool {
+    matches!(binding, Binding::Null | Binding::Literal(Json::Null))
+}
+
 /// Typed comparison.
 ///
 /// Returns `false` rather than an error when the operands are of unlike types:
@@ -194,7 +207,7 @@ fn operand_value(
 /// is filtered out. Erroring would make one badly-typed row fail a whole query
 /// that is otherwise answerable.
 fn compare(left: &Binding, right: &Binding, operator: ComparisonOperator) -> bool {
-    if matches!(left, Binding::Null) || matches!(right, Binding::Null) {
+    if is_null(left) || is_null(right) {
         // An unbound variable has no value to compare, so only an explicit
         // `IS_NULL` can ask about it.
         return false;
@@ -245,8 +258,8 @@ fn call(func: FilterFunction, args: &[Value]) -> Result<bool, KipError> {
     };
 
     Ok(match func {
-        FilterFunction::IsNull => matches!(single(0)?, Binding::Null),
-        FilterFunction::IsNotNull => !matches!(single(0)?, Binding::Null),
+        FilterFunction::IsNull => is_null(single(0)?),
+        FilterFunction::IsNotNull => !is_null(single(0)?),
         FilterFunction::IsElement => single(0)?.is_element(),
         FilterFunction::IsLiteral => single(0)?.is_literal(),
         FilterFunction::IsKind => {
@@ -377,6 +390,30 @@ mod tests {
                 !compare(&Binding::Null, &number(1.0), operator),
                 "{operator:?} should not decide against an unbound variable"
             );
+        }
+    }
+
+    #[test]
+    fn an_absent_member_is_null_to_a_filter() {
+        // Reading a dot path off an element yields `Literal(Json::Null)` for a
+        // member the element does not carry, not the `Null` an unbound
+        // variable gets. Both mean "no value", and a sweep that asks
+        // `IS_NULL(?c.facets["MnemonicState"].last_metabolized_at)` — "never
+        // metabolized" — is asking about exactly this one.
+        let absent = Binding::Literal(Json::Null);
+        assert!(
+            call(FilterFunction::IsNull, &[Value::One(absent.clone())]).unwrap(),
+            "an absent member must read as null"
+        );
+        assert!(!call(FilterFunction::IsNotNull, &[Value::One(absent.clone())]).unwrap());
+        // And it still compares to nothing, so it cannot slip through an
+        // ordering test either.
+        for operator in [
+            ComparisonOperator::Equal,
+            ComparisonOperator::NotEqual,
+            ComparisonOperator::LessThan,
+        ] {
+            assert!(!compare(&absent, &text("2026-01-01T00:00:00Z"), operator));
         }
     }
 

@@ -25,13 +25,13 @@ batch ≠ transaction; timeout ≠ abort; progress ≠ commit
 
 #### 1.1. Five Core element kinds
 
-| Kind            | What it is                                                    | Mutability |
-| --------------- | ------------------------------------------------------------- | ---------- |
-| **Concept**     | Referable entity/typed object (`schema_ref`, `key`, `name`, `attributes`) | mutable state |
-| **Proposition** | Truth-neutral statement `(subject, predicate, object)`        | immutable tuple |
+| Kind            | What it is                                                                                                                                        | Mutability                                 |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------ |
+| **Concept**     | Referable entity/typed object (`schema_ref`, `key`, `name`, `attributes`)                                                                         | mutable state                              |
+| **Proposition** | Truth-neutral statement `(subject, predicate, object)`                                                                                            | immutable tuple                            |
 | **Assertion**   | Actor's stance toward one Proposition (`asserted_by`, `stance`, `mode`, `confidence`, `asserted_at`, `valid_time`, evidence citations, lifecycle) | payload immutable; revise by new Assertion |
-| **Evidence**    | Observed artifact (`evidence_class`, payload, `observed_at`)  | payload immutable; correct via lineage |
-| **Activity**    | Provenance process (`activity_class`, inputs → outputs)       | immutable once terminal |
+| **Evidence**    | Observed artifact (`evidence_class`, payload, `observed_at`)                                                                                      | payload immutable; correct via lineage     |
+| **Activity**    | Provenance process (`activity_class`, inputs → outputs)                                                                                           | immutable once terminal                    |
 
 Profile objects (`Experience`, `Skill`, `Event`, ...) are typed Concepts + Facets + Structural References — not new kinds.
 
@@ -253,13 +253,13 @@ CREATE CONCEPT ?exp {                       // historically distinct thing
 
 ```kip
 UPSERT CONCEPT ?proj {                      // stable identity-bearing Concept
-  MATCH { type: "Project", key: "kip-2" }   // identity = id/key; name-only upsert is forbidden
+  MATCH { type: "Project", key: "kip-2" }   // identity = type + id/key; name-only upsert is forbidden
   EXPECT VERSION :v                         // optional; 0 = create-only
   SET FIELDS { name: "KIP 2.0" }
 }
 ```
 
-Clause menus (any order inside the braces, each at most once except `SET/UNSET FACET`): `CREATE CONCEPT` — `TYPE` (required), `CLIENT KEY`, `NAME`, `SET FIELDS | ATTRIBUTES | FACET | STRUCTURAL`. `UPSERT CONCEPT` — `MATCH` (required), `EXPECT VERSION`, `SET FIELDS | ATTRIBUTES | FACET | STRUCTURAL`, `UNSET ATTRIBUTES | FACET | STRUCTURAL`. `MATCH { type: "Person", key: "alice" }` may create; `MATCH { id: :id }` only matches. Where a value goes: Core fields (`name`, `key`) → `SET FIELDS`; schema-declared attributes (`goal`, `status`, …) → `SET ATTRIBUTES`; Profile facet values → `SET FACET "Facet"`; references → `SET STRUCTURAL`.
+Clause menus (any order inside the braces, each at most once except `SET/UNSET FACET`): `CREATE CONCEPT` — `TYPE` (required), `CLIENT KEY`, `NAME`, `SET FIELDS | ATTRIBUTES | FACET | STRUCTURAL`. `UPSERT CONCEPT` — `MATCH` (required), `EXPECT VERSION`, `SET FIELDS | ATTRIBUTES | FACET | STRUCTURAL`, `UNSET ATTRIBUTES | FACET | STRUCTURAL`. `MATCH { type: "Person", key: "alice" }` may create; `MATCH { id: :id }` only matches. The `type` is not decoration: a key is identity *within* its type (a Person and a Preference may both be keyed `alice`), and on a create it is the only source of the new Concept's type — so an upsert that must create without one is rejected, and a bare `{key: …}` that names two Concepts is an `IdentityConflict` rather than a coin flip. Where a value goes: Core fields (`name`, `key`) → `SET FIELDS`; schema-declared attributes (`goal`, `status`, …) → `SET ATTRIBUTES`; Profile facet values → `SET FACET "Facet"`; references → `SET STRUCTURAL`.
 
 #### 3.4. `MUTATE` — one atomic cognitive transition
 
@@ -445,13 +445,13 @@ At startup or after `requires_refresh`, call `DESCRIBE PRIMER`; ground concrete 
 
 ### 6. Cognitive Memory Profile (quick reference)
 
-Types: `Person` `Event` (what happened) `Experience` (goal-directed trajectory; required `goal`, `outcome_status`) `ExperienceStep` (`step_kind`: context|observation|decision|action|feedback|belief_update; `summary`; order = has_step edge index) `Preference` (summary artifact — the claim itself stays Proposition+Assertion) `Insight` `Commitment` (`status`: pending|fulfilled|cancelled|expired|blocked; `due_at` ≠ retention expiry) `Skill` (`skill_class`, `procedure`, `status`: candidate|validated|needs_review|deprecated|archived) `SleepTask` `SelfModel`
+Types: `Person` `Event` (what happened) `Experience` (goal-directed trajectory; required `goal`, `outcome_status`) `ExperienceStep` (`step_kind`: context|observation|decision|action|feedback|belief_update; `summary`; order = has_step edge index) `Preference` (summary artifact — the claim itself stays Proposition+Assertion) `Insight` `Commitment` (`status`: pending|fulfilled|cancelled|expired|blocked; `due_at` ≠ retention expiry) `Skill` (`skill_class`, `summary`, `procedure`, `status`: candidate|validated|needs_review|deprecated|archived) `SleepTask` (`task_class`: consolidate|review_conflict|review_skill|resolve_identity|review_retention|refresh_self_model|inspect_quarantine; `summary`; `status`: pending|running|completed|cancelled|blocked|failed) `SelfModel`
 
 Predicates: `prefers` (Person→Concept) `caused_by` (Step→Step, effect→cause, evidence-backed) `same_as` (identity claim → review)
 
-Facets: `MnemonicState {memory_strength, salience}` `SkillUtility {utility, success_count, failure_count}` — all `[0,1]`, none of them truth.
+Facets: `MnemonicState {memory_strength, salience, last_metabolized_at}` `SkillUtility {utility, success_count, failure_count, last_validated_at}` — the ratios are `[0,1]`, the counts are non-negative integers, the timestamps are nullable; none of them is truth.
 
-Structural fields: `has_step` (ordered) `experienced_by` `involves` `mentions` `about` `derived_from` `consolidated_to` `compiled_from` `compiled_by` `committed_to` `owed_to` `assigned_to`; Core built-ins on records: `evidence` `source` `generated_by` `inputs` `outputs`.
+Structural fields: `has_step` (ordered) `experienced_by` `involves` `mentions` `about` `derived_from` `consolidated_to` `compiled_from` `compiled_by` `committed_to` `owed_to` `assigned_to`; Core built-ins on records: `evidence` `source` `generated_by` `inputs` `outputs` `associated_actors`.
 
 Invariants: failed Experience is first-class memory; one success ≠ validated Skill; validated Skill ≠ execution authority; SelfModel ≠ Governance; imported memory keeps `mode: "imported"` and never becomes local autobiography.
 

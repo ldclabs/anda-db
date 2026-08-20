@@ -205,7 +205,9 @@ describe('the store', () => {
     })
   })
 
-  it('scopes a logical key to its Space', async () => {
+  it('scopes a logical key to its Space and its type', async () => {
+    const PERSON = 'kip://profiles/cognitive-memory@2.0.0/Person'
+    const PREFERENCE = 'kip://profiles/cognitive-memory@2.0.0/Preference'
     await withStore('keys', (store) => {
       newSpace(store, 'space://a')
       newSpace(store, 'space://b')
@@ -214,10 +216,13 @@ describe('the store', () => {
       store.put(concept('space://a', a.seq, { key: 'person:alice' }), 'create', 't')
       store.put(concept('space://b', b.seq, { key: 'person:alice' }), 'create', 't')
 
-      expect(store.conceptByKey('space://a', 'person:alice')?.id).toBe(a.seq)
-      expect(store.conceptByKey('space://b', 'person:alice')?.id).toBe(b.seq)
+      expect(store.conceptByKey('space://a', null, 'person:alice')?.id).toBe(a.seq)
+      expect(store.conceptByKey('space://b', null, 'person:alice')?.id).toBe(b.seq)
+      expect(store.conceptByKey('space://a', PERSON, 'person:alice')?.id).toBe(a.seq)
+      expect(store.conceptByKey('space://a', PREFERENCE, 'person:alice')).toBeNull()
 
-      // Within one Space it is an identity, so a second claim on it fails.
+      // Within one Space and one type it is an identity, so a second claim on
+      // it fails.
       const clash = store.reserve('Concept', 'space://a')
       expect(() =>
         store.put(
@@ -226,6 +231,29 @@ describe('the store', () => {
           't',
         ),
       ).toThrowError(/UNIQUE/)
+
+      // §7.3 scopes uniqueness to (space_id, schema_ref, key), so the same key
+      // under another type is a second identity rather than a collision — which
+      // is what lets 1.x `(type, name)` identity migrate into a key without
+      // merging unrelated Concepts.
+      const other = store.reserve('Concept', 'space://a')
+      store.put(
+        concept('space://a', other.seq, {
+          key: 'person:alice',
+          schema_ref: PREFERENCE,
+        }),
+        'create',
+        't',
+      )
+      expect(store.conceptByKey('space://a', PREFERENCE, 'person:alice')?.id).toBe(
+        other.seq,
+      )
+
+      // And now the key alone no longer names one Concept, so answering with
+      // either would be an arbitrary winner.
+      expect(() => store.conceptByKey('space://a', null, 'person:alice')).toThrowError(
+        /does not name one on its own/,
+      )
     })
   })
 
@@ -466,6 +494,73 @@ describe('the store', () => {
       expect(
         store.packageByRef('kip://example/only-here@2.0.0')?.content_digest,
       ).toBe('aaaa')
+    })
+  })
+
+  it('rebuilds an index whose definition changed under the same name', async () => {
+    // `CREATE UNIQUE INDEX IF NOT EXISTS` matches on the name alone, so a
+    // redefinition is a silent no-op on every database that already has the
+    // index. Without the rebuild, a deployed Space would keep enforcing
+    // `(space, key)` — and go on refusing the second-type-same-key upsert that
+    // §7.3 makes legal — while the DDL in this repo said otherwise.
+    const PERSON = 'kip://profiles/cognitive-memory@2.0.0/Person'
+    const PREFERENCE = 'kip://profiles/cognitive-memory@2.0.0/Preference'
+    const stub = env.KIP_DB.getByName('index-rebuild')
+    await runInDurableObject(stub, (_instance, state) => {
+      const sql = state.storage.sql
+      new Store(sql)
+      // Put the pre-2.0 index back, exactly as an older build left it.
+      sql.exec('DROP INDEX idx_concepts_key')
+      sql.exec(
+        `CREATE UNIQUE INDEX idx_concepts_key ON concepts(space, "key") WHERE "key" <> ''`,
+      )
+
+      const store = new Store(sql)
+      expect(
+        sql
+          .exec<{ name: string }>('PRAGMA index_info(idx_concepts_key)')
+          .toArray()
+          .map((row) => row.name),
+      ).toContain('schema_ref')
+
+      newSpace(store, 'space://a')
+      const person = store.reserve('Concept', 'space://a')
+      store.put(
+        concept('space://a', person.seq, { key: 'alice', schema_ref: PERSON }),
+        'create',
+        't',
+      )
+      const preference = store.reserve('Concept', 'space://a')
+      store.put(
+        concept('space://a', preference.seq, {
+          key: 'alice',
+          schema_ref: PREFERENCE,
+        }),
+        'create',
+        't',
+      )
+      expect(store.conceptByKey('space://a', PREFERENCE, 'alice')?.id).toBe(
+        preference.seq,
+      )
+
+      // Re-applying converges rather than dropping the index it just built —
+      // the property `REDEFINED_INDEXES` is keyed on columns for, so that a
+      // database interrupted mid-migration can simply retry.
+      new Store(sql)
+      expect(
+        sql
+          .exec<{ name: string }>('PRAGMA index_info(idx_concepts_key)')
+          .toArray()
+          .map((row) => row.name),
+      ).toContain('schema_ref')
+      const clash = store.reserve('Concept', 'space://a')
+      expect(() =>
+        store.put(
+          concept('space://a', clash.seq, { key: 'alice', schema_ref: PERSON }),
+          'create',
+          't',
+        ),
+      ).toThrowError(/UNIQUE/)
     })
   })
 

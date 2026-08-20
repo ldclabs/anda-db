@@ -432,6 +432,60 @@ describe('KML', () => {
     })
   })
 
+  /**
+   * `UPSERT ... MATCH {id: …}` resolves; it never mints.
+   *
+   * The insert half used to be reachable from an `id` selector, so an id
+   * nothing carried — or one carrying a type the MATCH did not declare —
+   * quietly created a *different* Concept under a *different* id, and reported
+   * success. §53 gives an upsert by id no create half at all.
+   */
+  it('refuses an upsert by an id nothing carries instead of creating one', async () => {
+    await withNexus('upsert-by-id', (nexus) => {
+      const alice = nexus.execute('CREATE CONCEPT ?p { TYPE "Person" NAME "Ada" }')
+        .handles.p!
+
+      for (const command of [
+        'UPSERT CONCEPT ?p { MATCH {id: "C-9999"} SET FIELDS {name: "Nobody"} }',
+        `UPSERT CONCEPT ?p { MATCH {type: "Person", id: "C-9999"} SET FIELDS {name: "Nobody"} }`,
+        // A declared type the element does not carry is simply not a match,
+        // and the refusal says no more than that (§86.4).
+        `UPSERT CONCEPT ?p { MATCH {type: "Preference", id: "${alice}"} SET FIELDS {name: "Wrong"} }`,
+      ]) {
+        const outcome = nexus.tryExecute(command)
+        expect('error' in outcome && outcome.error.code).toBe('NotFoundOrNotVisible')
+      }
+
+      // Nothing was minted along the way.
+      expect(nexus.query('FIND(COUNT(?c)) WHERE { ?c CONCEPT {} }')).toEqual([1])
+    })
+  })
+
+  it('reads a MATCH member as a selector and never as seed state', async () => {
+    await withNexus('upsert-match', (nexus) => {
+      // `name` in a MATCH is not a second way to spell SET FIELDS: the create
+      // half takes only the identity, so the same command cannot mean two
+      // things depending on whether it resolved or created.
+      const created = nexus.execute(
+        'UPSERT CONCEPT ?p { MATCH {type: "Person", key: "person:ada", name: "Ignored"} }',
+      )
+      const row = concept(nexus, created.handles.p!)
+      expect(row.key).toBe('person:ada')
+      expect(row.schema_ref).toBe(`${CM}/Person`)
+      expect(row.name).toBe('')
+
+      // A member of the wrong type is refused rather than read as absent —
+      // reading `{type: 42}` as "no type declared" would answer a different,
+      // valid command than the one written.
+      const badType = nexus.tryExecute(
+        'UPSERT CONCEPT ?p { MATCH {type: 42, key: "person:eve"} }',
+      )
+      expect('error' in badType && badType.error.code).toBe('TypeMismatch')
+      const badId = nexus.tryExecute('UPSERT CONCEPT ?p { MATCH {id: 42} }')
+      expect('error' in badId && badId.error.code).toBe('TypeMismatch')
+    })
+  })
+
   it('previews without taking a sequence or writing anything', async () => {
     await withNexus('dry-run', (nexus) => {
       const parsed = parseKip(SETUP)

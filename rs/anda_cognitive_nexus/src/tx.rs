@@ -29,7 +29,7 @@
 //! journalled transaction, so [`Store::sweep_pending`] removes them on open —
 //! recovery by construction rather than by replay.
 
-use anda_kip::{ElementKind, Json, KipError, Map, Receipt, ReceiptStatus};
+use anda_kip::{ElementKind, Json, KipError, KipErrorCode, Map, Receipt, ReceiptStatus};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::error::db_error;
@@ -314,6 +314,57 @@ impl Transaction {
                 self.store
                     .check_same_space(&self.cx.space, *id, referenced)
                     .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Rejects a staged Concept claiming a logical key another Concept of the
+    /// same type already holds (§7.3).
+    ///
+    /// One pass over the staged rows rather than a check inside each clause:
+    /// `CREATE CONCEPT`, the create half of `UPSERT` and Capsule import all
+    /// mint Concepts, and a rule each of them has to remember is a rule one of
+    /// them will forget.
+    ///
+    /// The scope is `(space_id, schema_ref, key)`, so a Person and a Preference
+    /// may both be keyed `"alice"` — which is what lets a 1.x database whose
+    /// identity was `(type, name)` migrate those names into keys without
+    /// merging unrelated Concepts. An empty key stores "no logical key" and
+    /// claims nothing.
+    async fn check_concept_key_identity(&self) -> Result<(), KipError> {
+        let mut claimed: Vec<(&str, &str)> = Vec::new();
+        for (id, staged) in &self.staged {
+            let Element::Concept(row) = &staged.row else {
+                continue;
+            };
+            if !staged.changed || row.key.is_empty() {
+                continue;
+            }
+            let claim = (row.schema_ref.as_str(), row.key.as_str());
+            let conflict = |holder: &str| {
+                KipError::new(
+                    KipErrorCode::IdentityConflict,
+                    format!(
+                        "the key {:?} already identifies {holder} of type {}; a logical key is \
+                         identity within its type, not a label two Concepts may share",
+                        row.key, row.schema_ref
+                    ),
+                )
+            };
+            if claimed.contains(&claim) {
+                return Err(conflict("another Concept in this transaction"));
+            }
+            claimed.push(claim);
+            if let Some(found) = self
+                .store
+                .find_concept_by_key(&self.cx.space, Some(&row.schema_ref), &row.key)
+                .await?
+                && found._id != id.seq
+            {
+                return Err(conflict(
+                    &ElementId::new(ElementKind::Concept, found._id).to_string(),
+                ));
             }
         }
         Ok(())
@@ -678,6 +729,7 @@ impl Transaction {
 
         self.propagate_governance().await?;
         self.check_reference_closure().await?;
+        self.check_concept_key_identity().await?;
 
         // Nothing this transaction touched keeps its shell state, and the
         // version rule is applied here so that a clause touching one element

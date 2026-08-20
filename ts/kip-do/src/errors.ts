@@ -103,9 +103,9 @@ export class KipError extends Error {
     const message = err instanceof Error ? err.message : String(err)
 
     // The unique indexes on `propositions(space, tuple_key)` and
-    // `concepts(space, key)` are the SQL expression of KIP's identity rules,
-    // so violating one means "something already claims this identity", not
-    // "engine bug".
+    // `concepts(space, schema_ref, key)` are the SQL expression of KIP's
+    // identity rules, so violating one means "something already claims this
+    // identity", not "engine bug".
     if (/UNIQUE constraint failed/i.test(message)) {
       return new KipError('IdentityConflict', message)
     }

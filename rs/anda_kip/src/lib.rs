@@ -128,6 +128,15 @@ pub use types::*;
 /// The KIP 2.0 syntax reference, condensed for a model to read in context.
 pub static KIP_SYNTAX: &str = include_str!("../KIPSyntax.md");
 
+/// The Cognitive Memory Profile — the standard portable memory structures the
+/// bundled prompts are written against.
+///
+/// [`SELF_INSTRUCTIONS`] and [`SYSTEM_INSTRUCTIONS`] both name this document
+/// among the ones they assume are loaded, so a host wiring those prompts needs
+/// a way to supply it. It is the Profile's prose half; the executable half is
+/// the Schema Package artifact an engine installs.
+pub static COGNITIVE_MEMORY_PROFILE: &str = include_str!("../CognitiveMemoryProfile-2.0.md");
+
 /// How an Agent should use KIP as its own memory protocol.
 pub static SELF_INSTRUCTIONS: &str = include_str!("../SelfInstructions.md");
 
@@ -195,6 +204,7 @@ mod tests {
             ("SelfInstructions.md", SELF_INSTRUCTIONS),
             ("SystemInstructions.md", SYSTEM_INSTRUCTIONS),
             ("KIPSyntax.md", KIP_SYNTAX),
+            ("CognitiveMemoryProfile-2.0.md", COGNITIVE_MEMORY_PROFILE),
         ] {
             assert!(!text.is_empty(), "{name} is empty");
             // The 1.x vocabulary must not survive in agent-facing prompts.
@@ -205,5 +215,12 @@ mod tests {
         }
         assert!(SELF_INSTRUCTIONS.contains("SUPERSEDING"));
         assert!(SYSTEM_INSTRUCTIONS.contains("outcome_unknown"));
+        // Both prompts tell the Agent this document is part of its context, so
+        // shipping the prompts without a way to reach it would leave a host
+        // unable to honour what they promise.
+        for prompt in [SELF_INSTRUCTIONS, SYSTEM_INSTRUCTIONS] {
+            assert!(prompt.contains("CognitiveMemoryProfile-2.0.md"));
+        }
+        assert!(COGNITIVE_MEMORY_PROFILE.contains("Cognitive Memory Profile"));
     }
 }

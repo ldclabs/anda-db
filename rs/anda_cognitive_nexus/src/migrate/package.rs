@@ -26,9 +26,10 @@
 
 use anda_kip::{Json, KipError, Map};
 use serde_json::json;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::stage::LegacyRow;
+use crate::schema::{Intent, SchemaEnvironment, SymbolKind};
 
 /// The package id every migrated symbol resolves through.
 pub const LEGACY_PACKAGE_ID: &str = "kip://legacy/nexus";
@@ -45,12 +46,25 @@ fn symbol(name: &str) -> String {
 }
 
 /// The vocabulary a set of staged rows actually uses.
+///
+/// Split in two after [`Vocabulary::resolve`]: names the Space can already
+/// resolve are *adopted* — a migrated element is written against the host's own
+/// symbol — and only what is left is declared here.
+///
+/// That split is the whole point. A 1.x Brain used `Person`, `Event` and
+/// `Preference`, and so does the Cognitive Memory Profile a 2.0 host activates.
+/// Minting a legacy `Person` beside the profile's would leave two symbols
+/// spelled the same, and every command naming the bare local name would resolve
+/// to neither — `SchemaSymbolAmbiguous`, on a Space whose data migrated
+/// perfectly.
 #[derive(Debug, Default)]
 pub struct Vocabulary {
-    /// Every distinct 1.x Concept `type`.
+    /// Every distinct 1.x Concept `type` this package declares.
     pub concept_types: BTreeSet<String>,
-    /// Every distinct 1.x predicate.
+    /// Every distinct 1.x predicate this package declares.
     pub predicates: BTreeSet<String>,
+    /// Legacy name → the exact symbol an already-active package provides.
+    adopted: BTreeMap<(SymbolKind, String), String>,
 }
 
 impl Vocabulary {
@@ -78,6 +92,40 @@ impl Vocabulary {
         vocabulary
     }
 
+    /// Hands every name the Space can already resolve to the package that
+    /// provides it, and keeps the rest for this one.
+    ///
+    /// Adoption is by local name, which is the same identity 1.x had: a 1.x
+    /// `Person` and the profile's `Person` are the same word for the same
+    /// thing, and the guide's §8 says exactly this — migrate toward the
+    /// standard profile where the semantics match.
+    ///
+    /// Where they do not match, nothing is adopted: a name no active package
+    /// declares stays here, unconstrained, because a 1.x deployment's
+    /// `ShipmentLeg` means whatever that deployment meant by it.
+    pub fn resolve(&mut self, env: &SchemaEnvironment) {
+        for (kind, names) in [
+            (SymbolKind::ConceptType, &mut self.concept_types),
+            (SymbolKind::PredicateType, &mut self.predicates),
+        ] {
+            let mut keep = BTreeSet::new();
+            for name in std::mem::take(names) {
+                // `Intent::Write`: a migrated element is written against this
+                // symbol, so a package that may be read but not written to is
+                // not one to adopt.
+                match env.resolve_symbol(kind, &name, Intent::Write) {
+                    Ok(symbol) => {
+                        self.adopted.insert((kind, name), symbol.to_string());
+                    }
+                    Err(_) => {
+                        keep.insert(name);
+                    }
+                }
+            }
+            *names = keep;
+        }
+    }
+
     /// Whether there is anything to publish.
     pub fn is_empty(&self) -> bool {
         self.concept_types.is_empty() && self.predicates.is_empty()
@@ -85,12 +133,24 @@ impl Vocabulary {
 
     /// The exact symbol a legacy Concept type resolves to.
     pub fn concept_ref(&self, name: &str) -> Option<String> {
-        self.concept_types.contains(name).then(|| symbol(name))
+        self.symbol_ref(SymbolKind::ConceptType, &self.concept_types, name)
     }
 
     /// The exact symbol a legacy predicate resolves to.
     pub fn predicate_ref(&self, name: &str) -> Option<String> {
-        self.predicates.contains(name).then(|| symbol(name))
+        self.symbol_ref(SymbolKind::PredicateType, &self.predicates, name)
+    }
+
+    fn symbol_ref(
+        &self,
+        kind: SymbolKind,
+        declared: &BTreeSet<String>,
+        name: &str,
+    ) -> Option<String> {
+        if let Some(adopted) = self.adopted.get(&(kind, name.to_string())) {
+            return Some(adopted.clone());
+        }
+        declared.contains(name).then(|| symbol(name))
     }
 
     /// Renders the Package artifact.

@@ -46,4 +46,67 @@ mod tests {
         assert_eq!(package_ref.package_id, COGNITIVE_MEMORY_ID);
         assert_eq!(package_ref.version.to_string(), COGNITIVE_MEMORY_VERSION);
     }
+
+    /// The syntax card a model reads must name everything this Profile declares.
+    ///
+    /// `anda_kip`'s `KIPSyntax.md` is a hand-maintained copy of the document in
+    /// the specification repository, and this artifact is a hand-maintained
+    /// copy of the Profile beside it. Nothing keeps two hand-copied files in
+    /// step, and they have already drifted once: the card described
+    /// `MnemonicState` as two members while the artifact declared three, and
+    /// omitted `Skill.summary`, which the artifact makes *required*. A model
+    /// working from the card then writes a `CREATE CONCEPT` the engine refuses
+    /// for a missing field the card never mentioned, and the refusal reads as
+    /// the model's mistake rather than as the card's.
+    ///
+    /// Names only, matched as whole words anywhere in the card. It is prose
+    /// written for a reader and cannot be generated from the artifact, so this
+    /// is a tripwire rather than a proof: a symbol whose name is also an
+    /// ordinary English word can pass without being documented. What it does
+    /// catch is the whole class that actually happened — a member added to the
+    /// artifact and never written into the card.
+    #[test]
+    fn the_syntax_card_names_every_symbol_this_profile_declares() {
+        let package: anda_kip::Json = serde_json::from_str(COGNITIVE_MEMORY).unwrap();
+        let definitions = &package["definitions"];
+        let words: std::collections::BTreeSet<&str> = anda_kip::KIP_SYNTAX
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .collect();
+
+        let mut missing: Vec<String> = Vec::new();
+        let mut require = |what: &str, name: &str| {
+            if !words.contains(name) {
+                missing.push(format!("{what} `{name}`"));
+            }
+        };
+
+        for kind in ["concept_types", "predicates", "structural_fields", "facets"] {
+            for name in definitions[kind].as_object().unwrap().keys() {
+                require(kind, name);
+            }
+        }
+        for (facet, definition) in definitions["facets"].as_object().unwrap() {
+            for member in definition["fields"].as_object().unwrap().keys() {
+                require(&format!("`{facet}` member"), member);
+            }
+        }
+        // A required attribute the card omits is the sharpest form of this
+        // drift: the model cannot supply what it was never told about.
+        for (name, definition) in definitions["concept_types"].as_object().unwrap() {
+            let Some(fields) = definition["attributes"]["fields"].as_object() else {
+                continue;
+            };
+            for (field, spec) in fields {
+                if spec["required"] == anda_kip::Json::Bool(true) {
+                    require(&format!("`{name}` required attribute"), field);
+                }
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "KIPSyntax.md never mentions: {}",
+            missing.join(", ")
+        );
+    }
 }

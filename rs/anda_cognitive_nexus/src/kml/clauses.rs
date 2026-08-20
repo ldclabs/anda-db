@@ -33,7 +33,7 @@ use super::update;
 use super::value::{Bindings, assignments_to_json, structural_value};
 use crate::governance::Permission;
 use crate::id::ElementId;
-use crate::schema::{EndpointFacts, Intent};
+use crate::schema::{EndpointFacts, Intent, SymbolKind};
 use crate::store::rows::*;
 use crate::store::{Element, Store};
 use crate::term::{Endpoint, tuple_key};
@@ -896,28 +896,58 @@ async fn upsert_concept(
             )
         })?;
 
-    let selector_value = match selector.1 {
-        MatchValue::Literal(value) => Json::from(value.clone()),
-        MatchValue::Param(name) => b.param(name)?,
-        _ => {
-            return Err(KipError::identity_selector_required(
-                "an UPSERT identity selector must be a literal or a parameter",
-            ));
-        }
-    };
-    let Json::String(selector_value) = selector_value else {
-        return Err(KipError::type_mismatch(
-            "an UPSERT identity selector must be a string",
-        ));
-    };
+    let selector_value = match_text(&b, selector.1, selector.0)?;
+
+    // MATCH is an `object_pattern` — the same production a KQL Concept pattern
+    // uses — so `type` here is what it is there: schema-resolution sugar for an
+    // exact `schema_ref` (§43.1). It carries identity weight in both halves of
+    // an upsert. On a resolve it is part of the address, because key uniqueness
+    // is scoped to `(space_id, schema_ref, key)` (§7.3). On a create it is the
+    // only place the new Concept's type can come from, and `schema_ref` is
+    // fixed at creation — so a Concept minted without one stays untyped
+    // forever, which §10.1 does not admit as a state a Concept can be in.
+    let declared_type = matcher
+        .get("type")
+        .map(|value| match_text(&b, value, "type"))
+        .transpose()?
+        .map(|name| {
+            tx.env
+                .resolve_symbol(SymbolKind::ConceptType, &name, Intent::Write)
+        })
+        .transpose()?
+        .map(|symbol| symbol.to_string());
 
     let existing = match selector.0 {
         "id" => {
             let id: ElementId = selector_value.parse()?;
-            store.contains(id).await.then_some(id)
+            // The kind is spelled in the id the caller wrote, so saying so
+            // reveals nothing they did not already state.
+            if id.kind != ElementKind::Concept {
+                return Err(KipError::structural_reference_invalid(format!(
+                    "{id} names a {:?}, and UPSERT CONCEPT resolves Concepts",
+                    id.kind
+                )));
+            }
+            match store.find_concept(id).await {
+                // A declared type is part of the pattern, so an element of
+                // another type is simply not a match. Reported as no match
+                // rather than as a type mismatch, which would let an id probe
+                // map the Space by reading the difference (§86.4) — and an
+                // upsert by id may not create, so this still fails loudly.
+                Ok(row) => match &declared_type {
+                    Some(declared) if &row.schema_ref != declared => None,
+                    _ => Some(id),
+                },
+                // Only absence is "no match". A poisoned collection or a row
+                // that will not decode is the engine failing, and reporting it
+                // as absence would send the caller to fix a command that is
+                // not what went wrong.
+                Err(err) if err.code == KipErrorCode::NotFoundOrNotVisible => None,
+                Err(err) => return Err(err),
+            }
         }
         _ => store
-            .find_concept_by_key(&tx.cx.space, &selector_value)
+            .find_concept_by_key(&tx.cx.space, declared_type.as_deref(), &selector_value)
             .await?
             .map(|row| ElementId::new(ElementKind::Concept, row._id)),
     };
@@ -945,9 +975,17 @@ async fn upsert_concept(
                      caller chose"
                 )));
             }
+            let declared = declared_type.ok_or_else(|| {
+                KipError::schema_symbol_not_found(
+                    "UPSERT CONCEPT creates only through MATCH {type: ..., key: ...}: a Concept's \
+                     type is schema-defined and fixed at creation, so a Concept minted without \
+                     one could never be given a type afterwards",
+                )
+            })?;
             let id = tx.mint(ElementKind::Concept).await?;
             let row = ConceptRow {
                 _id: id.seq,
+                schema_ref: declared,
                 key: selector_value.clone(),
                 ..Default::default()
             };
@@ -966,6 +1004,30 @@ async fn upsert_concept(
     }
 
     apply_concept_assignments(tx, clause, id, request, operation).await
+}
+
+/// Reads one `MATCH` member as a string.
+///
+/// `MATCH` values share the pattern grammar, which admits variables and nested
+/// matchers that mean nothing to an upsert: `?v` is bound by a `WHERE` an
+/// upsert does not have. Rejecting them here is what keeps a member from being
+/// accepted and then quietly skipped.
+fn match_text(b: &Bindings<'_>, value: &MatchValue, what: &str) -> Result<String, KipError> {
+    let value = match value {
+        MatchValue::Literal(value) => Json::from(value.clone()),
+        MatchValue::Param(name) => b.param(name)?,
+        _ => {
+            return Err(KipError::identity_selector_required(format!(
+                "an UPSERT MATCH `{what}` must be a literal or a parameter"
+            )));
+        }
+    };
+    match value {
+        Json::String(text) => Ok(text),
+        other => Err(KipError::type_mismatch(format!(
+            "an UPSERT MATCH `{what}` must be a string, got {other}"
+        ))),
+    }
 }
 
 /// Applies an `UPSERT CONCEPT`'s mutable state.

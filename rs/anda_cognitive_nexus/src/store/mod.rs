@@ -54,7 +54,7 @@ use anda_db::{
 };
 use anda_db_schema::Fv;
 use anda_db_tfs::jieba_tokenizer;
-use anda_kip::{ElementKind, KipError};
+use anda_kip::{ElementKind, KipError, KipErrorCode};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -904,9 +904,20 @@ impl Store {
     ///
     /// The key is immutable identity, unlike `name`, which is why `UPSERT`
     /// resolves through it (§54).
+    ///
+    /// `schema_ref` narrows the lookup rather than filtering its result,
+    /// because §7.3 scopes key uniqueness to `(space_id, schema_ref, key)`: a
+    /// Person and a Preference both keyed `"alice"` are two identities, not a
+    /// collision — which is also what makes the 1.x migration of `(type, name)`
+    /// identity into a key collision-free.
+    ///
+    /// Without a declared type the key alone must still land on one Concept.
+    /// Returning the first of several would be the arbitrary winner §51 forbids
+    /// for names, arriving through `key` instead.
     pub async fn find_concept_by_key(
         &self,
         space: &str,
+        schema_ref: Option<&str>,
         key: &str,
     ) -> Result<Option<rows::ConceptRow>, KipError> {
         if key.is_empty() {
@@ -915,21 +926,34 @@ impl Store {
             // answer an upsert meant for one of them.
             return Ok(None);
         }
+        let mut fields = vec![
+            ("space", Fv::Text(space.to_string())),
+            ("key", Fv::Text(key.to_string())),
+        ];
+        if let Some(schema_ref) = schema_ref {
+            fields.push(("schema_ref", Fv::Text(schema_ref.to_string())));
+        }
         let collection = self.concepts();
         let ids = collection
-            .query_all_ids(eq_fields(&[
-                ("space", Fv::Text(space.to_string())),
-                ("key", Fv::Text(key.to_string())),
-            ]))
+            .query_all_ids(eq_fields(&fields))
             .await
             .map_err(crate::error::db_error)?;
-        match ids.first() {
-            None => Ok(None),
-            Some(id) => Ok(Some(
+        match ids.as_slice() {
+            [] => Ok(None),
+            [id] => Ok(Some(
                 collection
                     .get_as(*id)
                     .await
                     .map_err(crate::error::db_error)?,
+            )),
+            ids => Err(KipError::new(
+                KipErrorCode::IdentityConflict,
+                format!(
+                    "the key {key:?} is carried by {} Concepts in this Space, so it does not name \
+                     one on its own; add the type — MATCH {{type: ..., key: ...}} — rather than \
+                     letting the engine pick among them",
+                    ids.len()
+                ),
             )),
         }
     }

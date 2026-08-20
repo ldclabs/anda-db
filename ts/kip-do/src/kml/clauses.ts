@@ -469,15 +469,72 @@ function upsertConcept(tx: Transaction, b: Bindings, clause: ConceptUpsert): voi
       'UPSERT CONCEPT needs a MATCH on a stable identity: {id: …} or {key: …}',
     )
   }
-  const found = resolveIdentity(tx, b, matcher)
-  // Nothing matched, so this is the "insert" half. The grammar gives UPSERT no
-  // TYPE slot, so a Concept created this way carries no `schema_ref`: the
-  // engine records what it was told rather than inventing a type, and an
-  // untyped Concept is honestly untyped rather than silently a Person.
-  const existing = found ?? createFromMatch(tx, b, clause.handle, matcher)
-  if (found !== null) tx.bindExisting(clause.handle, existing)
-  if (clause.expect_version !== null) {
-    tx.expectVersion(existing, numberOf(b, clause.expect_version, 'EXPECT VERSION'))
+  // Spec §51: name-only upsert is forbidden. A name is mutable grounding state
+  // that may be duplicated, so resolving identity through it would merge two
+  // different Concepts that happen to share a label. `key` is read only when
+  // `id` is absent, so a member the selector never consults is never evaluated.
+  const selectorId = matchText(b, matcher, 'id')
+  const selectorKey = selectorId === null ? matchText(b, matcher, 'key') : null
+  if (selectorId === null && selectorKey === null) {
+    if (Object.hasOwn(matcher, 'name')) {
+      throw errors.nameIdentityForbidden(
+        'a Concept name is mutable grounding state and several Concepts may ' +
+          'share one, so it cannot identify an upsert target; use {key: …} or ' +
+          '{id: …}',
+      )
+    }
+    throw errors.identitySelectorRequired(
+      'MATCH must name a stable identity: {id: …} or {key: …}',
+    )
+  }
+  // MATCH is an `object_pattern` — the same production a KQL Concept pattern
+  // uses — so `type` here is what it is there: schema-resolution sugar for an
+  // exact `schema_ref` (§43.1). It carries identity weight in both halves of an
+  // upsert. On a resolve it is part of the address, because key uniqueness is
+  // scoped to `(space_id, schema_ref, key)` (§7.3). On a create it is the only
+  // place the new Concept's type can come from, and `schema_ref` is fixed at
+  // creation — so a Concept minted without one stays untyped forever, which
+  // §10.1 does not admit as a state a Concept can be in.
+  const declaredType = matchText(b, matcher, 'type')
+  const schemaRef =
+    declaredType === null
+      ? null
+      : formatSymbolRef(tx.env.resolveSymbol('ConceptType', declaredType, 'write'))
+  const found =
+    selectorId === null
+      ? resolveByKey(tx, selectorKey as string, schemaRef)
+      : resolveById(tx, selectorId, schemaRef)
+
+  let existing: ElementId
+  if (found !== null) {
+    existing = found
+    tx.bindExisting(clause.handle, existing)
+    if (clause.expect_version !== null) {
+      tx.expectVersion(existing, numberOf(b, clause.expect_version, 'EXPECT VERSION'))
+    }
+  } else {
+    // Nothing matched, so this is the "insert" half — and three things can stop
+    // it, in the order they stop being about what the caller asked for and
+    // start being about what the engine may mint.
+    if (clause.expect_version !== null) {
+      const expected = numberOf(b, clause.expect_version, 'EXPECT VERSION')
+      if (expected !== 0) {
+        throw errors.versionConflict(
+          `no Concept matches this selector, so it cannot be at version ${expected}`,
+        )
+      }
+    }
+    if (selectorId !== null) {
+      // §53: an UPSERT by id resolves, it never mints — the id would not be the
+      // one the caller named. Reported existence-neutrally, without saying
+      // whether the element is absent or merely of another type, so that an id
+      // probe cannot map the Space by reading the difference (§86.4).
+      throw errors.notFoundOrNotVisible(
+        `${selectorId} does not exist, and an UPSERT by id cannot mint an id ` +
+          'the caller chose',
+      )
+    }
+    existing = createFromMatch(tx, clause.handle, selectorKey as string, schemaRef)
   }
 
   const element = tx.load(existing)
@@ -551,35 +608,37 @@ function upsertConcept(tx: Transaction, b: Bindings, clause: ConceptUpsert): voi
   if (JSON.stringify(element.row) !== before) tx.markChanged(existing, 'update')
 }
 
-/** The insert half of an UPSERT: a Concept pinned to the identity it matched. */
+/**
+ * The insert half of an UPSERT: a Concept pinned to the identity it matched.
+ *
+ * Only the identity comes from `MATCH`. Every other member of the pattern is a
+ * *selector* — it says which Concept the clause is about, not what a new one
+ * should hold — so grounding state arrives through `SET FIELDS` and nowhere
+ * else. Seeding `name` from the selector would also make the same command mean
+ * two things depending on whether it resolved or created.
+ */
 function createFromMatch(
   tx: Transaction,
-  b: Bindings,
   handle: string,
-  matcher: ObjectMatcher,
+  key: string,
+  schemaRef: string | null,
 ): ElementId {
+  if (schemaRef === null) {
+    throw errors.schemaSymbolNotFound(
+      'UPSERT CONCEPT creates only through MATCH {type: …, key: …}: a ' +
+        "Concept's type is schema-defined and fixed at creation, so a Concept " +
+        'minted without one could never be given a type afterwards',
+    )
+  }
   const id = tx.mint('Concept')
   tx.bindExisting(handle, id)
-  const literal = (field: string): string => {
-    const value = matcher[field]
-    if (value === undefined) return ''
-    if ('Literal' in value) {
-      const resolved = kipValue(value.Literal)
-      return typeof resolved === 'string' ? resolved : ''
-    }
-    if ('Param' in value) {
-      const resolved = parameter(b, value.Param)
-      return typeof resolved === 'string' ? resolved : ''
-    }
-    return ''
-  }
   const row: ConceptRow = {
     ...blank(id),
     client_key: '',
-    schema_ref: '',
-    key: literal('key'),
-    name: literal('name'),
-    canonical_id: literal('canonical_id'),
+    schema_ref: schemaRef,
+    key,
+    name: '',
+    canonical_id: '',
     aliases: [],
     attributes: {},
     merged_into: '',
@@ -874,55 +933,75 @@ function requireKind<K extends ElementKind>(
   return element as Extract<Element, { kind: K }>
 }
 
-/**
- * Resolves an identity matcher to the element it names.
- *
- * Only `id` and `key` are stable identities. A `name` is mutable grounding
- * state that duplicates are allowed to share, so matching on it would let an
- * upsert pick a winner among several equally valid Concepts (§5.2).
- */
-function resolveIdentity(
+/** The Concept an `id` selector names, or `null` when it names none. */
+function resolveById(
   tx: Transaction,
+  id: string,
+  schemaRef: string | null,
+): ElementId | null {
+  const parsed = parseElementId(id)
+  // The kind is spelled in the id the caller wrote, so saying so reveals
+  // nothing they did not already state.
+  if (parsed.kind !== 'Concept') {
+    throw errors.structuralReferenceInvalid(
+      `${formatElementId(parsed)} names a ${parsed.kind}, and UPSERT CONCEPT resolves Concepts`,
+    )
+  }
+  const element = tx.store.load(parsed)
+  if (element === null || element.kind !== 'Concept') return null
+  // A declared type is part of the pattern, so an element of another type is
+  // simply not a match. Reported as no match rather than as a type mismatch,
+  // which would let an id probe map the Space by reading the difference
+  // (§86.4) — and an upsert by id may not create, so this still fails loudly.
+  if (schemaRef !== null && element.row.schema_ref !== schemaRef) return null
+  return parsed
+}
+
+/** The Concept a `key` selector names, or `null` when it names none. */
+function resolveByKey(
+  tx: Transaction,
+  key: string,
+  schemaRef: string | null,
+): ElementId | null {
+  const found = tx.store.conceptByKey(tx.cx.space, schemaRef, key)
+  return found === null ? null : { kind: 'Concept', seq: found.id }
+}
+
+/**
+ * Reads one `MATCH` member as a string.
+ *
+ * `MATCH` values share the pattern grammar, which admits variables and nested
+ * matchers that mean nothing to an upsert: `?v` is bound by a `WHERE` an upsert
+ * does not have. Rejecting them here is what keeps a member from being accepted
+ * and then quietly skipped.
+ *
+ * A member of the wrong *type* is rejected for the same reason. Reading
+ * `{type: 42}` as "no type declared" would turn a malformed command into a
+ * different, valid one and answer it.
+ */
+function matchText(
   b: Bindings,
   matcher: ObjectMatcher,
-): ElementId | null {
-  const read = (field: string): string | null => {
-    const value = matcher[field]
-    if (value === undefined) return null
-    if ('Literal' in value) {
-      const literal = kipValue(value.Literal)
-      if (typeof literal !== 'string') return null
-      return literal
-    }
-    if ('Param' in value) {
-      const resolved = parameter(b, value.Param)
-      return typeof resolved === 'string' ? resolved : null
-    }
+  field: string,
+): string | null {
+  const value = matcher[field]
+  if (value === undefined) return null
+  let resolved: Json
+  if ('Literal' in value) {
+    resolved = kipValue(value.Literal)
+  } else if ('Param' in value) {
+    resolved = parameter(b, value.Param)
+  } else {
     throw errors.identitySelectorRequired(
-      'a MATCH identity must be a literal or a parameter, never a variable',
+      `an UPSERT MATCH \`${field}\` must be a literal or a parameter`,
     )
   }
-
-  const id = read('id')
-  if (id !== null) {
-    const parsed = parseElementId(id)
-    return tx.store.load(parsed) === null ? null : parsed
-  }
-  const key = read('key')
-  if (key !== null) {
-    const found = tx.store.conceptByKey(tx.cx.space, key)
-    return found === null ? null : { kind: 'Concept', seq: found.id }
-  }
-  if (Object.hasOwn(matcher, 'name')) {
-    throw errors.nameIdentityForbidden(
-      'a Concept name is mutable grounding state and several Concepts may ' +
-        'share one, so it cannot identify an upsert target; use {key: …} or ' +
-        '{id: …}',
+  if (typeof resolved !== 'string') {
+    throw errors.typeMismatch(
+      `an UPSERT MATCH \`${field}\` must be a string, got ${JSON.stringify(resolved)}`,
     )
   }
-  throw errors.identitySelectorRequired(
-    'MATCH must name a stable identity: {id: …} or {key: …}',
-  )
+  return resolved
 }
 
 // --- field routing ----------------------------------------------------------

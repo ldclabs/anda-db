@@ -2,6 +2,70 @@
 
 All notable changes to this workspace are documented in this file.
 
+## [Unreleased] — logical keys are identity within a type
+
+`anda_kip` 0.13.0, `anda_cognitive_nexus` 0.13.0,
+`anda_cognitive_nexus_server` 0.13.0.
+
+A Concept's logical `key` is unique within `(space_id, schema_ref, key)`, not
+within `(space_id, key)` (§7.3). A `Person` and a `Preference` may both be
+keyed `"alice"`; they are two identities, not a collision.
+
+### Changed
+
+- **`UPSERT CONCEPT ... MATCH {type: ..., key: ...}`.** `MATCH` is an object
+  pattern, so `type` inside it is the same schema-resolution sugar it is in a
+  KQL Concept pattern (§43.1), and it carries identity weight in both halves of
+  an upsert: on a resolve it is part of the address, and on a create it is the
+  only place the new Concept's type can come from. `schema_ref` is fixed at
+  creation, so an upsert that would create and declares no type now fails with
+  `SchemaSymbolNotFound` rather than minting a Concept no later write could
+  repair. Both engines previously parsed `type` here and dropped it.
+- **A bare `key` that names more than one Concept is `IdentityConflict`.**
+  Answering with either would be the arbitrary winner §51 forbids for names,
+  reaching the same outcome through `key`.
+- **A duplicate logical key is refused at commit** — `CREATE CONCEPT`, the
+  create half of `UPSERT` and Capsule import alike, including two Concepts
+  minted by one transaction, which no store lookup would catch.
+
+### Fixed
+
+- **`UPSERT CONCEPT ... MATCH {id: ...}` no longer creates** in `@ldclabs/kip-do`.
+  An id that did not resolve — absent, or carrying a type the `MATCH` did not
+  declare — fell through to the insert half and minted a *different* Concept
+  under a *different* id, reporting success. §53 gives an upsert by id no
+  create half; it now fails existence-neutrally, as the Rust engine does.
+- **A `MATCH` member of the wrong type is refused** rather than read as absent.
+  `{type: 42}` was silently taken as "no type declared" in `@ldclabs/kip-do`.
+- **The `MATCH` block selects and does not seed.** `@ldclabs/kip-do` copied
+  `name` and `canonical_id` out of `MATCH` into a newly created Concept, so the
+  same command meant different things depending on whether it resolved or
+  created. Grounding state arrives through `SET FIELDS` only.
+- **`idx_concepts_key` is rebuilt on existing databases.** `CREATE UNIQUE INDEX
+  IF NOT EXISTS` matches on the name alone, so widening it would otherwise have
+  been a silent no-op and a deployed Space would have gone on refusing a
+  `Preference` keyed like a `Person`. Schema version 4.
+- **A storage failure during an upsert by id is no longer reported as
+  absence.** Only `NotFoundOrNotVisible` means "no such Concept".
+- `py/anda_cognitive_nexus_py` follows the workspace to 0.13.
+
+### Upgrading
+
+- **An existing `anda_cognitive_nexus` database may already hold duplicate
+  keys.** Before this release nothing checked a logical key on the way in —
+  `CREATE CONCEPT ... SET FIELDS {key: ...}` staged whatever it was given and
+  there is no unique index underneath — so a Space written by the KIP 2.0
+  release (0.12) can hold two Concepts of one type sharing a key. Those keys now
+  answer `UPSERT` with `IdentityConflict` instead of silently resolving to
+  whichever row the index returned first. That is the ambiguity surfacing rather
+  than a new failure, and it is fixed by `MERGE CONCEPT` on the pair, or by
+  giving one of them a different key. `FIND(?c.name, ?c.key) WHERE { ?c CONCEPT
+  {} }` lists the Concepts that carry one.
+- `@ldclabs/kip-do` needs no such sweep: the old unique index made the
+  duplicate unwritable in the first place.
+
+---
+
 ## [KIP 2.0] — 2026-08-17
 
 `anda_kip` 0.12.0, `anda_cognitive_nexus` 0.12.0,
