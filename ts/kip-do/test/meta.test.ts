@@ -52,9 +52,15 @@ describe('META', () => {
       // are the element-scope ones, and they are listed as themselves.
       expect(gaps).toContain('set_retention')
       expect(gaps).toContain('trust_model')
-      expect(gaps).toContain('search')
       expect(gaps).toContain('capsule_import')
       expect(gaps).toContain('hop_quantifiers')
+      // Keyword SEARCH is built, so the gaps that remain are the specific ones
+      // — a partial capability names what is left rather than shrinking to the
+      // one word that would read as "no search at all".
+      expect(gaps).not.toContain('search')
+      expect(gaps).toContain('semantic_search')
+      expect(gaps).toContain('historical_search')
+      expect(gaps).toContain('search_over_assertions_and_activities')
       // Every gap carries a reason, not just a name.
       for (const entry of report.unsupported) {
         expect(entry.reason.length, entry.capability).toBeGreaterThan(20)
@@ -234,10 +240,10 @@ describe('META', () => {
       expect(() =>
         nexus.describe('VERIFY SCHEMA PACKAGE "kip://core@2.0.0"'),
       ).toThrowError(/not implemented by this engine/)
-      // A keyword search over a narrower index than the caller expects is
-      // indistinguishable from a narrower world.
-      expect(() => nexus.describe('SEARCH CONCEPT "Alice"')).toThrowError(
-        /builds no search index/,
+      // An Assertion has no free text, so an empty answer would read as "no
+      // such claim exists" rather than "nothing here is searchable".
+      expect(() => nexus.describe('SEARCH ASSERTION "Alice"')).toThrowError(
+        /carry no free text/,
       )
     })
   })

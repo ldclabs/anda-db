@@ -157,13 +157,11 @@ export {
 export type * from './kip/ast.js'
 
 export {
-  AlinkTokenizer,
-  SimpleTokenizer,
+  MAX_QUERY_TOKENS,
   extractJsonText,
-  MAX_TEXTS_PER_BATCH,
-  type FetcherLike,
-  type Tokenizer,
-  type TokenizeResult,
+  segment,
+  segmentToText,
+  segmenterMark,
 } from './tokenizer.js'
 
 export {

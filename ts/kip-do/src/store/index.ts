@@ -65,6 +65,16 @@ export {
 } from './store.js'
 
 export {
+  SEARCHABLE,
+  SEARCH_TABLES,
+  indexElement,
+  rebuildSearch,
+  searchIndex,
+  type SearchHit,
+  type SearchQuery,
+} from './search.js'
+
+export {
   coordinateFromToken,
   elementOfVersion,
   snapshotJson,

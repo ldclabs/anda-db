@@ -37,6 +37,8 @@
  */
 
 import { errors } from '../errors.js'
+import { segmenterMark } from '../tokenizer.js'
+import { rebuildSearch } from './search.js'
 
 /**
  * Bumped whenever the DDL below changes in a way that needs a migration.
@@ -55,8 +57,11 @@ import { errors } from '../errors.js'
  * A *narrowing* of what the database rejects, so it needs the rebuild in
  * {@link REDEFINED_INDEXES}: the old index would go on refusing a `Preference`
  * keyed the same as a `Person`.
+ *
+ * 5 — the three FTS5 indexes behind `SEARCH`. Additive, but they start empty,
+ * so an existing database is backfilled once (see {@link backfillSearch}).
  */
-export const SCHEMA_VERSION = 4
+export const SCHEMA_VERSION = 5
 
 /**
  * The `_system` envelope every element table repeats.
@@ -419,6 +424,29 @@ export const SCHEMA_STATEMENTS: readonly string[] = [
      ON schema_envs(space, version)`,
 
   // --- engine key/value sidecar ------------------------------------------
+  // --- full-text indexes --------------------------------------------------
+  // One per searchable kind, with the columns the Rust engine indexes over the
+  // same kind — a query that ranks differently between two engines is tolerable,
+  // one that searches a different *corpus* is not.
+  //
+  // The rowid is the element's row id, so maintenance is a delete and an insert
+  // keyed on the integer primary key. `unicode61` does the final tokenization on
+  // both the write and the read path; what the engine puts in these columns is
+  // already segmented (see `src/tokenizer.ts`), because `unicode61` cannot find
+  // a boundary inside a Han run.
+  //
+  // Space and lifecycle are deliberately *not* copied in here. They are joined
+  // from the element table at query time, so there is exactly one copy of the
+  // truth about which Space an element is in and whether it is still active.
+  `CREATE VIRTUAL TABLE IF NOT EXISTS fts_concepts USING fts5(
+     name, aliases, attributes, tokenize='unicode61'
+   )`,
+  `CREATE VIRTUAL TABLE IF NOT EXISTS fts_propositions USING fts5(
+     predicate_ref, attributes, tokenize='unicode61'
+   )`,
+  `CREATE VIRTUAL TABLE IF NOT EXISTS fts_evidence USING fts5(
+     payload_inline, tokenize='unicode61'
+   )`,
   `CREATE TABLE IF NOT EXISTS kip_meta (
      k TEXT PRIMARY KEY,
      v TEXT NOT NULL
@@ -721,6 +749,8 @@ export function applySchema(sql: SqlStorage): void {
   }
   addMissingColumns(sql)
 
+  rebuildSearchIfStale(sql)
+
   const previous = metaGet(sql, 'schema_version')
   if (previous !== null && Number(previous) > SCHEMA_VERSION) {
     // A database written by a newer build has columns this one does not know
@@ -731,6 +761,28 @@ export function applySchema(sql: SqlStorage): void {
     )
   }
   metaSet(sql, 'schema_version', String(SCHEMA_VERSION))
+}
+
+/**
+ * Rebuilds the full-text index when the segmenter's own output has moved.
+ *
+ * The index is only as good as the vocabulary that built it, and that
+ * vocabulary is ICU's — which changes when the runtime upgrades. A row indexed
+ * under boundaries the query path no longer produces is not ranked worse, it is
+ * unreachable, and nothing about it looks wrong from the outside. So the mark
+ * is stored beside the index and checked on every construction.
+ *
+ * Also the first-build path: a database that has never had the tables has no
+ * mark either, and the rebuild runs over rows that were written before the
+ * index existed.
+ *
+ * Written after the rebuild, so an interrupted one is simply redone.
+ */
+function rebuildSearchIfStale(sql: SqlStorage): void {
+  const mark = segmenterMark()
+  if (metaGet(sql, 'fts_segmenter') === mark) return
+  rebuildSearch(sql)
+  metaSet(sql, 'fts_segmenter', mark)
 }
 
 /** Reads a sidecar value, or `null` when absent. */

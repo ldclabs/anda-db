@@ -1,246 +1,110 @@
 /**
- * Tokenization for full-text search.
+ * Segmentation for full-text search.
  *
- * Durable Object SQLite ships FTS5 with only the built-in tokenizers
- * (`ascii`, `unicode61`, `porter`, `trigram`) and a Worker cannot load a C
- * extension, so jieba is not available inside SQLite. Chinese text under
- * `unicode61` collapses a whole Han run into a single token and returns
- * nothing for realistic queries.
+ * Durable Object SQLite ships FTS5 with only the built-in tokenizers (`ascii`,
+ * `unicode61`, `porter`, `trigram`) and a Worker cannot load a C extension.
+ * `unicode61` finds word boundaries from Unicode categories, which works for
+ * scripts that write spaces and fails completely for the ones that do not: a
+ * whole Han run collapses into one token, so `深色模式` indexes as a single
+ * term and no realistic query ever matches it.
  *
- * The engine therefore treats an external service as the sole segmentation
- * authority — `cf-tokenizer`, which wraps jieba-rs behind
- * `POST /tokenize`. Both the write path (indexing) and the read path
- * (`SEARCH`) call the same service, which is what prevents the write/read
- * asymmetry that a "tokenize on write, approximate on read" design produces.
+ * So the boundaries are inserted before the text reaches SQLite. That is this
+ * module's whole job — **not** to tokenize, but to put spaces where
+ * `unicode61` cannot see a break. FTS5 still does the final tokenization on
+ * both paths, which is what keeps the index and the query in step through the
+ * cases this module does not touch (case folding, apostrophes, hyphens).
  *
- * The service stamps `X-Tokenizer-Version` on every response. That version is
- * persisted per row in `tok_ver`; when it no longer matches the live service,
- * the affected rows are stale and must be re-indexed, because token
- * vocabularies from different versions are not comparable.
+ * KIP 1.x delegated this to `cf-tokenizer`, an external jieba-rs service that
+ * was the sole segmentation authority for both the write and the read path.
+ * That cannot survive into 2.0: the engine commits inside
+ * `ctx.storage.transactionSync`, and an HTTP call is not something a
+ * synchronous transaction can make. The alternatives were to make every write
+ * async — losing the all-or-none commit the platform hands us — or to index out
+ * of band and then report a freshness the index does not have, which §66.5 and
+ * §79 both forbid. `Intl.Segmenter` dissolves the problem: ICU's dictionary
+ * breaking, in process, synchronous.
+ *
+ * The cost is that ICU's dictionary is not jieba's, so this engine and the Rust
+ * one segment the same Chinese sentence slightly differently and rank the same
+ * corpus slightly differently. That is a *recall* difference between two
+ * engines, not an asymmetry inside either one — and an asymmetry inside one is
+ * the failure that actually loses data, because a document indexed under
+ * boundaries the query path does not reproduce is unreachable forever.
+ *
+ * ICU's dictionary can change when the runtime upgrades. {@link segmenterMark}
+ * makes that *detectable*: it is stored beside the index and a mismatch
+ * triggers a rebuild, because tokens from two vocabularies are not comparable.
  */
-
-import { errors } from './errors.js'
-
-/** Batch cap enforced by the service (`MAX_TEXTS_PER_BATCH`). */
-export const MAX_TEXTS_PER_BATCH = 256
-
-/** Result of tokenizing a batch. */
-export interface TokenizeResult {
-  /** One token list per input text, positionally aligned. */
-  tokens: string[][]
-  /** `X-Tokenizer-Version` of the service that produced them. */
-  version: string
-}
-
-export interface Tokenizer {
-  /**
-   * Segments texts for indexing and querying.
-   *
-   * Implementations must be deterministic for a given version: the same text
-   * must yield the same tokens on the write path and the read path.
-   */
-  tokenize(texts: string[]): Promise<TokenizeResult>
-}
 
 /**
- * A binding that can service a `fetch`.
+ * The locale the segmenter is pinned to.
  *
- * Typed structurally so the same client works against a Container binding, a
- * service binding, or a plain origin — the three ways `cf-tokenizer` is
- * reachable from a Worker.
+ * ICU selects dictionary breaking by *script*, not by locale — `zh`, `ja`, `en`
+ * and the host default all segment `我喜欢深色模式` identically today, verified
+ * in workerd. Pinning one anyway costs nothing and means a future ICU that does
+ * read the locale cannot make the index depend on where the object happens to
+ * run.
  */
-export interface FetcherLike {
-  fetch(input: RequestInfo, init?: RequestInit): Promise<Response>
-}
+const LOCALE = 'zh'
 
-export interface AlinkTokenizerOptions {
-  /**
-   * Base URL of the service. When calling through a service or Container
-   * binding the host is ignored by the runtime but a valid absolute URL is
-   * still required; the default is fine in that case.
-   */
-  baseUrl?: string
-  /** Per-request timeout. The service is pure CPU, so this should be short. */
-  timeoutMs?: number
-}
+/** The most tokens taken from one document. Bounds pathological input. */
+const MAX_TOKENS = 4096
+
+/** The most tokens taken from one query term. */
+export const MAX_QUERY_TOKENS = 64
+
+const SEGMENTER = new Intl.Segmenter(LOCALE, { granularity: 'word' })
 
 /**
- * Client for `cf-tokenizer`.
+ * Splits text into the terms an FTS5 column should see, in order.
  *
- * The class keeps its historical name for API compatibility. Contract (see
- * `rs/cf-tokenizer/README.md`):
- *   `POST /tokenize  { texts: string[], mode: "search" } -> { tokens: string[][] }`
- *   every successful response carries `X-Tokenizer-Version`.
+ * Order and repetition are preserved: BM25 scores on term frequency, and a
+ * deduplicating segmenter would tell the ranker that a name mentioned nine
+ * times was mentioned once.
  */
-export class AlinkTokenizer implements Tokenizer {
-  readonly #fetcher: FetcherLike
-  readonly #baseUrl: string
-  readonly #timeoutMs: number
-
-  constructor(fetcher: FetcherLike, options: AlinkTokenizerOptions = {}) {
-    this.#fetcher = fetcher
-    this.#baseUrl = (options.baseUrl ?? 'http://tokenizer').replace(/\/+$/, '')
-    this.#timeoutMs = options.timeoutMs ?? 5_000
-  }
-
-  async tokenize(texts: string[]): Promise<TokenizeResult> {
-    if (texts.length === 0) return { tokens: [], version: 'empty' }
-
-    const tokens: string[][] = []
-    let version: string | null = null
-
-    // The service rejects oversized batches rather than truncating, so
-    // chunking is the client's job.
-    for (let i = 0; i < texts.length; i += MAX_TEXTS_PER_BATCH) {
-      const chunk = texts.slice(i, i + MAX_TEXTS_PER_BATCH)
-      const result = await this.#post(chunk)
-
-      // A version change mid-write would stamp one `tok_ver` across rows
-      // tokenized by two different vocabularies, which silently defeats the
-      // staleness check that drives re-indexing.
-      if (version !== null && result.version !== version) {
-        throw errors.internalError(
-          `tokenizer version changed mid-batch (${version} -> ${result.version}); ` +
-            `retry the write so every row is stamped with one version`,
-        )
-      }
-      version = result.version
-      tokens.push(...result.tokens)
-    }
-
-    return { tokens, version: version! }
-  }
-
-  async #post(texts: string[]): Promise<TokenizeResult> {
-    // The deadline covers the *whole* exchange, body included: the signal is
-    // cleared only after the payload is consumed. Clearing it when the
-    // headers arrive would let a stalled body read hang forever — and every
-    // KML write queues behind this call, so a hang wedges the object.
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), this.#timeoutMs)
-    try {
-      let response: Response
-      try {
-        response = await this.#fetcher.fetch(`${this.#baseUrl}/tokenize`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ texts, mode: 'search' }),
-          signal: controller.signal,
-        })
-      } catch (err) {
-        // Only the deadline is a timeout; DNS, refused connections and reset
-        // streams are service failures and must not masquerade as one.
-        if (controller.signal.aborted) {
-          throw errors.executionTimeout(
-            `tokenizer request timed out after ${this.#timeoutMs}ms`,
-          )
-        }
-        throw errors.internalError(
-          `tokenizer request failed: ${(err as Error).message}`,
-        )
-      }
-
-      if (!response.ok) {
-        const body = await response.text().catch(() => '')
-        throw errors.internalError(
-          `tokenizer returned ${response.status}: ${body.slice(0, 200)}`,
-        )
-      }
-
-      const version = response.headers.get('x-tokenizer-version')
-      if (!version) {
-        // Without a version there is no way to detect stale index rows later,
-        // so an unversioned response is treated as a broken deployment rather
-        // than silently accepted.
-        throw errors.internalError(
-          'tokenizer response is missing the X-Tokenizer-Version header',
-        )
-      }
-
-      let payload: { tokens?: string[][] }
-      try {
-        payload = (await response.json()) as typeof payload
-      } catch (err) {
-        if (controller.signal.aborted) {
-          throw errors.executionTimeout(
-            `tokenizer response body timed out after ${this.#timeoutMs}ms`,
-          )
-        }
-        throw errors.internalError(
-          `tokenizer response is not valid JSON: ${(err as Error).message}`,
-        )
-      }
-      if (
-        !Array.isArray(payload.tokens) ||
-        payload.tokens.length !== texts.length
-      ) {
-        throw errors.internalError(
-          `tokenizer returned ${payload.tokens?.length ?? 0} token lists for ` +
-            `${texts.length} texts`,
-        )
-      }
-      return { tokens: payload.tokens, version }
-    } finally {
-      clearTimeout(timer)
-    }
-  }
-}
-
-/**
- * Whitespace/punctuation tokenizer used in tests and for ASCII-only
- * deployments that do not want the extra service hop.
- *
- * It is intentionally *not* a fallback for `AlinkTokenizer`: silently
- * degrading to this when the service is unreachable would write rows whose
- * tokens disagree with everything indexed before and after them. The engine
- * fails the write instead, and the caller decides.
- */
-export class SimpleTokenizer implements Tokenizer {
-  static readonly VERSION = 'simple-1'
-
-  async tokenize(texts: string[]): Promise<TokenizeResult> {
-    return {
-      tokens: texts.map((text) => normalizeTokens(splitSimple(text))),
-      version: SimpleTokenizer.VERSION,
-    }
-  }
-}
-
-function splitSimple(text: string): string[] {
-  const lowered = text.normalize('NFKC').toLowerCase()
+export function segment(text: string, maxTokens = MAX_TOKENS): string[] {
+  if (text === '') return []
   const out: string[] = []
-  // Latin/digit runs become words; each CJK codepoint becomes its own token,
-  // which is the best a tokenizer without a dictionary can do. This is why it
-  // is a test helper and not a production path.
-  for (const match of lowered.matchAll(
-    /[\p{Script=Han}]|[\p{Letter}\p{Number}]+/gu,
-  )) {
-    out.push(match[0])
+  // NFKC first: a full-width `Ａ` and an `A` are the same term to a reader, and
+  // normalizing on both paths is what makes them the same term here.
+  for (const part of SEGMENTER.segment(text.normalize('NFKC'))) {
+    if (!part.isWordLike) continue
+    out.push(part.segment.toLowerCase())
+    if (out.length >= maxTokens) break
   }
   return out
 }
 
-/** Order-preserving dedup plus the 256-token cap the service applies. */
-function normalizeTokens(tokens: string[]): string[] {
-  const seen = new Set<string>()
-  const out: string[] = []
-  for (const token of tokens) {
-    if (seen.has(token)) continue
-    seen.add(token)
-    out.push(token)
-    if (out.length >= 256) break
-  }
-  return out
+/**
+ * The segmented form of one document, ready to store in an FTS5 column.
+ *
+ * Joined with spaces because a space is the one separator every built-in FTS5
+ * tokenizer agrees on.
+ */
+export function segmentToText(text: string): string {
+  return segment(text).join(' ')
+}
+
+/**
+ * A fingerprint of what this runtime's ICU does to a fixed probe.
+ *
+ * Stored beside the index. When it changes, the vocabulary that produced every
+ * indexed row is gone and the rows are stale — not wrong in a way anything
+ * would notice, which is exactly why it has to be checked rather than assumed.
+ * The probe deliberately spans Han, Kana and Latin, the three cases whose
+ * boundaries this module exists to fix or to leave alone.
+ */
+export function segmenterMark(): string {
+  return `${LOCALE}:${segment('深色模式東京都に住むAlice-Aurora').join('|')}`
 }
 
 /**
  * Collects the searchable text of a JSON value.
  *
- * Mirrors `extract_json_text` in `anda_db`: the BM25 corpus is built from
- * every string *and* every object key reachable inside `attributes` /
- * `metadata`, not just top-level values. Reproducing this shape matters — an
- * index built over a different corpus ranks differently even with identical
- * tokenization.
+ * Mirrors `extract_json_text` in `anda_db`: the corpus is built from every
+ * string *and* every object key reachable inside `attributes`, not just
+ * top-level values. Reproducing this shape matters — an index built over a
+ * different corpus ranks differently even with identical tokenization.
  *
  * The caps mirror the Rust ones: they bound the work a single pathological
  * document can cause on a request path that also holds the Durable Object's

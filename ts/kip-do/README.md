@@ -52,10 +52,15 @@ here:
   formation off the control plane. `DESCRIBE CAPABILITIES` names what that costs
   and what is still missing, rather than letting the word "governance" imply
   more than is there.
-- **`SEARCH`, in every mode.** No search index is built here. A keyword search
-  over unsegmented text would silently disagree with the reference engine about
-  which documents match, and a caller cannot tell a narrow index from a narrow
-  world.
+- **Semantic and hybrid `SEARCH`.** There is no embedding model here, so
+  `MODE "semantic"` and `MODE "hybrid"` are refused by name. Keyword search is
+  built and is the portable baseline §66.3 asks for.
+- **Historical `SEARCH`.** The index is maintained against current state and
+  keeps no history of itself, so `AS OF SEQ` is refused rather than answered
+  from today's index under a past coordinate.
+- **`SEARCH ASSERTION | ACTIVITY`.** An Assertion carries a stance, a mode and a
+  number; an Activity a class and two timestamps. Neither has free text to
+  index, and an empty answer would read as "no such claim exists".
 
 Reading the past works on both axes, and they are deliberately kept apart:
 `AS OF SEQ | TX | TIME` asks what this Brain *held* then, `FOR TIME` asks what
@@ -179,50 +184,67 @@ rather than from the error's name. Two cases matter:
 - **`outcome_lookup_required` is never 500.** The write may well have landed.
   500 reads as "nothing happened", and a client acting on that writes again.
 
-## Multilingual text and the tokenizer service
+## Full-text search and multilingual text
 
-**Nothing indexes yet.** `SEARCH` is refused in every mode, and the tokenizer
-client below ships ahead of the index it will feed. The reasoning is recorded
-here because it is what the eventual index has to be built against, and getting
-it wrong is not visible from the outside — a mis-segmented corpus returns
-plausible results for the wrong reason.
+`SEARCH CONCEPT | PROPOSITION | EVIDENCE | COGNITION` is built, in keyword mode,
+over SQLite FTS5 with BM25 ranking. The corpus mirrors the Rust engine's field
+for field — Concept `name` / `aliases` / `attributes`, Proposition
+`predicate_ref` / `attributes`, Evidence `payload_inline` — because two engines
+ranking the same corpus differently is a quality difference a caller can live
+with, and two engines searching *different text* is a correctness difference
+nobody can debug from the outside.
+
+**The index is maintained inside the write transaction.** Maintenance hangs off
+`Store.put`, the single funnel every write passes through, so an index entry
+commits or rolls back with the row it describes. That is what lets the answer
+report `index_seq` equal to `current_space_seq` rather than hedging: there is no
+window in which the index lags (§66.5, §79).
+
+### Segmentation
 
 Durable Object SQLite ships FTS5 with only the built-in tokenizers (`ascii`,
-`unicode61`, `porter`, `trigram`), and a Worker cannot load a C extension, so
-jieba is unavailable inside SQLite. Under `unicode61` a whole Han run collapses
-into a single token and realistic Chinese queries return nothing.
+`unicode61`, `porter`, `trigram`), and a Worker cannot load a C extension.
+`unicode61` finds word boundaries from Unicode categories, which works for
+scripts that write spaces and fails completely for the ones that do not: a whole
+Han run collapses into one token, so `深色模式` would index as a single term that
+no realistic query matches.
 
-This engine therefore treats the public
-[`cf-tokenizer`](../../rs/cf-tokenizer) service as the **sole segmentation
-authority**, called on both the write path and the read path. It applies NFKC,
-lowercasing, script-aware segmentation (jieba search mode for Han, Unicode UAX
-#29 word boundaries for other scripts), and targeted Russian and Arabic search
-folding:
+So the boundaries are inserted before the text reaches SQLite, by
+`Intl.Segmenter` — ICU's dictionary breaking, in process and synchronous. FTS5
+still does the final tokenization on both paths, which keeps the index and the
+query in step through everything the segmenter does not touch (case folding,
+apostrophes, hyphens).
 
-- FTS5 columns use `tokenize = 'ascii'` so SQLite does *no* linguistic work of
-  its own — it splits on ASCII punctuation and treats every byte ≥ 0x80 as a
-  token character, so a pre-segmented CJK token survives intact. `unicode61`
-  would apply a second Unicode normalization and folding policy, so the
-  vocabulary actually stored would no longer be exactly the service's
-  versioned output.
-- If the service is unreachable, writes **fail**. There is no fallback to local
-  segmentation on purpose: degrading silently would write tokens that disagree
-  with everything indexed before and after, and the damage would only surface
-  as queries quietly returning nothing.
+KIP 1.x delegated this to [`cf-tokenizer`](../../rs/cf-tokenizer), an external
+jieba-rs service that was the sole segmentation authority for both paths. **That
+client is gone, and so is the `TOKENIZER` binding.** It could not survive into
+2.0: the engine commits inside `ctx.storage.transactionSync`, and an HTTP call
+is not something a synchronous transaction can make. The alternatives were to
+make every write async — losing the all-or-none commit the platform hands us —
+or to index out of band and then report a freshness the index does not have,
+which §66.5 and §79 both forbid.
 
-Without a `TOKENIZER` binding the package falls back to `SimpleTokenizer`.
-That is useful for tests and basic ASCII-oriented deployments, but it emits one
-token per Han code point and cannot provide dictionary-based Chinese search.
-Bind `cf-tokenizer` in production whenever the corpus is multilingual.
+The cost is that ICU's dictionary is not jieba's, so this engine and the Rust
+one segment the same Chinese sentence slightly differently and rank the same
+corpus slightly differently. That is a recall difference *between* two engines,
+not an asymmetry *inside* either one — and an asymmetry inside one is the
+failure that actually loses data, because a document indexed under boundaries
+the query path does not reproduce is unreachable forever.
 
-`cf-tokenizer` is a container image, not a Worker binding by itself. Deploy it
-behind a small Cloudflare Container Worker, then add that Worker's service
-binding as `TOKENIZER`. The tokenizer's
-[deployment guide](../../rs/cf-tokenizer/README.md#deploy-on-cloudflare) includes
-the Container class, Wrangler configuration, registry workflow, health check,
-limits, and version-rollout checklist. A service binding is preferred because
-the tokenizer HTTP server does not implement authentication and need not be
-publicly reachable.
+ICU's dictionary can change when the runtime upgrades. `segmenterMark()` makes
+that detectable: it is stored beside the index and a mismatch rebuilds it, on
+the same principle — tokens from two vocabularies are not comparable, and a row
+indexed under the old one is unreachable rather than merely ranked worse.
+
+### What a score is
+
+`retrieval.score` is `-bm25()`, so bigger is better and the default
+`THRESHOLD 0.0` keeps everything. It is relevance, never confidence: copying one
+into an Assertion would invent an epistemic commitment out of a text match
+(§2.10). Scores may be compared *within* one answer and never across engines.
+
+A `SEARCH` miss does not prove absence (§66.6). Ground with `SEARCH`, then read
+with `FIND` or `BELIEF`.
 
 ## Platform limits you will hit
 

@@ -2,14 +2,88 @@
 
 All notable changes to this workspace are documented in this file.
 
-## [Unreleased] — logical keys are identity within a type
+## [Unreleased] — logical keys, and `@ldclabs/kip-do` gets `SEARCH`
 
 `anda_kip` 0.13.0, `anda_cognitive_nexus` 0.13.0,
-`anda_cognitive_nexus_server` 0.13.0.
+`anda_cognitive_nexus_server` 0.13.0, `@ldclabs/kip-do` 0.13.0 (still
+unpublished, so this accumulates into the same version).
 
 A Concept's logical `key` is unique within `(space_id, schema_ref, key)`, not
 within `(space_id, key)` (§7.3). A `Person` and a `Preference` may both be
 keyed `"alice"`; they are two identities, not a collision.
+
+And `@ldclabs/kip-do` builds a full-text index. The 2.0 rewrite deleted the 1.x
+search layer and refused `SEARCH` in every mode, which left associative
+grounding — the thing §66 exists for — with no implementation at all in the
+TypeScript engine. Keyword search is now built; the remaining gaps
+(`SET RETENTION`, Capsule import, hop quantifiers, atomic multi-operation
+batches) are still reported by `DESCRIBE CAPABILITIES`.
+
+### Added — full-text `SEARCH` in `@ldclabs/kip-do`
+
+`SEARCH CONCEPT | PROPOSITION | EVIDENCE | COGNITION`, keyword mode, on SQLite
+FTS5 with BM25 ranking (§66).
+
+- **The corpus mirrors `anda_cognitive_nexus` field for field** — Concept
+  `name` / `aliases` / `attributes`, Proposition `predicate_ref` /
+  `attributes`, Evidence `payload_inline`, through the same `extract_json_text`
+  shape. Two engines ranking one corpus differently is a quality difference a
+  caller can live with; two engines searching *different text* is a correctness
+  difference nobody can debug from the outside.
+- **The index is maintained inside the write transaction.** Maintenance hangs
+  off `Store.put`, the single funnel every write passes through, so an index
+  entry commits or rolls back with the row it describes. That is what lets the
+  answer report `index_seq` equal to `current_space_seq` rather than hedging
+  (§66.5, §79): there is no window in which the index lags. Archive, tombstone
+  and purge are correct for free, because the entry is recomputed from the row
+  as it now stands and a purged stub carries no text.
+- **`Intl.Segmenter` replaces the external tokenizer service, and it had to.**
+  `unicode61` finds boundaries from Unicode categories, so a Han run collapses
+  into one token and `深色模式` indexes as a single term nothing matches. 1.x
+  solved that by making `cf-tokenizer` (jieba-rs, over HTTP) the sole
+  segmentation authority for both paths — which cannot survive into 2.0,
+  because the engine commits inside `ctx.storage.transactionSync` and a
+  synchronous transaction cannot make an HTTP call. The alternatives were an
+  async write path, losing the all-or-none commit the platform hands us, or
+  indexing out of band and then reporting a freshness the index does not have,
+  which §66.5 and §79 both forbid. ICU's dictionary breaking, in process,
+  dissolves it: verified in workerd for Chinese and Japanese, and
+  script-driven rather than locale-driven.
+- **A segmenter fingerprint drives rebuilds.** ICU's dictionary changes when the
+  runtime upgrades, and a row indexed under boundaries the query path no longer
+  produces is unreachable rather than merely ranked worse — nothing about it
+  looks wrong from the outside. `segmenterMark()` is stored beside the index and
+  a mismatch rebuilds the whole thing. Schema version 5.
+- **Scores are `-bm25()`**, so bigger is better and the default `THRESHOLD 0.0`
+  keeps everything, matching the Rust engine's sign convention. They are
+  comparable *within* one answer and never across engines: both are BM25 over
+  the same corpus under different dictionaries. `retrieval.score` is relevance,
+  never confidence (§2.10).
+- The refusals match `anda_cognitive_nexus`'s exactly, each with its own reason
+  rather than one word: `MODE "semantic"` / `"hybrid"` (no embedding model),
+  `AS OF SEQ` (the index keeps no history of itself), and
+  `SEARCH ASSERTION` / `ACTIVITY` (an Assertion carries a stance, a mode and a
+  number; an Activity a class and two timestamps — an empty answer would read as
+  "no such claim exists"). `DESCRIBE CAPABILITIES` now names these three
+  instead of a blanket `search` gap.
+- Space and lifecycle are joined from the element table rather than copied into
+  the index, so there is one copy of the truth about which Space a row is in and
+  the filter cannot drift away from `FIND`'s. Every hit goes through the same
+  read decision a query would and carries the **redacted** view: a field a Grant
+  masked out of a query must not come back through a search hit (§105).
+
+The cross-engine conformance fixtures carry no `SEARCH` case today. One added
+later must assert the contract — refusals, defaults, hit shape — and must not
+assert scores.
+
+### Removed — `@ldclabs/kip-do` tokenizer client
+
+`AlinkTokenizer`, `SimpleTokenizer`, `Tokenizer`, `FetcherLike`,
+`TokenizeResult` and `MAX_TEXTS_PER_BATCH` are gone, and so is the `TOKENIZER`
+service binding. Segmentation is in process and synchronous; keeping a second
+segmentation authority reachable would invite exactly the write/read asymmetry
+that makes an indexed document unreachable forever. `extractJsonText` stays,
+because it is the shape both engines' corpora are built from.
 
 ### Changed
 

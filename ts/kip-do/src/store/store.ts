@@ -39,6 +39,7 @@ import {
   seqOfTransaction,
 } from './history.js'
 import { elementReferences } from './references.js'
+import { indexElement } from './search.js'
 import {
   State,
   TABLES,
@@ -362,6 +363,10 @@ export class Store {
       row: rowToJson(row) as JsonMap,
     })
     this.reindexReferences(element)
+    // In the same transaction as the row, which is the whole reason `SEARCH`
+    // may report `index_seq` equal to `current_space_seq` (§66.5): a write that
+    // rolled back rolled its index entry back with it.
+    indexElement(this.sql, element)
 
     return { id, kind: element.kind, op, version: row.version }
   }

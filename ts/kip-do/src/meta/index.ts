@@ -32,10 +32,12 @@ import {
   type AuthContext,
 } from '../governance/index.js'
 import {
+  elementId,
   formatElementId,
   parseElementId,
   tryParseElementId,
   type ElementId,
+  type ElementKind,
 } from '../id.js'
 import type { Json, JsonMap } from '../json.js'
 import type {
@@ -45,6 +47,7 @@ import type {
   ListCommand,
   MetaCommand,
   Scalar,
+  SearchCommand,
   ValidateCommand,
 } from '../kip/ast.js'
 import { parseKip, parserVersion, specRevision } from '../kip/parser.js'
@@ -63,7 +66,12 @@ import {
   type SchemaEnvironment,
   type SymbolKind,
 } from '../schema/index.js'
-import { snapshotJson, type ChangeEntry, type Store } from '../store/index.js'
+import {
+  searchIndex,
+  snapshotJson,
+  type ChangeEntry,
+  type Store,
+} from '../store/index.js'
 import { capabilities, KIP_VERSION } from './capabilities.js'
 import { exportCapsule, verifyCapsule } from '../capsule/index.js'
 
@@ -141,15 +149,7 @@ export function executeMeta(command: MetaCommand, cx: MetaContext): Json {
       cx.store.schemaVersionAt(cx.space, seq),
     )
   }
-  // SEARCH. Refused by name and for its own reason: a keyword search over
-  // unsegmented text would silently disagree with the reference engine about
-  // which documents match, and a caller cannot tell a narrow index from a
-  // narrow world.
-  throw errors.searchIndexUnavailable(
-    'this engine builds no search index; SEARCH in every mode is refused ' +
-      'rather than answered from a narrower index than the caller expects. ' +
-      'Use FIND with a pattern; see DESCRIBE CAPABILITIES',
-  )
+  return search(command.Search, cx, b)
 }
 
 // --- DESCRIBE ---------------------------------------------------------------
@@ -711,7 +711,168 @@ function changes(
   } as unknown as Json
 }
 
+// --- SEARCH -----------------------------------------------------------------
+
+/**
+ * Associative grounding (§66).
+ *
+ * The contract is the Rust engine's, field for field, because two engines that
+ * *refuse* differently are two engines an Agent has to be written against
+ * twice: the same unsupported mode, the same historical refusal, the same
+ * defaults, the same hit shape. What they are allowed to differ on is ranking,
+ * and they do — ICU's dictionary is not jieba's — which is why the answer says
+ * what its scores mean rather than inviting them to be compared.
+ *
+ * Every hit goes through the same read decision a `FIND` would, and carries the
+ * **redacted** view: a field a Grant masked out of a query must not come back
+ * through a search snippet (§105).
+ */
+function search(command: SearchCommand, cx: MetaContext, b: ReadBindings): Json {
+  const term = text(command.term, b, 'SEARCH')
+
+  if (command.mode !== null) {
+    const mode = text(command.mode, b, 'MODE')
+    if (mode !== 'keyword') {
+      throw errors.searchModeUnsupported(
+        `this engine has no embedding model, so ${JSON.stringify(mode)} search is ` +
+          `unavailable; "keyword" is the only mode`,
+      )
+    }
+  }
+  if (command.as_of_seq !== null) {
+    // The index is maintained with the current state and keeps no history of
+    // itself, so answering this from today's index would be searching the
+    // present under a past coordinate (§66.1).
+    throw errors.historicalSearchUnavailable(
+      'this engine keeps no historical index, so AS OF SEQ search is unavailable',
+    )
+  }
+
+  const threshold = command.threshold === null ? 0 : numberOf(command.threshold, b, 'THRESHOLD')
+  const limit =
+    command.limit === null ? 10 : Math.min(numberOf(command.limit, b, 'LIMIT'), 100)
+  const offset = command.cursor === null ? 0 : numberOf(command.cursor, b, 'CURSOR')
+  const withType =
+    command.with_type === null
+      ? null
+      : formatSymbolRef(
+          cx.env.resolveSymbol('ConceptType', text(command.with_type, b, 'WITH TYPE'), 'read'),
+        )
+  const withPredicate =
+    command.with_predicate === null
+      ? null
+      : formatSymbolRef(
+          cx.env.resolveSymbol(
+            'PredicateType',
+            text(command.with_predicate, b, 'WITH PREDICATE'),
+            'read',
+          ),
+        )
+
+  let kinds: ElementKind[]
+  switch (command.target) {
+    case 'Concept':
+      kinds = ['Concept']
+      break
+    case 'Proposition':
+      kinds = ['Proposition']
+      break
+    case 'Evidence':
+      kinds = ['Evidence']
+      break
+    case 'Cognition':
+      kinds = ['Concept', 'Proposition', 'Evidence']
+      break
+    default:
+      // An Assertion's content is a stance and a number; an Activity's is a
+      // class and two timestamps. Refusing says so; answering nothing would
+      // read as "no such claim exists".
+      throw errors.searchIndexUnavailable(
+        'Assertions and Activities carry no free text, so this engine builds no ' +
+          'full-text index over them; reach them through the Proposition or Evidence ' +
+          'they are about',
+      )
+  }
+
+  const context = reader(cx)
+  const scored: { score: number; hit: JsonMap }[] = []
+  for (const kind of kinds) {
+    // Over-fetch, because every filter below runs after scoring: the window has
+    // to be wide enough that a page survives them.
+    const window = Math.max(limit + offset, 1) * 4
+    for (const row of searchIndex(cx.store.sql, {
+      kind,
+      space: cx.space,
+      term,
+      limit: window,
+    })) {
+      if (row.score < threshold) continue
+      const id = elementId(kind, row.seq)
+      // Applies the read decision and returns the **redacted** view; `null` is
+      // an element this caller may not read, which is indistinguishable from
+      // one that does not exist and must stay that way (§95). A field a Grant
+      // masked out of a query must not come back through a search hit (§105).
+      const view = context.view(id)
+      if (view === null) continue
+      if (withType !== null && view.schema_ref !== withType) continue
+      if (withPredicate !== null && view.predicate_ref !== withPredicate) continue
+      scored.push({
+        score: row.score,
+        hit: {
+          id: formatElementId(id),
+          kind: kind.toLowerCase(),
+          // Named `score`, never `confidence`: copying this into an Assertion
+          // would invent an epistemic commitment out of a text match (§2.10).
+          score: row.score,
+          element: view,
+        },
+      })
+    }
+  }
+  // Scores from three FTS tables are not strictly comparable — each has its own
+  // corpus statistics — and the Rust engine merges three separate BM25 indexes
+  // the same way. Ordering them together is a ranking heuristic, which is
+  // exactly what `score_semantics` tells the caller it is.
+  scored.sort((a, b2) => b2.score - a.score)
+
+  const total = scored.length
+  const page = scored.slice(offset, offset + limit)
+  const consumed = offset + page.length
+  const spaceSeq = cx.store.currentSeq(cx.space)
+
+  return {
+    hits: page.map((entry) => entry.hit),
+    search_context: {
+      mode: 'keyword',
+      score_semantics: 'bm25_relevance_not_confidence',
+      // The index is written inside the same transaction as the row it
+      // describes, so these are equal by construction rather than by luck
+      // (§66.5, §79). A caller deciding what a miss means needs to know which.
+      index_seq: spaceSeq,
+      current_space_seq: spaceSeq,
+      consistency: 'index is maintained synchronously with commits',
+    },
+    caveat:
+      'a SEARCH score is not a confidence and a miss is not an absence; ground ' +
+      'with SEARCH, then read with FIND or BELIEF',
+    // The Rust engine carries this on the operation result; this engine's
+    // envelope has no such slot, so it rides in the body — the same place
+    // `CHANGES` puts its cursor.
+    ...(consumed < total ? { next_cursor: String(consumed) } : {}),
+  } as unknown as Json
+}
+
 // --- small helpers ----------------------------------------------------------
+
+function numberOf(scalar: Scalar, b: ReadBindings, what: string): number {
+  const value = scalarValue(scalar, b)
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw errors.typeMismatch(
+      `${what} takes a number, got ${JSON.stringify(value)}`,
+    )
+  }
+  return value
+}
 
 function text(scalar: Scalar, b: ReadBindings, what: string): string {
   const value = scalarValue(scalar, b)

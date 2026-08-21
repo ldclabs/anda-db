@@ -86,6 +86,7 @@ export function capabilities(): Json {
       meta: [
         'DESCRIBE',
         'LIST',
+        'SEARCH CONCEPT | PROPOSITION | EVIDENCE | COGNITION, keyword mode',
         'VALIDATE KQL',
         'VALIDATE KML',
         'PREVIEW KML',
@@ -98,6 +99,24 @@ export function capabilities(): Json {
         policies: [BASELINE_ID, 'kip:policy:forecast'],
         statuses: ['accepted', 'rejected', 'contested', 'uncertain', 'insufficient'],
         score_semantics: 'normalized_support_not_probability',
+      },
+      search: {
+        modes: ['keyword'],
+        kinds: ['Concept', 'Proposition', 'Evidence', 'Cognition'],
+        ranking: 'SQLite FTS5 BM25 over segmented text',
+        // Not the same numbers as the Rust engine's, and saying so is the
+        // point: both are BM25, over the same corpus, under different
+        // dictionaries. A caller may compare scores *within* one answer and
+        // never across engines.
+        score_semantics: 'bm25_relevance_not_confidence',
+        segmentation:
+          'Intl.Segmenter (ICU dictionary) in process, then FTS5 unicode61; ' +
+          'the write and read paths run the same function',
+        // §66.5 and §79: a derived recall surface has to declare its freshness,
+        // and this one can declare the strongest form because the index is
+        // written inside the same transaction as the row.
+        consistency: 'index is maintained synchronously with commits',
+        miss_semantics: 'a miss is not an absence; confirm with FIND',
       },
       historical_read: {
         retention: 'unbounded: every element version is kept',
@@ -310,13 +329,29 @@ export function capabilities(): Json {
           'and the sweep that acts on it — not the column',
       },
       {
-        capability: 'search',
-        detail: 'SEARCH in every mode',
+        capability: 'semantic_search',
+        detail: 'SEARCH ... MODE "semantic" | "hybrid"',
         reason:
-          'no search index is built in this engine yet. A keyword search over ' +
-          'unsegmented text would silently disagree with the reference ' +
-          'engine’s BM25 on which documents match, which is worse than ' +
-          'refusing: the caller cannot tell a narrow index from a narrow world',
+          'this engine has no embedding model, so there is nothing to compare ' +
+          'vectors against; keyword search is built and is the portable ' +
+          'baseline §66.3 asks for',
+      },
+      {
+        capability: 'historical_search',
+        detail: 'SEARCH ... AS OF SEQ',
+        reason:
+          'the index is maintained against current state and keeps no history ' +
+          'of itself; answering from today’s index under a past coordinate ' +
+          'would be searching the present and calling it the past (§66.1)',
+      },
+      {
+        capability: 'search_over_assertions_and_activities',
+        detail: 'SEARCH ASSERTION | ACTIVITY',
+        reason:
+          'an Assertion carries a stance, a mode and a number, and an Activity ' +
+          'a class and two timestamps — neither has free text to index. ' +
+          'Refusing says so; an empty answer would read as “no such claim ' +
+          'exists”. Reach them through the Proposition or Evidence they are about',
       },
       {
         capability: 'hop_quantifiers',
