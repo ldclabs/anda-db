@@ -32,7 +32,7 @@
  */
 
 import { formatElementId, type ElementId } from '../id.js'
-import type { Json, JsonMap } from '../json.js'
+import { jsonEquals, type Json, type JsonMap } from '../json.js'
 import { predicateDef } from '../schema/index.js'
 import { parseSymbolRef } from '../schema/index.js'
 import {
@@ -54,8 +54,27 @@ interface Candidate {
   evidence: string[]
   stance: string
   confidence: number
+  /** The actor as a reader can follow it, for the ledger. */
+  actorRef: Json
   /** Whether this claim supports a *rival* value of a functional slot. */
   opposesTarget: boolean
+}
+
+/**
+ * One corroboration group: the independent root §23.3 counts once.
+ *
+ * Reported rather than merely counted, because §27.2 asks a side for its
+ * `root_groups` and §27.4 lists corroboration groups among what an Epistemic
+ * Ledger contains. A count says two sources agreed; the groups say *which*
+ * two, which is what lets a reader check they were really independent.
+ */
+interface Group {
+  /** The semantic actors behind this root, as references. */
+  actors: Json[]
+  /** The Evidence records it rests on. */
+  evidence: string[]
+  assertion_ids: string[]
+  contribution: number
 }
 
 /** The Assertions on each side, and the ones left out. */
@@ -64,20 +83,30 @@ interface Ledger {
   opposing: string[]
   uncertain: string[]
   excluded: { assertion_id: string; reason: string }[]
-  supportGroups: number
-  oppositionGroups: number
+  supportGroups: Group[]
+  oppositionGroups: Group[]
   warnings: string[]
 }
 
 /** A projected belief, as a query binds and projects it. */
 export interface Belief {
-  proposition: ElementId
+  /**
+   * The Proposition projected, when one durably exists.
+   *
+   * `null` is a real answer rather than a missing field: a fully grounded
+   * `BELIEF` over a tuple no Proposition has been created for answers
+   * `insufficient` with no id (§46.4), and a read must not create the
+   * Proposition just to have something to point at.
+   */
+  proposition: ElementId | null
   status: string
   support: number
   opposition: number
   ledger: Ledger
   policy: Policy
   validAt: string
+  /** The cognitive coordinate it read, when the read was bound to one. */
+  asOf: number | null
 }
 
 /**
@@ -105,8 +134,8 @@ export function project(
     opposing: [],
     uncertain: [],
     excluded: [],
-    supportGroups: 0,
-    oppositionGroups: 0,
+    supportGroups: [],
+    oppositionGroups: [],
     warnings: [...MISSING_STAGE_WARNINGS],
   }
 
@@ -142,6 +171,47 @@ export function project(
     ledger,
     policy,
     validAt,
+    asOf: cx.asOf ?? null,
+  }
+}
+
+/**
+ * The answer for a fully grounded `BELIEF` whose Proposition does not exist
+ * (§46.4).
+ *
+ * Nobody has asserted a tuple nobody has created, so the honest answer is
+ * `insufficient` with a null id — not an empty result set. Returning no row
+ * would make the Agent infer "unknown" from "the pattern did not match", which
+ * is the inference §24 exists to prevent, and it is indistinguishable from a
+ * query that was simply written wrong.
+ *
+ * A read must not create the Proposition to have something to point at.
+ */
+export function ungroundedBelief(
+  cx: Context,
+  policy: Policy,
+  validAt: string,
+): Belief {
+  return {
+    proposition: null,
+    status: 'insufficient',
+    support: 0,
+    opposition: 0,
+    ledger: {
+      supporting: [],
+      opposing: [],
+      uncertain: [],
+      excluded: [],
+      supportGroups: [],
+      oppositionGroups: [],
+      warnings: [
+        'no Proposition exists for this tuple in this Space, so nothing has ' +
+          'been asserted about it; that is an open-world absence, not a denial',
+      ],
+    },
+    policy,
+    validAt,
+    asOf: cx.asOf ?? null,
   }
 }
 
@@ -184,6 +254,9 @@ function admit(
     // it is its own group rather than joining a nameless one with every other
     // unattributed claim.
     actor: row.asserted_by_key === '' ? `anonymous:${id}` : row.asserted_by_key,
+    // The equality key is internal — it carries separators no reader should
+    // have to parse — so the reference travels alongside it for the ledger.
+    actorRef: (row.asserted_by ?? null) as Json,
     evidence: row.evidence_refs.map((ref) => ref.id),
     stance: row.stance,
     confidence: row.confidence < 0 ? policy.unstated_confidence : row.confidence,
@@ -201,32 +274,53 @@ function admit(
 function aggregate(
   candidates: readonly Candidate[],
   opposing: boolean,
-): [number, number] {
+): [number, Group[]] {
   const side = candidates.filter((candidate) =>
     opposing
       ? candidate.opposesTarget || candidate.stance === 'reject'
       : !candidate.opposesTarget && candidate.stance === 'support',
   )
-  if (side.length === 0) return [0, 0]
+  if (side.length === 0) return [0, []]
 
-  const groups: { keys: Set<string>; confidence: number }[] = []
+  interface Bucket {
+    keys: Set<string>
+    actors: Json[]
+    evidence: Set<string>
+    assertions: Set<string>
+    confidence: number
+  }
+  const absorb = (into: Bucket, other: Bucket): void => {
+    for (const key of other.keys) into.keys.add(key)
+    for (const id of other.evidence) into.evidence.add(id)
+    for (const id of other.assertions) into.assertions.add(id)
+    for (const actor of other.actors) {
+      if (!into.actors.some((held) => jsonEquals(held, actor))) into.actors.push(actor)
+    }
+    into.confidence = Math.max(into.confidence, other.confidence)
+  }
+  const groups: Bucket[] = []
   for (const candidate of side) {
     const keys = new Set<string>([`actor:${candidate.actor}`])
     for (const id of candidate.evidence) keys.add(`evidence:${id}`)
+    const arriving: Bucket = {
+      keys,
+      actors: [candidate.actorRef],
+      evidence: new Set(candidate.evidence),
+      assertions: new Set([candidate.id]),
+      confidence: candidate.confidence,
+    }
 
     const overlapping = groups.filter((group) =>
       [...keys].some((key) => group.keys.has(key)),
     )
     if (overlapping.length === 0) {
-      groups.push({ keys, confidence: candidate.confidence })
+      groups.push(arriving)
       continue
     }
-    const merged = overlapping[0] as { keys: Set<string>; confidence: number }
-    for (const key of keys) merged.keys.add(key)
-    merged.confidence = Math.max(merged.confidence, candidate.confidence)
+    const merged = overlapping[0] as Bucket
+    absorb(merged, arriving)
     for (const other of overlapping.slice(1)) {
-      for (const key of other.keys) merged.keys.add(key)
-      merged.confidence = Math.max(merged.confidence, other.confidence)
+      absorb(merged, other)
       groups.splice(groups.indexOf(other), 1)
     }
   }
@@ -241,7 +335,15 @@ function aggregate(
       (acc, group) => acc * (1 - Math.min(Math.max(group.confidence, 0), 1)),
       1,
     )
-  return [score, groups.length]
+  return [
+    score,
+    groups.map((group) => ({
+      actors: group.actors,
+      evidence: [...group.evidence].sort(),
+      assertion_ids: [...group.assertions].sort(),
+      contribution: group.confidence,
+    })),
+  ]
 }
 
 /** Belief-state classification (§68–§73). */
@@ -267,38 +369,68 @@ function classify(
   return 'uncertain'
 }
 
-/** The projection output a query binds and projects (§75). */
+/** The projection output a query binds and projects (§27.2). */
 export function beliefToJson(belief: Belief): JsonMap {
   return {
-    proposition_id: formatElementId(belief.proposition),
+    proposition_id:
+      belief.proposition === null ? null : formatElementId(belief.proposition),
     status: belief.status,
-    support: {
-      score: belief.support,
-      // Said out loud, because a number between 0 and 1 looks like a
-      // probability and this one is not calibrated as one.
-      score_semantics: 'normalized_support_not_probability',
-      assertion_ids: belief.ledger.supporting,
-      independent_groups: belief.ledger.supportGroups,
-    },
-    opposition: {
-      score: belief.opposition,
-      score_semantics: 'normalized_support_not_probability',
-      assertion_ids: belief.ledger.opposing,
-      independent_groups: belief.ledger.oppositionGroups,
-    },
+    // The Assertion ids and the corroboration groups *are* the ledger: they
+    // name who said it and which observations stood behind them. A caller that
+    // asked for no explanation is not handed them under another key (§49.2).
+    support: side(belief, belief.support, belief.ledger.supporting, belief.ledger.supportGroups),
+    opposition: side(
+      belief,
+      belief.opposition,
+      belief.ledger.opposing,
+      belief.ledger.oppositionGroups,
+    ),
     uncertainty: {
       level: uncertaintyLevel(belief),
       // Uncertainty is not `1 - confidence`: it has causes, and naming them is
       // what makes it actionable.
       reasons: uncertaintyReasons(belief),
     },
-    temporal: { valid_at: belief.validAt },
+    temporal: { valid_at: belief.validAt, as_of_seq: belief.asOf },
     policy: { id: belief.policy.id, version: belief.policy.version },
-    explanation: {
-      excluded: belief.ledger.excluded as unknown as Json,
-      uncertain_assertions: belief.ledger.uncertain,
-      warnings: belief.ledger.warnings,
-    },
+    // §49.1, §49.2: `none` returns no ledger at all rather than an empty one.
+    // An empty object reads as "we looked and found nothing to explain", and
+    // what happened is that the caller declined to be told.
+    ...(belief.policy.explanation === 'none'
+      ? {}
+      : belief.policy.explanation === 'summary'
+        ? {
+            explanation: {
+              excluded_count: belief.ledger.excluded.length,
+              uncertain_count: belief.ledger.uncertain.length,
+              warnings: belief.ledger.warnings,
+            },
+          }
+        : {
+            explanation: {
+              excluded: belief.ledger.excluded as unknown as Json,
+              uncertain_assertions: belief.ledger.uncertain,
+              warnings: belief.ledger.warnings,
+            },
+          }),
+  }
+}
+
+/** One side of the projection, with the roots its score came from (§27.2). */
+function side(
+  belief: Belief,
+  score: number,
+  assertionIds: string[],
+  groups: Group[],
+): JsonMap {
+  const disclosed = belief.policy.explanation === 'ledger'
+  return {
+    score,
+    // Said out loud, because a number between 0 and 1 looks like a probability
+    // and this one is not calibrated as one.
+    score_semantics: 'normalized_support_not_probability',
+    assertion_ids: disclosed ? assertionIds : [],
+    root_groups: (disclosed ? groups : []) as unknown as Json,
   }
 }
 
@@ -316,7 +448,8 @@ function uncertaintyLevel(belief: Belief): string {
 
 function uncertaintyReasons(belief: Belief): string[] {
   const reasons: string[] = []
-  const { supportGroups, oppositionGroups } = belief.ledger
+  const supportGroups = belief.ledger.supportGroups.length
+  const oppositionGroups = belief.ledger.oppositionGroups.length
   if (supportGroups === 0 && oppositionGroups === 0) {
     reasons.push('no eligible assertions')
   }
@@ -346,12 +479,19 @@ function uncertaintyReasons(belief: Belief): string[] {
  * `subject`, `predicate_ref`, `leading` and `contested` are additive: they
  * name what the slot was about and which side is ahead *without* claiming it
  * settled anything.
+ *
+ * The slot reports its own `policy` and `temporal`, from the coordinates it
+ * *ran* under rather than from whichever candidate happened to come first.
+ * Reading them off a candidate leaves them null exactly when the slot is
+ * empty — which is the case §47.4 is about, and the one where a caller most
+ * needs to know the answer was computed rather than skipped.
  */
 export function slotToJson(
   subject: Json,
   predicateRef: string,
-  beliefs: readonly Belief[],
+  slot: Slot,
 ): JsonMap {
+  const beliefs = slot.candidates
   const accepted = beliefs.filter((belief) => belief.status === 'accepted')
   const engaged = beliefs.filter((belief) => belief.status !== 'insufficient')
   const leading = [...engaged].sort((a, b) => b.support - a.support)[0]
@@ -370,20 +510,18 @@ export function slotToJson(
         ? 'uncertain'
         : 'insufficient'
 
-  // The slot ran under one policy at one coordinate, so it reports them
-  // itself: a caller that had to read them out of a candidate would have
-  // nothing to read when the slot is empty — which is the case §47.4 is about.
-  const first = beliefs[0]
-
   return {
     status,
     subject,
     predicate_ref: predicateRef,
-    accepted_values: accepted.map((belief) =>
-      formatElementId(belief.proposition),
+    accepted_values: accepted.flatMap((belief) =>
+      belief.proposition === null ? [] : [formatElementId(belief.proposition)],
     ),
     candidate_projections: beliefs.map(beliefToJson) as unknown as Json,
-    leading: leading === undefined ? null : formatElementId(leading.proposition),
+    leading:
+      leading === undefined || leading.proposition === null
+        ? null
+        : formatElementId(leading.proposition),
     contested,
     uncertainty: {
       level:
@@ -394,12 +532,31 @@ export function slotToJson(
             : 'low',
       reasons: leading === undefined ? [] : uncertaintyReasons(leading),
     },
-    temporal: { valid_at: first === undefined ? null : first.validAt },
-    policy:
-      first === undefined
-        ? null
-        : { id: first.policy.id, version: first.policy.version },
+    temporal: { valid_at: slot.validAt, as_of_seq: slot.asOf },
+    policy: { id: slot.policy.id, version: slot.policy.version },
+    // §47.3 lists an explanation on the slot too. A slot's own explanation is
+    // about the *set*: how many candidates competed for it, and what this
+    // engine could not weigh between them.
+    explanation: {
+      candidate_count: beliefs.length,
+      accepted_count: accepted.length,
+      warnings: slot.warnings,
+    },
   }
+}
+
+/**
+ * One subject-predicate slot, projected (§47.2).
+ *
+ * Carries the coordinates the projection ran under, so the slot can report
+ * them whether or not any candidate exists.
+ */
+export interface Slot {
+  candidates: Belief[]
+  policy: Policy
+  validAt: string
+  asOf: number | null
+  warnings: string[]
 }
 
 // --- reads ------------------------------------------------------------------

@@ -43,7 +43,10 @@
 //! that looks whole and is not: an Assertion with its Evidence silently
 //! removed reads as an unsupported claim rather than as a broken import.
 
-use anda_kip::{Capsule, ElementKind, Json, KipError, KipErrorCode, Map};
+use anda_kip::{
+    ASSERTION_LIFECYCLE, ASSERTION_MODES, Capsule, EVIDENCE_ROLES, ElementKind, Json, KipError,
+    KipErrorCode, Map, STANCES,
+};
 use std::collections::BTreeMap;
 
 use super::ImportReport;
@@ -268,7 +271,9 @@ async fn resolve_existing(
     if record.kind == ElementKind::Concept
         && let Some(canonical) = record.view.get("canonical_id").and_then(Json::as_str)
         && !canonical.is_empty()
-        && let Some(id) = find_concept_by_canonical_id(store, space_id, canonical).await?
+        && let Some(id) = store
+            .find_concept_by_canonical_id(space_id, canonical)
+            .await?
     {
         return Ok(Some(id));
     }
@@ -297,27 +302,6 @@ async fn find_by_client_key(
         .await
         .map_err(crate::error::db_error)?;
     Ok(ids.first().map(|seq| ElementId::new(kind, *seq)))
-}
-
-async fn find_concept_by_canonical_id(
-    store: &Store,
-    space_id: &str,
-    canonical: &str,
-) -> Result<Option<ElementId>, KipError> {
-    let ids = store
-        .concepts()
-        .query_all_ids(anda_db::query::Filter::And(vec![
-            Box::new(eq_field("space", anda_db_schema::Fv::Text(space_id.into()))),
-            Box::new(eq_field(
-                "canonical_id",
-                anda_db_schema::Fv::Text(canonical.to_string()),
-            )),
-        ]))
-        .await
-        .map_err(crate::error::db_error)?;
-    Ok(ids
-        .first()
-        .map(|seq| ElementId::new(ElementKind::Concept, *seq)))
 }
 
 /// Step 3: the Proposition this tuple already is, once its endpoints are
@@ -397,7 +381,6 @@ fn build(
                 object: object.to_json(),
                 object_key: object.key(),
                 tuple_key: tuple_key(space_id, &subject, &predicate_ref, &object),
-                attributes: map_of(view, "attributes"),
                 facets,
                 structural,
                 expires_at,
@@ -409,27 +392,40 @@ fn build(
             let proposition = reference_id(view.get("proposition"), mapping, "proposition")?;
             let asserted_by = endpoint(view.get("asserted_by"), mapping, "asserted_by")?;
             let evidence_refs = rewrite_refs(view.get("evidence"), mapping, "evidence")?;
+            for citation in &evidence_refs {
+                // §20.13 fixes the citation roles. `challenge` and `support`
+                // are the difference between dissent and corroboration, so a
+                // role this Space cannot read is refused rather than carried.
+                if let Some(role) = citation.get("role") {
+                    let role = role.as_str().ok_or_else(|| {
+                        KipError::type_mismatch(format!(
+                            "an imported Evidence citation `role` must be a string, got {role}"
+                        ))
+                    })?;
+                    crate::kml::clauses::check_registry(role, "role", EVIDENCE_ROLES)?;
+                }
+            }
             let evidence_ids = evidence_refs.iter().filter_map(reference_target).collect();
             Element::Assertion(Box::new(AssertionRow {
                 _id: id.seq,
                 proposition_id: proposition.to_string(),
                 asserted_by: asserted_by.to_json(),
                 asserted_by_key: asserted_by.key(),
-                stance: text(view, "stance"),
-                mode: text(view, "mode"),
-                // A missing confidence stays missing: the sentinel is what
-                // keeps "the actor stated none" from reading as a number.
-                confidence: view
-                    .get("confidence")
-                    .and_then(Json::as_f64)
-                    .unwrap_or(-1.0),
+                // The Core registries hold for an imported Assertion exactly as
+                // they hold for a written one (§20.13). An import is a write,
+                // not a back door: a Capsule that carries `stance: "maybe"`
+                // would put a word into the Space that no reader can interpret
+                // and the projection would count as an actor who engaged.
+                stance: core_registry(view, "stance", STANCES)?,
+                mode: core_registry(view, "mode", ASSERTION_MODES)?,
+                confidence: confidence_of(view)?,
                 asserted_at: text(view, "asserted_at"),
                 valid_from: nested_text(view, "valid_time", "from"),
                 valid_until: nested_text(view, "valid_time", "until"),
                 evidence_refs,
                 evidence_ids,
                 context_refs: rewrite_refs(view.get("context_refs"), mapping, "context")?,
-                status: nested_text(view, "lifecycle", "status"),
+                status: lifecycle_status(view)?,
                 supersedes: rewrite_ids(view, "lifecycle", "supersedes", mapping)?,
                 superseded_by: rewrite_ids(view, "lifecycle", "superseded_by", mapping)?,
                 retracted_at: nested_text(view, "lifecycle", "retracted_at"),
@@ -665,6 +661,49 @@ fn text(view: &Json, field: &str) -> String {
         .and_then(Json::as_str)
         .unwrap_or_default()
         .to_string()
+}
+
+/// Reads a Core-registry field off an imported record, refusing an unknown word.
+fn core_registry(view: &Json, field: &str, registry: &[&str]) -> Result<String, KipError> {
+    let value = text(view, field);
+    crate::kml::clauses::check_registry(&value, field, registry)?;
+    Ok(value)
+}
+
+/// Reads an imported Assertion's lifecycle status (§14).
+///
+/// An empty one becomes `active`: a Capsule written by an engine that omits a
+/// default is describing a live claim, not a claim in a state with no name.
+fn lifecycle_status(view: &Json) -> Result<String, KipError> {
+    let status = nested_text(view, "lifecycle", "status");
+    if status.is_empty() {
+        return Ok("active".to_string());
+    }
+    crate::kml::clauses::check_registry(&status, "lifecycle.status", ASSERTION_LIFECYCLE)?;
+    Ok(status)
+}
+
+/// Reads an imported Assertion's confidence, holding it to `[0, 1]` (§13.6).
+///
+/// A missing confidence stays missing: the sentinel is what keeps "the actor
+/// stated none" from reading as a number.
+fn confidence_of(view: &Json) -> Result<f64, KipError> {
+    match view.get("confidence") {
+        None | Some(Json::Null) => Ok(crate::kml::clauses::NO_CONFIDENCE),
+        Some(Json::Number(number)) => {
+            let value = number.as_f64().unwrap_or(f64::NAN);
+            if !(0.0..=1.0).contains(&value) {
+                return Err(KipError::constraint_violation(format!(
+                    "an imported Assertion's `confidence` is epistemic support in [0, 1] \
+                     (§13.6), got {value}"
+                )));
+            }
+            Ok(value)
+        }
+        Some(other) => Err(KipError::type_mismatch(format!(
+            "an imported Assertion's `confidence` must be a number in [0, 1], got {other}"
+        ))),
+    }
 }
 
 fn nested_text(view: &Json, container: &str, field: &str) -> String {

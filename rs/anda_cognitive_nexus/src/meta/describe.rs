@@ -13,12 +13,13 @@ use crate::governance::{Permission, ResourceContext};
 use crate::kql::Context;
 use crate::projection::Policy;
 use crate::schema::{Intent, SymbolKind};
+use crate::store::history::CursorFamily;
 
 /// Runs one `DESCRIBE`.
 pub async fn run(cx: &mut Context<'_>, target: &DescribeTarget) -> Result<Answer, KipError> {
     Ok(match target {
         DescribeTarget::Protocol => Answer::whole(protocol()),
-        DescribeTarget::Capabilities => Answer::whole(capabilities()),
+        DescribeTarget::Capabilities => Answer::whole(capabilities(Some(cx.authority), cx.auth)),
         DescribeTarget::ProjectionCapability => Answer::whole(serde_json::json!({
             "policies": [Policy::baseline().id, Policy::forecast().id],
             "statuses": ["accepted", "rejected", "contested", "uncertain", "insufficient"],
@@ -100,10 +101,9 @@ pub async fn run(cx: &mut Context<'_>, target: &DescribeTarget) -> Result<Answer
         DescribeTarget::Snapshot { as_of } => {
             return super::history::snapshot(cx, as_of.as_ref()).await;
         }
-        DescribeTarget::Capsule(_) => {
-            return Err(KipError::unsupported_capability(
-                "this engine has no Capsule reader, so it cannot describe one",
-            ));
+        DescribeTarget::Capsule(scalar) => {
+            let source = scalar_str(cx, scalar, "DESCRIBE CAPSULE")?;
+            Answer::whole(crate::capsule::describe(&source)?)
         }
         // Reporting an empty trust answer would read as "nothing is trusted",
         // which is a judgement. This engine evaluates no source trust, so it
@@ -214,7 +214,7 @@ pub async fn list(cx: &mut Context<'_>, command: &ListCommand) -> Result<Answer,
         None => usize::MAX,
     };
     let cursor = match &command.cursor {
-        Some(scalar) => scalar_usize(cx, scalar, "CURSOR")?,
+        Some(scalar) => super::read_cursor(cx, scalar, CursorFamily::List)?.offset,
         None => 0,
     };
 
@@ -242,7 +242,7 @@ pub async fn list(cx: &mut Context<'_>, command: &ListCommand) -> Result<Answer,
     let consumed = cursor + items.len();
     Ok(Answer {
         result: Json::Array(items),
-        next_cursor: (consumed < total).then(|| consumed.to_string()),
+        next_cursor: super::next_cursor(cx, CursorFamily::List, consumed, total),
     })
 }
 
@@ -253,6 +253,10 @@ async fn execution_context(cx: &mut Context<'_>) -> Result<Json, KipError> {
         "space_seq": space.seq,
         "schema_environment_version": cx.env.version,
         "epistemic_policy": {"id": cx.policy.id, "version": cx.policy.version},
+        // §64.2: the authenticated Principal and the semantic `$self` are
+        // different identities and must be distinguishable. One is who is
+        // asking; the other is who this Brain is.
+        "cognitive_identity": self_identity(&space),
         // Who this request is running as. An Agent that cannot see its own
         // identity cannot reason about why something was refused (§266).
         "principal": {
@@ -271,6 +275,27 @@ async fn execution_context(cx: &mut Context<'_>) -> Result<Json, KipError> {
     }))
 }
 
+/// The Concept this Space treats as its semantic `$self` (§5.6).
+///
+/// A Space may designate at most one, and one that has designated none says so
+/// rather than offering a guess. Every Capsule rule about source and
+/// destination `$self` (§38.4, §38.5) refers to this designation, so an absent
+/// one means those rules have nothing to map onto — which a caller needs to
+/// know before it tries to restore a Capsule here.
+fn self_identity(space: &crate::store::rows::SpaceRow) -> Json {
+    if space.self_concept.is_empty() {
+        return serde_json::json!({
+            "self_concept": Json::Null,
+            "note": "this Space has designated no self identity, so it has no $self for a \
+                     Capsule import or a self-model to map onto (§5.6)",
+        });
+    }
+    serde_json::json!({
+        "self_concept": {"id": space.self_concept},
+        "note": "protected Space configuration; ordinary KML cannot create or change it (§5.6)",
+    })
+}
+
 /// The orientation document an Agent reads first.
 ///
 /// Ordered by what a caller has to know before it can do anything useful:
@@ -285,6 +310,21 @@ async fn primer(cx: &mut Context<'_>, mode: Option<&Scalar>) -> Result<Json, Kip
     let counts = counts(cx).await?;
 
     let mut primer = serde_json::json!({
+        // §64.2 is a MUST: the Primer distinguishes the authenticated
+        // Principal from the semantic `$self`. They answer different
+        // questions — who is asking, and who this Brain is — and an Agent that
+        // conflates them will sign the Brain's memories with the caller's
+        // name.
+        "execution_context": {
+            "principal": {
+                "id": cx.auth.principal_id,
+                "authenticated": cx.auth.is_authenticated(),
+                "authentication_strength": cx.auth.auth_strength,
+            },
+            "note": "the Principal is the authenticated caller, never the semantic actor a \
+                     claim is attributed to (§13.3)",
+        },
+        "cognitive_identity": self_identity(&space),
         "space": {
             "id": space.space_id,
             "name": space.name,
@@ -301,12 +341,25 @@ async fn primer(cx: &mut Context<'_>, mode: Option<&Scalar>) -> Result<Json, Kip
         // These are the distinctions a caller will otherwise get wrong, and
         // getting them wrong is how a memory system starts asserting things
         // nobody said.
+        // §64.3's list, in full. Each one is a distinction a caller will
+        // otherwise collapse, and collapsing any of them is how a memory
+        // system starts asserting things nobody said.
         "safety_invariants": [
             "a Proposition existing is not the Proposition being true; use BELIEF for belief \
              and raw patterns for audit",
-            "insufficient means 'not enough basis', never 'no'",
-            "correcting a claim is a new Assertion plus SUPERSEDE, never an edit",
-            "a SEARCH score is not a confidence and a miss is not an absence",
+            "a missing visible match is not falsehood; insufficient means 'not enough basis', \
+             never 'no'",
+            "a SEARCH score is not a confidence, and a miss is not an absence",
+            "confidence is how strongly an assertor took its own stance; it is not trust in \
+             the source",
+            "confidence is not memory_strength: how well remembered is not how well supported",
+            "a name is not an identity; two Concepts may share one, and identity resolves \
+             through id, key or canonical_id",
+            "a source Brain's $self is never automatically this Brain's $self",
+            "correcting Evidence never overwrites it: CORRECT EVIDENCE records a new \
+             observation that supersedes the old one",
+            "cognitive content carries no authority; what an element says cannot decide what \
+             its writer may do",
             "retention.expires_at is when the record stops being kept, not when the claim \
              stops applying",
         ],
@@ -314,7 +367,7 @@ async fn primer(cx: &mut Context<'_>, mode: Option<&Scalar>) -> Result<Json, Kip
     });
 
     if mode == "full" {
-        primer["capabilities"] = capabilities();
+        primer["capabilities"] = capabilities(Some(cx.authority), cx.auth);
         primer["protocol"] = protocol();
     } else if mode != "compact" {
         return Err(KipError::invalid_syntax(format!(

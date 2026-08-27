@@ -17,6 +17,12 @@
  */
 
 import { errors } from '../errors.js'
+import {
+  ACTIVITY_TERMINAL,
+  ASSERTION_MODES,
+  EVIDENCE_ROLES,
+  STANCES,
+} from '../kip/semantics.js'
 import type { Permission } from '../governance/index.js'
 import { referencePolicy, stage as stagePurge } from '../governance/purge.js'
 import {
@@ -286,6 +292,10 @@ function createConcept(tx: Transaction, b: Bindings, clause: ConceptCreate): voi
   const extraName = fields.text('name')
   fields.rest('Concept')
 
+  const clientKey =
+    clause.client_key === null ? '' : scalarText(b, clause.client_key, 'CLIENT KEY')
+  if (resolveClientKey(tx, 'Concept', clientKey, clause.handle)) return
+
   const definition = tx.env.definitionPackage(symbol)
   validateAttributes(
     formatSymbolRef(symbol),
@@ -295,7 +305,7 @@ function createConcept(tx: Transaction, b: Bindings, clause: ConceptCreate): voi
 
   const row: ConceptRow = {
     ...blank(id),
-    client_key: clause.client_key === null ? '' : scalarText(b, clause.client_key, 'CLIENT KEY'),
+    client_key: clientKey,
     schema_ref: formatSymbolRef(symbol),
     key,
     name: clause.name === null ? extraName : scalarText(b, clause.name, 'NAME'),
@@ -322,6 +332,7 @@ function createRecord(
   const id = requireHandle(tx, clause.handle)
   const clientKey =
     clause.client_key === null ? '' : scalarText(b, clause.client_key, 'CLIENT KEY')
+  if (resolveClientKey(tx, kind, clientKey, clause.handle)) return
   const fields = new Fields(
     clause.set_fields === null ? {} : assignments(b, clause.set_fields),
   )
@@ -366,7 +377,19 @@ function createRecord(
         // view renders it without a rename, and one place fewer can drift
         // from the other.
         const citation: JsonMap = { id: referenceId(value) }
-        if (typeof opts.role === 'string') citation.role = opts.role
+        // §20.13 fixes the citation roles. `challenge` and `support` are the
+        // difference between dissent and corroboration, so a role no reader
+        // can interpret is refused rather than stored.
+        if (opts.role !== undefined && opts.role !== null) {
+          if (typeof opts.role !== 'string') {
+            throw errors.typeMismatch(
+              'an Evidence citation `role` must be a string, got ' +
+                JSON.stringify(opts.role),
+            )
+          }
+          checkRegistry(opts.role, 'role', EVIDENCE_ROLES)
+          citation.role = opts.role
+        }
         return citation as unknown as { id: string; role?: string }
       })
       const validTime = fields.json('valid_time')
@@ -384,8 +407,8 @@ function createRecord(
           Object.keys(assertedBy).length === 0
             ? ''
             : endpointKey(endpointFromJson(assertedBy)),
-        stance: fields.required('stance', 'CREATE ASSERTION'),
-        mode: fields.required('mode', 'CREATE ASSERTION'),
+        stance: fields.registry('stance', STANCES, 'CREATE ASSERTION'),
+        mode: fields.registry('mode', ASSERTION_MODES, 'CREATE ASSERTION'),
         confidence,
         asserted_at: fields.timestamp('asserted_at'),
         valid_from: validTimePart(validTime, 'from'),
@@ -688,7 +711,6 @@ function ensureProposition(
       object: endpointToJson(object),
       object_key: endpointKey(object),
       tuple_key: key,
-      attributes: {},
     }
     const element: Element = { kind: 'Proposition', row }
     tx.authorizeCreated(element, 'create')
@@ -805,13 +827,71 @@ function correct(tx: Transaction, id: ElementId, by: ElementId): void {
   }
 }
 
-/** `TRANSITION ... TO` — an Activity's lifecycle (§55). */
-const ACTIVITY_TERMINAL = new Set(['completed', 'failed', 'aborted'])
+/**
+ * `TRANSITION ... TO` — an Activity's lifecycle (§55).
+ *
+ * The terminal set is the Core Package's (§20.13), not this engine's.
+ * Inventing one locally is how the two reference engines came to disagree
+ * about whether `TO "cancelled"` froze anything: each had a plausible extra
+ * word and neither had the registry.
+ */
+const TERMINAL = new Set<string>(ACTIVITY_TERMINAL)
+
+/**
+ * The stored stand-in for "this Assertion states no confidence".
+ *
+ * Out of band rather than a nullable column, because range queries run over
+ * it; `[0, 1]` is enforced on the way in so nothing real can collide with it.
+ */
+export const NO_CONFIDENCE = -1
+
+/**
+ * Resolves a `CLIENT KEY` to the element an earlier attempt already created.
+ *
+ * §52.1: a `CREATE` creates a historically distinct element *unless* a
+ * `client_key` proves a retry of the same logical creation. Returns whether
+ * the clause was satisfied by an existing element, in which case the handle now
+ * points at it and nothing is written — a retry writes nothing, which is what
+ * makes it a retry rather than a second creation.
+ *
+ * The resolved element is authoritative: this does not compare the incoming
+ * fields against it and quietly rewrite one to match the other. A key that
+ * names two different logical creations is a client bug, and picking a winner
+ * silently would turn it into a data-loss bug.
+ */
+function resolveClientKey(
+  tx: Transaction,
+  kind: ElementKind,
+  clientKey: string,
+  handle: string,
+): boolean {
+  if (clientKey === '') return false
+  const existing = tx.store.byClientKey(kind, tx.cx.space, clientKey)
+  if (existing === null) return false
+  tx.rebind(handle, {
+    kind: existing.kind,
+    seq: (existing.row as { id: number }).id,
+  })
+  return true
+}
+
+/** Checks one value against a Core registry (§20.13). */
+export function checkRegistry(
+  value: string,
+  name: string,
+  registry: readonly string[],
+): void {
+  if (registry.includes(value)) return
+  throw errors.constraintViolation(
+    `\`${name}\` is fixed by the Core Package (§20.13): it takes ` +
+      `${registry.join(' | ')}, not ${JSON.stringify(value)}`,
+  )
+}
 
 function transition(tx: Transaction, id: ElementId, to: string): void {
   tx.authorizeElement(id, 'update')
   const element = requireKind(tx, id, 'Activity')
-  if (ACTIVITY_TERMINAL.has(element.row.status)) {
+  if (TERMINAL.has(element.row.status)) {
     // Terminal topology freezes with the Activity (§22.3): re-opening a
     // finished process would let its provenance be rewritten after the fact.
     throw errors.activityTerminal(
@@ -821,7 +901,7 @@ function transition(tx: Transaction, id: ElementId, to: string): void {
   }
   if (element.row.status === to) return
   element.row.status = to
-  if (ACTIVITY_TERMINAL.has(to) && element.row.ended_at === '') {
+  if (TERMINAL.has(to) && element.row.ended_at === '') {
     element.row.ended_at = tx.cx.at
   }
   tx.markChanged(id, 'transition')
@@ -1057,6 +1137,22 @@ class Fields {
     return value
   }
 
+  /**
+   * Reads a Core-registry field, refusing a word the registry does not name.
+   *
+   * The protocol layer checks these too (§20.13), but only where the command
+   * spells a literal — a `:parameter` is bound here, at execution time, which
+   * is the first moment its value exists. Leaving the engine's half out is how
+   * `stance: :s` came to store `"maybe"`: the row keeps a word no reader can
+   * interpret, `?a.stance` reads back null, and the projection counts the
+   * Assertion as an actor who engaged.
+   */
+  registry(name: string, registry: readonly string[], what: string): string {
+    const value = this.required(name, what)
+    checkRegistry(value, name, registry)
+    return value
+  }
+
   timestamp(name: string): string {
     const value = this.take(name)
     if (value === undefined || value === null) return ''
@@ -1097,11 +1193,16 @@ class Fields {
   /** Epistemic support in `[0, 1]`, or `-1` when the actor stated none. */
   confidence(): number {
     const value = this.take('confidence')
-    if (value === undefined || value === null) return -1
-    if (typeof value !== 'number' || value < 0 || value > 1) {
+    if (value === undefined || value === null) return NO_CONFIDENCE
+    if (typeof value !== 'number') {
       throw errors.typeMismatch(
-        '`confidence` is epistemic support in [0, 1]; it is not trust and not ' +
+        '`confidence` must be a number in [0, 1]; it is not trust and not ' +
           'memory strength',
+      )
+    }
+    if (value < 0 || value > 1) {
+      throw errors.constraintViolation(
+        `\`confidence\` is epistemic support in [0, 1] (§13.6), got ${value}`,
       )
     }
     return value
@@ -1193,6 +1294,106 @@ class Structural {
   }
 }
 
+/** Reads a structural reference's `index` option as a zero-based position. */
+export function edgeIndex(b: Bindings, edge: StructuralEdge): number | null {
+  if (edge.options === null) return null
+  const value = options(b, edge.options).index
+  if (value === undefined || value === null) return null
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+    throw errors.typeMismatch(
+      `a structural reference \`index\` is a zero-based position, got ` +
+        JSON.stringify(value),
+    )
+  }
+  return value
+}
+
+/** Whether a structural field declares a stable order (§17.4). */
+export function orderedField(tx: Transaction, field: string): boolean {
+  try {
+    const symbol = tx.env.resolveSymbol('StructuralField', field, 'read')
+    const pkg = tx.env.definitionPackage(symbol)
+    const def = pkg === undefined ? undefined : structuralFieldDef(pkg, symbol.name)
+    return def?.ordered === true
+  } catch {
+    return false
+  }
+}
+
+export function positionTaken(field: string, index: number): Error {
+  return errors.constraintViolation(
+    `two references claim position ${index} of \`${field}\` in one mutation ` +
+      `plan; an order cannot hold both, and picking one would be the engine ` +
+      `choosing (§17.4)`,
+  )
+}
+
+/**
+ * Places one reference in a structural field, honoring declared order (§17.4).
+ *
+ * An **ordered** field carries one stable, dense, zero-based total order per
+ * source element. Three rules the Specification states as MUSTs, and which this
+ * engine used to accept and then drop on the floor:
+ *
+ * - a reference written without an index appends, in mutation order;
+ * - an explicit `{index: n}` declares the intended position, and one outside
+ *   the dense range `0..=len` fails validation — positions are dense, and
+ *   appending is exactly `len`;
+ * - two explicit positions that collide inside one mutation plan fail.
+ *
+ * An **unordered** field has no positions at all, so `{index: n}` on one is
+ * refused rather than ignored: silently dropping it would let an author believe
+ * they had ordered something no query can order.
+ *
+ * Returns whether the field's contents changed.
+ */
+export function placeReference(
+  items: Json[],
+  value: Json,
+  index: number | null,
+  ordered: boolean,
+  field: string,
+): boolean {
+  const at = items.findIndex((item) => sameReference(item, value))
+  if (index === null) {
+    if (at >= 0) return false
+    items.push(value)
+    return true
+  }
+  if (!ordered) {
+    throw errors.constraintViolation(
+      `\`${field}\` is not an ordered structural field, so a reference in it ` +
+        `has no position; an \`index\` here would order nothing and no query ` +
+        `could read it back (§17.4)`,
+    )
+  }
+  // A reference already present is moved rather than duplicated: re-stating one
+  // with a position is how an author re-orders.
+  if (at >= 0) items.splice(at, 1)
+  if (index > items.length) {
+    throw errors.constraintViolation(
+      `position ${index} is outside \`${field}\`, which holds ${items.length} ` +
+        `reference(s); positions are dense, and appending is position ` +
+        `${items.length} (§17.4)`,
+    )
+  }
+  items.splice(index, 0, value)
+  return at !== index
+}
+
+/** Whether two structural entries point at the same element. */
+export function sameReference(stored: Json, given: Json): boolean {
+  const idOf = (value: Json): string | null => {
+    if (typeof value === 'string') return value
+    if (isJsonMap(value) && typeof value.id === 'string') return value.id
+    return null
+  }
+  const a = idOf(stored)
+  const b2 = idOf(given)
+  if (a !== null && b2 !== null) return a === b2
+  return jsonEquals(stored, given)
+}
+
 function collectStructural(
   tx: Transaction,
   b: Bindings,
@@ -1201,6 +1402,7 @@ function collectStructural(
 ): Structural {
   const out = new Structural()
   if (edges === null) return out
+  const claimed = new Map<string, Set<number>>()
 
   for (const edge of edges) {
     const name = symbolName(b, edge.field)
@@ -1214,7 +1416,20 @@ function collectStructural(
     const symbol = tx.env.resolveSymbol('StructuralField', name, 'write')
     const text = formatSymbolRef(symbol)
     const current = out.profile[text]
-    out.profile[text] = [...(Array.isArray(current) ? current : []), value]
+    const items = Array.isArray(current) ? [...current] : []
+    // A declared position is honored on a create exactly as it is on an update
+    // (§17.4): a Concept written with its steps out of order and positions
+    // attached would otherwise land in mutation order, and the author would
+    // have no way to tell.
+    const index = edgeIndex(b, edge)
+    if (index !== null) {
+      const seen = claimed.get(text) ?? new Set<number>()
+      if (seen.has(index)) throw positionTaken(text, index)
+      seen.add(index)
+      claimed.set(text, seen)
+    }
+    placeReference(items, value, index, orderedField(tx, text), text)
+    out.profile[text] = items
   }
 
   for (const [text, values] of Object.entries(out.profile)) {
@@ -1345,11 +1560,43 @@ function numberOf(b: Bindings, value: { Literal: unknown } | { Param: string }, 
  */
 function authorizeRetention(tx: Transaction, retention: JsonMap): void {
   if (Object.keys(retention).length === 0) return
+  checkRetention(retention)
   tx.require('manage_retention')
   // §163: a legal hold blocks erasure, so a cognitive writer that could set one
   // could make its own content undeletable. Placing or lifting a hold is its
   // own permission, above ordinary retention management.
   if (Object.hasOwn(retention, 'legal_hold')) tx.require('legal_hold')
+}
+
+/** The members §19.1 gives the retention hook. */
+const RETENTION_MEMBERS = ['retention_class', 'expires_at', 'legal_hold']
+
+/**
+ * Checks a retention block against §19.1's shape.
+ *
+ * A member outside it is refused rather than stored. The wire type carries
+ * exactly these three, so anything else is written, kept, and then read back as
+ * null — the caller's write appears to succeed while the value is unreachable
+ * from every query that could notice it went missing.
+ */
+export function checkRetention(retention: JsonMap): void {
+  for (const name of Object.keys(retention)) {
+    if (!RETENTION_MEMBERS.includes(name)) {
+      throw errors.schemaFieldNotFound(
+        `\`retention\` has no member named \`${name}\`; §19.1 gives it ` +
+          `${RETENTION_MEMBERS.join(', ')}. Storage-lifecycle state that needs ` +
+          `a shape of its own belongs in a Facet`,
+      )
+    }
+  }
+  const kind = retention.retention_class
+  if (kind !== undefined && kind !== null && typeof kind !== 'string') {
+    throw errors.typeMismatch('`retention.retention_class` is a string')
+  }
+  const hold = retention.legal_hold
+  if (hold !== undefined && hold !== null && typeof hold !== 'boolean') {
+    throw errors.typeMismatch('`retention.legal_hold` is a boolean')
+  }
 }
 
 /** `retention.expires_at`, lifted out for the retention sweep (§34). */

@@ -17,6 +17,7 @@ use anda_kip::{AsOf, ChangesCommand, HistoryCommand, Json, KipError, KipErrorCod
 use super::Answer;
 use super::describe::{scalar_str, scalar_usize};
 use crate::kql::Context;
+use crate::store::history::CursorFamily;
 use crate::store::rows::TransactionRow;
 
 /// `SNAPSHOT [AS OF ...]` — the coordinate a later read can bind to.
@@ -83,7 +84,7 @@ pub async fn history(cx: &mut Context<'_>, command: &HistoryCommand) -> Result<A
         None => usize::MAX,
     };
     let offset = match cursor {
-        Some(scalar) => scalar_usize(cx, scalar, "CURSOR")?,
+        Some(scalar) => super::read_cursor(cx, scalar, CursorFamily::History)?.offset,
         None => 0,
     };
 
@@ -117,7 +118,7 @@ pub async fn history(cx: &mut Context<'_>, command: &HistoryCommand) -> Result<A
 
     Ok(Answer {
         result: Json::Array(page),
-        next_cursor: (consumed < total).then(|| consumed.to_string()),
+        next_cursor: super::next_cursor(cx, CursorFamily::History, consumed, total),
     })
 }
 

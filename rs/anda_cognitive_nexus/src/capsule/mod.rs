@@ -27,7 +27,8 @@
 
 use anda_kip::{
     Capsule, CapsuleIntegrity, CapsuleKind, CapsuleManifest, CapsulePayload, CapsuleRecords,
-    CapsuleSource, ElementKind, Json, KipError, KipErrorCode, Map, SchemaDependency,
+    CapsuleSource, ElementKind, ExternalRef, ExternalRefKind, Json, KipError, KipErrorCode, Map,
+    SchemaDependency,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -57,13 +58,31 @@ pub async fn export(
         .and_then(Json::as_u64)
         .map(|d| d as usize)
         .unwrap_or(DEFAULT_DEPTH);
-    let closure = options
-        .get("closure")
-        .and_then(Json::as_str)
-        .unwrap_or("referential");
-    if closure != "referential" && closure != "none" {
+    // §40.3's vocabulary, spelled the way §40.3 spells it. An engine that
+    // invented its own words for the same three shapes would make a Capsule's
+    // own manifest unreadable to the destination that has to decide whether to
+    // trust it.
+    let closure = match options.get("closure").and_then(Json::as_str) {
+        None => Closure::Referential,
+        Some("referential") => Closure::Referential,
+        Some("closed") => Closure::Closed,
+        Some("selective") => Closure::Selective,
+        Some(other) => {
+            return Err(KipError::unsupported_capability(format!(
+                "§40.3 declares a closure as \"closed\", \"referential\" or \"selective\"; \
+                 this Capsule asks for {other:?}"
+            )));
+        }
+    };
+    // A proof profile promises a signature, and this engine holds no signing
+    // keys. Emitting an unsigned Capsule under a profile that names one would
+    // put the claim in the manifest and nothing behind it (§37.8).
+    if let Some(profile) = options.get("proof_profile")
+        && !profile.is_null()
+    {
         return Err(KipError::unsupported_capability(format!(
-            "this engine writes a \"referential\" closure or \"none\"; it has no {closure:?}"
+            "this engine signs nothing, so it cannot produce a Capsule under the proof profile \
+             {profile}; an exported Capsule is unsigned and says so"
         )));
     }
     let include_schema = options
@@ -76,10 +95,9 @@ pub async fn export(
         ));
     }
 
-    let ids = if closure == "none" {
-        roots.iter().copied().collect::<BTreeSet<_>>()
-    } else {
-        expand(cx, &roots, depth).await?
+    let ids = match closure {
+        Closure::Selective => roots.iter().copied().collect::<BTreeSet<_>>(),
+        Closure::Referential | Closure::Closed => expand(cx, &roots, depth).await?,
     };
 
     let mut records = CapsuleRecords::default();
@@ -110,6 +128,47 @@ pub async fn export(
         }
     }
 
+    // §40.1: what the records reference but do not carry is *declared*, not
+    // dropped. A Capsule missing an edge and saying nothing imports as a graph
+    // the destination believes is whole — an Assertion whose Evidence is
+    // silently gone reads as an unsupported claim rather than a partial
+    // import.
+    let mut external_refs = Vec::new();
+    for id in &ids {
+        let Some(element) = cx.load(*id).await? else {
+            continue;
+        };
+        for referenced in element.references() {
+            if ids.contains(&referenced) {
+                continue;
+            }
+            external_refs.push(ExternalRef {
+                reference: referenced.to_string(),
+                kind: ExternalRefKind::SourceElement,
+                identity: Some(serde_json::json!({"id": referenced.to_string()})),
+                reason: Some(format!(
+                    "outside the {} closure of this export",
+                    closure.as_str()
+                )),
+            });
+        }
+    }
+    external_refs.sort_by(|a, b| a.reference.cmp(&b.reference));
+    external_refs.dedup_by(|a, b| a.reference == b.reference);
+    // A `closed` Capsule promises self-containment, so it fails rather than
+    // shipping the promise with a hole in it. §40.3 names the three shapes so
+    // a destination can tell them apart; one that claimed `closed` and carried
+    // ExternalRefs would make the word mean nothing.
+    if closure == Closure::Closed && !external_refs.is_empty() {
+        return Err(KipError::constraint_violation(format!(
+            "a \"closed\" Capsule carries everything it references, and this export would leave \
+             {} reference(s) outside it — the first is {}. Raise `provenance_depth`, widen the \
+             roots, or ask for a \"referential\" closure, which declares what it does not carry",
+            external_refs.len(),
+            external_refs[0].reference
+        )));
+    }
+
     let space = cx.store.get_space(&cx.space).await?;
     let payload = CapsulePayload {
         manifest: CapsuleManifest {
@@ -118,12 +177,8 @@ pub async fn export(
             // `partial` unless the closure ran and nothing was dropped: a
             // Capsule that claimed completeness it does not have would import
             // as a graph the destination believes is whole.
-            completeness: Some(if closure == "referential" {
-                "referential_closure".to_string()
-            } else {
-                "roots_only".to_string()
-            }),
-            closure: Some(serde_json::json!({"mode": closure, "provenance_depth": depth})),
+            completeness: Some(closure.completeness().to_string()),
+            closure: Some(serde_json::json!({"mode": closure.as_str(), "provenance_depth": depth})),
         },
         source: CapsuleSource {
             nexus_id: Some(cx.store.db.name().to_string()),
@@ -142,7 +197,7 @@ pub async fn export(
             vec![]
         },
         records,
-        external_refs: vec![],
+        external_refs,
         blobs: vec![],
         handling: None,
         extensions: Map::new(),
@@ -158,6 +213,37 @@ pub async fn export(
             proofs: vec![],
         },
     ))
+}
+
+/// How much of the graph around the roots a Capsule carries (§40.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Closure {
+    /// Self-contained: everything the records reference travels with them, and
+    /// an export that would leave a dangling edge fails instead.
+    Closed,
+    /// The references are walked to the declared depth; whatever falls outside
+    /// is declared as an `ExternalRef` rather than dropped.
+    Referential,
+    /// The roots and nothing else. Honest about being a selection.
+    Selective,
+}
+
+impl Closure {
+    fn as_str(self) -> &'static str {
+        match self {
+            Closure::Closed => "closed",
+            Closure::Referential => "referential",
+            Closure::Selective => "selective",
+        }
+    }
+
+    fn completeness(self) -> &'static str {
+        match self {
+            Closure::Closed => "closed",
+            Closure::Referential => "referential_closure",
+            Closure::Selective => "roots_only",
+        }
+    }
 }
 
 /// Walks the referential closure out from the roots.
@@ -227,15 +313,25 @@ fn schema_dependencies(cx: &Context<'_>, refs: &BTreeSet<String>) -> Vec<SchemaD
     packages.into_values().collect()
 }
 
-/// The engine-local content digest over a Capsule payload.
+/// The content digest over a Capsule payload (§37.7).
 ///
-/// The specification's canonicalization profile is still a draft, so this is
-/// the same engine-local encoding the Schema Package registry uses. It detects
-/// a modified Capsule; it is not presented as the standard digest.
+/// Canonicalized by [`anda_kip::canonical_json`] — RFC 8785, keys ordered by
+/// UTF-16 code units — rather than by this engine's own encoder. Portable
+/// artifact identity is cryptographic: two implementations that disagree about
+/// which bytes a Capsule *is* produce different digests for the same
+/// cognition, and every `VERIFY CAPSULE` across that boundary then fails for a
+/// reason neither side can see. The Schema Package registry keeps its own
+/// engine-local digest, which is correct — a package artifact never crosses
+/// between engines under this digest, and a Capsule always does.
 pub fn payload_digest(payload: &CapsulePayload) -> Result<String, KipError> {
     let value = serde_json::to_value(payload)
         .map_err(|err| KipError::internal_error(format!("a Capsule failed to encode: {err}")))?;
-    Ok(crate::store::schema::content_digest(&value))
+    let canonical = anda_kip::canonical_json(&value);
+    use sha3::{Digest, Sha3_256};
+    Ok(format!(
+        "{DIGEST_PROFILE}:{}",
+        hex::encode(Sha3_256::digest(canonical.as_bytes()))
+    ))
 }
 
 /// What an import did, or would do.
@@ -261,12 +357,43 @@ impl ImportReport {
     }
 }
 
+/// The digest algorithm this engine computes over a Capsule payload.
+pub const DIGEST_PROFILE: &str = "sha3-256";
+
+/// Refuses a Capsule digested under an algorithm this engine cannot compute.
+///
+/// Reported as an unsupported profile rather than as a digest mismatch, and
+/// the difference matters: `DigestMismatch` says *this artifact was modified*,
+/// which is an accusation. An artifact written by an engine that hashes its
+/// canonical bytes differently is intact and unreadable here, and telling an
+/// operator it was tampered with would send them hunting for an attacker that
+/// does not exist (§86.4).
+fn check_digest_profile(declared: &str) -> Result<(), KipError> {
+    let profile = declared.split_once(':').map(|(algorithm, _)| algorithm);
+    match profile {
+        Some(DIGEST_PROFILE) => Ok(()),
+        Some(other) => Err(KipError::unsupported_capability(format!(
+            "this Capsule is digested under {other:?} and this engine computes {DIGEST_PROFILE:?} \
+             over RFC 8785 canonical JSON; it cannot check the artifact's integrity, which is not \
+             the same as finding it corrupt"
+        ))),
+        None => Err(KipError::new(
+            KipErrorCode::CapsuleValidationFailed,
+            format!(
+                "this Capsule's content digest {declared:?} names no algorithm; a digest whose \
+                 profile is unstated cannot be checked"
+            ),
+        )),
+    }
+}
+
 /// Checks a Capsule's frame and digest without importing it.
 ///
 /// Integrity, not legality: this says the artifact is what it claims to be, and
 /// says nothing about whether its records would be accepted.
 pub fn verify(capsule: &Capsule) -> Result<Json, KipError> {
     capsule.validate_frame()?;
+    check_digest_profile(&capsule.integrity.content_digest)?;
     let recomputed = payload_digest(&capsule.payload)?;
     let matches = recomputed == capsule.integrity.content_digest;
     if !matches {
@@ -274,8 +401,7 @@ pub fn verify(capsule: &Capsule) -> Result<Json, KipError> {
             KipErrorCode::DigestMismatch,
             format!(
                 "this Capsule declares the digest {} and its payload digests to {recomputed}; it \
-                 was modified after it was written, or written by an engine using a different \
-                 canonicalization",
+                 was modified after it was written",
                 capsule.integrity.content_digest
             ),
         ));
@@ -283,7 +409,7 @@ pub fn verify(capsule: &Capsule) -> Result<Json, KipError> {
     Ok(serde_json::json!({
         "valid": true,
         "content_digest": recomputed,
-        "digest_profile": "engine-local canonical JSON (the KIP profile is still a draft)",
+        "digest_profile": "sha3-256 over RFC 8785 canonical JSON (§37.7)",
         // An unsigned Capsule proves nothing about who wrote it. Saying so is
         // the difference between "intact" and "trustworthy".
         "signed": !capsule.integrity.proofs.is_empty(),
@@ -311,6 +437,7 @@ pub async fn import(
     // Integrity first (§41.2: VERIFY → VALIDATE → PREVIEW → import). A
     // modified artifact must not reach identity resolution: everything after
     // this point trusts the record ids to mean what the digest covers.
+    check_digest_profile(&capsule.integrity.content_digest)?;
     let digest = payload_digest(&capsule.payload)?;
     if digest != capsule.integrity.content_digest {
         return Err(KipError::new(
@@ -401,6 +528,46 @@ pub fn parse(source: &str) -> Result<Capsule, KipError> {
     Ok(capsule)
 }
 
+/// Reports what a Capsule artifact contains, without importing it (§63.3).
+///
+/// Inspection rather than verification: this is the manifest, the source
+/// identity, the schema it was written against and how much of each kind it
+/// carries. `VERIFY CAPSULE` is what checks the digest, and the two are kept
+/// apart on purpose — describing an artifact must not read as vouching for it.
+///
+/// It answers from the parsed artifact alone. Nothing here touches the Space,
+/// so an operator can look at a Capsule before deciding whether this Brain
+/// should see it at all.
+pub fn describe(source: &str) -> Result<Json, KipError> {
+    let capsule = parse(source)?;
+    let payload = &capsule.payload;
+    Ok(serde_json::json!({
+        "format": capsule.format,
+        "manifest": payload.manifest,
+        "source": payload.source,
+        "schema": payload.schema,
+        "counts": {
+            "concept": payload.records.concepts.len(),
+            "proposition": payload.records.propositions.len(),
+            "assertion": payload.records.assertions.len(),
+            "evidence": payload.records.evidence.len(),
+            "activity": payload.records.activities.len(),
+        },
+        "external_refs": payload.external_refs.len(),
+        "blobs": payload.blobs.len(),
+        "integrity": {
+            "content_digest": capsule.integrity.content_digest,
+            // Stated separately from the digest, because they answer different
+            // questions: the digest says the bytes are intact, a signature
+            // would say who stood behind them, and neither says the claims are
+            // true (§37.8).
+            "signed": !capsule.integrity.proofs.is_empty(),
+        },
+        "note": "this describes the artifact; VERIFY CAPSULE checks its digest, and neither \
+                 makes its claims true",
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,6 +610,36 @@ mod tests {
         tampered.payload.records.concepts[0]["name"] = Json::from("Mallory");
         let err = verify(&tampered).unwrap_err();
         assert_eq!(err.name(), "DigestMismatch");
+    }
+
+    /// The cross-engine pin for the Capsule content digest.
+    ///
+    /// `ts/kip-do`'s `test/foundation.test.ts` has the same literal over the
+    /// same value. A Capsule is the one artifact that leaves this engine and
+    /// is checked by another, so the canonicalization *and* the algorithm are
+    /// part of the contract — and if either side drifts, one of these two
+    /// tests goes red instead of every cross-engine `VERIFY CAPSULE` failing
+    /// for a reason neither side can see.
+    ///
+    /// The members are deliberately out of order: canonicalization is what has
+    /// to agree, not the writer's key order.
+    #[test]
+    fn a_capsule_payload_digests_the_same_in_both_engines() {
+        let payload = serde_json::json!({
+            "records": {"concepts": [{"id": "C-1", "kind": "concept", "name": "Alice"}]},
+            "manifest": {"kind": "snapshot", "completeness": "referential_closure"},
+            "source": {"space_ref": "kip:space:default", "snapshot_seq": 3},
+        });
+        let canonical = anda_kip::canonical_json(&payload);
+        assert_eq!(
+            canonical,
+            r#"{"manifest":{"completeness":"referential_closure","kind":"snapshot"},"records":{"concepts":[{"id":"C-1","kind":"concept","name":"Alice"}]},"source":{"snapshot_seq":3,"space_ref":"kip:space:default"}}"#
+        );
+        use sha3::{Digest, Sha3_256};
+        assert_eq!(
+            hex::encode(Sha3_256::digest(canonical.as_bytes())),
+            "fa8db2155f56bf075fe25e59dda1ba01c9a87500baa77d7f3d5c79af6558e567"
+        );
     }
 
     #[test]

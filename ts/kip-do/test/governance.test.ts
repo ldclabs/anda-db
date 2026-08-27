@@ -2569,3 +2569,111 @@ describe('the threat model', () => {
     })
   })
 })
+
+describe('the host operations no command can reach', () => {
+  async function withNexus<T>(
+    name: string,
+    body: (nexus: CognitiveNexus) => T,
+  ): Promise<T> {
+    const stub = env.KIP_DB.getByName(`host-${name}`)
+    return await runInDurableObject(stub, (_instance, state) => {
+      const nexus = CognitiveNexus.connect(state.storage)
+      nexus.activatePackages([COGNITIVE_MEMORY])
+      return body(nexus)
+    })
+  }
+
+  it('designates the Space self identity, and refuses a dangling one', async () => {
+    await withNexus('self-identity', (nexus) => {
+      const created = nexus.execute(
+        'CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }',
+      )
+      const alice = parseElementId(created.handles.alice as string)
+
+      // §5.6: a Space that has designated none says so rather than guessing at
+      // whichever Person Concept looks like the Brain.
+      const before = nexus.describe('DESCRIBE PRIMER') as unknown as {
+        cognitive_identity: { self_concept: unknown }
+        execution_context: { principal: { id: string } }
+      }
+      expect(before.cognitive_identity.self_concept).toBeNull()
+      // §64.2 is a MUST: the Principal and the semantic self are two different
+      // identities, and the Primer distinguishes them.
+      expect(typeof before.execution_context.principal.id).toBe('string')
+
+      nexus.systemSession().designateSelf(alice)
+      const after = nexus.describe('DESCRIBE PRIMER') as unknown as {
+        cognitive_identity: { self_concept: { id: string } }
+      }
+      expect(after.cognitive_identity.self_concept.id).toBe(created.handles.alice)
+
+      // Every `$self` rule downstream dereferences it, so a designation
+      // nothing resolves is refused rather than stored as a broken link.
+      expect(() =>
+        nexus.systemSession().designateSelf({ kind: 'Concept', seq: 9999 }),
+      ).toThrow()
+    })
+  })
+
+  it('sweeps what its retention lapsed, and says what it left behind', async () => {
+    await withNexus('retention-sweep', (nexus) => {
+      const created = nexus.execute(`MUTATE {
+        CREATE CONCEPT ?stale {
+          TYPE "Person" NAME "Stale"
+          SET FIELDS { retention: { retention_class: "short", expires_at: "2020-01-01T00:00:00Z" } }
+        }
+        CREATE CONCEPT ?held {
+          TYPE "Person" NAME "Held"
+          SET FIELDS { retention: { expires_at: "2020-01-01T00:00:00Z", legal_hold: true } }
+        }
+        CREATE CONCEPT ?fresh { TYPE "Person" NAME "Fresh" }
+      }`)
+
+      const report = nexus.systemSession().sweepExpired('archive')
+      expect(report.swept).toEqual([created.handles.stale])
+      // §163: a hold blocks removal for everyone, including a sweep the holder
+      // authorized — and the report says so rather than returning a smaller
+      // number that reads as the whole truth.
+      expect(report.held).toBe(1)
+
+      // Archived means out of ordinary recall, and still there.
+      expect(
+        nexus.query(
+          'FIND(?c.name) WHERE { ?c CONCEPT {type: "Person"} } ORDER BY ?c.name',
+        ),
+      ).toEqual(['Fresh', 'Held'])
+      expect(
+        nexus.query('FIND(?c.name) WHERE { ?c CONCEPT {id: :x, state: "archived"} }', {
+          x: created.handles.stale as string,
+        }),
+      ).toEqual(['Stale'])
+    })
+  })
+
+  it('marks a lapsed Assertion expired without calling it retracted', async () => {
+    await withNexus('assertion-expiry', (nexus) => {
+      nexus.execute(`MUTATE {
+        CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
+        CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+        ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
+        CREATE ASSERTION ?a {
+          SET FIELDS {
+            proposition: ?p, asserted_by: ?alice, stance: "support", mode: "stated",
+            confidence: 0.9, valid_time: { until: "2020-01-01T00:00:00Z" }
+          }
+        }
+      }`)
+
+      const expired = nexus.systemSession().expireLapsedAssertions()
+      expect(expired).toHaveLength(1)
+      // §14.1: administrative action must not mark an Assertion retracted when
+      // no withdrawal occurred. Nobody withdrew this; its own window ran out.
+      expect(
+        nexus.query('FIND(?a.lifecycle.status) WHERE { ?a ASSERTION {} }'),
+      ).toEqual(['expired'])
+      expect(
+        nexus.query('FIND(?a.lifecycle.retracted_at) WHERE { ?a ASSERTION {} }'),
+      ).toEqual([null])
+    })
+  })
+})

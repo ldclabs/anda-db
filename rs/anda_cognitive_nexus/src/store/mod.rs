@@ -184,8 +184,11 @@ async fn init_propositions(c: &mut Collection) -> Result<(), DBError> {
     c.create_btree_index_nx(&["subject_key"]).await?;
     c.create_btree_index_nx(&["object_key"]).await?;
     c.create_btree_index_nx(&["predicate_ref"]).await?;
-    c.create_bm25_index_nx(&["predicate_ref", "attributes"])
-        .await?;
+    // A Proposition's whole content is its tuple (§12.2), so the only text it
+    // has of its own is the predicate it was written under. The endpoints
+    // carry the words, and they are Concepts and Literals a search reaches on
+    // their own terms.
+    c.create_bm25_index_nx(&["predicate_ref"]).await?;
     Ok(())
 }
 
@@ -914,6 +917,147 @@ impl Store {
     /// Without a declared type the key alone must still land on one Concept.
     /// Returning the first of several would be the arbitrary winner §51 forbids
     /// for names, arriving through `key` instead.
+    /// Every active Assertion in a Space whose validity window has closed.
+    ///
+    /// Ordered by id, so a bounded pass is repeatable.
+    pub async fn lapsed_assertions(
+        &self,
+        space: &str,
+        now: &str,
+    ) -> Result<Vec<ElementId>, KipError> {
+        let ids = self
+            .elements(ElementKind::Assertion)
+            .query_all_ids(anda_db::query::Filter::And(vec![
+                Box::new(eq_field("space", Fv::Text(space.to_string()))),
+                Box::new(eq_field("state", Fv::Text("active".to_string()))),
+                Box::new(eq_field("status", Fv::Text("active".to_string()))),
+                // The empty string stores "no window", and sorts below every
+                // timestamp, so the range starts just above it rather than
+                // sweeping every claim that never declared one.
+                Box::new(anda_db::query::Filter::Field((
+                    "valid_until".to_string(),
+                    anda_db::query::RangeQuery::Between(
+                        Fv::Text("0".to_string()),
+                        Fv::Text(now.to_string()),
+                    ),
+                ))),
+            ]))
+            .await
+            .map_err(crate::error::db_error)?;
+        let mut out: Vec<ElementId> = ids
+            .into_iter()
+            .map(|seq| ElementId::new(ElementKind::Assertion, seq))
+            .collect();
+        out.sort();
+        Ok(out)
+    }
+
+    /// Every active element in a Space whose retention has lapsed (§19.1).
+    ///
+    /// Sorted by id so a bounded sweep is repeatable: the same `limit` over
+    /// the same state acts on the same elements, which is what lets a host run
+    /// one in slices without wondering what it skipped.
+    pub async fn expired_elements(
+        &self,
+        space: &str,
+        now: &str,
+    ) -> Result<Vec<ElementId>, KipError> {
+        let mut out = Vec::new();
+        for kind in [
+            ElementKind::Concept,
+            ElementKind::Proposition,
+            ElementKind::Assertion,
+            ElementKind::Evidence,
+            ElementKind::Activity,
+        ] {
+            let ids = self
+                .elements(kind)
+                .query_all_ids(anda_db::query::Filter::And(vec![
+                    Box::new(eq_field("space", Fv::Text(space.to_string()))),
+                    Box::new(eq_field("state", Fv::Text("active".to_string()))),
+                    // The empty string stores "no expiry", and it sorts below
+                    // every timestamp — so the range starts just above it
+                    // rather than sweeping every element that never had one.
+                    Box::new(anda_db::query::Filter::Field((
+                        "expires_at".to_string(),
+                        anda_db::query::RangeQuery::Between(
+                            Fv::Text("0".to_string()),
+                            Fv::Text(now.to_string()),
+                        ),
+                    ))),
+                ]))
+                .await
+                .map_err(crate::error::db_error)?;
+            out.extend(ids.into_iter().map(|seq| ElementId::new(kind, seq)));
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// Resolves a Concept by validated `canonical_id` (§8.2).
+    ///
+    /// Same-Space only: a canonical id is a cross-system identity claim, and
+    /// resolving one outside the Space would be a foreign reference (§8.3),
+    /// which never grants read authority or triggers traversal on its own.
+    pub async fn find_concept_by_canonical_id(
+        &self,
+        space: &str,
+        canonical_id: &str,
+    ) -> Result<Option<ElementId>, KipError> {
+        if canonical_id.is_empty() {
+            return Ok(None);
+        }
+        let ids = self
+            .concepts()
+            .query_all_ids(eq_fields(&[
+                ("space", Fv::Text(space.to_string())),
+                ("canonical_id", Fv::Text(canonical_id.to_string())),
+            ]))
+            .await
+            .map_err(crate::error::db_error)?;
+        Ok(ids
+            .iter()
+            .min()
+            .map(|seq| ElementId::new(ElementKind::Concept, *seq)))
+    }
+
+    /// Resolves the element a `CLIENT KEY` names, when this Space has one.
+    ///
+    /// §52.1 makes a `CREATE` create "a historically distinct element unless a
+    /// `client_key` proves a retry of the same logical creation". Without this
+    /// lookup the key is written and never read, so a client that lost its
+    /// response and re-sent the same command gets a second element — the exact
+    /// duplicate the key exists to prevent, and the one a caller is least able
+    /// to detect afterwards.
+    ///
+    /// A Proposition has no client key: its identity is its tuple (§12.3),
+    /// which is what `ENSURE` resolves through instead.
+    pub async fn find_by_client_key(
+        &self,
+        space: &str,
+        kind: ElementKind,
+        key: &str,
+    ) -> Result<Option<ElementId>, KipError> {
+        // The empty string stores "no client key", so it must never match —
+        // otherwise every keyless element in the Space would answer for one
+        // another.
+        if key.is_empty() || kind == ElementKind::Proposition {
+            return Ok(None);
+        }
+        let ids = self
+            .elements(kind)
+            .query_all_ids(eq_fields(&[
+                ("space", Fv::Text(space.to_string())),
+                ("client_key", Fv::Text(key.to_string())),
+            ]))
+            .await
+            .map_err(crate::error::db_error)?;
+        // Lowest id wins, deterministically: a database written before this
+        // lookup existed may hold more than one, and a retry that resolved to
+        // a different one each time would be worse than not resolving at all.
+        Ok(ids.iter().min().map(|seq| ElementId::new(kind, *seq)))
+    }
+
     pub async fn find_concept_by_key(
         &self,
         space: &str,

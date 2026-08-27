@@ -19,7 +19,7 @@
 //! construction instead: elements are minted `pending` and swept on open.
 
 use anda_kip::{
-    Command, CommandType, Executor, KipError, Operation, Request, Response, SpaceSelector,
+    Command, CommandType, Executor, Json, KipError, Operation, Request, Response, SpaceSelector,
 };
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -522,6 +522,214 @@ impl Session {
         .await
     }
 
+    /// Acts on the elements whose retention has lapsed (§19.1, §19.2).
+    ///
+    /// `retention.expires_at` says when the *record* stops being kept. It is not
+    /// `valid_time.until`, which says when the claim stops applying, and it is not
+    /// archival, which says the element is out of ordinary recall while still
+    /// being kept. Until this existed the field was written, indexed, and never
+    /// read — a caller could set a 90-day expiry and the engine would keep the
+    /// record forever without ever saying it would not honor it.
+    ///
+    /// This is an explicit sweep rather than a background timer, and the
+    /// capability answer says so. A Nexus is a library inside somebody's process:
+    /// a thread that deleted memory on its own schedule would act while no request
+    /// was in flight and no Principal was accountable for it. The host decides
+    /// when forgetting happens; the engine decides what may be forgotten.
+    ///
+    /// Four gates, in this order:
+    ///
+    /// 1. `manage_retention` at Space scope — reaching the whole Space's lifecycle
+    ///    is not something an element-scoped Grant should confer;
+    /// 2. the action's own permission per element (`archive`, `tombstone`,
+    ///    `purge`), because expiry is not an exemption from what those cost;
+    /// 3. `legal_hold`, which stops erasure for everyone (§163);
+    /// 4. per-element authorization, so a sweep cannot reach what the caller
+    ///    cannot see.
+    ///
+    /// A held or unauthorized element is **skipped and counted**, not silently
+    /// dropped: the answer says how many were left and why, because "swept 4"
+    /// when 9 expired is the shape of a compliance failure nobody notices.
+    pub async fn sweep_expired(
+        &self,
+        space_id: &str,
+        action: RetentionAction,
+        limit: usize,
+    ) -> Result<RetentionSweep, KipError> {
+        let _guard = self.nexus.lock.write().await;
+        self.nexus.store.reopen_if_poisoned().await?;
+        let authority = self.authority(space_id, &self.auth).await?;
+        let resource = ResourceContext::default();
+        Approved::require(
+            crate::governance::approval::resolve(
+                &self.nexus.store,
+                space_id,
+                &resource,
+                authority.authorize(Permission::ManageRetention, &resource, &self.auth),
+                &self.auth,
+            )
+            .await?,
+        )?
+        .spend(&self.nexus.store)
+        .await?;
+
+        let now = crate::time::now();
+        let mut report = RetentionSweep::default();
+        let expired = self.nexus.store.expired_elements(space_id, &now).await?;
+        for id in expired {
+            if report.swept.len() >= limit {
+                report.remaining += 1;
+                continue;
+            }
+            let element = match self.nexus.store.get_element(id).await {
+                Ok(element) => element,
+                Err(_) => continue,
+            };
+            // §163: a hold blocks removal for everyone, including a sweep the
+            // holder authorized. Reported as held rather than as failed, because
+            // nothing went wrong — the record is being kept on purpose.
+            if element
+                .retention()
+                .get("legal_hold")
+                .and_then(anda_kip::Json::as_bool)
+                .unwrap_or(false)
+            {
+                report.held += 1;
+                continue;
+            }
+            let outcome = match action {
+                RetentionAction::Archive => {
+                    crate::governance::element::archive_expired(
+                        &self.nexus.store,
+                        space_id,
+                        id,
+                        &authority,
+                        &self.auth,
+                    )
+                    .await
+                }
+                RetentionAction::Tombstone => {
+                    crate::governance::element::tombstone_expired(
+                        &self.nexus.store,
+                        space_id,
+                        id,
+                        &authority,
+                        &self.auth,
+                    )
+                    .await
+                }
+            };
+            match outcome {
+                Ok(()) => report.swept.push(id.to_string()),
+                Err(_) => report.refused += 1,
+            }
+        }
+        Ok(report)
+    }
+
+    /// Marks the Assertions whose validity windows have closed as `expired`.
+    ///
+    /// §14.3's lifecycle state, reached explicitly. The alternative — deriving
+    /// it on every read and never recording it — leaves `expired` as a state
+    /// the model names and nothing ever produces, and leaves a caller unable
+    /// to ask which claims have lapsed without recomputing the answer itself.
+    ///
+    /// Not retraction and not supersession (§14.1, §14.2): nobody withdrew
+    /// these and nothing replaced them; their own stated windows ran out.
+    pub async fn expire_lapsed_assertions(
+        &self,
+        space_id: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, KipError> {
+        let _guard = self.nexus.lock.write().await;
+        self.nexus.store.reopen_if_poisoned().await?;
+        let authority = self.authority(space_id, &self.auth).await?;
+        let now = crate::time::now();
+        let mut expired = Vec::new();
+        for id in self.nexus.store.lapsed_assertions(space_id, &now).await? {
+            if expired.len() >= limit {
+                break;
+            }
+            if crate::governance::element::expire_assertion(
+                &self.nexus.store,
+                space_id,
+                id,
+                &authority,
+                &self.auth,
+            )
+            .await
+            .unwrap_or(false)
+            {
+                expired.push(id.to_string());
+            }
+        }
+        Ok(expired)
+    }
+
+    /// Designates the Concept this Space treats as its semantic `$self` (§5.6).
+    ///
+    /// A Governance operation and not a KML clause, because §5.6 makes the
+    /// designation protected Space configuration: "ordinary KML MUST NOT
+    /// create or change it". Cognitive content that could name the Brain's own
+    /// identity would be content deciding who the Brain is, which is the
+    /// laundering §88.8 is about.
+    ///
+    /// Every Capsule rule about source and destination `$self` (§38.4, §38.5)
+    /// refers to this designation, and a Space that has designated none has no
+    /// `$self` for those rules to map onto.
+    ///
+    /// Pass `None` to clear it.
+    pub async fn designate_self(
+        &self,
+        space_id: &str,
+        concept: Option<crate::id::ElementId>,
+    ) -> Result<(), KipError> {
+        let _guard = self.nexus.lock.write().await;
+        self.nexus.store.reopen_if_poisoned().await?;
+        let authority = self.authority(space_id, &self.auth).await?;
+        let decision = authority.authorize(
+            Permission::ManagePolicy,
+            &ResourceContext::default(),
+            &self.auth,
+        );
+        Approved::require(
+            crate::governance::approval::resolve(
+                &self.nexus.store,
+                space_id,
+                &ResourceContext::default(),
+                decision,
+                &self.auth,
+            )
+            .await?,
+        )?
+        .spend(&self.nexus.store)
+        .await?;
+
+        let mut row = self.nexus.store.get_space(space_id).await?;
+        row.self_concept = match concept {
+            Some(id) => {
+                // Refused rather than stored as a name nothing resolves: every
+                // `$self` rule downstream dereferences it, and a dangling one
+                // would make the Space's own identity a broken link.
+                let element = self.nexus.store.get_element(id).await?;
+                if element.kind() != anda_kip::ElementKind::Concept {
+                    return Err(KipError::structural_reference_invalid(format!(
+                        "{id} is a {:?}; a Space's self identity is a Concept (§5.6)",
+                        element.kind()
+                    )));
+                }
+                if element.space() != space_id {
+                    return Err(KipError::structural_reference_invalid(format!(
+                        "{id} belongs to another Space; a self identity is Space-local (§5.3)"
+                    )));
+                }
+                id.to_string()
+            }
+            None => String::new(),
+        };
+        self.nexus.store.put_space(&row).await
+    }
+
     /// Sets one element's classification (§93, §100).
     ///
     /// A Governance operation rather than a KML clause, because an element's
@@ -564,6 +772,9 @@ impl Executor for Session {
             Ok(space) => space,
             Err(err) => return Response::from(err),
         };
+        if let Err(err) = self.check_envelope(&space, request).await {
+            return Response::from(err);
+        }
         // The envelope contributes a purpose and a client label and nothing
         // else. Identity, strength and delegation come from the host (§10).
         let auth = self.auth.merged_with_request(request);
@@ -666,6 +877,35 @@ impl Executor for Session {
     }
 }
 
+/// What a retention sweep does with an element whose retention has lapsed.
+///
+/// Purge is deliberately absent. §19.3 makes physical erasure a high-impact
+/// operation with its own reference policy, its own confirmation and its own
+/// destruction of the version log; running it over a set the caller never
+/// enumerated would be the largest irreversible action this engine can take,
+/// reached by a maintenance call. A host that means to erase expired records
+/// sweeps them to tombstones first and purges those it has looked at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetentionAction {
+    /// Out of ordinary recall, still readable and still referenced.
+    Archive,
+    /// Withdrawn from use, identity and references intact.
+    Tombstone,
+}
+
+/// What one retention sweep did, and what it left alone.
+#[derive(Clone, Debug, Default)]
+pub struct RetentionSweep {
+    /// The elements it acted on.
+    pub swept: Vec<String>,
+    /// How many were kept because a legal hold blocks removal (§163).
+    pub held: usize,
+    /// How many the caller was not authorized to act on.
+    pub refused: usize,
+    /// How many were left for the next sweep by `limit`.
+    pub remaining: usize,
+}
+
 /// The Space-scope decision for each permission a command needs.
 ///
 /// Resolved once and then read twice — by the approval guard and by the gate.
@@ -684,6 +924,84 @@ fn base_authorizations(
 }
 
 impl Session {
+    /// Checks the envelope fields that decide whether a command may run at all.
+    ///
+    /// `anda_kip::Executor` asks an implementation to honor every applicable
+    /// request field "or fail explicitly", and these three are the ones where
+    /// ignoring them changes what the caller gets rather than merely what it is
+    /// told:
+    ///
+    /// - **`preconditions`** (§35.4) is the caller's optimistic-concurrency guard.
+    ///   Executing past a stale `space_seq` commits the write the guard existed to
+    ///   stop, and the caller has no way to notice.
+    /// - **`requires`** (§67) is a fail-fast capability check. Running a command
+    ///   that needed semantic search and answering it with keyword results is a
+    ///   wrong answer wearing a success status.
+    /// - **`options.deadline_ms`** (§80.1) is the caller's execution window.
+    ///   Accepting a deadline this engine cannot enforce would be a promise, and
+    ///   §80.2 is explicit that a client timeout is not an abort — so the honest
+    ///   move is to say so rather than to imply a cancellation that will not
+    ///   happen.
+    async fn check_envelope(&self, space: &str, request: &Request) -> Result<(), KipError> {
+        if let Some(preconditions) = &request.preconditions {
+            let row = self.nexus.store.get_space(space).await?;
+            if let Some(expected) = preconditions.space_seq
+                && row.seq != expected
+            {
+                return Err(KipError::precondition_failed(format!(
+                    "this request expects {space} at sequence {expected}, and it is at {}",
+                    row.seq
+                )));
+            }
+            if let Some(expected) = preconditions.schema_environment_version
+                && row.schema_environment_version != expected
+            {
+                return Err(KipError::precondition_failed(format!(
+                    "this request expects Schema Environment version {expected}, and {space} is on \
+                     version {}",
+                    row.schema_environment_version
+                )));
+            }
+        }
+
+        for (name, wanted) in request.requires.iter().flatten() {
+            // A requirement is satisfied only by a capability this engine can
+            // name. An unknown one is refused rather than assumed present: a
+            // fail-fast check that passes because nobody recognized it is worse
+            // than no check, because the caller believes it ran.
+            let satisfied = crate::meta::capability_state(name);
+            match (satisfied, wanted) {
+                (Some(true), Json::Bool(true)) | (Some(false), Json::Bool(false)) => {}
+                (Some(have), wanted) => {
+                    return Err(KipError::unsupported_capability(format!(
+                        "this request requires the capability {name:?} to be {wanted}, and this \
+                         engine reports {have}; DESCRIBE CAPABILITIES lists what it does and does \
+                         not implement"
+                    )));
+                }
+                (None, _) => {
+                    return Err(KipError::unsupported_capability(format!(
+                        "this request requires the capability {name:?}, which this engine does not \
+                         recognize; it will not report an unknown requirement as satisfied"
+                    )));
+                }
+            }
+        }
+
+        if let Some(options) = &request.options
+            && options.deadline_ms.is_some()
+        {
+            return Err(KipError::unsupported_capability(
+                "this engine does not enforce `options.deadline_ms`: a KML statement runs under one \
+                 exclusive lock and is not cancellable mid-commit, and §80.2 is explicit that a \
+                 client timeout is not an abort. Accepting the deadline would promise a cancellation \
+                 that never happens",
+            ));
+        }
+
+        Ok(())
+    }
+
     async fn authority(
         &self,
         space: &str,

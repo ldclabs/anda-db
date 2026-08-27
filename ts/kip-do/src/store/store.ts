@@ -13,6 +13,7 @@
 
 import { errors } from '../errors.js'
 import {
+  ELEMENT_KINDS,
   formatElementId,
   parseElementId,
   tagOf,
@@ -145,6 +146,55 @@ export class Store {
       throw errors.notFoundOrNotVisible(`no MemorySpace ${spaceId}`)
     }
     return row.seq
+  }
+
+  /**
+   * Every active element in a Space whose retention has lapsed (§19.1).
+   *
+   * Ordered by kind and id so a bounded sweep is repeatable: the same `limit`
+   * over the same state acts on the same elements, which is what lets a host
+   * run one in slices without wondering what it skipped.
+   *
+   * The empty string stores "no expiry" and sorts below every timestamp, so
+   * the comparison excludes it rather than sweeping every element that never
+   * declared one.
+   */
+  expiredElements(spaceId: string, now: string): ElementId[] {
+    const out: ElementId[] = []
+    for (const kind of ELEMENT_KINDS) {
+      const rows = this.sql
+        .exec<{ id: number }>(
+          `SELECT id FROM ${TABLES[kind]}
+             WHERE space = ? AND state = ? AND expires_at <> '' AND expires_at <= ?
+             ORDER BY id`,
+          spaceId,
+          State.ACTIVE,
+          now,
+        )
+        .toArray()
+      for (const row of rows) out.push({ kind, seq: row.id })
+    }
+    return out
+  }
+
+  /**
+   * Every active Assertion in a Space whose validity window has closed (§14.3).
+   *
+   * Ordered by id, so a bounded pass is repeatable.
+   */
+  lapsedAssertions(spaceId: string, now: string): ElementId[] {
+    return this.sql
+      .exec<{ id: number }>(
+        `SELECT id FROM assertions
+           WHERE space = ? AND state = ? AND status = 'active'
+             AND valid_until <> '' AND valid_until <= ?
+           ORDER BY id`,
+        spaceId,
+        State.ACTIVE,
+        now,
+      )
+      .toArray()
+      .map((row) => ({ kind: 'Assertion' as const, seq: row.id }))
   }
 
   /** The Space's current sequence coordinate, without advancing it. */
@@ -322,11 +372,18 @@ export class Store {
     space: string,
     clientKey: string,
   ): Element | null {
-    if (clientKey === '') return null
+    // The empty string stores "no client key", so it must never match —
+    // otherwise every keyless element in the Space would answer for one
+    // another. A Proposition has no client key either: its identity is its
+    // tuple (§12.3), which is what `ENSURE` resolves through instead.
+    if (clientKey === '' || kind === 'Proposition') return null
     const table = TABLES[kind]
     const row = this.sql
       .exec<SqlRow>(
-        `SELECT * FROM ${table} WHERE space = ? AND client_key = ?`,
+        // Lowest id wins, deterministically: a database written before this
+        // lookup existed may hold more than one, and a retry that resolved to
+        // a different one each time would be worse than not resolving at all.
+        `SELECT * FROM ${table} WHERE space = ? AND client_key = ? ORDER BY id LIMIT 1`,
         space,
         clientKey,
       )

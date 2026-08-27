@@ -74,6 +74,13 @@ pub struct Transaction {
     purges: BTreeMap<ElementId, Vec<u64>>,
     approval_decisions: Vec<Approved>,
     governance_audit: Vec<MutationEntry>,
+    /// The explicit positions this mutation plan has already claimed, per
+    /// element and ordered structural field (§17.4).
+    ///
+    /// Plan-wide rather than clause-wide, because §17.4 forbids *conflicting
+    /// explicit positions in one mutation plan* and a plan is free to spread
+    /// them across clauses.
+    structural_positions: BTreeMap<(ElementId, String), BTreeSet<usize>>,
 }
 
 /// One element this transaction will write.
@@ -118,6 +125,7 @@ impl Transaction {
             purges: BTreeMap::new(),
             approval_decisions: Vec::new(),
             governance_audit: Vec::new(),
+            structural_positions: BTreeMap::new(),
         })
     }
 
@@ -154,6 +162,27 @@ impl Transaction {
         let id = self.mint_shell(kind).await?;
         self.handles.insert(handle.to_string(), id);
         Ok(id)
+    }
+
+    /// Claims one explicit position in an ordered structural field.
+    ///
+    /// Returns `false` when this plan already claimed it — two references
+    /// cannot both be third, and picking one would be the engine choosing.
+    pub fn claim_position(&mut self, id: ElementId, field: &str, index: usize) -> bool {
+        self.structural_positions
+            .entry((id, field.to_string()))
+            .or_default()
+            .insert(index)
+    }
+
+    /// Re-points a declared handle at an element that already exists.
+    ///
+    /// The shell minted for the handle stays unstaged and is discarded at
+    /// commit, so a resolved retry writes nothing at all — which is the point:
+    /// §52.1 says a `client_key` proves a *retry*, and a retry that left a
+    /// spare row behind would still be a duplicate, just an invisible one.
+    pub fn rebind(&mut self, handle: &str, id: ElementId) {
+        self.handles.insert(handle.to_string(), id);
     }
 
     /// Mints an element with no handle — an anonymous `ENSURE PROPOSITION`.

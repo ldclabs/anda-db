@@ -2,7 +2,9 @@
   "name": "core-truth-neutrality",
   "description": "The distinction the version exists for: a Proposition existing is not the Proposition being true. A tuple carries no confidence, the same tuple resolves to one Proposition, and a raw read reports claims rather than beliefs.",
   "setup": [
-    "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE EVIDENCE ?e {\n    SET FIELDS { evidence_class: \"user_statement\", payload: \"I prefer dark mode\" }\n  }\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 }\n    SET STRUCTURAL { (\"evidence\", ?e) { role: \"support\" } }\n  }\n}"
+    "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE EVIDENCE ?e {\n    SET FIELDS { evidence_class: \"user_statement\", payload: \"I prefer dark mode\" }\n  }\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 }\n    SET STRUCTURAL { (\"evidence\", ?e) { role: \"support\" } }\n  }\n}",
+    "CREATE EVIDENCE ?e {\n  CLIENT KEY \"message:42:evidence\"\n  SET FIELDS { evidence_class: \"user_statement\", payload: \"I prefer dark mode\" }\n}",
+    "CREATE EVIDENCE ?e {\n  CLIENT KEY \"message:42:evidence\"\n  SET FIELDS { evidence_class: \"user_statement\", payload: \"I prefer dark mode\" }\n}"
   ],
   "cases": [
     {
@@ -100,6 +102,70 @@
               "role": "support"
             }
           ]
+        ]
+      }
+    },
+    {
+      "name": "a Proposition carries no author-writable attribute bag",
+      "command": "UPDATE ?p SET ATTRIBUTES { note: \"about the tuple\" } WHERE { ?p PROPOSITION (?s, \"prefers\", ?o) }",
+      "expect": {
+        "error": "ImmutableField"
+      }
+    },
+    {
+      "name": "a stance the Core Package does not name is refused, bound parameter or not",
+      "command": "MUTATE {\n  ENSURE PROPOSITION ?p (:alice, \"prefers\", :dark)\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: :alice, stance: :stance, mode: \"stated\" }\n  }\n}",
+      "params": {
+        "alice": {
+          "id": "C-1"
+        },
+        "dark": {
+          "id": "C-2"
+        },
+        "stance": "maybe"
+      },
+      "expect": {
+        "error": "ConstraintViolation"
+      }
+    },
+    {
+      "name": "confidence is epistemic support in [0, 1] at both ends",
+      "command": "MUTATE {\n  ENSURE PROPOSITION ?p (:alice, \"prefers\", :dark)\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: :alice, stance: \"support\", mode: \"stated\", confidence: :c }\n  }\n}",
+      "params": {
+        "alice": {
+          "id": "C-1"
+        },
+        "dark": {
+          "id": "C-2"
+        },
+        "c": -0.5
+      },
+      "expect": {
+        "error": "ConstraintViolation"
+      }
+    },
+    {
+      "name": "an Evidence citation role comes from the Core registry",
+      "command": "MUTATE {\n  ENSURE PROPOSITION ?p (:alice, \"prefers\", :dark)\n  CREATE EVIDENCE ?e { SET FIELDS { evidence_class: \"user_statement\", payload: \"x\" } }\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: :alice, stance: \"support\", mode: \"stated\" }\n    SET STRUCTURAL { (\"evidence\", ?e) { role: :role } }\n  }\n}",
+      "params": {
+        "alice": {
+          "id": "C-1"
+        },
+        "dark": {
+          "id": "C-2"
+        },
+        "role": "vouches"
+      },
+      "expect": {
+        "error": "ConstraintViolation"
+      }
+    },
+    {
+      "name": "a CLIENT KEY makes a resend a retry rather than a second creation",
+      "command": "FIND(COUNT(?e)) WHERE { ?e EVIDENCE {evidence_class: \"user_statement\"} }",
+      "expect": {
+        "result": [
+          2
         ]
       }
     }

@@ -229,6 +229,20 @@ record's `source`/`generated_by`, an Activity's `inputs`/`outputs` — are
 unreachable, so *which Assertions cite this Evidence* cannot be asked even
 though `evidence_ids` is indexed.
 
+`?edge STRUCTURAL (…)` binds the edge itself. §43.7 calls it "virtual
+structural query state, not necessarily a durable Cognitive Element", which is
+exactly what it is here: an object carrying `source`, `field`, `target` and —
+for a field the schema declares `ordered` — `index`, the reference's current
+zero-based position (§17.4). An unordered field has no positions, so its
+`index` reads null rather than reporting one it does not have.
+
+**Paging carries its coordinate.** A `CURSOR` is the opaque token this engine
+issued, never an offset a caller can type (§88.4). It pins the coordinate the
+traversal began at, so page two answers over the same canonical snapshot as
+page one (§44.8), and it names the operation family that produced it, so a
+`HISTORY` cursor cannot continue a `FIND` (§102.28). Every KQL answer reports
+that coordinate as `snapshot_seq` in its result context (§50).
+
 ---
 
 ## 7. Executing KML
@@ -238,8 +252,18 @@ though `evidence_ids` is indexed.
 `RETRACT ASSERTION` / `SUPERSEDE ASSERTION` / `CORRECT EVIDENCE` /
 `TRANSITION ACTIVITY` / `SET RETENTION` / `ARCHIVE` / `TOMBSTONE` / `PURGE` /
 `MERGE CONCEPT`, each with an optional `WHERE` selection block and `LIMIT`, plus
-handles, `EXPECT VERSION` / `EXPECT STATE`, idempotency keys, receipts and dry
-runs.
+handles, `EXPECT VERSION` / `EXPECT STATE`, receipts and dry runs.
+
+An idempotency key is **recorded, not replayed**: it is stored on the committed
+transaction and `DESCRIBE TRANSACTION BY IDEMPOTENCY KEY` finds it, which is
+what lets a client that lost a response discover the outcome — but the write
+path does not look it up first, so a resend commits a second time.
+`DESCRIBE CAPABILITIES` says so under `idempotent_replay`.
+
+`CLIENT KEY` is the mechanism that *is* retry-safe (§52.1): a `CREATE` under a
+key some earlier attempt already used resolves to that element and writes
+nothing at all. The same key on a request-level `ingest` entry does the same
+for the Evidence it mints.
 
 Planning runs in three passes (`clauses::plan_pass`): `CREATE CONCEPT`, then
 `UPSERT`/`ENSURE`, then everything else. `ENSURE` needs to see a Concept the
@@ -249,6 +273,17 @@ same transaction created before it can check a predicate's subject type, and the
 **`LIMIT` cuts in ascending element id.** §52.7 permits a runtime to document an
 order, and documenting one is what makes a bounded sweep repeatable.
 
+**The request envelope is honored or refused, never ignored.**
+`preconditions.space_seq` and `preconditions.schema_environment_version` are
+checked before the command runs (§35.4); `requires` is checked against the
+capability names `DESCRIBE CAPABILITIES` reports, and an unrecognized name is
+refused rather than assumed present (§67); `ingest` mints its Evidence inside
+the command's own transaction and binds each entry's `key` as a request
+parameter, so an observation reaches Evidence from the transport rather than
+through model-written command text (§71.1, §88.12); `options.deadline_ms` is
+refused, because §80.2 makes a client timeout not an abort and this engine
+cannot cancel a commit in flight.
+
 `UPDATE` reaches mutable, non-protected state only. Its reachable surface is
 decided by *the element the engine loaded*, not by how the command looked:
 an Assertion answers `EpistemicRevisionRequired`, an Evidence record
@@ -256,7 +291,9 @@ an Assertion answers `EpistemicRevisionRequired`, an Evidence record
 
 `MERGE CONCEPT` is non-destructive: the source keeps all its state plus
 `merged_into` and `state: "merged"`, and future writes canonicalize to the
-survivor.
+survivor — every reference slot, not only a tuple endpoint (§11.3). An
+Assertion written afterwards under the merged-away actor lands on the survivor,
+which is the fragmentation a merge exists to end.
 
 ---
 
@@ -500,7 +537,23 @@ nexus.import_capsule(&capsule, space_id)
 nexus.import_capsule_isolated(&capsule, space) // lands in quarantine
 nexus.governance()                             // the control plane, host-trusted
 nexus.session(auth)                            // an authenticated caller
+
+// on a Session, because each is a Governance decision with a Principal behind it
+session.designate_self(space_id, Some(concept)) // the Space's semantic $self (§5.6)
+session.sweep_expired(space_id, action, limit)  // retention expiry (§19.1)
+session.expire_lapsed_assertions(space_id, n)   // the `expired` lifecycle (§14.3)
 ```
+
+`designate_self` is a host API and not a KML clause because §5.6 makes the
+designation protected Space configuration: cognitive content that could name
+the Brain's own identity would be content deciding who the Brain is.
+
+The two sweeps are explicit rather than background timers. A Nexus is a library
+inside somebody's process; a thread that deleted memory on its own schedule
+would act while no request was in flight and no Principal was accountable for
+it. The host decides *when* forgetting happens; the engine decides *what* may
+be forgotten — a legal hold stops a sweep the holder authorized, and every
+element it touches is authorized individually.
 
 `ensure_schema` exists because every activation mints a new environment version:
 a host that unconditionally re-activated its baseline lock would walk the
@@ -523,7 +576,13 @@ refused rather than answered wrongly:
 | the `restore` import mode    | its point is mapping a source `$self` onto the destination's, which is the one thing an import must never do by resemblance |
 | `DESCRIBE TRUST`             | no trust evaluation; an empty trust report reads as "nothing is trusted"    |
 | trust / evidence quality     | stages 9 and 10 of the projection; every projection says so in its warnings |
-| Space-level retention policy | retention is set and enforced per element, not defaulted by kind or class   |
+| Space-level retention policy | retention is set per element and swept on request, not defaulted by kind or class |
+| grouped aggregation          | `FIND(?c.name, COUNT(?x))` and `ORDER BY COUNT(?x)` need grouping; answering either without it returns one global row where a caller asked for one per group |
+| idempotent replay            | the key is recorded and findable, and the write path does not look it up first; a resend commits again |
+| `STRUCTURAL` over Core fields | the pattern walks Profile fields only, so *which Assertions cite this Evidence* cannot be asked |
+| Capsule digest profiles      | both engines digest as sha3-256 over RFC 8785 canonical JSON and interoperate; an artifact from elsewhere under another profile is refused as unreadable, never reported as tampered with |
+| `options.deadline_ms`        | §80.2 makes a client timeout not an abort, and a commit here is not cancellable; accepting one would promise a cancellation that never happens |
+| artifact handles             | there is nowhere to fetch bytes from, so `payload_artifact` names content this engine cannot read |
 
 ---
 

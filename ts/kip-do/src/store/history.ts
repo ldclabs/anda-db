@@ -89,6 +89,78 @@ export function coordinateFromToken(token: string, spaceId: string): Coordinate 
   return { seq }
 }
 
+/**
+ * One page of a paged answer: which traversal, pinned to which coordinate, and
+ * how far in.
+ *
+ * §44.8 makes a KQL cursor preserve **one canonical cognitive snapshot for that
+ * traversal**, and §88.4 makes every cursor opaque or safely server-mapped. A
+ * bare offset is neither: page two of a query re-runs against whatever the
+ * Space holds by then, so a write between pages duplicates or skips rows —
+ * silently, since both pages look well-formed — and a caller can type any
+ * number it likes into a cursor slot.
+ *
+ * The family tag is §102.28: a cursor issued by `HISTORY` must not continue a
+ * `FIND`, even though both count from zero. Without it the two are the same
+ * integer and the engine cannot tell which traversal it is resuming.
+ */
+export interface PageCursor {
+  family: CursorFamily
+  snapshotSeq: number
+  offset: number
+}
+
+/** The operation families that issue page cursors (§102.28). */
+export type CursorFamily = 'find' | 'search' | 'list' | 'history'
+
+/** The opaque token a client passes back to continue. */
+export function pageToken(spaceId: string, cursor: PageCursor): string {
+  return hexEncode(
+    `kip:cursor:${cursor.family}:${spaceId}:${cursor.snapshotSeq}:${cursor.offset}`,
+  )
+}
+
+/**
+ * Reads a page token back, refusing one this engine did not issue for this
+ * Space and this operation family.
+ */
+export function pageCursorFromToken(
+  token: string,
+  spaceId: string,
+  family: CursorFamily,
+): PageCursor {
+  const invalid = () =>
+    errors.cursorInvalidated(
+      `${JSON.stringify(token)} is not a ${family} cursor this engine issued ` +
+        `for this Space; a cursor is opaque and belongs to the traversal that ` +
+        `produced it`,
+    )
+  let text: string
+  try {
+    text = hexDecode(token)
+  } catch {
+    throw invalid()
+  }
+  if (!text.startsWith('kip:cursor:')) throw invalid()
+  const parts = text.slice('kip:cursor:'.length)
+  const firstColon = parts.indexOf(':')
+  if (firstColon < 0) throw invalid()
+  if (parts.slice(0, firstColon) !== family) throw invalid()
+  const rest = parts.slice(firstColon + 1)
+  const lastColon = rest.lastIndexOf(':')
+  if (lastColon < 0) throw invalid()
+  const offset = Number(rest.slice(lastColon + 1))
+  const head = rest.slice(0, lastColon)
+  const seqColon = head.lastIndexOf(':')
+  if (seqColon < 0) throw invalid()
+  const snapshotSeq = Number(head.slice(seqColon + 1))
+  const space = head.slice(0, seqColon)
+  if (space !== spaceId) throw invalid()
+  if (!Number.isInteger(offset) || offset < 0) throw invalid()
+  if (!Number.isInteger(snapshotSeq) || snapshotSeq < 0) throw invalid()
+  return { family, snapshotSeq, offset }
+}
+
 function hexEncode(text: string): string {
   return [...new TextEncoder().encode(text)]
     .map((byte) => byte.toString(16).padStart(2, '0'))

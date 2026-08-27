@@ -34,7 +34,7 @@ pub mod history;
 pub mod inspect;
 
 use anda_kip::{
-    Json, KipError, MetaCommand, Operation, Request, Response, ResponseContext, ResultContext,
+    Json, KipError, Map, MetaCommand, Operation, Request, Response, ResponseContext, ResultContext,
 };
 
 use crate::governance::{AuthContext, EffectiveAuthority};
@@ -92,6 +92,37 @@ pub async fn execute(
     }
 }
 
+/// Reads a `CURSOR` slot as the opaque token this engine issues.
+///
+/// §88.4: a cursor is opaque or authenticated, never a number a caller can
+/// invent. §102.28 adds that one family's cursor must not continue another's,
+/// which is why the family is checked rather than merely encoded.
+pub(crate) fn read_cursor(
+    cx: &crate::kql::Context<'_>,
+    scalar: &anda_kip::Scalar,
+    family: crate::store::history::CursorFamily,
+) -> Result<crate::store::history::PageCursor, KipError> {
+    let token = describe::scalar_str(cx, scalar, "CURSOR")?;
+    crate::store::history::PageCursor::from_token(&token, &cx.space, family)
+}
+
+/// Issues the cursor for the next page, when one remains.
+pub(crate) fn next_cursor(
+    cx: &crate::kql::Context<'_>,
+    family: crate::store::history::CursorFamily,
+    consumed: usize,
+    total: usize,
+) -> Option<String> {
+    (consumed < total).then(|| {
+        crate::store::history::PageCursor {
+            family,
+            snapshot_seq: cx.pinned_seq,
+            offset: consumed,
+        }
+        .to_token(&cx.space)
+    })
+}
+
 /// One META answer, with its page cursor when it pages.
 pub struct Answer {
     /// The answer body.
@@ -133,16 +164,26 @@ async fn run(cx: &mut crate::kql::Context<'_>, command: &MetaCommand) -> Result<
     }
 }
 
-/// What this engine can and cannot do, as data.
+/// What this engine can and cannot do, as data (§67).
+///
+/// Three layers, because §67 asks for three and they answer different
+/// questions. **`supported`** is what this build implements. **`available`**
+/// is what *this* Principal may actually request — a caller told only the
+/// first will try things it will be refused for, and one told only the second
+/// reads an authorization gap as a missing feature. **`limits`** is the
+/// ceilings that apply to it either way.
 ///
 /// The `unsupported` list is not an apology: an Agent that can read it will
 /// not spend a turn discovering a gap, and — more importantly — will not read
 /// a missing feature as a missing fact.
-pub fn capabilities() -> Json {
-    serde_json::json!({
-        "kip": anda_kip::KIP_VERSION,
-        "languages": ["KQL", "KML", "META"],
-        "supported": {
+///
+/// Built through [`anda_kip::Capabilities`] so that the profile list §89
+/// requires an implementation to declare is spelled the way §89 spells it,
+/// rather than being invented per engine.
+pub fn capabilities(authority: Option<&EffectiveAuthority>, auth: &AuthContext) -> Json {
+    let capabilities = anda_kip::Capabilities {
+        profiles: CONFORMANCE_PROFILES.to_vec(),
+        supported: as_map(serde_json::json!({
             "kml": [
                 "CREATE CONCEPT", "UPSERT CONCEPT", "ENSURE PROPOSITION",
                 "CREATE EVIDENCE", "CREATE ASSERTION", "CREATE ACTIVITY",
@@ -166,11 +207,54 @@ pub fn capabilities() -> Json {
                 "WITH EPISTEMIC", "aggregates", "predicate alternation",
                 "hop quantifiers", "AS OF SEQ | TX | TIME"
             ],
+            "epistemic": {
+                // §49's settings, honored rather than parsed and dropped.
+                "settings": [
+                    "policy", "accept", "material", "modes",
+                    "include_hypothetical", "include_predicted", "explanation"
+                ],
+                "explanation_levels": ["none", "summary", "ledger"],
+                // §25.1 and §92: both conflict shapes, not just the strong one.
+                "conflicts": ["functional", "exclusive values"]
+            },
             "meta": [
                 "DESCRIBE", "LIST", "SEARCH", "VALIDATE", "PREVIEW KML",
                 "PREVIEW IMPORT CAPSULE", "HISTORY", "CHANGES", "SNAPSHOT",
-                "EXPORT CAPSULE", "VERIFY CAPSULE"
+                "EXPORT CAPSULE", "VERIFY CAPSULE", "DESCRIBE CAPSULE"
             ],
+            "paging": {
+                // §44.8 and §88.4: a cursor is opaque, carries the coordinate the
+                // traversal began at, and belongs to the family that issued it.
+                "cursor": "opaque token, snapshot-pinned, per operation family",
+                "families": ["find", "search", "list", "history"]
+            },
+            "structural": {
+                // §17.4: an ordered field keeps one dense zero-based order per
+                // source element, and exposes each reference's position.
+                "ordered_fields": true,
+                "edge_binding": "?edge STRUCTURAL (...) binds virtual edge state \
+                                 carrying source, field, target and index",
+                "single_cardinality": "SET STRUCTURAL replaces rather than appends"
+            },
+            "envelope": {
+                // What the runtime honors from the request envelope, stated
+                // because ignoring one of these changes what the caller gets.
+                "preconditions": ["space_seq", "schema_environment_version"],
+                "requires": "capability names are checked against this list before \
+                             the command runs",
+                "ingest": "Evidence minted from the transport envelope inside the \
+                           command's own transaction (§71.1)",
+                "client_key": "a CREATE under a client_key already used resolves to \
+                               that element instead of creating a second (§52.1)"
+            },
+            "retention": {
+                // §19.2: this is storage lifecycle, never world validity.
+                "hook": ["retention_class", "expires_at", "legal_hold"],
+                "expiry": "enforced by an explicit sweep the host runs, not by a \
+                           background timer: forgetting happens when a Principal \
+                           asks for it and is accountable for it",
+                "actions": ["archive", "tombstone"]
+            },
             "capsule": {
                 // The import itself is a host operation: KML has no import
                 // clause and META is read-only, so a command cannot decide
@@ -196,6 +280,11 @@ pub fn capabilities() -> Json {
                 // Brain does not currently allow ordinary use, which is a
                 // statement about the Brain rather than about the source.
                 "quarantine": "excluded from ordinary recall, readable by a reviewer",
+                // §14.3: expiry is neither retraction nor supersession. Nobody
+                // withdrew these; their own stated windows ran out.
+                "assertion_expiry": "an explicit pass marks Assertions whose \
+                                     valid_time closed, and a projection at a \
+                                     coordinate the window covered still admits them",
                 "purge": {
                     "reference_policies": [
                         "deny_if_referenced", "tombstone_reference", "authorized_cascade"
@@ -267,8 +356,20 @@ pub fn capabilities() -> Json {
                 },
                 "permission_registry": "DESCRIBE ACCESS"
             }
-        },
-        "unsupported": [
+        })),
+        available: available(authority, auth),
+        limits: as_map(serde_json::json!({
+            // A read is bounded by elements examined rather than by a clock:
+            // a timeout makes the same query succeed or fail depending on
+            // machine load, which is not a property a caller can plan around.
+            "kql_elements_examined": crate::kql::MAX_CANDIDATES,
+            "search_results_per_page": 100,
+            "meta_page_default": 100,
+        })),
+        extensions: as_map(serde_json::json!({
+                "kip": anda_kip::KIP_VERSION,
+                "languages": ["KQL", "KML", "META"],
+                "unsupported": [
             {
                 "capability": "atomic_batch",
                 "detail": "execution.mode \"atomic\" over several operations",
@@ -296,7 +397,16 @@ pub fn capabilities() -> Json {
                            bare variable instead of the aggregate"
             },
             {
-                "capability": "structural_core_fields",
+                "capability": "capsule_digest_profiles",
+                    "detail": "verifying a Capsule digested under an algorithm other than sha3-256",
+                    "reason": "this engine digests a Capsule as sha3-256 over RFC 8785 canonical \
+                               JSON. An artifact under another profile — ts/kip-do writes sha256 — \
+                               is refused as an unsupported profile rather than reported as a digest \
+                               mismatch, because the second is an accusation of tampering and the \
+                               first is the truth"
+                },
+                {
+                    "capability": "structural_core_fields",
                 "detail": "STRUCTURAL over an Assertion's evidence, an Activity's inputs/outputs, \
                            an Evidence record's source",
                 "reason": "the pattern walks Profile structural fields only, so it cannot ask \
@@ -364,9 +474,131 @@ pub fn capabilities() -> Json {
                            yet declare that raw Experiences expire in 90 days and audit records \
                            in 7 years"
             }
-        ]
-    })
+        ],
+            })),
+    };
+    serde_json::to_value(capabilities).unwrap_or(Json::Null)
 }
+
+/// The §89 profiles this engine claims.
+///
+/// A claim, not a wish: each of these is exercised by the shared conformance
+/// fixtures both engines run. `KIP-High-Assurance` is absent because this
+/// engine signs nothing (§101), and `KIP-1-Migration` is present because it
+/// does migrate a 1.x database (§103).
+pub const CONFORMANCE_PROFILES: &[anda_kip::ConformanceProfile] = &[
+    anda_kip::ConformanceProfile::Core,
+    anda_kip::ConformanceProfile::Schema,
+    anda_kip::ConformanceProfile::Epistemic,
+    anda_kip::ConformanceProfile::Governance,
+    anda_kip::ConformanceProfile::Transactions,
+    anda_kip::ConformanceProfile::Capsule,
+    anda_kip::ConformanceProfile::Kql,
+    anda_kip::ConformanceProfile::Kml,
+    anda_kip::ConformanceProfile::Meta,
+    anda_kip::ConformanceProfile::Runtime,
+    anda_kip::ConformanceProfile::Historical,
+    anda_kip::ConformanceProfile::Migration1x,
+];
+
+/// What the calling Principal may request, in at least some scope (§67.2).
+///
+/// Not a Grant dump (§67.2) and not a promise: "available" means the command
+/// family will not be refused at the Space gate, never that every element
+/// inside it is readable. Without an authority resolved — the capability
+/// answer is reachable unauthenticated, which is how a caller learns *how* to
+/// authenticate (§266) — the list is omitted rather than guessed.
+fn available(authority: Option<&EffectiveAuthority>, auth: &AuthContext) -> Map<String, Json> {
+    let Some(authority) = authority else {
+        return Map::new();
+    };
+    let resource = crate::governance::ResourceContext::default();
+    let mut granted = Vec::new();
+    for permission in crate::governance::Permission::ALL {
+        if authority
+            .authorize(*permission, &resource, auth)
+            .is_permitted()
+        {
+            granted.push(Json::String(permission.as_str().to_string()));
+        }
+    }
+    as_map(serde_json::json!({
+        "principal_id": auth.principal_id,
+        "permissions": granted,
+        "note": "a permitted command family is not a promise about every element in it; \
+                 per-element authorization still applies",
+    }))
+}
+
+fn as_map(value: Json) -> Map<String, Json> {
+    match value {
+        Json::Object(map) => map,
+        _ => Map::new(),
+    }
+}
+
+/// Whether this engine implements one named capability, for `requires` (§67).
+///
+/// `None` means the name is not one this engine knows. A fail-fast check that
+/// passes because nobody recognized the requirement is worse than no check at
+/// all, because the caller believes it ran.
+pub fn capability_state(name: &str) -> Option<bool> {
+    if UNSUPPORTED_NAMES.contains(&name) {
+        return Some(false);
+    }
+    SUPPORTED_NAMES.contains(&name).then_some(true)
+}
+
+/// The capability names `requires` may ask about and get `true` for.
+///
+/// Spelled out rather than derived from the `supported` map, because the map
+/// is organized for a reader and this list is a contract: a name here is one a
+/// caller may build a fail-fast check on.
+const SUPPORTED_NAMES: &[&str] = &[
+    "kql",
+    "kml",
+    "meta",
+    "governance",
+    "projection",
+    "historical_read",
+    "keyword_search",
+    "capsule_export",
+    "capsule_import",
+    "client_key_retry",
+    "ingest",
+    "preconditions",
+    "dry_run",
+    "snapshot_token",
+    "ordered_structural",
+    "structural_edge_binding",
+    "exclusive_conflict",
+    "space_self_identity",
+    "discover_read_separation",
+    "retention_expiry",
+    "opaque_cursors",
+];
+
+/// The capability names this engine reports as *not* implemented.
+///
+/// Kept beside [`SUPPORTED_NAMES`] so the two cannot drift into claiming and
+/// disclaiming the same thing; the unit test below checks they do not overlap.
+const UNSUPPORTED_NAMES: &[&str] = &[
+    "atomic_batch",
+    "idempotent_replay",
+    "grouped_aggregation",
+    "structural_core_fields",
+    "ungated_permissions",
+    "capsule_digest_profiles",
+    "historical_search",
+    "semantic_search",
+    "trust_model",
+    "trust_governance",
+    "capsule_restore_mode",
+    "capsule_signatures",
+    "retention_policy",
+    "deadlines",
+    "artifact_store",
+];
 
 /// The protocol this engine speaks.
 pub fn protocol() -> Json {
@@ -380,4 +612,55 @@ pub fn protocol() -> Json {
         // well-formed command; shipping it here saves a round trip.
         "syntax": anda_kip::KIP_SYNTAX,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two capability lists are one contract read from two directions.
+    ///
+    /// A name in both would let `requires` answer `true` and `false` for the
+    /// same question depending on which list was consulted first — and a
+    /// fail-fast check that can go either way is worse than none.
+    #[test]
+    fn no_capability_is_both_claimed_and_disclaimed() {
+        for name in SUPPORTED_NAMES {
+            assert!(
+                !UNSUPPORTED_NAMES.contains(name),
+                "{name} is in both capability lists"
+            );
+            assert_eq!(capability_state(name), Some(true));
+        }
+        for name in UNSUPPORTED_NAMES {
+            assert_eq!(capability_state(name), Some(false));
+        }
+        // An unknown name is not "supported by omission" (§67): a `requires`
+        // check that passed because nobody recognized it is the failure mode
+        // this exists to prevent.
+        assert_eq!(capability_state("read_everything"), None);
+    }
+
+    /// §89 makes declaring the profiles a MUST, and the names are §89's.
+    #[test]
+    fn the_declared_profiles_are_the_ones_the_spec_names() {
+        let declared = capabilities(None, &AuthContext::system());
+        let profiles = declared["profiles"].as_array().expect("a profile list");
+        assert!(!profiles.is_empty());
+        for profile in profiles {
+            let name = profile.as_str().expect("a profile name");
+            assert!(
+                anda_kip::ConformanceProfile::ALL
+                    .iter()
+                    .any(|known| known.name() == name),
+                "{name} is not a profile §89 names"
+            );
+        }
+        // Claimed only where it is true: this engine signs nothing (§101).
+        assert!(
+            !profiles
+                .iter()
+                .any(|p| p.as_str() == Some("KIP-High-Assurance"))
+        );
+    }
 }

@@ -141,6 +141,23 @@ impl ResourceContext {
     }
 }
 
+/// What one caller may see of one element (§29.1, §29.2).
+///
+/// Two answers rather than one, because the Specification asks two questions.
+/// A `None` from [`EffectiveAuthority::may_read`] means the element is outside
+/// this caller's query universe entirely; a `Visibility` with `content: false`
+/// means it exists and its contents do not come back.
+#[derive(Clone, Debug)]
+pub struct Visibility {
+    /// The field mask and result cap that apply to the content.
+    pub constraints: AuthorityConstraints,
+    /// Whether the content fields may be returned at all.
+    ///
+    /// `false` is `discover` without `read`: the element is real, it can be
+    /// counted and cited, and what it says stays closed.
+    pub content: bool,
+}
+
 /// One authorization decision (§39).
 #[derive(Clone, Debug)]
 pub struct Authorization {
@@ -624,13 +641,40 @@ impl EffectiveAuthority {
         &self,
         element: &crate::store::Element,
         auth: &AuthContext,
-    ) -> Option<AuthorityConstraints> {
+    ) -> Option<Visibility> {
         let resource = ResourceContext::of_element(element);
+        // §29.1 and §29.2 are two questions, and collapsing them loses the one
+        // §30.4 cares about. `discover` decides whether the element exists as
+        // far as this caller is concerned — not matched, not counted, not
+        // ranked, not paged. `read` decides whether its *content* comes back.
+        //
+        // A Principal with `discover` and not `read` learns that something is
+        // there and nothing about what it says. That is a real and useful
+        // state: it is how a reviewer sees that a Space holds records it may
+        // not open, without the engine having to pretend they do not exist.
         let decision = self.authorize(Permission::Read, &resource, auth);
-        decision.is_permitted().then_some(decision.constraints)
+        if decision.is_permitted() {
+            // `read` subsumes `discover`: content nobody may know exists is
+            // not content anybody can read, so a Grant naming only `read`
+            // confers both rather than nothing.
+            return Some(Visibility {
+                constraints: decision.constraints,
+                content: true,
+            });
+        }
+        // Denied `read`, so the only question left is whether the element is
+        // in this caller's universe at all. `discover` is the weaker of the
+        // two and answers exactly that.
+        self.authorize(Permission::Discover, &resource, auth)
+            .is_permitted()
+            .then(|| Visibility {
+                constraints: AuthorityConstraints::default(),
+                content: false,
+            })
     }
 
     /// Whether this caller's authority reaches every element in the Space.
+    ///
     ///
     /// A Space-wide count is only honest when it is: a caller whose Grant is
     /// narrowed to one classification must not be told how many elements exist

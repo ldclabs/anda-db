@@ -32,18 +32,29 @@
 
 pub mod policy;
 
-use anda_kip::{AssertionMode, BeliefStatus, Json, KipError, Map};
+use anda_kip::{
+    AssertionMode, BeliefStatus, Json, KipError, Map, Projection, ProjectionSide,
+    ProjectionTemporal, ProjectionUncertainty,
+};
 
 use crate::id::ElementId;
 use crate::kql::Context;
 use crate::store::Element;
 use crate::store::rows::AssertionRow;
-pub use policy::Policy;
+use crate::term::Endpoint;
+pub use policy::{Explanation, Policy};
 
 /// One Assertion, as the projection sees it.
 struct Candidate {
     id: ElementId,
+    /// The actor's equality key, for grouping.
+    ///
+    /// An internal key, never a wire value: it is the storage layer's answer to
+    /// "are these the same actor", and it carries separators no reader should
+    /// have to parse. [`Candidate::actor_ref`] is what a root group reports.
     actor: String,
+    /// The actor as a reader can follow it.
+    actor_ref: Json,
     evidence: Vec<String>,
     stance: String,
     confidence: f64,
@@ -60,8 +71,13 @@ struct Excluded {
 
 /// The projected belief about one Proposition.
 pub struct Belief {
-    /// The Proposition projected.
-    pub proposition: ElementId,
+    /// The Proposition projected, when one durably exists.
+    ///
+    /// `None` is a real answer rather than a missing field: a fully grounded
+    /// `BELIEF` over a tuple no Proposition has been created for answers
+    /// `insufficient` with no id (§46.4), and a read must not create the
+    /// Proposition just to have something to point at.
+    pub proposition: Option<ElementId>,
     /// The classification.
     pub status: BeliefStatus,
     /// Normalized support strength.
@@ -74,6 +90,8 @@ pub struct Belief {
     policy: Policy,
     /// The world time it was projected at.
     valid_at: String,
+    /// The cognitive coordinate it read, when the read was bound to one.
+    as_of: Option<u64>,
 }
 
 #[derive(Default)]
@@ -82,39 +100,97 @@ struct Ledger {
     opposing: Vec<String>,
     uncertain: Vec<String>,
     excluded: Vec<(String, &'static str)>,
-    support_groups: usize,
-    opposition_groups: usize,
+    support_groups: Vec<Group>,
+    opposition_groups: Vec<Group>,
     warnings: Vec<String>,
 }
 
-impl Belief {
-    /// The projection output a query binds and projects (§75).
-    pub fn to_json(&self) -> Json {
+/// One corroboration group: the independent root §23.3 counts once.
+///
+/// Reported rather than merely counted, because §27.2 asks a side for its
+/// `root_groups` and §27.4 lists corroboration groups among what an Epistemic
+/// Ledger contains. A count says two sources agreed; the groups say *which*
+/// two, which is what lets a reader check that they were really independent.
+#[derive(Clone, Debug, Default)]
+struct Group {
+    /// The equality keys that merged into this root.
+    ///
+    /// Internal, and never on the wire: they carry the separators the storage
+    /// layer compares on. [`Group::actors`] and [`Group::evidence`] are what a
+    /// reader gets.
+    keys: Vec<String>,
+    /// The semantic actors behind this root, as references.
+    actors: Vec<Json>,
+    /// The Evidence records it rests on.
+    evidence: Vec<String>,
+    /// The Assertions it collapsed.
+    assertion_ids: Vec<String>,
+    /// What it contributed: its strongest member, never the sum.
+    contribution: f64,
+}
+
+impl Group {
+    fn to_json(&self) -> Json {
         serde_json::json!({
-            "proposition_id": self.proposition.to_string(),
-            "status": self.status,
-            "support": {
-                "score": self.support,
-                // §76: an implementation MUST declare what its scores mean,
-                // and MUST NOT present a normalized strength as a calibrated
-                // probability. These combine self-reported commitments.
-                "score_semantics": "normalized_support_not_probability",
-                "assertion_ids": self.ledger.supporting,
-                "independent_groups": self.ledger.support_groups,
-            },
-            "opposition": {
-                "score": self.opposition,
-                "score_semantics": "normalized_support_not_probability",
-                "assertion_ids": self.ledger.opposing,
-                "independent_groups": self.ledger.opposition_groups,
-            },
-            "uncertainty": {
-                "level": self.uncertainty_level(),
-                "reasons": self.uncertainty_reasons(),
-            },
-            "temporal": {"valid_at": self.valid_at},
-            "policy": {"id": self.policy.id, "version": self.policy.version},
-            "explanation": {
+            "actors": self.actors,
+            "evidence": self.evidence,
+            "assertion_ids": self.assertion_ids,
+            "contribution": self.contribution,
+        })
+    }
+}
+
+impl Belief {
+    /// The projection output a query binds and projects (§27.2).
+    ///
+    /// Built through [`anda_kip::Projection`] rather than as hand-written
+    /// JSON: the protocol crate owns this shape, so a member renamed there
+    /// becomes a compile error here instead of a dot path that silently reads
+    /// null. It is the same discipline `view.rs` applies to the Core types,
+    /// and the reason `support.root_groups` was once spelled
+    /// `independent_groups` on this side alone.
+    pub fn to_json(&self) -> Json {
+        let projection = Projection {
+            proposition_id: self.proposition.map(|id| id.to_string()),
+            status: self.status,
+            support: Some(self.side(
+                &self.ledger.supporting,
+                self.support,
+                &self.ledger.support_groups,
+            )),
+            opposition: Some(self.side(
+                &self.ledger.opposing,
+                self.opposition,
+                &self.ledger.opposition_groups,
+            )),
+            uncertainty: Some(ProjectionUncertainty {
+                level: Some(Json::from(self.uncertainty_level())),
+                reasons: self.uncertainty_reasons(),
+            }),
+            temporal: Some(ProjectionTemporal {
+                valid_at: Some(self.valid_at.clone()),
+                as_of_seq: self.as_of,
+            }),
+            policy: Some(self.policy.identity()),
+            explanation: self.explanation(),
+        };
+        serde_json::to_value(projection).unwrap_or(Json::Null)
+    }
+
+    /// The Epistemic Ledger, at the level the query asked for (§49.1, §49.2).
+    ///
+    /// `none` returns no ledger at all rather than an empty one: an empty
+    /// object reads as "we looked and found nothing to explain", and what
+    /// happened is that the caller declined to be told.
+    fn explanation(&self) -> Option<Json> {
+        match self.policy.explanation {
+            Explanation::None => None,
+            Explanation::Summary => Some(serde_json::json!({
+                "excluded_count": self.ledger.excluded.len(),
+                "uncertain_count": self.ledger.uncertain.len(),
+                "warnings": self.ledger.warnings,
+            })),
+            Explanation::Ledger => Some(serde_json::json!({
                 "excluded": self
                     .ledger
                     .excluded
@@ -123,8 +199,35 @@ impl Belief {
                     .collect::<Vec<_>>(),
                 "uncertain_assertions": self.ledger.uncertain,
                 "warnings": self.ledger.warnings,
+            })),
+        }
+    }
+
+    /// One side of the projection, with the roots its score came from.
+    ///
+    /// The Assertion ids and the corroboration groups *are* the ledger: they
+    /// name who said it and which observations stood behind them. A caller
+    /// that asked for no explanation is not handed them under another key
+    /// (§49.2).
+    fn side(&self, assertion_ids: &[String], score: f64, groups: &[Group]) -> ProjectionSide {
+        let disclosed = self.policy.explanation == Explanation::Ledger;
+        ProjectionSide {
+            score: Some(score),
+            // §27.3: an implementation MUST declare what its scores mean, and
+            // MUST NOT present a normalized strength as a calibrated
+            // probability. These combine self-reported commitments.
+            score_semantics: Some("normalized_support_not_probability".to_string()),
+            assertion_ids: if disclosed {
+                assertion_ids.to_vec()
+            } else {
+                Vec::new()
             },
-        })
+            root_groups: if disclosed {
+                groups.iter().map(Group::to_json).collect()
+            } else {
+                Vec::new()
+            },
+        }
     }
 
     fn uncertainty_level(&self) -> &'static str {
@@ -143,16 +246,17 @@ impl Belief {
     /// what lets a caller decide whether to act or to go and look.
     fn uncertainty_reasons(&self) -> Vec<String> {
         let mut reasons = Vec::new();
-        if self.ledger.support_groups == 0 && self.ledger.opposition_groups == 0 {
+        let support_groups = self.ledger.support_groups.len();
+        let opposition_groups = self.ledger.opposition_groups.len();
+        if support_groups == 0 && opposition_groups == 0 {
             reasons.push("no eligible Assertion bears on this Proposition".into());
         }
-        if self.ledger.support_groups > 0 && self.ledger.opposition_groups > 0 {
+        if support_groups > 0 && opposition_groups > 0 {
             reasons.push(format!(
-                "{} independent group(s) support and {} oppose",
-                self.ledger.support_groups, self.ledger.opposition_groups
+                "{support_groups} independent group(s) support and {opposition_groups} oppose"
             ));
         }
-        if self.ledger.support_groups == 1 && self.ledger.opposition_groups == 0 {
+        if support_groups == 1 && opposition_groups == 0 {
             reasons.push("a single source, with no independent corroboration".into());
         }
         if !self.ledger.uncertain.is_empty() {
@@ -202,14 +306,45 @@ impl Context<'_> {
 
         let status = classify(support, opposition, &ledger, policy);
         Ok(Belief {
-            proposition,
+            proposition: Some(proposition),
             status,
             support,
             opposition,
             ledger,
             policy: policy.clone(),
             valid_at: at.to_string(),
+            as_of: self.as_of,
         })
+    }
+
+    /// The answer for a fully grounded `BELIEF` whose Proposition does not
+    /// exist (§46.4).
+    ///
+    /// Nobody has asserted a tuple nobody has created, so the honest answer is
+    /// `insufficient` with a null id — not an empty result set. Returning no
+    /// row would make the Agent infer "unknown" from "the pattern did not
+    /// match", which is the inference §24 exists to prevent, and it is
+    /// indistinguishable from a query that was simply written wrong.
+    ///
+    /// A read must not create the Proposition to have something to point at.
+    pub fn ungrounded_belief(&self, policy: &Policy, at: &str) -> Belief {
+        Belief {
+            proposition: None,
+            status: BeliefStatus::Insufficient,
+            support: 0.0,
+            opposition: 0.0,
+            ledger: Ledger {
+                warnings: vec![
+                    "no Proposition exists for this tuple in this Space, so nothing has been \
+                     asserted about it; that is an open-world absence, not a denial"
+                        .to_string(),
+                ],
+                ..Default::default()
+            },
+            policy: policy.clone(),
+            valid_at: at.to_string(),
+            as_of: self.as_of,
+        }
     }
 
     /// The conflict set of one slot: every Proposition with this subject and
@@ -220,12 +355,22 @@ impl Context<'_> {
         predicate_ref: &str,
         policy: &Policy,
         at: &str,
-    ) -> Result<Vec<Belief>, KipError> {
-        let mut beliefs = Vec::new();
+    ) -> Result<Slot, KipError> {
+        let mut candidates = Vec::new();
         for id in self.slot_propositions(subject_key, predicate_ref).await? {
-            beliefs.push(self.project_belief(id, policy, at).await?);
+            candidates.push(self.project_belief(id, policy, at).await?);
         }
-        Ok(beliefs)
+        Ok(Slot {
+            candidates,
+            policy: policy.clone(),
+            valid_at: at.to_string(),
+            as_of: self.as_of,
+            warnings: vec![
+                "this engine evaluates no source trust and no evidence quality; every eligible \
+                 corroboration group counts equally"
+                    .to_string(),
+            ],
+        })
     }
 
     /// Gathers eligible Assertions, from this Proposition and its rivals.
@@ -294,6 +439,14 @@ impl Context<'_> {
             "active" => {}
             "retracted" => return reject("retracted"),
             "superseded" => return reject("superseded"),
+            // §14.3: expiry says the claim is no longer *current*, which is a
+            // statement about time rather than about withdrawal. An Assertion
+            // read at a moment its own validity window covered is still the
+            // claim that applied then, so the temporal stage below decides it
+            // — otherwise `FOR TIME` in the past would silently lose every
+            // claim that has since lapsed, which is the one question that
+            // asks about them.
+            "expired" if !row.valid_from.is_empty() || !row.valid_until.is_empty() => {}
             "expired" => return reject("expired"),
             _ => return reject("invalid_schema"),
         }
@@ -326,9 +479,14 @@ impl Context<'_> {
             } else {
                 row.asserted_by_key.clone()
             },
+            actor_ref: if row.asserted_by.is_null() {
+                Json::Null
+            } else {
+                row.asserted_by.clone()
+            },
             evidence: row.evidence_ids.clone(),
             stance: row.stance.clone(),
-            confidence: if row.confidence < 0.0 {
+            confidence: if row.confidence == crate::kml::clauses::NO_CONFIDENCE {
                 policy.unstated_confidence
             } else {
                 row.confidence
@@ -378,19 +536,40 @@ impl Context<'_> {
             // it declares no exclusivity either.
             Err(_) => return Ok(vec![]),
         };
-        let functional = self
-            .env
-            .predicate_def(&symbol)
-            .map(|def| def.functional)
-            .unwrap_or(false);
-        if !functional {
+        let Ok(def) = self.env.predicate_def(&symbol) else {
+            return Ok(vec![]);
+        };
+        let functional = def.functional;
+        // §25.1 names two conflict shapes and §92 requires both. Functional is
+        // the strong one: one subject, one true object, so every rival value
+        // disagrees. Exclusive is the weaker one — only the values a schema
+        // declared incompatible disagree, and everything else coexists. A
+        // person may hold many tags without being both alive and dead.
+        let group: Option<Vec<Json>> = def
+            .exclusive_values
+            .iter()
+            .find(|group| group.iter().any(|value| same_object(value, &row.object)))
+            .cloned();
+        if !functional && group.is_none() {
             return Ok(vec![]);
         }
         let mut rivals = self
             .slot_propositions(&row.subject_key, &row.predicate_ref)
             .await?;
         rivals.retain(|id| *id != target);
-        Ok(rivals)
+        if functional {
+            return Ok(rivals);
+        }
+        let group = group.unwrap_or_default();
+        let mut exclusive = Vec::new();
+        for id in rivals {
+            if let Some(Element::Proposition(rival)) = self.load(id).await?
+                && group.iter().any(|value| same_object(value, &rival.object))
+            {
+                exclusive.push(id);
+            }
+        }
+        Ok(exclusive)
     }
 
     /// Every active Proposition in one `(subject, predicate)` slot.
@@ -451,7 +630,7 @@ impl Context<'_> {
 ///
 /// A group contributes its strongest member, not the sum of its members —
 /// saying something twice does not make it truer.
-fn aggregate(candidates: &[Candidate], opposing: bool) -> (f64, usize) {
+fn aggregate(candidates: &[Candidate], opposing: bool) -> (f64, Vec<Group>) {
     let side: Vec<&Candidate> = candidates
         .iter()
         .filter(|candidate| {
@@ -463,33 +642,39 @@ fn aggregate(candidates: &[Candidate], opposing: bool) -> (f64, usize) {
         })
         .collect();
     if side.is_empty() {
-        return (0.0, 0);
+        return (0.0, Vec::new());
     }
 
     // Union-find over actors and Evidence ids.
-    let mut groups: Vec<(Vec<String>, f64)> = Vec::new();
+    let mut groups: Vec<Group> = Vec::new();
     for candidate in side {
         let mut keys = vec![format!("actor:{}", candidate.actor)];
         keys.extend(candidate.evidence.iter().map(|id| format!("evidence:{id}")));
+        let assertion = candidate.id.to_string();
+        let arriving = Group {
+            keys: keys.clone(),
+            actors: vec![candidate.actor_ref.clone()],
+            evidence: candidate.evidence.clone(),
+            assertion_ids: vec![assertion],
+            contribution: candidate.confidence,
+        };
 
         let mut merged: Option<usize> = None;
         let mut index = 0;
         while index < groups.len() {
-            if groups[index].0.iter().any(|key| keys.contains(key)) {
+            if groups[index].keys.iter().any(|key| keys.contains(key)) {
                 match merged {
                     None => {
-                        groups[index].0.extend(keys.clone());
-                        groups[index].1 = groups[index].1.max(candidate.confidence);
+                        absorb(&mut groups[index], arriving.clone());
                         merged = Some(index);
                         index += 1;
                     }
                     Some(target) => {
                         // This candidate bridges two groups that looked
                         // independent, so they were not.
-                        let (keys, confidence) = groups.remove(index);
+                        let absorbed = groups.remove(index);
                         let target = if target > index { target - 1 } else { target };
-                        groups[target].0.extend(keys);
-                        groups[target].1 = groups[target].1.max(confidence);
+                        absorb(&mut groups[target], absorbed);
                         merged = Some(target);
                     }
                 }
@@ -498,24 +683,83 @@ fn aggregate(candidates: &[Candidate], opposing: bool) -> (f64, usize) {
             index += 1;
         }
         if merged.is_none() {
-            groups.push((keys, candidate.confidence));
+            groups.push(arriving);
         }
+    }
+
+    for group in &mut groups {
+        group.keys.sort();
+        group.keys.dedup();
+        group.evidence.sort();
+        group.evidence.dedup();
+        group.assertion_ids.sort();
+        group.assertion_ids.dedup();
+        dedup_json(&mut group.actors);
     }
 
     // Independent groups accumulate, with diminishing returns: two moderate
     // independent sources say more than either alone, but nothing here is a
     // calibrated probability, so the score is declared as normalized strength.
     let score = 1.0
-        - groups
-            .iter()
-            .fold(1.0, |acc, (_, c)| acc * (1.0 - c.clamp(0.0, 1.0)));
-    (score, groups.len())
+        - groups.iter().fold(1.0, |acc, group| {
+            acc * (1.0 - group.contribution.clamp(0.0, 1.0))
+        });
+    (score, groups)
+}
+
+/// Folds one group into another, keeping the strongest contribution.
+fn absorb(into: &mut Group, other: Group) {
+    into.keys.extend(other.keys);
+    into.actors.extend(other.actors);
+    into.evidence.extend(other.evidence);
+    into.assertion_ids.extend(other.assertion_ids);
+    into.contribution = into.contribution.max(other.contribution);
+}
+
+/// Removes duplicate references, preserving order.
+///
+/// A reference has no total order to sort by, and the list is one group's
+/// actors — small enough that the quadratic scan is cheaper than inventing a
+/// canonical form to sort on.
+fn dedup_json(values: &mut Vec<Json>) {
+    let mut seen: Vec<Json> = Vec::new();
+    values.retain(|value| {
+        if seen.contains(value) {
+            false
+        } else {
+            seen.push(value.clone());
+            true
+        }
+    });
+}
+
+/// Whether a declared exclusive value names this Proposition object.
+///
+/// A schema writes the value the way a Proposition object is written — an
+/// exact reference or a Literal — so a bare id string and `{"id": ...}` name
+/// the same thing and have to compare equal.
+fn same_object(declared: &Json, object: &Json) -> bool {
+    fn id_of(value: &Json) -> Option<&str> {
+        match value {
+            Json::String(text) => Some(text.as_str()),
+            Json::Object(map) => map.get("id").and_then(Json::as_str),
+            _ => None,
+        }
+    }
+    if declared == object {
+        return true;
+    }
+    match (id_of(declared), id_of(object)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// Stage 13: belief-state classification (§68–§73).
 fn classify(support: f64, opposition: f64, ledger: &Ledger, policy: &Policy) -> BeliefStatus {
-    let engaged =
-        ledger.support_groups > 0 || ledger.opposition_groups > 0 || !ledger.uncertain.is_empty();
+    let engaged = !ledger.support_groups.is_empty()
+        || !ledger.opposition_groups.is_empty()
+        || !ledger.uncertain.is_empty();
 
     if !engaged {
         // The open-world state. Nobody has spoken, which is not a denial.
@@ -551,11 +795,18 @@ fn classify(support: f64, opposition: f64, ledger: &Ledger, policy: &Policy) -> 
 /// `subject`, `predicate_ref`, `leading` and `contested` are additive: they
 /// name what the slot was about and which side is ahead *without* claiming it
 /// settled anything.
-pub fn slot_to_json(subject: &str, predicate: &str, beliefs: &[Belief]) -> Json {
+///
+/// The slot reports its own `policy` and `temporal`, from the coordinates it
+/// *ran* under rather than from whichever candidate happened to come first.
+/// Reading them off a candidate leaves them null exactly when the slot is
+/// empty — which is the case §47.4 is about, and the one where a caller most
+/// needs to know the answer was computed rather than skipped.
+pub fn slot_to_json(subject: &Endpoint, predicate: &str, slot: &Slot) -> Json {
+    let beliefs = &slot.candidates;
     let accepted: Vec<String> = beliefs
         .iter()
         .filter(|belief| belief.status == BeliefStatus::Accepted)
-        .map(|belief| belief.proposition.to_string())
+        .filter_map(|belief| belief.proposition.map(|id| id.to_string()))
         .collect();
     let leading = beliefs
         .iter()
@@ -586,26 +837,18 @@ pub fn slot_to_json(subject: &str, predicate: &str, beliefs: &[Belief]) -> Json 
         BeliefStatus::Insufficient
     };
 
-    // The slot ran under one policy at one coordinate, so it reports them
-    // itself: a caller that had to read them out of a candidate would have
-    // nothing to read when the slot is empty — which is the case §47.4 is
-    // about.
-    let (policy, valid_at) = match beliefs.first() {
-        Some(belief) => (
-            serde_json::json!({"id": belief.policy.id, "version": belief.policy.version}),
-            Json::from(belief.valid_at.clone()),
-        ),
-        None => (Json::Null, Json::Null),
-    };
-
     serde_json::json!({
         "status": status,
-        "subject": subject,
+        // The reference shape §8 fixes, never the engine's internal endpoint
+        // key: a caller cannot feed `id\u001fC-1` back into anything, and a
+        // storage key on the wire is a detail that becomes a contract the
+        // moment somebody parses it.
+        "subject": subject.to_json(),
         "predicate_ref": predicate,
         "accepted_values": accepted,
         "candidate_projections": beliefs.iter().map(Belief::to_json).collect::<Vec<_>>(),
         // A leading side is not a settled answer, so it is named as leading.
-        "leading": leading.map(|belief| belief.proposition.to_string()),
+        "leading": leading.and_then(|belief| belief.proposition.map(|id| id.to_string())),
         "contested": contested,
         "uncertainty": {
             "level": match status {
@@ -617,9 +860,34 @@ pub fn slot_to_json(subject: &str, predicate: &str, beliefs: &[Belief]) -> Json 
                 .map(|belief| belief.uncertainty_reasons())
                 .unwrap_or_default(),
         },
-        "temporal": {"valid_at": valid_at},
-        "policy": policy,
+        "temporal": {"valid_at": slot.valid_at, "as_of_seq": slot.as_of},
+        "policy": slot.policy.identity(),
+        // §47.3 lists an explanation on the slot too. A slot's own explanation
+        // is about the *set*: how many candidates competed for it, and what
+        // this engine could not weigh between them.
+        "explanation": {
+            "candidate_count": beliefs.len(),
+            "accepted_count": accepted.len(),
+            "warnings": slot.warnings,
+        },
     })
+}
+
+/// One subject-predicate slot, projected (§47.2).
+///
+/// Carries the coordinates the projection ran under, so the slot can report
+/// them whether or not any candidate exists.
+pub struct Slot {
+    /// Every Proposition competing for the slot, each projected.
+    pub candidates: Vec<Belief>,
+    /// The policy it ran under.
+    pub policy: Policy,
+    /// The world time it evaluated for.
+    pub valid_at: String,
+    /// The cognitive coordinate it read, when bound to one.
+    pub as_of: Option<u64>,
+    /// What this engine could not do while deciding the slot.
+    pub warnings: Vec<String>,
 }
 
 /// The settings block of `WITH EPISTEMIC { ... }`, evaluated.
@@ -677,6 +945,7 @@ mod tests {
         Candidate {
             id: ElementId::new(anda_kip::ElementKind::Assertion, 1),
             actor: actor.to_string(),
+            actor_ref: Json::from(actor),
             evidence: evidence.iter().map(|s| s.to_string()).collect(),
             stance: stance.to_string(),
             confidence,
@@ -695,7 +964,7 @@ mod tests {
             candidate("actor:alice", &[], "support", 0.6),
         ];
         let (score, groups) = aggregate(&repeated, false);
-        assert_eq!(groups, 1);
+        assert_eq!(groups.len(), 1);
         assert!((score - 0.6).abs() < 1e-9, "got {score}");
 
         // Three genuinely independent actors say more.
@@ -705,7 +974,7 @@ mod tests {
             candidate("actor:carol", &[], "support", 0.6),
         ];
         let (score, groups) = aggregate(&independent, false);
-        assert_eq!(groups, 3);
+        assert_eq!(groups.len(), 3);
         assert!(score > 0.9, "got {score}");
     }
 
@@ -718,7 +987,7 @@ mod tests {
             candidate("actor:bob", &["E-1"], "support", 0.6),
         ];
         let (score, groups) = aggregate(&echo, false);
-        assert_eq!(groups, 1, "one observation, relayed twice");
+        assert_eq!(groups.len(), 1, "one observation, relayed twice");
         assert!((score - 0.6).abs() < 1e-9);
 
         // A third actor with its own evidence is a second group.
@@ -727,7 +996,7 @@ mod tests {
             candidate("actor:bob", &["E-1"], "support", 0.6),
             candidate("actor:carol", &["E-2"], "support", 0.6),
         ];
-        assert_eq!(aggregate(&mixed, false).1, 2);
+        assert_eq!(aggregate(&mixed, false).1.len(), 2);
     }
 
     #[test]
@@ -739,7 +1008,7 @@ mod tests {
             candidate("actor:bob", &["E-2"], "support", 0.5),
             candidate("actor:carol", &["E-1", "E-2"], "support", 0.5),
         ];
-        assert_eq!(aggregate(&bridged, false).1, 1);
+        assert_eq!(aggregate(&bridged, false).1.len(), 1);
     }
 
     #[test]
@@ -758,7 +1027,7 @@ mod tests {
     fn rejection_needs_positive_opposition() {
         let policy = Policy::baseline();
         let opposed = Ledger {
-            opposition_groups: 1,
+            opposition_groups: vec![Group::default()],
             ..Default::default()
         };
         assert_eq!(
@@ -778,8 +1047,8 @@ mod tests {
         // leader as accepted would hide the disagreement entirely.
         let policy = Policy::baseline();
         let both = Ledger {
-            support_groups: 2,
-            opposition_groups: 1,
+            support_groups: vec![Group::default(), Group::default()],
+            opposition_groups: vec![Group::default()],
             ..Default::default()
         };
         assert_eq!(classify(0.85, 0.5, &both, &policy), BeliefStatus::Contested);

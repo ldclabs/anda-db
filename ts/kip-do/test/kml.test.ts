@@ -254,14 +254,29 @@ describe('KML', () => {
       )
 
       // A bound parameter is only knowable at execution time, so that one is
-      // the Schema layer's to refuse — and it still does.
+      // the engine's to refuse — under the same code, because it is the same
+      // rule. A caller that switched from a literal to a parameter should not
+      // have to switch error handlers too.
       const bound = nexus.tryExecute(
         `CREATE ASSERTION ?a {
            SET FIELDS { proposition: :p, stance: "support", mode: "stated", confidence: :c }
          }`,
         { p: first.handles.p!, c: 1.5 },
       )
-      expect('error' in bound && bound.error.code).toBe('TypeMismatch')
+      expect('error' in bound && bound.error.code).toBe('ConstraintViolation')
+
+      // The lower bound matters as much as the upper one: -1 is the stored
+      // stand-in for "the actor stated none", so a negative that got through
+      // would not be stored wrong — it would be stored as silence.
+      const negative = nexus.tryExecute(
+        `CREATE ASSERTION ?a {
+           SET FIELDS { proposition: :p, stance: "support", mode: "stated", confidence: :c }
+         }`,
+        { p: first.handles.p!, c: -0.5 },
+      )
+      expect('error' in negative && negative.error.code).toBe(
+        'ConstraintViolation',
+      )
     })
   })
 

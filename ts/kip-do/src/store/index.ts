@@ -77,9 +77,13 @@ export {
 export {
   coordinateFromToken,
   elementOfVersion,
+  pageCursorFromToken,
+  pageToken,
   snapshotJson,
   snapshotToken,
   type Coordinate,
+  type CursorFamily,
+  type PageCursor,
 } from './history.js'
 
 export {

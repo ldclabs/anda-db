@@ -52,7 +52,14 @@ export class Normalizer {
     if (Array.isArray(value)) return value.map((item) => this.value(item))
     if (value !== null && typeof value === 'object') {
       const out: { [key: string]: Json } = {}
-      for (const [key, item] of Object.entries(value)) {
+      // Sorted, because the *ordinal* an id gets depends on the order this
+      // walk reaches it. The reference engine serializes object members
+      // sorted; this one preserves insertion order. Walking in a different
+      // order would make two structurally identical answers normalize to
+      // different ordinals — a divergence report about nothing.
+      for (const [key, item] of Object.entries(value).sort(([a], [b]) =>
+        a < b ? -1 : a > b ? 1 : 0,
+      )) {
         if (VOLATILE.has(key)) continue
         out[key] = this.value(item)
       }

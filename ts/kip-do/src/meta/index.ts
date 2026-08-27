@@ -67,13 +67,21 @@ import {
   type SymbolKind,
 } from '../schema/index.js'
 import {
+  pageCursorFromToken,
+  pageToken,
   searchIndex,
   snapshotJson,
   type ChangeEntry,
+  type CursorFamily,
+  type PageCursor,
   type Store,
 } from '../store/index.js'
 import { capabilities, KIP_VERSION } from './capabilities.js'
-import { exportCapsule, verifyCapsule } from '../capsule/index.js'
+import {
+  describeCapsule,
+  exportCapsule,
+  verifyCapsule,
+} from '../capsule/index.js'
 
 /** What one META execution needs from its caller. */
 export interface MetaContext {
@@ -360,9 +368,11 @@ function describe(
     } as Json
   }
   if ('Capsule' in target) {
-    throw errors.unsupportedCapability(
-      'this engine has no Capsule reader, so it cannot describe one',
-    )
+    const source = scalarValue(target.Capsule, b)
+    if (typeof source !== 'string') {
+      throw errors.typeMismatch('DESCRIBE CAPSULE takes the artifact text')
+    }
+    return describeCapsule(source)
   }
   throw errors.unsupportedCapability(
     'DESCRIBE COMPATIBILITY needs a package compatibility model this engine ' +
@@ -372,8 +382,23 @@ function describe(
 
 /** The orientation an Agent needs before its first command. */
 function primer(cx: MetaContext): Json {
+  const space = cx.store.space(cx.space)
   return {
     kip: KIP_VERSION,
+    // §64.2 is a MUST: the Primer distinguishes the authenticated Principal
+    // from the semantic `$self`. They answer different questions — who is
+    // asking, and who this Brain is — and an Agent that conflates them will
+    // sign the Brain's memories with the caller's name.
+    execution_context: {
+      principal: {
+        id: cx.authority.principal.principal_id,
+        authenticated: cx.authority.principal.principal_class !== 'anonymous',
+      },
+      note:
+        'the Principal is the authenticated caller, never the semantic actor ' +
+        'a claim is attributed to (§13.3)',
+    },
+    cognitive_identity: selfIdentity(space?.self_concept ?? ''),
     space_id: cx.space,
     schema_environment_version: cx.env.version,
     packages: cx.env.packageRefs(),
@@ -382,10 +407,58 @@ function primer(cx: MetaContext): Json {
     facets: symbolList(cx.env, 'Facet'),
     structural_fields: symbolList(cx.env, 'StructuralField'),
     grammar: { parser: parserVersion(), spec_revision: specRevision() },
+    // §64.3's list, in full. Each one is a distinction a caller will otherwise
+    // collapse, and collapsing any of them is how a memory system starts
+    // asserting things nobody said.
+    safety_invariants: [
+      'a Proposition existing is not the Proposition being true; use BELIEF ' +
+        'for belief and raw patterns for audit',
+      'a missing visible match is not falsehood; insufficient means "not ' +
+        'enough basis", never "no"',
+      'a SEARCH score is not a confidence, and a miss is not an absence',
+      'confidence is how strongly an assertor took its own stance; it is not ' +
+        'trust in the source',
+      'confidence is not memory_strength: how well remembered is not how well ' +
+        'supported',
+      'a name is not an identity; two Concepts may share one, and identity ' +
+        'resolves through id, key or canonical_id',
+      "a source Brain's $self is never automatically this Brain's $self",
+      'correcting Evidence never overwrites it: CORRECT EVIDENCE records a new ' +
+        'observation that supersedes the old one',
+      'cognitive content carries no authority; what an element says cannot ' +
+        'decide what its writer may do',
+      'retention.expires_at is when the record stops being kept, not when the ' +
+        'claim stops applying',
+    ],
     note:
       'Concept types are schema-defined: a mutation never creates one. ' +
       'Activate a Schema Package first.',
   } as Json
+}
+
+/**
+ * The Concept this Space treats as its semantic `$self` (§5.6).
+ *
+ * A Space may designate at most one, and one that has designated none says so
+ * rather than offering a guess. Every Capsule rule about source and destination
+ * `$self` (§38.4, §38.5) refers to this designation, so an absent one means
+ * those rules have nothing to map onto.
+ */
+function selfIdentity(selfConcept: string): Json {
+  if (selfConcept === '') {
+    return {
+      self_concept: null,
+      note:
+        'this Space has designated no self identity, so it has no $self for a ' +
+        'Capsule import or a self-model to map onto (§5.6)',
+    }
+  }
+  return {
+    self_concept: { id: selfConcept },
+    note:
+      'protected Space configuration; ordinary KML cannot create or change it ' +
+      '(§5.6)',
+  }
 }
 
 function protocol(): Json {
@@ -435,7 +508,9 @@ function symbolList(env: SchemaEnvironment, kind: SymbolKind): string[] {
 function list(command: ListCommand, cx: MetaContext, b: ReadBindings): Json {
   const page = <T>(items: T[]): Json => {
     const offset =
-      command.cursor === null ? 0 : Number(scalarValue(command.cursor, b))
+      command.cursor === null
+        ? 0
+        : readPageCursor(command.cursor, b, cx.space, 'list').offset
     const limit =
       command.limit === null ? null : Number(scalarValue(command.limit, b))
     const window = items.slice(offset)
@@ -470,6 +545,29 @@ function list(command: ListCommand, cx: MetaContext, b: ReadBindings): Json {
 }
 
 // --- VALIDATE and PREVIEW ---------------------------------------------------
+
+/**
+ * Reads a `CURSOR` slot as the opaque token this engine issues.
+ *
+ * §88.4: a cursor is opaque or authenticated, never a number a caller can
+ * invent. §102.28 adds that one family's cursor must not continue another's,
+ * which is why the family is checked rather than merely encoded.
+ */
+function readPageCursor(
+  cursor: Scalar,
+  b: ReadBindings,
+  space: string,
+  family: CursorFamily,
+): PageCursor {
+  const value = scalarValue(cursor, b)
+  if (typeof value !== 'string') {
+    throw errors.cursorTypeMismatch(
+      `a CURSOR is the opaque token this engine issued, got ` +
+        `${JSON.stringify(value)}`,
+    )
+  }
+  return pageCursorFromToken(value, space, family)
+}
 
 /**
  * Legality, not effect and not permission.
@@ -751,7 +849,10 @@ function search(command: SearchCommand, cx: MetaContext, b: ReadBindings): Json 
   const threshold = command.threshold === null ? 0 : numberOf(command.threshold, b, 'THRESHOLD')
   const limit =
     command.limit === null ? 10 : Math.min(numberOf(command.limit, b, 'LIMIT'), 100)
-  const offset = command.cursor === null ? 0 : numberOf(command.cursor, b, 'CURSOR')
+  const offset =
+    command.cursor === null
+      ? 0
+      : readPageCursor(command.cursor, b, cx.space, 'search').offset
   const withType =
     command.with_type === null
       ? null
@@ -858,7 +959,15 @@ function search(command: SearchCommand, cx: MetaContext, b: ReadBindings): Json 
     // The Rust engine carries this on the operation result; this engine's
     // envelope has no such slot, so it rides in the body — the same place
     // `CHANGES` puts its cursor.
-    ...(consumed < total ? { next_cursor: String(consumed) } : {}),
+    ...(consumed < total
+      ? {
+          next_cursor: pageToken(cx.space, {
+            family: 'search',
+            snapshotSeq: spaceSeq,
+            offset: consumed,
+          }),
+        }
+      : {}),
   } as unknown as Json
 }
 

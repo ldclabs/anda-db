@@ -96,6 +96,7 @@ impl Store {
             // commit is sequence 1 and no element ever carries `space_seq: 0`.
             seq: 0,
             schema_environment_version: 0,
+            self_concept: String::new(),
             policies: Json::Null,
         };
         let id = self.spaces().add_from(&row).await.map_err(db_error)?;

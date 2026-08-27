@@ -384,3 +384,108 @@ function audit(
     record: { ...record, element: formatElementId(id) } as Json,
   })
 }
+
+/**
+ * Archives one element whose retention has lapsed (§19.1).
+ *
+ * The lapse is the *reason*, and it is recorded on the element rather than only
+ * in the audit: an element that left ordinary recall on a schedule and one a
+ * moderator archived are different facts, and a reader that cannot tell them
+ * apart will read a retention sweep as a judgement about the content.
+ *
+ * Returns whether anything changed. An element already out of ordinary recall
+ * is left alone rather than re-stated, which would bump a version and write a
+ * change record for a transition that did not happen.
+ */
+export function archiveExpired(
+  cx: ElementGovernanceContext,
+  id: ElementId,
+): boolean {
+  return expire(cx, id, State.ARCHIVED, 'archive')
+}
+
+/** Tombstones one element whose retention has lapsed (§19.1). */
+export function tombstoneExpired(
+  cx: ElementGovernanceContext,
+  id: ElementId,
+): boolean {
+  return expire(cx, id, State.TOMBSTONED, 'tombstone')
+}
+
+function expire(
+  cx: ElementGovernanceContext,
+  id: ElementId,
+  newState: string,
+  permission: Permission,
+): boolean {
+  const element = readable(cx, id)
+  if (element.row.state !== State.ACTIVE) return false
+  const resource = resourceOfElement(element)
+  // Expiry is not an exemption: reaching an element still costs what reaching
+  // it always costs.
+  const approved = decide(cx, resource, permission)
+  apply(
+    cx,
+    element,
+    'retention_expiry',
+    'retention_expiry',
+    newState,
+    (block) => setMember(block, RETENTION_LAPSED_KEY, 'expired'),
+    (version) => ({ state: newState, version }),
+    approved,
+  )
+  return true
+}
+
+/**
+ * The Governance member that records why an element left ordinary recall.
+ *
+ * Its value is the reason rather than a bare `true`, matching how
+ * `quarantine` records its own: a reader following `HISTORY ELEMENT` sees
+ * *what happened*, not that something did.
+ */
+const RETENTION_LAPSED_KEY = 'retention_lapsed'
+
+/**
+ * Marks an Assertion whose validity window has closed as `expired` (§14.3).
+ *
+ * Expiry is not retraction and not supersession. §14.1 is explicit that
+ * administrative action must not falsely mark an Assertion retracted when no
+ * withdrawal occurred — and a claim whose own stated window has run out was
+ * never withdrawn by anybody. It is also not storage retention (§19.2): the
+ * record is kept, and what lapsed is its currency.
+ *
+ * The projection still admits an expired Assertion at a coordinate its window
+ * covered, so this loses no history; it records, once, what the temporal stage
+ * would otherwise re-derive on every read.
+ */
+export function expireAssertion(
+  cx: ElementGovernanceContext,
+  id: ElementId,
+  now: string,
+): boolean {
+  const element = readable(cx, id)
+  if (element.kind !== 'Assertion') {
+    throw errors.structuralReferenceInvalid(
+      `${formatElementId(id)} is not an Assertion; only an Assertion has an ` +
+        `epistemic lifecycle (§14)`,
+    )
+  }
+  if (element.row.status !== 'active' || element.row.valid_until === '') {
+    return false
+  }
+  if (element.row.valid_until > now) return false
+  const approved = decide(cx, resourceOfElement(element), 'maintain')
+  element.row.status = 'expired'
+  apply(
+    cx,
+    element,
+    'expire',
+    'expire_assertion',
+    null,
+    (block) => block,
+    (version) => ({ version }),
+    approved,
+  )
+  return true
+}

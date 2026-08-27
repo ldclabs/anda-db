@@ -265,18 +265,7 @@ fn proposition(row: &PropositionRow) -> Json {
         predicate_ref: row.predicate_ref.clone(),
         object: row.object.clone(),
     };
-    finish(
-        &value,
-        &row.structural,
-        &[(
-            "attributes",
-            if row.attributes.is_empty() {
-                Json::Null
-            } else {
-                Json::Object(row.attributes.clone())
-            },
-        )],
-    )
+    finish(&value, &row.structural, &[])
 }
 
 fn assertion(row: &AssertionRow) -> Json {
@@ -321,10 +310,12 @@ fn assertion(row: &AssertionRow) -> Json {
             "imported" => Some(AssertionMode::Imported),
             _ => None,
         },
-        // A negative confidence is the storage sentinel for "the actor stated
-        // none", and it must not surface as a real value: `-1` would read as
-        // an extraordinarily strong denial rather than as silence.
-        confidence: (row.confidence >= 0.0).then_some(row.confidence),
+        // The out-of-band sentinel means "the actor stated none", and it must
+        // not surface as a real value: a negative number would read as an
+        // extraordinarily strong denial rather than as silence. Writes are
+        // held to `[0, 1]`, so nothing real lands on it.
+        confidence: (row.confidence != crate::kml::clauses::NO_CONFIDENCE)
+            .then_some(row.confidence),
         asserted_at: some_text(&row.asserted_at),
         valid_time: (valid_time.from.is_some() || valid_time.until.is_some()).then_some(valid_time),
         // Mapped field by field rather than through `from_value(..).ok()`:
@@ -502,7 +493,7 @@ mod tests {
         // extraordinarily strong denial rather than as silence.
         let silent = render(&Element::Assertion(Box::new(AssertionRow {
             _id: 1,
-            confidence: -1.0,
+            confidence: crate::kml::clauses::NO_CONFIDENCE,
             stance: "support".into(),
             status: "active".into(),
             ..Default::default()

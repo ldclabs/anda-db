@@ -90,7 +90,6 @@ function proposition(
     object: endpointToJson(o),
     object_key: endpointKey(o),
     tuple_key: tupleKey(space, s, predicate, o),
-    attributes: {},
   }
   return { kind: 'Proposition', row } satisfies Element
 }
@@ -111,6 +110,7 @@ function newSpace(store: Store, spaceId: string) {
     created_at: nowTime(),
     seq: 0,
     schema_environment_version: 0,
+    self_concept: '',
     policies: {},
   })
 }

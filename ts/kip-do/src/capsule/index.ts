@@ -15,7 +15,7 @@
  * and no way to notice. It is refused by name; see `DESCRIBE CAPABILITIES`.
  */
 
-import { sha256Text } from '../digest.js'
+import { sha3_256Text } from '../digest.js'
 import { errors } from '../errors.js'
 import { formatElementId, type ElementId } from '../id.js'
 import { canonicalJson, isJsonMap, type Json, type JsonMap } from '../json.js'
@@ -50,11 +50,25 @@ export function exportCapsule(
     )
   }
   const options = evaluateOptions(command.options, cx)
+  // §40.3's vocabulary, spelled the way §40.3 spells it. An engine that
+  // invented its own words for the same three shapes would make a Capsule's own
+  // manifest unreadable to the destination that has to decide whether to trust
+  // it.
   const closure = stringOption(options, 'closure', 'referential')
-  if (closure !== 'referential' && closure !== 'none') {
+  if (!['closed', 'referential', 'selective'].includes(closure)) {
     throw errors.unsupportedCapability(
-      `this engine writes a "referential" closure or "none"; it has no ` +
-        `${JSON.stringify(closure)}`,
+      `§40.3 declares a closure as "closed", "referential" or "selective"; ` +
+        `this Capsule asks for ${JSON.stringify(closure)}`,
+    )
+  }
+  // A proof profile promises a signature, and this engine holds no signing
+  // keys. Emitting an unsigned Capsule under a profile that names one would put
+  // the claim in the manifest and nothing behind it (§37.8).
+  if (options.proof_profile !== undefined && options.proof_profile !== null) {
+    throw errors.unsupportedCapability(
+      `this engine signs nothing, so it cannot produce a Capsule under the ` +
+        `proof profile ${JSON.stringify(options.proof_profile)}; an exported ` +
+        `Capsule is unsigned and says so`,
     )
   }
   if (options.include_blobs === true) {
@@ -80,7 +94,7 @@ export function exportCapsule(
   }
 
   const ids =
-    closure === 'none' ? [...roots] : expand(context, [...roots], depth)
+    closure === 'selective' ? [...roots] : expand(context, [...roots], depth)
 
   const records: Record<string, Json[]> = {
     concepts: [],
@@ -111,6 +125,38 @@ export function exportCapsule(
     records[bucket[element.kind] as string]?.push(view as Json)
   }
 
+  const included = new Set(ids)
+  const externalRefs: JsonMap[] = []
+  const seenExternal = new Set<string>()
+  for (const id of ids) {
+    const element = context.load(parse(id))
+    if (element === null) continue
+    for (const referenced of referencedIds(element)) {
+      if (included.has(referenced) || seenExternal.has(referenced)) continue
+      seenExternal.add(referenced)
+      externalRefs.push({
+        ref: referenced,
+        kind: 'source_element',
+        identity: { id: referenced },
+        reason: `outside the ${closure} closure of this export`,
+      })
+    }
+  }
+  externalRefs.sort((a, b2) => String(a.ref).localeCompare(String(b2.ref)))
+  // A `closed` Capsule promises self-containment, so it fails rather than
+  // shipping the promise with a hole in it. §40.3 names the three shapes so a
+  // destination can tell them apart; one that claimed `closed` and carried
+  // ExternalRefs would make the word mean nothing.
+  if (closure === 'closed' && externalRefs.length > 0) {
+    throw errors.constraintViolation(
+      `a "closed" Capsule carries everything it references, and this export ` +
+        `would leave ${externalRefs.length} reference(s) outside it — the ` +
+        `first is ${String(externalRefs[0]?.ref)}. Raise ` +
+        `\`provenance_depth\`, widen the roots, or ask for a "referential" ` +
+        `closure, which declares what it does not carry`,
+    )
+  }
+
   const space = cx.store.space(cx.space)
   const payload: JsonMap = {
     manifest: {
@@ -119,7 +165,12 @@ export function exportCapsule(
       // `roots_only` unless the closure actually ran: a Capsule claiming a
       // completeness it does not have imports as a graph the destination
       // believes is whole.
-      completeness: closure === 'referential' ? 'referential_closure' : 'roots_only',
+      completeness:
+        closure === 'closed'
+          ? 'closed'
+          : closure === 'referential'
+            ? 'referential_closure'
+            : 'roots_only',
       closure: { mode: closure, provenance_depth: depth },
     },
     source: {
@@ -132,7 +183,10 @@ export function exportCapsule(
     // call them.
     schema: includeSchema ? schemaDependencies(cx, schemaRefs) : [],
     records: records as unknown as Json,
-    external_refs: [],
+    // §40.1: what the records reference but do not carry is *declared*, not
+    // dropped. A Capsule missing an edge and saying nothing imports as a graph
+    // the destination believes is whole.
+    external_refs: externalRefs as unknown as Json,
     blobs: [],
   }
 
@@ -149,7 +203,7 @@ export function exportCapsule(
     integrity: {
       content_digest: payloadDigest(payload),
       digest_profile:
-        'engine-local canonical JSON (the KIP profile is still a draft)',
+        'sha3-256 over RFC 8785 canonical JSON (§37.7)',
       // No proofs: this engine signs nothing, and an empty proof list is an
       // honest "unsigned" rather than a claim of provenance.
       proofs: [],
@@ -178,12 +232,12 @@ export function verifyCapsule(capsule: Json): Json {
   }
 
   const declared = integrity.content_digest
+  checkDigestProfile(declared)
   const recomputed = payloadDigest(payload)
   if (declared !== recomputed) {
     throw errors.digestMismatch(
       `this Capsule declares the digest ${String(declared)} and its payload ` +
-        `digests to ${recomputed}; it was modified after it was written, or ` +
-        `written by an engine using a different canonicalization`,
+        `digests to ${recomputed}; it was modified after it was written`,
     )
   }
 
@@ -283,8 +337,54 @@ function schemaDependencies(cx: MetaContext, refs: ReadonlySet<string>): Json {
   }) as Json
 }
 
+/**
+ * The digest algorithm a Capsule content digest uses.
+ *
+ * SHA3-256 over RFC 8785 canonical JSON, matching
+ * `rs/anda_cognitive_nexus::capsule::DIGEST_PROFILE`. A Capsule is the one
+ * artifact that leaves this engine and is checked by another, so the algorithm
+ * is part of the interoperability contract rather than an engine choice: two
+ * implementations hashing the same canonical bytes differently produce
+ * different digests for the same cognition, and every cross-engine `VERIFY
+ * CAPSULE` then fails for a reason neither side can see.
+ *
+ * The engine-local digests — Proposition tuple identity, Schema Package
+ * content, purge stubs, approval subjects — stay on SHA-256. None of them
+ * crosses an engine boundary, and changing them would rewrite every stored
+ * `tuple_key`.
+ */
+export const DIGEST_PROFILE = 'sha3-256'
+
 function payloadDigest(payload: Json): string {
-  return `sha256:${sha256Text(canonicalJson(payload))}`
+  return `${DIGEST_PROFILE}:${sha3_256Text(canonicalJson(payload))}`
+}
+
+/**
+ * Refuses a Capsule digested under an algorithm this engine cannot compute.
+ *
+ * Reported as an unsupported profile rather than as a digest mismatch, and the
+ * difference matters: a mismatch says *this artifact was modified*, which is an
+ * accusation. An artifact written by an engine that hashes its canonical bytes
+ * differently is intact and unreadable here, and telling an operator it was
+ * tampered with would send them hunting for an attacker that does not exist
+ * (§86.4).
+ */
+function checkDigestProfile(declared: unknown): void {
+  if (typeof declared !== 'string' || !declared.includes(':')) {
+    throw errors.capsuleValidationFailed(
+      `this Capsule's content digest ${JSON.stringify(declared)} names no ` +
+        `algorithm; a digest whose profile is unstated cannot be checked`,
+    )
+  }
+  const profile = declared.slice(0, declared.indexOf(':'))
+  if (profile !== DIGEST_PROFILE) {
+    throw errors.unsupportedCapability(
+      `this Capsule is digested under ${JSON.stringify(profile)} and this ` +
+        `engine computes ${JSON.stringify(DIGEST_PROFILE)} over RFC 8785 ` +
+        `canonical JSON; it cannot check the artifact's integrity, which is ` +
+        `not the same as finding it corrupt`,
+    )
+  }
 }
 
 function countRecords(payload: JsonMap): number {
@@ -324,4 +424,54 @@ function evaluateOptions(
 function stringOption(options: JsonMap, name: string, fallback: string): string {
   const value = options[name]
   return typeof value === 'string' ? value : fallback
+}
+
+/**
+ * Reports what a Capsule artifact contains, without importing it (§63.3).
+ *
+ * Inspection rather than verification: this is the manifest, the source
+ * identity, the schema it was written against and how much of each kind it
+ * carries. `VERIFY CAPSULE` is what checks the digest, and the two are kept
+ * apart on purpose — describing an artifact must not read as vouching for it.
+ *
+ * It answers from the parsed artifact alone. Nothing here touches the Space, so
+ * an operator can look at a Capsule before deciding whether this Brain should
+ * see it at all.
+ */
+export function describeCapsule(source: string): Json {
+  const artifact = parseJsonArtifact(source)
+  if (!isJsonMap(artifact)) {
+    throw errors.artifactParseError('a Capsule must be a JSON object')
+  }
+  const payload = isJsonMap(artifact.payload) ? artifact.payload : {}
+  const integrity = isJsonMap(artifact.integrity) ? artifact.integrity : {}
+  const records = isJsonMap(payload.records) ? payload.records : {}
+  const proofs = Array.isArray(integrity.proofs) ? integrity.proofs : []
+  const externalRefs = Array.isArray(payload.external_refs)
+    ? payload.external_refs.length
+    : 0
+  return {
+    format: artifact.format ?? null,
+    manifest: payload.manifest ?? null,
+    source: payload.source ?? null,
+    schema: payload.schema ?? null,
+    counts: Object.fromEntries(
+      Object.entries(records).map(([kind, list]) => [
+        kind,
+        Array.isArray(list) ? list.length : 0,
+      ]),
+    ),
+    external_refs: externalRefs,
+    blobs: Array.isArray(payload.blobs) ? payload.blobs.length : 0,
+    integrity: {
+      content_digest: integrity.content_digest ?? null,
+      // Stated separately from the digest, because they answer different
+      // questions: the digest says the bytes are intact, a signature would say
+      // who stood behind them, and neither says the claims are true (§37.8).
+      signed: proofs.length > 0,
+    },
+    note:
+      'this describes the artifact; VERIFY CAPSULE checks its digest, and ' +
+      'neither makes its claims true',
+  } as Json
 }

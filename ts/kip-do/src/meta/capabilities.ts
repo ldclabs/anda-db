@@ -74,6 +74,58 @@ export function capabilities(): Json {
         'WITH EPISTEMIC',
         'global aggregates',
       ],
+      epistemic: {
+        // §49's settings, honored rather than parsed and dropped.
+        settings: [
+          'policy',
+          'accept',
+          'material',
+          'modes',
+          'include_hypothetical',
+          'include_predicted',
+          'explanation',
+        ],
+        explanation_levels: ['none', 'summary', 'ledger'],
+        // §25.1 and §92: both conflict shapes, not just the strong one.
+        conflicts: ['functional', 'exclusive values'],
+      },
+      paging: {
+        // §44.8 and §88.4: a cursor is opaque, carries the coordinate the
+        // traversal began at, and belongs to the family that issued it.
+        cursor: 'opaque token, snapshot-pinned, per operation family',
+        families: ['find', 'search', 'list'],
+      },
+      structural: {
+        // §17.4: an ordered field keeps one dense zero-based order per source
+        // element.
+        ordered_fields: true,
+      },
+      envelope: {
+        client_key:
+          'a CREATE under a client_key already used resolves to that element ' +
+          'instead of creating a second (§52.1)',
+      },
+      retention: {
+        // §19.2: this is storage lifecycle, never world validity.
+        hook: ['retention_class', 'expires_at', 'legal_hold'],
+        expiry:
+          'enforced by an explicit sweep the host runs, not by a background ' +
+          'alarm: forgetting happens when a Principal asks for it and is ' +
+          'accountable for it',
+        actions: ['archive', 'tombstone'],
+      },
+      capsule: {
+        // §37.7, and the same profile rs/anda_cognitive_nexus writes: a
+        // Capsule is the one artifact that crosses between engines, so the
+        // algorithm is part of the contract rather than an engine choice. The
+        // two are pinned to one digest by a literal in each engine's tests.
+        digest_profile: 'sha3-256 over RFC 8785 canonical JSON',
+        closure: ['closed', 'referential', 'selective'],
+      },
+      space: {
+        // §5.6, reported by DESCRIBE PRIMER as §64.2 requires.
+        self_identity: 'protected Space configuration, set through a host API',
+      },
       read: {
         // §52.7: a bounded read may be assumed repeatable only where the
         // runtime documents an order. This one does.
@@ -298,6 +350,18 @@ export function capabilities(): Json {
       grammar: { parser: parserVersion(), spec_revision: specRevision() },
     },
     unsupported: [
+      {
+        capability: 'capsule_digest_profiles',
+        detail:
+          'verifying a Capsule digested under an algorithm other than sha3-256',
+        reason:
+          'this engine digests a Capsule as sha3-256 over RFC 8785 canonical ' +
+          'JSON, and so does rs/anda_cognitive_nexus — the two interoperate. ' +
+          'An artifact from somewhere else under another profile is refused ' +
+          'as an unsupported profile rather than reported as a digest ' +
+          'mismatch, because the second is an accusation of tampering and the ' +
+          'first is the truth',
+      },
       {
         capability: 'ungated_permissions',
         detail:

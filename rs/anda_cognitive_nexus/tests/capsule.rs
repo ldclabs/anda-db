@@ -109,10 +109,10 @@ async fn an_export_carries_the_referential_closure_of_its_roots() {
     assert_eq!(records["evidence"].as_array().unwrap().len(), 1);
     assert_eq!(records["concepts"].as_array().unwrap().len(), 2);
 
-    // `closure: "none"` exports exactly what was asked for, and says so.
+    // `closure: "selective"` exports exactly what was asked for, and says so.
     let bare = ok(
         &nexus,
-        r#"EXPORT CAPSULE ?a WHERE { ?a ASSERTION {} } WITH {closure: "none"}"#,
+        r#"EXPORT CAPSULE ?a WHERE { ?a ASSERTION {} } WITH {closure: "selective"}"#,
     )
     .await;
     // An empty record list is omitted from the wire form rather than written
@@ -519,7 +519,7 @@ async fn an_incomplete_capsule_is_refused_rather_than_partly_imported() {
     let source = seeded("incomplete_source").await;
     let artifact = ok(
         &source,
-        r#"EXPORT CAPSULE ?a WHERE { ?a ASSERTION {} } WITH {closure: "none"}"#,
+        r#"EXPORT CAPSULE ?a WHERE { ?a ASSERTION {} } WITH {closure: "selective"}"#,
     )
     .await;
     let capsule = anda_cognitive_nexus::capsule::parse(&artifact.to_string()).unwrap();

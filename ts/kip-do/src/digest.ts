@@ -142,3 +142,191 @@ export function digestParts(parts: readonly string[]): string {
   }
   return sha256Hex(buffer)
 }
+
+// ---------------------------------------------------------------------------
+// SHA3-256, for the one digest that crosses between engines
+// ---------------------------------------------------------------------------
+
+/**
+ * SHA3-256 (FIPS 202), synchronous, for the Capsule content digest.
+ *
+ * A Capsule is the one artifact that leaves this engine and is checked by
+ * another. §37.7 makes the canonical serialization the design target, and
+ * canonical bytes are only half of it: two implementations that hash the same
+ * bytes with different algorithms produce different digests for the same
+ * cognition, and every `VERIFY CAPSULE` across that boundary then fails for a
+ * reason neither side can see. `rs/anda_cognitive_nexus` uses SHA3-256, so
+ * this does too — which is what makes a Capsule written here verifiable there.
+ *
+ * Written out rather than imported for the same reason SHA-256 above is: the
+ * digest is taken inside `transactionSync`, `crypto.subtle` is async, and
+ * `node:crypto` needs a deployment flag from every consumer.
+ *
+ * The engine-local digests — Proposition tuple identity, Schema Package
+ * content, purge stubs — stay on SHA-256. They never cross an engine boundary,
+ * and changing them would rewrite every stored `tuple_key`.
+ */
+
+/** Lane rotation offsets, by lane index `x + 5y`. */
+// prettier-ignore
+const KECCAK_ROTATION = [
+  0, 1, 62, 28, 27, 36, 44, 6, 55, 20, 3, 10, 43, 25, 39,
+  41, 45, 15, 21, 8, 18, 2, 61, 56, 14,
+]
+
+/**
+ * The ρ/π lane permutation: `B[y][2x+3y] = rot(A[x][y])`.
+ *
+ * Derived rather than transcribed. A 25-entry table copied by hand is a table
+ * with a typo in it, and a wrong Keccak permutation produces a plausible
+ * digest that no other implementation agrees with.
+ */
+const KECCAK_PI = (() => {
+  const out = new Int32Array(25)
+  for (let y = 0; y < 5; y += 1) {
+    for (let x = 0; x < 5; x += 1) {
+      out[x + 5 * y] = y + 5 * ((2 * x + 3 * y) % 5)
+    }
+  }
+  return out
+})()
+
+/** The 24 round constants, split into 32-bit halves. */
+// prettier-ignore
+const KECCAK_RC_LO = new Int32Array([
+  0x00000001, 0x00008082, 0x0000808a, 0x80008000, 0x0000808b, 0x80000001,
+  0x80008081, 0x00008009, 0x0000008a, 0x00000088, 0x80008009, 0x8000000a,
+  0x8000808b, 0x0000008b, 0x00008089, 0x00008003, 0x00008002, 0x00000080,
+  0x0000800a, 0x8000000a, 0x80008081, 0x00008080, 0x80000001, 0x80008008,
+])
+// prettier-ignore
+const KECCAK_RC_HI = new Int32Array([
+  0x00000000, 0x00000000, 0x80000000, 0x80000000, 0x00000000, 0x00000000,
+  0x80000000, 0x80000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+  0x00000000, 0x80000000, 0x80000000, 0x80000000, 0x80000000, 0x80000000,
+  0x00000000, 0x80000000, 0x80000000, 0x80000000, 0x00000000, 0x80000000,
+])
+
+/** SHA3-256's rate: 1600 bits of state minus 512 bits of capacity. */
+const KECCAK_RATE = 136
+
+/**
+ * A 64-bit lane lives in two 32-bit halves, so a rotation is written twice.
+ *
+ * `x << 32` is `x << 0` in JavaScript — the shift count is taken modulo 32 —
+ * so the 0 and 32 cases are branches rather than arithmetic. Getting that
+ * wrong yields a hash that is self-consistent and wrong.
+ */
+function rotLo(lo: number, hi: number, n: number): number {
+  if (n === 0) return lo
+  if (n === 32) return hi
+  if (n < 32) return ((lo << n) | (hi >>> (32 - n))) | 0
+  const m = n - 32
+  return ((hi << m) | (lo >>> (32 - m))) | 0
+}
+
+function rotHi(lo: number, hi: number, n: number): number {
+  if (n === 0) return hi
+  if (n === 32) return lo
+  if (n < 32) return ((hi << n) | (lo >>> (32 - n))) | 0
+  const m = n - 32
+  return ((lo << m) | (hi >>> (32 - m))) | 0
+}
+
+/** The Keccak-f[1600] permutation, in place. */
+function keccakF(s: Int32Array): void {
+  const c = new Int32Array(10)
+  const b = new Int32Array(50)
+
+  for (let round = 0; round < 24; round += 1) {
+    // θ: fold each column, then mix the two neighbouring columns back in.
+    for (let x = 0; x < 5; x += 1) {
+      let lo = 0
+      let hi = 0
+      for (let y = 0; y < 5; y += 1) {
+        const i = 2 * (x + 5 * y)
+        lo ^= s[i] as number
+        hi ^= s[i + 1] as number
+      }
+      c[2 * x] = lo
+      c[2 * x + 1] = hi
+    }
+    for (let x = 0; x < 5; x += 1) {
+      const p = 2 * ((x + 4) % 5)
+      const n = 2 * ((x + 1) % 5)
+      const dLo = (c[p] as number) ^ rotLo(c[n] as number, c[n + 1] as number, 1)
+      const dHi = (c[p + 1] as number) ^ rotHi(c[n] as number, c[n + 1] as number, 1)
+      for (let y = 0; y < 5; y += 1) {
+        const i = 2 * (x + 5 * y)
+        s[i] = (s[i] as number) ^ dLo
+        s[i + 1] = (s[i + 1] as number) ^ dHi
+      }
+    }
+
+    // ρ and π: rotate each lane, then move it to its permuted position.
+    for (let i = 0; i < 25; i += 1) {
+      const j = KECCAK_PI[i] as number
+      const n = KECCAK_ROTATION[i] as number
+      b[2 * j] = rotLo(s[2 * i] as number, s[2 * i + 1] as number, n)
+      b[2 * j + 1] = rotHi(s[2 * i] as number, s[2 * i + 1] as number, n)
+    }
+
+    // χ: the only non-linear step.
+    for (let y = 0; y < 5; y += 1) {
+      for (let x = 0; x < 5; x += 1) {
+        const i = 2 * (x + 5 * y)
+        const i1 = 2 * (((x + 1) % 5) + 5 * y)
+        const i2 = 2 * (((x + 2) % 5) + 5 * y)
+        s[i] = (b[i] as number) ^ (~(b[i1] as number) & (b[i2] as number))
+        s[i + 1] = (b[i + 1] as number) ^ (~(b[i1 + 1] as number) & (b[i2 + 1] as number))
+      }
+    }
+
+    // ι: break the round symmetry.
+    s[0] = (s[0] as number) ^ (KECCAK_RC_LO[round] as number)
+    s[1] = (s[1] as number) ^ (KECCAK_RC_HI[round] as number)
+  }
+}
+
+/** XORs one rate-sized block into the state, little-endian per lane. */
+function absorb(s: Int32Array, data: Uint8Array, offset: number): void {
+  for (let i = 0; i < KECCAK_RATE; i += 1) {
+    const half = 2 * (i >> 3) + (((i & 7) < 4) ? 0 : 1)
+    s[half] = (s[half] as number) ^ ((data[offset + i] as number) << (8 * (i & 3)))
+  }
+}
+
+/** SHA3-256 over raw bytes, as a lowercase hex string. */
+export function sha3_256Hex(bytes: Uint8Array): string {
+  const s = new Int32Array(50)
+  let offset = 0
+  while (offset + KECCAK_RATE <= bytes.length) {
+    absorb(s, bytes, offset)
+    keccakF(s)
+    offset += KECCAK_RATE
+  }
+
+  // The final block carries the SHA-3 domain separator and the pad. When the
+  // remainder is exactly one byte short of the rate, both land on the same
+  // byte — which is why the second is an OR rather than an assignment.
+  const tail = new Uint8Array(KECCAK_RATE)
+  tail.set(bytes.subarray(offset), 0)
+  tail[bytes.length - offset] = 0x06
+  tail[KECCAK_RATE - 1] = (tail[KECCAK_RATE - 1] as number) | 0x80
+  absorb(s, tail, 0)
+  keccakF(s)
+
+  let out = ''
+  for (let i = 0; i < 32; i += 1) {
+    const half = 2 * (i >> 3) + (((i & 7) < 4) ? 0 : 1)
+    const byte = ((s[half] as number) >>> (8 * (i & 3))) & 0xff
+    out += HEX[byte >>> 4]
+    out += HEX[byte & 0xf]
+  }
+  return out
+}
+
+/** SHA3-256 over UTF-8 text. */
+export function sha3_256Text(text: string): string {
+  return sha3_256Hex(encoder.encode(text))
+}

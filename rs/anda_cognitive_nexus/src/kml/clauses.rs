@@ -21,10 +21,10 @@
 //! was once believed survives.
 
 use anda_kip::{
-    ConceptCreate, ConceptUpsert, CorrectEvidence, ElementKind, EnsureProposition, Json, KipError,
-    KipErrorCode, Map, MatchValue, MergeConcept, MutationClause, RecordCreate, RemovalStatement,
-    RetractAssertion, SetRetention, SupersedeAssertion, SymbolRef as AstSymbolRef,
-    TransitionActivity, UpdateAction, UpdateStatement,
+    ASSERTION_MODES, ConceptCreate, ConceptUpsert, CorrectEvidence, EVIDENCE_ROLES, ElementKind,
+    EnsureProposition, Json, KipError, KipErrorCode, Map, MatchValue, MergeConcept, MutationClause,
+    RecordCreate, RemovalStatement, RetractAssertion, STANCES, SetRetention, SupersedeAssertion,
+    SymbolRef as AstSymbolRef, TransitionActivity, UpdateAction, UpdateStatement,
 };
 use std::collections::BTreeMap;
 
@@ -103,19 +103,19 @@ pub async fn apply(
     operation: Option<&Map<String, Json>>,
 ) -> Result<(), KipError> {
     match clause {
-        MutationClause::CreateConcept(c) => create_concept(tx, c, request, operation).await,
+        MutationClause::CreateConcept(c) => create_concept(store, tx, c, request, operation).await,
         MutationClause::UpsertConcept(c) => upsert_concept(store, tx, c, request, operation).await,
         MutationClause::EnsureProposition(c) => {
             ensure_proposition(store, tx, c, request, operation).await
         }
         MutationClause::CreateEvidence(c) => {
-            create_record(tx, c, ElementKind::Evidence, request, operation).await
+            create_record(store, tx, c, ElementKind::Evidence, request, operation).await
         }
         MutationClause::CreateAssertion(c) => {
-            create_record(tx, c, ElementKind::Assertion, request, operation).await
+            create_record(store, tx, c, ElementKind::Assertion, request, operation).await
         }
         MutationClause::CreateActivity(c) => {
-            create_record(tx, c, ElementKind::Activity, request, operation).await
+            create_record(store, tx, c, ElementKind::Activity, request, operation).await
         }
         MutationClause::Update(c) => update_elements(store, tx, c, request, operation).await,
         MutationClause::RetractAssertion(c) => retract(store, tx, c, request, operation).await,
@@ -336,6 +336,21 @@ struct Structural {
 }
 
 impl Structural {
+    /// Rewrites every reference onto the Concept a merge made canonical (§11.3).
+    async fn canonicalize(&mut self, tx: &mut Transaction) -> Result<(), KipError> {
+        for edges in self.core.values_mut() {
+            for (value, _) in edges.iter_mut() {
+                *value = canonicalize_reference(tx, std::mem::take(value)).await?;
+            }
+        }
+        for value in self.profile.values_mut() {
+            if let Json::Array(items) = value {
+                *items = canonicalize_all(tx, std::mem::take(items)).await?;
+            }
+        }
+        Ok(())
+    }
+
     fn take(&mut self, field: &str) -> Vec<Edge> {
         self.core.remove(field).unwrap_or_default()
     }
@@ -364,6 +379,7 @@ fn collect_structural(
         return Ok(out);
     };
     let mut grouped: BTreeMap<String, Vec<Json>> = BTreeMap::new();
+    let mut claimed: BTreeMap<String, std::collections::BTreeSet<usize>> = BTreeMap::new();
     for edge in edges {
         let name = symbol_name(b, &edge.field)?;
         let value = structural_value(b.value(&edge.value, None)?);
@@ -382,7 +398,29 @@ fn collect_structural(
             &name,
             Intent::Write,
         )?;
-        grouped.entry(symbol.to_string()).or_default().push(value);
+        let field = symbol.to_string();
+        let ordered = tx.env.structural_field_def(&symbol)?.ordered;
+        // A declared position is honored on a create exactly as it is on an
+        // update (§17.4): a Concept written with its steps out of order and
+        // positions attached would otherwise land in mutation order, and the
+        // author would have no way to tell.
+        let index = match &edge.options {
+            Some(block) => match block.get("index") {
+                Some(value) => Some(read_index(&b.bound(value, None)?)?),
+                None => None,
+            },
+            None => None,
+        };
+        if let Some(index) = index
+            && !claimed.entry(field.clone()).or_default().insert(index)
+        {
+            return Err(KipError::constraint_violation(format!(
+                "two references claim position {index} of `{field}` in one mutation plan; an \
+                 order cannot hold both, and picking one would be the engine choosing (§17.4)"
+            )));
+        }
+        let items = grouped.entry(field.clone()).or_default();
+        update::place_reference(items, value, index, ordered, &field)?;
     }
     for (field, refs) in grouped {
         out.profile.insert(field, Json::Array(refs));
@@ -390,7 +428,18 @@ fn collect_structural(
     Ok(out)
 }
 
+/// Reads a structural reference's `index` option as a zero-based position.
+pub(crate) fn read_index(value: &Json) -> Result<usize, KipError> {
+    match value.as_u64() {
+        Some(index) => Ok(index as usize),
+        None => Err(KipError::type_mismatch(format!(
+            "a structural reference `index` is a zero-based position, got {value}"
+        ))),
+    }
+}
+
 async fn create_concept(
+    store: &Store,
     tx: &mut Transaction,
     clause: &ConceptCreate,
     request: Option<&Map<String, Json>>,
@@ -428,6 +477,10 @@ async fn create_concept(
         .map(|scalar| b.scalar_str(scalar, "CLIENT KEY"))
         .transpose()?
         .unwrap_or_default();
+    if resolve_client_key(store, tx, ElementKind::Concept, &client_key, &clause.handle).await? {
+        return Ok(());
+    }
+    let b = bindings(tx, request, operation);
     let mut fields = Fields(
         clause
             .set_fields
@@ -450,7 +503,11 @@ async fn create_concept(
 
     let facets = apply_facets(tx, &b, &clause.set_facets, ElementKind::Concept, None).await?;
     // A Concept has no Core structural fields; every one is Profile-defined.
-    let structural = collect_structural(tx, &b, clause.set_structural.as_ref(), &[])?.profile;
+    let mut structural = collect_structural(tx, &b, clause.set_structural.as_ref(), &[])?;
+    // §11.3: a new write resolves references through whatever merges the Space
+    // has already declared.
+    structural.canonicalize(tx).await?;
+    let structural = structural.profile;
 
     let (symbol, validation) =
         tx.env
@@ -479,6 +536,7 @@ async fn create_concept(
 }
 
 async fn create_record(
+    store: &Store,
     tx: &mut Transaction,
     clause: &RecordCreate,
     kind: ElementKind,
@@ -493,6 +551,10 @@ async fn create_record(
         .map(|scalar| b.scalar_str(scalar, "CLIENT KEY"))
         .transpose()?
         .unwrap_or_default();
+    if resolve_client_key(store, tx, kind, &client_key, &clause.handle).await? {
+        return Ok(());
+    }
+    let b = bindings(tx, request, operation);
     let mut fields = Fields(
         clause
             .set_fields
@@ -506,6 +568,11 @@ async fn create_record(
         collect_structural(tx, &b, clause.set_structural.as_ref(), core_fields(kind))?;
     let retention = fields.json("retention");
     require_retention_authority(tx, &retention)?;
+    // §11.3: a new write resolves references through whatever merges the Space
+    // has already declared. Doing this for tuple endpoints alone would leave a
+    // merge decorative everywhere else — new Assertions would keep piling up
+    // under a Concept the Space said was the same as another one.
+    structural.canonicalize(tx).await?;
 
     let row = match kind {
         ElementKind::Evidence => {
@@ -539,7 +606,10 @@ async fn create_record(
         }
         ElementKind::Assertion => {
             let proposition = require_reference(&mut fields, "proposition", "CREATE ASSERTION")?;
-            let asserted_by = fields.json("asserted_by");
+            // The semantic actor is a reference like any other, and a merged
+            // one has to resolve to the surviving identity or the actor's own
+            // claims split across two Concepts the Space calls one (§11.3).
+            let asserted_by = canonicalize_reference(tx, fields.json("asserted_by")).await?;
             // Each citation keeps the role it was cited in: Core records that
             // this Assertion cites E *as supporting*, and never that E proves
             // anything — that judgement belongs to the Projection (§8.4).
@@ -553,28 +623,30 @@ async fn create_record(
                     let mut citation = Map::new();
                     citation.insert("id".into(), Json::String(reference_id(&value)));
                     if let Some(role) = options.get("role") {
-                        citation.insert("role".into(), role.clone());
+                        // §20.13 fixes the Evidence roles, and a citation
+                        // whose role nobody can read is a citation whose
+                        // meaning is lost: `challenge` and `support` are the
+                        // difference between corroboration and dissent.
+                        let role = role.as_str().ok_or_else(|| {
+                            KipError::type_mismatch(format!(
+                                "an Evidence citation `role` must be a string, got {role}"
+                            ))
+                        })?;
+                        check_registry(role, "role", EVIDENCE_ROLES)?;
+                        citation.insert("role".into(), Json::String(role.to_string()));
                     }
-                    Json::Object(citation)
+                    Ok(Json::Object(citation))
                 })
-                .collect();
+                .collect::<Result<Vec<Json>, KipError>>()?;
             let valid_time = fields.json("valid_time");
             let row = AssertionRow {
                 _id: id.seq,
                 proposition_id: proposition.to_string(),
                 asserted_by_key: endpoint_key(&asserted_by),
                 asserted_by,
-                stance: require_text(&mut fields, "stance", "CREATE ASSERTION")?,
-                mode: require_text(&mut fields, "mode", "CREATE ASSERTION")?,
-                confidence: match fields.take("confidence") {
-                    None | Some(Json::Null) => -1.0,
-                    Some(Json::Number(n)) => n.as_f64().unwrap_or(-1.0),
-                    Some(other) => {
-                        return Err(KipError::type_mismatch(format!(
-                            "`confidence` must be a number in [0, 1], got {other}"
-                        )));
-                    }
-                },
+                stance: require_registry(&mut fields, "stance", STANCES, "CREATE ASSERTION")?,
+                mode: require_registry(&mut fields, "mode", ASSERTION_MODES, "CREATE ASSERTION")?,
+                confidence: read_confidence(&mut fields)?,
                 asserted_at: fields.timestamp("asserted_at")?,
                 valid_from: valid_time_part(&valid_time, "from")?,
                 valid_until: valid_time_part(&valid_time, "until")?,
@@ -589,11 +661,6 @@ async fn create_record(
                 retention,
                 ..Default::default()
             };
-            if row.confidence > 1.0 {
-                return Err(KipError::type_mismatch(
-                    "`confidence` is epistemic support in [0, 1]",
-                ));
-            }
             Element::Assertion(Box::new(row))
         }
         ElementKind::Activity => {
@@ -754,6 +821,7 @@ fn require_retention_authority(tx: &Transaction, retention: &Json) -> Result<(),
     if retention.is_null() {
         return Ok(());
     }
+    check_retention(retention)?;
     tx.require(Permission::ManageRetention)?;
     require_legal_hold_authority(tx, retention)
 }
@@ -765,6 +833,7 @@ fn require_retention_authority(tx: &Transaction, retention: &Json) -> Result<(),
 /// for everyone, so it is its own permission rather than part of retention
 /// management.
 fn require_legal_hold_authority(tx: &Transaction, retention: &Json) -> Result<(), KipError> {
+    check_retention(retention)?;
     let held = retention
         .get("legal_hold")
         .and_then(Json::as_bool)
@@ -1643,6 +1712,61 @@ async fn canonicalize(tx: &mut Transaction, endpoint: Endpoint) -> Result<Endpoi
     Ok(Endpoint::Local(*chain.last().unwrap_or(&id)))
 }
 
+/// Rewrites one reference value onto the Concept a merge made canonical.
+///
+/// §11.3: ordinary new writes canonicalize merged references. Doing it only
+/// for `ENSURE PROPOSITION` endpoints — which is where this started — makes a
+/// merge decorative for everything else: new Assertions keep accumulating
+/// under `asserted_by: :A` after A was merged into B, and the two identities
+/// the merge declared to be one never meet again.
+///
+/// A reference this cannot resolve is left exactly as written. Canonicalizing
+/// is a rewrite toward an identity the Space already declared; it is not a
+/// place to invent one.
+pub(crate) async fn canonicalize_reference(
+    tx: &mut Transaction,
+    value: Json,
+) -> Result<Json, KipError> {
+    let (text, was_object) = match &value {
+        Json::String(text) => (text.clone(), false),
+        Json::Object(map) => match map.get("id").and_then(Json::as_str) {
+            Some(id) => (id.to_string(), true),
+            None => return Ok(value),
+        },
+        _ => return Ok(value),
+    };
+    let Ok(id) = text.parse::<ElementId>() else {
+        return Ok(value);
+    };
+    if id.kind != ElementKind::Concept {
+        return Ok(value);
+    }
+    let chain = canonical_chain(tx, id).await?;
+    let canonical = *chain.last().unwrap_or(&id);
+    if canonical == id {
+        return Ok(value);
+    }
+    Ok(if was_object {
+        let mut map = match value {
+            Json::Object(map) => map,
+            _ => Map::new(),
+        };
+        map.insert("id".to_string(), Json::String(canonical.to_string()));
+        Json::Object(map)
+    } else {
+        Json::String(canonical.to_string())
+    })
+}
+
+/// Canonicalizes every reference in a list.
+async fn canonicalize_all(tx: &mut Transaction, values: Vec<Json>) -> Result<Vec<Json>, KipError> {
+    let mut out = Vec::with_capacity(values.len());
+    for value in values {
+        out.push(canonicalize_reference(tx, value).await?);
+    }
+    Ok(out)
+}
+
 /// The `merged_into` chain above one Concept, ending at its canonical id.
 ///
 /// Bounded independently of the cycle check that maintains it: a chain longer
@@ -1677,8 +1801,46 @@ async fn canonical_chain(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Whether an Activity has ended, and its provenance frozen (§16.6).
+///
+/// The set is the Core Package's, not this engine's (§20.13). Inventing a
+/// terminal state locally is how the two reference engines came to disagree
+/// about whether `TRANSITION ACTIVITY ... TO "cancelled"` froze anything —
+/// each had a plausible extra word and neither had the registry.
 fn is_terminal(status: &str) -> bool {
-    matches!(status, "completed" | "failed" | "cancelled" | "aborted")
+    anda_kip::ACTIVITY_TERMINAL.contains(&status)
+}
+
+/// Resolves a `CLIENT KEY` to the element an earlier attempt already created.
+///
+/// §52.1: a `CREATE` creates a historically distinct element *unless* a
+/// `client_key` proves a retry of the same logical creation. Returns whether
+/// the clause was satisfied by an existing element, in which case the handle
+/// now points at it and nothing is written — a retry writes nothing, which is
+/// what makes it a retry rather than a second creation.
+///
+/// The resolved element is authoritative: this does not compare the incoming
+/// fields against it and quietly rewrite one to match the other. A key that
+/// names two different logical creations is a client bug, and picking a winner
+/// silently would turn it into a data-loss bug.
+async fn resolve_client_key(
+    store: &Store,
+    tx: &mut Transaction,
+    kind: ElementKind,
+    client_key: &str,
+    handle: &str,
+) -> Result<bool, KipError> {
+    if client_key.is_empty() {
+        return Ok(false);
+    }
+    let Some(existing) = store
+        .find_by_client_key(&tx.cx.space, kind, client_key)
+        .await?
+    else {
+        return Ok(false);
+    };
+    tx.rebind(handle, existing);
+    Ok(true)
 }
 
 fn require_text(fields: &mut Fields, name: &str, clause: &str) -> Result<String, KipError> {
@@ -1690,6 +1852,70 @@ fn require_text(fields: &mut Fields, name: &str, clause: &str) -> Result<String,
     }
     Ok(value)
 }
+
+/// Reads a Core-registry field, refusing a word the registry does not name.
+///
+/// The protocol layer checks these too (§20.13), but only where the command
+/// spells a literal — a `:parameter` is bound *here*, at execution time, which
+/// is the first moment its value exists. Leaving the engine's half out is how
+/// `stance: :s` came to store `"maybe"`: the row keeps a word no reader can
+/// interpret, `?a.stance` reads back `null`, and the projection counts the
+/// Assertion as an actor who engaged — turning `insufficient` into `uncertain`
+/// on the strength of a typo.
+fn require_registry(
+    fields: &mut Fields,
+    name: &str,
+    registry: &[&str],
+    clause: &str,
+) -> Result<String, KipError> {
+    let value = require_text(fields, name, clause)?;
+    check_registry(&value, name, registry)?;
+    Ok(value)
+}
+
+/// Checks one value against a Core registry.
+pub(crate) fn check_registry(value: &str, name: &str, registry: &[&str]) -> Result<(), KipError> {
+    if registry.contains(&value) {
+        return Ok(());
+    }
+    Err(KipError::constraint_violation(format!(
+        "`{name}` is fixed by the Core Package (§20.13): it takes {}, not {value:?}",
+        registry.join(" | ")
+    )))
+}
+
+/// Reads `confidence`, which is epistemic support in `[0, 1]` (§13.6).
+///
+/// A missing confidence is stored as `-1.0`, the sentinel the view reads as
+/// "the actor stated none". A caller-supplied negative would land on the same
+/// sentinel and silently become silence, so the lower bound is checked as
+/// carefully as the upper one.
+fn read_confidence(fields: &mut Fields) -> Result<f64, KipError> {
+    match fields.take("confidence") {
+        None | Some(Json::Null) => Ok(NO_CONFIDENCE),
+        Some(Json::Number(number)) => {
+            let value = number.as_f64().ok_or_else(|| {
+                KipError::type_mismatch("`confidence` must be a number in [0, 1]")
+            })?;
+            if !(0.0..=1.0).contains(&value) {
+                return Err(KipError::constraint_violation(format!(
+                    "`confidence` is epistemic support in [0, 1] (§13.6), got {value}"
+                )));
+            }
+            Ok(value)
+        }
+        Some(other) => Err(KipError::type_mismatch(format!(
+            "`confidence` must be a number in [0, 1], got {other}"
+        ))),
+    }
+}
+
+/// The stored stand-in for "this Assertion states no confidence".
+///
+/// Out of band rather than `Option`, because the column is a plain `f64` that
+/// range queries run over; `[0, 1]` is enforced on the way in so nothing real
+/// can collide with it.
+pub(crate) const NO_CONFIDENCE: f64 = -1.0;
 
 fn require_reference(fields: &mut Fields, name: &str, clause: &str) -> Result<ElementId, KipError> {
     let value = fields.json(name);
@@ -1733,7 +1959,7 @@ fn evidence_id(value: &Json) -> Option<String> {
     }
 }
 
-fn endpoint_key(value: &Json) -> String {
+pub(crate) fn endpoint_key(value: &Json) -> String {
     Endpoint::from_json(value)
         .map(|endpoint| endpoint.key())
         .unwrap_or_default()
@@ -1785,6 +2011,53 @@ fn expires_at(retention: &Json) -> Result<String, KipError> {
             "`retention.expires_at` must be a timestamp, got {other}"
         ))),
     }
+}
+
+/// The members §19.1 gives the retention hook.
+const RETENTION_MEMBERS: &[&str] = &["retention_class", "expires_at", "legal_hold"];
+
+/// Checks a retention block against §19.1's shape.
+///
+/// A member outside it is refused rather than stored. The wire type carries
+/// exactly these three, so anything else is written, kept, and then read back
+/// as null — the caller's write appears to succeed while the value is
+/// unreachable from every query that could notice it went missing.
+pub(crate) fn check_retention(retention: &Json) -> Result<(), KipError> {
+    if retention.is_null() {
+        return Ok(());
+    }
+    let Json::Object(members) = retention else {
+        return Err(KipError::type_mismatch(format!(
+            "`retention` is an object with the members {}, got {retention}",
+            RETENTION_MEMBERS.join(", ")
+        )));
+    };
+    for name in members.keys() {
+        if !RETENTION_MEMBERS.contains(&name.as_str()) {
+            return Err(KipError::schema_field_not_found(format!(
+                "`retention` has no member named `{name}`; §19.1 gives it {}. Storage-lifecycle \
+                 state that needs a shape of its own belongs in a Facet",
+                RETENTION_MEMBERS.join(", ")
+            )));
+        }
+    }
+    match members.get("retention_class") {
+        None | Some(Json::Null) | Some(Json::String(_)) => {}
+        Some(other) => {
+            return Err(KipError::type_mismatch(format!(
+                "`retention.retention_class` is a string, got {other}"
+            )));
+        }
+    }
+    match members.get("legal_hold") {
+        None | Some(Json::Null) | Some(Json::Bool(_)) => {}
+        Some(other) => {
+            return Err(KipError::type_mismatch(format!(
+                "`retention.legal_hold` is a boolean, got {other}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn set_state(element: &mut Element, to: &str) {

@@ -61,6 +61,11 @@ describe('META', () => {
       expect(gaps).toContain('semantic_search')
       expect(gaps).toContain('historical_search')
       expect(gaps).toContain('search_over_assertions_and_activities')
+      // Closed gaps stay closed: each of these was on the list, and leaving a
+      // stale entry there is the same failure as a missing one — a caller
+      // reads it and does not try.
+      expect(gaps).not.toContain('space_self_identity')
+      expect(gaps).not.toContain('retention_expiry')
       // Every gap carries a reason, not just a name.
       for (const entry of report.unsupported) {
         expect(entry.reason.length, entry.capability).toBeGreaterThan(20)
@@ -294,14 +299,20 @@ describe('Capsules', () => {
       // Unsigned, and it says so by carrying no proofs rather than by
       // implying provenance it cannot support.
       expect(capsule.integrity.proofs).toEqual([])
-      expect(capsule.integrity.content_digest).toMatch(/^sha256:[0-9a-f]{64}$/)
+      // SHA3-256, the same profile `rs/anda_cognitive_nexus` writes: a
+      // Capsule is the one artifact that leaves this engine and is checked by
+      // another, so the algorithm is part of the contract rather than an
+      // engine choice.
+      expect(capsule.integrity.content_digest).toMatch(
+        /^sha3-256:[0-9a-f]{64}$/,
+      )
     })
   })
 
-  it('exports only the roots when the closure is turned off', async () => {
+  it('exports only the roots under a selective closure', async () => {
     await withNexus('roots-only', (nexus) => {
       const capsule = nexus.describe(
-        'EXPORT CAPSULE :out WHERE { ?a ASSERTION {} } WITH {closure: "none"}',
+        'EXPORT CAPSULE :out WHERE { ?a ASSERTION {} } WITH {closure: "selective"}',
       ) as { payload: { manifest: { completeness: string }; records: Record<string, unknown[]> } }
       expect(capsule.payload.records.assertions).toHaveLength(1)
       expect(capsule.payload.records.propositions).toHaveLength(0)

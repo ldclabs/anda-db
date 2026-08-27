@@ -142,8 +142,6 @@ export interface PropositionRow extends Envelope {
   object_key: string
   /** The tuple's structural identity within its Space (§12.5). */
   tuple_key: string
-  /** Representation-local state about the tuple itself (§12.9). */
-  attributes: JsonMap
 }
 
 /** One cited Evidence record and the role it plays (Spec §13.2). */
@@ -357,6 +355,16 @@ export interface SpaceRow {
   /** The Space's current sequence coordinate; every commit advances it. */
   seq: number
   schema_environment_version: number
+  /**
+   * The Concept this Space treats as its semantic `$self` (§5.6).
+   *
+   * Protected Space configuration, not cognitive content: ordinary KML has no
+   * path to it, and changing it is a Governance operation. Empty means the
+   * Space has designated none — which §5.6 admits, and which is the honest
+   * answer when nothing has been designated rather than a guess at which
+   * Person Concept "looks like" the Brain.
+   */
+  self_concept: string
   /** Space-local Governance settings that have no column of their own. */
   policies: JsonMap
 }

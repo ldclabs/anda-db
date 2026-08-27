@@ -350,6 +350,102 @@ impl Coordinate {
     }
 }
 
+/// One page of a paged answer: which traversal, pinned to which coordinate,
+/// and how far in.
+///
+/// §44.8 makes a KQL cursor preserve **one canonical cognitive snapshot for
+/// that traversal**, and §88.4 makes every cursor opaque or safely
+/// server-mapped. A bare offset is neither: page two of a query re-runs
+/// against whatever the Space holds by then, so a write between pages
+/// duplicates or skips rows — silently, since both pages look well-formed —
+/// and a caller can type any number it likes into a cursor slot.
+///
+/// The `family` tag is §102.28: a cursor issued by `HISTORY` must not continue
+/// a `FIND`, even though both count from zero. Without it the two are the same
+/// integer and the engine cannot tell which traversal it is being asked to
+/// resume.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageCursor {
+    /// Which operation family issued it.
+    pub family: CursorFamily,
+    /// The Space coordinate the traversal is pinned to.
+    pub snapshot_seq: u64,
+    /// How many rows of it the caller has already consumed.
+    pub offset: usize,
+}
+
+/// The operation families that issue page cursors (§102.28).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorFamily {
+    /// `FIND ... LIMIT ... CURSOR`.
+    Query,
+    /// `SEARCH ... LIMIT ... CURSOR`.
+    Search,
+    /// `LIST ... LIMIT ... CURSOR`.
+    List,
+    /// `HISTORY ELEMENT | SPACE`.
+    History,
+}
+
+impl CursorFamily {
+    fn tag(self) -> &'static str {
+        match self {
+            CursorFamily::Query => "find",
+            CursorFamily::Search => "search",
+            CursorFamily::List => "list",
+            CursorFamily::History => "history",
+        }
+    }
+}
+
+impl PageCursor {
+    /// The opaque token a client passes back to continue.
+    ///
+    /// Opaque by contract rather than by encryption, like a snapshot token: a
+    /// client that decoded it would be depending on a shape this engine may
+    /// change, and every field inside it is re-checked on the way back in.
+    pub fn to_token(self, space_id: &str) -> String {
+        hex::encode(format!(
+            "kip:cursor:{}:{space_id}:{}:{}",
+            self.family.tag(),
+            self.snapshot_seq,
+            self.offset
+        ))
+    }
+
+    /// Reads a token back, refusing one this engine did not issue for this
+    /// Space and this operation family.
+    pub fn from_token(token: &str, space_id: &str, family: CursorFamily) -> Result<Self, KipError> {
+        let invalid = || {
+            KipError::new(
+                KipErrorCode::CursorInvalidated,
+                format!(
+                    "{token:?} is not a {} cursor this engine issued for this Space; a cursor is \
+                     opaque and belongs to the traversal that produced it",
+                    family.tag()
+                ),
+            )
+        };
+        let decoded = hex::decode(token).map_err(|_| invalid())?;
+        let text = String::from_utf8(decoded).map_err(|_| invalid())?;
+        let rest = text.strip_prefix("kip:cursor:").ok_or_else(invalid)?;
+        let (tag, rest) = rest.split_once(':').ok_or_else(invalid)?;
+        if tag != family.tag() {
+            return Err(invalid());
+        }
+        let (rest, offset) = rest.rsplit_once(':').ok_or_else(invalid)?;
+        let (space, snapshot_seq) = rest.rsplit_once(':').ok_or_else(invalid)?;
+        if space != space_id {
+            return Err(invalid());
+        }
+        Ok(PageCursor {
+            family,
+            snapshot_seq: snapshot_seq.parse().map_err(|_| invalid())?,
+            offset: offset.parse().map_err(|_| invalid())?,
+        })
+    }
+}
+
 /// The JSON a snapshot answer carries.
 pub fn snapshot_json(space_id: &str, coordinate: Coordinate, schema_version: u64) -> Json {
     serde_json::json!({

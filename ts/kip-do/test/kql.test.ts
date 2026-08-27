@@ -268,20 +268,34 @@ describe('KQL', () => {
     })
   })
 
-  it('pages over a documented order', async () => {
+  it('pages over a documented order, on a cursor it issued itself', async () => {
     await withNexus('paging', (nexus) => {
       const all = nexus.query(
         'FIND(?c.name) WHERE { ?c CONCEPT {} } ORDER BY ?c.name',
       )
       expect(all).toHaveLength(3)
-      expect(
-        nexus.query('FIND(?c.name) WHERE { ?c CONCEPT {} } ORDER BY ?c.name LIMIT 2'),
-      ).toEqual(all.slice(0, 2))
-      expect(
-        nexus.query(
-          'FIND(?c.name) WHERE { ?c CONCEPT {} } ORDER BY ?c.name LIMIT 2 CURSOR "2"',
-        ),
-      ).toEqual(all.slice(2))
+      const first = nexus.queryPage(
+        'FIND(?c.name) WHERE { ?c CONCEPT {} } ORDER BY ?c.name LIMIT 2',
+      )
+      expect(first.rows).toEqual(all.slice(0, 2))
+      // §88.4: the cursor is opaque, not an offset a caller can type. §44.8:
+      // it carries the coordinate the traversal began at, so page two answers
+      // over the same canonical snapshot as page one.
+      expect(first.nextCursor).not.toBeNull()
+      expect(Number(first.nextCursor)).toBeNaN()
+
+      const second = nexus.queryPage(
+        `FIND(?c.name) WHERE { ?c CONCEPT {} } ORDER BY ?c.name LIMIT 2 CURSOR "${first.nextCursor}"`,
+      )
+      expect(second.rows).toEqual(all.slice(2))
+      expect(second.nextCursor).toBeNull()
+
+      // A bare offset is refused, and so is a cursor from another family: an
+      // integer that happens to be valid in both is exactly what §102.28 says
+      // must not be interchangeable.
+      expect(() =>
+        nexus.query('FIND(?c.name) WHERE { ?c CONCEPT {} } LIMIT 2 CURSOR "2"'),
+      ).toThrow()
     })
   })
 

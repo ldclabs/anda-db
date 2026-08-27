@@ -23,7 +23,12 @@ import type {
 import type { SchemaEnvironment } from '../schema/index.js'
 import type { Store } from '../store/index.js'
 import { Context } from './context.js'
-import { coordinateFromToken } from '../store/index.js'
+import {
+  coordinateFromToken,
+  pageCursorFromToken,
+  pageToken,
+  type PageCursor,
+} from '../store/index.js'
 import { normalizeTime } from '../time.js'
 import {
   scalarValue,
@@ -76,8 +81,24 @@ export interface KqlContext {
   environmentAt: (version: number) => SchemaEnvironment
 }
 
+/** One KQL answer, with the coordinates it was produced under (§50). */
+export interface KqlAnswer {
+  rows: Json[]
+  /** The coordinate this read answered at. */
+  snapshotSeq: number
+  /** The world-time basis, when `FOR TIME` named one. */
+  validAt: string | null
+  /** The cursor for the next page, when one remains. */
+  nextCursor: string | null
+}
+
 /** Runs one KQL query and returns the result array. */
 export function executeKql(query: KqlQuery, cx: KqlContext): Json[] {
+  return executeKqlPage(query, cx).rows
+}
+
+/** Runs one KQL query, reporting its coordinates and page cursor. */
+export function executeKqlPage(query: KqlQuery, cx: KqlContext): KqlAnswer {
   const b: ReadBindings = {
     request: cx.request ?? {},
     operation: cx.operation ?? {},
@@ -87,7 +108,27 @@ export function executeKql(query: KqlQuery, cx: KqlContext): Json[] {
     policy: policyFromSettings(epistemicSettings(query.epistemic, cx)),
   }
 
-  const asOf = bindCoordinate(query, cx, b)
+  // The cursor is read before the coordinate is bound, because it *is* one of
+  // the things that decides the coordinate.
+  const cursor =
+    query.cursor === null ? null : readCursor(query.cursor, b, cx.space)
+  const currentSeq = cx.store.currentSeq(cx.space)
+  const named = bindCoordinate(query, cx, b)
+  if (cursor !== null && named !== null && named !== cursor.snapshotSeq) {
+    throw errors.invalidRequestEnvelope(
+      `this cursor continues a traversal pinned to snapshot ` +
+        `${cursor.snapshotSeq}, and this read names ${named}; one traversal ` +
+        `answers at one coordinate`,
+    )
+  }
+  // A continuation is pinned to the coordinate its own first page read at
+  // (§44.8). Reconstruction is engaged only when the Space has moved on: at
+  // the current coordinate the version log would rebuild exactly what the live
+  // tables already hold.
+  const asOf =
+    named ??
+    (cursor !== null && cursor.snapshotSeq < currentSeq ? cursor.snapshotSeq : null)
+  const pinnedSeq = cursor?.snapshotSeq ?? named ?? currentSeq
   const env =
     asOf === null ? cx.env : cx.environmentAt(cx.store.schemaVersionAt(cx.space, asOf))
   const context = new Context(cx.store, env, cx.space, cx.authority, cx.auth, asOf)
@@ -108,15 +149,37 @@ export function executeKql(query: KqlQuery, cx: KqlContext): Json[] {
   const expressions = query.find_clause.expressions
 
   if (expressions.some((e) => 'Aggregation' in e)) {
-    return capResults(
-      aggregate(context, expressions, solutions, b),
-      context.resultLimit(),
-    )
+    return {
+      rows: capResults(
+        aggregate(context, expressions, solutions, b),
+        context.resultLimit(),
+      ),
+      snapshotSeq: pinnedSeq,
+      validAt,
+      // An aggregate is one row, so there is nothing to page.
+      nextCursor: null,
+    }
   }
 
   const ordered = sort(context, solutions, query.order_by, b)
-  const rows = page(ordered, query, b, context.resultLimit())
-  return rows.map((solution) => project(context, expressions, solution))
+  const paged = page(ordered, query, b, context.resultLimit(), cursor)
+  const consumed = paged.offset + paged.rows.length
+  return {
+    rows: paged.rows.map((solution) => project(context, expressions, solution)),
+    snapshotSeq: pinnedSeq,
+    validAt,
+    // The cursor carries the coordinate this page was read at, so the next one
+    // continues over the same canonical snapshot rather than over whatever the
+    // Space holds by then (§44.8).
+    nextCursor:
+      query.limit !== null && consumed < paged.total
+        ? pageToken(cx.space, {
+            family: 'find',
+            snapshotSeq: pinnedSeq,
+            offset: consumed,
+          })
+        : null,
+  }
 }
 
 /**
@@ -405,18 +468,19 @@ function compareValues(left: Json, right: Json): number {
 /**
  * Applies `LIMIT` and `CURSOR`.
  *
- * The cursor is a numeric offset over the documented order. It is deliberately
- * *not* interchangeable with the Rust engine's, which uses element-anchored
- * keyset tokens for some projection shapes — a token from one engine handed to
- * the other would page through a different sequence while looking valid.
+ * The cursor is the opaque token this engine issued (§88.4), carrying the
+ * coordinate the traversal began at so the next page continues over the same
+ * canonical snapshot (§44.8) and the family that produced it so a `HISTORY`
+ * cursor cannot resume a `FIND` (§102.28).
  */
 function page(
   solutions: readonly Solution[],
   query: KqlQuery,
   b: ReadBindings,
   governedLimit: number | null,
-): Solution[] {
-  const offset = query.cursor === null ? 0 : cursorOffset(query.cursor, b)
+  cursor: PageCursor | null,
+): { rows: Solution[]; total: number; offset: number } {
+  const offset = cursor?.offset ?? 0
   const requested = query.limit === null ? null : count(query.limit, b, 'LIMIT')
   const limit =
     requested === null
@@ -425,23 +489,31 @@ function page(
         ? requested
         : Math.min(requested, governedLimit)
   const from = solutions.slice(offset)
-  return limit === null ? from : from.slice(0, limit)
+  return {
+    rows: limit === null ? from : from.slice(0, limit),
+    total: solutions.length,
+    offset,
+  }
 }
 
 function capResults(rows: Json[], governedLimit: number | null): Json[] {
   return governedLimit === null ? rows : rows.slice(0, governedLimit)
 }
 
-function cursorOffset(cursor: Scalar, b: ReadBindings): number {
+/** Reads a `CURSOR` slot as the opaque token this engine issues. */
+function readCursor(
+  cursor: Scalar,
+  b: ReadBindings,
+  space: string,
+): PageCursor {
   const value = scalarValue(cursor, b)
-  const offset = typeof value === 'string' ? Number(value) : value
-  if (typeof offset !== 'number' || !Number.isInteger(offset) || offset < 0) {
+  if (typeof value !== 'string') {
     throw errors.cursorTypeMismatch(
-      `a CURSOR from this engine is a non-negative offset, got ` +
+      `a CURSOR is the opaque token this engine issued, got ` +
         `${JSON.stringify(value)}`,
     )
   }
-  return offset
+  return pageCursorFromToken(value, space, 'find')
 }
 
 function count(scalar: Scalar, b: ReadBindings, what: string): number {

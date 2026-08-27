@@ -61,18 +61,21 @@ export {
   type ReferencePolicy,
 } from './purge.js'
 
-export { redactView } from './redact.js'
+export { redactView, toIdentityOnly } from './redact.js'
 
 export {
   AUTHORITY_KEY,
   LINEAGE_KEY,
   QUARANTINE_KEY,
+  archiveExpired,
   ceilingOf,
   classify,
   elevateAuthority,
+  expireAssertion,
   lineageOf,
   quarantine,
   release,
+  tombstoneExpired,
   type ElementGovernanceContext,
 } from './element.js'
 

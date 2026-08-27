@@ -66,16 +66,8 @@ export const TABLE_SPECS: Readonly<Record<string, TableSpec>> = {
     ['aliases', 'attributes'],
   ),
   propositions: spec(
-    [
-      'subject',
-      'subject_key',
-      'predicate_ref',
-      'object',
-      'object_key',
-      'tuple_key',
-      'attributes',
-    ],
-    ['subject', 'object', 'attributes'],
+    ['subject', 'subject_key', 'predicate_ref', 'object', 'object_key', 'tuple_key'],
+    ['subject', 'object'],
   ),
   assertions: spec(
     [
@@ -152,6 +144,7 @@ export const TABLE_SPECS: Readonly<Record<string, TableSpec>> = {
       'created_at',
       'seq',
       'schema_environment_version',
+      'self_concept',
       'policies',
     ],
     json: new Set(['owners', 'policies']),

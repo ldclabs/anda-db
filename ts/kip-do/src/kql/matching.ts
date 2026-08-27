@@ -34,6 +34,7 @@ import type {
   ObjectMatcher,
   PredAtom,
   PropositionMatcher,
+  PropositionTriple,
   Term,
   WhereClause,
 } from '../kip/ast.js'
@@ -49,8 +50,11 @@ import {
   project,
   slotPropositions,
   slotToJson,
+  ungroundedBelief,
   type Policy,
+  type Slot,
 } from '../projection/index.js'
+import { nowTime } from '../time.js'
 import { Context, LIMITS } from './context.js'
 import { evaluateFilter } from './filter.js'
 import {
@@ -811,7 +815,14 @@ function belief(
   const out: Solution[] = []
   for (const solution of incoming) {
     const target = beliefTarget(cx, clause.target, solution, b)
-    const projected = project(cx, target, b.policy)
+    // A fully grounded tuple that resolves to no Proposition still gets an
+    // answer (§46.4): `insufficient` with a null id. Refusing, or returning no
+    // row, makes the Agent infer "unknown" from "the pattern did not match" —
+    // the inference §24 exists to prevent.
+    const projected =
+      target === null
+        ? ungroundedBelief(cx, b.policy, nowTime())
+        : project(cx, target, b.policy)
     const next = extend(
       solution,
       clause.variable,
@@ -822,13 +833,18 @@ function belief(
   return out
 }
 
-/** The Proposition a BELIEF clause names. */
+/**
+ * The Proposition a BELIEF clause names.
+ *
+ * `null` means a fully grounded tuple that no Proposition matches — the §46.4
+ * case, which is an answer rather than an error.
+ */
 function beliefTarget(
   cx: Context,
   target: BeliefTarget,
   solution: Solution,
   b: ReadBindings,
-): ElementId {
+): ElementId | null {
   if ('Proposition' in target) {
     const bound = solution.get(target.Proposition)
     if (bound === undefined || bound.kind !== 'element') {
@@ -849,16 +865,41 @@ function beliefTarget(
     }
     return parseElementId(value)
   }
-  // An inline tuple: resolved the way a pattern would, and refused when it
-  // names no Proposition on record rather than projecting about nothing.
+  // An inline tuple: resolved the way a pattern would.
   const tuple = propositions(cx, '__belief', { Tuple: target.Tuple }, [solution], b)
   const first = tuple[0]?.get('__belief')
   if (first === undefined || first.kind !== 'element') {
+    // Only a *fully grounded* tuple earns the §46.4 answer. A tuple with an
+    // unbound end asked about a family of slots, and "no Proposition" there is
+    // an empty match, not one belief about nothing.
+    if (tupleIsGrounded(target.Tuple, solution, b)) return null
     throw errors.notFoundOrNotVisible(
       'the BELIEF tuple names no Proposition on record here',
     )
   }
   return first.id
+}
+
+/**
+ * Whether every position of a tuple names something exactly (§46.3).
+ *
+ * This is what separates "the Proposition does not exist" from "the pattern did
+ * not match": only a fully grounded tuple asks about one Proposition, so only a
+ * fully grounded tuple can be answered with one belief about the Proposition
+ * that is missing.
+ */
+function tupleIsGrounded(
+  tuple: PropositionTriple,
+  solution: Solution,
+  b: ReadBindings,
+): boolean {
+  if (termEndpoint(tuple.subject, solution, b) === null) return false
+  if (termEndpoint(tuple.object, solution, b) === null) return false
+  // A traversal path is never grounded in this sense: §46.1 refuses a raw path
+  // under BELIEF precisely because projection must not propagate belief along
+  // one.
+  if (!('Atom' in tuple.predicate)) return false
+  return !('Variable' in tuple.predicate.Atom)
 }
 
 /**
@@ -899,13 +940,25 @@ function beliefSlot(
     }
     const predicateRef = resolveSymbol(cx, 'predicate', name)
     const key = endpointKey(endpointFromJson(subject))
-    const beliefs = slotPropositions(cx, key, predicateRef).map((id) =>
-      project(cx, id, b.policy),
-    )
+    const validAt = nowTime()
+    const slot: Slot = {
+      candidates: slotPropositions(cx, key, predicateRef).map((id) =>
+        project(cx, id, b.policy, validAt),
+      ),
+      policy: b.policy,
+      validAt,
+      asOf: cx.asOf ?? null,
+      warnings: [
+        'no trust model is applied: every eligible corroboration group counts ' +
+          'equally, whoever asserted it',
+        'no evidence-quality evaluation is applied: a cited Evidence record is ' +
+          'counted for its independence, never for how good it is',
+      ],
+    }
     const next = extend(
       solution,
       clause.variable,
-      literalBinding(slotToJson(subject, predicateRef, beliefs) as Json),
+      literalBinding(slotToJson(subject, predicateRef, slot) as Json),
     )
     if (next !== null) out.push(next)
   }

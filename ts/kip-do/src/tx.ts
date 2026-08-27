@@ -345,6 +345,39 @@ export class Transaction {
     return id
   }
 
+  /**
+   * Claims one explicit position in an ordered structural field (§17.4).
+   *
+   * Returns `false` when this plan already claimed it — two references cannot
+   * both be third, and picking one would be the engine choosing.
+   *
+   * Plan-wide rather than clause-wide, because §17.4 forbids *conflicting
+   * explicit positions in one mutation plan* and a plan is free to spread them
+   * across clauses.
+   */
+  claimPosition(elementId: number, field: string, index: number): boolean {
+    const key = `${elementId}\u001f${field}`
+    const claimed = this.structuralPositions.get(key) ?? new Set<number>()
+    if (claimed.has(index)) return false
+    claimed.add(index)
+    this.structuralPositions.set(key, claimed)
+    return true
+  }
+
+  /**
+   * Re-points a declared handle at an element that already exists.
+   *
+   * The shell minted for the handle stays unstaged and is discarded at commit,
+   * so a resolved retry writes nothing at all — which is the point: §52.1 says
+   * a `client_key` proves a *retry*, and a retry that left a spare row behind
+   * would still be a duplicate, just an invisible one.
+   */
+  rebind(name: string, id: ElementId): void {
+    this.handleMap.set(name, id)
+  }
+
+  private readonly structuralPositions = new Map<string, Set<number>>()
+
   /** Mints an element with no handle — an anonymous `ENSURE PROPOSITION`. */
   mint(kind: ElementKind): ElementId {
     const id = this.store.reserve(kind, this.cx.space)

@@ -47,6 +47,36 @@ pub struct Policy {
     pub unstated_confidence: f64,
     /// Whether a functional predicate's competing values oppose one another.
     pub expand_conflicts: bool,
+    /// How much of the Epistemic Ledger the answer carries (§49.1).
+    pub explanation: Explanation,
+}
+
+/// How much explanation a projection returns (Spec §49.1).
+///
+/// A caller that asked for `none` and got the full ledger has been handed the
+/// Assertion ids, the actors and the exclusion reasons it declined — which
+/// §49.2 treats as a disclosure decision rather than a formatting one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Explanation {
+    /// The status and scores only.
+    None,
+    /// The scores, the group counts and the warnings; no Assertion ids.
+    Summary,
+    /// The whole Epistemic Ledger (§27.4).
+    Ledger,
+}
+
+impl Explanation {
+    fn parse(value: &Json) -> Result<Self, KipError> {
+        match value.as_str() {
+            Some("none") => Ok(Explanation::None),
+            Some("summary") => Ok(Explanation::Summary),
+            Some("ledger") => Ok(Explanation::Ledger),
+            _ => Err(KipError::constraint_violation(format!(
+                "`explanation` is one of \"none\" | \"summary\" | \"ledger\" (§49.1), got {value}"
+            ))),
+        }
+    }
 }
 
 impl Default for Policy {
@@ -76,6 +106,7 @@ impl Policy {
             material: 0.3,
             unstated_confidence: 0.5,
             expand_conflicts: true,
+            explanation: Explanation::Ledger,
         }
     }
 
@@ -134,6 +165,46 @@ impl Policy {
             policy.modes = parse_modes(modes)?;
             overridden = true;
         }
+        // §49's own vocabulary. These name eligibility, not weighting: a
+        // hypothetical admitted here is still a hypothetical, and the answer
+        // still says which policy it ran under.
+        if let Some(include) = flag(settings, "include_hypothetical")? {
+            set_mode(&mut policy.modes, AssertionMode::Hypothetical, include);
+            overridden = true;
+        }
+        if let Some(include) = flag(settings, "include_predicted")? {
+            set_mode(&mut policy.modes, AssertionMode::Predicted, include);
+            overridden = true;
+        }
+        if let Some(include) = flag(settings, "include_historical")? {
+            // Retracted and superseded Assertions are history, and history is
+            // not what this Brain currently holds (§14). Admitting them into a
+            // projection would let a withdrawn claim decide a present belief,
+            // which is the one thing retraction is for.
+            if include {
+                return Err(KipError::unsupported_capability(
+                    "`include_historical` would let retracted and superseded Assertions decide a \
+                     present belief; read the history with FIND ... AS OF, which answers at a \
+                     coordinate where those claims still stood",
+                ));
+            }
+        }
+        if let Some(level) = settings.get("explanation") {
+            policy.explanation = Explanation::parse(level)?;
+            overridden = true;
+        }
+        // `purpose` and `risk` are the caller's own non-authoritative context
+        // (§71): they reach Governance through the request envelope, where a
+        // session-bound purpose outranks them, and they must not quietly
+        // reconfigure the arithmetic here.
+        for name in settings.keys() {
+            if !EPISTEMIC_SETTINGS.contains(&name.as_str()) {
+                return Err(KipError::schema_field_not_found(format!(
+                    "`WITH EPISTEMIC` has no setting named `{name}`; it takes {}",
+                    EPISTEMIC_SETTINGS.join(", ")
+                )));
+            }
+        }
         if policy.material > policy.accept {
             return Err(KipError::invalid_syntax(format!(
                 "`material` ({}) must not exceed `accept` ({}); a side cannot be decisive at a \
@@ -174,6 +245,44 @@ impl Policy {
             self.id.clone(),
             anda_kip::PolicyVersion::Integer(self.version),
         )
+    }
+}
+
+/// Every member `WITH EPISTEMIC` accepts.
+///
+/// Checked exhaustively, because the alternative is what this block used to
+/// do: parse `explanation: "none"`, return the whole ledger anyway, and report
+/// success. A setting that is accepted and ignored is indistinguishable from
+/// one that was honored.
+const EPISTEMIC_SETTINGS: &[&str] = &[
+    "policy",
+    "accept",
+    "material",
+    "modes",
+    "include_hypothetical",
+    "include_predicted",
+    "include_historical",
+    "explanation",
+    "purpose",
+    "risk",
+];
+
+fn flag(settings: &Map<String, Json>, key: &str) -> Result<Option<bool>, KipError> {
+    match settings.get(key) {
+        None | Some(Json::Null) => Ok(None),
+        Some(Json::Bool(value)) => Ok(Some(*value)),
+        Some(other) => Err(KipError::type_mismatch(format!(
+            "`{key}` is a boolean, got {other}"
+        ))),
+    }
+}
+
+fn set_mode(modes: &mut Vec<AssertionMode>, mode: AssertionMode, include: bool) {
+    let present = modes.contains(&mode);
+    match (include, present) {
+        (true, false) => modes.push(mode),
+        (false, true) => modes.retain(|existing| *existing != mode),
+        _ => {}
     }
 }
 

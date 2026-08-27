@@ -85,3 +85,21 @@ function redactOrigin(system: unknown): void {
   if (!Object.hasOwn(block, 'origin')) return
   block.origin = { redacted: 'read_raw_origin' }
 }
+
+/**
+ * Narrows a view to identity alone: discoverable, unreadable (§29.1, §29.2).
+ *
+ * The caller holds `discover` and not `read`, so it may learn the element is
+ * there and nothing about what it says. Everything but the always-visible
+ * members goes, and a `withheld` marker takes their place — because an element
+ * rendered as `{id, kind}` with no explanation reads as an element that happens
+ * to be empty, and "empty" is a claim about the content.
+ */
+export function toIdentityOnly(view: JsonMap): void {
+  for (const key of Object.keys(view)) {
+    if (!ALWAYS_VISIBLE.includes(key)) delete view[key]
+  }
+  view.withheld =
+    'this Principal may discover this element but not read it; its content ' +
+    'is withheld, not absent'
+}

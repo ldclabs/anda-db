@@ -319,9 +319,22 @@ async fn each_immutable_target_is_refused_with_the_code_that_says_what_to_do() {
         (
             "p",
             r#"UPDATE :x SET ATTRIBUTES {note: "about the tuple"}"#,
-            // A Proposition's attributes are representation-local, so this one
-            // is legal; the tuple itself is what cannot move.
-            "",
+            // §6.4 removed the universal author-writable metadata bag, and
+            // §12.2 gives a Proposition its tuple and the common envelope and
+            // nothing else. A bag here would be the one place §12.6's
+            // forbidden fields — confidence, asserted_by, observed_at — could
+            // be written onto a truth-neutral tuple and read back as if they
+            // belonged to it.
+            "ImmutableField",
+        ),
+        (
+            "p",
+            // A Facet is the sanctioned namespaced extension (§18.1), and it
+            // is validated rather than accepting anything: this Profile
+            // declares `MnemonicState` for Concepts, so a Proposition is
+            // refused by the schema rather than by the element kind.
+            r#"UPDATE :x SET FACET "MnemonicState" {memory_strength: 0.4}"#,
+            "ConstraintViolation",
         ),
         (
             "alice",

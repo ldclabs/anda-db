@@ -254,6 +254,19 @@ pub struct PredicateDef {
     /// Whether the recorded set is claimed to be exhaustive.
     #[serde(default)]
     pub complete: bool,
+    /// Groups of object values that cannot hold together for one subject
+    /// (§25.1, §12.7).
+    ///
+    /// The weaker sibling of [`functional`](Self::functional). A functional
+    /// predicate lets one object be true at a time, so *every* rival value
+    /// conflicts. An exclusive group says only that these particular values
+    /// exclude one another, while values outside it coexist freely: a person
+    /// may hold many tags and still not be both `alive` and `dead`.
+    ///
+    /// Each entry is one group. Values are written as they appear in a
+    /// Proposition object — an exact element reference, or a Literal.
+    #[serde(default)]
+    pub exclusive_values: Vec<Vec<Json>>,
     /// Anything else, including the algebraic hints of §52–§55.
     #[serde(flatten)]
     pub extra: Map<String, Json>,

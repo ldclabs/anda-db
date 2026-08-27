@@ -11,7 +11,7 @@
 //!
 //! ```text
 //! Concept      name · canonical_id · aliases · attributes · facets · structural
-//! Proposition  attributes · facets            (the tuple itself is immutable, §12.5)
+//! Proposition  facets                         (the tuple is its whole content, §12.2)
 //! Assertion    facets                         (epistemic payload is history, §15.1)
 //! Evidence     facets                         (an observation is corrected, never edited, §70)
 //! Activity     facets                         (topology is finalized by TRANSITION, §93)
@@ -242,27 +242,147 @@ async fn set_structural(
     if kind != ElementKind::Concept {
         return Err(immutable_target(kind, id, "SET STRUCTURAL"));
     }
-    let b = bindings(tx, request, operation);
-    let mut resolved: Vec<(String, Json)> = Vec::with_capacity(edges.len());
-    for edge in edges {
-        let field = resolve_structural_field(tx, &b, &edge.field)?;
-        resolved.push((field, structural_value(b.value(&edge.value, Some(view))?)));
+    let mut resolved = resolve_edges(tx, edges, Some(view), request, operation)?;
+    // §11.3: a reference added now resolves through whatever merges the Space
+    // has already declared, so an edge cannot re-point at an identity the
+    // Space said was the same as another one.
+    for edge in &mut resolved {
+        edge.value = super::clauses::canonicalize_reference(tx, edge.value.clone()).await?;
     }
 
-    let structural = structural_mut(tx, id).await?;
     let mut applied = Applied::default();
-    for (field, value) in resolved {
+    for edge in resolved {
+        if edge.index.is_some() && !tx.claim_position(id, &edge.field, edge.index.unwrap_or(0)) {
+            return Err(position_taken(&edge.field, edge.index.unwrap_or(0)));
+        }
+        let structural = structural_mut(tx, id).await?;
         let entry = structural
-            .entry(field)
+            .entry(edge.field.clone())
             .or_insert_with(|| Json::Array(Vec::new()));
-        if let Json::Array(items) = entry
-            && !items.contains(&value)
-        {
-            items.push(value);
+        let Json::Array(items) = entry else { continue };
+        // §17.5: on a single-cardinality field, `SET STRUCTURAL` *replaces*.
+        // Appending and then failing the cardinality check would refuse the
+        // one write the Specification says this form is for.
+        if edge.single {
+            let replaced = items.first() != Some(&edge.value);
+            items.clear();
+            items.push(edge.value);
+            applied.changed |= replaced;
+            continue;
+        }
+        if place_reference(items, edge.value, edge.index, edge.ordered, &edge.field)? {
             applied.changed = true;
         }
     }
     Ok(applied)
+}
+
+/// One resolved `SET STRUCTURAL` edge: where it points, and where it goes.
+pub(crate) struct ResolvedEdge {
+    pub field: String,
+    pub value: Json,
+    pub index: Option<usize>,
+    pub ordered: bool,
+    /// Whether the field holds at most one reference (§17.5).
+    pub single: bool,
+}
+
+/// Resolves the field symbol, the target and the declared position of each edge.
+pub(crate) fn resolve_edges(
+    tx: &Transaction,
+    edges: &[StructuralEdge],
+    view: Option<&Json>,
+    request: Option<&Map<String, Json>>,
+    operation: Option<&Map<String, Json>>,
+) -> Result<Vec<ResolvedEdge>, KipError> {
+    let b = bindings(tx, request, operation);
+    let mut resolved = Vec::with_capacity(edges.len());
+    for edge in edges {
+        let field = resolve_structural_field(tx, &b, &edge.field)?;
+        let symbol: crate::schema::SymbolRef = field.parse()?;
+        let def = tx.env.structural_field_def(&symbol)?;
+        let ordered = def.ordered;
+        let single = def.cardinality.max == Some(1);
+        let index = match &edge.options {
+            Some(options) => match options.get("index") {
+                Some(value) => Some(super::clauses::read_index(&b.bound(value, view)?)?),
+                None => None,
+            },
+            None => None,
+        };
+        resolved.push(ResolvedEdge {
+            field,
+            value: structural_value(b.value(&edge.value, view)?),
+            index,
+            ordered,
+            single,
+        });
+    }
+    Ok(resolved)
+}
+
+fn position_taken(field: &str, index: usize) -> KipError {
+    KipError::constraint_violation(format!(
+        "two references claim position {index} of `{field}` in one mutation plan; an order cannot \
+         hold both, and picking one would be the engine choosing (§17.4)"
+    ))
+}
+
+/// Places one reference in a structural field, honoring declared order (§17.4).
+///
+/// An **ordered** field carries one stable, dense, zero-based total order per
+/// source element. Three rules the Specification states as MUSTs, and which
+/// this engine used to accept and then drop on the floor:
+///
+/// - a reference written without an index appends, in mutation order;
+/// - an explicit `{index: n}` declares the intended position, and one outside
+///   the dense range `0..=len` fails validation — positions are dense, and
+///   appending is exactly `len`;
+/// - two explicit positions that collide inside one mutation plan fail.
+///
+/// An **unordered** field has no positions at all, so `{index: n}` on one is
+/// refused rather than ignored: silently dropping it would let an author
+/// believe they had ordered something no query can order.
+///
+/// Returns whether the field's contents changed.
+pub(crate) fn place_reference(
+    items: &mut Vec<Json>,
+    value: Json,
+    index: Option<usize>,
+    ordered: bool,
+    field: &str,
+) -> Result<bool, KipError> {
+    let Some(index) = index else {
+        if items.iter().any(|item| same_reference(item, &value)) {
+            return Ok(false);
+        }
+        items.push(value);
+        return Ok(true);
+    };
+
+    if !ordered {
+        return Err(KipError::constraint_violation(format!(
+            "`{field}` is not an ordered structural field, so a reference in it has no position; \
+             an `index` here would order nothing and no query could read it back (§17.4)"
+        )));
+    }
+
+    // A reference already present is moved rather than duplicated: re-stating
+    // one with a position is how an author re-orders.
+    let existing = items.iter().position(|item| same_reference(item, &value));
+    if let Some(from) = existing {
+        items.remove(from);
+    }
+    if index > items.len() {
+        return Err(KipError::constraint_violation(format!(
+            "position {index} is outside `{field}`, which holds {} reference(s); positions are \
+             dense, and appending is position {} (§17.4)",
+            items.len(),
+            items.len()
+        )));
+    }
+    items.insert(index, value);
+    Ok(existing != Some(index))
 }
 
 async fn unset_structural(
@@ -332,7 +452,6 @@ async fn attributes_mut<'a>(
 ) -> Result<&'a mut Map<String, Json>, KipError> {
     match tx.load(id).await? {
         Element::Concept(row) => Ok(&mut row.attributes),
-        Element::Proposition(row) => Ok(&mut row.attributes),
         other => Err(immutable_target(other.kind(), id, what)),
     }
 }
@@ -390,8 +509,11 @@ fn immutable_target(kind: ElementKind, id: ElementId, what: &str) -> KipError {
         ElementKind::Proposition => KipError::new(
             KipErrorCode::ImmutableField,
             format!(
-                "{what} does not reach a Proposition's tuple: a different tuple is a different \
-                 Proposition (§12.5)"
+                "{what} does not reach a Proposition: the tuple is its whole content (§12.2), a \
+                 different tuple is a different Proposition (§12.5), and it carries no \
+                 author-writable attribute bag (§6.4). Representation-local state about a tuple \
+                 goes in a Facet; anything with its own source, confidence or validity is an \
+                 Assertion"
             ),
         ),
         ElementKind::Concept => KipError::new(

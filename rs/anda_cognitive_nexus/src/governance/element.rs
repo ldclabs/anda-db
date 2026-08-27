@@ -541,6 +541,152 @@ fn engine_origin(auth: &AuthContext) -> Json {
     })
 }
 
+/// Archives one element whose retention has lapsed (§19.1).
+///
+/// The lapse is the *reason*, and it is recorded on the element rather than
+/// only in the audit: an element that left ordinary recall on a schedule and
+/// one a moderator archived are different facts, and a reader that cannot tell
+/// them apart will read a retention sweep as a judgement about the content.
+pub async fn archive_expired(
+    store: &Store,
+    space_id: &str,
+    id: ElementId,
+    authority: &EffectiveAuthority,
+    auth: &AuthContext,
+) -> Result<(), KipError> {
+    expire(
+        store,
+        space_id,
+        id,
+        state::ARCHIVED,
+        Permission::Archive,
+        authority,
+        auth,
+    )
+    .await
+}
+
+/// Tombstones one element whose retention has lapsed (§19.1).
+pub async fn tombstone_expired(
+    store: &Store,
+    space_id: &str,
+    id: ElementId,
+    authority: &EffectiveAuthority,
+    auth: &AuthContext,
+) -> Result<(), KipError> {
+    expire(
+        store,
+        space_id,
+        id,
+        state::TOMBSTONED,
+        Permission::Tombstone,
+        authority,
+        auth,
+    )
+    .await
+}
+
+/// The shared body of the retention sweep's two actions.
+#[allow(clippy::too_many_arguments)]
+async fn expire(
+    store: &Store,
+    space_id: &str,
+    id: ElementId,
+    new_state: &'static str,
+    permission: Permission,
+    authority: &EffectiveAuthority,
+    auth: &AuthContext,
+) -> Result<(), KipError> {
+    let element = readable(store, space_id, id, authority, auth).await?;
+    if element.state() != state::ACTIVE {
+        // Already out of ordinary recall. Re-stating it would bump a version
+        // and write a change record for a transition that did not happen.
+        return Ok(());
+    }
+    let resource = ResourceContext::of_element(&element);
+    // Expiry is not an exemption: reaching an element still costs what
+    // reaching it always costs.
+    let approved = decide(store, space_id, &resource, permission, authority, auth).await?;
+    let patch = |governance: &Json| set_member(governance, RETENTION_LAPSED_KEY, Json::Bool(true));
+    apply(
+        store,
+        space_id,
+        element,
+        "retention_expiry",
+        "retention_expiry",
+        Some(new_state),
+        patch,
+        |version| serde_json::json!({"state": new_state, "version": version}),
+        approved,
+        auth,
+    )
+    .await?;
+    Ok(())
+}
+
+/// The Governance member that records why an element left ordinary recall.
+const RETENTION_LAPSED_KEY: &str = "retention_lapsed";
+
+/// Marks an Assertion whose validity window has closed as `expired` (§14.3).
+///
+/// Expiry is not retraction and not supersession. §14.1 is explicit that
+/// administrative action must not falsely mark an Assertion retracted when no
+/// withdrawal occurred — and a claim whose own stated window has run out was
+/// never withdrawn by anybody. It is also not storage retention (§19.2): the
+/// record is kept, and what lapsed is its currency.
+///
+/// The projection still admits an expired Assertion at a coordinate its window
+/// covered, so this loses no history; it records, once, what the temporal stage
+/// would otherwise re-derive on every read.
+pub async fn expire_assertion(
+    store: &Store,
+    space_id: &str,
+    id: ElementId,
+    authority: &EffectiveAuthority,
+    auth: &AuthContext,
+) -> Result<bool, KipError> {
+    let element = readable(store, space_id, id, authority, auth).await?;
+    let Element::Assertion(row) = &element else {
+        return Err(KipError::structural_reference_invalid(format!(
+            "{id} is not an Assertion; only an Assertion has an epistemic lifecycle (§14)"
+        )));
+    };
+    if row.status != "active" || row.valid_until.is_empty() {
+        return Ok(false);
+    }
+    if row.valid_until.as_str() > crate::time::now().as_str() {
+        return Ok(false);
+    }
+    let resource = ResourceContext::of_element(&element);
+    let approved = decide(
+        store,
+        space_id,
+        &resource,
+        Permission::Maintain,
+        authority,
+        auth,
+    )
+    .await?;
+    let mut expired = element;
+    if let Element::Assertion(row) = &mut expired {
+        row.status = "expired".to_string();
+    }
+    apply(
+        store,
+        space_id,
+        expired,
+        "expire",
+        "expire_assertion",
+        None,
+        |governance| governance.clone(),
+        |version| serde_json::json!({"version": version}),
+        approved,
+        auth,
+    )
+    .await?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

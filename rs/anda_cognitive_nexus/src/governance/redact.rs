@@ -82,6 +82,28 @@ fn redact_origin(system: &mut Json) {
     );
 }
 
+/// Narrows a view to identity alone: discoverable, unreadable (§29.1, §29.2).
+///
+/// The caller holds `discover` and not `read`, so it may learn the element is
+/// there and nothing about what it says. Everything but the members
+/// [`ALWAYS_VISIBLE`] names goes, and a `withheld` marker takes their place —
+/// because an element rendered as `{id, kind}` with no explanation reads as an
+/// element that happens to be empty, and "empty" is a claim about the content.
+pub fn to_identity_only(view: &mut Json) {
+    let Some(object) = view.as_object_mut() else {
+        return;
+    };
+    object.retain(|key, _| ALWAYS_VISIBLE.contains(&key.as_str()));
+    object.insert(
+        "withheld".to_string(),
+        Json::String(
+            "this Principal may discover this element but not read it; its content is withheld, \
+             not absent"
+                .to_string(),
+        ),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

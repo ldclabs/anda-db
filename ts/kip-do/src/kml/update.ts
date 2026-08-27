@@ -17,6 +17,12 @@
  * update, and only the engine knows that A-7 is an Assertion.
  */
 
+import {
+  edgeIndex,
+  orderedField,
+  placeReference,
+  positionTaken,
+} from './clauses.js'
 import { errors } from '../errors.js'
 import { formatElementId, type ElementId } from '../id.js'
 import { isJsonMap, jsonEquals, type Json, type JsonMap } from '../json.js'
@@ -68,6 +74,23 @@ export function requireUpdatable(id: ElementId, element: Element): void {
  * element is already in must not burn a version or emit a change record for a
  * transition that did not happen (§44).
  */
+/**
+ * Why an element kind has no author-writable attribute bag.
+ *
+ * §6.4 removed the universal metadata bag, and §12.2 gives a Proposition its
+ * tuple and the common envelope and nothing else. A bag there would be the one
+ * place §12.6's forbidden fields — confidence, asserted_by, observed_at —
+ * could be written onto a truth-neutral tuple and read back as if they
+ * belonged to it.
+ */
+function noAttributeBag(kind: string): string {
+  return (
+    `a ${kind} carries no author-writable attribute bag (§6.4). ` +
+    `Representation-local state goes in a Facet; anything with its own ` +
+    `source, confidence or validity is an Assertion`
+  )
+}
+
 export function applyAction(
   tx: Transaction,
   b: Bindings,
@@ -119,10 +142,8 @@ export function applyAction(
   }
 
   if ('SetAttributes' in action) {
-    if (element.kind !== 'Concept' && element.kind !== 'Proposition') {
-      throw errors.immutableField(
-        `a ${element.kind} carries no attributes`,
-      )
+    if (element.kind !== 'Concept') {
+      throw errors.immutableField(noAttributeBag(element.kind))
     }
     Object.assign(
       element.row.attributes,
@@ -132,8 +153,8 @@ export function applyAction(
   }
 
   if ('UnsetAttributes' in action) {
-    if (element.kind !== 'Concept' && element.kind !== 'Proposition') {
-      throw errors.immutableField(`a ${element.kind} carries no attributes`)
+    if (element.kind !== 'Concept') {
+      throw errors.immutableField(noAttributeBag(element.kind))
     }
     for (const name of action.UnsetAttributes) {
       delete element.row.attributes[name]
@@ -167,10 +188,16 @@ export function applyAction(
       const field = resolveStructural(tx, b, edge)
       const value = referenceValue(mutationValue(b, edge.value, read), field)
       const current = row.structural[field]
-      row.structural[field] = [
-        ...(Array.isArray(current) ? current : []),
-        value,
-      ]
+      const items = Array.isArray(current) ? [...current] : []
+      const index = edgeIndex(b, edge)
+      // §17.4 forbids conflicting explicit positions *in one mutation plan*,
+      // and a plan is free to spread them across clauses — so the claim is
+      // tracked on the transaction rather than per clause.
+      if (index !== null && !tx.claimPosition(element.row.id, field, index)) {
+        throw positionTaken(field, index)
+      }
+      placeReference(items, value, index, orderedField(tx, field), field)
+      row.structural[field] = items
     }
     return
   }

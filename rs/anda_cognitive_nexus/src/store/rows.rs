@@ -166,8 +166,6 @@ pub struct PropositionRow {
     /// against instead of racing two writers into a duplicate.
     #[unique]
     pub tuple_key: String,
-    /// Representation-local state about the tuple itself (§12.9).
-    pub attributes: Map<String, Json>,
     /// Schema-validated Facets.
     pub facets: Map<String, Json>,
     /// Profile structural fields.
@@ -445,6 +443,14 @@ pub struct SpaceRow {
     pub seq: u64,
     /// The active Schema Environment version.
     pub schema_environment_version: u64,
+    /// The Concept this Space treats as its semantic `$self` (§5.6).
+    ///
+    /// Protected Space configuration, not cognitive content: ordinary KML has
+    /// no path to it, and changing it is a Governance operation. Empty means
+    /// the Space has designated none — which §5.6 admits, and which is the
+    /// honest answer when nothing has been designated rather than a guess at
+    /// which Person Concept "looks like" the Brain.
+    pub self_concept: String,
     /// Space-local Governance settings that have no column of their own.
     pub policies: Json,
 }

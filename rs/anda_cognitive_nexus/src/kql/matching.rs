@@ -362,6 +362,7 @@ impl Context<'_> {
     /// relation would be a separate Proposition plus Assertion.
     pub async fn match_structural(
         &mut self,
+        edge: Option<&str>,
         subject: &Term,
         field: &AstSymbolRef,
         object: &Term,
@@ -380,6 +381,15 @@ impl Context<'_> {
         let symbol = self
             .env
             .resolve_symbol(SymbolKind::StructuralField, &name, Intent::Read)?;
+        // §17.4: an ordered field exposes each reference's current position as
+        // `?edge.index`; an unordered one exposes no index at all, so the
+        // member reads null there rather than reporting a position the field
+        // does not have.
+        let ordered = self
+            .env
+            .structural_field_def(&symbol)
+            .map(|def| def.ordered)
+            .unwrap_or(false);
 
         let source = self.endpoint_slot(subject)?;
         let target = self.endpoint_slot(object)?;
@@ -394,6 +404,9 @@ impl Context<'_> {
         self.charge(sources.len())?;
 
         let mut vars: Vec<String> = Vec::new();
+        if let Some(edge) = edge {
+            vars.push(edge.to_string());
+        }
         for slot in [&source, &target] {
             if let EndpointSlot::Bind(name) = slot
                 && !vars.contains(name)
@@ -418,7 +431,7 @@ impl Context<'_> {
             else {
                 continue;
             };
-            for reference in refs {
+            for (position, reference) in refs.iter().enumerate() {
                 let bound = endpoint_binding(reference);
                 if let EndpointSlot::Fixed(expected) = &target
                     && endpoint_binding(&expected.to_json()) != bound
@@ -426,6 +439,24 @@ impl Context<'_> {
                     continue;
                 }
                 let mut solution = vec![Binding::Null; vars.len()];
+                if let Some(edge) = edge {
+                    // §43.7: the bound edge is *virtual* structural query
+                    // state, explicitly "not necessarily a durable Cognitive
+                    // Element" — so it binds as the value it is, describing
+                    // the reference rather than standing in for a record Core
+                    // does not keep.
+                    set(
+                        &vars,
+                        &mut solution,
+                        edge,
+                        Binding::Literal(serde_json::json!({
+                            "source": {"id": id.to_string()},
+                            "field": symbol.to_string(),
+                            "target": reference.clone(),
+                            "index": ordered.then_some(position),
+                        })),
+                    );
+                }
                 if let EndpointSlot::Bind(name) = &source {
                     set(&vars, &mut solution, name, Binding::Element(id));
                 }
@@ -492,6 +523,34 @@ impl Context<'_> {
                 .to_string());
         }
         Ok(text.clone())
+    }
+
+    /// Whether every position of a tuple names something exactly (§46.3).
+    ///
+    /// This is what separates "the Proposition does not exist" from "the
+    /// pattern did not match": only a fully grounded tuple asks about one
+    /// Proposition, so only a fully grounded tuple can be answered with one
+    /// belief about the Proposition that is missing.
+    fn tuple_is_grounded(&mut self, triple: &PropositionTriple) -> Result<bool, KipError> {
+        let ends = [
+            self.endpoint_slot(&triple.subject)?,
+            self.endpoint_slot(&triple.object)?,
+        ];
+        if ends
+            .iter()
+            .any(|slot| matches!(slot, EndpointSlot::Bind(_)))
+        {
+            return Ok(false);
+        }
+        // A traversal path is never grounded in this sense: §46.1 refuses a
+        // raw path under BELIEF precisely because projection must not
+        // propagate belief along one.
+        let PredTerm::Atom(atom) = &triple.predicate else {
+            return Ok(false);
+        };
+        Ok(
+            matches!(self.predicate_atom(atom)?, PredicateSlot::Fixed(symbols) if symbols.len() == 1),
+        )
     }
 
     fn endpoint_slot(&mut self, term: &Term) -> Result<EndpointSlot, KipError> {
@@ -1035,6 +1094,13 @@ impl Context<'_> {
         let policy = self.policy.clone();
         let at = self.at.clone();
 
+        // A fully grounded tuple that resolves to no Proposition still gets an
+        // answer (§46.4). The alternative — no row — makes the Agent infer
+        // "unknown" from "the pattern did not match", which is the inference
+        // §24 exists to prevent, and it reads exactly like a query that was
+        // written wrong.
+        let mut ungrounded = false;
+
         // When the target is a variable an earlier pattern bound, the result
         // has to carry that variable too, or the join would cross-product every
         // projection against every Proposition.
@@ -1063,13 +1129,26 @@ impl Context<'_> {
                 let found = self
                     .match_tuple(Some("__belief_target"), triple, &Solutions::unit())
                     .await?;
-                (None, found.elements_of("__belief_target"))
+                let ids = found.elements_of("__belief_target");
+                // Only a *fully grounded* tuple earns the §46.4 answer. A
+                // tuple with an unbound end asked about a family of slots, and
+                // "no Proposition" there is an empty match, not one belief
+                // about nothing.
+                ungrounded = ids.is_empty() && self.tuple_is_grounded(triple)?;
+                (None, ids)
             }
         };
 
         let mut vars = vec![variable.to_string()];
         if let Some(name) = &carried {
             vars.push(name.clone());
+        }
+        if ungrounded {
+            let belief = self.ungrounded_belief(&policy, &at);
+            return Ok(Solutions::table(
+                vars,
+                vec![vec![Binding::Literal(belief.to_json())]],
+            ));
         }
         let mut rows = Vec::with_capacity(propositions.len());
         for id in propositions {
@@ -1099,8 +1178,8 @@ impl Context<'_> {
         let policy = self.policy.clone();
         let at = self.at.clone();
 
-        let subject_key = match self.endpoint_slot(subject)? {
-            EndpointSlot::Fixed(endpoint) => endpoint.key(),
+        let subject = match self.endpoint_slot(subject)? {
+            EndpointSlot::Fixed(endpoint) => endpoint,
             EndpointSlot::Bind(name) => {
                 return Err(KipError::projection_target_unbounded(format!(
                     "?{name} is unbound, so this would project every slot in the Space; identify \
@@ -1108,6 +1187,7 @@ impl Context<'_> {
                 )));
             }
         };
+        let subject_key = subject.key();
         let predicate_ref = match self.predicate_atom(predicate)? {
             PredicateSlot::Fixed(mut symbols) if symbols.len() == 1 => symbols.remove(0),
             _ => {
@@ -1117,10 +1197,10 @@ impl Context<'_> {
             }
         };
 
-        let beliefs = self
+        let slot = self
             .project_slot(&subject_key, &predicate_ref, &policy, &at)
             .await?;
-        let rendered = crate::projection::slot_to_json(&subject_key, &predicate_ref, &beliefs);
+        let rendered = crate::projection::slot_to_json(&subject, &predicate_ref, &slot);
         Ok(Solutions::table(
             vec![variable.to_string()],
             vec![vec![Binding::Literal(rendered)]],

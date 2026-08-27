@@ -73,6 +73,21 @@ const BELIEF = (name: string) => `WHERE {
   ?b BELIEF (?p)
 }`
 
+/**
+ * How many independent corroboration groups support `(Alice, prefers, Loud)`.
+ *
+ * §27.2 asks a side for its `root_groups` — the groups themselves, not a count
+ * — so the count is taken here rather than read off the wire. A reader that
+ * only ever sees a number cannot check that the groups were really
+ * independent, which is the whole question §23 is about.
+ */
+function rootGroups(nexus: CognitiveNexus): number {
+  const [groups] = nexus.query(
+    `FIND(?b.support.root_groups) ${BELIEF('Loud')}`,
+  ) as unknown[][]
+  return (groups ?? []).length
+}
+
 /** Adds one Assertion about a Proposition, by actor name. */
 function assert_(
   nexus: CognitiveNexus,
@@ -173,18 +188,13 @@ describe('the Epistemic Projection', () => {
       assert_(nexus, 'Loud', 'Alice', 'support', 0.6)
       assert_(nexus, 'Loud', 'Alice', 'support', 0.6)
       assert_(nexus, 'Loud', 'Alice', 'support', 0.6)
-      expect(
-        nexus.query(`FIND(?b.support.independent_groups) ${BELIEF('Loud')}`),
-      ).toEqual([1])
+      expect(rootGroups(nexus)).toBe(1)
       expect(nexus.query(`FIND(?b.support.score) ${BELIEF('Loud')}`)).toEqual([0.6])
       // Three independent moderate sources say more than one, and still not
       // enough to be a probability.
       assert_(nexus, 'Loud', 'Bob', 'support', 0.6)
       assert_(nexus, 'Loud', 'Carol', 'support', 0.6)
-      const [groups] = nexus.query(
-        `FIND(?b.support.independent_groups) ${BELIEF('Loud')}`,
-      ) as number[]
-      expect(groups).toBe(3)
+      expect(rootGroups(nexus)).toBe(3)
       const [score] = nexus.query(`FIND(?b.support.score) ${BELIEF('Loud')}`) as number[]
       expect(score).toBeCloseTo(1 - 0.4 ** 3, 10)
       expect(nexus.query(`FIND(?b.status) ${BELIEF('Loud')}`)).toEqual(['accepted'])
@@ -199,9 +209,7 @@ describe('the Epistemic Projection', () => {
       const seen = newEvidence(nexus, 'the same observation')
       assert_(nexus, 'Loud', 'Alice', 'support', 0.6, seen)
       assert_(nexus, 'Loud', 'Bob', 'support', 0.6, seen)
-      expect(
-        nexus.query(`FIND(?b.support.independent_groups) ${BELIEF('Loud')}`),
-      ).toEqual([1])
+      expect(rootGroups(nexus)).toBe(1)
       expect(nexus.query(`FIND(?b.support.score) ${BELIEF('Loud')}`)).toEqual([0.6])
     })
   })

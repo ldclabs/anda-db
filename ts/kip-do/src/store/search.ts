@@ -53,16 +53,19 @@ const CONCEPT: SearchableKind = {
 const PROPOSITION: SearchableKind = {
   fts: 'fts_propositions',
   table: 'propositions',
-  columns: ['predicate_ref', 'attributes'],
+  // A Proposition's whole content is its tuple (§12.2), so the only text it
+  // has of its own is the predicate it was written under. The endpoints carry
+  // the words, and they are Concepts and Literals a search reaches on their
+  // own terms.
+  columns: ['predicate_ref'],
   textOf: (element) => {
-    const row = element.row as { predicate_ref: string; attributes: JsonMap }
+    const row = element.row as { predicate_ref: string }
     return [
       // The exact symbol, segmented like anything else: `unicode61` splits it
       // at the scheme and path separators, so `SEARCH PROPOSITION "prefers"`
       // finds tuples under `kip://profiles/cognitive-memory@2.0.0/prefers`
       // without the caller having to know the package it came from.
       segmentToText(row.predicate_ref),
-      segmentToText(extractJsonText(row.attributes).join(' ')),
     ]
   },
 }

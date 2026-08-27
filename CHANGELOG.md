@@ -2,7 +2,185 @@
 
 All notable changes to this workspace are documented in this file.
 
-## [Unreleased] — logical keys, `SEARCH` in `@ldclabs/kip-do`, and the Core registries
+## [Unreleased] — holding the engines to the Specification, below the syntax
+
+`anda_kip` 0.13.0, `anda_cognitive_nexus` 0.13.0,
+`anda_cognitive_nexus_server` 0.13.0, `@ldclabs/kip-do` 0.13.0 (still
+unpublished, so this accumulates into the same version).
+
+The previous entry brought the *protocol layer* in line with the Specification
+it vendors. This one does the same for the two engines underneath it, and the
+findings fall into three shapes.
+
+**Values that were accepted and then silently dropped.** The Core registries
+(§20.13) were enforced against a written literal and not against a bound
+parameter — so `stance: :s` with `"maybe"` committed, read back as `null`, and
+counted in the projection as an actor who had engaged, turning `insufficient`
+into `uncertain` on the strength of a typo. `{index: n}` on an ordered
+structural field parsed and went nowhere. Every `WITH EPISTEMIC` member §49
+names except four was ignored, `explanation: "none"` included, so a caller that
+declined the ledger got it anyway. `SET RETENTION` accepted members the wire
+type cannot carry. The request envelope's `preconditions`, `requires`, `ingest`
+and `deadline_ms` were read by nobody.
+
+**Answers that were well-formed and wrong.** A page cursor was a decimal
+offset: not opaque (§88.4), not pinned to a snapshot (§44.8), and
+interchangeable between operation families (§102.28), so a write between two
+pages silently duplicated or skipped rows. A fully grounded `BELIEF` about a
+Proposition nobody had created returned *no rows* instead of `insufficient`
+(§46.4) — the inference §24 exists to prevent, and indistinguishable from a
+query written wrong. A `BELIEF SLOT` leaked the storage layer's endpoint key
+(`id\u001fC-1`) where §8 fixes a reference shape.
+
+**Contracts the engines stated and did not keep.** `CLIENT KEY` was stored and
+never read, so §52.1's retry-safe creation created twice. `DESCRIBE
+CAPABILITIES` claimed retention was "enforced per element" while nothing swept
+on `expires_at`. The Primer could not satisfy §64.2 because §5.6's Space self
+identity was not modelled at all. And the three wire types the previous release
+added to `anda_kip` — `Projection`, `ChangeEnvelope`, `Capabilities` — were
+used by neither engine, which is how `support.root_groups` came to be spelled
+`independent_groups` on one side alone.
+
+KIP 2.0 is unreleased, so these are fixed rather than carried forward.
+
+### Changed — breaking
+
+- **A Proposition has no author-writable attribute bag.** §6.4 removed the
+  universal metadata bag and §12.2 gives a Proposition its tuple and the common
+  envelope and nothing else. The bag was the one place §12.6's forbidden fields
+  — `confidence`, `asserted_by`, `observed_at` — could be written onto a
+  truth-neutral tuple and read back as if they belonged to it. The column and
+  its FTS coverage are gone in both engines; representation-local state about a
+  tuple goes in a Facet.
+- **`support.root_groups` replaces `independent_groups`** (§27.2), and carries
+  the groups rather than a count: which actors and which Evidence collapsed
+  into each independent root, which is what lets a reader check that they were
+  really independent. `temporal.as_of_seq` is reported alongside `valid_at`.
+- **A page cursor is an opaque token.** `CURSOR "2"` is refused; the token a
+  previous page returned is what continues it. It carries the Space, the
+  coordinate the traversal began at, and the operation family that issued it.
+- **A Capsule closure uses §40.3's vocabulary** — `closed` / `referential` /
+  `selective`, where `none` used to mean `selective`. A `closed` export fails
+  rather than shipping a self-containment claim with a hole in it, a
+  `referential` one declares what it does not carry as `external_refs` (§40.1),
+  and `proof_profile` is refused rather than ignored.
+- **`options.deadline_ms` is refused** rather than accepted and ignored (§80.1,
+  §80.2).
+
+### Fixed — the Core registries reach the values a command actually carries
+
+`stance`, `mode`, an Evidence citation `role` and an Assertion's lifecycle
+status are checked against §20.13 wherever they are written: a literal, a bound
+parameter, or an imported Capsule record. `confidence` is bounded at both ends
+— the lower one matters, because `-1` is the stored stand-in for "the actor
+stated none", so a negative that got through would be stored as *silence*
+rather than as a wrong number.
+
+The Activity terminal states are the Core Package's, from
+`anda_kip::ACTIVITY_TERMINAL`. The two engines had invented their own and
+disagreed: `cancelled` froze an Activity in Rust and not in TypeScript, and
+`aborted` froze it in both while §20.13 does not name it.
+
+### Fixed — §17.4 ordered structural references
+
+An explicit `{index: n}` declares a position; a position outside the dense
+range `0..len` fails validation; two references claiming one position in a
+mutation plan fail. `?edge STRUCTURAL (…)` binds the edge and exposes
+`?edge.index` — §43.7 calls it "virtual structural query state, not necessarily
+a durable Cognitive Element", which is what it now is rather than a reason to
+refuse it. A single-cardinality field replaces on `SET STRUCTURAL` (§17.5)
+instead of appending and failing its own cardinality check.
+
+### Fixed — the request envelope
+
+`preconditions.space_seq` and `preconditions.schema_environment_version` are
+checked before the command runs (§35.4). `requires` is checked against the
+capability names `DESCRIBE CAPABILITIES` reports, and an unrecognized name is
+refused rather than assumed satisfied (§67) — a fail-fast check that passes
+because nobody recognized it is worse than none. `ingest` mints its Evidence
+inside the command's own transaction and binds each `key` as a request
+parameter (§71.1), which is the Specification's answer to §88.12: an
+observation reaches Evidence from the transport rather than through
+model-written command text that can truncate or invent it.
+
+### Added — §5.6 Space self identity, and §64.2
+
+A Space may designate one Concept as its semantic `$self`. It is protected
+Space configuration reached through `Session::designate_self` /
+`Session.designateSelf`, never a KML clause: cognitive content that could name
+the Brain's own identity would be content deciding who the Brain is.
+`DESCRIBE PRIMER` now reports the authenticated Principal and the designated
+self as the two different things §64.2 requires it to distinguish, and carries
+§64.3's safety reminders in full rather than half of them.
+
+### Added — retention expiry and the `expired` lifecycle
+
+`retention.expires_at` was stored, indexed, and read by nothing. `sweep_expired`
+acts on what lapsed, and `expire_lapsed_assertions` marks the Assertions whose
+validity windows closed as `expired` (§14.3) — a state the model named and
+nothing produced. Both engines have both.
+
+Both are explicit rather than background timers: a thread or an alarm that
+deleted memory on its own schedule would act while no request was in flight and
+no Principal was accountable for it. A legal hold stops a sweep the holder
+authorized (§163), and the report says how many were left and why rather than
+returning a smaller number that reads as the whole truth. Purge is deliberately
+not one of the actions — §19.3 makes erasure high-impact with its own reference
+policy, and running it over a set the caller never enumerated would be the
+largest irreversible action either engine can take, reached by a maintenance
+call.
+
+A projection still admits an `expired` Assertion at a coordinate its window
+covered, so `FOR TIME` in the past does not lose every claim that has since
+lapsed.
+
+### Added — the conflict shape §92 requires and §29's permission split
+
+A Schema Package may declare `exclusive_values`: groups of object values that
+cannot hold together for one subject (§25.1, §12.7). It is the weaker sibling of
+`functional` — a person may hold many tags without being both alive and dead —
+and §92 requires both.
+
+`discover` and `read` are now different answers at element scope (§29.1,
+§29.2). A Principal holding `discover` alone learns an element is there and
+nothing about what it says; `read` subsumes `discover`, because content nobody
+may know exists is not content anybody can read.
+
+### Fixed — merged references canonicalize on every write
+
+§11.3 was implemented for `ENSURE PROPOSITION` endpoints only, which left a
+merge decorative everywhere else: new Assertions kept accumulating under
+`asserted_by: :A` after A was merged into B, and the two identities the merge
+declared to be one never met again. Every reference slot canonicalizes now.
+
+### Fixed — smaller things
+
+- **A Capsule written by either engine verifies in the other.** The digest is
+  taken over `anda_kip::canonical_json` (RFC 8785, §37.7) rather than each
+  engine's own encoder, and both hash it with SHA3-256 — `@ldclabs/kip-do`
+  gained a synchronous Keccak for the purpose, because the digest is taken
+  inside `transactionSync` where `crypto.subtle` cannot be awaited. A literal
+  in each engine's tests pins the same payload to the same digest, so a drift
+  on either side turns one test red rather than making every cross-engine
+  `VERIFY CAPSULE` fail for a reason neither side can see. The engine-local
+  digests — tuple identity, package content, purge stubs — stay on SHA-256;
+  none of them crosses a boundary, and changing them would rewrite every stored
+  `tuple_key`. `VERIFY` refuses a digest profile it cannot compute instead of
+  reporting a mismatch, because the second is an accusation of tampering.
+- `DESCRIBE CAPSULE` answers, in both engines. The refusal said "this engine
+  has no Capsule reader" while `VERIFY CAPSULE` was using one.
+- A KQL answer reports `snapshot_seq`, `valid_at` and its `cursor` in the
+  result context (§50). `valid_at` was added to `ResultContext` in the previous
+  release and populated by nobody.
+- `SEARCH` widens its candidate window and reports whether the page was
+  exhaustive: the index spans the database while a search is Space-scoped, so a
+  narrow Space could have its whole page crowded out by hits it may not see
+  (§66.6).
+- `DESCRIBE CAPABILITIES` declares the §89 conformance profiles it claims — a
+  MUST that neither engine met — and splits `available` and `limits` from
+  `supported` (§67).
+
+## Earlier in this cycle — logical keys, `SEARCH` in `@ldclabs/kip-do`, and the Core registries
 
 `anda_kip` 0.13.0, `anda_cognitive_nexus` 0.13.0,
 `anda_cognitive_nexus_server` 0.13.0, `@ldclabs/kip-do` 0.13.0 (still
@@ -25,9 +203,8 @@ batches) are still reported by `DESCRIBE CAPABILITIES`.
 FTS5 with BM25 ranking (§66).
 
 - **The corpus mirrors `anda_cognitive_nexus` field for field** — Concept
-  `name` / `aliases` / `attributes`, Proposition `predicate_ref` /
-  `attributes`, Evidence `payload_inline`, through the same `extract_json_text`
-  shape. Two engines ranking one corpus differently is a quality difference a
+  `name` / `aliases` / `attributes`, Proposition `predicate_ref`, Evidence
+  `payload_inline`, through the same `extract_json_text` shape. Two engines ranking one corpus differently is a quality difference a
   caller can live with; two engines searching *different text* is a correctness
   difference nobody can debug from the outside.
 - **The index is maintained inside the write transaction.** Maintenance hangs

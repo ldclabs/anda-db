@@ -22,7 +22,12 @@
 
 import { errors } from '../errors.js'
 import type { AuthContext, EffectiveAuthority } from '../governance/index.js'
-import { isPermitted, redactView, spaceResource } from '../governance/index.js'
+import {
+  isPermitted,
+  redactView,
+  spaceResource,
+  toIdentityOnly,
+} from '../governance/index.js'
 import { formatElementId, type ElementId, type ElementKind } from '../id.js'
 import type { JsonMap } from '../json.js'
 import type { SchemaEnvironment } from '../schema/index.js'
@@ -191,15 +196,20 @@ export class Context {
   /**
    * Applies the read decision to one element, caching its redacted view.
    *
-   * Returns `null` for an element this caller may not read, and caches the
-   * **redacted** view for one it may — so a `FILTER` or an `ORDER BY` on a
+   * Returns `null` for an element this caller may not *discover*, and caches
+   * the **redacted** view for one it may — so a `FILTER` or an `ORDER BY` on a
    * masked field sees what the projection would, rather than being able to probe
    * the value through row membership (§109).
+   *
+   * An element the caller may discover but not read comes back with its
+   * identity and nothing else (§29.2). It still exists, is still counted and
+   * can still be cited; what it says stays closed.
    */
   private admit(key: string, element: Element | null): Element | null {
     if (element === null || element.row.space !== this.space) return null
-    const constraints = this.authority.mayRead(element, this.auth)
-    if (constraints === null) return null
+    const visibility = this.authority.mayRead(element, this.auth)
+    if (visibility === null) return null
+    const { constraints } = visibility
     if (constraints.max_results !== null) {
       this.governedResultLimit =
         this.governedResultLimit === null
@@ -207,7 +217,11 @@ export class Context {
           : Math.min(this.governedResultLimit, constraints.max_results)
     }
     const view = render(element)
-    redactView(view, constraints, this.readOrigin)
+    if (visibility.content) {
+      redactView(view, constraints, this.readOrigin)
+    } else {
+      toIdentityOnly(view)
+    }
     this.views.set(key, view)
     return element
   }

@@ -178,6 +178,26 @@ function label(resource: ResourceContext): string {
   return 'the Space'
 }
 
+/**
+ * What one caller may see of one element (§29.1, §29.2).
+ *
+ * Two answers rather than one, because the Specification asks two questions. A
+ * `null` from `mayRead` means the element is outside this caller's query
+ * universe entirely; a `Visibility` with `content: false` means it exists and
+ * its contents do not come back.
+ */
+export interface Visibility {
+  /** The field mask and result cap that apply to the content. */
+  constraints: AuthorityConstraints
+  /**
+   * Whether the content fields may be returned at all.
+   *
+   * `false` is `discover` without `read`: the element is real, it can be
+   * counted and cited, and what it says stays closed.
+   */
+  content: boolean
+}
+
 /** One authorization decision (§39). */
 export interface Authorization {
   /** What it evaluated to. */
@@ -555,9 +575,26 @@ export class EffectiveAuthority {
    * written. That last part is deliberate — a distinguishable "exists but hidden"
    * is the existence leak §103 is about.
    */
-  mayRead(element: Element, auth: AuthContext): AuthorityConstraints | null {
-    const decision = this.authorize('read', resourceOfElement(element), auth)
-    return isPermitted(decision.decision) ? decision.constraints : null
+  mayRead(element: Element, auth: AuthContext): Visibility | null {
+    const resource = resourceOfElement(element)
+    // §29.1 and §29.2 are two questions, and collapsing them loses the one
+    // §30.4 cares about. `discover` decides whether the element exists as far
+    // as this caller is concerned — not matched, not counted, not ranked, not
+    // paged. `read` decides whether its *content* comes back.
+    const decision = this.authorize('read', resource, auth)
+    if (isPermitted(decision.decision)) {
+      // `read` subsumes `discover`: content nobody may know exists is not
+      // content anybody can read, so a Grant naming only `read` confers both
+      // rather than nothing.
+      return { constraints: decision.constraints, content: true }
+    }
+    // Denied `read`, so the only question left is whether the element is in
+    // this caller's universe at all. `discover` is the weaker of the two and
+    // answers exactly that.
+    const discover = this.authorize('discover', resource, auth)
+    return isPermitted(discover.decision)
+      ? { constraints: emptyConstraints(), content: false }
+      : null
   }
 
   /**

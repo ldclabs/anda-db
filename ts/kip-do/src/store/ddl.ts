@@ -61,7 +61,7 @@ import { rebuildSearch } from './search.js'
  * 5 — the three FTS5 indexes behind `SEARCH`. Additive, but they start empty,
  * so an existing database is backfilled once (see {@link backfillSearch}).
  */
-export const SCHEMA_VERSION = 5
+export const SCHEMA_VERSION = 6
 
 /**
  * The `_system` envelope every element table repeats.
@@ -152,8 +152,7 @@ export const SCHEMA_STATEMENTS: readonly string[] = [
      predicate_ref TEXT NOT NULL DEFAULT '',
      object        TEXT NOT NULL DEFAULT '{}',
      object_key    TEXT NOT NULL DEFAULT '',
-     tuple_key     TEXT NOT NULL DEFAULT '',
-     attributes    TEXT NOT NULL DEFAULT '{}'
+     tuple_key     TEXT NOT NULL DEFAULT ''
    )`,
   ...envelopeIndexes('propositions'),
   // One canonical Proposition per semantic tuple per Space (§93.6). This is
@@ -374,6 +373,13 @@ export const SCHEMA_STATEMENTS: readonly string[] = [
      created_at                 TEXT NOT NULL,
      seq                        INTEGER NOT NULL DEFAULT 0,
      schema_environment_version INTEGER NOT NULL DEFAULT 0,
+     -- The Concept this Space treats as its semantic self (§5.6).
+     --
+     -- Protected Space configuration, not cognitive content: ordinary KML has
+     -- no path to it. Empty means the Space has designated none, which §5.6
+     -- admits and which is the honest answer when nothing has been designated
+     -- rather than a guess at which Person Concept "looks like" the Brain.
+     self_concept               TEXT NOT NULL DEFAULT '',
      policies                   TEXT NOT NULL DEFAULT '{}'
    )`,
   `CREATE UNIQUE INDEX IF NOT EXISTS idx_spaces_space_id
@@ -442,7 +448,7 @@ export const SCHEMA_STATEMENTS: readonly string[] = [
      name, aliases, attributes, tokenize='unicode61'
    )`,
   `CREATE VIRTUAL TABLE IF NOT EXISTS fts_propositions USING fts5(
-     predicate_ref, attributes, tokenize='unicode61'
+     predicate_ref, tokenize='unicode61'
    )`,
   `CREATE VIRTUAL TABLE IF NOT EXISTS fts_evidence USING fts5(
      payload_inline, tokenize='unicode61'
@@ -698,6 +704,7 @@ export function configureSql(sql: SqlStorage): void {
  */
 const ADDED_COLUMNS: readonly { table: string; column: string; definition: string }[] = [
   { table: 'schema_envs', column: 'seq', definition: 'INTEGER NOT NULL DEFAULT 0' },
+  { table: 'spaces', column: 'self_concept', definition: "TEXT NOT NULL DEFAULT ''" },
 ]
 
 function addMissingColumns(sql: SqlStorage): void {

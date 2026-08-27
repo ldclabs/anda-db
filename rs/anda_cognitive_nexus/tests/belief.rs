@@ -201,7 +201,13 @@ async fn one_confident_source_is_accepted_and_says_it_stands_alone() {
     let projected = belief(&nexus, "").await;
     assert_eq!(projected["status"], "accepted");
     assert_eq!(projected["support"]["score"], 0.9);
-    assert_eq!(projected["support"]["independent_groups"], 1);
+    assert_eq!(
+        projected["support"]["root_groups"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
     // Accepted, and still honest about resting on one voice.
     let reasons = projected["uncertainty"]["reasons"].as_array().unwrap();
     assert!(
@@ -231,7 +237,10 @@ async fn repeating_a_claim_does_not_make_it_stronger() {
         .await;
     }
     let repeated = belief(&nexus, "").await;
-    assert_eq!(repeated["support"]["independent_groups"], 1);
+    assert_eq!(
+        repeated["support"]["root_groups"].as_array().unwrap().len(),
+        1
+    );
     assert_eq!(repeated["support"]["score"], 0.6);
     assert_eq!(repeated["status"], "uncertain", "0.6 is below acceptance");
 
@@ -246,7 +255,13 @@ async fn repeating_a_claim_does_not_make_it_stronger() {
         .await;
     }
     let corroborated = belief(&nexus, "").await;
-    assert_eq!(corroborated["support"]["independent_groups"], 3);
+    assert_eq!(
+        corroborated["support"]["root_groups"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
     assert_eq!(corroborated["status"], "accepted");
     assert!(corroborated["support"]["score"].as_f64().unwrap() > 0.9);
 }
@@ -441,7 +456,11 @@ async fn a_functional_predicate_makes_rival_values_oppose_each_other() {
     let projected = &result.as_array().unwrap()[0];
     assert_eq!(projected["status"], "contested");
     assert_eq!(
-        projected["opposition"]["independent_groups"], 1,
+        projected["opposition"]["root_groups"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
         "the rival value opposes without anyone rejecting"
     );
 

@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import { digestParts, sha256Hex, sha256Text } from '../src/digest.js'
+import {
+  digestParts,
+  sha256Hex,
+  sha256Text,
+  sha3_256Text,
+} from '../src/digest.js'
 import {
   compareElementId,
   elementId,
@@ -37,6 +42,39 @@ describe('digest', () => {
         'abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq',
       ),
     ).toBe('248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1')
+  })
+
+  it('agrees with the published SHA3-256 vectors', () => {
+    // The Capsule content digest, and the one digest that crosses between
+    // engines: `rs/anda_cognitive_nexus` hashes the same canonical bytes with
+    // the same algorithm, which is what makes a Capsule written here
+    // verifiable there.
+    expect(sha3_256Text('')).toBe(
+      'a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a',
+    )
+    expect(sha3_256Text('abc')).toBe(
+      '3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532',
+    )
+    expect(
+      sha3_256Text(
+        'abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq',
+      ),
+    ).toBe('41c0dba2a9d6240849100376a8235e2c82e1b9998a999e21db32dd97496d3376')
+  })
+
+  it('hashes SHA3-256 across its rate boundary', () => {
+    // 135, 136 and 137 bytes are where the pad either shares a byte with the
+    // domain separator, fills a block exactly, or needs a second one. A wrong
+    // boundary passes the short vectors above.
+    expect(sha3_256Text('a'.repeat(135))).toBe(
+      '8094bb53c44cfb1e67b7c30447f9a1c33696d2463ecc1d9c92538913392843c9',
+    )
+    expect(sha3_256Text('a'.repeat(136))).toBe(
+      '3fc5559f14db8e453a0a3091edbd2bc25e11528d81c66fa570a4efdcc2695ee1',
+    )
+    expect(sha3_256Text('a'.repeat(137))).toBe(
+      'f8d6846cedd2ccfadf15c5879ef95af724d799eed7391fb1c91f95344e738614',
+    )
   })
 
   it('hashes past the one-block and length-field boundaries', () => {

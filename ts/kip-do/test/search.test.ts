@@ -238,17 +238,18 @@ describe('SEARCH', () => {
       }
       const first = nexus.describe('SEARCH CONCEPT "Paging" LIMIT 2') as unknown as Answer
       expect(first.hits).toHaveLength(2)
-      expect(first.next_cursor).toBe('2')
+      // §88.4: opaque, not an offset a caller can invent.
+      expect(Number(first.next_cursor)).toBeNaN()
 
       const second = nexus.describe(
-        'SEARCH CONCEPT "Paging" LIMIT 2 CURSOR 2',
+        `SEARCH CONCEPT "Paging" LIMIT 2 CURSOR "${first.next_cursor}"`,
       ) as unknown as Answer
       expect(second.hits).toHaveLength(2)
       const seen = [...first.hits, ...second.hits].map((h) => h.id)
       expect(new Set(seen).size).toBe(4)
 
       const last = nexus.describe(
-        'SEARCH CONCEPT "Paging" LIMIT 2 CURSOR 4',
+        `SEARCH CONCEPT "Paging" LIMIT 2 CURSOR "${second.next_cursor}"`,
       ) as unknown as Answer
       expect(last.hits).toHaveLength(1)
       // Nothing left, so no cursor: a cursor that always came back would make a

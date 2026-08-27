@@ -35,7 +35,9 @@ export const FIXTURES: readonly Fixture[] = [
     "name": "core-truth-neutrality",
     "description": "The distinction the version exists for: a Proposition existing is not the Proposition being true. A tuple carries no confidence, the same tuple resolves to one Proposition, and a raw read reports claims rather than beliefs.",
     "setup": [
-      "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE EVIDENCE ?e {\n    SET FIELDS { evidence_class: \"user_statement\", payload: \"I prefer dark mode\" }\n  }\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 }\n    SET STRUCTURAL { (\"evidence\", ?e) { role: \"support\" } }\n  }\n}"
+      "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE EVIDENCE ?e {\n    SET FIELDS { evidence_class: \"user_statement\", payload: \"I prefer dark mode\" }\n  }\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 }\n    SET STRUCTURAL { (\"evidence\", ?e) { role: \"support\" } }\n  }\n}",
+      "CREATE EVIDENCE ?e {\n  CLIENT KEY \"message:42:evidence\"\n  SET FIELDS { evidence_class: \"user_statement\", payload: \"I prefer dark mode\" }\n}",
+      "CREATE EVIDENCE ?e {\n  CLIENT KEY \"message:42:evidence\"\n  SET FIELDS { evidence_class: \"user_statement\", payload: \"I prefer dark mode\" }\n}"
     ],
     "cases": [
       {
@@ -135,6 +137,70 @@ export const FIXTURES: readonly Fixture[] = [
             ]
           ]
         }
+      },
+      {
+        "name": "a Proposition carries no author-writable attribute bag",
+        "command": "UPDATE ?p SET ATTRIBUTES { note: \"about the tuple\" } WHERE { ?p PROPOSITION (?s, \"prefers\", ?o) }",
+        "expect": {
+          "error": "ImmutableField"
+        }
+      },
+      {
+        "name": "a stance the Core Package does not name is refused, bound parameter or not",
+        "command": "MUTATE {\n  ENSURE PROPOSITION ?p (:alice, \"prefers\", :dark)\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: :alice, stance: :stance, mode: \"stated\" }\n  }\n}",
+        "params": {
+          "alice": {
+            "id": "C-1"
+          },
+          "dark": {
+            "id": "C-2"
+          },
+          "stance": "maybe"
+        },
+        "expect": {
+          "error": "ConstraintViolation"
+        }
+      },
+      {
+        "name": "confidence is epistemic support in [0, 1] at both ends",
+        "command": "MUTATE {\n  ENSURE PROPOSITION ?p (:alice, \"prefers\", :dark)\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: :alice, stance: \"support\", mode: \"stated\", confidence: :c }\n  }\n}",
+        "params": {
+          "alice": {
+            "id": "C-1"
+          },
+          "dark": {
+            "id": "C-2"
+          },
+          "c": -0.5
+        },
+        "expect": {
+          "error": "ConstraintViolation"
+        }
+      },
+      {
+        "name": "an Evidence citation role comes from the Core registry",
+        "command": "MUTATE {\n  ENSURE PROPOSITION ?p (:alice, \"prefers\", :dark)\n  CREATE EVIDENCE ?e { SET FIELDS { evidence_class: \"user_statement\", payload: \"x\" } }\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: :alice, stance: \"support\", mode: \"stated\" }\n    SET STRUCTURAL { (\"evidence\", ?e) { role: :role } }\n  }\n}",
+        "params": {
+          "alice": {
+            "id": "C-1"
+          },
+          "dark": {
+            "id": "C-2"
+          },
+          "role": "vouches"
+        },
+        "expect": {
+          "error": "ConstraintViolation"
+        }
+      },
+      {
+        "name": "a CLIENT KEY makes a resend a retry rather than a second creation",
+        "command": "FIND(COUNT(?e)) WHERE { ?e EVIDENCE {evidence_class: \"user_statement\"} }",
+        "expect": {
+          "result": [
+            2
+          ]
+        }
       }
     ]
   },
@@ -171,7 +237,8 @@ export const FIXTURES: readonly Fixture[] = [
     ],
     "setup": [
       "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?bob { TYPE \"Person\" NAME \"Bob\" }\n  CREATE CONCEPT ?carol { TYPE \"Person\" NAME \"Carol\" }\n  CREATE CONCEPT ?quiet { TYPE \"Preference\" NAME \"Quiet\" }\n  CREATE CONCEPT ?loud { TYPE \"Preference\" NAME \"Loud\" }\n  ENSURE PROPOSITION ?unspoken (?alice, \"prefers\", ?quiet)\n  ENSURE PROPOSITION ?repeated (?alice, \"prefers\", ?loud)\n}",
-      "MUTATE {\n  CREATE CONCEPT ?svc { TYPE \"Service\" NAME \"api\" }\n  CREATE CONCEPT ?healthy { TYPE \"Status\" NAME \"healthy\" }\n  CREATE CONCEPT ?degraded { TYPE \"Status\" NAME \"degraded\" }\n  ENSURE PROPOSITION ?ok (?svc, \"status\", ?healthy)\n  ENSURE PROPOSITION ?bad (?svc, \"status\", ?degraded)\n}"
+      "MUTATE {\n  CREATE CONCEPT ?svc { TYPE \"Service\" NAME \"api\" }\n  CREATE CONCEPT ?healthy { TYPE \"Status\" NAME \"healthy\" }\n  CREATE CONCEPT ?degraded { TYPE \"Status\" NAME \"degraded\" }\n  ENSURE PROPOSITION ?ok (?svc, \"status\", ?healthy)\n  ENSURE PROPOSITION ?bad (?svc, \"status\", ?degraded)\n}",
+      "MUTATE {\n  CREATE CONCEPT ?dave { TYPE \"Person\" NAME \"Dave\" }\n  CREATE CONCEPT ?warm { TYPE \"Preference\" NAME \"Warm\" }\n  ENSURE PROPOSITION ?p (?dave, \"prefers\", ?warm)\n  CREATE EVIDENCE ?seen { SET FIELDS { evidence_class: \"observation\", payload: \"one observation\" } }\n  CREATE ASSERTION ?a1 {\n    SET FIELDS { proposition: ?p, asserted_by: ?dave, stance: \"support\", mode: \"stated\", confidence: 0.6 }\n    SET STRUCTURAL { (\"evidence\", ?seen) { role: \"support\" } }\n  }\n  CREATE ASSERTION ?a2 {\n    SET FIELDS { proposition: ?p, asserted_by: ?dave, stance: \"support\", mode: \"stated\", confidence: 0.6 }\n    SET STRUCTURAL { (\"evidence\", ?seen) { role: \"support\" } }\n  }\n}"
     ],
     "cases": [
       {
@@ -232,6 +299,76 @@ export const FIXTURES: readonly Fixture[] = [
         "command": "FIND(?b) WHERE {\n  ?s CONCEPT {name: \"Alice\"}\n  ?o CONCEPT {name: \"Quiet\"}\n  ?p PROPOSITION (?s, \"prefers\", ?o)\n  ?b BELIEF (?p)\n} WITH EPISTEMIC {policy: \"strict\"}",
         "expect": {
           "error": "ProjectionPolicyUnavailable"
+        }
+      },
+      {
+        "name": "repetition is one voice: a side reports its roots, not its rows",
+        "command": "FIND(?b.support.root_groups) WHERE {\n  ?s CONCEPT {name: \"Dave\"}\n  ?o CONCEPT {name: \"Warm\"}\n  ?p PROPOSITION (?s, \"prefers\", ?o)\n  ?b BELIEF (?p)\n}",
+        "expect": {
+          "result": [
+            [
+              {
+                "actors": [
+                  {
+                    "id": "C:<1>"
+                  }
+                ],
+                "assertion_ids": [
+                  "A:<2>",
+                  "A:<3>"
+                ],
+                "contribution": 0.6,
+                "evidence": [
+                  "E:<4>"
+                ]
+              }
+            ]
+          ]
+        }
+      },
+      {
+        "name": "two claims relaying one observation score as one",
+        "command": "FIND(?b.support.score) WHERE {\n  ?s CONCEPT {name: \"Dave\"}\n  ?o CONCEPT {name: \"Warm\"}\n  ?p PROPOSITION (?s, \"prefers\", ?o)\n  ?b BELIEF (?p)\n}",
+        "expect": {
+          "result": [
+            0.6
+          ]
+        }
+      },
+      {
+        "name": "a fully grounded BELIEF about a Proposition nobody created still answers",
+        "command": "FIND(?b.status, ?b.proposition_id) WHERE { ?b BELIEF (:bob, \"prefers\", :quiet) }",
+        "params": {
+          "bob": {
+            "id": "C-2"
+          },
+          "quiet": {
+            "id": "C-4"
+          }
+        },
+        "expect": {
+          "result": [
+            [
+              "insufficient",
+              null
+            ]
+          ]
+        }
+      },
+      {
+        "name": "explanation: none returns no ledger rather than an empty one",
+        "command": "FIND(?b.explanation) WHERE {\n  ?s CONCEPT {name: \"Dave\"}\n  ?o CONCEPT {name: \"Warm\"}\n  ?p PROPOSITION (?s, \"prefers\", ?o)\n  ?b BELIEF (?p)\n} WITH EPISTEMIC { explanation: \"none\" }",
+        "expect": {
+          "result": [
+            null
+          ]
+        }
+      },
+      {
+        "name": "a setting WITH EPISTEMIC does not implement is refused, never ignored",
+        "command": "FIND(?b.status) WHERE {\n  ?s CONCEPT {name: \"Dave\"}\n  ?o CONCEPT {name: \"Warm\"}\n  ?p PROPOSITION (?s, \"prefers\", ?o)\n  ?b BELIEF (?p)\n} WITH EPISTEMIC { curiosity: 0.5 }",
+        "expect": {
+          "error": "SchemaFieldNotFound"
         }
       }
     ]
@@ -832,4 +969,4 @@ export const FIXTURES: readonly Fixture[] = [
 ] as unknown as Fixture[]
 
 /** The total number of cases, so a silent shrink is visible. */
-export const CASE_COUNT = 82
+export const CASE_COUNT = 92

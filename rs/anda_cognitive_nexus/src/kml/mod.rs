@@ -21,7 +21,8 @@ pub mod update;
 pub mod value;
 
 use anda_kip::{
-    Json, KipError, KmlStatement, Map, Operation, Request, Response, ResponseContext, Warning,
+    ElementKind, Json, KipError, KmlStatement, Map, Operation, Request, Response, ResponseContext,
+    Warning,
 };
 
 use crate::governance::{AuthContext, EffectiveAuthority};
@@ -56,7 +57,19 @@ pub async fn execute(
         Err(err) => return Response::from(err),
     };
 
-    match plan(store, &mut tx, statement, request, operation).await {
+    // Ingested Evidence is minted before the plan runs, inside this same
+    // transaction, so a command can cite it as `:key` and an abort takes it
+    // with everything else (§71.1).
+    let ingested = match mint_ingested_evidence(store, &mut tx, request).await {
+        Ok(bound) => bound,
+        Err(err) => {
+            tx.abort().await;
+            return Response::from(err);
+        }
+    };
+    let parameters = merge_parameters(request.parameters.as_ref(), ingested);
+
+    match plan(store, &mut tx, statement, parameters.as_ref(), operation).await {
         Ok(()) => {}
         Err(err) => {
             // The only durable thing a failed statement wrote is its shells,
@@ -129,11 +142,27 @@ fn access_provenance(
     }))
 }
 
+/// The request parameters a command sees, with the ingest bindings folded in.
+///
+/// `None` stays `None` when there is nothing to bind, so the common path
+/// allocates nothing.
+fn merge_parameters(
+    declared: Option<&Map<String, Json>>,
+    ingested: Map<String, Json>,
+) -> Option<Map<String, Json>> {
+    if ingested.is_empty() {
+        return declared.cloned();
+    }
+    let mut merged = declared.cloned().unwrap_or_default();
+    merged.extend(ingested);
+    Some(merged)
+}
+
 async fn plan(
     store: &Store,
     tx: &mut Transaction,
     statement: &KmlStatement,
-    request: &Request,
+    parameters: Option<&Map<String, Json>>,
     operation: &Operation,
 ) -> Result<(), KipError> {
     for clause in &statement.clauses {
@@ -146,17 +175,147 @@ async fn plan(
             if clauses::plan_pass(clause) != pass {
                 continue;
             }
-            clauses::apply(
-                store,
-                tx,
-                clause,
-                request.parameters.as_ref(),
-                operation.parameters.as_ref(),
-            )
-            .await?;
+            clauses::apply(store, tx, clause, parameters, operation.parameters.as_ref()).await?;
         }
     }
     Ok(())
+}
+
+/// Mints the Evidence a request's ingestion context carries (§71.1).
+///
+/// The point is Evidence fidelity (§88.12, §102.33). A model re-typing an
+/// observation inside KML text can truncate, paraphrase or invent it, and the
+/// resulting "evidence" is then a fabrication that looks exactly like the real
+/// thing. An ingestion context is the runtime's answer: the payload reaches
+/// Evidence from the transport envelope, byte for byte, and the command only
+/// cites it.
+///
+/// Three properties this has to keep:
+///
+/// - **the payload is preserved, not rewritten.** Whatever the envelope
+///   carried is what lands in `payload.inline`.
+/// - **it is transactional.** The Evidence is staged in the caller's own
+///   transaction, so an aborted statement leaves none of it behind.
+/// - **each `key` binds as a request parameter.** `evidence: :msg` in the
+///   command resolves to the minted Evidence's reference, which is the whole
+///   mechanism — the command never spells the content.
+///
+/// Returns the bindings to merge into the request parameters.
+async fn mint_ingested_evidence(
+    store: &Store,
+    tx: &mut Transaction,
+    request: &Request,
+) -> Result<Map<String, Json>, KipError> {
+    let Some(ingest) = &request.ingest else {
+        return Ok(Map::new());
+    };
+    ingest.validate()?;
+
+    let mut bound = Map::new();
+    for entry in &ingest.evidence {
+        // A request parameter of the same name would make it ambiguous which
+        // value the command cited, and the two cannot be reconciled: one is a
+        // caller-supplied value, the other is an element this request created.
+        if request
+            .parameters
+            .as_ref()
+            .is_some_and(|parameters| parameters.contains_key(&entry.key))
+        {
+            return Err(KipError::invalid_request_envelope(format!(
+                "the ingest key {:?} is also a request parameter; a command citing :{} could \
+                 mean either",
+                entry.key, entry.key
+            )));
+        }
+        // An artifact handle promises bytes this engine has nowhere to fetch
+        // from. Minting an Evidence record with an empty payload under a
+        // handle that resolves to nothing would be the fabrication the whole
+        // mechanism exists to prevent (§85.2).
+        if entry.payload_artifact.is_some() {
+            return Err(KipError::unsupported_capability(
+                "this engine has no artifact store, so `payload_artifact` names bytes it cannot \
+                 read; send the observation as an inline `payload`",
+            ));
+        }
+        let payload = entry.payload.clone().ok_or_else(|| {
+            KipError::invalid_request_envelope(
+                "an ingest entry declares exactly one of `payload` or `payload_artifact`",
+            )
+        })?;
+
+        // A retry of the same logical ingestion resolves to the Evidence the
+        // first attempt minted, exactly as `CLIENT KEY` does on a `CREATE`
+        // (§52.1) — which is what makes re-sending a lost request safe.
+        let client_key = entry.client_key.clone().unwrap_or_default();
+        if let Some(existing) = store
+            .find_by_client_key(&tx.cx.space, ElementKind::Evidence, &client_key)
+            .await?
+        {
+            bound.insert(
+                entry.key.clone(),
+                serde_json::json!({"id": existing.to_string()}),
+            );
+            continue;
+        }
+
+        let source_refs = match &entry.source_actor {
+            Some(actor) => vec![resolve_source_actor(store, tx, actor).await?],
+            None => Vec::new(),
+        };
+        let observed_at = match &entry.observed_at {
+            Some(at) => crate::time::normalize(at, "ingest.observed_at")?,
+            None => tx.cx.at.clone(),
+        };
+
+        let id = tx.mint(ElementKind::Evidence).await?;
+        let row = crate::store::rows::EvidenceRow {
+            _id: id.seq,
+            evidence_class: entry.evidence_class.clone(),
+            payload_mode: "inline".to_string(),
+            payload_inline: payload,
+            media_type: entry.media_type.clone().unwrap_or_default(),
+            observed_at,
+            source_keys: source_refs.iter().map(clauses::endpoint_key).collect(),
+            source_refs,
+            status: "active".to_string(),
+            client_key,
+            ..Default::default()
+        };
+        let element = crate::store::Element::Evidence(Box::new(row));
+        tx.authorize_created(&element, crate::governance::Permission::Create)?;
+        tx.stage_new(id, element, "create");
+        bound.insert(entry.key.clone(), serde_json::json!({"id": id.to_string()}));
+    }
+    Ok(bound)
+}
+
+/// Resolves an ingest entry's `source_actor` to a reference in this Space.
+///
+/// Refused rather than stored as a bare name. §71.1 records the actor as
+/// Evidence *source*, and a source slot holding a string nothing resolves is a
+/// citation a reader cannot follow — indistinguishable, later, from one that
+/// was checked. The actor is a semantic actor and never a Principal (§88.1),
+/// so this looks it up among Concepts and never in the control plane.
+async fn resolve_source_actor(
+    store: &Store,
+    tx: &Transaction,
+    actor: &str,
+) -> Result<Json, KipError> {
+    if let Ok(id) = actor.parse::<crate::id::ElementId>()
+        && store.get_element(id).await.is_ok()
+    {
+        return Ok(serde_json::json!({"id": id.to_string()}));
+    }
+    if let Some(id) = store
+        .find_concept_by_canonical_id(&tx.cx.space, actor)
+        .await?
+    {
+        return Ok(serde_json::json!({"id": id.to_string()}));
+    }
+    Err(KipError::not_found_or_not_visible(format!(
+        "the ingest source actor {actor:?} names no Concept in this Space; an Evidence source \
+         must resolve to something a reader can follow"
+    )))
 }
 
 fn success(outcome: Outcome, space_id: &str, schema_environment_version: u64) -> Response {

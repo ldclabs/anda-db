@@ -76,6 +76,14 @@ pub struct Context<'a> {
     /// coordinate: a query whose patterns disagreed about *when* they were
     /// reading would join two different Brains together.
     pub as_of: Option<u64>,
+    /// The coordinate this read answers at, historical or not.
+    ///
+    /// Always known, unlike [`Context::as_of`], which is `None` for a read of
+    /// the present. §50 asks a KQL answer to identify its `snapshot_seq`, and
+    /// §44.8 makes a page cursor carry it so the next page continues over the
+    /// same canonical snapshot rather than over whatever the Space holds by
+    /// then.
+    pub pinned_seq: u64,
     /// What the caller may see here, resolved once for the whole read.
     pub authority: &'a EffectiveAuthority,
     /// Who the caller is.
@@ -112,6 +120,7 @@ impl<'a> Context<'a> {
             at: crate::time::now(),
             projected: false,
             as_of: None,
+            pinned_seq: store.get_space(space).await?.seq,
             authority,
             auth,
             read_origin: authority
@@ -169,21 +178,37 @@ impl<'a> Context<'a> {
 
     /// Applies the read decision to one loaded element, caching its view.
     ///
-    /// Returns `None` for an element this caller may not read, and caches the
-    /// **redacted** view for one it may — so a `FILTER` or an `ORDER BY` on a
-    /// masked field sees what the projection would, rather than being able to
+    /// Returns `None` for an element this caller may not *discover*, and caches
+    /// the **redacted** view for one it may — so a `FILTER` or an `ORDER BY` on
+    /// a masked field sees what the projection would, rather than being able to
     /// probe the value through row membership (§109).
+    ///
+    /// An element the caller may discover but not read comes back with its
+    /// identity and nothing else (§29.2). It still exists, is still counted and
+    /// can still be cited; what it says stays closed.
     pub(crate) fn admit(&mut self, element: Option<Element>) -> Option<Element> {
         let element = element?;
-        let constraints = self.authority.may_read(&element, self.auth)?;
-        if let Some(limit) = constraints.max_results.map(|limit| limit as usize) {
+        let visibility = self.authority.may_read(&element, self.auth)?;
+        if let Some(limit) = visibility
+            .constraints
+            .max_results
+            .map(|limit| limit as usize)
+        {
             self.governed_limit = Some(
                 self.governed_limit
                     .map_or(limit, |current| current.min(limit)),
             );
         }
         let mut view = crate::view::render(&element);
-        crate::governance::redact::apply(&mut view, &constraints, self.read_origin);
+        if visibility.content {
+            crate::governance::redact::apply(&mut view, &visibility.constraints, self.read_origin);
+        } else {
+            // `discover` without `read` (§29.1, §29.2): the element is in the
+            // query universe and its contents are not. Everything but identity
+            // goes, and the view says so rather than looking like an element
+            // that happens to have no fields.
+            crate::governance::redact::to_identity_only(&mut view);
+        }
         self.views.insert(element.id(), Arc::new(view));
         Some(element)
     }
@@ -340,6 +365,7 @@ impl<'a> Context<'a> {
         &mut self,
         as_of: Option<&anda_kip::AsOf>,
         request: &Request,
+        cursor: Option<crate::store::history::PageCursor>,
     ) -> Result<(), KipError> {
         let from_token = match request
             .read
@@ -358,12 +384,41 @@ impl<'a> Context<'a> {
         match (from_token, from_command) {
             (Some(bound), Some(named)) if bound != named => {
                 return Err(KipError::invalid_request_envelope(format!(
-                    "this request is bound to snapshot {bound} and its command reads AS OF                      {named}; one read answers at one coordinate"
+                    "this request is bound to snapshot {bound} and its command reads AS OF \
+                     {named}; one read answers at one coordinate"
                 )));
             }
             _ => {}
         }
-        self.as_of = from_command.or(from_token);
+        // A continuation is pinned to the coordinate its own first page read
+        // at (§44.8). It does not ask for `read_history`: the caller is
+        // resuming a traversal it already began, over the same rows page one
+        // returned, so requiring a permission page one did not need would make
+        // paging a privilege rather than a mechanic.
+        //
+        // Reconstruction is only engaged when the Space has actually moved on.
+        // At the current coordinate the version log would rebuild exactly what
+        // the live indexes already hold, at the cost of scanning it.
+        let from_cursor = cursor.and_then(|cursor| {
+            (cursor.snapshot_seq < self.pinned_seq).then_some(cursor.snapshot_seq)
+        });
+        if let Some(cursor) = cursor {
+            match from_command.or(from_token) {
+                Some(named) if named != cursor.snapshot_seq => {
+                    return Err(KipError::invalid_request_envelope(format!(
+                        "this cursor continues a traversal pinned to snapshot {}, and this read \
+                         names {named}; one traversal answers at one coordinate",
+                        cursor.snapshot_seq
+                    )));
+                }
+                _ => {}
+            }
+            self.pinned_seq = cursor.snapshot_seq;
+        }
+        self.as_of = from_command.or(from_token).or(from_cursor);
+        if let Some(seq) = self.as_of {
+            self.pinned_seq = seq;
+        }
         // The Schema that was in force then is what a historical read resolves
         // symbols through: reconstructing the past under today's schema would
         // answer a question nobody asked (§144).
@@ -475,15 +530,9 @@ impl<'a> Context<'a> {
                 field,
                 object,
             } => {
-                if variable.is_some() {
-                    // Binding the edge itself would need a durable edge record,
-                    // and Core deliberately has none (§103 Q1).
-                    return Err(KipError::unsupported_capability(
-                        "binding a variable to a structural edge is not supported: Core stores \
-                         structural references as typed fields, not as addressable edge records",
-                    ));
-                }
-                let table = self.match_structural(subject, field, object).await?;
+                let table = self
+                    .match_structural(variable.as_deref(), subject, field, object)
+                    .await?;
                 solutions.join(table)
             }
             WhereClause::Filter { expression } => {
@@ -537,7 +586,13 @@ pub async fn execute(
     auth: &AuthContext,
 ) -> Response {
     match run(store, space, query, request, operation, authority, auth).await {
-        Ok((projected, schema_environment_version, epistemic_policy)) => {
+        Ok(Answer {
+            projected,
+            schema_environment_version,
+            epistemic_policy,
+            snapshot_seq,
+            valid_at,
+        }) => {
             let result = Json::Array(projected.rows);
             Response {
                 context: Some(ResponseContext {
@@ -550,10 +605,24 @@ pub async fn execute(
                 results: vec![anda_kip::OperationResult {
                     context: Some(ResultContext {
                         space_id: Some(space.to_string()),
+                        // §50: an answer that cannot say which coordinate it
+                        // read is an answer a caller cannot reproduce, and it
+                        // is the same field a page cursor pins.
+                        snapshot_seq: Some(snapshot_seq),
                         schema_environment_version: Some(schema_environment_version),
                         // Spec §54: a belief reported without the policy it was
                         // projected under is not auditable.
                         epistemic_policy,
+                        // The world-time basis, when `FOR TIME` named one.
+                        // §48.3 makes it an axis independent of the snapshot:
+                        // reporting one without the other leaves a caller
+                        // unable to tell a stale answer from a deliberately
+                        // historical one.
+                        valid_at: valid_at.clone(),
+                        cursor: query.cursor.as_ref().and_then(|scalar| match scalar {
+                            Scalar::Literal(anda_kip::KipValue::String(text)) => Some(text.clone()),
+                            _ => None,
+                        }),
                         ..Default::default()
                     }),
                     next_cursor: projected.next_cursor,
@@ -566,7 +635,42 @@ pub async fn execute(
     }
 }
 
-type Answer = (Projected, u64, Option<anda_kip::PolicyIdentity>);
+/// One KQL answer, with the coordinates and policies it was produced under.
+///
+/// A struct rather than a tuple because §50 keeps adding to it, and a
+/// five-element tuple is where `snapshot_seq` and `schema_environment_version`
+/// swap places without a compiler complaint.
+struct Answer {
+    projected: Projected,
+    schema_environment_version: u64,
+    epistemic_policy: Option<anda_kip::PolicyIdentity>,
+    snapshot_seq: u64,
+    /// The world-time basis, when `FOR TIME` named one.
+    valid_at: Option<String>,
+}
+
+/// Reads a `CURSOR` slot as the opaque token this engine issues.
+fn page_cursor(
+    cx: &Context<'_>,
+    scalar: &Scalar,
+    space: &str,
+) -> Result<crate::store::history::PageCursor, KipError> {
+    let token = match scalar {
+        Scalar::Literal(literal) => Json::from(literal.clone()),
+        Scalar::Param(name) => cx.param_ref(name)?,
+    };
+    let Json::String(token) = token else {
+        return Err(KipError::new(
+            anda_kip::KipErrorCode::CursorInvalidated,
+            format!("CURSOR takes the opaque token this engine issued, got {token}"),
+        ));
+    };
+    crate::store::history::PageCursor::from_token(
+        &token,
+        space,
+        crate::store::history::CursorFamily::Query,
+    )
+}
 
 async fn run(
     store: &Store,
@@ -586,7 +690,13 @@ async fn run(
         auth,
     )
     .await?;
-    cx.bind_read(query.as_of.as_ref(), request).await?;
+    // The cursor is read before the coordinate is bound, because it *is* one
+    // of the things that decides the coordinate.
+    let cursor = match &query.cursor {
+        Some(scalar) => Some(page_cursor(&cx, scalar, space)?),
+        None => None,
+    };
+    cx.bind_read(query.as_of.as_ref(), request, cursor).await?;
     let environment_version = cx.env.version;
 
     if let Some(block) = &query.epistemic {
@@ -606,6 +716,7 @@ async fn run(
     }
 
     let mut solutions = cx.solve(&query.where_clauses).await?;
+    let mut valid_at = None;
     if let Some(for_time) = &query.for_time {
         let at = match &for_time {
             Scalar::Literal(literal) => Json::from(literal.clone()),
@@ -619,6 +730,7 @@ async fn run(
         let at = crate::time::normalize(&at, "FOR TIME")?;
         cx.warm(&solutions).await?;
         restrict_to_valid_time(&mut cx, &mut solutions, &at);
+        valid_at = Some(at);
     }
 
     let limit = query
@@ -626,25 +738,27 @@ async fn run(
         .as_ref()
         .map(|scalar| scalar_usize(&cx, scalar, "LIMIT"))
         .transpose()?;
-    let cursor = query
-        .cursor
-        .as_ref()
-        .map(|scalar| scalar_usize(&cx, scalar, "CURSOR"))
-        .transpose()?;
-
     // ORDER BY and the projection both read fields off bound elements. The
     // governed cap is merged in by `project`, after this — every element that
     // could tighten it has been admitted by then.
     cx.warm(&solutions).await?;
     let policy = cx.projected.then(|| cx.policy.identity());
+    let pinned_seq = cx.pinned_seq;
     let projected = cx.project(
         solutions,
         &query.find_clause,
         query.order_by.as_ref(),
         limit,
-        cursor,
+        cursor.map(|cursor| cursor.offset),
+        pinned_seq,
     )?;
-    Ok((projected, environment_version, policy))
+    Ok(Answer {
+        projected,
+        schema_environment_version: environment_version,
+        epistemic_policy: policy,
+        snapshot_seq: pinned_seq,
+        valid_at,
+    })
 }
 
 /// Drops solutions whose Assertions did not apply at the given world time.

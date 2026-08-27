@@ -26,8 +26,18 @@ use super::Answer;
 use super::describe::{scalar_json, scalar_str, scalar_usize};
 use crate::id::ElementId;
 use crate::kql::Context;
+use crate::store::history::CursorFamily;
 
 /// `SEARCH <KIND> :term` — grounding.
+/// How many index hits are scored per page requested.
+const SEARCH_OVERFETCH: usize = 4;
+
+/// The smallest candidate window a search considers, whatever the page size.
+///
+/// A page of ten in a database whose index spans several Spaces would
+/// otherwise be decided by forty hits that may all belong to somebody else.
+const SEARCH_MIN_WINDOW: usize = 512;
+
 pub async fn search(cx: &mut Context<'_>, command: &SearchCommand) -> Result<Answer, KipError> {
     let term = scalar_str(cx, &command.term, "SEARCH")?;
     if let Some(mode) = &command.mode {
@@ -64,7 +74,7 @@ pub async fn search(cx: &mut Context<'_>, command: &SearchCommand) -> Result<Ans
         None => 10,
     };
     let offset = match &command.cursor {
-        Some(scalar) => scalar_usize(cx, scalar, "CURSOR")?,
+        Some(scalar) => super::read_cursor(cx, scalar, CursorFamily::Search)?.offset,
         None => 0,
     };
     let with_type = match &command.with_type {
@@ -98,12 +108,12 @@ pub async fn search(cx: &mut Context<'_>, command: &SearchCommand) -> Result<Ans
             &["name", "aliases", "attributes"] as &[&str],
         )],
         SearchTarget::Proposition => {
-            vec![(ElementKind::Proposition, &["predicate_ref", "attributes"])]
+            vec![(ElementKind::Proposition, &["predicate_ref"] as &[&str])]
         }
         SearchTarget::Evidence => vec![(ElementKind::Evidence, &["payload_inline"])],
         SearchTarget::Cognition => vec![
             (ElementKind::Concept, &["name", "aliases", "attributes"]),
-            (ElementKind::Proposition, &["predicate_ref", "attributes"]),
+            (ElementKind::Proposition, &["predicate_ref"]),
             (ElementKind::Evidence, &["payload_inline"]),
         ],
         // An Assertion's content is a stance and a number, and an Activity's is
@@ -120,6 +130,7 @@ pub async fn search(cx: &mut Context<'_>, command: &SearchCommand) -> Result<Ans
     };
 
     let mut hits: Vec<(f32, Json)> = Vec::new();
+    let mut scanned = 0usize;
     for (kind, fields) in kinds {
         let collection = cx.store.elements(kind);
         let index = collection.get_bm25_index(fields).map_err(|_| {
@@ -128,9 +139,20 @@ pub async fn search(cx: &mut Context<'_>, command: &SearchCommand) -> Result<Ans
                 format!("no full-text index exists over {kind}"),
             )
         })?;
-        // Over-fetch: the filters below are applied after scoring, so the
-        // window has to be wide enough to survive them.
-        for (seq, score) in index.search_advanced(&term, (limit + offset).saturating_mul(4), None) {
+        // Over-fetch, because the filters below run after scoring: Space,
+        // lifecycle state, declared type and — most importantly — Governance
+        // visibility. The index is database-wide while a search is
+        // Space-scoped, so a narrow Space in a busy database can have its
+        // whole page crowded out by hits it may not see. The window is
+        // therefore wide in absolute terms rather than a small multiple of the
+        // page, and what still falls off the end is disclosed as a caveat
+        // rather than reported as an empty Space (§66.6).
+        let window = (limit + offset)
+            .saturating_mul(SEARCH_OVERFETCH)
+            .max(SEARCH_MIN_WINDOW);
+        let candidates = index.search_advanced(&term, window, None);
+        scanned = scanned.max(candidates.len());
+        for (seq, score) in candidates {
             if score < threshold as f32 {
                 continue;
             }
@@ -195,8 +217,12 @@ pub async fn search(cx: &mut Context<'_>, command: &SearchCommand) -> Result<Ans
             },
             "caveat": "a SEARCH score is not a confidence and a miss is not an absence; \
                        ground with SEARCH, then read with FIND or BELIEF",
+            // §66.6 in the one place a caller can act on it: this page was cut
+            // from a bounded candidate window, so an exhaustive question needs
+            // FIND, which has no such window.
+            "exhaustive": scanned < SEARCH_MIN_WINDOW,
         }),
-        next_cursor: (consumed < total).then(|| consumed.to_string()),
+        next_cursor: super::next_cursor(cx, CursorFamily::Search, consumed, total),
     })
 }
 

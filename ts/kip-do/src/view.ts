@@ -98,7 +98,6 @@ function proposition(id: ElementId, row: PropositionRow): JsonMap {
       subject: row.subject,
       predicate_ref: row.predicate_ref,
       object: row.object,
-      attributes: row.attributes,
     }),
   }
 }

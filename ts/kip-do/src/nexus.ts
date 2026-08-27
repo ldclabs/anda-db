@@ -13,15 +13,37 @@
  */
 
 import { errors, KipError } from './errors.js'
+import { formatElementId } from './id.js'
+
+/**
+ * What one retention sweep did, and what it left alone (§19.1).
+ *
+ * The counts are the point. A sweep that reported only what it touched would
+ * read as complete, and "swept 4" when 9 expired is the shape of a compliance
+ * failure nobody notices.
+ */
+export interface RetentionSweep {
+  /** The elements it acted on. */
+  swept: string[]
+  /** How many were kept because a legal hold blocks removal (§163). */
+  held: number
+  /** How many the caller was not authorized to act on. */
+  refused: number
+  /** How many were left for the next sweep by `limit`. */
+  remaining: number
+}
 import {
   EffectiveAuthority,
+  archiveExpired,
   classify,
   Approved,
   elevateAuthority,
   isPermitted,
   principalClass,
+  expireAssertion,
   quarantine,
   release,
+  tombstoneExpired,
   requirePermitted,
   resolveApproval,
   spaceResource,
@@ -38,7 +60,11 @@ import { parseKip } from './kip/parser.js'
 import type { ElementId } from './id.js'
 import type { Command, KmlStatement, KqlQuery } from './kip/ast.js'
 import { executeKml, type KmlContext } from './kml/index.js'
-import { executeKql, type KqlContext } from './kql/index.js'
+import {
+  executeKqlPage,
+  type KqlAnswer,
+  type KqlContext,
+} from './kql/index.js'
 import { executeMeta, type MetaContext } from './meta/index.js'
 import {
   BUNDLED_PACKAGES,
@@ -347,13 +373,31 @@ export class CognitiveNexus {
     return this.systemSession().query(command, params, read)
   }
 
-  /** Runs one parsed KQL query. */
+  /** Runs one KQL command, reporting its coordinates and page cursor (§50). */
+  queryPage(
+    command: string,
+    params: JsonMap = {},
+    read: ReadOptions = {},
+  ): KqlAnswer {
+    return this.systemSession().queryPage(command, params, read)
+  }
+
+  /** Runs one parsed KQL query, reporting its coordinates and page cursor. */
+  findPage(
+    query: KqlQuery,
+    params: JsonMap = {},
+    options: Partial<KqlContext> & ReadOptions = {},
+  ): KqlAnswer {
+    return this.systemSession().findPage(query, params, options)
+  }
+
+  /** Runs one parsed KQL query and returns its rows. */
   find(
     query: KqlQuery,
     params: JsonMap = {},
     options: Partial<KqlContext> & ReadOptions = {},
   ): Json[] {
-    return this.systemSession().find(query, params, options)
+    return this.findPage(query, params, options).rows
   }
 
   /** Runs one KML statement, all-or-nothing. */
@@ -404,6 +448,7 @@ export class CognitiveNexus {
       created_at: nowTime(),
       seq: 0,
       schema_environment_version: 0,
+      self_concept: '',
       policies: {} as Json as JsonMap,
     })
   }
@@ -467,11 +512,20 @@ export class Session {
 
   /** Parses and runs one KQL query, returning the bare result array. */
   query(command: string, params: JsonMap = {}, read: ReadOptions = {}): Json[] {
+    return this.queryPage(command, params, read).rows
+  }
+
+  /** Runs one KQL command, reporting its coordinates and page cursor (§50). */
+  queryPage(
+    command: string,
+    params: JsonMap = {},
+    read: ReadOptions = {},
+  ): KqlAnswer {
     const parsed: Command = parseKip(command)
     if (!('Kql' in parsed)) {
       throw errors.languageMismatch('this command is not a KQL query')
     }
-    return this.find(parsed.Kql, params, read)
+    return this.findPage(parsed.Kql, params, read)
   }
 
   /** Parses and runs one META command. */
@@ -502,12 +556,12 @@ export class Session {
     })
   }
 
-  /** Runs one parsed KQL query. */
-  find(
+  /** Runs one parsed KQL query, reporting its coordinates and page cursor. */
+  findPage(
     query: KqlQuery,
     params: JsonMap = {},
     options: Partial<KqlContext> & ReadOptions = {},
-  ): Json[] {
+  ): KqlAnswer {
     const space = options.space ?? this.nexus.space
     const authority = this.effectiveAuthority(space)
     // Both spellings, because both reach `executeKql`: the envelope's
@@ -519,7 +573,7 @@ export class Session {
       authority,
       kqlPermissions(query, snapshotToken !== undefined),
     )
-    const result = executeKql(query, {
+    const result = executeKqlPage(query, {
       store: this.nexus.store,
       space,
       env: this.nexus.environment(space),
@@ -534,6 +588,15 @@ export class Session {
     })
     this.consume(decisions)
     return result
+  }
+
+  /** Runs one parsed KQL query and returns its rows. */
+  find(
+    query: KqlQuery,
+    params: JsonMap = {},
+    options: Partial<KqlContext> & ReadOptions = {},
+  ): Json[] {
+    return this.findPage(query, params, options).rows
   }
 
   /** Runs one KML statement, all-or-nothing. */
@@ -686,6 +749,154 @@ export class Session {
   /** Returns a quarantined element to ordinary use. */
   releaseQuarantine(element: ElementId, space = this.nexus.space): void {
     this.nexus.transact(() => release(this.governanceContext(space), element))
+  }
+
+  /**
+   * Designates the Concept this Space treats as its semantic `$self` (§5.6).
+   *
+   * A Governance operation and not a KML clause, because §5.6 makes the
+   * designation protected Space configuration: "ordinary KML MUST NOT create
+   * or change it". Cognitive content that could name the Brain's own identity
+   * would be content deciding who the Brain is, which is the laundering §88.8
+   * is about.
+   *
+   * Every Capsule rule about source and destination `$self` (§38.4, §38.5)
+   * refers to this designation, and a Space that has designated none has no
+   * `$self` for those rules to map onto.
+   *
+   * Pass `null` to clear it.
+   */
+  designateSelf(concept: ElementId | null, space = this.nexus.space): void {
+    this.nexus.transact(() => {
+      const authority = this.effectiveAuthority(space)
+      this.consume(this.gate(authority, ['manage_policy']))
+      const row = this.nexus.store.space(space)
+      if (row === null) {
+        throw errors.notFoundOrNotVisible(`no MemorySpace ${space}`)
+      }
+      if (concept === null) {
+        this.nexus.store.putSpace({ ...row, self_concept: '' })
+        return
+      }
+      // Refused rather than stored as a name nothing resolves: every `$self`
+      // rule downstream dereferences it, and a dangling one would make the
+      // Space's own identity a broken link.
+      const element = this.nexus.store.load(concept)
+      if (element === null || element.row.space !== space) {
+        throw errors.structuralReferenceInvalid(
+          `${formatElementId(concept)} is not a Concept in this Space; a self ` +
+            `identity is Space-local (§5.3)`,
+        )
+      }
+      if (element.kind !== 'Concept') {
+        throw errors.structuralReferenceInvalid(
+          `${formatElementId(concept)} is a ${element.kind}; a Space's self ` +
+            `identity is a Concept (§5.6)`,
+        )
+      }
+      this.nexus.store.putSpace({
+        ...row,
+        self_concept: formatElementId(concept),
+      })
+    })
+  }
+
+  /**
+   * Acts on the elements whose retention has lapsed (§19.1, §19.2).
+   *
+   * `retention.expires_at` says when the *record* stops being kept. It is not
+   * `valid_time.until`, which says when the claim stops applying, and it is not
+   * archival, which says the element is out of ordinary recall while still
+   * being kept.
+   *
+   * An explicit sweep rather than a background timer, and the capability answer
+   * says so. A Durable Object could schedule an alarm; one that deleted memory
+   * on its own schedule would act while no request was in flight and no
+   * Principal was accountable for it. The host decides when forgetting happens;
+   * the engine decides what may be forgotten.
+   *
+   * Four gates, in this order: `manage_retention` at Space scope, the action's
+   * own permission per element, the legal hold (§163), and per-element
+   * authorization. A held or unauthorized element is **skipped and counted**,
+   * not silently dropped: "swept 4" when 9 expired is the shape of a compliance
+   * failure nobody notices.
+   *
+   * Purge is deliberately not an action here. §19.3 makes physical erasure a
+   * high-impact operation with its own reference policy and its own destruction
+   * of the version log; running it over a set the caller never enumerated would
+   * be the largest irreversible action this engine can take, reached by a
+   * maintenance call.
+   */
+  sweepExpired(
+    action: 'archive' | 'tombstone' = 'tombstone',
+    limit = 100,
+    space = this.nexus.space,
+  ): RetentionSweep {
+    return this.nexus.transact(() => {
+      const authority = this.effectiveAuthority(space)
+      this.consume(this.gate(authority, ['manage_retention']))
+      const cx = this.governanceContext(space)
+      const report: RetentionSweep = {
+        swept: [],
+        held: 0,
+        refused: 0,
+        remaining: 0,
+      }
+      for (const id of this.nexus.store.expiredElements(space, nowTime())) {
+        if (report.swept.length >= limit) {
+          report.remaining += 1
+          continue
+        }
+        const element = this.nexus.store.load(id)
+        if (element === null) continue
+        // §163: a hold blocks removal for everyone, including a sweep the
+        // holder authorized. Reported as held rather than as failed, because
+        // nothing went wrong — the record is being kept on purpose.
+        if (element.row.retention.legal_hold === true) {
+          report.held += 1
+          continue
+        }
+        try {
+          const changed =
+            action === 'archive'
+              ? archiveExpired(cx, id)
+              : tombstoneExpired(cx, id)
+          if (changed) report.swept.push(formatElementId(id))
+        } catch {
+          report.refused += 1
+        }
+      }
+      return report
+    })
+  }
+
+  /**
+   * Marks the Assertions whose validity windows have closed as `expired`.
+   *
+   * §14.3's lifecycle state, reached explicitly. The alternative — deriving it
+   * on every read and never recording it — leaves `expired` as a state the
+   * model names and nothing produces, and leaves a caller unable to ask which
+   * claims have lapsed without recomputing the answer itself.
+   *
+   * Not retraction and not supersession (§14.1, §14.2): nobody withdrew these
+   * and nothing replaced them; their own stated windows ran out.
+   */
+  expireLapsedAssertions(limit = 100, space = this.nexus.space): string[] {
+    return this.nexus.transact(() => {
+      const cx = this.governanceContext(space)
+      const now = nowTime()
+      const expired: string[] = []
+      for (const id of this.nexus.store.lapsedAssertions(space, now)) {
+        if (expired.length >= limit) break
+        try {
+          if (expireAssertion(cx, id, now)) expired.push(formatElementId(id))
+        } catch {
+          // An Assertion this caller may not maintain stays as it is; the
+          // sweep is not a way around per-element authorization.
+        }
+      }
+      return expired
+    })
   }
 
   private governanceContext(space: string): ElementGovernanceContext {

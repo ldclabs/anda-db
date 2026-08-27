@@ -5,9 +5,11 @@
 //! **Nulls sort last.** An unbound value is not a small value; putting it
 //! first under `ASC` would make "nothing recorded" look like the minimum.
 //!
-//! **The cursor is an offset over a deterministic order.** Paging without a
+//! **The cursor pins a snapshot over a deterministic order.** Paging without a
 //! total order returns overlapping or missing rows, so a query that pages gets
-//! `id` appended as the final sort key whether or not it asked for one.
+//! `id` appended as the final sort key whether or not it asked for one — and
+//! the cursor carries the coordinate the traversal began at, because a total
+//! order over a moving set is still not one set (§44.8).
 
 use anda_kip::{
     AggregationFunction, FindClause, FindExpression, Json, KipError, OrderByItem, OrderDirection,
@@ -33,7 +35,8 @@ impl Context<'_> {
         find: &FindClause,
         order_by: Option<&Vec<OrderByItem>>,
         limit: Option<usize>,
-        cursor: Option<usize>,
+        offset: Option<usize>,
+        pinned_seq: u64,
     ) -> Result<Projected, KipError> {
         // Every row this engine returns leaves through here, so the cap an
         // authority carries is merged in at this one place rather than by each
@@ -86,7 +89,7 @@ impl Context<'_> {
 
         self.sort(&mut solutions, order_by)?;
 
-        let offset = cursor.unwrap_or(0);
+        let offset = offset.unwrap_or(0);
         let total = solutions.rows.len();
         let window: Vec<Vec<Binding>> = solutions
             .rows
@@ -96,7 +99,17 @@ impl Context<'_> {
             .cloned()
             .collect();
         let consumed = offset + window.len();
-        let next_cursor = (limit.is_some() && consumed < total).then(|| consumed.to_string());
+        // The cursor carries the coordinate this page was read at, so the
+        // next one continues over the same canonical snapshot rather than over
+        // whatever the Space holds by then (§44.8).
+        let next_cursor = (limit.is_some() && consumed < total).then(|| {
+            crate::store::history::PageCursor {
+                family: crate::store::history::CursorFamily::Query,
+                snapshot_seq: pinned_seq,
+                offset: consumed,
+            }
+            .to_token(&self.space)
+        });
 
         let mut rows = Vec::with_capacity(window.len());
         for row in &window {
