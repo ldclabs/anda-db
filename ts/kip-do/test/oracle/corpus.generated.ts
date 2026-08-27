@@ -145,6 +145,8 @@ const CORPUS: readonly string[] = [
   "DESCRIBE TYPE",
   "DESCRIBE TYPE \"Person\"",
   "DESCRIBE TYPE \"Spaceship\"",
+  "DESCRIBE TYPE \"oops\n{deep}",
+  "DESCRIBE TYPE \"oops\\\n{deep}",
   "DESCRIBE TYPE \"{deep}\"",
   "ENSURE PROPOSITION",
   "ENSURE PROPOSITION (:a, \"related_to\", :b)",

@@ -53,16 +53,16 @@
     "ncu": "npx npm-check-updates -u"
   },
   "devDependencies": {
-    "@cloudflare/vitest-pool-workers": "^0.20.2",
-    "@cloudflare/workers-types": "^5.20260804.1",
+    "@cloudflare/vitest-pool-workers": "^0.22.0",
+    "@cloudflare/workers-types": "^5.20260826.1",
     "typescript": "^7.0.2",
-    "vitest": "~4.1.10",
-    "wrangler": "^4.119.0"
+    "vitest": "~4.1.11",
+    "wrangler": "^4.126.0"
   },
   "engines": {
     "node": ">=20"
   },
   "dependencies": {
-    "@ldclabs/kip-lang": "^2.0.1"
+    "@ldclabs/kip-lang": "^2.0.2"
   }
 }

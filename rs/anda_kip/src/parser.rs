@@ -238,10 +238,12 @@ fn validate_parser_budget(input: &str) -> Result<(), KipError> {
     let mut stack = Vec::new();
     let mut in_string = false;
     let mut escaped = false;
-    // Line comments must be skipped exactly as `skip_ws_and_comments` does, or
-    // this scan desynchronizes from the real parser: a single `"` inside a
-    // comment would latch `in_string` for the rest of the input and every
-    // bracket after it would go uncounted, defeating the depth guard entirely.
+    // Comments and strings must be delimited exactly as the real parser
+    // delimits them, or this scan desynchronizes from it and the guard stops
+    // guarding. A single `"` inside a comment would latch `in_string` for the
+    // rest of the input; so would running past the end of a string the lexer
+    // has already closed. Either way every bracket after it goes uncounted and
+    // the depth ceiling silently stops existing.
     let mut in_line_comment = false;
     let mut prev_slash = false;
 
@@ -255,6 +257,17 @@ fn validate_parser_budget(input: &str) -> Result<(), KipError> {
 
         if in_string {
             prev_slash = false;
+            // A newline ends the string here whether or not a backslash
+            // precedes it, because `character()` admits neither: it refuses
+            // every char below U+0020, and `\n` is not among the escapes it
+            // accepts. An unterminated string is a syntax error, and the scan
+            // must go on counting brackets so that it is *this* guard that
+            // rejects `"` + newline + a thousand `[`.
+            if ch == '\n' {
+                in_string = false;
+                escaped = false;
+                continue;
+            }
             if escaped {
                 escaped = false;
                 continue;
@@ -422,6 +435,18 @@ mod tests {
         // the input, which would let the real brackets go uncounted.
         let latched = format!("// \"\n{deep}");
         assert!(validate_parser_budget(&latched).is_err());
+
+        // Neither may an unterminated one. The lexer closes a string at the
+        // newline, so everything after it is code — including, here, a nesting
+        // depth that on its own is refused.
+        let unterminated = format!("DESCRIBE TYPE \"oops\n{deep}");
+        assert!(validate_parser_budget(&unterminated).is_err());
+
+        // And an escaped newline is not a continuation either: `character()`
+        // has no `\\n` escape, so the string is over at the newline just the
+        // same.
+        let escaped_newline = format!("DESCRIBE TYPE \"oops\\\n{deep}");
+        assert!(validate_parser_budget(&escaped_newline).is_err());
     }
 
     #[test]

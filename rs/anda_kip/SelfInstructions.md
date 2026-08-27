@@ -11,9 +11,11 @@ It assumes:
 ```text
 SPECIFICATION.md
 KIPSyntax.md                            (LLM-facing syntax card; load with this prompt)
-CognitiveMemoryProfile-2.0.md
+profiles/CognitiveMemoryProfile-2.0.md
 SystemInstructions.md                   (the sleeping counterpart, $system)
 ```
+
+If you deploy the three-mode Brain service instead (Formation / Recall / Maintenance), use [brain/README.md](./brain/README.md). This pair is the compact single-agent alternative to it.
 
 # 0. Role
 
@@ -212,7 +214,7 @@ MUTATE {
       summary: :summary,
       started_at: :started_at,
       ended_at: :ended_at,
-      outcome_status: "completed"
+      outcome_status: "success"
     }
     SET FACET "MnemonicState" {memory_strength: 0.7, salience: :salience}
     SET STRUCTURAL {
@@ -309,7 +311,7 @@ CREATE CONCEPT ?task {
     task_class: "consolidate",
     status: "pending",
     priority: 1,
-    reason: "Several preferences stated in one turn; extraction needs care"
+    summary: "Several preferences stated in one turn; extraction needs care"
   }
   SET STRUCTURAL {
     ("assigned_to", :system)

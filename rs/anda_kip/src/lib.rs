@@ -135,7 +135,8 @@ pub static KIP_SYNTAX: &str = include_str!("../KIPSyntax.md");
 /// among the ones they assume are loaded, so a host wiring those prompts needs
 /// a way to supply it. It is the Profile's prose half; the executable half is
 /// the Schema Package artifact an engine installs.
-pub static COGNITIVE_MEMORY_PROFILE: &str = include_str!("../CognitiveMemoryProfile-2.0.md");
+pub static COGNITIVE_MEMORY_PROFILE: &str =
+    include_str!("../profiles/CognitiveMemoryProfile-2.0.md");
 
 /// How an Agent should use KIP as its own memory protocol.
 pub static SELF_INSTRUCTIONS: &str = include_str!("../SelfInstructions.md");
@@ -204,7 +205,10 @@ mod tests {
             ("SelfInstructions.md", SELF_INSTRUCTIONS),
             ("SystemInstructions.md", SYSTEM_INSTRUCTIONS),
             ("KIPSyntax.md", KIP_SYNTAX),
-            ("CognitiveMemoryProfile-2.0.md", COGNITIVE_MEMORY_PROFILE),
+            (
+                "profiles/CognitiveMemoryProfile-2.0.md",
+                COGNITIVE_MEMORY_PROFILE,
+            ),
         ] {
             assert!(!text.is_empty(), "{name} is empty");
             // The 1.x vocabulary must not survive in agent-facing prompts.
@@ -219,7 +223,7 @@ mod tests {
         // shipping the prompts without a way to reach it would leave a host
         // unable to honour what they promise.
         for prompt in [SELF_INSTRUCTIONS, SYSTEM_INSTRUCTIONS] {
-            assert!(prompt.contains("CognitiveMemoryProfile-2.0.md"));
+            assert!(prompt.contains("profiles/CognitiveMemoryProfile-2.0.md"));
         }
         assert!(COGNITIVE_MEMORY_PROFILE.contains("Cognitive Memory Profile"));
     }

@@ -101,6 +101,21 @@ because it is the shape both engines' corpora are built from.
 - **A duplicate logical key is refused at commit** — `CREATE CONCEPT`, the
   create half of `UPSERT` and Capsule import alike, including two Concepts
   minted by one transaction, which no store lookup would catch.
+- **`anda_kip` vendors the Specification's normative companions.** The three
+  EBNF grammars (`grammar/`) and the two wire schemas (`schemas/`) sit beside
+  the documents that cite them, and the reference Brain design (`brain/`) beside
+  the `$self` / `$system` pair it is the three-service form of. The prose half
+  of the Profile moved to `profiles/CognitiveMemoryProfile-2.0.md`, which is
+  where both prompts already said it was; `anda_kip::COGNITIVE_MEMORY_PROFILE`
+  is unchanged. Vendored copies drop the upstream `KIP-2.0-` filename prefix and
+  the EN/CN navigation line, as `SPECIFICATION.md` already did, and every
+  relative link between them resolves.
+- **The pnpm workspace root moved to the repository root.** `ts/kip-do` was
+  its own pnpm root while the lockfile and `node_modules` it produced landed
+  beside the Cargo workspace anyway. One `pnpm-workspace.yaml` at the top now
+  declares `ts/kip-do` as its only package, so `allowBuilds` and the release-age
+  policy are checked in with the tree they apply to. `make test-ts` and the CI
+  job are unchanged: pnpm finds the root by walking up.
 
 ### Fixed
 
@@ -121,6 +136,25 @@ because it is the shape both engines' corpora are built from.
   `Preference` keyed like a `Person`. Schema version 4.
 - **A storage failure during an upsert by id is no longer reported as
   absence.** Only `NotFoundOrNotVisible` means "no such Concept".
+- **The parser budget no longer stops guarding after an unterminated string.**
+  Both lexers close a string at a raw newline; neither budget scan did, so one
+  `"` followed by a newline latched the scan into string mode for the rest of
+  the input and every later bracket went uncounted — `"` + newline + a thousand
+  `[` sailed past a ceiling that refuses a thousand `[` on its own. These
+  budgets exist so that a command one engine refuses is refused by every other,
+  which made it a cross-engine divergence as much as a missing guard. Fixed in
+  `anda_kip`'s scan and, for `@ldclabs/kip-do`, by `@ldclabs/kip-lang` 2.0.2.
+- **Six examples in the bundled documents that a conforming runtime would have
+  rejected** (upstream `kip@85a911e`). These are teaching material — the
+  `$self` / `$system` pair is loaded into prompts and copied by implementers —
+  so a wrong enum value propagates. Against the Cognitive Memory Profile:
+  `SleepTask.status` `"in_progress"` → `"running"`, `Skill.skill_class`
+  `"procedure"` → `"workflow"`, `Event.outcome_status` `"completed"` →
+  `"success"`, and a handoff `SleepTask` carrying an undeclared `reason`
+  instead of its required `summary`. Against Core: §54.1's `CREATE` built an
+  `Experience` without the `goal` that makes it one rather than an `Event`, and
+  the consolidation example cited an `Experience` Concept as an Assertion's
+  `evidence`, which §20.13 reserves for `Evidence` elements.
 - `py/anda_cognitive_nexus_py` follows the workspace to 0.13.
 
 ### Upgrading

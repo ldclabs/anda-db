@@ -1,7 +1,5 @@
 # KIP 2.0 Specification
 
-**[English](./KIP-2.0-SPECIFICATION.md) | [中文](./KIP-2.0-SPECIFICATION_CN.md)**
-
 ## Status
 
 **Normative Draft / Protocol Consolidation Candidate**
@@ -12,24 +10,24 @@ This document is the normative consolidation of the KIP 2.0 design.
 
 The following KIP 2.0 design documents are informative references and design rationale:
 
-- `KIP-2.0-Architecture.md`
-- `design/KIP-2.0-Core-Data-Model.md`
-- `design/KIP-2.0-Epistemic-Model.md`
-- `design/KIP-2.0-Governance.md`
-- `design/KIP-2.0-Schema-Packages.md`
-- `design/KIP-2.0-Transactions.md`
-- `design/KIP-2.0-Capsule.md`
-- `design/KIP-2.0-KQL.md`
-- `design/KIP-2.0-KML.md`
-- `design/KIP-2.0-META.md`
-- `design/KIP-2.0-Protocol-Runtime.md`
+- `Architecture.md`
+- `design/Core-Data-Model.md`
+- `design/Epistemic-Model.md`
+- `design/Governance.md`
+- `design/Schema-Packages.md`
+- `design/Transactions.md`
+- `design/Capsule.md`
+- `design/KQL.md`
+- `design/KML.md`
+- `design/META.md`
+- `design/Protocol-Runtime.md`
 
 The following artifacts are normative companions to this Specification:
 
-- `grammar/KIP-2.0-KQL.ebnf`, `grammar/KIP-2.0-KML.ebnf`, `grammar/KIP-2.0-META.ebnf` — normative syntax
+- `grammar/KQL.ebnf`, `grammar/KML.ebnf`, `grammar/META.ebnf` — normative syntax
 - `schemas/kip-request.schema.json`, `schemas/kip-response.schema.json` — normative wire shapes
 - `profiles/cognitive-memory-2.0.0.schema.json` and `profiles/CognitiveMemoryProfile-2.0.md` — the standard Profile package
-- `conformance/KIP-2.0-Conformance-Tests.md`, `conformance/conformance-test-vector.schema.json`, `conformance/conformance-report.schema.json` and `conformance/fixtures/` — the conformance suite
+- `conformance/Conformance-Tests.md`, `conformance/conformance-test-vector.schema.json`, `conformance/conformance-report.schema.json` and `conformance/fixtures/` — the conformance suite
 
 `KIPSyntax.md` is an informative LLM-facing syntax card, not a normative artifact.
 
@@ -3893,6 +3891,7 @@ CREATE CONCEPT ?exp {
   NAME "Deployment failure"
 
   SET ATTRIBUTES {
+    goal: :goal,
     outcome_status: "failure"
   }
 
@@ -6257,7 +6256,7 @@ path_quantifier :=
     "{" integer ("," integer?)? "}"
 ```
 
-The normative parser grammars ship with this Specification as [`grammar/KIP-2.0-KQL.ebnf`](./grammar/KIP-2.0-KQL.ebnf), [`grammar/KIP-2.0-KML.ebnf`](./grammar/KIP-2.0-KML.ebnf) and [`grammar/KIP-2.0-META.ebnf`](./grammar/KIP-2.0-META.ebnf). Where a sketch in these appendices is less complete than its EBNF, the EBNF governs syntax. Productions referenced but not spelled out here (`structural_field`, `order_clause`, `limit_clause`, `cursor_clause`, `scalar`, `value`, …) are defined in [`grammar/KIP-2.0-KQL.ebnf`](./grammar/KIP-2.0-KQL.ebnf).
+The normative parser grammars ship with this Specification as [`grammar/KQL.ebnf`](./grammar/KQL.ebnf), [`grammar/KML.ebnf`](./grammar/KML.ebnf) and [`grammar/META.ebnf`](./grammar/META.ebnf). Where a sketch in these appendices is less complete than its EBNF, the EBNF governs syntax. Productions referenced but not spelled out here (`structural_field`, `order_clause`, `limit_clause`, `cursor_clause`, `scalar`, `value`, …) are defined in [`grammar/KQL.ebnf`](./grammar/KQL.ebnf).
 
 ---
 

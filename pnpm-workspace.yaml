@@ -1,7 +1,8 @@
+packages:
+  - 'ts/kip-do'
 allowBuilds:
   esbuild: true
   sharp: false
   workerd: true
 minimumReleaseAgeExclude:
-  - '@ldclabs/kip-lang@2.0.0'
-  - '@ldclabs/kip-lang@2.0.1'
+  - '@ldclabs/kip-lang@2.0.2'
