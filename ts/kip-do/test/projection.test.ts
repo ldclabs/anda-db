@@ -354,10 +354,25 @@ describe('the Epistemic Projection', () => {
            ?s CONCEPT {name: "api"}
            ?slot BELIEF SLOT (?s, "status")
          }`,
-      ) as { candidate_projections: unknown[]; accepted_values: string[]; contested: boolean }[]
+      ) as {
+        status: string
+        candidate_projections: unknown[]
+        accepted_values: string[]
+        contested: boolean
+        policy: { id: string }
+        uncertainty: { level: string }
+      }[]
       expect(slot?.candidate_projections).toHaveLength(2)
       expect(slot?.accepted_values).toEqual([])
       expect(slot?.contested).toBe(true)
+      // §47.3: the slot states its own status, so the Agent does not have to
+      // derive it by scanning the candidates. Two candidates opposing each
+      // other through a functional predicate is a contested slot.
+      expect(slot?.status).toBe('contested')
+      // And it names the policy and coordinate it ran under (§47.3), which is
+      // what an empty slot would otherwise have nowhere to report.
+      expect(typeof slot?.policy.id).toBe('string')
+      expect(slot?.uncertainty.level).toBe('high')
     })
   })
 })

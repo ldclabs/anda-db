@@ -1,0 +1,714 @@
+//! # Static checks the Core Package decides on its own (Spec §20.13)
+//!
+//! `kip://core@2.0.0` is a virtual Schema Package the Specification defines
+//! itself: implicitly active in every Schema Environment, never deactivated,
+//! never shadowed. Its registries therefore hold no matter which packages a
+//! Space has installed, which makes them decidable *here* — before an engine,
+//! before a Schema Environment, before a transaction opens.
+//!
+//! ```text
+//! stance                support | reject | uncertain
+//! mode                  observed | stated | inferred | predicted | hypothetical | imported
+//! Assertion lifecycle   active | retracted | superseded | expired
+//! Evidence role         support | challenge | context
+//! Activity terminal     completed | failed | cancelled
+//! belief status         accepted | rejected | contested | uncertain | insufficient
+//! ```
+//!
+//! Two boundaries this module holds to, because crossing either turns a
+//! useful check into a wrong one:
+//!
+//! - **Only written literals are checked.** A `:parameter` is bound from the
+//!   request envelope at execution time, so nothing here can know its value;
+//!   guessing would reject valid commands.
+//! - **Only protocol-fixed vocabulary is checked.** `confidence` is `[0,1]`
+//!   because §13.6 says so. The Cognitive Memory Profile fixes
+//!   `memory_strength`, `salience` and `utility` to the same interval, but
+//!   those belong to a *package* — a Space running a different Profile may
+//!   legitimately mean something else by them, and hard-coding package
+//!   semantics into the protocol layer would reject commands the
+//!   Specification admits. Those stay with the engine, which is the only party
+//!   that knows the active Schema Environment.
+//!
+//! Two things are deliberately *not* checked, both because the Specification
+//! declines to fix them:
+//!
+//! - `TRANSITION ACTIVITY ... TO`. §20.13 registers the Activity **terminal**
+//!   states, not the whole lifecycle vocabulary, and an Activity may
+//!   legitimately move to a non-terminal state the Core registry does not name.
+//! - `SEARCH ... THRESHOLD`. A threshold is compared against a retrieval
+//!   score, and §66.5 makes an engine *declare* its score semantics rather
+//!   than adopt one — §27.3 lists `log_odds` among them, which is not bounded
+//!   at all. A `[0,1]` ceiling here would refuse a legal threshold against a
+//!   perfectly conforming ranker.
+
+use std::fmt;
+
+use crate::ast::{
+    BoundValue, Command, KipValue, KmlStatement, KqlQuery, MetaCommand, MutationClause,
+    MutationValue, Scalar, StructuralEdge, UpdateAction,
+};
+use crate::error::{KipError, KipErrorCode};
+
+/// `stance` — what an Assertion does with its Proposition (§13.4).
+pub const STANCES: &[&str] = &["support", "reject", "uncertain"];
+
+/// `mode` — how an Assertion was arrived at (§13.5).
+pub const ASSERTION_MODES: &[&str] = &[
+    "observed",
+    "stated",
+    "inferred",
+    "predicted",
+    "hypothetical",
+    "imported",
+];
+
+/// The Assertion lifecycle states (§14).
+pub const ASSERTION_LIFECYCLE: &[&str] = &["active", "retracted", "superseded", "expired"];
+
+/// What an Evidence citation does for a claim (§56.2).
+pub const EVIDENCE_ROLES: &[&str] = &["support", "challenge", "context"];
+
+/// The Activity terminal states (§16.6).
+pub const ACTIVITY_TERMINAL: &[&str] = &["completed", "failed", "cancelled"];
+
+/// The belief statuses an Epistemic Projection can return (§21.3).
+pub const BELIEF_STATUSES: &[&str] = &[
+    "accepted",
+    "rejected",
+    "contested",
+    "uncertain",
+    "insufficient",
+];
+
+/// The baseline SEARCH modes (§66.3).
+pub const SEARCH_MODES: &[&str] = &["keyword", "semantic", "hybrid"];
+
+/// The `DESCRIBE PRIMER` modes (§64).
+pub const PRIMER_MODES: &[&str] = &["compact", "full"];
+
+/// The explanation levels `WITH EPISTEMIC` accepts (§49.1).
+pub const EXPLANATION_LEVELS: &[&str] = &["none", "summary", "ledger"];
+
+/// How much a diagnostic matters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Severity {
+    /// The command violates a rule the Core Package fixes. [`check`] turns
+    /// these into errors, so a command carrying one never reaches an engine.
+    Error,
+    /// The command is legal but is the shape a mistake usually takes.
+    Warning,
+}
+
+impl fmt::Display for Severity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Severity::Error => f.write_str("error"),
+            Severity::Warning => f.write_str("warning"),
+        }
+    }
+}
+
+/// One finding about a parsed command.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Diagnostic {
+    /// How much it matters.
+    pub severity: Severity,
+    /// The registry code it would be reported under.
+    pub code: KipErrorCode,
+    /// What is wrong, and what would be right.
+    pub message: String,
+}
+
+impl Diagnostic {
+    fn error(code: KipErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            severity: Severity::Error,
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn warning(code: KipErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            severity: Severity::Warning,
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for Diagnostic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.severity, self.message)
+    }
+}
+
+impl From<Diagnostic> for KipError {
+    fn from(diagnostic: Diagnostic) -> Self {
+        KipError::new(diagnostic.code, diagnostic.message)
+    }
+}
+
+/// Reports everything the Core Package can decide about a parsed command.
+///
+/// Warnings are included, so this is the entry point for a tool that shows
+/// findings rather than rejecting; [`check`] is the one that rejects.
+///
+/// # Examples
+///
+/// ```rust
+/// use anda_kip::{Severity, analyze, parse_kip};
+///
+/// let command = parse_kip(
+///     r#"CREATE ASSERTION ?a { SET FIELDS { asserted_by: :me, mode: "observed" } }"#,
+/// )
+/// .unwrap();
+/// let findings = analyze(&command);
+/// // An observation that cites nothing is legal, but it is the shape a
+/// // missing citation takes.
+/// assert!(findings.iter().any(|d| d.severity == Severity::Warning));
+/// ```
+pub fn analyze(command: &Command) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    match command {
+        Command::Kql(query) => analyze_kql(query, &mut out),
+        Command::Kml(statement) => analyze_kml(statement, &mut out),
+        Command::Meta(meta) => analyze_meta(meta, &mut out),
+    }
+    out
+}
+
+/// Fails on the first [`Severity::Error`] finding, ignoring warnings.
+///
+/// This is what the parser runs, which is why a command whose `stance` is
+/// misspelled is rejected here rather than half-way through an engine's
+/// transaction.
+///
+/// # Examples
+///
+/// ```rust
+/// use anda_kip::parse_kip;
+///
+/// // `maybe` is not one of support | reject | uncertain (Spec §20.13).
+/// assert!(parse_kip(r#"ASSERT (:a, "p", :b) { by: :me, mode: "stated", stance: "maybe" }"#).is_err());
+/// // Nor is a confidence outside [0,1] (Spec §13.6).
+/// assert!(parse_kip(r#"ASSERT (:a, "p", :b) { by: :me, mode: "stated", confidence: 5 }"#).is_err());
+/// ```
+pub fn check(command: &Command) -> Result<(), KipError> {
+    first_error(analyze(command))
+}
+
+/// [`check`] for a query that was parsed on its own.
+pub fn check_kql(query: &KqlQuery) -> Result<(), KipError> {
+    let mut out = Vec::new();
+    analyze_kql(query, &mut out);
+    first_error(out)
+}
+
+/// [`check`] for a mutation that was parsed on its own.
+pub fn check_kml(statement: &KmlStatement) -> Result<(), KipError> {
+    let mut out = Vec::new();
+    analyze_kml(statement, &mut out);
+    first_error(out)
+}
+
+/// [`check`] for a META command that was parsed on its own.
+pub fn check_meta(meta: &MetaCommand) -> Result<(), KipError> {
+    let mut out = Vec::new();
+    analyze_meta(meta, &mut out);
+    first_error(out)
+}
+
+fn first_error(diagnostics: Vec<Diagnostic>) -> Result<(), KipError> {
+    match diagnostics
+        .into_iter()
+        .find(|d| d.severity == Severity::Error)
+    {
+        Some(diagnostic) => Err(diagnostic.into()),
+        None => Ok(()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Value inspection
+// ---------------------------------------------------------------------------
+
+/// The written string in a value position, or `None` when there is nothing to
+/// check: a `:parameter` is bound at execution time, and a non-string value is
+/// a type error the Schema layer reports.
+fn literal_str(value: &MutationValue) -> Option<&str> {
+    match value {
+        MutationValue::Value(KipValue::String(text)) => Some(text),
+        _ => None,
+    }
+}
+
+fn literal_f64(value: &MutationValue) -> Option<f64> {
+    match value {
+        MutationValue::Value(KipValue::Number(number)) => number.as_f64(),
+        _ => None,
+    }
+}
+
+fn scalar_str(scalar: &Scalar) -> Option<&str> {
+    match scalar {
+        Scalar::Literal(KipValue::String(text)) => Some(text),
+        _ => None,
+    }
+}
+
+fn bound_str(value: &BoundValue) -> Option<&str> {
+    match value {
+        BoundValue::Value(KipValue::String(text)) => Some(text),
+        _ => None,
+    }
+}
+
+fn check_enum(written: Option<&str>, allowed: &[&str], label: &str, out: &mut Vec<Diagnostic>) {
+    let Some(written) = written else { return };
+    if allowed.contains(&written) {
+        return;
+    }
+    out.push(Diagnostic::error(
+        KipErrorCode::ConstraintViolation,
+        format!(
+            "{label} must be one of {}, found {written:?}",
+            allowed.join(" | ")
+        ),
+    ));
+}
+
+fn check_unit_interval(value: Option<f64>, label: &str, out: &mut Vec<Diagnostic>) {
+    let Some(value) = value else { return };
+    if (0.0..=1.0).contains(&value) {
+        return;
+    }
+    out.push(Diagnostic::error(
+        KipErrorCode::ConstraintViolation,
+        format!("{label} must be within [0, 1], found {value}"),
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// KML
+// ---------------------------------------------------------------------------
+
+fn analyze_kml(statement: &KmlStatement, out: &mut Vec<Diagnostic>) {
+    for clause in &statement.clauses {
+        analyze_clause(clause, out);
+    }
+}
+
+fn analyze_clause(clause: &MutationClause, out: &mut Vec<Diagnostic>) {
+    match clause {
+        // `ASSERT` has already been desugared into this by the parser, so
+        // checking the created Assertion covers the sugar form too.
+        MutationClause::CreateAssertion(record) => {
+            if let Some(fields) = &record.set_fields {
+                analyze_assignments(fields, out);
+                analyze_assertion_shape(fields, record.set_structural.as_deref(), out);
+            }
+            analyze_structural(record.set_structural.as_deref(), out);
+            for facet in &record.set_facets {
+                analyze_assignments(&facet.values, out);
+            }
+        }
+        MutationClause::CreateEvidence(record) | MutationClause::CreateActivity(record) => {
+            if let Some(fields) = &record.set_fields {
+                analyze_assignments(fields, out);
+            }
+            analyze_structural(record.set_structural.as_deref(), out);
+            for facet in &record.set_facets {
+                analyze_assignments(&facet.values, out);
+            }
+        }
+        MutationClause::CreateConcept(concept) => {
+            for fields in [&concept.set_fields, &concept.set_attributes]
+                .into_iter()
+                .flatten()
+            {
+                analyze_assignments(fields, out);
+            }
+            analyze_structural(concept.set_structural.as_deref(), out);
+            for facet in &concept.set_facets {
+                analyze_assignments(&facet.values, out);
+            }
+        }
+        MutationClause::UpsertConcept(concept) => {
+            for fields in [&concept.set_fields, &concept.set_attributes]
+                .into_iter()
+                .flatten()
+            {
+                analyze_assignments(fields, out);
+            }
+            analyze_structural(concept.set_structural.as_deref(), out);
+            for facet in &concept.set_facets {
+                analyze_assignments(&facet.values, out);
+            }
+        }
+        MutationClause::Update(update) => {
+            for action in &update.actions {
+                match action {
+                    UpdateAction::SetFields(a) | UpdateAction::SetAttributes(a) => {
+                        analyze_assignments(a, out)
+                    }
+                    UpdateAction::SetFacet(facet) => analyze_assignments(&facet.values, out),
+                    UpdateAction::SetStructural(edges) => analyze_structural(Some(edges), out),
+                    _ => {}
+                }
+            }
+            warn_unbounded(
+                "UPDATE",
+                update.where_clauses.is_some(),
+                update.limit.is_some(),
+                out,
+            );
+        }
+        // The target of these two is an Assertion by construction, so the
+        // Assertion lifecycle registry is the right vocabulary. `ARCHIVE`,
+        // `TOMBSTONE` and `CORRECT EVIDENCE` take other kinds, for which Core
+        // registers no lifecycle vocabulary — checking them would reject
+        // states the Specification admits.
+        MutationClause::RetractAssertion(retract) => {
+            check_enum(
+                retract.expect_state.as_ref().and_then(scalar_str),
+                ASSERTION_LIFECYCLE,
+                "EXPECT STATE on an Assertion",
+                out,
+            );
+            warn_unbounded(
+                "RETRACT ASSERTION",
+                retract.where_clauses.is_some(),
+                retract.limit.is_some(),
+                out,
+            );
+        }
+        MutationClause::SupersedeAssertion(supersede) => check_enum(
+            supersede.expect_state.as_ref().and_then(scalar_str),
+            ASSERTION_LIFECYCLE,
+            "EXPECT STATE on an Assertion",
+            out,
+        ),
+        MutationClause::TransitionActivity(transition) => {
+            if let Some(fields) = &transition.set_fields {
+                analyze_assignments(fields, out);
+            }
+            analyze_structural(transition.set_structural.as_deref(), out);
+        }
+        MutationClause::SetRetention(retention) => {
+            analyze_assignments(&retention.values, out);
+            warn_unbounded(
+                "SET RETENTION",
+                retention.where_clauses.is_some(),
+                retention.limit.is_some(),
+                out,
+            );
+        }
+        MutationClause::Archive(removal) => warn_unbounded(
+            "ARCHIVE",
+            removal.where_clauses.is_some(),
+            removal.limit.is_some(),
+            out,
+        ),
+        MutationClause::Tombstone(removal) => warn_unbounded(
+            "TOMBSTONE",
+            removal.where_clauses.is_some(),
+            removal.limit.is_some(),
+            out,
+        ),
+        MutationClause::Purge(purge) => warn_unbounded(
+            "PURGE",
+            purge.where_clauses.is_some(),
+            purge.limit.is_some(),
+            out,
+        ),
+        MutationClause::EnsureProposition(_) | MutationClause::CorrectEvidence(_) => {}
+        MutationClause::MergeConcept(_) => {}
+    }
+}
+
+/// Core-typed fields mean the same thing wherever they are written, so an
+/// `UPDATE` that sets one gets the same check a `CREATE ASSERTION` gets.
+fn analyze_assignments(assignments: &crate::ast::Assignments, out: &mut Vec<Diagnostic>) {
+    for (field, value) in assignments {
+        match field.as_str() {
+            "stance" => check_enum(literal_str(value), STANCES, "stance", out),
+            "mode" => check_enum(literal_str(value), ASSERTION_MODES, "mode", out),
+            "confidence" => check_unit_interval(literal_f64(value), "confidence", out),
+            _ => {}
+        }
+    }
+}
+
+/// `role` on an `("evidence", ...)` citation comes from the Core registry
+/// (§56.2). Options on any other structural field are package-defined, and
+/// only the Schema Environment can judge those.
+fn analyze_structural(edges: Option<&[StructuralEdge]>, out: &mut Vec<Diagnostic>) {
+    for edge in edges.into_iter().flatten() {
+        let crate::ast::SymbolRef::Name(field) = &edge.field else {
+            continue;
+        };
+        if field != "evidence" {
+            continue;
+        }
+        let Some(options) = &edge.options else {
+            continue;
+        };
+        if let Some(role) = options.get("role") {
+            check_enum(
+                bound_str(role),
+                EVIDENCE_ROLES,
+                "an Evidence citation role",
+                out,
+            );
+        }
+    }
+}
+
+/// An observation that cites nothing is a valid Assertion, but it is the shape
+/// a forgotten citation takes: `mode: "observed"` claims the actor saw it, and
+/// what they saw is exactly what Evidence records.
+fn analyze_assertion_shape(
+    fields: &crate::ast::Assignments,
+    structural: Option<&[StructuralEdge]>,
+    out: &mut Vec<Diagnostic>,
+) {
+    let observed = fields
+        .iter()
+        .any(|(name, value)| name == "mode" && literal_str(value) == Some("observed"));
+    if !observed {
+        return;
+    }
+    let cites_evidence = structural.into_iter().flatten().any(
+        |edge| matches!(&edge.field, crate::ast::SymbolRef::Name(field) if field == "evidence"),
+    );
+    if !cites_evidence {
+        out.push(Diagnostic::warning(
+            KipErrorCode::ConstraintViolation,
+            "mode: \"observed\" without evidence: an observation normally cites the artifact it \
+             was observed from",
+        ));
+    }
+}
+
+/// Spec §52.7 names the statements whose `WHERE` can select an unbounded set.
+/// A statement that names its target directly is already bounded to one
+/// element, so only the pattern-selecting form is worth warning about.
+fn warn_unbounded(statement: &str, has_where: bool, has_limit: bool, out: &mut Vec<Diagnostic>) {
+    if has_where && !has_limit {
+        out.push(Diagnostic::warning(
+            KipErrorCode::ResultLimitExceeded,
+            format!(
+                "{statement} selects by pattern without a LIMIT: the match set is unbounded, and \
+                 an over-broad one cannot be undone"
+            ),
+        ));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// KQL
+// ---------------------------------------------------------------------------
+
+fn analyze_kql(query: &KqlQuery, out: &mut Vec<Diagnostic>) {
+    if let Some(epistemic) = &query.epistemic
+        && let Some(explanation) = epistemic.get("explanation")
+    {
+        check_enum(
+            bound_str(explanation),
+            EXPLANATION_LEVELS,
+            "WITH EPISTEMIC explanation",
+            out,
+        );
+    }
+    if query.limit.is_none() {
+        out.push(Diagnostic::warning(
+            KipErrorCode::ResultLimitExceeded,
+            "FIND without a LIMIT: an unbounded recall returns whatever the Space happens to hold",
+        ));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// META
+// ---------------------------------------------------------------------------
+
+fn analyze_meta(meta: &MetaCommand, out: &mut Vec<Diagnostic>) {
+    match meta {
+        // `THRESHOLD` is compared against a retrieval score whose semantics
+        // the engine declares (§66.5) rather than inherits, so it carries no
+        // protocol-fixed range to check it against.
+        MetaCommand::Search(search) => check_enum(
+            search.mode.as_ref().and_then(scalar_str),
+            SEARCH_MODES,
+            "SEARCH MODE",
+            out,
+        ),
+        MetaCommand::Describe(crate::ast::DescribeTarget::Primer { mode }) => check_enum(
+            mode.as_ref().and_then(scalar_str),
+            PRIMER_MODES,
+            "DESCRIBE PRIMER MODE",
+            out,
+        ),
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::{parse_kip, parse_kml};
+
+    #[test]
+    fn core_registry_values_are_checked_wherever_they_are_written() {
+        for input in [
+            r#"ASSERT (:a, "p", :b) { by: :me, mode: "guessed" }"#,
+            r#"ASSERT (:a, "p", :b) { by: :me, mode: "stated", stance: "maybe" }"#,
+            r#"CREATE ASSERTION ?a { SET FIELDS { stance: "nope" } }"#,
+            r#"UPDATE :c SET FIELDS { mode: "wat" }"#,
+            r#"CREATE ASSERTION ?a { SET STRUCTURAL { ("evidence", :e) { role: "bogus" } } }"#,
+            r#"RETRACT ASSERTION :a EXPECT STATE "banana""#,
+            r#"SUPERSEDE ASSERTION :a BY :b EXPECT STATE "banana""#,
+            r#"SEARCH CONCEPT "x" MODE "fuzzy""#,
+            r#"DESCRIBE PRIMER MODE "verbose""#,
+        ] {
+            assert!(
+                parse_kip(input).is_err(),
+                "a Core registry violation must not parse: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_unit_interval_is_enforced_where_the_protocol_fixes_it() {
+        for input in [
+            r#"ASSERT (:a, "p", :b) { by: :me, mode: "stated", confidence: 5 }"#,
+            r#"ASSERT (:a, "p", :b) { by: :me, mode: "stated", confidence: -0.5 }"#,
+            r#"CREATE ASSERTION ?a { SET FIELDS { confidence: 1.5 } }"#,
+        ] {
+            assert!(parse_kip(input).is_err(), "out of [0,1]: {input}");
+        }
+        for input in [
+            r#"ASSERT (:a, "p", :b) { by: :me, mode: "stated", confidence: 0 }"#,
+            r#"ASSERT (:a, "p", :b) { by: :me, mode: "stated", confidence: 1 }"#,
+            r#"ASSERT (:a, "p", :b) { by: :me, mode: "stated", confidence: 0.5 }"#,
+        ] {
+            assert!(parse_kip(input).is_ok(), "inside [0,1]: {input}");
+        }
+    }
+
+    #[test]
+    fn a_search_threshold_is_not_forced_into_the_unit_interval() {
+        // A threshold is compared against a retrieval score, and §66.5 has an
+        // engine declare its score semantics rather than adopt one — §27.3
+        // lists `log_odds`, which is unbounded. Capping this at 1 would
+        // refuse a legal threshold against a conforming ranker.
+        for input in [
+            r#"SEARCH CONCEPT "x" THRESHOLD 0.5"#,
+            r#"SEARCH CONCEPT "x" THRESHOLD 1000"#,
+            r#"SEARCH CONCEPT "x" THRESHOLD -3"#,
+        ] {
+            assert!(parse_kip(input).is_ok(), "{input}");
+        }
+    }
+
+    #[test]
+    fn a_parameter_is_never_second_guessed() {
+        // Its value arrives with the envelope; rejecting it here would reject
+        // a command that is going to be perfectly legal.
+        for input in [
+            r#"ASSERT (:a, "p", :b) { by: :me, mode: :mode, stance: :stance, confidence: :c }"#,
+            r#"SEARCH CONCEPT "x" MODE :mode THRESHOLD :threshold"#,
+            r#"DESCRIBE PRIMER MODE :mode"#,
+            r#"RETRACT ASSERTION :a EXPECT STATE :state"#,
+        ] {
+            assert!(parse_kip(input).is_ok(), "a parameter must pass: {input}");
+        }
+    }
+
+    #[test]
+    fn package_defined_signals_are_left_to_the_engine() {
+        // The Cognitive Memory Profile fixes these to [0,1], but a Space
+        // running a different Profile may mean something else by them. Only
+        // the active Schema Environment can decide, so the protocol layer
+        // does not.
+        assert!(parse_kip(r#"UPDATE :c SET FACET "MnemonicState" { salience: 42 }"#).is_ok());
+        assert!(parse_kip(r#"UPDATE :c SET FACET "Skill" { utility: 42 }"#).is_ok());
+    }
+
+    #[test]
+    fn a_transition_target_is_not_restricted_to_the_terminal_states() {
+        // §20.13 registers the Activity *terminal* states, not its whole
+        // lifecycle vocabulary; an Activity may move to a non-terminal state.
+        assert!(parse_kip(r#"TRANSITION ACTIVITY :a TO "running""#).is_ok());
+        assert!(parse_kip(r#"TRANSITION ACTIVITY :a TO "succeeded""#).is_ok());
+        assert!(parse_kip(r#"TRANSITION ACTIVITY :a TO "completed""#).is_ok());
+    }
+
+    #[test]
+    fn lifecycle_states_are_only_checked_where_the_kind_is_fixed() {
+        // ARCHIVE and TOMBSTONE take any element, and Core registers no
+        // element-lifecycle vocabulary.
+        assert!(parse_kip(r#"ARCHIVE :x EXPECT STATE "quarantined""#).is_ok());
+        assert!(parse_kip(r#"TOMBSTONE :x EXPECT STATE "whatever""#).is_ok());
+        assert!(parse_kip(r#"CORRECT EVIDENCE :a BY :b EXPECT STATE "anything""#).is_ok());
+    }
+
+    #[test]
+    fn unbounded_pattern_mutations_warn_but_still_parse() {
+        let statement = parse_kml(r#"PURGE ?x WHERE { ?x {type: "T"} } CONFIRM "PURGE""#)
+            .expect("a legal command");
+        let mut diagnostics = Vec::new();
+        analyze_kml(&statement, &mut diagnostics);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.severity == Severity::Warning && d.message.contains("LIMIT")),
+            "an unbounded PURGE must warn: {diagnostics:?}"
+        );
+
+        // Naming the target directly is already bounded to one element.
+        let bounded = parse_kml(r#"PURGE :x CONFIRM "PURGE""#).expect("a legal command");
+        let mut none = Vec::new();
+        analyze_kml(&bounded, &mut none);
+        assert!(none.is_empty(), "a targeted PURGE must not warn: {none:?}");
+    }
+
+    #[test]
+    fn an_observation_without_evidence_is_a_warning_not_a_rejection() {
+        let command =
+            parse_kip(r#"ASSERT (:a, "p", :b) { by: :me, mode: "observed" }"#).expect("legal");
+        let diagnostics = analyze(&command);
+        assert!(diagnostics.iter().all(|d| d.severity == Severity::Warning));
+        assert!(diagnostics.iter().any(|d| d.message.contains("observed")));
+
+        // Citing one clears it.
+        let cited =
+            parse_kip(r#"ASSERT (:a, "p", :b) { by: :me, mode: "observed", evidence: :e }"#)
+                .expect("legal");
+        assert!(analyze(&cited).is_empty());
+    }
+
+    #[test]
+    fn the_explanation_level_comes_from_the_registry() {
+        assert!(
+            parse_kip(r#"FIND(?x) WHERE { ?x {a: 1} } WITH EPISTEMIC { explanation: "verbose" }"#)
+                .is_err()
+        );
+        assert!(
+            parse_kip(
+                r#"FIND(?x) WHERE { ?x {a: 1} } WITH EPISTEMIC { explanation: "ledger" } LIMIT 5"#
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn diagnostics_carry_the_registry_code_they_would_be_reported_under() {
+        let err = parse_kip(r#"ASSERT (:a, "p", :b) { by: :me, mode: "guessed" }"#)
+            .expect_err("rejected");
+        assert_eq!(err.code, KipErrorCode::ConstraintViolation);
+        assert!(err.message.contains("observed | stated"), "{}", err.message);
+    }
+}

@@ -119,7 +119,8 @@ pub fn parse_kip(input: &str) -> Result<Command, KipError> {
 /// ```
 pub fn validate_command(command: &Command) -> Result<(), KipError> {
     match command {
-        Command::Kml(statement) => kml::validate_plan(statement),
+        Command::Kml(statement) => kml::validate_plan(statement)?,
+        Command::Kql(query) => validate_query(query)?,
         Command::Meta(MetaCommand::ExportCapsule(export)) => {
             if export.where_clauses.is_empty() {
                 return Err(KipError::invalid_syntax(
@@ -127,10 +128,26 @@ pub fn validate_command(command: &Command) -> Result<(), KipError> {
                      not a Capsule",
                 ));
             }
-            kml::validate_exact_patterns(&export.where_clauses)
+            kml::validate_exact_patterns(&export.where_clauses)?;
         }
-        _ => Ok(()),
+        Command::Meta(_) => {}
     }
+    crate::semantics::check(command)
+}
+
+/// The structural rules a `FIND` must satisfy, re-checked off the text path.
+///
+/// `FIND()` never parses, but a hand-built or transported AST can carry an
+/// empty projection list — and a query with no column to name is not a
+/// narrower query, it is a query with no answer shape at all.
+fn validate_query(query: &KqlQuery) -> Result<(), KipError> {
+    if query.find_clause.expressions.is_empty() {
+        return Err(KipError::invalid_syntax(
+            "FIND needs at least one projection: a query with no projected column has no result \
+             shape",
+        ));
+    }
+    Ok(())
 }
 
 /// Parses a KQL query.
@@ -152,6 +169,7 @@ pub fn parse_kql(input: &str) -> Result<KqlQuery, KipError> {
     let (_, query) = all_consuming(json::ws(kql::parse_kql_query))
         .parse(input)
         .map_err(|err| format_nom_error(input, err))?;
+    crate::semantics::check_kql(&query)?;
     Ok(query)
 }
 
@@ -183,6 +201,7 @@ pub fn parse_kml(input: &str) -> Result<KmlStatement, KipError> {
         .parse(input)
         .map_err(|err| format_nom_error(input, err))?;
     kml::validate_plan(&statement)?;
+    crate::semantics::check_kml(&statement)?;
     Ok(statement)
 }
 
@@ -201,6 +220,7 @@ pub fn parse_meta(input: &str) -> Result<MetaCommand, KipError> {
     let (_, command) = all_consuming(json::ws(meta::parse_meta_command))
         .parse(input)
         .map_err(|err| format_nom_error(input, err))?;
+    crate::semantics::check_meta(&command)?;
     Ok(command)
 }
 
@@ -405,6 +425,36 @@ mod tests {
         )
         .expect_err("duplicate handle");
         assert_eq!(err.code, crate::error::KipErrorCode::DuplicateLocalHandle);
+    }
+
+    #[test]
+    fn the_ast_channel_is_held_to_the_same_rules_as_the_text_channel() {
+        // §73: an operation may carry a pre-parsed `ast` instead of `command`
+        // text, and such a tree has had none of the parser's guards applied.
+        // Anything the text form rejects must be rejected here too, or the
+        // `ast` form becomes the way to hand an engine what the text form
+        // exists to refuse.
+
+        // `FIND()` never parses; an empty projection list must not validate.
+        assert!(parse_kip(r#"FIND() WHERE { ?x {a: 1} }"#).is_err());
+        let empty_projection: Command = serde_json::from_str(
+            r#"{"Kql":{"find_clause":{"expressions":[]},"where_clauses":[],"as_of":null,
+                "for_time":null,"epistemic":null,"order_by":null,"limit":null,"cursor":null}}"#,
+        )
+        .unwrap();
+        assert!(validate_command(&empty_projection).is_err());
+
+        // And so must a Core registry violation, on every surface.
+        let bad_search: Command = serde_json::from_str(
+            r#"{"Meta":{"Search":{"target":"Concept","term":{"Literal":{"String":"x"}},
+                "with_type":null,"with_predicate":null,"mode":{"Literal":{"String":"fuzzy"}},
+                "threshold":null,"as_of_seq":null,"limit":null,"cursor":null}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            validate_command(&bad_search).unwrap_err().code,
+            crate::error::KipErrorCode::ConstraintViolation
+        );
     }
 
     #[test]

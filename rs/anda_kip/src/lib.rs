@@ -30,11 +30,14 @@
 //!   one can be differentially tested against each other;
 //! - [`parser`] — nom parsers for the three surfaces, enforcing the
 //!   schema-independent rules as they parse;
+//! - [`semantics`] — the Core Package registries (§20.13) and the other rules
+//!   decidable without a Schema Environment;
 //! - [`error`] — the Core Error Registry (§87) with categories and retry
 //!   classes;
 //! - [`request`] — the runtime envelope (§71–§85);
 //! - [`types`] — the Core data model (§6–§19);
 //! - [`capsule`] — portable Cognitive Capsules (§37–§41);
+//! - [`conformance`] — the profile names an implementation declares (§89);
 //! - [`executor`] — the engine seam.
 //!
 //! ## Standards compliance
@@ -111,18 +114,22 @@ use std::sync::LazyLock;
 
 pub mod ast;
 pub mod capsule;
+pub mod conformance;
 pub mod error;
 pub mod executor;
 pub mod parser;
 pub mod request;
+pub mod semantics;
 pub mod types;
 
 pub use ast::*;
 pub use capsule::*;
+pub use conformance::*;
 pub use error::*;
 pub use executor::*;
 pub use parser::*;
 pub use request::*;
+pub use semantics::*;
 pub use types::*;
 
 /// The KIP 2.0 syntax reference, condensed for a model to read in context.

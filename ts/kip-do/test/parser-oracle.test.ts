@@ -105,7 +105,7 @@ const KNOWN_DIVERGENCES: readonly { source: string; why: string }[] = [
     why:
       "`anda_kip` rejects an Assertion's `evidence` at parse time, because an " +
       'Assertion payload is immutable (§76) — the citation is part of the ' +
-      'commitment, not an annotation on it. `@ldclabs/kip-lang` 2.0.1 still ' +
+      'commitment, not an annotation on it. `@ldclabs/kip-lang` 2.0.2 still ' +
       'accepts it and leaves the refusal to the engine. Nothing is writable ' +
       'either way: this engine answers `EpistemicRevisionRequired` from ' +
       '`kml/update.ts`, which names the way round rather than the syntax. ' +

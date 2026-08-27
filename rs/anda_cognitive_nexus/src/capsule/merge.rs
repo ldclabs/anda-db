@@ -406,9 +406,9 @@ fn build(
             }))
         }
         ElementKind::Assertion => {
-            let proposition = reference_id(view.get("proposition_id"), mapping, "proposition")?;
+            let proposition = reference_id(view.get("proposition"), mapping, "proposition")?;
             let asserted_by = endpoint(view.get("asserted_by"), mapping, "asserted_by")?;
-            let evidence_refs = rewrite_refs(view.get("evidence_refs"), mapping, "evidence")?;
+            let evidence_refs = rewrite_refs(view.get("evidence"), mapping, "evidence")?;
             let evidence_ids = evidence_refs.iter().filter_map(reference_target).collect();
             Element::Assertion(Box::new(AssertionRow {
                 _id: id.seq,
@@ -454,7 +454,7 @@ fn build(
             content_digest: text(view, "content_digest"),
             media_type: text(view, "media_type"),
             observed_at: text(view, "observed_at"),
-            source_refs: rewrite_refs(view.get("source_refs"), mapping, "source")?,
+            source_refs: rewrite_refs(view.get("source"), mapping, "source")?,
             generated_by: view
                 .get("generated_by")
                 .and_then(|value| value.get("id"))
@@ -524,14 +524,13 @@ fn resolve(
 
 /// The members a reference can be spelled under.
 ///
-/// `{"id": …}` is the general form, and `evidence_id` is the one a citation
-/// uses because an `EvidenceRef` carries a role alongside it. Missing either
-/// would leave the import pointing at the source's ids — an edge that resolves
-/// in the destination to some unrelated element, or to nothing.
-const REFERENCE_KEYS: &[&str] = &["id", "evidence_id"];
+/// One, since §13.2 spells a citation `{"id": …, "role": …}` like every other
+/// reference: a reference the rewriter does not recognize leaves the import
+/// pointing at the *source's* ids — an edge that resolves in the destination to
+/// some unrelated element, or to nothing.
+const REFERENCE_KEYS: &[&str] = &["id"];
 
-/// Rewrites a reference value — `{"id": …}`, `{"evidence_id": …}`, or a bare id
-/// string.
+/// Rewrites a reference value — `{"id": …}` or a bare id string.
 fn rewrite_reference(
     value: &Json,
     mapping: &BTreeMap<String, ElementId>,
@@ -638,18 +637,23 @@ fn endpoint(
     Endpoint::from_json(&rewritten)
 }
 
+/// Resolves a single required reference slot onto a destination id.
+///
+/// The slot holds a reference object — `{"id": …}` — as every reference slot
+/// in the wire shape does (§8, §13.2). A bare id string is accepted too,
+/// because `rewrite_reference` emits one for a value that arrived that way.
 fn reference_id(
     value: Option<&Json>,
     mapping: &BTreeMap<String, ElementId>,
     what: &str,
 ) -> Result<ElementId, KipError> {
-    let source = value.and_then(Json::as_str).ok_or_else(|| {
+    let source = value.and_then(reference_target).ok_or_else(|| {
         KipError::new(
             KipErrorCode::CapsuleValidationFailed,
             format!("a record is missing its {what}"),
         )
     })?;
-    resolve(mapping, source, what)
+    resolve(mapping, &source, what)
 }
 
 // ---------------------------------------------------------------------------

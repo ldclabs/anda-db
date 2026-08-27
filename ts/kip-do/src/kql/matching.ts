@@ -95,9 +95,16 @@ const REFERENCE_FIELDS: Readonly<Record<ElementKind, readonly string[]>> = {
   Activity: [],
 }
 
-/** Where a matcher field is read from in the rendered view. */
+/**
+ * Where a matcher field is read from in the rendered view.
+ *
+ * What is left here is sugar — a short spelling the Specification's own
+ * examples use — rather than translation. `proposition` used to be redirected
+ * to `proposition_id` because the view spelled it that way; the view now
+ * spells it as §13.2 does, so the entry is gone and `FIND(?a.proposition)`
+ * reads the same slot the pattern matched on.
+ */
 const FIELD_PATHS: Readonly<Record<string, string[]>> = {
-  proposition: ['proposition_id'],
   status: ['lifecycle', 'status'],
   state: ['_system', 'state'],
   version: ['_system', 'version'],

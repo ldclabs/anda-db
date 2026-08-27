@@ -101,7 +101,7 @@ function materialInputs(element: Element): string[] {
   }
   switch (element.kind) {
     case 'Assertion':
-      for (const ref of element.row.evidence_refs) push(ref.evidence_id)
+      for (const ref of element.row.evidence_refs) push(ref.id)
       for (const ref of element.row.context_refs) push(ref)
       break
     case 'Evidence':

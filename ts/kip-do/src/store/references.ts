@@ -101,7 +101,7 @@ export function elementReferences(element: Element): ElementReference[] {
         out,
         'evidence',
         element.row.evidence_refs as unknown as Json[],
-        (value) => (isJsonMap(value) ? byId(value.evidence_id) : null),
+        (value) => (isJsonMap(value) ? byId(value.id) : null),
       )
       pushEach(out, 'context', element.row.context_refs, local)
       pushEach(out, 'supersedes', element.row.supersedes, byId)

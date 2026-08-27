@@ -369,7 +369,7 @@ async fn an_import_rebuilds_the_graph_under_destination_identity() {
     // the id it had at the source.
     let cited = ok(
         &destination,
-        r#"FIND(?a.evidence_refs)
+        r#"FIND(?a.evidence)
            WHERE {
              ?what CONCEPT {name: "Dark"}
              ?p PROPOSITION (?who, "prefers", ?what)
@@ -385,7 +385,9 @@ async fn an_import_rebuilds_the_graph_under_destination_identity() {
         .find(|(source, _)| source.starts_with("E-"))
         .map(|(_, destination)| destination.clone())
         .unwrap();
-    assert_eq!(refs[0]["evidence_id"], json!(source_evidence), "{refs:?}");
+    // §13.2 spells a citation `{id, role}`, and the id it carries is the
+    // destination's — the whole point of the rewrite.
+    assert_eq!(refs[0]["id"], json!(source_evidence), "{refs:?}");
 }
 
 /// Importing the same artifact twice writes nothing the second time. The

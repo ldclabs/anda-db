@@ -362,9 +362,12 @@ function createRecord(
       // Assertion cites E *as supporting*, and never that E proves anything —
       // that judgement belongs to the Projection (§8.4).
       const evidence = structural.take('evidence').map(([value, opts]) => {
-        const citation: JsonMap = { evidence_id: referenceId(value) }
+        // Stored in the wire shape §13.2 fixes — `{id, role}` — so the
+        // view renders it without a rename, and one place fewer can drift
+        // from the other.
+        const citation: JsonMap = { id: referenceId(value) }
         if (typeof opts.role === 'string') citation.role = opts.role
-        return citation as unknown as { evidence_id: string; role?: string }
+        return citation as unknown as { id: string; role?: string }
       })
       const validTime = fields.json('valid_time')
       const confidence = fields.confidence()

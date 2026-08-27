@@ -14,6 +14,12 @@
  * `lower(parse(src))` must deep-equal what the Rust grammar compiled to WASM
  * produces, or both must reject. The two engines agreeing on what a command
  * means is enforced there rather than assumed here.
+ *
+ * `lower` stops at what the *grammar* decides. The Core Package registries
+ * (§20.13) are decidable without a Schema Environment too — a `stance` of
+ * `"maybe"` is wrong whatever packages a Space has installed — so
+ * `./semantics.ts` runs after it, mirroring `anda_kip::semantics` so both
+ * engines refuse the same commands for the same reason.
  */
 
 import {
@@ -29,6 +35,7 @@ import {
 import type { Program } from '@ldclabs/kip-lang'
 import { KipError, errors, type KipErrorCode } from '../errors.js'
 import type { Command } from './ast.js'
+import { checkSemantics } from './semantics.js'
 
 /**
  * The parse-time codes kip-lang reports, in this engine's registry.
@@ -91,7 +98,9 @@ function parseProgram(source: string): Program {
  */
 export function parseKip(source: string): Command {
   try {
-    return lower(parseProgram(source))
+    const command = lower(parseProgram(source))
+    checkSemantics(command)
+    return command
   } catch (err) {
     throw toKipError(err)
   }
@@ -132,7 +141,9 @@ export function parseKipBatch(
  */
 export function parseKipAll(source: string): Command[] {
   try {
-    return lowerAll(parseProgram(source))
+    const commands = lowerAll(parseProgram(source))
+    for (const command of commands) checkSemantics(command)
+    return commands
   } catch (err) {
     throw toKipError(err)
   }

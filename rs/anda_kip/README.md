@@ -37,12 +37,19 @@ erase the audit trail.
 - **`ast`** — the executable AST, field-for-field compatible with the reference
   toolkit [`@ldclabs/kip-lang`](https://github.com/ldclabs/KIP/tree/main/packages/kip-lang),
   so a Rust engine and a TypeScript one can be differentially tested;
+- **`semantics`** — the Core Package registries (§20.13) and the other rules
+  decidable without a Schema Environment: `stance`, `mode`, Assertion
+  lifecycle, Evidence roles, SEARCH modes, and the `[0,1]` ranges the protocol
+  itself fixes. A misspelled `stance` is refused here rather than half-way
+  through an engine's transaction;
 - **`error`** — the Core Error Registry (§87): stable named codes with a
   category, a retry class and a recovery hint;
 - **`request`** — the runtime envelope (§71–§85), including ingestion contexts,
   execution modes and receipts;
 - **`types`** — the Core data model (§6–§19);
-- **`capsule`** — portable Cognitive Capsules (§37–§41);
+- **`capsule`** — portable Cognitive Capsules (§37–§41), with the canonical
+  serialization their digests are taken over (§37.7);
+- **`conformance`** — the profile names an implementation declares (§89);
 - **`executor`** — the trait an engine implements, plus the read-only path;
 - bundled agent-facing prompts and function-calling schemas.
 
@@ -53,7 +60,7 @@ Governance, transactions, projection — belongs to an engine behind `Executor`.
 
 ```toml
 [dependencies]
-anda_kip = "0.12"
+anda_kip = "0.13"
 ```
 
 ```rust

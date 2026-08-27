@@ -400,7 +400,7 @@ async fn the_policy_travels_with_the_answer() {
     .await;
     let context = response.results[0].context.as_ref().unwrap();
     let policy = context.epistemic_policy.as_ref().expect("a projection ran");
-    assert_eq!(policy.id.as_deref(), Some("kip:policy:baseline"));
+    assert_eq!(policy.id, "kip:policy:baseline");
 }
 
 #[tokio::test]
@@ -532,6 +532,15 @@ async fn a_belief_slot_reports_the_conflict_set_not_a_winner() {
     let slot = &response.first_result().unwrap().as_array().unwrap()[0];
     assert_eq!(slot["candidate_projections"].as_array().unwrap().len(), 2);
     assert_eq!(slot["contested"], true);
+    // §47.3: the slot states its own status, so the Agent does not have to
+    // derive it by scanning the candidates. Two candidates opposing each
+    // other through a functional predicate is a contested slot.
+    assert_eq!(slot["status"], "contested");
+    // And it names the policy and coordinate it ran under (§47.3), which is
+    // what an empty slot would otherwise have nowhere to report.
+    assert!(slot["policy"]["id"].is_string());
+    assert!(slot.get("temporal").is_some());
+    assert_eq!(slot["uncertainty"]["level"], "high");
     // Neither candidate is accepted: each opposes the other through the
     // functional predicate, so the slot has no settled value at all.
     assert!(slot["accepted_values"].as_array().unwrap().is_empty());

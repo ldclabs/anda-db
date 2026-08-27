@@ -71,12 +71,17 @@ fn column_of(kind: ElementKind, key: &str) -> Option<&'static str> {
 }
 
 /// The dot path a matcher key reads in the rendered view.
+///
+/// What is left here is sugar — a short spelling the Specification's own
+/// examples use — rather than translation. `proposition` used to be renamed to
+/// `proposition_id` on the way in because the view spelled it that way; the
+/// view now spells it as §13.2 does, so the entry is gone and
+/// `FIND(?a.proposition)` reads the same field the pattern matched on.
 fn view_key(kind: ElementKind, key: &str) -> String {
     match (kind, key) {
         (ElementKind::Concept, "type") => "schema_ref".to_string(),
         (ElementKind::Evidence, "class") => "evidence_class".to_string(),
         (ElementKind::Activity, "class") => "activity_class".to_string(),
-        (ElementKind::Assertion, "proposition") => "proposition_id".to_string(),
         (ElementKind::Assertion, "by") => "asserted_by".to_string(),
         (ElementKind::Assertion, "status") => "lifecycle.status".to_string(),
         (ElementKind::Evidence, "status") => "lifecycle.status".to_string(),
@@ -94,7 +99,6 @@ fn is_reference_key(kind: ElementKind, key: &str) -> bool {
     matches!(
         (kind, key),
         (ElementKind::Assertion, "proposition")
-            | (ElementKind::Assertion, "proposition_id")
             | (ElementKind::Assertion, "by")
             | (ElementKind::Assertion, "asserted_by")
             | (ElementKind::Evidence, "generated_by")

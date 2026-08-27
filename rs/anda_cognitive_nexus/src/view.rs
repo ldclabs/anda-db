@@ -153,7 +153,7 @@ fn envelope(parts: EnvelopeParts<'_>) -> ElementEnvelope {
     } = parts;
     ElementEnvelope {
         id,
-        kind: Some(kind),
+        kind,
         space_id: some_text(space),
         governance: serde_json::from_value::<GovernanceState>(governance.clone()).ok(),
         retention: serde_json::from_value::<Retention>(retention.clone()).ok(),
@@ -301,7 +301,10 @@ fn assertion(row: &AssertionRow) -> Json {
             retention: &row.retention,
             facets: &row.facets,
         }),
-        proposition_id: row.proposition_id.clone(),
+        // The wire form of a reference is an object, never a bare id string
+        // (§8, §13.2): a string can spell a local id and nothing else, and a
+        // reader cannot tell one that was resolved from one that was guessed.
+        proposition: serde_json::json!({ "id": row.proposition_id }),
         asserted_by: row.asserted_by.clone(),
         stance: match row.stance.as_str() {
             "support" => Some(Stance::Support),
@@ -324,10 +327,22 @@ fn assertion(row: &AssertionRow) -> Json {
         confidence: (row.confidence >= 0.0).then_some(row.confidence),
         asserted_at: some_text(&row.asserted_at),
         valid_time: (valid_time.from.is_some() || valid_time.until.is_some()).then_some(valid_time),
-        evidence_refs: row
+        // Mapped field by field rather than through `from_value(..).ok()`:
+        // dropping a citation that failed to decode would make the Assertion
+        // look like it cited less than it did, which is the one direction an
+        // evidence list must never be wrong in. A malformed entry surfaces as
+        // an empty id instead of disappearing.
+        evidence: row
             .evidence_refs
             .iter()
-            .filter_map(|value| serde_json::from_value::<EvidenceRef>(value.clone()).ok())
+            .map(|value| EvidenceRef {
+                id: value
+                    .get("id")
+                    .and_then(Json::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                role: value.get("role").and_then(Json::as_str).map(str::to_string),
+            })
             .collect(),
         context_refs: row.context_refs.clone(),
         lifecycle: Some(AssertionLifecycle {
@@ -373,7 +388,7 @@ fn evidence(row: &EvidenceRow) -> Json {
         content_digest: some_text(&row.content_digest),
         media_type: some_text(&row.media_type),
         observed_at: some_text(&row.observed_at),
-        source_refs: row.source_refs.clone(),
+        source: row.source_refs.clone(),
         generated_by: some_text(&row.generated_by).map(|id| serde_json::json!({"id": id})),
         lifecycle: Some(EvidenceLifecycle {
             status: some_text(&row.status),
@@ -513,7 +528,13 @@ mod tests {
             valid_from: "2026-01-01T00:00:00.000Z".into(),
             ..Default::default()
         })));
-        assert_eq!(view["proposition_id"], "P-1");
+        // §13.2 spells the slot `proposition` and its value as a reference
+        // object, so `?a.proposition.id` is what a KQL dot path reads.
+        assert_eq!(
+            read_path(&view, &path(&["proposition", "id"])),
+            Json::from("P-1")
+        );
+        assert_eq!(view["proposition_id"], Json::Null);
         assert_eq!(
             read_path(&view, &path(&["lifecycle", "status"])),
             Json::from("superseded")

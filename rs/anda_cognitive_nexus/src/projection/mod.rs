@@ -537,13 +537,20 @@ fn classify(support: f64, opposition: f64, ledger: &Ledger, policy: &Policy) -> 
     BeliefStatus::Uncertain
 }
 
-/// Renders a slot projection: the conflict set, not a winner (§35).
+/// Renders a slot projection: the conflict set, not a winner (§47.3).
 ///
-/// The field names follow the agent-facing syntax card, which promises
-/// `accepted_values` and `candidate_projections`. `accepted_values` is a list
-/// rather than a value on purpose: a functional slot with two accepted
-/// candidates is a contradiction the caller has to see, and collapsing it to
-/// one would be the engine picking a winner nobody authorized.
+/// `accepted_values` is a list rather than a value on purpose: a functional
+/// slot with two accepted candidates is a contradiction the caller has to see,
+/// and collapsing it to one would be the engine picking a winner nobody
+/// authorized.
+///
+/// `status` leads, because §47.4 asks a grounded empty slot to answer
+/// `insufficient` with an empty `accepted_values` rather than force the Agent
+/// to infer unknown from zero raw rows — and an Agent that has to derive the
+/// slot's state by scanning `candidate_projections` is doing exactly that.
+/// `subject`, `predicate_ref`, `leading` and `contested` are additive: they
+/// name what the slot was about and which side is ahead *without* claiming it
+/// settled anything.
 pub fn slot_to_json(subject: &str, predicate: &str, beliefs: &[Belief]) -> Json {
     let accepted: Vec<String> = beliefs
         .iter()
@@ -562,7 +569,37 @@ pub fn slot_to_json(subject: &str, predicate: &str, beliefs: &[Belief]) -> Json 
         || beliefs
             .iter()
             .any(|belief| belief.status == BeliefStatus::Contested);
+
+    // §47.3's four statuses, decided over the slot rather than over any one
+    // candidate. Two accepted values in one slot is a contradiction, so it is
+    // `contested` even though each candidate on its own was accepted.
+    let status = if contested {
+        BeliefStatus::Contested
+    } else if !accepted.is_empty() {
+        BeliefStatus::Accepted
+    } else if beliefs
+        .iter()
+        .any(|belief| belief.status != BeliefStatus::Insufficient)
+    {
+        BeliefStatus::Uncertain
+    } else {
+        BeliefStatus::Insufficient
+    };
+
+    // The slot ran under one policy at one coordinate, so it reports them
+    // itself: a caller that had to read them out of a candidate would have
+    // nothing to read when the slot is empty — which is the case §47.4 is
+    // about.
+    let (policy, valid_at) = match beliefs.first() {
+        Some(belief) => (
+            serde_json::json!({"id": belief.policy.id, "version": belief.policy.version}),
+            Json::from(belief.valid_at.clone()),
+        ),
+        None => (Json::Null, Json::Null),
+    };
+
     serde_json::json!({
+        "status": status,
         "subject": subject,
         "predicate_ref": predicate,
         "accepted_values": accepted,
@@ -570,6 +607,18 @@ pub fn slot_to_json(subject: &str, predicate: &str, beliefs: &[Belief]) -> Json 
         // A leading side is not a settled answer, so it is named as leading.
         "leading": leading.map(|belief| belief.proposition.to_string()),
         "contested": contested,
+        "uncertainty": {
+            "level": match status {
+                BeliefStatus::Insufficient => "total",
+                BeliefStatus::Contested | BeliefStatus::Uncertain => "high",
+                _ => "low",
+            },
+            "reasons": leading
+                .map(|belief| belief.uncertainty_reasons())
+                .unwrap_or_default(),
+        },
+        "temporal": {"valid_at": valid_at},
+        "policy": policy,
     })
 }
 

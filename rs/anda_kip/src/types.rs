@@ -1,5 +1,9 @@
 //! # The KIP 2.0 Core data model (Spec §6–§19)
 //!
+//! Plus the read-out shapes the Specification fixes elsewhere and every engine
+//! would otherwise invent for itself: the Epistemic Projection output (§27.2),
+//! the Change Stream envelope (§36.1) and the capability report (§67).
+//!
 //! KIP 2.0 keeps meaning, belief, evidence, provenance, mnemonic state,
 //! retention and governance in separate planes. That separation is the point of
 //! the version, so these types deliberately refuse to offer the one thing KIP
@@ -41,10 +45,11 @@ pub const PROTECTED_SYSTEM_FIELDS: &[&str] = &[
 /// `MemorySpace` is a Governance container, not an ordinary element, and Profile
 /// objects such as Experience or Skill are typed Concepts plus Facets — not new
 /// Core kinds.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum ElementKind {
     /// A unit of meaning.
+    #[default]
     Concept,
     /// A truth-neutral `(subject, predicate, object)` tuple.
     Proposition,
@@ -75,8 +80,17 @@ pub struct ElementEnvelope {
     /// The immutable Nexus-local id: opaque to clients, never reused (§7.1).
     pub id: String,
     /// Which Core kind this element is.
-    pub kind: Option<ElementKind>,
+    ///
+    /// Not optional: every durable element is exactly one of the five Core
+    /// kinds (§6.1), and a reader that cannot tell which cannot tell an
+    /// Assertion's `confidence` from a Concept attribute of the same name.
+    pub kind: ElementKind,
     /// The element's one home Space (§5.2).
+    ///
+    /// Omitted rather than sent as an empty string when the view has no Space
+    /// to report: a blank home Space is not a Space, and saying so plainly
+    /// beats encoding "unknown" as a value that looks like an answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub space_id: Option<String>,
     /// Governance state — part of the protected control plane.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -294,14 +308,29 @@ pub struct ValidTime {
     pub until: Option<String>,
 }
 
-/// One Evidence citation, with the role it plays.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+/// One Evidence citation, with the role it plays (Spec §13.2).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct EvidenceRef {
     /// The cited Evidence element.
-    pub evidence_id: String,
-    /// What the citation does for the claim, e.g. `support`.
+    pub id: String,
+    /// What the citation does for the claim: `support`, `challenge` or
+    /// `context` (§56.2).
+    ///
+    /// A citation with no role is not a supporting one — it is a citation
+    /// whose role the record does not state, which projection has to treat
+    /// differently from one that says `support`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+}
+
+impl EvidenceRef {
+    /// Cites an Evidence element in the given role.
+    pub fn new(id: impl Into<String>, role: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            role: Some(role.into()),
+        }
+    }
 }
 
 /// An Assertion — one actor's epistemic commitment (Spec §13.2).
@@ -313,8 +342,13 @@ pub struct Assertion {
     /// The common envelope.
     #[serde(flatten)]
     pub envelope: ElementEnvelope,
-    /// The Proposition this Assertion is about.
-    pub proposition_id: String,
+    /// The Proposition this Assertion is about — exactly one.
+    ///
+    /// A reference rather than a bare id string, like every other reference
+    /// slot in the model: §8 admits a local id, a validated `canonical_id` and
+    /// (as an extension) a foreign-Space reference, and a string can only ever
+    /// spell the first.
+    pub proposition: Json,
     /// The semantic actor whose commitment this is — not the writing Principal
     /// (§13.3).
     pub asserted_by: Json,
@@ -331,9 +365,9 @@ pub struct Assertion {
     /// The world-time window the claim applies to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub valid_time: Option<ValidTime>,
-    /// The Evidence cited.
+    /// The Evidence cited, each with its role.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub evidence_refs: Vec<EvidenceRef>,
+    pub evidence: Vec<EvidenceRef>,
     /// The context this claim was made in.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context_refs: Vec<Json>,
@@ -397,9 +431,10 @@ pub struct Evidence {
     /// When the observation happened — not when the record was written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_at: Option<String>,
-    /// Where the observation came from.
+    /// Where the observation came from — a Concept or another Evidence
+    /// (§20.13).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub source_refs: Vec<Json>,
+    pub source: Vec<Json>,
     /// The Activity that produced it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generated_by: Option<Json>,
@@ -460,7 +495,12 @@ pub struct Activity {
 /// KIP is open-world: [`BeliefStatus::Insufficient`] is the unknown state, and
 /// [`BeliefStatus::Rejected`] must never be produced merely because support is
 /// absent (§21.5, §24).
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
+///
+/// Which is also why it is the `Default`: silence is the absence of a basis,
+/// never a verdict. A default of `Accepted` would let an unfilled field read as
+/// a belief nobody holds, and one of `Rejected` would turn "nobody said
+/// anything" into "the Brain denies it".
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum BeliefStatus {
     /// Eligible support is sufficient and unresolved opposition is below the
@@ -473,6 +513,7 @@ pub enum BeliefStatus {
     /// Meaningful material exists but is too weak to decide.
     Uncertain,
     /// No sufficient eligible epistemic basis exists — the open-world unknown.
+    #[default]
     Insufficient,
 }
 
@@ -521,6 +562,182 @@ pub const ACTIVITY_CLASSES: &[&str] = &[
     "belief_revision",
 ];
 
+// ---------------------------------------------------------------------------
+// Read-out shapes the Specification fixes outside §6–§19
+// ---------------------------------------------------------------------------
+
+/// What an Epistemic Projection answers with (Spec §27.2).
+///
+/// A `BELIEF` result is not a Core element — it is computed, never stored
+/// (§21.2) — but its shape is normative all the same, and an engine that
+/// invents its own makes every consumer engine-specific. Four properties the
+/// shape exists to preserve:
+///
+/// - support and opposition are reported **separately**, because a claim with
+///   strong evidence on both sides is not the same as one with none, and a
+///   single blended number cannot tell them apart;
+/// - scores never come without [`ScoreSemantics`]: an unlabelled 0.7 invites
+///   the reader to assume a probability (§27.3);
+/// - the policy that produced the answer is named, so a different threshold
+///   yields a visibly different answer rather than a silently different one;
+/// - `temporal` carries both axes, since *what was known* and *what was true
+///   then* are independent (§48.3).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct Projection {
+    /// The Proposition this belief is about, when one durably exists.
+    ///
+    /// `None` is a real answer, not a missing field: a fully grounded `BELIEF`
+    /// over a tuple no Proposition has been created for returns
+    /// `insufficient` with no id (§46.4). A read must not create the
+    /// Proposition to have something to point at.
+    ///
+    /// An id rather than a reference object, because this names the subject of
+    /// the projection rather than occupying a reference slot on a record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposition_id: Option<String>,
+    /// The projected belief status.
+    pub status: BeliefStatus,
+    /// The material supporting the Proposition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub support: Option<ProjectionSide>,
+    /// The material opposing it. Never assume the two scores sum to 1 (§27.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opposition: Option<ProjectionSide>,
+    /// Why the answer is not firmer than it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uncertainty: Option<ProjectionUncertainty>,
+    /// The coordinates the projection ran at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temporal: Option<ProjectionTemporal>,
+    /// Which policy decided it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<crate::request::PolicyIdentity>,
+    /// The Epistemic Ledger, when one was requested and authorized (§27.4).
+    ///
+    /// Open by construction: what a ledger contains is the projection
+    /// implementation's decision, and §27.4 forbids requiring private
+    /// chain-of-thought to produce one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<Json>,
+}
+
+/// One side — supporting or opposing — of a projection (Spec §27.2).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct ProjectionSide {
+    /// The strength of this side, in whatever `score_semantics` declares.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
+    /// What the score means. Required alongside a score (§27.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score_semantics: Option<String>,
+    /// The Assertions on this side.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assertion_ids: Vec<String>,
+    /// The corroboration groups they collapse into.
+    ///
+    /// Two actors repeating one observation are one root, not two: this is
+    /// where independent support is distinguished from repetition (§23).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub root_groups: Vec<Json>,
+}
+
+/// Why a projection is not firmer than it is (Spec §27.2).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct ProjectionUncertainty {
+    /// A qualitative or numeric level, as the policy defines it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<Json>,
+    /// What limited the answer — staleness, low trust, exclusions, thin
+    /// material. Naming these is what separates "we do not know" from "we
+    /// looked and found nothing".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<String>,
+}
+
+/// The two independent time axes a projection ran under (Spec §27.2, §48.3).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct ProjectionTemporal {
+    /// The world moment the claims were evaluated for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_at: Option<String>,
+    /// The cognitive history the projection read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub as_of_seq: Option<u64>,
+}
+
+/// The score interpretations §27.3 names.
+///
+/// A recommendation rather than a closed enum: an implementation may declare
+/// its own, and the requirement is that it declares *something*.
+pub const SCORE_SEMANTICS: &[&str] = &[
+    "ordinal_strength",
+    "normalized_support",
+    "calibrated_probability",
+    "log_odds",
+    "implementation_specific",
+];
+
+/// One committed transition, as the Change Stream delivers it (Spec §36.1).
+///
+/// The envelope is the unit of atomicity: a consumer must treat everything in
+/// `changes` as one cognitive transition (§36.2). Delivery may be
+/// at-least-once, so `space_id + space_seq + tx_id` is the deduplication key
+/// (§36.3) — and a replayed envelope must not become new Evidence,
+/// reinforcement or a duplicated Experience (§36.4).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct ChangeEnvelope {
+    /// The Space that committed.
+    pub space_id: String,
+    /// The commit sequence this transition produced.
+    pub space_seq: u64,
+    /// The transaction that produced it.
+    pub tx_id: String,
+    /// When it committed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub committed_at: Option<String>,
+    /// The transaction class, e.g. `cognitive`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transaction_class: Option<String>,
+    /// What changed. Shapes are engine-defined; the atomicity is not.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changes: Vec<Json>,
+}
+
+impl ChangeEnvelope {
+    /// The at-least-once deduplication key (Spec §36.3).
+    pub fn dedup_key(&self) -> (&str, u64, &str) {
+        (&self.space_id, self.space_seq, &self.tx_id)
+    }
+}
+
+/// What `DESCRIBE CAPABILITIES` answers with (Spec §67).
+///
+/// The three-way split is the point. **Supported** is what the runtime
+/// implements; **available** is what this Principal may actually request. A
+/// runtime that reports only the first tells a caller to try things it will be
+/// refused for; one that reports only the second makes an authorization gap
+/// look like a missing feature. Neither is a Grant dump — §67.2 is explicit
+/// that availability is not unlimited authorization, and §67.3 allows the
+/// enumeration itself to be redacted.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct Capabilities {
+    /// The conformance profiles the runtime claims (§89).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profiles: Vec<crate::conformance::ConformanceProfile>,
+    /// What this runtime or Space technically implements (§67.1).
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    pub supported: Map<String, Json>,
+    /// What the current Principal may request, in at least some scope (§67.2).
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    pub available: Map<String, Json>,
+    /// Quotas and ceilings that apply.
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    pub limits: Map<String, Json>,
+    /// Capabilities this crate has no name for.
+    #[serde(flatten, default, skip_serializing_if = "Map::is_empty")]
+    pub extensions: Map<String, Json>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,11 +763,128 @@ mod tests {
     }
 
     #[test]
+    fn an_unfilled_projection_is_unknown_and_not_a_verdict() {
+        // §21.5 / §24: absence of support is never rejection, so the state a
+        // projection falls back to has to be the open-world unknown.
+        assert_eq!(Projection::default().status, BeliefStatus::Insufficient);
+        assert_eq!(
+            serde_json::to_value(Projection::default()).unwrap(),
+            serde_json::json!({ "status": "insufficient" })
+        );
+
+        // §46.4: a fully grounded BELIEF over a tuple no Proposition exists
+        // for answers `insufficient` with no id — and the read must not
+        // create one just to have something to point at.
+        assert_eq!(Projection::default().proposition_id, None);
+    }
+
+    #[test]
+    fn a_projection_reports_support_and_opposition_separately() {
+        // §27.3: the two are not complements, and a caller must be able to
+        // see strong-evidence-on-both-sides for what it is.
+        let projection = Projection {
+            proposition_id: Some("P-1".into()),
+            status: BeliefStatus::Contested,
+            support: Some(ProjectionSide {
+                score: Some(0.8),
+                score_semantics: Some("ordinal_strength".into()),
+                assertion_ids: vec!["A-1".into()],
+                root_groups: vec![serde_json::json!({ "roots": ["E-1"] })],
+            }),
+            opposition: Some(ProjectionSide {
+                score: Some(0.7),
+                score_semantics: Some("ordinal_strength".into()),
+                assertion_ids: vec!["A-2".into()],
+                root_groups: Vec::new(),
+            }),
+            uncertainty: Some(ProjectionUncertainty {
+                level: Some(serde_json::json!("high")),
+                reasons: vec!["conflicting independent roots".into()],
+            }),
+            temporal: Some(ProjectionTemporal {
+                valid_at: Some("2026-01-01T00:00:00Z".into()),
+                as_of_seq: Some(1500),
+            }),
+            policy: Some(crate::request::PolicyIdentity::new("kip:policy:baseline")),
+            explanation: None,
+        };
+
+        let json = serde_json::to_value(&projection).unwrap();
+        assert_eq!(json["status"], "contested");
+        // The scores do not sum to 1, and nothing in the shape suggests they
+        // should.
+        assert_eq!(json["support"]["score"], 0.8);
+        assert_eq!(json["opposition"]["score"], 0.7);
+        assert_eq!(json["support"]["score_semantics"], "ordinal_strength");
+        assert_eq!(json["temporal"]["as_of_seq"], 1500);
+        assert_eq!(
+            serde_json::from_value::<Projection>(json).unwrap(),
+            projection
+        );
+    }
+
+    #[test]
+    fn a_change_envelope_dedupes_on_the_key_the_spec_names() {
+        // §36.3: delivery may be at-least-once, so the consumer needs exactly
+        // this triple to recognize a replay.
+        let envelope = ChangeEnvelope {
+            space_id: "space-1".into(),
+            space_seq: 1501,
+            tx_id: "tx-900".into(),
+            committed_at: Some("2026-01-01T00:00:00Z".into()),
+            transaction_class: Some("cognitive".into()),
+            changes: vec![serde_json::json!({ "kind": "concept", "op": "create" })],
+        };
+        assert_eq!(envelope.dedup_key(), ("space-1", 1501, "tx-900"));
+
+        let replayed = envelope.clone();
+        assert_eq!(replayed.dedup_key(), envelope.dedup_key());
+    }
+
+    #[test]
+    fn capabilities_keep_supported_and_available_apart() {
+        // §67.1 vs §67.2: implementing a feature and being allowed to ask for
+        // it are different answers, and collapsing them makes an
+        // authorization gap look like a missing feature.
+        let capabilities = Capabilities {
+            profiles: vec![
+                crate::conformance::ConformanceProfile::Core,
+                crate::conformance::ConformanceProfile::Kql,
+            ],
+            supported: serde_json::json!({ "belief_slot": true, "capsule_import": true })
+                .as_object()
+                .cloned()
+                .unwrap(),
+            available: serde_json::json!({ "belief_slot": true })
+                .as_object()
+                .cloned()
+                .unwrap(),
+            limits: serde_json::json!({ "max_limit": 1000 })
+                .as_object()
+                .cloned()
+                .unwrap(),
+            extensions: Map::new(),
+        };
+
+        let json = serde_json::to_value(&capabilities).unwrap();
+        assert_eq!(json["profiles"], serde_json::json!(["KIP-Core", "KIP-KQL"]));
+        assert_eq!(json["supported"]["capsule_import"], true);
+        assert!(
+            json["available"].get("capsule_import").is_none(),
+            "supported but not available must stay visible as exactly that"
+        );
+        assert_eq!(
+            serde_json::from_value::<Capabilities>(json).unwrap(),
+            capabilities
+        );
+    }
+
+    #[test]
     fn the_envelope_nests_engine_truth_under_its_reserved_name() {
         let concept = Concept {
             envelope: ElementEnvelope {
                 id: "C-1".into(),
-                kind: Some(ElementKind::Concept),
+                kind: ElementKind::Concept,
                 space_id: Some("space-1".into()),
                 system: Some(SystemState {
                     version: Some(3),
@@ -604,22 +938,55 @@ mod tests {
         let assertion = Assertion {
             envelope: ElementEnvelope {
                 id: "A-1".into(),
-                kind: Some(ElementKind::Assertion),
+                kind: ElementKind::Assertion,
                 ..Default::default()
             },
-            proposition_id: "P-1".into(),
+            proposition: serde_json::json!({"id": "P-1"}),
             asserted_by: serde_json::json!({"id": "C-alice"}),
             stance: Some(Stance::Support),
             mode: Some(AssertionMode::Stated),
             confidence: Some(0.9),
-            evidence_refs: vec![EvidenceRef {
-                evidence_id: "E-1".into(),
-                role: Some("support".into()),
-            }],
+            evidence: vec![EvidenceRef::new("E-1", "support")],
             ..Default::default()
         };
         let encoded = serde_json::to_string(&assertion).unwrap();
         let decoded: Assertion = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, assertion);
+    }
+
+    #[test]
+    fn the_core_elements_use_the_field_names_the_spec_gives_them() {
+        // §13.2 and §15.3 fix these slots, and an engine that renames one
+        // makes every cross-engine reader wrong about the same record. The
+        // reference slots carry objects rather than bare ids, because §8
+        // admits a canonical or foreign identity in the same position and a
+        // string can only ever spell a local one.
+        let assertion = serde_json::to_value(Assertion {
+            proposition: serde_json::json!({"id": "P-1"}),
+            asserted_by: serde_json::json!({"id": "C-alice"}),
+            evidence: vec![EvidenceRef::new("E-1", "support")],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(assertion["proposition"], serde_json::json!({"id": "P-1"}));
+        assert_eq!(
+            assertion["evidence"],
+            serde_json::json!([{"id": "E-1", "role": "support"}])
+        );
+        for gone in ["proposition_id", "evidence_refs"] {
+            assert!(
+                assertion.get(gone).is_none(),
+                "{gone} is not a KIP 2.0 slot"
+            );
+        }
+
+        let evidence = serde_json::to_value(Evidence {
+            evidence_class: "tool_result".into(),
+            source: vec![serde_json::json!({"id": "C-tool"})],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(evidence["source"], serde_json::json!([{"id": "C-tool"}]));
+        assert!(evidence.get("source_refs").is_none());
     }
 }

@@ -240,13 +240,28 @@ describe('KML', () => {
   it('keeps confidence inside [0, 1]', async () => {
     await withNexus('confidence', (nexus) => {
       const first = nexus.execute(SETUP)
-      const result = nexus.tryExecute(
+      // A written literal is refused before the transaction opens: §13.6
+      // fixes the range in Core, so no Schema Environment is needed to know
+      // 1.5 is wrong. `ConstraintViolation` names the rule it broke.
+      const written = nexus.tryExecute(
         `CREATE ASSERTION ?a {
            SET FIELDS { proposition: :p, stance: "support", mode: "stated", confidence: 1.5 }
          }`,
         { p: first.handles.p! },
       )
-      expect('error' in result && result.error.code).toBe('TypeMismatch')
+      expect('error' in written && written.error.code).toBe(
+        'ConstraintViolation',
+      )
+
+      // A bound parameter is only knowable at execution time, so that one is
+      // the Schema layer's to refuse — and it still does.
+      const bound = nexus.tryExecute(
+        `CREATE ASSERTION ?a {
+           SET FIELDS { proposition: :p, stance: "support", mode: "stated", confidence: :c }
+         }`,
+        { p: first.handles.p!, c: 1.5 },
+      )
+      expect('error' in bound && bound.error.code).toBe('TypeMismatch')
     })
   })
 

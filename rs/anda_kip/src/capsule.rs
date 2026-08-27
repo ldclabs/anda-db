@@ -24,6 +24,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fmt::Write;
 
 use crate::ast::{Json, Map};
 use crate::error::{KipError, KipErrorCode};
@@ -389,6 +390,116 @@ impl IdentityResolution {
 /// to. Kept ordered so an import plan renders deterministically.
 pub type CapsuleRefMap = BTreeMap<String, String>;
 
+// ---------------------------------------------------------------------------
+// Canonical serialization (Spec §37.7)
+// ---------------------------------------------------------------------------
+
+/// Serializes a JSON value to the canonical bytes a Capsule digest is taken
+/// over (Spec §37.7).
+///
+/// Portable artifact identity is cryptographic, so two implementations that
+/// disagree about which bytes a Capsule *is* produce different digests for the
+/// same cognition — and every `VERIFY CAPSULE` across that boundary fails for
+/// a reason neither side can see. Pinning the encoding is what makes the
+/// digest mean the same thing on both sides.
+///
+/// The form is RFC 8785 (JCS):
+///
+/// - object members sorted by their keys' UTF-16 code units;
+/// - no insignificant whitespace;
+/// - the shortest round-tripping number form;
+/// - the minimal string escaping JSON allows.
+///
+/// One honest limit: `serde_json` renders floats via the shortest-round-trip
+/// algorithm JCS also specifies, but a value that arrived as an
+/// arbitrary-precision literal is rendered as it was parsed. Digest inputs
+/// should therefore stay within JSON's interoperable number range — which is
+/// what §9.3 asks of Literals anyway.
+pub fn canonical_json(value: &Json) -> String {
+    let mut out = String::new();
+    write_canonical(value, &mut out);
+    out
+}
+
+fn write_canonical(value: &Json, out: &mut String) {
+    match value {
+        Json::Null | Json::Bool(_) | Json::Number(_) | Json::String(_) => {
+            // serde_json already emits these in the form JCS prescribes.
+            write!(out, "{value}").expect("writing to a String cannot fail");
+        }
+        Json::Array(items) => {
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                write_canonical(item, out);
+            }
+            out.push(']');
+        }
+        Json::Object(members) => {
+            // JCS orders by UTF-16 code units, which differs from Rust's
+            // UTF-8 byte order for astral-plane keys: a surrogate pair starts
+            // with 0xD800..=0xDBFF, below the U+E000..=U+FFFF range whose
+            // UTF-8 sorts above it. Rare, but a digest that depends on which
+            // one you picked is not deterministic.
+            // Cached rather than plain `sort_by_key`: the key is an allocated
+            // `Vec<u16>`, and recomputing it on every comparison would turn a
+            // digest of a large Capsule into O(n log n) allocations.
+            let mut keys: Vec<&String> = members.keys().collect();
+            keys.sort_by_cached_key(|key| utf16_units(key));
+
+            out.push('{');
+            for (index, key) in keys.into_iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                write!(out, "{}", Json::String(key.clone()))
+                    .expect("writing to a String cannot fail");
+                out.push(':');
+                write_canonical(&members[key], out);
+            }
+            out.push('}');
+        }
+    }
+}
+
+fn utf16_units(text: &str) -> Vec<u16> {
+    text.encode_utf16().collect()
+}
+
+impl Capsule {
+    /// The canonical bytes this Capsule's `integrity.content_digest` covers.
+    ///
+    /// The digest is taken over the **payload**, not over the whole artifact:
+    /// a signature must not cover itself, and adding a countersignature must
+    /// not invalidate the digest the first signer attested to (§37.8).
+    ///
+    /// The hash function stays the caller's: `content_digest` is an
+    /// `algorithm:value` pair precisely so the algorithm can be negotiated
+    /// and rotated, and pinning one here would freeze it.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use anda_kip::{Capsule, CapsuleIntegrity, CapsulePayload};
+    ///
+    /// let capsule = Capsule::new(CapsulePayload::default(), CapsuleIntegrity::default());
+    /// // Two Capsules carrying the same cognition digest identically,
+    /// // whatever order their fields were built in.
+    /// assert_eq!(
+    ///     capsule.canonical_payload(),
+    ///     Capsule::new(CapsulePayload::default(), CapsuleIntegrity::default())
+    ///         .canonical_payload()
+    /// );
+    /// ```
+    pub fn canonical_payload(&self) -> String {
+        let value = serde_json::to_value(&self.payload)
+            .expect("a Capsule payload is representable as JSON");
+        canonical_json(&value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,6 +549,61 @@ mod tests {
         let decoded: Capsule = serde_json::from_value(json).unwrap();
         assert_eq!(decoded, capsule);
         assert_eq!(decoded.payload.records.len(), 1);
+    }
+
+    #[test]
+    fn the_canonical_form_does_not_depend_on_how_the_json_was_built() {
+        // The same cognition written in two member orders must digest to the
+        // same bytes, or a Capsule's identity depends on its author's habits.
+        let one = serde_json::from_str::<Json>(
+            r#"{ "b": [1, {"z": true, "a": null}], "a": "x", "é": 1 }"#,
+        )
+        .unwrap();
+        let two = serde_json::from_str::<Json>(
+            r#"{ "é": 1, "a": "x", "b": [1, {"a": null, "z": true}] }"#,
+        )
+        .unwrap();
+        assert_eq!(canonical_json(&one), canonical_json(&two));
+        assert_eq!(
+            canonical_json(&one),
+            r#"{"a":"x","b":[1,{"a":null,"z":true}],"é":1}"#
+        );
+    }
+
+    #[test]
+    fn canonical_keys_sort_by_utf16_code_units() {
+        // U+10000 encodes as the surrogate pair D800 DC00, which sorts below
+        // U+FFFD — the opposite of their UTF-8 byte order. Sorting the Rust
+        // way here would make the digest depend on the implementation.
+        let value = serde_json::json!({ "\u{10000}": 1, "\u{fffd}": 2 });
+        assert_eq!(canonical_json(&value), "{\"\u{10000}\":1,\"\u{fffd}\":2}");
+
+        let mut rust_order: Vec<&str> = vec!["\u{10000}", "\u{fffd}"];
+        rust_order.sort();
+        assert_eq!(
+            rust_order,
+            vec!["\u{fffd}", "\u{10000}"],
+            "the two orders really do differ, so the test is not vacuous"
+        );
+    }
+
+    #[test]
+    fn a_capsules_digest_covers_its_payload_and_not_its_proofs() {
+        // §37.8: a signature cannot cover itself, and countersigning must not
+        // invalidate what the first signer attested to.
+        let mut capsule = snapshot();
+        let before = capsule.canonical_payload();
+        capsule.integrity.proofs.push(CapsuleProof {
+            proof_type: "signature".into(),
+            suite: None,
+            verification_method: None,
+            signature: Some("sig".into()),
+        });
+        assert_eq!(capsule.canonical_payload(), before);
+
+        // But changing what it carries does change it.
+        capsule.payload.records.concepts.push(serde_json::json!({}));
+        assert_ne!(capsule.canonical_payload(), before);
     }
 
     #[test]

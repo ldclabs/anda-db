@@ -184,7 +184,7 @@ function admit(
     // it is its own group rather than joining a nameless one with every other
     // unattributed claim.
     actor: row.asserted_by_key === '' ? `anonymous:${id}` : row.asserted_by_key,
-    evidence: row.evidence_refs.map((ref) => ref.evidence_id),
+    evidence: row.evidence_refs.map((ref) => ref.id),
     stance: row.stance,
     confidence: row.confidence < 0 ? policy.unstated_confidence : row.confidence,
     opposesTarget,
@@ -333,13 +333,19 @@ function uncertaintyReasons(belief: Belief): string[] {
 }
 
 /**
- * Renders a slot projection: the conflict set, not a winner (§35).
+ * Renders a slot projection: the conflict set, not a winner (§47.3).
  *
- * The field names follow the agent-facing syntax card, which promises
- * `accepted_values` and `candidate_projections`. `accepted_values` is a *list*
- * because a functional slot with two accepted values is a real state the Brain
- * can be in, and reporting one of them would be picking a side the record does
- * not.
+ * `accepted_values` is a *list* because a functional slot with two accepted
+ * values is a real state the Brain can be in, and reporting one of them would
+ * be picking a side the record does not.
+ *
+ * `status` leads, because §47.4 asks a grounded empty slot to answer
+ * `insufficient` with an empty `accepted_values` rather than force the Agent
+ * to infer unknown from zero raw rows — and an Agent that has to derive the
+ * slot's state by scanning `candidate_projections` is doing exactly that.
+ * `subject`, `predicate_ref`, `leading` and `contested` are additive: they
+ * name what the slot was about and which side is ahead *without* claiming it
+ * settled anything.
  */
 export function slotToJson(
   subject: Json,
@@ -349,7 +355,28 @@ export function slotToJson(
   const accepted = beliefs.filter((belief) => belief.status === 'accepted')
   const engaged = beliefs.filter((belief) => belief.status !== 'insufficient')
   const leading = [...engaged].sort((a, b) => b.support - a.support)[0]
+  // Two accepted values in one slot is a contradiction the caller has to see,
+  // even though each candidate was accepted on its own.
+  const contested =
+    accepted.length > 1 || beliefs.some((belief) => belief.status === 'contested')
+
+  // §47.3's four statuses, decided over the slot rather than over any one
+  // candidate.
+  const status = contested
+    ? 'contested'
+    : accepted.length > 0
+      ? 'accepted'
+      : engaged.length > 0
+        ? 'uncertain'
+        : 'insufficient'
+
+  // The slot ran under one policy at one coordinate, so it reports them
+  // itself: a caller that had to read them out of a candidate would have
+  // nothing to read when the slot is empty — which is the case §47.4 is about.
+  const first = beliefs[0]
+
   return {
+    status,
     subject,
     predicate_ref: predicateRef,
     accepted_values: accepted.map((belief) =>
@@ -357,7 +384,21 @@ export function slotToJson(
     ),
     candidate_projections: beliefs.map(beliefToJson) as unknown as Json,
     leading: leading === undefined ? null : formatElementId(leading.proposition),
-    contested: beliefs.some((belief) => belief.status === 'contested'),
+    contested,
+    uncertainty: {
+      level:
+        status === 'insufficient'
+          ? 'total'
+          : status === 'contested' || status === 'uncertain'
+            ? 'high'
+            : 'low',
+      reasons: leading === undefined ? [] : uncertaintyReasons(leading),
+    },
+    temporal: { valid_at: first === undefined ? null : first.validAt },
+    policy:
+      first === undefined
+        ? null
+        : { id: first.policy.id, version: first.policy.version },
   }
 }
 

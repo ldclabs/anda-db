@@ -146,9 +146,9 @@ export interface PropositionRow extends Envelope {
   attributes: JsonMap
 }
 
-/** One cited Evidence record and the role it plays. */
+/** One cited Evidence record and the role it plays (Spec §13.2). */
 export interface EvidenceRef {
-  evidence_id: string
+  id: string
   role?: string
 }
 

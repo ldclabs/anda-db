@@ -170,10 +170,10 @@ impl Policy {
 
     /// The policy identity reported alongside an answer.
     pub fn identity(&self) -> anda_kip::PolicyIdentity {
-        anda_kip::PolicyIdentity {
-            id: Some(self.id.clone()),
-            version: Some(anda_kip::PolicyVersion::Integer(self.version)),
-        }
+        anda_kip::PolicyIdentity::versioned(
+            self.id.clone(),
+            anda_kip::PolicyVersion::Integer(self.version),
+        )
     }
 }
 

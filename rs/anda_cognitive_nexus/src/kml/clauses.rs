@@ -547,8 +547,11 @@ async fn create_record(
                 .take("evidence")
                 .into_iter()
                 .map(|(value, options)| {
+                    // Stored in the wire shape §13.2 fixes — `{id, role}` —
+                    // so the view renders it without a rename, and one place
+                    // fewer can drift from the other.
                     let mut citation = Map::new();
-                    citation.insert("evidence_id".into(), Json::String(reference_id(&value)));
+                    citation.insert("id".into(), Json::String(reference_id(&value)));
                     if let Some(role) = options.get("role") {
                         citation.insert("role".into(), role.clone());
                     }
@@ -1725,11 +1728,7 @@ fn split_payload(payload: Json) -> Result<(String, Json, String), KipError> {
 fn evidence_id(value: &Json) -> Option<String> {
     match value {
         Json::String(text) => Some(text.clone()),
-        Json::Object(map) => map
-            .get("evidence_id")
-            .or_else(|| map.get("id"))
-            .and_then(Json::as_str)
-            .map(str::to_string),
+        Json::Object(map) => map.get("id").and_then(Json::as_str).map(str::to_string),
         _ => None,
     }
 }

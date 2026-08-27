@@ -4,11 +4,20 @@
   "packages": [
     {
       "format": "KIP-Schema-Package",
-      "manifest": { "package_id": "kip://conformance/status", "version": "1.0.0" },
+      "manifest": {
+        "package_id": "kip://conformance/status",
+        "version": "1.0.0"
+      },
       "definitions": {
         "concept_types": {
-          "Service": { "kind": "ConceptType", "description": "A service." },
-          "Status": { "kind": "ConceptType", "description": "A status value." }
+          "Service": {
+            "kind": "ConceptType",
+            "description": "A service."
+          },
+          "Status": {
+            "kind": "ConceptType",
+            "description": "A status value."
+          }
         },
         "predicates": {
           "status": {
@@ -28,37 +37,62 @@
     {
       "name": "nothing on record is insufficient, not rejected",
       "command": "FIND(?b.status) WHERE {\n  ?s CONCEPT {name: \"Alice\"}\n  ?o CONCEPT {name: \"Quiet\"}\n  ?p PROPOSITION (?s, \"prefers\", ?o)\n  ?b BELIEF (?p)\n}",
-      "expect": { "result": ["insufficient"] }
+      "expect": {
+        "result": [
+          "insufficient"
+        ]
+      }
     },
     {
       "name": "an unsupported Proposition has no support and no opposition",
       "command": "FIND(?b.support.score, ?b.opposition.score) WHERE {\n  ?s CONCEPT {name: \"Alice\"}\n  ?o CONCEPT {name: \"Quiet\"}\n  ?p PROPOSITION (?s, \"prefers\", ?o)\n  ?b BELIEF (?p)\n}",
-      "expect": { "result": [[0.0, 0.0]] }
+      "expect": {
+        "result": [
+          [
+            0.0,
+            0.0
+          ]
+        ]
+      }
     },
     {
       "name": "a projection declares that its score is not a probability",
       "command": "FIND(?b.support.score_semantics) WHERE {\n  ?s CONCEPT {name: \"Alice\"}\n  ?o CONCEPT {name: \"Quiet\"}\n  ?p PROPOSITION (?s, \"prefers\", ?o)\n  ?b BELIEF (?p)\n}",
-      "expect": { "result": ["normalized_support_not_probability"] }
+      "expect": {
+        "result": [
+          "normalized_support_not_probability"
+        ]
+      }
     },
     {
       "name": "a projection reports the policy it ran under",
       "command": "FIND(?b.policy.id) WHERE {\n  ?s CONCEPT {name: \"Alice\"}\n  ?o CONCEPT {name: \"Quiet\"}\n  ?p PROPOSITION (?s, \"prefers\", ?o)\n  ?b BELIEF (?p)\n}",
-      "expect": { "result": ["kip:policy:baseline"] }
+      "expect": {
+        "result": [
+          "kip:policy:baseline"
+        ]
+      }
     },
     {
       "name": "BELIEF over an unbound variable is refused, not guessed",
       "command": "FIND(?b) WHERE { ?b BELIEF (?nothing) }",
-      "expect": { "error": "ProjectionTargetUnbound" }
+      "expect": {
+        "error": "ProjectionTargetUnbound"
+      }
     },
     {
       "name": "BELIEF SLOT over an unbound subject is refused",
       "command": "FIND(?slot) WHERE { ?slot BELIEF SLOT (?anything, \"prefers\") }",
-      "expect": { "error": "ProjectionTargetUnbounded" }
+      "expect": {
+        "error": "ProjectionTargetUnbounded"
+      }
     },
     {
       "name": "an unknown epistemic policy is named rather than defaulted",
       "command": "FIND(?b) WHERE {\n  ?s CONCEPT {name: \"Alice\"}\n  ?o CONCEPT {name: \"Quiet\"}\n  ?p PROPOSITION (?s, \"prefers\", ?o)\n  ?b BELIEF (?p)\n} WITH EPISTEMIC {policy: \"strict\"}",
-      "expect": { "error": "ProjectionPolicyUnavailable" }
+      "expect": {
+        "error": "ProjectionPolicyUnavailable"
+      }
     }
   ]
 }

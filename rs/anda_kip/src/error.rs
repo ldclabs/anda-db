@@ -439,12 +439,11 @@ impl KipErrorCode {
         use KipErrorCode::*;
         match self {
             // Nothing durable happened and the same bytes may work next time.
-            SerializationConflict | SearchIndexUnavailable | ExecutionTimeout | RateLimited => {
+            // A serialization loss is an abort, a rate limit refused to run at
+            // all, and an unavailable index only ever failed a read.
+            SerializationConflict | SearchIndexUnavailable | RateLimited => {
                 RetryClass::SafeSameRequest
             }
-            // An internal failure says nothing about whether the write landed;
-            // resending under the same idempotency key is the safe recovery.
-            InternalError => RetryClass::SafeSameRequest,
             // Re-read, then retry with what you learned.
             SchemaPackageUnavailable
             | SchemaEnvironmentChanged
@@ -474,7 +473,19 @@ impl KipErrorCode {
                 RetryClass::RequiresReacquireArtifact
             }
             // The write's fate is undecided.
-            TransactionUnknown | OutcomeUnknown => RetryClass::OutcomeLookupRequired,
+            //
+            // A deadline is not an abort (§80.2): the transaction may still be
+            // running, and may still commit. An internal failure says nothing
+            // about whether the write landed either. Classifying either as
+            // `safe_same_request` would state that nothing durable happened —
+            // which is the one thing neither of them establishes — and a
+            // caller acting on it re-issues a mutation that may already be in
+            // the log. The conservative default is to look the transaction up
+            // (§80.3, §80.4); a runtime that *knows* its read timed out
+            // without touching state may override `retry` on the wire.
+            TransactionUnknown | OutcomeUnknown | ExecutionTimeout | InternalError => {
+                RetryClass::OutcomeLookupRequired
+            }
             // Retrying cannot help: the runtime will never support it, or the
             // history it needs is gone for good.
             UnsupportedProtocolVersion
@@ -687,7 +698,9 @@ impl KipErrorCode {
             }
             ResultLimitExceeded => "Use `LIMIT` with `CURSOR` to page through the result set.",
             ExecutionTimeout => {
-                "Simplify the query: fewer UNION branches, a lower LIMIT, fewer path hops."
+                "A deadline is not an abort: look the transaction up by idempotency key before \
+                 deciding. For a read, simplify it — fewer UNION branches, a lower LIMIT, fewer \
+                 path hops."
             }
             RateLimited => "Back off and retry the identical request.",
             InternalError => {
@@ -1071,14 +1084,41 @@ mod tests {
     #[test]
     fn lost_write_recovery_is_not_a_fresh_mutation() {
         // §80.4: the response being lost must never turn into a second write.
-        assert_eq!(
-            KipErrorCode::OutcomeUnknown.retry_class(),
-            RetryClass::OutcomeLookupRequired
-        );
-        assert_eq!(
-            KipErrorCode::TransactionUnknown.retry_class(),
-            RetryClass::OutcomeLookupRequired
-        );
+        for code in [
+            KipErrorCode::OutcomeUnknown,
+            KipErrorCode::TransactionUnknown,
+            // §80.2: a client deadline is not proof the transaction aborted.
+            KipErrorCode::ExecutionTimeout,
+            // And an internal failure proves nothing about it either.
+            KipErrorCode::InternalError,
+        ] {
+            assert_eq!(
+                code.retry_class(),
+                RetryClass::OutcomeLookupRequired,
+                "{code} must not tell a caller the write definitely did not land"
+            );
+        }
+    }
+
+    #[test]
+    fn safe_same_request_is_reserved_for_outcomes_that_are_actually_known() {
+        // The class means "nothing durable happened", so only codes that
+        // establish that may carry it: an abort, a refusal to run, and a read
+        // path that never touches state.
+        for code in KipErrorCode::ALL {
+            if code.retry_class() != RetryClass::SafeSameRequest {
+                continue;
+            }
+            assert!(
+                matches!(
+                    code,
+                    KipErrorCode::SerializationConflict
+                        | KipErrorCode::SearchIndexUnavailable
+                        | KipErrorCode::RateLimited
+                ),
+                "{code} claims nothing durable happened; does it establish that?"
+            );
+        }
     }
 
     #[test]

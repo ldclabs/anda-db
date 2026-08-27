@@ -2,7 +2,7 @@
 
 All notable changes to this workspace are documented in this file.
 
-## [Unreleased] — logical keys, and `@ldclabs/kip-do` gets `SEARCH`
+## [Unreleased] — logical keys, `SEARCH` in `@ldclabs/kip-do`, and the Core registries
 
 `anda_kip` 0.13.0, `anda_cognitive_nexus` 0.13.0,
 `anda_cognitive_nexus_server` 0.13.0, `@ldclabs/kip-do` 0.13.0 (still
@@ -85,8 +85,150 @@ segmentation authority reachable would invite exactly the write/read asymmetry
 that makes an indexed document unreachable forever. `extractJsonText` stays,
 because it is the shape both engines' corpora are built from.
 
+### Added — the Core Package registries are enforced before an engine sees them
+
+`kip://core@2.0.0` is a virtual Schema Package the Specification defines itself
+(§20.13): implicitly active everywhere, never deactivated, never shadowed. Its
+registries therefore hold whatever packages a Space has installed, which makes
+them decidable in the protocol layer — and until now neither engine checked
+them. `stance: "maybe"`, `mode: "guessed"`, `role: "bogus"` and
+`confidence: 5` all parsed, and were refused (or not) somewhere inside a
+transaction, differently on each engine.
+
+`anda_kip::semantics` and `ts/kip-do/src/kip/semantics.ts` are the two halves of
+one implementation, and `test/parser-oracle.test.ts` is what holds them
+together — its 661-command differential corpus now includes every one of these
+cases. Both engines answer `ConstraintViolation`, naming the registry that was
+broken.
+
+- **Only written literals are checked.** `mode: :mode` passes: the value
+  arrives with the envelope, and rejecting it here would refuse a command that
+  is going to be perfectly legal.
+- **Only protocol-fixed vocabulary is checked.** `confidence` is `[0,1]`
+  because §13.6 says so. The Cognitive Memory Profile fixes `memory_strength`,
+  `salience` and `utility` to the same interval, but those belong to a
+  *package*, and a Space running a different Profile may mean something else by
+  them. `@ldclabs/kip-lang`'s own linter checks them, which is why this is a
+  separate implementation rather than a call into it.
+- **Two things are deliberately not checked**, both because the Specification
+  declines to fix them: `TRANSITION ACTIVITY … TO`, since §20.13 registers the
+  Activity *terminal* states rather than its whole lifecycle vocabulary; and
+  `SEARCH … THRESHOLD`, since §66.5 has an engine *declare* its score semantics
+  rather than adopt one, and §27.3 lists `log_odds` among them.
+
+`analyze` also reports warnings — an unbounded `PURGE` (§52.7), a `FIND`
+without `LIMIT`, a `mode: "observed"` that cites no Evidence — for a tool that
+shows findings rather than rejecting.
+
+### Added — the wire schemas are now tested against, not just shipped
+
+`schemas/kip-request.schema.json` and `kip-response.schema.json` are the
+normative description of what goes on the wire, and nothing validated the Rust
+types against them. `tests/wire_schema.rs` now does, in both directions:
+serialized output must satisfy the schema, and a payload using every field the
+schema defines must survive the round trip. It found three divergences on its
+first run, all fixed below.
+
+### Added
+
+- **`anda_kip::conformance`** — the thirteen profile names §89 requires an
+  implementation to declare, so an engine answering `DESCRIBE CAPABILITIES` and
+  a client reading it agree on the list.
+- **`Capsule::canonical_payload` / `canonical_json`** — the RFC 8785 form a
+  Capsule's `content_digest` is taken over (§37.7). Two engines that disagree
+  about which bytes a Capsule *is* produce different digests for the same
+  cognition, and every cross-boundary `VERIFY CAPSULE` fails for a reason
+  neither side can see. The hash function stays the caller's: `content_digest`
+  is an `algorithm:value` pair precisely so it can be negotiated.
+- **`Projection`, `ChangeEnvelope`, `Capabilities`** — the read-out shapes
+  §27.2, §36.1 and §67 fix and every engine was otherwise inventing.
+- **`Request::critical_extensions`** — §71 makes a critical extension a
+  precondition rather than a hint, so a runtime has to be able to find them all
+  before deciding whether it can honour the request.
+
+### Changed — the Core elements use the field names the Specification gives them
+
+Four slots were spelled the way an older draft of the wire shape spelled them,
+and both engines had grown compensating machinery around it — `anda_cognitive_nexus`
+kept an alias table so `?a ASSERTION {proposition: ?p}` would match a field
+actually called `proposition_id`, while `FIND(?a.proposition)` read `null`
+because the *view* still spelled it the old way. The Specification's own KQL
+examples use the short name (§6124), so the compensations were papering over a
+divergence rather than bridging one.
+
+```text
+Assertion.proposition_id   →  Assertion.proposition   (§13.2)
+Assertion.evidence_refs    →  Assertion.evidence      (§13.2)
+Evidence.source_refs       →  Evidence.source         (§15.3)
+EvidenceRef.evidence_id    →  EvidenceRef.id          (§13.2)
+```
+
+**References are objects now, not bare id strings.** `proposition` carries
+`{"id": "P-1"}` the way `asserted_by`, `subject` and `generated_by` already
+did, and a citation is `{"id": "E-1", "role": "support"}`. §8 admits a local
+id, a validated `canonical_id` and (as an extension) a foreign-Space reference
+in the same position; a string can only ever spell the first, and a reader
+cannot tell one that was resolved from one that was guessed.
+
+Storage column names are unchanged — §6.2 leaves physical representation to the
+implementation, and `proposition_id` is a B-Tree index in both engines. What
+changed is the wire: what a KQL dot path reads, what a Capsule carries, what
+crosses between engines. Two shared conformance cases now pin it, so an engine
+that renames one of these again fails against the other rather than silently
+disagreeing.
+
+One consequence worth stating plainly: `anda_cognitive_nexus`'s view built its
+`EvidenceRef` list with `filter_map(|v| from_value(v).ok())`, which would have
+*silently dropped* every citation once the shape changed. It is now mapped
+field by field — a malformed entry surfaces as an empty id rather than
+disappearing, because an Assertion that looks like it cited less than it did is
+the one direction an evidence list must never be wrong in.
+
+### Changed — `BELIEF SLOT` states its own status
+
+§47.3 puts `status` at the head of a slot projection and §47.4 asks a grounded
+empty slot to answer `insufficient` with an empty `accepted_values` "rather
+than force the Agent to infer unknown from zero raw rows". Neither engine
+reported one, so an Agent had to derive the slot's state by scanning
+`candidate_projections` — which is exactly the inference §47.4 exists to
+prevent, and which has nothing to read when the slot is empty. The slot now
+reports `status`, `uncertainty`, `temporal` and `policy` alongside the
+candidate set.
+
+This also fixes a divergence between the two engines that predates the change:
+`anda_cognitive_nexus` counted two accepted values in one slot as `contested`
+and `@ldclabs/kip-do` did not. Two accepted values in a functional slot is a
+contradiction the caller has to see, so both count it now.
+
 ### Changed
 
+- **`ExecutionTimeout` and `InternalError` are now
+  `outcome_lookup_required`,** not `safe_same_request`. That class states that
+  nothing durable happened, which is the one thing neither of them establishes:
+  §80.2 is explicit that a client deadline is not an abort, and an internal
+  failure says nothing about whether the write landed. A caller acting on the
+  old classification re-issues a mutation that may already be in the log. A
+  runtime that *knows* its read timed out without touching state may still
+  override `retry` on the wire.
+- **`PolicyIdentity.id` and `SnapshotContext.snapshot_seq` are required
+  fields.** Both types were all-optional and serialized to `{}` — which the
+  wire schema forbids in both places, with `minProperties: 1` and a `required`
+  respectively. A projection whose policy cannot be named cannot be audited,
+  and a snapshot block with no coordinate says a read was pinned somewhere
+  without saying where. Construct them with `PolicyIdentity::new` /
+  `SnapshotContext::at`.
+- **`ElementEnvelope.kind` is required and `space_id` is omitted when
+  absent.** Every durable element is exactly one of the five Core kinds (§6.1);
+  a reader that cannot tell which cannot tell an Assertion's `confidence` from
+  a Concept attribute of the same name. `space_id` now disappears rather than
+  serializing as `null`.
+- **The request envelope is held to the schema's own limits.** Length ceilings
+  on `request_id`, `op_id`, `idempotency_key`, `space.id` / `space.uri`,
+  `compatibility_profile` and snapshot tokens; `extensions` keys must be
+  namespaced as `vendor/feature`; `requires` keys must be capability names.
+  Accepting a longer or unnamespaced value accepts something a conforming peer
+  is entitled to reject, and the disagreement surfaces downstream instead of
+  here.
 - **`UPSERT CONCEPT ... MATCH {type: ..., key: ...}`.** `MATCH` is an object
   pattern, so `type` inside it is the same schema-resolution sugar it is in a
   KQL Concept pattern (§43.1), and it carries identity weight in both halves of
@@ -119,6 +261,28 @@ because it is the shape both engines' corpora are built from.
 
 ### Fixed
 
+- **`ResultContext` can report `valid_at` again.** The wire schema defines it —
+  the world valid-time a projection was evaluated for, present whenever
+  `FOR TIME` was applied — and the Rust type had no field for it, so serde
+  dropped it silently on the way in and could not produce it on the way out.
+  `AS OF` and `FOR TIME` are independent axes (§48.3); reporting only the first
+  leaves a caller unable to tell a stale answer from a deliberately historical
+  one.
+- **The `ast` operation channel is held to the text channel's rules.** §73 lets
+  an operation carry a pre-parsed `ast` instead of `command` text, and
+  `validate_command` re-applies the guards such a tree never went through. It
+  covered KML and `EXPORT CAPSULE` but returned `Ok` for KQL, so a `FIND` with
+  an empty projection list — which never parses from text — passed. Both
+  surfaces are now checked, registries included.
+- **An Assertion's `evidence` is immutable under either spelling.** §13.7 lists
+  the initial Evidence citations among the immutable payload, and the citation
+  list is written `evidence` in KML source but `evidence_refs` in the wire
+  view. Only the second was refused. *Known divergence from
+  `@ldclabs/kip-lang` 2.0.2*, which still accepts the first and leaves the
+  refusal to the engine; the parity fixture is a corpus of commands the
+  reference *accepts*, so nothing there catches the two lists drifting. Both
+  engines here refuse it, and `ts/kip-do` records the gap in
+  `KNOWN_DIVERGENCES` with the reason. The fix belongs upstream.
 - **`UPSERT CONCEPT ... MATCH {id: ...}` no longer creates** in `@ldclabs/kip-do`.
   An id that did not resolve — absent, or carrying a type the `MATCH` did not
   declare — fell through to the insert half and minted a *different* Concept
@@ -171,6 +335,32 @@ because it is the shape both engines' corpora are built from.
   {} }` lists the Concepts that carry one.
 - `@ldclabs/kip-do` needs no such sweep: the old unique index made the
   duplicate unwritable in the first place.
+- **Commands carrying a bad Core registry value now fail at parse time.** A
+  stored `stance: "maybe"` or `confidence: 5` was already being refused
+  somewhere further in; what changes is when, and that both engines now agree.
+  If a caller was relying on such a command reaching the engine, the answer is
+  `ConstraintViolation` naming the registry rather than whatever the engine
+  happened to report. Values arriving through `:parameters` are unaffected —
+  they are still the Schema layer's to judge.
+- **`PolicyIdentity` and `SnapshotContext` no longer implement `Default`, and
+  `ElementEnvelope.kind` is no longer `Option`.** Construct them with
+  `PolicyIdentity::new(id)`, `SnapshotContext::at(seq)`, and a bare
+  `ElementKind`.
+- **Retry policies keyed on `ExecutionTimeout` or `InternalError` should be
+  re-read.** Both moved from `safe_same_request` to
+  `outcome_lookup_required`: recover by looking the transaction up under its
+  idempotency key rather than re-sending (§80.3, §80.4).
+- **A reader of the Core wire shape needs four renames**, listed above.
+  `?a.proposition` is now a reference object, so a dot path that ended at the
+  id needs one more step: `?a.proposition.id`. `?a.evidence_refs` becomes
+  `?a.evidence`, and each entry's `evidence_id` becomes `id`. KQL *patterns*
+  are unaffected — `?a ASSERTION {proposition: ?p}` was always the spelling the
+  Specification's examples use, and it kept working through the alias table
+  that is now unnecessary.
+- **No data migration is needed.** The change is to the wire shape and to the
+  JSON inside a stored citation, both of which are rebuilt from the row on
+  every read; storage column names and indexes are untouched. KIP 2.0 is
+  unreleased, so no Space predates this.
 
 ---
 

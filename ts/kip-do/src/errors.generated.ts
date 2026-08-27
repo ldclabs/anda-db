@@ -598,8 +598,8 @@ export const KIP_ERROR_REGISTRY: Readonly<Record<KipErrorCode, KipErrorSpec>> = 
   },
   "ExecutionTimeout": {
     category: "resource",
-    retry: "safe_same_request",
-    hint: "Simplify the query: fewer UNION branches, a lower LIMIT, fewer path hops.",
+    retry: "outcome_lookup_required",
+    hint: "A deadline is not an abort: look the transaction up by idempotency key before deciding. For a read, simplify it — fewer UNION branches, a lower LIMIT, fewer path hops.",
   },
   "RateLimited": {
     category: "resource",
@@ -608,7 +608,7 @@ export const KIP_ERROR_REGISTRY: Readonly<Record<KipErrorCode, KipErrorSpec>> = 
   },
   "InternalError": {
     category: "system",
-    retry: "safe_same_request",
+    retry: "outcome_lookup_required",
     hint: "Retry under the same idempotency key; if it persists, report the `request_id`.",
   },
 }

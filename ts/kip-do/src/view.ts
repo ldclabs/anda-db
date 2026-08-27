@@ -107,7 +107,10 @@ function assertion(id: ElementId, row: AssertionRow): JsonMap {
   return {
     ...envelope(id, row),
     ...present({
-      proposition_id: row.proposition_id,
+      // The wire form of a reference is an object, never a bare id string
+      // (§8, §13.2): a string can spell a local id and nothing else, and a
+      // reader cannot tell one that was resolved from one that was guessed.
+      proposition: { id: row.proposition_id },
       asserted_by: row.asserted_by,
       stance: row.stance,
       mode: row.mode,
@@ -116,7 +119,7 @@ function assertion(id: ElementId, row: AssertionRow): JsonMap {
       confidence: row.confidence < 0 ? undefined : row.confidence,
       asserted_at: row.asserted_at,
       valid_time: present({ from: row.valid_from, until: row.valid_until }),
-      evidence_refs: row.evidence_refs as unknown as Json,
+      evidence: row.evidence_refs as unknown as Json,
       context_refs: row.context_refs,
       lifecycle: present({
         status: row.status,
@@ -141,8 +144,10 @@ function evidence(id: ElementId, row: EvidenceRow): JsonMap {
       content_digest: row.content_digest,
       media_type: row.media_type,
       observed_at: row.observed_at,
-      source_refs: row.source_refs,
-      generated_by: row.generated_by,
+      source: row.source_refs,
+      generated_by: row.generated_by
+        ? { id: row.generated_by }
+        : undefined,
       lifecycle: present({
         status: row.status,
         corrects: row.corrects,

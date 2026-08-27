@@ -88,17 +88,25 @@ rs/anda_kip/
 │   │   ├── kml.rs      mutations, ASSERT desugaring, mutation guards
 │   │   ├── meta.rs     DESCRIBE / LIST / SEARCH / VERIFY / … / EXPORT CAPSULE
 │   │   └── json.rs     the model-friendly JSON dialect
+│   ├── semantics.rs    Core Package registries, the protocol-fixed ranges
 │   ├── error.rs        Core Error Registry, categories, retry classes
 │   ├── request.rs      request/response envelope
-│   ├── types.rs        Core data model
-│   ├── capsule.rs      Cognitive Capsules
+│   ├── types.rs        Core data model + the normative read-out shapes
+│   ├── capsule.rs      Cognitive Capsules, canonical serialization
+│   ├── conformance.rs  the profile names an implementation declares
 │   ├── executor.rs     the engine seam
 │   └── bin/kip_cli.rs  syntax checker
+├── schemas/            the normative request/response wire schemas
+├── grammar/            the normative KQL / KML / META EBNF
 ├── SPECIFICATION.md    the normative KIP 2.0 specification
 ├── KIPSyntax.md        LLM-facing syntax reference
 ├── SelfInstructions.md how an Agent should use its memory
 └── SystemInstructions.md what a runtime owes its callers
 ```
+
+The vendored `schemas/` and `grammar/` are not decoration: `tests/wire_schema.rs`
+validates the Rust envelope types against the former in both directions, so a
+type that drifts from the wire contract fails the build rather than a peer.
 
 ---
 
@@ -310,7 +318,51 @@ corruption of the epistemic record.
 | `PURGE … CONFIRM "purge"` | The confirmation spelling is frozen. |
 | Duplicate keys in any block | A duplicate key is almost always a generation slip; last-write-wins would hide it. |
 
-### 6.1 The `ASSERT` desugaring
+### 6.1 Core Package registries
+
+`kip://core@2.0.0` is a virtual Schema Package the Specification defines itself
+(§20.13): implicitly active in every Schema Environment, never deactivated,
+never shadowed. Its registries therefore hold whatever packages a Space has
+installed, which makes them decidable before an engine is involved. `semantics`
+enforces them:
+
+| Rejected | Registry |
+| --- | --- |
+| `stance: "maybe"` | `support \| reject \| uncertain` (§13.4) |
+| `mode: "guessed"` | `observed \| stated \| inferred \| predicted \| hypothetical \| imported` (§13.5) |
+| `("evidence", :e) {role: "bogus"}` | `support \| challenge \| context` (§56.2) |
+| `RETRACT ASSERTION … EXPECT STATE "banana"` | `active \| retracted \| superseded \| expired` (§14) |
+| `SEARCH … MODE "fuzzy"` | `keyword \| semantic \| hybrid` (§66.3) |
+| `DESCRIBE PRIMER MODE "verbose"` | `compact \| full` (§64) |
+| `WITH EPISTEMIC { explanation: "verbose" }` | `none \| summary \| ledger` (§49.1) |
+| `confidence: 5`, `THRESHOLD 5` | `[0,1]` (§13.6, §66) |
+
+Two boundaries this layer holds to:
+
+- **Only written literals are checked.** A `:parameter` is bound from the
+  envelope at execution time, so `mode: :mode` always passes — guessing would
+  reject commands that are going to be perfectly legal.
+- **Only protocol-fixed vocabulary is checked.** The Cognitive Memory Profile
+  fixes `memory_strength`, `salience` and `utility` to `[0,1]` too, but those
+  belong to a *package*: a Space running a different Profile may legitimately
+  mean something else by them. They stay with the engine, which is the only
+  party that knows the active Schema Environment. For the same reason
+  `TRANSITION ACTIVITY … TO` is not checked — §20.13 registers the Activity
+  *terminal* states, not its whole lifecycle vocabulary.
+
+`analyze` returns warnings as well, for a tool that reports rather than
+rejects — an unbounded `PURGE`, a `FIND` with no `LIMIT`, a `mode: "observed"`
+that cites no Evidence:
+
+```rust
+use anda_kip::{Severity, analyze, parse_kip};
+
+let command = parse_kip(r#"PURGE ?x WHERE { ?x {type: "Draft"} } CONFIRM "PURGE""#).unwrap();
+let findings = analyze(&command);
+assert!(findings.iter().any(|d| d.severity == Severity::Warning));
+```
+
+### 6.2 The `ASSERT` desugaring
 
 `ASSERT` is normative sugar (§55.1), and the parser expands it to exactly what
 it is defined as — nothing more is fabricated:
@@ -512,6 +564,22 @@ Helpers:
 `Concept`, `Proposition`, `Assertion`, `Evidence`, `Activity`, each carrying an
 `ElementEnvelope` with `governance`, `retention`, `facets` and `_system`.
 
+**The field names are the Specification's, not this crate's.** §13.2 and §15.3
+fix the slots, and an engine that renames one makes every cross-engine reader
+wrong about the same record:
+
+```text
+Assertion   proposition   asserted_by   stance   mode   confidence
+            asserted_at   valid_time    evidence   context_refs   lifecycle
+Evidence    evidence_class  payload  content_digest  media_type
+            observed_at   source   generated_by   lifecycle
+```
+
+Every reference slot carries an object — `{"id": "P-1"}` — rather than a bare
+id string, and a citation is `{"id": "E-1", "role": "support"}`. §8 admits a
+local id, a validated `canonical_id` and (as an extension) a foreign-Space
+reference in the same position, and a string can only ever spell the first.
+
 There is **no universal author-writable metadata bag**. Data goes where it
 belongs:
 
@@ -640,7 +708,7 @@ non-zero if anything failed.
 This is a breaking rewrite. The 1.x API is gone rather than deprecated, because
 the semantics behind it are gone.
 
-| 0.11 (KIP 1.x) | 0.12 (KIP 2.0) |
+| 0.11 (KIP 1.x) | 0.12+ (KIP 2.0) |
 | --- | --- |
 | `UPSERT { CONCEPT ?c {…} }` | `CREATE CONCEPT` / `UPSERT CONCEPT` / `ASSERT` |
 | `DELETE` | `ARCHIVE` / `TOMBSTONE` / `PURGE` / `RETRACT` — classify the intent |

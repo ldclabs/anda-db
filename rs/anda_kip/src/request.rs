@@ -28,6 +28,40 @@ use crate::parser::{MAX_KIP_BATCH_COMMANDS, parse_kip, validate_command};
 /// The protocol profile this crate speaks.
 pub const KIP_VERSION: &str = "2.0";
 
+/// The length ceilings `kip-request.schema.json` puts on envelope strings.
+///
+/// These are the wire contract, not defensive guesses: a runtime that accepts
+/// a longer value accepts something a conforming peer is entitled to reject,
+/// and the disagreement surfaces as a mysterious rejection downstream rather
+/// than as a clear one here. Lengths are counted in characters, as the schema
+/// counts them.
+pub mod limits {
+    /// `RequestId` and `Operation.op_id`.
+    pub const REQUEST_ID: usize = 256;
+    /// `IdempotencyKey`, at the request and the operation level.
+    pub const IDEMPOTENCY_KEY: usize = 1024;
+    /// `SpaceSelector.id`.
+    pub const SPACE_ID: usize = 512;
+    /// `SpaceSelector.uri`.
+    pub const SPACE_URI: usize = 2048;
+    /// `compatibility_profile`.
+    pub const COMPATIBILITY_PROFILE: usize = 128;
+    /// `OpaqueToken` — snapshot tokens and artifact handles.
+    pub const OPAQUE_TOKEN: usize = 8192;
+    /// `execution.isolation`.
+    pub const ISOLATION: usize = 64;
+    /// `context.purpose`, `context.client`, `evidence_class`, `media_type`.
+    pub const SHORT_LABEL: usize = 256;
+    /// `context.risk`.
+    pub const RISK: usize = 128;
+    /// `context.locale`.
+    pub const LOCALE: usize = 64;
+    /// `ingest.evidence[].source_actor`.
+    pub const SOURCE_ACTOR: usize = 512;
+    /// `ingest.evidence[].client_key`.
+    pub const CLIENT_KEY: usize = 1024;
+}
+
 // ---------------------------------------------------------------------------
 // Request
 // ---------------------------------------------------------------------------
@@ -151,8 +185,13 @@ impl Request {
             )));
         }
 
-        validate_optional_non_empty(&self.request_id, "request_id")?;
-        validate_optional_non_empty(&self.compatibility_profile, "compatibility_profile")?;
+        validate_optional_non_empty(&self.request_id, "request_id", limits::REQUEST_ID)?;
+        validate_optional_non_empty(
+            &self.compatibility_profile,
+            "compatibility_profile",
+            limits::COMPATIBILITY_PROFILE,
+        )?;
+        validate_extensions(&self.extensions, "extensions")?;
 
         if let Some(space) = &self.space {
             if space.id.is_none() && space.uri.is_none() {
@@ -160,22 +199,43 @@ impl Request {
                     "space must identify a MemorySpace by `id`, `uri`, or both",
                 ));
             }
-            validate_optional_non_empty(&space.id, "space.id")?;
-            validate_optional_non_empty(&space.uri, "space.uri")?;
+            validate_optional_non_empty(&space.id, "space.id", limits::SPACE_ID)?;
+            validate_optional_non_empty(&space.uri, "space.uri", limits::SPACE_URI)?;
         }
 
         if let Some(execution) = &self.execution {
-            validate_optional_non_empty(&execution.isolation, "execution.isolation")?;
-            validate_optional_non_empty(&execution.idempotency_key, "execution.idempotency_key")?;
+            validate_optional_non_empty(
+                &execution.isolation,
+                "execution.isolation",
+                limits::ISOLATION,
+            )?;
+            validate_optional_non_empty(
+                &execution.idempotency_key,
+                "execution.idempotency_key",
+                limits::IDEMPOTENCY_KEY,
+            )?;
+            validate_extensions(&execution.extensions, "execution.extensions")?;
         }
         if let Some(read) = &self.read {
-            validate_optional_non_empty(&read.snapshot_token, "read.snapshot_token")?;
+            validate_optional_non_empty(
+                &read.snapshot_token,
+                "read.snapshot_token",
+                limits::OPAQUE_TOKEN,
+            )?;
+            validate_extensions(&read.extensions, "read.extensions")?;
+        }
+        if let Some(preconditions) = &self.preconditions {
+            validate_extensions(&preconditions.extensions, "preconditions.extensions")?;
         }
         if let Some(context) = &self.context {
-            validate_optional_non_empty(&context.purpose, "context.purpose")?;
-            validate_optional_non_empty(&context.risk, "context.risk")?;
-            validate_optional_non_empty(&context.locale, "context.locale")?;
-            validate_optional_non_empty(&context.client, "context.client")?;
+            validate_optional_non_empty(&context.purpose, "context.purpose", limits::SHORT_LABEL)?;
+            validate_optional_non_empty(&context.risk, "context.risk", limits::RISK)?;
+            validate_optional_non_empty(&context.locale, "context.locale", limits::LOCALE)?;
+            validate_optional_non_empty(&context.client, "context.client", limits::SHORT_LABEL)?;
+            validate_extensions(&context.extensions, "context.extensions")?;
+        }
+        if let Some(options) = &self.options {
+            validate_extensions(&options.extensions, "options.extensions")?;
         }
         if self
             .options
@@ -225,11 +285,84 @@ impl Request {
                 validate_binding_name(name, "parameter")?;
             }
         }
+        if let Some(requires) = &self.requires {
+            for name in requires.keys() {
+                validate_capability_name(name)?;
+            }
+        }
         if let Some(ingest) = &self.ingest {
             ingest.validate()?;
         }
 
         Ok(())
+    }
+
+    /// The namespaced extensions this request marks `critical`.
+    ///
+    /// §71 makes a critical extension a precondition rather than a hint: a
+    /// runtime that does not implement one MUST fail instead of proceeding
+    /// without it, because the caller has said the request means something
+    /// different without it. This crate cannot know what a given runtime
+    /// supports, so it surfaces the list and leaves the decision where the
+    /// knowledge is.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use anda_kip::Request;
+    ///
+    /// let mut request = Request::single("DESCRIBE PROTOCOL");
+    /// request.extensions = serde_json::json!({
+    ///     "acme/tracing": { "critical": false },
+    ///     "acme/redaction": { "critical": true }
+    /// })
+    /// .as_object()
+    /// .cloned();
+    ///
+    /// assert_eq!(request.critical_extensions(), vec!["acme/redaction"]);
+    /// ```
+    pub fn critical_extensions(&self) -> Vec<&str> {
+        let blocks = [
+            self.extensions.as_ref(),
+            self.execution.as_ref().and_then(|e| e.extensions.as_ref()),
+            self.read.as_ref().and_then(|r| r.extensions.as_ref()),
+            self.preconditions
+                .as_ref()
+                .and_then(|p| p.extensions.as_ref()),
+            self.context.as_ref().and_then(|c| c.extensions.as_ref()),
+            self.options.as_ref().and_then(|o| o.extensions.as_ref()),
+            self.ingest.as_ref().and_then(|i| i.extensions.as_ref()),
+        ];
+        let operation_blocks = self.operations.iter().flat_map(|operation| {
+            [
+                operation.extensions.as_ref(),
+                operation
+                    .options
+                    .as_ref()
+                    .and_then(|o| o.extensions.as_ref()),
+            ]
+        });
+        let ingest_blocks = self
+            .ingest
+            .iter()
+            .flat_map(|ingest| ingest.evidence.iter().map(|e| e.extensions.as_ref()));
+
+        let mut critical = Vec::new();
+        for block in blocks
+            .into_iter()
+            .chain(operation_blocks)
+            .chain(ingest_blocks)
+            .flatten()
+        {
+            for (name, value) in block {
+                if value.get("critical") == Some(&Json::Bool(true)) {
+                    critical.push(name.as_str());
+                }
+            }
+        }
+        critical.sort_unstable();
+        critical.dedup();
+        critical
     }
 
     /// Parses and classifies every operation, enforcing the language contract.
@@ -442,8 +575,16 @@ impl Operation {
             }
         }
 
-        validate_optional_non_empty(&self.op_id, "op_id")?;
-        validate_optional_non_empty(&self.idempotency_key, "operation.idempotency_key")?;
+        validate_optional_non_empty(&self.op_id, "op_id", limits::REQUEST_ID)?;
+        validate_optional_non_empty(
+            &self.idempotency_key,
+            "operation.idempotency_key",
+            limits::IDEMPOTENCY_KEY,
+        )?;
+        validate_extensions(&self.extensions, "operation.extensions")?;
+        if let Some(options) = &self.options {
+            validate_extensions(&options.extensions, "operation.options.extensions")?;
+        }
 
         if let Some(parameters) = &self.parameters {
             for name in parameters.keys() {
@@ -544,6 +685,7 @@ impl IngestContext {
                 "an ingest context must carry at least one Evidence entry",
             ));
         }
+        validate_extensions(&self.extensions, "ingest.extensions")?;
         let mut seen: Vec<&str> = Vec::new();
         for entry in &self.evidence {
             entry.validate()?;
@@ -600,11 +742,25 @@ impl IngestEvidence {
                 "an ingest Evidence entry must declare an evidence_class",
             ));
         }
-        validate_optional_non_empty(&self.payload_artifact, "ingest payload_artifact")?;
-        validate_optional_non_empty(&self.media_type, "ingest media_type")?;
-        validate_optional_non_empty(&self.observed_at, "ingest observed_at")?;
-        validate_optional_non_empty(&self.source_actor, "ingest source_actor")?;
-        validate_optional_non_empty(&self.client_key, "ingest client_key")?;
+        validate_bounded(
+            &self.evidence_class,
+            "ingest evidence_class",
+            limits::SHORT_LABEL,
+        )?;
+        validate_optional_non_empty(
+            &self.payload_artifact,
+            "ingest payload_artifact",
+            limits::OPAQUE_TOKEN,
+        )?;
+        validate_optional_non_empty(&self.media_type, "ingest media_type", limits::SHORT_LABEL)?;
+        validate_optional_non_empty(&self.observed_at, "ingest observed_at", limits::SHORT_LABEL)?;
+        validate_optional_non_empty(
+            &self.source_actor,
+            "ingest source_actor",
+            limits::SOURCE_ACTOR,
+        )?;
+        validate_optional_non_empty(&self.client_key, "ingest client_key", limits::CLIENT_KEY)?;
+        validate_extensions(&self.extensions, "ingest evidence extensions")?;
         match (&self.payload, &self.payload_artifact) {
             (Some(_), None) | (None, Some(_)) => Ok(()),
             _ => Err(KipError::invalid_request_envelope(format!(
@@ -615,13 +771,83 @@ impl IngestEvidence {
     }
 }
 
-fn validate_optional_non_empty(value: &Option<String>, what: &str) -> Result<(), KipError> {
-    if value.as_ref().is_some_and(|value| value.trim().is_empty()) {
-        Err(KipError::invalid_request_envelope(format!(
+fn validate_optional_non_empty(
+    value: &Option<String>,
+    what: &str,
+    max: usize,
+) -> Result<(), KipError> {
+    let Some(value) = value else { return Ok(()) };
+    validate_bounded(value, what, max)
+}
+
+fn validate_bounded(value: &str, what: &str, max: usize) -> Result<(), KipError> {
+    if value.trim().is_empty() {
+        return Err(KipError::invalid_request_envelope(format!(
             "{what} must not be empty"
-        )))
-    } else {
+        )));
+    }
+    // The schema counts characters, so counting bytes here would reject a
+    // legal value that happens to be non-ASCII.
+    let length = value.chars().count();
+    if length > max {
+        return Err(KipError::invalid_request_envelope(format!(
+            "{what} is {length} characters, and the wire schema allows at most {max}"
+        )));
+    }
+    Ok(())
+}
+
+/// Extension keys are namespaced: `vendor/feature` (Spec §71).
+///
+/// An unnamespaced key is a vendor field sitting in the shared namespace,
+/// where it will one day collide with a standard one — which is why the schema
+/// admits no such key rather than tolerating it.
+fn validate_extensions(extensions: &Option<Map<String, Json>>, what: &str) -> Result<(), KipError> {
+    let Some(extensions) = extensions else {
+        return Ok(());
+    };
+    for name in extensions.keys() {
+        if !is_namespaced_extension(name) {
+            return Err(KipError::invalid_identifier(format!(
+                "{what} key {name:?} must be namespaced as <vendor>/<feature>"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn is_namespaced_extension(name: &str) -> bool {
+    let Some((namespace, rest)) = name.split_once('/') else {
+        return false;
+    };
+    let head_ok = |segment: &str| {
+        segment
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+    };
+    head_ok(namespace)
+        && namespace
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        && head_ok(rest)
+        && rest
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+}
+
+/// Capability names are dotted identifiers, e.g. `belief_slot`, `kip.streaming`.
+fn validate_capability_name(name: &str) -> Result<(), KipError> {
+    let valid = name.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
+    if valid {
         Ok(())
+    } else {
+        Err(KipError::invalid_identifier(format!(
+            "capability requirement {name:?} must match [A-Za-z][A-Za-z0-9_.-]*"
+        )))
     }
 }
 
@@ -945,6 +1171,16 @@ pub struct ResultContext {
     /// Which Projection Policy produced any belief in this result.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub epistemic_policy: Option<PolicyIdentity>,
+    /// The world valid-time basis the projection ran under, when `FOR TIME`
+    /// was applied.
+    ///
+    /// An independent axis from `snapshot_seq` (Spec §48.3): that one says
+    /// *which cognitive history* was read, this one says *what moment in the
+    /// world* the claims were evaluated for. Reporting the first without the
+    /// second leaves a caller unable to tell a stale answer from a
+    /// deliberately historical one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_at: Option<String>,
     /// How a SEARCH result was produced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search: Option<SearchContext>,
@@ -967,14 +1203,38 @@ pub enum PolicyVersion {
 }
 
 /// Identifies the policy a projection ran under.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+///
+/// The id is not optional. An answer that reports *some* policy produced it
+/// without saying which is indistinguishable from one that reports nothing,
+/// and a projection whose policy cannot be named cannot be audited or
+/// reproduced (Spec §27.2). The wire schema says the same thing with
+/// `minProperties: 1`; saying it in the type is what makes the empty shape
+/// unconstructible rather than merely invalid.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct PolicyIdentity {
     /// The policy id.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
+    pub id: String,
     /// The policy version.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<PolicyVersion>,
+}
+
+impl PolicyIdentity {
+    /// Names a policy without a version.
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            version: None,
+        }
+    }
+
+    /// Names a policy and the version of it that ran.
+    pub fn versioned(id: impl Into<String>, version: PolicyVersion) -> Self {
+        Self {
+            id: id.into(),
+            version: Some(version),
+        }
+    }
 }
 
 /// How a SEARCH result was produced (Spec §66, §79).
@@ -1017,14 +1277,17 @@ pub enum SearchMode {
 }
 
 /// The snapshot coordinate a response was produced at (Spec §78).
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+///
+/// The sequence is not optional: a snapshot block whose coordinate is absent
+/// states that the read was pinned somewhere without saying where, which no
+/// caller can bind a later read to. Omit the whole block instead.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct SnapshotContext {
     /// The Space the snapshot belongs to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub space_id: Option<String>,
     /// The snapshot sequence.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub snapshot_seq: Option<u64>,
+    pub snapshot_seq: u64,
     /// The Schema Environment version at that coordinate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_environment_version: Option<u64>,
@@ -1034,6 +1297,19 @@ pub struct SnapshotContext {
     /// Namespaced extensions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extensions: Option<Map<String, Json>>,
+}
+
+impl SnapshotContext {
+    /// The snapshot coordinate a read was pinned to.
+    pub fn at(snapshot_seq: u64) -> Self {
+        Self {
+            space_id: None,
+            snapshot_seq,
+            schema_environment_version: None,
+            snapshot_token: None,
+            extensions: None,
+        }
+    }
 }
 
 /// The receipt for a state-changing request (Spec §33).
@@ -1228,10 +1504,111 @@ mod tests {
         assert_eq!(numeric.version, Some(PolicyVersion::Integer(7)));
 
         let textual: PolicyIdentity = serde_json::from_value(serde_json::json!({
+            "id": "projection-policy",
             "version": "7.1"
         }))
         .unwrap();
         assert_eq!(textual.version, Some(PolicyVersion::Text("7.1".into())));
+
+        // A policy that cannot be named cannot be audited, so the id is not
+        // optional and a version-only identity does not decode.
+        assert!(
+            serde_json::from_value::<PolicyIdentity>(serde_json::json!({ "version": "7.1" }))
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(PolicyIdentity::new("projection-policy")).unwrap(),
+            serde_json::json!({ "id": "projection-policy" })
+        );
+    }
+
+    #[test]
+    fn envelope_strings_are_held_to_the_wire_schemas_length_ceilings() {
+        let mut request = Request::single("DESCRIBE PROTOCOL");
+        request.request_id = Some("r".repeat(limits::REQUEST_ID));
+        request.validate().expect("exactly at the ceiling is legal");
+
+        request.request_id = Some("r".repeat(limits::REQUEST_ID + 1));
+        let err = request.validate().expect_err("one over the ceiling");
+        assert_eq!(err.code, KipErrorCode::InvalidRequestEnvelope);
+        assert!(err.message.contains("at most"), "{}", err.message);
+
+        // The schema counts characters, so a multi-byte value is not
+        // rejected for the length of its encoding.
+        request.request_id = Some("é".repeat(limits::REQUEST_ID));
+        request.validate().expect("characters, not bytes");
+    }
+
+    #[test]
+    fn extension_keys_must_be_namespaced() {
+        let mut request = Request::single("DESCRIBE PROTOCOL");
+        request.extensions = serde_json::json!({ "acme/tracing": { "critical": false } })
+            .as_object()
+            .cloned();
+        request.validate().expect("a namespaced key is fine");
+
+        request.extensions = serde_json::json!({ "tracing": { "critical": true } })
+            .as_object()
+            .cloned();
+        let err = request.validate().expect_err("unnamespaced");
+        assert_eq!(err.code, KipErrorCode::InvalidIdentifier);
+
+        // A vendor field cannot squat the standard namespace by nesting either.
+        request.extensions = serde_json::json!({ "/tracing": {} }).as_object().cloned();
+        assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn critical_extensions_are_reported_from_every_block_that_carries_them() {
+        // §71: a runtime that cannot honour a critical extension must fail
+        // rather than quietly proceed, so it has to be able to find them all.
+        let mut request = Request::single("DESCRIBE PROTOCOL");
+        request.extensions = serde_json::json!({
+            "acme/redaction": { "critical": true },
+            "acme/tracing": { "critical": false }
+        })
+        .as_object()
+        .cloned();
+        request.operations[0].extensions =
+            serde_json::json!({ "acme/hints": { "critical": true } })
+                .as_object()
+                .cloned();
+        request.execution = Some(Execution {
+            mode: ExecutionMode::Independent,
+            on_error: None,
+            isolation: None,
+            idempotency_key: None,
+            extensions: serde_json::json!({ "acme/pinning": { "critical": true } })
+                .as_object()
+                .cloned(),
+        });
+
+        request.validate().expect("a legal envelope");
+        assert_eq!(
+            request.critical_extensions(),
+            vec!["acme/hints", "acme/pinning", "acme/redaction"]
+        );
+
+        assert!(
+            Request::single("DESCRIBE PROTOCOL")
+                .critical_extensions()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn capability_requirements_are_named_like_capabilities() {
+        let mut request = Request::single("DESCRIBE PROTOCOL");
+        request.requires = serde_json::json!({ "belief_slot": true, "kip.streaming": true })
+            .as_object()
+            .cloned();
+        request.validate().expect("dotted identifiers are fine");
+
+        request.requires = serde_json::json!({ "!! nonsense": true })
+            .as_object()
+            .cloned();
+        let err = request.validate().expect_err("not an identifier");
+        assert_eq!(err.code, KipErrorCode::InvalidIdentifier);
     }
 
     #[test]

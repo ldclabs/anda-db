@@ -35,7 +35,7 @@ export const FIXTURES: readonly Fixture[] = [
     "name": "core-truth-neutrality",
     "description": "The distinction the version exists for: a Proposition existing is not the Proposition being true. A tuple carries no confidence, the same tuple resolves to one Proposition, and a raw read reports claims rather than beliefs.",
     "setup": [
-      "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 }\n  }\n}"
+      "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE EVIDENCE ?e {\n    SET FIELDS { evidence_class: \"user_statement\", payload: \"I prefer dark mode\" }\n  }\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 }\n    SET STRUCTURAL { (\"evidence\", ?e) { role: \"support\" } }\n  }\n}"
     ],
     "cases": [
       {
@@ -108,6 +108,32 @@ export const FIXTURES: readonly Fixture[] = [
         "command": "UPDATE ?a SET FIELDS { confidence: 0.1 } WHERE { ?a ASSERTION {} }",
         "expect": {
           "error": "InvalidSyntax"
+        }
+      },
+      {
+        "name": "a reference slot carries the name and the shape the Specification fixes",
+        "command": "FIND(?a.proposition.id, ?a.asserted_by.id) WHERE { ?a ASSERTION {} }",
+        "expect": {
+          "result": [
+            [
+              "P:<1>",
+              "C:<2>"
+            ]
+          ]
+        }
+      },
+      {
+        "name": "a citation is {id, role}, under the slot named evidence",
+        "command": "FIND(?a.evidence) WHERE { ?a ASSERTION {} }",
+        "expect": {
+          "result": [
+            [
+              {
+                "id": "E:<1>",
+                "role": "support"
+              }
+            ]
+          ]
         }
       }
     ]
@@ -806,4 +832,4 @@ export const FIXTURES: readonly Fixture[] = [
 ] as unknown as Fixture[]
 
 /** The total number of cases, so a silent shrink is visible. */
-export const CASE_COUNT = 80
+export const CASE_COUNT = 82

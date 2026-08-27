@@ -36,8 +36,21 @@ use crate::ast::{
 use crate::error::KipError;
 
 /// Assertion payload that is immutable after creation (Spec §13.7).
+///
+/// These are the field names §13.2 gives the slots, which is also what KML
+/// source writes and what the wire view renders — one spelling per slot, so
+/// there is no second name that reaches the same state unguarded.
+///
+/// **Known divergence from `@ldclabs/kip-lang`**, whose list carries
+/// `evidence_refs` — a name from an older draft of the wire shape — but not
+/// `evidence`: on that side,
+/// `UPDATE ?a SET FIELDS { evidence: ... } WHERE { ?a ASSERTION {...} }`
+/// parses. §13.7 lists "initial Evidence citations" among the immutable
+/// payload, so rewriting them is exactly the epistemic rewrite it forbids.
+/// The differential fixture is a corpus of commands the reference *accepts*,
+/// which is why the two lists can drift without the parity test noticing;
+/// `an_assertions_citations_are_immutable` below is the basis for it.
 const ASSERTION_IMMUTABLE: &[&str] = &[
-    "proposition_id",
     "proposition",
     "asserted_by",
     "stance",
@@ -46,7 +59,6 @@ const ASSERTION_IMMUTABLE: &[&str] = &[
     "asserted_at",
     "valid_time",
     "evidence",
-    "evidence_refs",
 ];
 
 /// Evidence payload and observation identity are immutable (Spec §15.5).
@@ -1544,6 +1556,37 @@ mod tests {
     #[test]
     fn mutate_needs_at_least_one_mutation() {
         assert!(parse_kml_statement("MUTATE { }").is_err());
+    }
+
+    #[test]
+    fn an_assertions_citations_are_immutable() {
+        // §13.7 makes the initial Evidence citations immutable payload, so an
+        // UPDATE naming the slot is a forbidden rewrite — record a new
+        // Assertion with SUPERSEDING instead.
+        //
+        // This is the basis for a known divergence from `@ldclabs/kip-lang`,
+        // which guards `evidence_refs` — a name from an older draft of the
+        // wire shape — and lets `evidence` through. The parity fixture is a
+        // corpus of commands the reference accepts, so nothing there would
+        // catch the two lists drifting apart.
+        for field in ASSERTION_IMMUTABLE {
+            let source = format!(
+                r#"UPDATE ?a SET FIELDS {{ {field}: :v }} WHERE {{ ?a ASSERTION {{id: "A-1"}} }}"#
+            );
+            assert!(
+                parse_kml_statement(&source).is_err(),
+                "an UPDATE rewriting {field} must not parse"
+            );
+        }
+
+        // The rule is about the Assertion's own citations. A Concept field
+        // that happens to be called `evidence` is ordinary mutable state.
+        assert!(
+            parse_kml_statement(
+                r#"UPDATE ?c SET FIELDS { evidence: :e } WHERE { ?c CONCEPT {id: "C-1"} }"#
+            )
+            .is_ok()
+        );
     }
 
     #[test]
