@@ -55,6 +55,7 @@ import {
   validateAttributes,
   validateFacet,
   validateStructural,
+  type StructuralFieldDef,
   type SymbolKind,
 } from '../schema/index.js'
 import {
@@ -1310,14 +1311,40 @@ export function edgeIndex(b: Bindings, edge: StructuralEdge): number | null {
 
 /** Whether a structural field declares a stable order (§17.4). */
 export function orderedField(tx: Transaction, field: string): boolean {
+  return fieldDef(tx, field)?.ordered === true
+}
+
+/**
+ * Whether a structural field holds at most one reference (§17.5).
+ *
+ * The one that decides whether `SET STRUCTURAL` appends or *replaces*:
+ * appending to a single-cardinality field and then failing the cardinality
+ * check would refuse the one write the Specification says this form is for.
+ */
+export function singleField(tx: Transaction, field: string): boolean {
+  return fieldDef(tx, field)?.cardinality?.max === 1
+}
+
+function fieldDef(
+  tx: Transaction,
+  field: string,
+): StructuralFieldDef | undefined {
   try {
     const symbol = tx.env.resolveSymbol('StructuralField', field, 'read')
     const pkg = tx.env.definitionPackage(symbol)
-    const def = pkg === undefined ? undefined : structuralFieldDef(pkg, symbol.name)
-    return def?.ordered === true
+    return pkg === undefined ? undefined : structuralFieldDef(pkg, symbol.name)
   } catch {
-    return false
+    return undefined
   }
+}
+
+/** An `index` on a field that declares no order (§17.4). */
+export function unorderedIndex(field: string): Error {
+  return errors.constraintViolation(
+    `\`${field}\` is not an ordered structural field, so a reference in it ` +
+      `has no position; an \`index\` here would order nothing and no query ` +
+      `could read it back (§17.4)`,
+  )
 }
 
 export function positionTaken(field: string, index: number): Error {
@@ -1360,13 +1387,7 @@ export function placeReference(
     items.push(value)
     return true
   }
-  if (!ordered) {
-    throw errors.constraintViolation(
-      `\`${field}\` is not an ordered structural field, so a reference in it ` +
-        `has no position; an \`index\` here would order nothing and no query ` +
-        `could read it back (§17.4)`,
-    )
-  }
+  if (!ordered) throw unorderedIndex(field)
   // A reference already present is moved rather than duplicated: re-stating one
   // with a position is how an author re-orders.
   if (at >= 0) items.splice(at, 1)

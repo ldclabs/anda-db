@@ -22,6 +22,8 @@ import {
   orderedField,
   placeReference,
   positionTaken,
+  singleField,
+  unorderedIndex,
 } from './clauses.js'
 import { errors } from '../errors.js'
 import { formatElementId, type ElementId } from '../id.js'
@@ -190,13 +192,31 @@ export function applyAction(
       const current = row.structural[field]
       const items = Array.isArray(current) ? [...current] : []
       const index = edgeIndex(b, edge)
+      const ordered = orderedField(tx, field)
       // §17.4 forbids conflicting explicit positions *in one mutation plan*,
       // and a plan is free to spread them across clauses — so the claim is
       // tracked on the transaction rather than per clause.
       if (index !== null && !tx.claimPosition(element.row.id, field, index)) {
         throw positionTaken(field, index)
       }
-      placeReference(items, value, index, orderedField(tx, field), field)
+      // §17.5: on a single-cardinality field, `SET STRUCTURAL` *replaces*.
+      // Appending and then failing the cardinality check would refuse the one
+      // write the Specification says this form is for.
+      if (singleField(tx, field)) {
+        if (index !== null) {
+          if (!ordered) throw unorderedIndex(field)
+          if (index > 0) {
+            throw errors.constraintViolation(
+              `position ${index} is outside \`${field}\`, which holds at ` +
+                `most one reference; positions are dense, and the only one ` +
+                `it has is 0 (§17.4)`,
+            )
+          }
+        }
+        row.structural[field] = [value]
+        continue
+      }
+      placeReference(items, value, index, ordered, field)
       row.structural[field] = items
     }
     return

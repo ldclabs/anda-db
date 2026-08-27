@@ -512,6 +512,63 @@ async fn an_ordered_structural_field_honors_the_position_it_was_given() {
     assert_eq!(error.code, "ConstraintViolation");
 }
 
+/// §17.5: a single-cardinality field is replaced, never appended to.
+#[tokio::test]
+async fn a_single_cardinality_structural_field_is_replaced() {
+    let nexus = nexus("single_cardinality").await;
+    let created = ok(
+        &nexus,
+        r#"MUTATE {
+            CREATE CONCEPT ?exp {
+                TYPE "Experience"
+                SET ATTRIBUTES {goal: "learn", outcome_status: "success"}
+            }
+            CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
+            CREATE CONCEPT ?bob { TYPE "Person" NAME "Bob" }
+        }"#,
+        json!({}),
+    )
+    .await;
+    let bob = handle(&created, "bob");
+    let params = json!({
+        "exp": handle(&created, "exp"),
+        "alice": {"id": handle(&created, "alice")},
+        "bob": {"id": bob},
+    });
+
+    ok(
+        &nexus,
+        r#"UPDATE :exp SET STRUCTURAL { ("experienced_by", :alice) }"#,
+        params.clone(),
+    )
+    .await;
+    // Appending here would fail the cardinality check and refuse the one write
+    // this form exists for.
+    ok(
+        &nexus,
+        r#"UPDATE :exp SET STRUCTURAL { ("experienced_by", :bob) }"#,
+        params.clone(),
+    )
+    .await;
+    let who = ok(
+        &nexus,
+        r#"FIND(?p.id) WHERE { ?e STRUCTURAL (?src, "experienced_by", ?p) }"#,
+        json!({}),
+    )
+    .await;
+    assert_eq!(who, json!([bob]));
+
+    // `experienced_by` declares no order, so a position on it orders nothing
+    // and is refused rather than dropped (§17.4).
+    let error = err(
+        &nexus,
+        r#"UPDATE :exp SET STRUCTURAL { ("experienced_by", :alice) {index: 0} }"#,
+        params,
+    )
+    .await;
+    assert_eq!(error.code, "ConstraintViolation");
+}
+
 // ---------------------------------------------------------------------------
 // §44.8 / §88.4 — cursors
 // ---------------------------------------------------------------------------

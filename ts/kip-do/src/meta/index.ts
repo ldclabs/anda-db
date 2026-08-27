@@ -109,6 +109,17 @@ export interface MetaContext {
    * it rather than today's.
    */
   environmentAt: (version: number) => SchemaEnvironment
+  /**
+   * Where a paging META command leaves its continuation token (§44.8).
+   *
+   * An out-parameter, because the bodies these commands answer with have no
+   * slot for one: `LIST` answers with a bare array. Without it the engine
+   * accepts an opaque `list` cursor it has no way to hand out, which makes
+   * `LIST ... LIMIT n CURSOR ...` impossible to reach rather than merely
+   * awkward. `SEARCH` carries its own inside its object body and does not use
+   * this.
+   */
+  page?: { next_cursor?: string }
 }
 
 /** Runs one META command. */
@@ -514,7 +525,19 @@ function list(command: ListCommand, cx: MetaContext, b: ReadBindings): Json {
     const limit =
       command.limit === null ? null : Number(scalarValue(command.limit, b))
     const window = items.slice(offset)
-    return (limit === null ? window : window.slice(0, limit)) as Json
+    const rows = limit === null ? window : window.slice(0, limit)
+    const consumed = offset + rows.length
+    // The cursor this page's continuation needs. Issued rather than left
+    // implicit: a cursor is opaque (§88.4), so a caller that is never handed
+    // one cannot page at all.
+    if (cx.page !== undefined && consumed < items.length) {
+      cx.page.next_cursor = pageToken(cx.space, {
+        family: 'list',
+        snapshotSeq: cx.store.currentSeq(cx.space),
+        offset: consumed,
+      })
+    }
+    return rows as Json
   }
 
   switch (command.target) {

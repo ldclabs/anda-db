@@ -821,8 +821,11 @@ fn require_retention_authority(tx: &Transaction, retention: &Json) -> Result<(),
     if retention.is_null() {
         return Ok(());
     }
-    check_retention(retention)?;
     tx.require(Permission::ManageRetention)?;
+    // The shape check lives in `require_legal_hold_authority`, which is also
+    // `SET RETENTION`'s entry point — so every path that writes a retention
+    // block runs it exactly once, and it runs after the permission rather than
+    // telling an unauthorized caller which member it got wrong.
     require_legal_hold_authority(tx, retention)
 }
 

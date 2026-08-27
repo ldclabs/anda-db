@@ -80,6 +80,7 @@ export {
   type KipDatabaseEnv,
   type KipResponse,
   type KipResult,
+  type KipResultContext,
 } from './durable-object.js'
 
 export {

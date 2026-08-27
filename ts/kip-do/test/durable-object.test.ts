@@ -53,6 +53,37 @@ describe('the Durable Object', () => {
     expect((body.results[2]?.result as { kip: string }).kip).toBe('2.0')
   })
 
+  it('returns the coordinate a read answered at, and the cursor to continue it', async () => {
+    // §50 and §44.8: a cursor is opaque, so the only way a caller can page a
+    // `FIND` is to be handed the token — an object that computed one and kept
+    // it made `CURSOR` unreachable over its own HTTP surface.
+    const response = await post(
+      'paging',
+      request(
+        'MUTATE { CREATE CONCEPT ?a { TYPE "Person" NAME "Alice" } ' +
+          'CREATE CONCEPT ?b { TYPE "Person" NAME "Bob" } ' +
+          'CREATE CONCEPT ?c { TYPE "Person" NAME "Carol" } }',
+        'FIND(?c.name) WHERE { ?c CONCEPT {type: "Person"} } ORDER BY ?c.name LIMIT 2',
+      ),
+    )
+    const body = (await response.json()) as KipResponse
+    const page = body.results[1]
+    expect(page?.result).toEqual(['Alice', 'Bob'])
+    expect(page?.context?.snapshot_seq).toBeGreaterThan(0)
+    expect(page?.next_cursor).toBeDefined()
+
+    const next = await post(
+      'paging',
+      request(
+        'FIND(?c.name) WHERE { ?c CONCEPT {type: "Person"} } ORDER BY ?c.name ' +
+          `LIMIT 2 CURSOR "${page?.next_cursor}"`,
+      ),
+    )
+    const rest = (await next.json()) as KipResponse
+    expect(rest.results[0]?.result).toEqual(['Carol'])
+    expect(rest.results[0]?.next_cursor).toBeUndefined()
+  })
+
   it('reports a partial batch as 207, never as a failure', async () => {
     // The earlier operation has already committed and is durable. Reporting
     // the whole request as a failure invites the client to re-send a write

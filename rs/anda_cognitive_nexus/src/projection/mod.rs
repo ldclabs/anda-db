@@ -486,7 +486,12 @@ impl Context<'_> {
             },
             evidence: row.evidence_ids.clone(),
             stance: row.stance.clone(),
-            confidence: if row.confidence == crate::kml::clauses::NO_CONFIDENCE {
+            // Every negative reads as "the actor stated none", not only the
+            // exact sentinel written today: a row stored before `[0, 1]` was
+            // enforced on the way in may hold another, and taking one of those
+            // as a real commitment would clamp it to zero and silently weigh
+            // the claim as worthless.
+            confidence: if row.confidence < 0.0 {
                 policy.unstated_confidence
             } else {
                 row.confidence

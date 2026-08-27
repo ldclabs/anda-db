@@ -252,8 +252,10 @@ async fn set_structural(
 
     let mut applied = Applied::default();
     for edge in resolved {
-        if edge.index.is_some() && !tx.claim_position(id, &edge.field, edge.index.unwrap_or(0)) {
-            return Err(position_taken(&edge.field, edge.index.unwrap_or(0)));
+        if let Some(index) = edge.index
+            && !tx.claim_position(id, &edge.field, index)
+        {
+            return Err(position_taken(&edge.field, index));
         }
         let structural = structural_mut(tx, id).await?;
         let entry = structural
@@ -264,7 +266,25 @@ async fn set_structural(
         // Appending and then failing the cardinality check would refuse the
         // one write the Specification says this form is for.
         if edge.single {
-            let replaced = items.first() != Some(&edge.value);
+            // The one position a single-cardinality field has is 0, and an
+            // `index` on an unordered field is refused wherever it is written
+            // — dropping it here would let an author believe they had ordered
+            // a field no query can order (§17.4).
+            if let Some(index) = edge.index {
+                if !edge.ordered {
+                    return Err(unordered_index(&edge.field));
+                }
+                if index > 0 {
+                    return Err(KipError::constraint_violation(format!(
+                        "position {index} is outside `{}`, which holds at most one reference; \
+                         positions are dense, and the only one it has is 0 (§17.4)",
+                        edge.field
+                    )));
+                }
+            }
+            let replaced = items
+                .first()
+                .is_none_or(|held| !same_reference(held, &edge.value));
             items.clear();
             items.push(edge.value);
             applied.changed |= replaced;
@@ -321,6 +341,14 @@ pub(crate) fn resolve_edges(
     Ok(resolved)
 }
 
+/// An `index` on a field that declares no order (§17.4).
+fn unordered_index(field: &str) -> KipError {
+    KipError::constraint_violation(format!(
+        "`{field}` is not an ordered structural field, so a reference in it has no position; an \
+         `index` here would order nothing and no query could read it back (§17.4)"
+    ))
+}
+
 fn position_taken(field: &str, index: usize) -> KipError {
     KipError::constraint_violation(format!(
         "two references claim position {index} of `{field}` in one mutation plan; an order cannot \
@@ -361,10 +389,7 @@ pub(crate) fn place_reference(
     };
 
     if !ordered {
-        return Err(KipError::constraint_violation(format!(
-            "`{field}` is not an ordered structural field, so a reference in it has no position; \
-             an `index` here would order nothing and no query could read it back (§17.4)"
-        )));
+        return Err(unordered_index(field));
     }
 
     // A reference already present is moved rather than duplicated: re-stating

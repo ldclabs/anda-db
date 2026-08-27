@@ -312,10 +312,12 @@ fn assertion(row: &AssertionRow) -> Json {
         },
         // The out-of-band sentinel means "the actor stated none", and it must
         // not surface as a real value: a negative number would read as an
-        // extraordinarily strong denial rather than as silence. Writes are
-        // held to `[0, 1]`, so nothing real lands on it.
-        confidence: (row.confidence != crate::kml::clauses::NO_CONFIDENCE)
-            .then_some(row.confidence),
+        // extraordinarily strong denial rather than as silence. Every negative
+        // is read as the sentinel, not only the exact one written today: a row
+        // stored before `[0, 1]` was enforced on the way in may hold any of
+        // them, and letting one of those through is the one direction this
+        // must never be wrong in.
+        confidence: (row.confidence >= 0.0).then_some(row.confidence),
         asserted_at: some_text(&row.asserted_at),
         valid_time: (valid_time.from.is_some() || valid_time.until.is_some()).then_some(valid_time),
         // Mapped field by field rather than through `from_value(..).ok()`:
@@ -499,6 +501,20 @@ mod tests {
             ..Default::default()
         })));
         assert_eq!(read_path(&silent, &path(&["confidence"])), Json::Null);
+
+        // A row written before `[0, 1]` was enforced on the way in may hold
+        // any negative, and every one of them means the same thing. Rendering
+        // one as a number is the failure this guard exists to prevent, so the
+        // test is over the whole range rather than over the one value the
+        // writer happens to produce today.
+        let legacy = render(&Element::Assertion(Box::new(AssertionRow {
+            _id: 1,
+            confidence: -0.5,
+            stance: "support".into(),
+            status: "active".into(),
+            ..Default::default()
+        })));
+        assert_eq!(read_path(&legacy, &path(&["confidence"])), Json::Null);
 
         let stated = render(&Element::Assertion(Box::new(AssertionRow {
             _id: 1,

@@ -607,7 +607,8 @@ async fn expire(
     // Expiry is not an exemption: reaching an element still costs what
     // reaching it always costs.
     let approved = decide(store, space_id, &resource, permission, authority, auth).await?;
-    let patch = |governance: &Json| set_member(governance, RETENTION_LAPSED_KEY, Json::Bool(true));
+    let patch =
+        |governance: &Json| set_member(governance, RETENTION_LAPSED_KEY, Json::from("expired"));
     apply(
         store,
         space_id,
@@ -625,6 +626,11 @@ async fn expire(
 }
 
 /// The Governance member that records why an element left ordinary recall.
+///
+/// Its value is the reason rather than a bare `true`, matching how
+/// [`QUARANTINE_KEY`] records its own — and matching `ts/kip-do`, which writes
+/// the same member: a reader following `HISTORY ELEMENT` across either engine
+/// sees *what happened*, not that something did.
 const RETENTION_LAPSED_KEY: &str = "retention_lapsed";
 
 /// Marks an Assertion whose validity window has closed as `expired` (§14.3).

@@ -91,14 +91,20 @@ export function capabilities(): Json {
       },
       paging: {
         // §44.8 and §88.4: a cursor is opaque, carries the coordinate the
-        // traversal began at, and belongs to the family that issued it.
+        // traversal began at, and belongs to the family that issued it. Each
+        // family issues its own, because a family that accepts one and never
+        // hands one out cannot be paged at all.
         cursor: 'opaque token, snapshot-pinned, per operation family',
         families: ['find', 'search', 'list'],
       },
       structural: {
         // §17.4: an ordered field keeps one dense zero-based order per source
-        // element.
+        // element, and exposes each reference's position.
         ordered_fields: true,
+        edge_binding:
+          '?edge STRUCTURAL (...) binds virtual edge state carrying source, ' +
+          'field, target and index',
+        single_cardinality: 'SET STRUCTURAL replaces rather than appends',
       },
       envelope: {
         client_key:

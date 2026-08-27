@@ -3,8 +3,9 @@
  *
  * `kip://core@2.0.0` is a virtual Schema Package the Specification defines
  * itself: implicitly active in every Schema Environment, never deactivated,
- * never shadowed. Its registries therefore hold whatever packages a Space has
- * installed, which makes them decidable before an engine is involved.
+ * never shadowed. Its registries therefore hold no matter which packages a
+ * Space has installed, which makes them decidable before an engine is
+ * involved.
  *
  * This is the TypeScript half of `rs/anda_kip/src/semantics.rs`, and the two
  * are kept identical on purpose: the same command must be refused by both

@@ -35,9 +35,32 @@ export interface KipDatabaseEnv {
   [key: string]: unknown
 }
 
+/**
+ * The coordinates one read answered at (Spec §50).
+ *
+ * Reported rather than implied: an answer that cannot say which coordinate it
+ * read is an answer a caller cannot reproduce, and it is the same coordinate a
+ * page cursor pins.
+ */
+export interface KipResultContext {
+  /** The Space coordinate the read was pinned to. */
+  snapshot_seq: number
+  /** The world-time basis, when `FOR TIME` named one. */
+  valid_at?: string
+}
+
 /** One operation's answer. */
 export interface KipResult {
   result?: Json
+  context?: KipResultContext
+  /**
+   * The cursor for the next page, when one remains (§44.8).
+   *
+   * A KQL cursor is the opaque token this engine issues, so a caller has no
+   * other way to obtain one — a paged `FIND` whose continuation token never
+   * left the object could not be continued at all.
+   */
+  next_cursor?: string
   receipt?: Outcome
   error?: KipErrorJSON
 }
@@ -117,9 +140,25 @@ export class KipDatabase<Env = KipDatabaseEnv> extends DurableObject<Env> {
         return { receipt: session.mutate(parsed.Kml, params) }
       }
       if ('Kql' in parsed) {
-        return { result: session.find(parsed.Kql, params, read ?? {}) as Json }
+        const answer = session.findPage(parsed.Kql, params, read ?? {})
+        return {
+          result: answer.rows as Json,
+          context: {
+            snapshot_seq: answer.snapshotSeq,
+            ...(answer.validAt === null ? {} : { valid_at: answer.validAt }),
+          },
+          ...(answer.nextCursor === null
+            ? {}
+            : { next_cursor: answer.nextCursor }),
+        }
       }
-      return { result: session.describe(command, params) }
+      const answer = session.describePage(command, params)
+      return {
+        result: answer.result,
+        ...(answer.nextCursor === null
+          ? {}
+          : { next_cursor: answer.nextCursor }),
+      }
     } catch (err) {
       return { error: KipError.from(err).toJSON() }
     }

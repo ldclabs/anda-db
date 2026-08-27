@@ -516,6 +516,111 @@ describe('KML', () => {
     })
   })
 
+  it('binds the structural edge, with the position an ordered field has', async () => {
+    await withNexus('edge-binding', (nexus) => {
+      // §43.7: the bound edge is virtual structural query state, "not
+      // necessarily a durable Cognitive Element" — so it binds as the value it
+      // is, and §17.4 puts each reference's current position on it. An
+      // unordered field has no positions, so the member reads null there.
+      nexus.execute(`MUTATE {
+        CREATE CONCEPT ?exp {
+          TYPE "Experience"
+          SET ATTRIBUTES {goal: "learn", outcome_status: "success"}
+        }
+        CREATE CONCEPT ?one {
+          TYPE "ExperienceStep" SET ATTRIBUTES {step_kind: "action", summary: "one"}
+        }
+        CREATE CONCEPT ?two {
+          TYPE "ExperienceStep" SET ATTRIBUTES {step_kind: "action", summary: "two"}
+        }
+      }`)
+      const step = (summary: string): string =>
+        nexus.query(
+          `FIND(?c.id) WHERE { ?c CONCEPT {type: "ExperienceStep"} FILTER(?c.attributes.summary == "${summary}") } LIMIT 1`,
+        )[0] as string
+      const exp = nexus.query(
+        'FIND(?c.id) WHERE { ?c CONCEPT {type: "Experience"} } LIMIT 1',
+      )[0] as string
+      const params = {
+        exp,
+        one: { id: step('one') },
+        two: { id: step('two') },
+      }
+      nexus.execute(`UPDATE :exp SET STRUCTURAL { ("has_step", :one) }`, params)
+      // Position 0 puts the second step first, which is the whole point of an
+      // explicit index.
+      nexus.execute(
+        `UPDATE :exp SET STRUCTURAL { ("has_step", :two) {index: 0} }`,
+        params,
+      )
+
+      const ordered = nexus.query(
+        'FIND(?step.attributes.summary, ?e.index) ' +
+          'WHERE { ?e STRUCTURAL (?src, "has_step", ?step) } ORDER BY ?e.index',
+      )
+      expect(ordered).toEqual([
+        ['two', 0],
+        ['one', 1],
+      ])
+    })
+  })
+
+  it('replaces rather than appends on a single-cardinality structural field', async () => {
+    await withNexus('single-cardinality', (nexus) => {
+      // §17.5: `SET STRUCTURAL` on a field that holds at most one reference
+      // *replaces* it. Appending and then failing the cardinality check would
+      // refuse the one write this form exists for — and would disagree with
+      // `rs/anda_cognitive_nexus`, which replaces.
+      nexus.execute(`MUTATE {
+        CREATE CONCEPT ?exp {
+          TYPE "Experience"
+          SET ATTRIBUTES {goal: "learn", outcome_status: "success"}
+        }
+        CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
+        CREATE CONCEPT ?bob { TYPE "Person" NAME "Bob" }
+      }`)
+      const exp = nexus.query(
+        'FIND(?c.id) WHERE { ?c CONCEPT {type: "Experience"} } LIMIT 1',
+      )[0] as string
+      const person = (name: string): string =>
+        nexus.query(
+          `FIND(?c.id) WHERE { ?c CONCEPT {type: "Person", name: "${name}"} } LIMIT 1`,
+        )[0] as string
+      const alice = person('Alice')
+      const bob = person('Bob')
+
+      nexus.execute(`UPDATE :exp SET STRUCTURAL { ("experienced_by", :who) }`, {
+        exp,
+        who: { id: alice },
+      })
+      nexus.execute(`UPDATE :exp SET STRUCTURAL { ("experienced_by", :who) }`, {
+        exp,
+        who: { id: bob },
+      })
+
+      const row = nexus.store.sql
+        .exec<{ structural: string }>(
+          'SELECT structural FROM concepts WHERE id = ?',
+          parseElementId(exp).seq,
+        )
+        .toArray()[0]
+      const structural = JSON.parse(row?.structural ?? '{}') as Record<
+        string,
+        { id: string }[]
+      >
+      expect(structural[`${CM}/experienced_by`]).toEqual([{ id: bob }])
+
+      // An unordered field has no positions, single-cardinality or not.
+      const positioned = nexus.tryExecute(
+        `UPDATE :exp SET STRUCTURAL { ("experienced_by", :who) {index: 0} }`,
+        { exp, who: { id: alice } },
+      )
+      expect('error' in positioned && positioned.error.code).toBe(
+        'ConstraintViolation',
+      )
+    })
+  })
+
   it('previews without taking a sequence or writing anything', async () => {
     await withNexus('dry-run', (nexus) => {
       const parsed = parseKip(SETUP)

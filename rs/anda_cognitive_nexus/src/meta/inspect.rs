@@ -129,6 +129,17 @@ pub async fn search(cx: &mut Context<'_>, command: &SearchCommand) -> Result<Ans
         }
     };
 
+    // Over-fetch, because the filters below run after scoring: Space,
+    // lifecycle state, declared type and — most importantly — Governance
+    // visibility. The index is database-wide while a search is Space-scoped,
+    // so a narrow Space in a busy database can have its whole page crowded out
+    // by hits it may not see. The window is therefore wide in absolute terms
+    // rather than a small multiple of the page, and what still falls off the
+    // end is disclosed as a caveat rather than reported as an empty Space
+    // (§66.6).
+    let window = (limit + offset)
+        .saturating_mul(SEARCH_OVERFETCH)
+        .max(SEARCH_MIN_WINDOW);
     let mut hits: Vec<(f32, Json)> = Vec::new();
     let mut scanned = 0usize;
     for (kind, fields) in kinds {
@@ -139,17 +150,6 @@ pub async fn search(cx: &mut Context<'_>, command: &SearchCommand) -> Result<Ans
                 format!("no full-text index exists over {kind}"),
             )
         })?;
-        // Over-fetch, because the filters below run after scoring: Space,
-        // lifecycle state, declared type and — most importantly — Governance
-        // visibility. The index is database-wide while a search is
-        // Space-scoped, so a narrow Space in a busy database can have its
-        // whole page crowded out by hits it may not see. The window is
-        // therefore wide in absolute terms rather than a small multiple of the
-        // page, and what still falls off the end is disclosed as a caveat
-        // rather than reported as an empty Space (§66.6).
-        let window = (limit + offset)
-            .saturating_mul(SEARCH_OVERFETCH)
-            .max(SEARCH_MIN_WINDOW);
         let candidates = index.search_advanced(&term, window, None);
         scanned = scanned.max(candidates.len());
         for (seq, score) in candidates {
@@ -219,8 +219,11 @@ pub async fn search(cx: &mut Context<'_>, command: &SearchCommand) -> Result<Ans
                        ground with SEARCH, then read with FIND or BELIEF",
             // §66.6 in the one place a caller can act on it: this page was cut
             // from a bounded candidate window, so an exhaustive question needs
-            // FIND, which has no such window.
-            "exhaustive": scanned < SEARCH_MIN_WINDOW,
+            // FIND, which has no such window. The comparison is against the
+            // window that actually ran, not against its floor — a wide page
+            // raises the window, and measuring it against the floor would
+            // report a search that saw everything as one that did not.
+            "exhaustive": scanned < window,
         }),
         next_cursor: super::next_cursor(cx, CursorFamily::Search, consumed, total),
     })

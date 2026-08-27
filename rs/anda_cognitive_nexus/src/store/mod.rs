@@ -903,20 +903,6 @@ impl Store {
         }
     }
 
-    /// Looks a Concept up by its Space-local logical key.
-    ///
-    /// The key is immutable identity, unlike `name`, which is why `UPSERT`
-    /// resolves through it (§54).
-    ///
-    /// `schema_ref` narrows the lookup rather than filtering its result,
-    /// because §7.3 scopes key uniqueness to `(space_id, schema_ref, key)`: a
-    /// Person and a Preference both keyed `"alice"` are two identities, not a
-    /// collision — which is also what makes the 1.x migration of `(type, name)`
-    /// identity into a key collision-free.
-    ///
-    /// Without a declared type the key alone must still land on one Concept.
-    /// Returning the first of several would be the arbitrary winner §51 forbids
-    /// for names, arriving through `key` instead.
     /// Every active Assertion in a Space whose validity window has closed.
     ///
     /// Ordered by id, so a bounded pass is repeatable.
@@ -1058,6 +1044,20 @@ impl Store {
         Ok(ids.iter().min().map(|seq| ElementId::new(kind, *seq)))
     }
 
+    /// Looks a Concept up by its Space-local logical key.
+    ///
+    /// The key is immutable identity, unlike `name`, which is why `UPSERT`
+    /// resolves through it (§54).
+    ///
+    /// `schema_ref` narrows the lookup rather than filtering its result,
+    /// because §7.3 scopes key uniqueness to `(space_id, schema_ref, key)`: a
+    /// Person and a Preference both keyed `"alice"` are two identities, not a
+    /// collision — which is also what makes the 1.x migration of `(type, name)`
+    /// identity into a key collision-free.
+    ///
+    /// Without a declared type the key alone must still land on one Concept.
+    /// Returning the first of several would be the arbitrary winner §51 forbids
+    /// for names, arriving through `key` instead.
     pub async fn find_concept_by_key(
         &self,
         space: &str,

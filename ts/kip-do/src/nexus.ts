@@ -363,6 +363,14 @@ export class CognitiveNexus {
     return this.systemSession().describe(command, params)
   }
 
+  /** Parses and runs one META command, reporting its page cursor. */
+  describePage(
+    command: string,
+    params: JsonMap = {},
+  ): { result: Json; nextCursor: string | null } {
+    return this.systemSession().describePage(command, params)
+  }
+
   /**
    * Parses and runs one KQL query, returning the bare result array.
    *
@@ -530,6 +538,21 @@ export class Session {
 
   /** Parses and runs one META command. */
   describe(command: string, params: JsonMap = {}): Json {
+    return this.describePage(command, params).result
+  }
+
+  /**
+   * Parses and runs one META command, reporting its page cursor.
+   *
+   * `LIST` answers with a bare array and `SEARCH` with an object carrying its
+   * own `next_cursor`, so the token a caller needs to continue a `LIST` has
+   * nowhere to ride in the body — it comes back here instead. A cursor is
+   * opaque (§88.4), so a caller that is never handed one cannot page at all.
+   */
+  describePage(
+    command: string,
+    params: JsonMap = {},
+  ): { result: Json; nextCursor: string | null } {
     const parsed: Command = parseKip(command)
     if (!('Meta' in parsed)) {
       throw errors.languageMismatch('this command is not a META command')
@@ -537,6 +560,7 @@ export class Session {
     const space = this.nexus.space
     const authority = this.effectiveAuthority(space)
     const decisions = this.gate(authority, metaPermissions(parsed.Meta))
+    const page: { next_cursor?: string } = {}
     const cx: MetaContext = {
       store: this.nexus.store,
       space,
@@ -545,15 +569,17 @@ export class Session {
       environmentAt: (version) => this.nexus.environmentAt(space, version),
       authority,
       auth: this.auth,
+      page,
     }
     // `PREVIEW KML` mints shells to allocate ids and then discards them, so it
     // runs inside a transaction like any other mutation path — one that is
     // simply never committed.
-    return this.nexus.transact(() => {
-      const result = executeMeta(parsed.Meta, cx)
+    const result = this.nexus.transact(() => {
+      const answer = executeMeta(parsed.Meta, cx)
       this.consume(decisions)
-      return result
+      return answer
     })
+    return { result, nextCursor: page.next_cursor ?? null }
   }
 
   /** Runs one parsed KQL query, reporting its coordinates and page cursor. */

@@ -120,6 +120,32 @@ describe('META', () => {
     })
   })
 
+  it('hands back the opaque cursor a paged LIST needs to continue', async () => {
+    await withNexus('list-paging', (nexus) => {
+      // §88.4 makes a cursor opaque, so a caller cannot invent one — which
+      // means an engine that accepts an opaque `list` cursor and never issues
+      // one has made `LIST ... CURSOR` unreachable rather than merely awkward.
+      const all = nexus.describe('LIST TYPES') as string[]
+      expect(all.length).toBeGreaterThan(2)
+
+      const first = nexus.describePage('LIST TYPES LIMIT 2')
+      expect(first.result).toEqual(all.slice(0, 2))
+      expect(first.nextCursor).not.toBeNull()
+      // Opaque: not the offset a caller could have typed.
+      expect(Number(first.nextCursor)).toBeNaN()
+
+      const second = nexus.describePage(
+        `LIST TYPES LIMIT 2 CURSOR "${first.nextCursor}"`,
+      )
+      expect(second.result).toEqual(all.slice(2, 4))
+
+      // §102.28: one family's cursor must not continue another's.
+      expect(() =>
+        nexus.describe(`LIST TYPES LIMIT 2 CURSOR "${'2'}"`),
+      ).toThrow()
+    })
+  })
+
   it('validates legality without promising a commit', async () => {
     await withNexus('validate', (nexus) => {
       expect(

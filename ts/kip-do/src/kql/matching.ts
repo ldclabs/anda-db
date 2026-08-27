@@ -39,7 +39,7 @@ import type {
   WhereClause,
 } from '../kip/ast.js'
 import { kipValue as kipLiteral } from '../kml/value.js'
-import { formatSymbolRef } from '../schema/index.js'
+import { formatSymbolRef, structuralFieldDef } from '../schema/index.js'
 import { State, type PropositionRow, type SqlRow } from '../store/index.js'
 import { decodeRow } from '../store/codec.js'
 import type { Element, ElementRow } from '../store/index.js'
@@ -709,7 +709,26 @@ function structural(
   b: ReadBindings,
 ): Solution[] {
   const name = 'Name' in clause.field ? clause.field.Name : String(parameterValue(b, clause.field.Param))
-  const field = formatSymbolRef(cx.env.resolveSymbol('StructuralField', name, 'read'))
+  const symbol = cx.env.resolveSymbol('StructuralField', name, 'read')
+  const field = formatSymbolRef(symbol)
+  // §17.4: an ordered field exposes each reference's current position as
+  // `?edge.index`; an unordered one exposes no index at all, so the member
+  // reads null there rather than reporting a position the field does not have.
+  const pkg = cx.env.definitionPackage(symbol)
+  const ordered =
+    (pkg === undefined ? undefined : structuralFieldDef(pkg, symbol.name))
+      ?.ordered === true
+  // §43.7: the bound edge is *virtual* structural query state, explicitly "not
+  // necessarily a durable Cognitive Element" — so it binds as the value it is,
+  // describing the reference rather than standing in for a record Core does
+  // not keep.
+  const edge = (source: string, target: Json, index: number | null): Json =>
+    ({
+      source: { id: source },
+      field,
+      target,
+      index: ordered ? index : null,
+    }) as Json
 
   const out: Solution[] = []
   if (cx.historical) {
@@ -734,7 +753,7 @@ function structural(
         const structural = view === null ? null : view.structural
         const references = isJsonMap(structural) ? structural[field] : null
         if (!Array.isArray(references)) continue
-        for (const reference of references) {
+        for (const [position, reference] of references.entries()) {
           if (!isJsonMap(reference) || typeof reference.id !== 'string') continue
           const dst = tryParseElementId(reference.id)
           if (dst === null || cx.view(dst) === null) continue
@@ -744,7 +763,11 @@ function structural(
           current = bindTerm(current, clause.object, reference as Json, b)
           if (current === null) continue
           if (clause.variable !== null) {
-            current = extend(current, clause.variable, symbolBinding(field))
+            current = extend(
+              current,
+              clause.variable,
+              literalBinding(edge(formatElementId(src), reference as Json, position)),
+            )
             if (current === null) continue
           }
           out.push(current)
@@ -769,8 +792,8 @@ function structural(
     }
 
     const rows = cx.store.sql
-      .exec<{ from_id: string; to_id: string }>(
-        `SELECT from_id, to_id FROM element_refs
+      .exec<{ from_id: string; to_id: string; ord: number }>(
+        `SELECT from_id, to_id, ord FROM element_refs
            WHERE ${wheres.join(' AND ')} ORDER BY from_id, ord`,
         ...values,
       )
@@ -787,7 +810,11 @@ function structural(
       current = bindTerm(current, clause.object, { id: row.to_id }, b)
       if (current === null) continue
       if (clause.variable !== null) {
-        current = extend(current, clause.variable, symbolBinding(field))
+        current = extend(
+          current,
+          clause.variable,
+          literalBinding(edge(row.from_id, { id: row.to_id } as Json, row.ord)),
+        )
         if (current === null) continue
       }
       out.push(current)
