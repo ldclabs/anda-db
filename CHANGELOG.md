@@ -129,6 +129,21 @@ used it.
   engines hand the same consumer, so a field one invents is a field the other
   silently lacks.
 
+### Fixed — Clippy hangs on `anda_kip` under Rust 1.98.0
+
+`clippy::needless_borrows_for_generic_args` asks whether a bound would still
+hold with the `&` removed, which re-enters trait selection with the borrow
+stripped. Under Rust 1.98.0 that recursion does not terminate on this crate —
+`evaluate_predicate_recursively` → `enter_forall::<HostEffectPredicate>` →
+itself — until the process is ~19 GB. On a GitHub runner the OOM takes the
+agent down with it, so CI reported `exit code 143` and no diagnostic at all.
+
+Confirmed as a toolchain regression rather than a code change: the last green
+commit fails the same way when its job is re-run on the newer runner image
+(Rust 1.97.1 → 1.98.0), and plain `rustc` is unaffected — the `coverage` job,
+which builds and runs everything, passes on the same image. The one lint is
+allowed in `anda_kip` alone; every other Clippy lint still runs there.
+
 ### Fixed — `@ldclabs/kip-do` stored no scalar Evidence payload
 
 `CREATE EVIDENCE ?e { SET FIELDS { payload: "she said yes" } }` committed and

@@ -110,6 +110,21 @@
 //! );
 //! ```
 
+// Works around a trait-solver regression in Rust 1.98.0: this lint asks "would
+// the bound still hold without the `&`?", which re-enters selection with the
+// borrow stripped, and on this crate that recursion does not terminate —
+// `evaluate_predicate_recursively` → `enter_forall::<HostEffectPredicate>` →
+// itself, until the process is ~19 GB and the machine gives up. On a GitHub
+// runner the OOM takes the agent with it, so the job reports `exit code 143`
+// with no diagnostic at all, which is how this cost an afternoon to find.
+//
+// Scoped to the crate that reproduces it, and to the one lint: 1.97.1 checks
+// this crate in seconds, and every other Clippy lint still runs here. Plain
+// `rustc` is unaffected — only Clippy re-runs selection this way. Remove the
+// attribute once the toolchain no longer hangs; the test for that is simply
+// `cargo clippy -p anda_kip --lib` on a newer stable.
+#![allow(clippy::needless_borrows_for_generic_args)]
+
 use std::sync::LazyLock;
 
 pub mod ast;
