@@ -605,6 +605,31 @@ impl Store {
         Ok(found)
     }
 
+    /// Every Activity in a Space that names one endpoint key among its inputs.
+    ///
+    /// The reverse of the provenance edge `Activity.inputs`, which is what
+    /// `LIST DEPENDENTS` walks (§63.5). An index lookup rather than a scan:
+    /// `input_keys` is indexed precisely so the DAG can be traversed in the
+    /// derived direction as cheaply as in the source direction (§62).
+    pub async fn activities_with_input(
+        &self,
+        space_id: &str,
+        input_key: &str,
+    ) -> Result<Vec<ElementId>, KipError> {
+        let ids = self
+            .elements(ElementKind::Activity)
+            .query_all_ids(eq_fields(&[
+                ("space", Fv::Text(space_id.to_string())),
+                ("input_keys", Fv::Text(input_key.to_string())),
+            ]))
+            .await
+            .map_err(db_error)?;
+        Ok(ids
+            .into_iter()
+            .map(|row_id| ElementId::new(ElementKind::Activity, row_id))
+            .collect())
+    }
+
     /// Whether an element exists at all.
     pub async fn contains(&self, id: ElementId) -> bool {
         self.elements(id.kind).contains(id.seq)

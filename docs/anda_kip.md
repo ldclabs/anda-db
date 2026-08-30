@@ -168,7 +168,8 @@ MUTATE {
 Families: `CREATE CONCEPT` / `EVIDENCE` / `ASSERTION` / `ACTIVITY`,
 `UPSERT CONCEPT`, `ENSURE PROPOSITION`, `ASSERT`, `UPDATE`, `RETRACT ASSERTION`,
 `SUPERSEDE ASSERTION`, `CORRECT EVIDENCE`, `TRANSITION ACTIVITY`,
-`SET RETENTION`, `ARCHIVE`, `TOMBSTONE`, `PURGE`, `MERGE CONCEPT`.
+`SET RETENTION`, `ARCHIVE`, `TOMBSTONE`, `PURGE`, `PURGE PAYLOAD`,
+`MERGE CONCEPT`.
 
 A statement written on its own is still a one-clause transaction;
 `explicit_transaction` only records which spelling the source used.
@@ -179,6 +180,7 @@ A statement written on its own is still a one-clause transaction;
 DESCRIBE PRIMER MODE "compact"
 DESCRIBE TYPE "Person"
 LIST SCHEMA PACKAGES STATUS "active" LIMIT 20
+LIST DEPENDENTS "C-1" DEPTH 2 LIMIT 50
 SEARCH COGNITION "dark mode" MODE "hybrid" THRESHOLD 0.7 LIMIT 5
 HISTORY ELEMENT "C-1" FROM SEQ 1 TO SEQ 99
 VERIFY CAPSULE :artifact
@@ -685,8 +687,9 @@ for you because each needs state.
 - report SEARCH index lag instead of implying snapshot consistency
 
 **Bounded mutation**
-- `UPDATE`, `RETRACT`, `SET RETENTION`, `ARCHIVE`, `TOMBSTONE` and `PURGE`
-  accept a `LIMIT`; an unbounded selection should be refused, not guessed at
+- `UPDATE`, `RETRACT`, `SET RETENTION`, `ARCHIVE`, `TOMBSTONE`, `PURGE` and
+  `PURGE PAYLOAD` accept a `LIMIT`; an unbounded selection should be refused,
+  not guessed at
 - no destructive cascade by default
 
 ---

@@ -568,3 +568,158 @@ async fn execution_context_states_what_the_next_read_will_see() {
             .contains("committed state")
     );
 }
+
+// ---------------------------------------------------------------------------
+// LIST DEPENDENTS (§63.5)
+// ---------------------------------------------------------------------------
+
+/// A Space with two derivation hops recorded as Activity provenance.
+///
+/// ```text
+/// Event ──inputs──▸ consolidation ──outputs──▸ Insight
+///                   Insight ──inputs──▸ compilation ──outputs──▸ Skill
+/// ```
+async fn derived(name: &str) -> CognitiveNexus {
+    let nexus = fresh(name).await;
+    ok(
+        &nexus,
+        r#"MUTATE {
+            CREATE CONCEPT ?event {
+                TYPE "Event"
+                NAME "Migration meeting"
+                SET ATTRIBUTES {summary: "The team agreed to migrate on Friday"}
+            }
+            CREATE CONCEPT ?insight {
+                TYPE "Insight"
+                NAME "Migrations need a rollback plan"
+                SET ATTRIBUTES {summary: "Every migration ships with a rollback"}
+            }
+            CREATE ACTIVITY ?consolidate {
+                SET FIELDS {activity_class: "semantic_consolidation", status: "completed"}
+                SET STRUCTURAL {
+                    ("inputs", ?event)
+                    ("outputs", ?insight)
+                }
+            }
+        }"#,
+    )
+    .await;
+    ok(
+        &nexus,
+        r#"MUTATE {
+            CREATE CONCEPT ?skill {
+                TYPE "Skill"
+                NAME "Plan a migration"
+                SET ATTRIBUTES {
+                    skill_class: "workflow",
+                    summary: "Write the rollback first",
+                    procedure: "1. write the rollback 2. migrate",
+                    status: "candidate"
+                }
+            }
+            CREATE ACTIVITY ?compile {
+                SET FIELDS {activity_class: "procedural_consolidation", status: "completed"}
+                SET STRUCTURAL {
+                    ("inputs", "C-2")
+                    ("outputs", ?skill)
+                }
+            }
+        }"#,
+    )
+    .await;
+    nexus
+}
+
+#[tokio::test]
+async fn dependents_walk_the_provenance_dag_in_the_derived_direction() {
+    // §63.5: X ∈ Activity.inputs → that Activity → each element in its outputs.
+    // This is the read §57.5 asks a Brain to make after revising a root: the
+    // cognition built on the old claim is still active state, and it has to be
+    // findable before it can be reviewed.
+    let nexus = derived("dependents").await;
+
+    let one = ok(&nexus, r#"LIST DEPENDENTS "C-1""#).await;
+    let rows = one.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    assert_eq!(rows[0]["id"], "C-2");
+    assert_eq!(rows[0]["kind"], "concept");
+    assert_eq!(rows[0]["distance"], 1);
+    assert_eq!(
+        rows[0]["via"]["activity"], "X-1",
+        "the row names the Activity it was reached through"
+    );
+
+    // DEPTH is what turns one hop into the closure. Default is one hop, so the
+    // Skill two derivations away is out of reach until it is asked for.
+    let two = ok(&nexus, r#"LIST DEPENDENTS "C-1" DEPTH 2"#).await;
+    let rows = two.as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{rows:#?}");
+    assert_eq!(rows[1]["id"], "C-3");
+    assert_eq!(rows[1]["distance"], 2);
+    assert_eq!(rows[1]["via"]["activity"], "X-2");
+}
+
+#[tokio::test]
+async fn dependents_is_a_read_and_pages_like_every_other_list() {
+    let nexus = derived("dependents_paging").await;
+    let response = run(&nexus, r#"LIST DEPENDENTS "C-1" DEPTH 2 LIMIT 1"#).await;
+    assert_eq!(response.status, TopLevelStatus::Succeeded);
+    let page = response.first_result().unwrap().as_array().unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0]["id"], "C-2");
+
+    // Reachability is provenance topology, not judgment (§57.5): nothing about
+    // the listed element changed.
+    let insight = ok(
+        &nexus,
+        r#"FIND(?c._system.state, ?c._system.version) WHERE { ?c CONCEPT {id: "C-2"} }"#,
+    )
+    .await;
+    let rows = insight.as_array().unwrap();
+    assert_eq!(rows[0][0], "active");
+    assert_eq!(rows[0][1], 1);
+}
+
+#[tokio::test]
+async fn a_transformation_with_no_activity_lineage_is_not_discoverable() {
+    // §63.5's own caveat, and the reason the Profile's consolidation guidance
+    // insists on citing the inputs you actually relied on: an uncited input is
+    // an invisible dependency, and this command cannot invent the edge.
+    let nexus = fresh("dependents_unlinked").await;
+    ok(
+        &nexus,
+        r#"MUTATE {
+            CREATE CONCEPT ?event {
+                TYPE "Event"
+                NAME "Meeting"
+                SET ATTRIBUTES {summary: "A meeting happened"}
+            }
+            CREATE CONCEPT ?insight {
+                TYPE "Insight"
+                NAME "Undeclared derivation"
+                SET ATTRIBUTES {summary: "Derived from the meeting, but nobody said so"}
+            }
+        }"#,
+    )
+    .await;
+    let rows = ok(&nexus, r#"LIST DEPENDENTS "C-1" DEPTH 4"#).await;
+    assert!(rows.as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn an_unknown_dependents_root_is_answered_as_an_absent_one() {
+    // §30.4: omission is indistinguishable from absence. An error here would
+    // turn the command into an existence oracle.
+    let nexus = derived("dependents_absent").await;
+    let rows = ok(&nexus, r#"LIST DEPENDENTS "C-999""#).await;
+    assert!(rows.as_array().unwrap().is_empty());
+
+    // A string that is not an element id at all is a different mistake, and is
+    // reported as one.
+    let response = run(&nexus, r#"LIST DEPENDENTS "not-an-id""#).await;
+    assert_eq!(response.status, TopLevelStatus::Failed);
+    assert_eq!(
+        response.error.as_ref().unwrap().code.as_str(),
+        "InvalidIdentifier"
+    );
+}

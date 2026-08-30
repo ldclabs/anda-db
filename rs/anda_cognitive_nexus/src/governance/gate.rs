@@ -133,7 +133,7 @@ pub fn clause_permissions(clause: &MutationClause) -> Vec<Permission> {
         MutationClause::SetRetention(_) => vec![Permission::ManageRetention],
         MutationClause::Archive(_) => vec![Permission::Archive],
         MutationClause::Tombstone(_) => vec![Permission::Tombstone],
-        MutationClause::Purge(_) => vec![Permission::Purge],
+        MutationClause::Purge(_) | MutationClause::PurgePayload(_) => vec![Permission::Purge],
         MutationClause::MergeConcept(_) => vec![Permission::MergeIdentity, Permission::Maintain],
     }
 }
@@ -236,6 +236,23 @@ mod tests {
         assert_eq!(
             kml_permissions(&kml(r#"PURGE :x CONFIRM "PURGE""#)),
             vec![Permission::Purge]
+        );
+        // §60.6: destroying an Evidence payload asks for the same authority
+        // destroying the record asks for. Both are irreversible; a policy that
+        // wants them scoped apart does it per element, through approval.
+        assert_eq!(
+            kml_permissions(&kml(r#"PURGE PAYLOAD :e CONFIRM "PURGE""#)),
+            vec![Permission::Purge]
+        );
+    }
+
+    #[test]
+    fn listing_dependents_is_discovery_like_every_other_list() {
+        // §63.5 is a read. The Space gate asks for discovery; whether each row
+        // may be seen is decided per element inside the traversal (§30.4).
+        assert_eq!(
+            meta_permissions(&meta(r#"LIST DEPENDENTS "C-1" DEPTH 2"#)),
+            vec![Permission::Discover]
         );
     }
 

@@ -79,6 +79,7 @@ export type {
   SetRetention,
   RemovalStatement,
   ExecPurgeStatement as PurgeStatement,
+  ExecPurgePayloadStatement as PurgePayloadStatement,
   MergeConcept,
   // META
   MetaCommand,

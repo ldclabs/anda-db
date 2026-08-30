@@ -2,7 +2,117 @@
 
 All notable changes to this workspace are documented in this file.
 
-## [Unreleased] — holding the engines to the Specification, below the syntax
+## [Unreleased] — the proactivity gap: watches, working state, derivation review, payload purge
+
+`anda_kip` 0.13.0, `anda_cognitive_nexus` 0.13.0,
+`anda_cognitive_nexus_server` 0.13.0, `@ldclabs/kip-do` 0.13.0 (still
+unpublished, so this accumulates into the same version).
+
+Syncs upstream [KIP 2.0 `40e655f`](https://github.com/ldclabs/kip) and
+implements the two statements it adds, in both engines.
+
+The gap the upstream commit names is this: a Brain that only answers when asked
+cannot notice that something *did not* happen, and a Brain that revises a claim
+leaves behind every Insight, Preference, Skill and SelfModel that was built
+while the old claim stood. The Specification's answer is deliberately narrow —
+it adds a way to *find* the derived cognition and a way to *record* the review,
+and it forbids the engine from acting on either.
+
+**`LIST DEPENDENTS :id [DEPTH :n]`** (§63.5) walks provenance in the derived
+direction — `X ∈ Activity.inputs → that Activity → each element in
+Activity.outputs` — so the artifacts downstream of a revised root are one
+command away instead of a guess. §57.5 is the rule it serves: a runtime MUST
+NOT auto-retract, auto-archive or auto-rewrite derived cognition because a root
+moved. Reachability is topology, not a verdict.
+
+**`PURGE PAYLOAD <target> [WHERE {…}] [LIMIT :n] CONFIRM "PURGE"`** (§60.6) is
+the data-minimization instrument: it destroys an Evidence record's bytes while
+the record, its `content_digest`, its citations and its provenance role survive.
+Element purge (§60.3) remains the instrument for destroying the record itself,
+and the difference is the point — an Assertion whose Evidence went to a stub is
+a history pointing at nothing.
+
+The Cognitive Memory Profile gains `Watch`, `WorkingState`, `DerivationState`,
+`MnemonicState.utility`, the `watches` structural field, the `review_derived`
+task class and four Activity classes (`watch_fire`, `action_gate`,
+`derivation_review`, `working_state_refresh`). Those are Profile vocabulary,
+not engine behaviour: both engines resolve them because they ship the artifact,
+and neither has an opinion about them.
+
+### Added — `LIST DEPENDENTS` (§63.5)
+
+- Both engines walk the closure, bounded by `DEPTH` (default 1, capped at 8)
+  and paged by `LIMIT` / `CURSOR` like every other `LIST`. A row carries the
+  dependent's `id`, `kind`, `distance` and the `via.activity` it was reached
+  through.
+- Governance applies per row, and a root the caller may not discover is
+  answered exactly as an absent one is (§30.4) — an error there would turn the
+  command into an existence oracle. An Activity the caller may not read is not
+  a route: naming it in `via` would disclose it.
+- The traversal is walked in sorted id order at every level, so which Activity
+  first reached a shared dependent — and therefore what the `via` says and how
+  the page splits — is the same in both engines rather than a function of
+  storage layout.
+- `DEPTH` and the root operand are typed the same way in both engines: the
+  root is a string or a `TypeMismatch`, a `DEPTH` that is not a non-negative
+  integer is a `TypeMismatch`, and only `DEPTH 0` is a `ConstraintViolation`.
+  Stated because an agent branches on the code, and because the shared
+  `scalar_usize` would otherwise have reported a non-numeric `DEPTH` as
+  `CursorInvalidated`.
+- The Structural-Field extension §63.5 permits is **not** taken, and
+  `DESCRIBE CAPABILITIES` says so (`dependents.structural_lineage: false`). A
+  Schema Package carries no machine-readable lineage marker, so honouring it
+  would mean a Core engine hard-coding one Profile's field names and guessing
+  each one's direction — and a guess in the wrong direction hands back an
+  element's *sources* where it promised its dependents, which sends a reviewer
+  to the wrong artifacts.
+
+### Added — `PURGE PAYLOAD` (§60.6)
+
+- The target MUST be Evidence; other kinds are refused rather than succeeding
+  vacuously over a set that never had bytes. `CONFIRM "PURGE"` is required, the
+  `purge` permission is required, and `legal_hold` blocks it exactly as it
+  blocks element purge.
+- **The version log is scrubbed, not destroyed.** A payload cleared only in the
+  current row stays fully readable through `AS OF`; destroying the log instead
+  would erase the record's lifecycle, which is not what the caller asked for.
+  The full-text index is rewritten with the row, so the bytes are not
+  retrievable by the words that were minimized away. A version the engine
+  cannot rewrite refuses the whole statement rather than being skipped: bytes
+  that survive under a receipt saying they were destroyed is the one outcome a
+  data-minimization instrument must never produce.
+- `payload.mode` becomes `"purged"` — a distinct mode rather than an empty one,
+  because "the bytes were destroyed" and "this Evidence never carried bytes"
+  are different facts. Purging an already-purged payload is a `no_effect`.
+- Purging a payload whose record carries no `content_digest` warns: this is the
+  last instant that digest could have been computed, and §60.6 promises the
+  surviving record keeps one. Neither engine mints a substitute — two engines
+  would have to agree on the exact bytes for it to mean anything.
+
+### Fixed — `@ldclabs/kip-do` stored no scalar Evidence payload
+
+`CREATE EVIDENCE ?e { SET FIELDS { payload: "she said yes" } }` committed and
+kept nothing: the payload was read through a JSON-*object* accessor, so any
+scalar became `{}` and `payload_mode` became the empty string. §15.3 makes the
+payload the observation and invariant 33 forbids re-typing a transport-supplied
+one. The reference engine always stored it. A conformance case now pins the
+inline payload across both engines, which is what would have caught this.
+
+### Changed — vendored artifacts
+
+- `rs/anda_kip/{SPECIFICATION,KIPSyntax,SelfInstructions,SystemInstructions}.md`,
+  `grammar/{KML,META}.ebnf`, `profiles/CognitiveMemoryProfile-2.0.md` and
+  `brain/*.md` re-synced from upstream `v2/`.
+- `rs/anda_cognitive_nexus/profiles/cognitive-memory-2.0.0.json` re-copied
+  verbatim; its `content_digest` moves to
+  `sha256:16c21c2888130b1e1b1d2a7899a83a063b40b1d3d75549532121bef1d5395ac8`.
+- `@ldclabs/kip-lang` moves to `^2.1.0`, which parses and lowers both new
+  statements. The WASM parser oracle and the generated fixtures/corpus are
+  rebuilt with it, and the AST parity fixture is regenerated: `ListCommand`
+  gains `element` and `depth`, `ListTarget` gains `Dependents`, and
+  `MutationClause` gains `PurgePayload`.
+
+## Earlier in this cycle — holding the engines to the Specification, below the syntax
 
 `anda_kip` 0.13.0, `anda_cognitive_nexus` 0.13.0,
 `anda_cognitive_nexus_server` 0.13.0, `@ldclabs/kip-do` 0.13.0 (still

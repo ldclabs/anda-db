@@ -189,8 +189,8 @@ pub fn capabilities(authority: Option<&EffectiveAuthority>, auth: &AuthContext) 
                 "CREATE EVIDENCE", "CREATE ASSERTION", "CREATE ACTIVITY",
                 "ASSERT (desugared)", "UPDATE", "RETRACT ASSERTION",
                 "SUPERSEDE ASSERTION", "CORRECT EVIDENCE", "TRANSITION ACTIVITY",
-                "SET RETENTION", "ARCHIVE", "TOMBSTONE", "MERGE CONCEPT",
-                "WHERE selection blocks", "LIMIT"
+                "SET RETENTION", "ARCHIVE", "TOMBSTONE", "PURGE", "PURGE PAYLOAD",
+                "MERGE CONCEPT", "WHERE selection blocks", "LIMIT"
             ],
             "selection": {
                 // §52.7: a bounded sweep may be assumed repeatable only where
@@ -218,10 +218,22 @@ pub fn capabilities(authority: Option<&EffectiveAuthority>, auth: &AuthContext) 
                 "conflicts": ["functional", "exclusive values"]
             },
             "meta": [
-                "DESCRIBE", "LIST", "SEARCH", "VALIDATE", "PREVIEW KML",
-                "PREVIEW IMPORT CAPSULE", "HISTORY", "CHANGES", "SNAPSHOT",
-                "EXPORT CAPSULE", "VERIFY CAPSULE", "DESCRIBE CAPSULE"
+                "DESCRIBE", "LIST", "LIST DEPENDENTS", "SEARCH", "VALIDATE",
+                "PREVIEW KML", "PREVIEW IMPORT CAPSULE", "HISTORY", "CHANGES",
+                "SNAPSHOT", "EXPORT CAPSULE", "VERIFY CAPSULE", "DESCRIBE CAPSULE"
             ],
+            // §63.5: what this engine actually traverses, stated because the
+            // Structural-Field extension is optional and an Agent that assumed
+            // it would read a missing route as an absent dependent.
+            "dependents": {
+                "traverses": "Activity inputs -> Activity -> Activity outputs",
+                "structural_lineage": false,
+                "default_depth": 1,
+                "max_depth": describe::MAX_DEPENDENTS_DEPTH,
+                "row": ["id", "kind", "distance", "via.activity"],
+                "note": "a transformation that recorded no Activity provenance is not \
+                         discoverable here"
+            },
             "paging": {
                 // §44.8 and §88.4: a cursor is opaque, carries the coordinate the
                 // traversal began at, and belongs to the family that issued it.
@@ -292,6 +304,18 @@ pub fn capabilities(authority: Option<&EffectiveAuthority>, auth: &AuthContext) 
                     "default_reference_policy": "deny_if_referenced",
                     "leaves": "an identity stub carrying a content digest",
                     "destroys": "every recorded version of the element"
+                },
+                // §60.6: the data-minimization instrument. Byte destruction
+                // that keeps the evidence event, which is a different promise
+                // from element purge and worth stating as one.
+                "payload_purge": {
+                    "targets": "Evidence only",
+                    "destroys": "inline payload and content_ref bytes, in the current row \
+                                 and in every recorded version",
+                    "keeps": "identity, evidence_class, content_digest, media_type, \
+                              observed_at, source, generated_by, citations",
+                    "reports": "payload.mode becomes \"purged\"",
+                    "repeat": "purging an already-purged payload is a no_effect"
                 }
             },
             "transactions": {
@@ -576,6 +600,8 @@ const SUPPORTED_NAMES: &[&str] = &[
     "discover_read_separation",
     "retention_expiry",
     "opaque_cursors",
+    "payload_purge",
+    "list_dependents",
 ];
 
 /// The capability names this engine reports as *not* implemented.

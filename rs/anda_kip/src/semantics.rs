@@ -423,6 +423,12 @@ fn analyze_clause(clause: &MutationClause, out: &mut Vec<Diagnostic>) {
             purge.limit.is_some(),
             out,
         ),
+        MutationClause::PurgePayload(purge) => warn_unbounded(
+            "PURGE PAYLOAD",
+            purge.where_clauses.is_some(),
+            purge.limit.is_some(),
+            out,
+        ),
         MutationClause::EnsureProposition(_) | MutationClause::CorrectEvidence(_) => {}
         MutationClause::MergeConcept(_) => {}
     }
@@ -673,6 +679,20 @@ mod tests {
         let mut none = Vec::new();
         analyze_kml(&bounded, &mut none);
         assert!(none.is_empty(), "a targeted PURGE must not warn: {none:?}");
+
+        // §60.5 names PURGE PAYLOAD alongside PURGE: byte destruction over an
+        // unbounded WHERE is exactly the sweep that must not run by accident.
+        let payload =
+            parse_kml(r#"PURGE PAYLOAD ?x WHERE { ?x EVIDENCE {evidence_class: "document"} } CONFIRM "PURGE""#)
+                .expect("a legal command");
+        let mut diagnostics = Vec::new();
+        analyze_kml(&payload, &mut diagnostics);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.severity == Severity::Warning && d.message.contains("LIMIT")),
+            "an unbounded PURGE PAYLOAD must warn: {diagnostics:?}"
+        );
     }
 
     #[test]

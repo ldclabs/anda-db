@@ -3108,6 +3108,62 @@ async fn every_erasure_leaves_a_receipt_in_the_governance_audit() {
     );
 }
 
+#[tokio::test]
+async fn a_payload_purge_needs_the_purge_permission_and_leaves_the_same_receipt() {
+    // §60.6: payload purge asks for `purge` authority, and it is byte
+    // destruction — so §164's receipt is owed for it exactly as it is for
+    // element purge. Naming it `purge_payload` rather than `purge` is what
+    // lets an auditor tell "the bytes went" from "the record went".
+    let nexus = stocked("purge_payload_audit").await;
+    let owner = nexus.system_session();
+    run_as(
+        &owner,
+        r#"CREATE EVIDENCE ?e {
+            SET FIELDS {evidence_class: "Document", payload: "the secret", content_digest: "sha3-256:d1ge5t"}
+        }"#,
+    )
+    .await;
+
+    let keeper = agent(nexus.governance(), "kip:principal:keeper").await;
+    grant(
+        &nexus,
+        &keeper,
+        &["read", "archive", "tombstone"],
+        AuthorityScope::default(),
+    )
+    .await;
+    assert_eq!(
+        error_code(
+            &run_as(
+                &nexus.session(AuthContext::principal(&keeper)),
+                r#"PURGE PAYLOAD "E-1" CONFIRM "PURGE""#,
+            )
+            .await
+        ),
+        "NotAuthorized",
+        "tombstone authority is not erasure authority (§271)"
+    );
+
+    run_as(&owner, r#"PURGE PAYLOAD "E-1" CONFIRM "PURGE""#).await;
+    let audit = nexus
+        .governance()
+        .read_audit(DEFAULT_SPACE, 50)
+        .await
+        .unwrap();
+    let receipt = audit
+        .iter()
+        .find(|entry| entry.operation == "purge_payload")
+        .expect("the erasure is on record");
+    assert_eq!(receipt.resource, "E-1");
+    assert_eq!(receipt.record["content_digest"], "sha3-256:d1ge5t");
+    assert!(
+        !serde_json::to_string(&receipt.record)
+            .unwrap()
+            .contains("the secret"),
+        "and the receipt carries none of what it erased"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The threat model, fixture by fixture (§235–§247)
 // ---------------------------------------------------------------------------

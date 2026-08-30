@@ -543,6 +543,28 @@ pub struct ElementVersionRow {
     pub row: Json,
 }
 
+/// The `payload.mode` a purged Evidence payload reports (§60.6).
+///
+/// A distinct mode rather than an empty one: "the bytes were destroyed" and
+/// "this Evidence never carried bytes" are different facts, and a reader that
+/// cannot tell them apart will read a data-minimization decision as a
+/// malformed record.
+pub const PAYLOAD_PURGED: &str = "purged";
+
+/// Clears the payload columns of one Evidence row, in place.
+///
+/// Lives beside the row rather than beside the purge that calls it, because it
+/// runs twice per payload purge — once on the current row, once per recorded
+/// version — and the columns a payload purge may touch have to be named in
+/// exactly one place. The surrounding record — digest, media type, observed
+/// time, source, `generated_by`, lifecycle, Facets, structural topology — is
+/// what §60.6 promises survives, and it is untouched here.
+pub fn erase_payload(row: &mut EvidenceRow) {
+    row.payload_mode = PAYLOAD_PURGED.to_string();
+    row.payload_inline = Json::Null;
+    row.content_ref = String::new();
+}
+
 /// One committed transaction (Spec §82).
 ///
 /// The journal is what makes `HISTORY`, `CHANGES` and idempotent recovery

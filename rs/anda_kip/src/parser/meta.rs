@@ -148,26 +148,71 @@ fn nothing(input: &str) -> VResult<'_, ()> {
 // LIST
 // ---------------------------------------------------------------------------
 
+/// The operands a `LIST` target clause may carry.
+///
+/// Most targets carry none, and two carry one each: `SCHEMA PACKAGES` takes a
+/// `STATUS`, `DEPENDENTS` takes the traversal root and an optional `DEPTH`.
+/// Collected in one value so the branches that take nothing say so once
+/// instead of spelling out a `None` per operand any target ever gained.
+#[derive(Default)]
+struct ListOperands {
+    status: Option<Scalar>,
+    element: Option<Scalar>,
+    depth: Option<Scalar>,
+}
+
+/// A target with no operands of its own.
+fn bare(target: ListTarget) -> (ListTarget, ListOperands) {
+    (target, ListOperands::default())
+}
+
 fn list(input: &str) -> VResult<'_, ListCommand> {
     let (input, _) = ws(word("LIST")).parse(input)?;
-    let (input, (target, status)) = cut(alt((
+    let (input, (target, operands)) = cut(alt((
         map(
             preceded(
                 ws(words(&["SCHEMA", "PACKAGES"])),
                 opt_after(&["STATUS"], ws(scalar)),
             ),
-            |status| (ListTarget::SchemaPackages, status),
+            |status| {
+                (
+                    ListTarget::SchemaPackages,
+                    ListOperands {
+                        status,
+                        ..Default::default()
+                    },
+                )
+            },
         ),
         map(ws(words(&["STRUCTURAL", "FIELDS"])), |_| {
-            (ListTarget::StructuralFields, None)
+            bare(ListTarget::StructuralFields)
         }),
         map(ws(words(&["EPISTEMIC", "POLICIES"])), |_| {
-            (ListTarget::EpistemicPolicies, None)
+            bare(ListTarget::EpistemicPolicies)
         }),
-        map(ws(word("SPACES")), |_| (ListTarget::Spaces, None)),
-        map(ws(word("TYPES")), |_| (ListTarget::Types, None)),
-        map(ws(word("PREDICATES")), |_| (ListTarget::Predicates, None)),
-        map(ws(word("FACETS")), |_| (ListTarget::Facets, None)),
+        // §63.5: the element operand is required — a dependents closure with
+        // no root is not a shorter question, it is a different one — and the
+        // DEPTH bound is optional, defaulting to 1 in the engine.
+        map(
+            preceded(
+                ws(word("DEPENDENTS")),
+                cut((ws(scalar), opt_after(&["DEPTH"], ws(scalar)))),
+            ),
+            |(element, depth)| {
+                (
+                    ListTarget::Dependents,
+                    ListOperands {
+                        element: Some(element),
+                        depth,
+                        ..Default::default()
+                    },
+                )
+            },
+        ),
+        map(ws(word("SPACES")), |_| bare(ListTarget::Spaces)),
+        map(ws(word("TYPES")), |_| bare(ListTarget::Types)),
+        map(ws(word("PREDICATES")), |_| bare(ListTarget::Predicates)),
+        map(ws(word("FACETS")), |_| bare(ListTarget::Facets)),
     )))
     .parse(input)?;
 
@@ -176,7 +221,9 @@ fn list(input: &str) -> VResult<'_, ListCommand> {
         input,
         ListCommand {
             target,
-            status,
+            status: operands.status,
+            element: operands.element,
+            depth: operands.depth,
             limit,
             cursor,
         },
@@ -481,6 +528,33 @@ mod tests {
             panic!("expected DESCRIBE ACCESS WITH");
         };
         assert_eq!(with.len(), 2);
+    }
+
+    #[test]
+    fn list_dependents_carries_its_root_and_its_bound() {
+        // §63.5: the operand names the revised root whose derived cognition is
+        // enumerated; DEPTH bounds the closure and defaults engine-side to 1.
+        let MetaCommand::List(command) = meta("LIST DEPENDENTS :root DEPTH 2 LIMIT 50") else {
+            panic!("expected LIST");
+        };
+        assert_eq!(command.target, ListTarget::Dependents);
+        assert!(command.element.is_some());
+        assert!(command.depth.is_some());
+        assert!(command.limit.is_some());
+
+        let MetaCommand::List(plain) = meta("LIST DEPENDENTS :root") else {
+            panic!("expected LIST");
+        };
+        assert!(plain.element.is_some());
+        assert!(plain.depth.is_none());
+    }
+
+    #[test]
+    fn list_dependents_without_a_root_is_refused() {
+        // A dependents closure with no root is not a shorter question; it is a
+        // different one, and answering it with the whole Space would be wrong.
+        assert!(crate::parse_meta("LIST DEPENDENTS").is_err());
+        assert!(crate::parse_meta("LIST DEPENDENTS LIMIT 10").is_err());
     }
 
     #[test]

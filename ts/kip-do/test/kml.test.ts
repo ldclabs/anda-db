@@ -4,7 +4,13 @@ import { CognitiveNexus } from '../src/nexus.js'
 import { COGNITIVE_MEMORY } from '../src/schema/index.js'
 import { parseElementId } from '../src/id.js'
 import { parseKip } from '../src/kip/parser.js'
-import type { AssertionRow, ConceptRow, PropositionRow } from '../src/store/index.js'
+import { render } from '../src/view.js'
+import type {
+  AssertionRow,
+  ConceptRow,
+  EvidenceRow,
+  PropositionRow,
+} from '../src/store/index.js'
 
 /**
  * KML runs end to end, through the real parser.
@@ -637,6 +643,153 @@ describe('KML', () => {
           .exec<{ n: number }>('SELECT COUNT(*) AS n FROM concepts')
           .toArray()[0]?.n,
       ).toBe(0)
+    })
+  })
+
+  // --- PURGE PAYLOAD (§60.6) ------------------------------------------------
+
+  /** One Evidence record with an inline payload, cited by an Assertion. */
+  const CITED_EVIDENCE = `MUTATE {
+  CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
+  CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+  ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
+  CREATE EVIDENCE ?e {
+    SET FIELDS {
+      evidence_class: "user_statement",
+      payload: "I prefer dark mode, and my address is 12 Elm Street.",
+      content_digest: "sha3-256:d1ge5t",
+      media_type: "text/plain",
+      observed_at: "2026-08-16T09:00:00Z"
+    }
+  }
+  CREATE ASSERTION ?a {
+    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: "support", mode: "stated", confidence: 0.9 }
+    SET STRUCTURAL { ("evidence", ?e) {role: "support"} }
+  }
+}`
+
+  function evidence(nexus: CognitiveNexus, id: string): EvidenceRow {
+    const element = nexus.store.load(parseElementId(id))
+    if (element?.kind !== 'Evidence') throw new Error(`${id} is not Evidence`)
+    return element.row
+  }
+
+  it('destroys the payload bytes and keeps the Evidence', async () => {
+    // §60.6: the data-minimization instrument. A Space can discard observed raw
+    // bytes after digesting them without destroying the evidence event, its
+    // citations, or its provenance role — which is exactly what makes it usable
+    // where element purge is not.
+    await withNexus('purge-payload', (nexus) => {
+      nexus.execute(CITED_EVIDENCE)
+      expect(evidence(nexus, 'E-1').payload_inline).toBe(
+        'I prefer dark mode, and my address is 12 Elm Street.',
+      )
+
+      const outcome = nexus.execute('PURGE PAYLOAD "E-1" CONFIRM "PURGE"')
+      expect(outcome.status).toBe('committed')
+
+      const row = evidence(nexus, 'E-1')
+      // Gone: the bytes, and nothing but the bytes.
+      expect(row.payload_mode).toBe('purged')
+      expect(row.content_ref).toBe('')
+      const view = render({ kind: 'Evidence', row }) as {
+        payload: Record<string, unknown>
+      }
+      expect(view.payload).toEqual({ mode: 'purged' })
+      // The search index is the other copy of the payload. A purge that left
+      // it behind would keep the bytes retrievable by the very words the
+      // caller was minimizing away.
+      const found = nexus.describe('SEARCH EVIDENCE "Elm"') as { hits: unknown[] }
+      expect(found.hits).toHaveLength(0)
+
+      // The change stream names it `purge_payload`, not `purge`: a follower
+      // that could not tell the two apart would read a data-minimization
+      // decision as the loss of the record (§36).
+      // The change stream names it `purge_payload`, not `purge`: a follower
+      // that could not tell the two apart would read a data-minimization
+      // decision as the loss of the record (§36).
+      const history = nexus.describe('HISTORY ELEMENT "E-1"') as {
+        op: string
+      }[]
+      expect(history.map((entry) => entry.op)).toEqual([
+        'create',
+        'purge_payload',
+      ])
+      // Kept: everything §60.6 lists, so corroboration grouping and
+      // independence counting keep operating on the surviving digest and
+      // provenance (§23).
+      expect(row.content_digest).toBe('sha3-256:d1ge5t')
+      expect(row.evidence_class).toBe('user_statement')
+      expect(row.media_type).toBe('text/plain')
+      expect(row.state).toBe('active')
+
+      // The citation still resolves: an Assertion whose Evidence went to a stub
+      // would be a history pointing at nothing, which is the failure element
+      // purge exists to refuse and this operation never risks.
+      const cited = nexus.query(
+        'FIND(?a.evidence) WHERE { ?a ASSERTION {id: "A-1"} }',
+      )
+      expect(JSON.stringify(cited)).toContain('E-1')
+    })
+  })
+
+  it('reaches the version log, so no past coordinate hands the bytes back', async () => {
+    // The half that is easy to forget and fatal to skip: every commit appends
+    // the whole row it wrote, so a payload cleared only in the current row
+    // stays fully readable through `AS OF`.
+    await withNexus('purge-payload-history', (nexus) => {
+      nexus.execute(CITED_EVIDENCE)
+      const before = nexus.store.currentSeq(nexus.space)
+      nexus.execute('PURGE PAYLOAD "E-1" CONFIRM "PURGE"')
+
+      const historical = nexus.query(
+        `FIND(?e.payload) WHERE { ?e EVIDENCE {id: "E-1"} } AS OF SEQ ${before}`,
+      )
+      expect(JSON.stringify(historical)).not.toContain('Elm Street')
+      expect(JSON.stringify(historical)).toContain('purged')
+    })
+  })
+
+  it('treats a repeat payload purge as a no_effect', async () => {
+    // §60.6 states it outright, and it matters for a retry: a sweep that ran
+    // twice must not burn a second version or emit a second change record.
+    await withNexus('purge-payload-twice', (nexus) => {
+      nexus.execute(CITED_EVIDENCE)
+      nexus.execute('PURGE PAYLOAD "E-1" CONFIRM "PURGE"')
+      const version = evidence(nexus, 'E-1').version
+
+      const again = nexus.execute('PURGE PAYLOAD "E-1" CONFIRM "PURGE"')
+      expect(again.status).toBe('no_effect')
+      expect(evidence(nexus, 'E-1').version).toBe(version)
+    })
+  })
+
+  it('refuses a payload purge of anything that has no payload', async () => {
+    // §60.6: other kinds have no payload. Succeeding vacuously over a set of
+    // Concepts would read as "the bytes are gone" when nothing was there.
+    await withNexus('purge-payload-kind', (nexus) => {
+      nexus.execute(CITED_EVIDENCE)
+      expect(() =>
+        nexus.execute('PURGE PAYLOAD "C-1" CONFIRM "PURGE"'),
+      ).toThrowError(/has no payload/)
+      // And the refusal erased nothing on the way to refusing.
+      expect(evidence(nexus, 'E-1').payload_mode).toBe('inline')
+    })
+  })
+
+  it('lets a legal hold block a payload purge, as it blocks an element purge', async () => {
+    // §163: a hold is most often placed precisely to preserve the bytes.
+    await withNexus('purge-payload-hold', (nexus) => {
+      nexus.execute(CITED_EVIDENCE)
+      // This engine has no `SET RETENTION` clause yet, so the hold is placed
+      // where the clause would place it. What is under test is the purge.
+      const held = nexus.store.load(parseElementId('E-1'))
+      if (held === null) throw new Error('E-1 should exist')
+      held.row.retention = { legal_hold: true }
+      nexus.store.put(held, 'update', 'test')
+      expect(() =>
+        nexus.execute('PURGE PAYLOAD "E-1" CONFIRM "PURGE"'),
+      ).toThrowError(/legal hold/)
     })
   })
 })

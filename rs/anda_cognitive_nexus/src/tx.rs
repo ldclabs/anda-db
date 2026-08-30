@@ -72,6 +72,8 @@ pub struct Transaction {
     /// The version rows each staged purge will destroy at commit, read when the
     /// stub was staged so the receipt and the erasure cannot disagree.
     purges: BTreeMap<ElementId, Vec<u64>>,
+    /// Elements whose recorded versions lose their Evidence payload at commit.
+    payload_purges: BTreeMap<ElementId, Vec<u64>>,
     approval_decisions: Vec<Approved>,
     governance_audit: Vec<MutationEntry>,
     /// The explicit positions this mutation plan has already claimed, per
@@ -123,6 +125,7 @@ impl Transaction {
             shells: Vec::new(),
             warnings: Vec::new(),
             purges: BTreeMap::new(),
+            payload_purges: BTreeMap::new(),
             approval_decisions: Vec::new(),
             governance_audit: Vec::new(),
             structural_positions: BTreeMap::new(),
@@ -305,6 +308,24 @@ impl Transaction {
         let destroyed = versions.len();
         self.purges.insert(id, versions);
         Ok(destroyed)
+    }
+
+    /// Stages a payload purge and defers scrubbing its recorded versions.
+    ///
+    /// Returns how many version rows the commit will scrub, read here rather
+    /// than again at commit so the number a receipt reports and the number of
+    /// rows actually rewritten cannot come apart — the same contract
+    /// [`Self::stage_purge`] keeps for destruction.
+    ///
+    /// Scrubbed, not destroyed: an Evidence record survives a payload purge, so
+    /// its lifecycle history survives with it. Only the payload columns go
+    /// (§60.6).
+    pub async fn stage_payload_purge(&mut self, id: ElementId) -> Result<usize, KipError> {
+        self.load(id).await?;
+        let versions = self.store.version_ids(&self.cx.space, id).await?;
+        let scrubbed = versions.len();
+        self.payload_purges.insert(id, versions);
+        Ok(scrubbed)
     }
 
     /// Defers spending an approval until this transaction commits successfully.
@@ -776,6 +797,9 @@ impl Transaction {
             };
             if let Some(versions) = self.purges.get(&id) {
                 self.store.remove_versions(versions).await?;
+            }
+            if let Some(versions) = self.payload_purges.get(&id) {
+                self.store.scrub_payload_versions(versions).await?;
             }
             self.write(
                 id,

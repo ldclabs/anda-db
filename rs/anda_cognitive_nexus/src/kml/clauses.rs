@@ -151,6 +151,7 @@ pub async fn apply(
         }
         MutationClause::MergeConcept(c) => merge_concept(store, tx, c, request, operation).await,
         MutationClause::Purge(c) => purge(store, tx, c, request, operation).await,
+        MutationClause::PurgePayload(c) => purge_payload(store, tx, c, request, operation).await,
     }
 }
 
@@ -807,6 +808,65 @@ async fn purge(
             "purge of {id} staged with {} identity stub(s) and {} historical version(s) scheduled for destruction",
             report.purged.len(),
             report.versions_destroyed,
+        ));
+    }
+    Ok(())
+}
+
+/// `PURGE PAYLOAD` — Evidence bytes only (§60.6).
+///
+/// The data-minimization instrument: a Space can discard observed raw bytes
+/// after digesting them without destroying the evidence event, its citations,
+/// or its provenance role. That is why this asks for no `REFERENCE POLICY` and
+/// never consults the target's referrers — the element survives, so nothing
+/// can be left pointing at nothing.
+async fn purge_payload(
+    store: &Store,
+    tx: &mut Transaction,
+    clause: &anda_kip::PurgePayloadStatement,
+    request: Option<&Map<String, Json>>,
+    operation: Option<&Map<String, Json>>,
+) -> Result<(), KipError> {
+    let targets = {
+        let b = bindings(tx, request, operation);
+        select::targets(
+            store,
+            tx,
+            "PURGE PAYLOAD",
+            Permission::Purge,
+            &clause.target,
+            clause.where_clauses.as_ref(),
+            clause.limit.as_ref(),
+            &b,
+        )
+        .await?
+    };
+
+    let ids = targets.authorized(tx).await?;
+    if tx.dry_run {
+        // A preview must compute the effect without performing it, and there
+        // is no such thing as a reversible byte destruction to perform and
+        // undo.
+        for id in &ids {
+            tx.warn(format!(
+                "PURGE PAYLOAD would destroy the payload bytes of {id}, keeping the record, its \
+                 digest and its citations"
+            ));
+        }
+        return Ok(());
+    }
+    for id in ids {
+        let report = crate::governance::purge::stage_payload(store, tx, id).await?;
+        if !report.erased {
+            // §60.6: purging an already-purged payload is a `no_effect`, and
+            // saying so beats a silent success that reads as "erased again".
+            tx.warn(format!("the payload of {id} was already purged"));
+            continue;
+        }
+        tx.warn(format!(
+            "payload purge of {id} destroyed its bytes and scrubbed {} recorded version(s); the \
+             record, its digest and its citations survive",
+            report.versions_scrubbed,
         ));
     }
     Ok(())

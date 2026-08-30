@@ -21,7 +21,14 @@ import { canonicalJson } from '../json.js'
 import { sha256Text } from '../digest.js'
 import { errors } from '../errors.js'
 import { formatElementId, parseElementId, type ElementId } from '../id.js'
-import { State, TABLES, specOf, type Element } from '../store/index.js'
+import {
+  erasePayload,
+  PAYLOAD_PURGED,
+  specOf,
+  State,
+  TABLES,
+  type Element,
+} from '../store/index.js'
 import type { Transaction } from '../tx.js'
 import { requireApproved } from './approval.js'
 import { resourceOfElement } from './decision.js'
@@ -105,6 +112,123 @@ export function stage(
   // Object's transaction, so a later clause that refuses rolls this back with
   // everything else. An approval buys a completed erasure, not an attempt.
   approved.spend(tx.store)
+}
+
+/** What one payload purge did. */
+export interface PayloadPurgeReport {
+  /**
+   * Whether the payload still held bytes when the statement reached it.
+   *
+   * A payload already purged is a `no_effect`, not an error (§60.6): the caller
+   * asked for a state that already holds.
+   */
+  erased: boolean
+  /** How many recorded versions were scrubbed alongside the current row. */
+  versionsScrubbed: number
+}
+
+/**
+ * `PURGE PAYLOAD` — Evidence bytes only (§60.6).
+ *
+ * The Evidence record survives — identity, `evidence_class`, `content_digest`,
+ * `media_type`, `observed_at`, its source and `generated_by` provenance, and
+ * every Assertion citation that points at it. Only the observed bytes go, so
+ * corroboration grouping and independence counting (§23) keep working on what
+ * is left, and nothing can dangle: that is why there is no `REFERENCE POLICY`
+ * here and why the target's referrers are never consulted.
+ *
+ * **The version log goes first**, exactly as it does for element purge — a
+ * payload cleared only in the current row stays fully readable through `AS OF`.
+ * It is scrubbed rather than destroyed: the record's own history is not
+ * payload, and destroying it would erase the lifecycle this operation promises
+ * to keep.
+ *
+ * @see rs/anda_cognitive_nexus/src/governance/purge.rs
+ */
+export function stagePayload(
+  tx: Transaction,
+  id: ElementId,
+): PayloadPurgeReport {
+  const named = formatElementId(id)
+  const element = tx.load(id)
+  if (element.kind !== 'Evidence') {
+    // §60.6: other kinds have no payload. Succeeding vacuously over a set of
+    // Concepts would read as "the bytes are gone" when nothing was there.
+    throw errors.constraintViolation(
+      `${named} is a ${element.kind.toLowerCase()} and has no payload; ` +
+        `PURGE PAYLOAD targets Evidence`,
+    )
+  }
+
+  // Payload purge asks for the same `purge` authority element purge asks for
+  // (§60.6). A policy that wants to scope the two apart does it through the
+  // element-scoped approval resolved here.
+  const approved = requireApproved(
+    tx.store,
+    tx.cx.space,
+    resourceOfElement(element),
+    tx.authority.authorize('purge', resourceOfElement(element), tx.auth),
+    tx.auth,
+  )
+
+  // §163: a legal hold blocks payload purge exactly as it blocks element
+  // purge. The bytes are the thing a hold most often exists to preserve.
+  if (hasLegalHold(element)) {
+    throw errors.legalHoldConflict(
+      `${named} is under a legal hold; lifting the hold is a separate ` +
+        `Governance decision under its own permission`,
+    )
+  }
+
+  if (element.row.payload_mode === PAYLOAD_PURGED) {
+    // Purging an already-purged payload yields `no_effect` (§60.6): no version
+    // burned, no change record, no audit entry for an erasure that did not
+    // happen.
+    return { erased: false, versionsScrubbed: 0 }
+  }
+
+  if (element.row.content_digest === '') {
+    // §60.6 promises the surviving record keeps its `content_digest`, and
+    // corroboration grouping (§23) goes on using it. A record that never
+    // carried one loses that for good at this instant — the engine mints no
+    // digest at `CREATE EVIDENCE`, and after this the bytes it would have
+    // covered are gone. Said out loud rather than papered over with an
+    // engine-invented digest: two engines would have to agree on the exact
+    // bytes for such a digest to mean anything, and a caller minimizing data
+    // should digest before discarding.
+    tx.warn(
+      `${named} carries no content_digest, so its payload purge leaves ` +
+        `nothing to verify the destroyed bytes against`,
+    )
+  }
+
+  const versionsScrubbed = tx.store.scrubPayloadVersions(tx.cx.space, id)
+  erasePayload(element.row)
+  tx.markChanged(id, 'purge_payload')
+
+  // The receipt §164 permits: enough to audit the erasure, and nothing of what
+  // was erased. The digest was already public — it is what the surviving record
+  // keeps — so naming it here discloses nothing new and lets an auditor tie the
+  // entry to the Evidence it names.
+  tx.store.governance.recordMutation({
+    operation: 'purge_payload',
+    at: tx.cx.at,
+    space_id: tx.cx.space,
+    resource: named,
+    principal_id: tx.auth.principal_id,
+    record: {
+      element: named,
+      content_digest: element.row.content_digest,
+      versions_scrubbed: versionsScrubbed,
+      tx_id: tx.cx.tx_id,
+    },
+  })
+
+  // Spent last, and only here: the whole statement runs inside the Durable
+  // Object's transaction, so a later clause that refuses rolls this back with
+  // everything else. An approval buys a completed erasure, not an attempt.
+  approved.spend(tx.store)
+  return { erased: true, versionsScrubbed }
 }
 
 /**

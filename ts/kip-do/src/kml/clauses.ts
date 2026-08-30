@@ -24,7 +24,11 @@ import {
   STANCES,
 } from '../kip/semantics.js'
 import type { Permission } from '../governance/index.js'
-import { referencePolicy, stage as stagePurge } from '../governance/purge.js'
+import {
+  referencePolicy,
+  stage as stagePurge,
+  stagePayload as stagePayloadPurge,
+} from '../governance/purge.js'
 import {
   formatElementId,
   parseElementId,
@@ -246,6 +250,29 @@ export function apply(
     }
     return
   }
+  if ('PurgePayload' in clause) {
+    // §60.6: the data-minimization instrument. A Space can discard observed raw
+    // bytes after digesting them without destroying the evidence event, its
+    // citations, or its provenance role. No `REFERENCE POLICY` and no referrer
+    // check: the element survives, so nothing can be left pointing at nothing.
+    const { target, where_clauses, limit } = clause.PurgePayload
+    const selected = select(target, where_clauses, limit, 'PURGE PAYLOAD', 'purge')
+    for (const id of selected.authorized(tx)) {
+      const report = stagePayloadPurge(tx, id)
+      if (!report.erased) {
+        // §60.6: purging an already-purged payload is a `no_effect`, and saying
+        // so beats a silent success that reads as "erased again".
+        tx.warn(`the payload of ${formatElementId(id)} was already purged`)
+        continue
+      }
+      tx.warn(
+        `payload purge of ${formatElementId(id)} destroyed its bytes and ` +
+          `scrubbed ${report.versionsScrubbed} recorded version(s); the ` +
+          `record, its digest and its citations survive`,
+      )
+    }
+    return
+  }
   if ('MergeConcept' in clause) {
     const { source, into, where_clauses, expect_version } = clause.MergeConcept
     const sources = select(source, where_clauses, null, 'MERGE CONCEPT', 'merge_identity').authorized(tx)
@@ -346,7 +373,9 @@ function createRecord(
   let element: Element
   switch (kind) {
     case 'Evidence': {
-      const [payloadMode, payloadInline, contentRef] = splitPayload(fields.json('payload'))
+      const [payloadMode, payloadInline, contentRef] = splitPayload(
+        fields.value('payload'),
+      )
       const sources = structural.values('source')
       const row: EvidenceRow = {
         ...envelope,
@@ -1171,6 +1200,19 @@ class Fields {
     return isJsonMap(value) ? value : {}
   }
 
+  /**
+   * Reads a field as whatever JSON it is, without re-typing it.
+   *
+   * {@link json} coerces anything that is not an object to `{}`, which is right
+   * for a hook block and wrong for an Evidence payload: §15.3 makes the payload
+   * the observation, and invariant 33 forbids re-typing it. A `payload: "she
+   * said yes"` that arrived as a string has to stay a string.
+   */
+  value(name: string): Json {
+    const value = this.take(name)
+    return value === undefined ? null : value
+  }
+
   array(name: string): Json[] {
     const value = this.take(name)
     if (value === undefined || value === null) return []
@@ -1641,12 +1683,26 @@ function validTimePart(validTime: JsonMap, part: 'from' | 'until'): string {
 }
 
 /** Evidence carries its payload inline or by content reference (§19). */
-function splitPayload(payload: JsonMap): [string, Json, string] {
-  if (Object.keys(payload).length === 0) return ['', null, '']
-  const ref = payload.content_ref
-  if (typeof ref === 'string' && ref !== '') return ['external', null, ref]
-  const inline = Object.hasOwn(payload, 'inline') ? (payload.inline as Json) : payload
-  return ['inline', inline, '']
+/**
+ * Splits an Evidence `payload` into the three columns that store it.
+ *
+ * A payload is whatever the observation was (§15.3): a string, a number, an
+ * object, an array. Only two shapes are interpreted rather than stored —
+ * absence, and an object naming `content_ref`, which is the external-payload
+ * form of §15.4. Everything else is kept as it arrived, because invariant 33
+ * forbids re-typing a transport-supplied payload, and because an engine that
+ * quietly turned a scalar payload into an empty object would report a
+ * successful `CREATE EVIDENCE` for an observation it did not keep.
+ *
+ * @see rs/anda_cognitive_nexus/src/kml/clauses.rs — `split_payload`
+ */
+function splitPayload(payload: Json): [string, Json, string] {
+  if (payload === null) return ['', null, '']
+  if (isJsonMap(payload) && Object.hasOwn(payload, 'content_ref')) {
+    const ref = payload.content_ref
+    return ['external', null, typeof ref === 'string' ? ref : '']
+  }
+  return ['inline', payload, '']
 }
 
 /** Exposed for the tests that pin the routing table. */

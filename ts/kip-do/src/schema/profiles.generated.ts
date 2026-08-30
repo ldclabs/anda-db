@@ -623,6 +623,7 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
                 "review_skill",
                 "resolve_identity",
                 "review_retention",
+                "review_derived",
                 "refresh_self_model",
                 "inspect_quarantine"
               ]
@@ -681,6 +682,85 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
         },
         "model_hints": {
           "authority_invariant": "Semantic assignment, including to $system, does not grant Principal permission."
+        }
+      },
+      "Watch": {
+        "ref": "kip://profiles/cognitive-memory@2.0.0/Watch",
+        "kind": "ConceptType",
+        "description": "Durable attention state: a declared condition under which a committed change (delta) or the absence of one before due_at (silence) deserves the Brain's attention. Firing grants nothing.",
+        "attributes": {
+          "open": true,
+          "fields": {
+            "watch_class": {
+              "type": "string",
+              "required": true,
+              "mutable": true,
+              "enum": [
+                "delta",
+                "silence"
+              ]
+            },
+            "summary": {
+              "type": "string",
+              "required": true,
+              "mutable": true
+            },
+            "condition": {
+              "type": [
+                "string",
+                "object"
+              ],
+              "required": true,
+              "mutable": true
+            },
+            "due_at": {
+              "type": [
+                "timestamp",
+                "null"
+              ],
+              "required": false,
+              "mutable": true
+            },
+            "status": {
+              "type": "string",
+              "required": true,
+              "mutable": true,
+              "enum": [
+                "armed",
+                "fired",
+                "expired",
+                "disarmed"
+              ]
+            },
+            "priority": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "required": false,
+              "mutable": true
+            },
+            "created_at": {
+              "type": [
+                "timestamp",
+                "null"
+              ],
+              "required": false,
+              "mutable": true
+            },
+            "fired_at": {
+              "type": [
+                "timestamp",
+                "null"
+              ],
+              "required": false,
+              "mutable": true
+            }
+          }
+        },
+        "model_hints": {
+          "authority_invariant": "A fired Watch creates attention (SleepTask/wake signal), never an external action or permission.",
+          "firing_invariant": "Firing is recorded as a watch_fire Activity; the outward decision goes through the action_gate outcomes act | ask | defer | silence."
         }
       },
       "SelfModel": {
@@ -761,6 +841,47 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
         },
         "model_hints": {
           "authority_invariant": "SelfModel is descriptive cognition, never Governance or Principal identity."
+        }
+      },
+      "WorkingState": {
+        "ref": "kip://profiles/cognitive-memory@2.0.0/WorkingState",
+        "kind": "ConceptType",
+        "description": "Derived, versioned digest of what matters now — the consolidated state a waking Agent resumes from. A derived recall surface served with its basis_seq; never Evidence.",
+        "attributes": {
+          "open": true,
+          "fields": {
+            "summary": {
+              "type": "string",
+              "required": true,
+              "mutable": true
+            },
+            "horizon": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "required": false,
+              "mutable": true
+            },
+            "basis_seq": {
+              "type": "integer",
+              "required": true,
+              "mutable": true,
+              "minimum": 0
+            },
+            "refreshed_at": {
+              "type": [
+                "timestamp",
+                "null"
+              ],
+              "required": false,
+              "mutable": true
+            }
+          }
+        },
+        "model_hints": {
+          "evidence_invariant": "WorkingState is never cited as Evidence and never corroborates its own inputs.",
+          "identity_hint": "WorkingState answers 'what is my situation'; SelfModel answers 'who am I'. Keep at most one active per actor scope under a stable key."
         }
       }
     },
@@ -846,6 +967,13 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
             "minimum": 0,
             "maximum": 1
           },
+          "utility": {
+            "type": "number",
+            "required": false,
+            "mutable": true,
+            "minimum": 0,
+            "maximum": 1
+          },
           "last_metabolized_at": {
             "type": [
               "timestamp",
@@ -859,6 +987,7 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
           "invariants": [
             "memory_strength != Assertion confidence",
             "salience != source trust",
+            "utility is the admission bet, revised by outcomes; not truth, salience, or permission",
             "Facet state cannot override Core/Governance fields"
           ]
         }
@@ -904,6 +1033,46 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
         },
         "model_hints": {
           "authority_invariant": "High utility != executable authority."
+        }
+      },
+      "DerivationState": {
+        "ref": "kip://profiles/cognitive-memory@2.0.0/DerivationState",
+        "kind": "FacetDefinition",
+        "description": "Review state of a derived artifact relative to its provenance roots. stale means a root was revised after basis_seq and the derivation awaits review; it is a flag, not an epistemic verdict.",
+        "closed": true,
+        "applicable_to": {
+          "kinds": [
+            "Concept"
+          ]
+        },
+        "fields": {
+          "basis_seq": {
+            "type": "integer",
+            "required": false,
+            "mutable": true,
+            "minimum": 0
+          },
+          "status": {
+            "type": "string",
+            "required": false,
+            "mutable": true,
+            "enum": [
+              "current",
+              "stale",
+              "under_review"
+            ]
+          },
+          "reviewed_at": {
+            "type": [
+              "timestamp",
+              "null"
+            ],
+            "required": false,
+            "mutable": true
+          }
+        },
+        "model_hints": {
+          "epistemic_invariant": "DerivationState != Assertion lifecycle; stale != retracted, wrong, or excluded from recall."
         }
       }
     },
@@ -1007,9 +1176,11 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
             "kip://profiles/cognitive-memory@2.0.0/Preference",
             "kip://profiles/cognitive-memory@2.0.0/Insight",
             "kip://profiles/cognitive-memory@2.0.0/Commitment",
+            "kip://profiles/cognitive-memory@2.0.0/Watch",
             "kip://profiles/cognitive-memory@2.0.0/Skill",
             "kip://profiles/cognitive-memory@2.0.0/SleepTask",
-            "kip://profiles/cognitive-memory@2.0.0/SelfModel"
+            "kip://profiles/cognitive-memory@2.0.0/SelfModel",
+            "kip://profiles/cognitive-memory@2.0.0/WorkingState"
           ]
         },
         "target": {
@@ -1137,10 +1308,11 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
       "assigned_to": {
         "ref": "kip://profiles/cognitive-memory@2.0.0/assigned_to",
         "kind": "StructuralFieldDefinition",
-        "description": "Semantic SleepTask assignment; never Governance permission.",
+        "description": "Semantic SleepTask/Watch assignment; never Governance permission.",
         "source": {
           "concept_types": [
-            "kip://profiles/cognitive-memory@2.0.0/SleepTask"
+            "kip://profiles/cognitive-memory@2.0.0/SleepTask",
+            "kip://profiles/cognitive-memory@2.0.0/Watch"
           ]
         },
         "target": {
@@ -1151,6 +1323,31 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
         "cardinality": {
           "min": 0,
           "max": 1
+        },
+        "ordered": false,
+        "unique": true
+      },
+      "watches": {
+        "ref": "kip://profiles/cognitive-memory@2.0.0/watches",
+        "kind": "StructuralFieldDefinition",
+        "description": "The cognition a Watch observes. Topology only: watching an element claims nothing about it.",
+        "source": {
+          "concept_types": [
+            "kip://profiles/cognitive-memory@2.0.0/Watch"
+          ]
+        },
+        "target": {
+          "kinds": [
+            "Concept",
+            "Proposition",
+            "Assertion",
+            "Evidence",
+            "Activity"
+          ]
+        },
+        "cardinality": {
+          "min": 0,
+          "max": null
         },
         "ordered": false,
         "unique": true
@@ -1167,9 +1364,11 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
             "kip://profiles/cognitive-memory@2.0.0/Preference",
             "kip://profiles/cognitive-memory@2.0.0/Insight",
             "kip://profiles/cognitive-memory@2.0.0/Commitment",
+            "kip://profiles/cognitive-memory@2.0.0/Watch",
             "kip://profiles/cognitive-memory@2.0.0/Skill",
             "kip://profiles/cognitive-memory@2.0.0/SleepTask",
-            "kip://profiles/cognitive-memory@2.0.0/SelfModel"
+            "kip://profiles/cognitive-memory@2.0.0/SelfModel",
+            "kip://profiles/cognitive-memory@2.0.0/WorkingState"
           ]
         },
         "target": {
@@ -1197,9 +1396,13 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
           "skill_validation",
           "self_model_refresh",
           "mnemonic_metabolism",
-          "commitment_review"
+          "commitment_review",
+          "watch_fire",
+          "action_gate",
+          "derivation_review",
+          "working_state_refresh"
         ],
-        "description": "Recommended Profile activity_class values; Activity remains a KIP Core kind."
+        "description": "Recommended Profile activity_class values; Activity remains a KIP Core kind. action_gate outcomes: act | ask | defer | silence."
       }
     }
   },
@@ -1263,6 +1466,24 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
       "scope": "kip://profiles/cognitive-memory@2.0.0/Skill",
       "kind": "capsule_boundary",
       "description": "Imported Skill content is non-authoritative by default and cannot raise destination Governance authority."
+    },
+    {
+      "id": "cognitive-memory.watch-is-not-authority",
+      "scope": "kip://profiles/cognitive-memory@2.0.0/Watch",
+      "kind": "governance_boundary",
+      "description": "A fired Watch creates attention, never an external action, a schedule, or a permission."
+    },
+    {
+      "id": "cognitive-memory.derivation-state-is-not-belief",
+      "scope": "kip://profiles/cognitive-memory@2.0.0/DerivationState",
+      "kind": "epistemic_boundary",
+      "description": "DerivationState.status is review state; stale does not retract, reject, or hide the artifact."
+    },
+    {
+      "id": "cognitive-memory.working-state-is-not-evidence",
+      "scope": "kip://profiles/cognitive-memory@2.0.0/WorkingState",
+      "kind": "epistemic_boundary",
+      "description": "WorkingState is a derived view served with its basis_seq; it is never cited as Evidence and never corroborates its inputs."
     }
   ],
   "aliases": {
@@ -1288,9 +1509,12 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
       "caused_by = explicit effect->cause claim between steps; edge order alone is not causality",
       "Skill = reusable procedure; not execution authority",
       "Commitment = prospective memory; not automatic scheduling",
+      "Watch = armed attention (delta or silence); firing grants nothing",
       "SelfModel = cognition about self; not Governance",
-      "MnemonicState = accessibility/importance; not confidence",
-      "SkillUtility = procedural usefulness; not authority"
+      "WorkingState = what matters now, with its basis_seq; never Evidence",
+      "MnemonicState = accessibility/importance/expected usefulness; not confidence",
+      "SkillUtility = procedural usefulness; not authority",
+      "DerivationState = review state relative to provenance roots; not belief"
     ],
     "common_confusions": [
       "Event != Experience",
@@ -1298,12 +1522,16 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
       "Skill != executable authority",
       "memory_strength != Assertion confidence",
       "salience != source trust",
+      "utility != truth or permission",
       "Person != Principal",
       "SelfModel != Governance",
       "Structural Reference != Proposition",
       "Remote Experience != local autobiography",
       "has_step order != caused_by",
-      "same_as claim != merged identity"
+      "same_as claim != merged identity",
+      "fired Watch != authorized action",
+      "stale != retracted",
+      "WorkingState != Evidence"
     ]
   },
   "canonicalization": {
@@ -1313,7 +1541,7 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
   },
   "integrity": {
     "digest_profile": "kip-draft-canonical-json-v1",
-    "content_digest": "sha256:db92ac4de7777bef88de8d64245381dc4277e47628824f0cd5433de0255b45c1",
+    "content_digest": "sha256:16c21c2888130b1e1b1d2a7899a83a063b40b1d3d75549532121bef1d5395ac8",
     "covers": "all top-level fields except integrity",
     "signatures": []
   }

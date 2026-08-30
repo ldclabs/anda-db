@@ -19,6 +19,18 @@ import { BASELINE_ID } from '../projection/policy.js'
 /** The KIP revision this engine implements. */
 export const KIP_VERSION = '2.0'
 
+/**
+ * How deep a `LIST DEPENDENTS` closure this engine will walk (§63.5).
+ *
+ * The traversal is bounded by construction: each level is a fan-out over the
+ * provenance DAG, and a depth nobody bounded is a whole-Space scan wearing a
+ * `LIMIT`. A caller that needs further walks the closure a page at a time.
+ *
+ * Declared here rather than beside the traversal so the number a caller reads
+ * from `DESCRIBE CAPABILITIES` is the number the walk actually stops at.
+ */
+export const MAX_DEPENDENTS_DEPTH = 8
+
 export function capabilities(): Json {
   return {
     kip: KIP_VERSION,
@@ -41,8 +53,9 @@ export function capabilities(): Json {
         'UPDATE',
         'MERGE CONCEPT',
         'PURGE, with all three reference policies',
+        'PURGE PAYLOAD',
         'selection blocks: WHERE and LIMIT on UPDATE, ARCHIVE, TOMBSTONE, ' +
-          'RETRACT, PURGE and MERGE CONCEPT',
+          'RETRACT, PURGE, PURGE PAYLOAD and MERGE CONCEPT',
       ],
       transaction: {
         // Not a claim about this engine's care, but about the platform: a
@@ -111,6 +124,33 @@ export function capabilities(): Json {
           'a CREATE under a client_key already used resolves to that element ' +
           'instead of creating a second (§52.1)',
       },
+      // §60.6: the data-minimization instrument. Byte destruction that keeps
+      // the evidence event, which is a different promise from element purge and
+      // worth stating as one.
+      payload_purge: {
+        targets: 'Evidence only',
+        destroys:
+          'inline payload and content_ref bytes, in the current row and in ' +
+          'every recorded version',
+        keeps:
+          'identity, evidence_class, content_digest, media_type, observed_at, ' +
+          'source, generated_by, citations',
+        reports: 'payload.mode becomes "purged"',
+        repeat: 'purging an already-purged payload is a no_effect',
+      },
+      // §63.5: what this engine actually traverses, stated because the
+      // Structural-Field extension is optional and an Agent that assumed it
+      // would read a missing route as an absent dependent.
+      dependents: {
+        traverses: 'Activity inputs -> Activity -> Activity outputs',
+        structural_lineage: false,
+        default_depth: 1,
+        max_depth: MAX_DEPENDENTS_DEPTH,
+        row: ['id', 'kind', 'distance', 'via.activity'],
+        note:
+          'a transformation that recorded no Activity provenance is not ' +
+          'discoverable here',
+      },
       retention: {
         // §19.2: this is storage lifecycle, never world validity.
         hook: ['retention_class', 'expires_at', 'legal_hold'],
@@ -144,6 +184,7 @@ export function capabilities(): Json {
       meta: [
         'DESCRIBE',
         'LIST',
+        'LIST DEPENDENTS',
         'SEARCH CONCEPT | PROPOSITION | EVIDENCE | COGNITION, keyword mode',
         'VALIDATE KQL',
         'VALIDATE KML',

@@ -251,7 +251,8 @@ that coordinate as `snapshot_seq` in its result context (§50).
 `CREATE EVIDENCE|ASSERTION|ACTIVITY` / `ASSERT` (desugared) / `UPDATE` /
 `RETRACT ASSERTION` / `SUPERSEDE ASSERTION` / `CORRECT EVIDENCE` /
 `TRANSITION ACTIVITY` / `SET RETENTION` / `ARCHIVE` / `TOMBSTONE` / `PURGE` /
-`MERGE CONCEPT`, each with an optional `WHERE` selection block and `LIMIT`, plus
+`PURGE PAYLOAD` / `MERGE CONCEPT`, each with an optional `WHERE` selection block
+and `LIMIT`, plus
 handles, `EXPECT VERSION` / `EXPECT STATE`, receipts and dry runs.
 
 An idempotency key is **recorded, not replayed**: it is stored on the committed

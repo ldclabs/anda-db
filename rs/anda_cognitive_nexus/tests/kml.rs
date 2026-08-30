@@ -893,3 +893,206 @@ async fn all_three_command_families_reach_this_engine() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// PURGE PAYLOAD (§60.6)
+// ---------------------------------------------------------------------------
+
+/// A Space holding one Evidence record with an inline payload, cited by an
+/// Assertion — the shape a payload purge has to survive intact.
+async fn with_cited_evidence(name: &str) -> CognitiveNexus {
+    let nexus = nexus(name).await;
+    ok(
+        &nexus,
+        r#"MUTATE {
+            CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
+            CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark mode" }
+            ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
+            CREATE EVIDENCE ?e {
+                SET FIELDS {
+                    evidence_class: "user_statement",
+                    payload: "I prefer dark mode, and my address is 12 Elm Street.",
+                    content_digest: "sha3-256:d1ge5t",
+                    media_type: "text/plain",
+                    observed_at: "2026-08-16T09:00:00Z"
+                }
+            }
+            CREATE ASSERTION ?a {
+                SET FIELDS {
+                    proposition: ?p,
+                    asserted_by: ?alice,
+                    stance: "support",
+                    mode: "stated",
+                    confidence: 0.9
+                }
+                SET STRUCTURAL { ("evidence", ?e) {role: "support"} }
+            }
+        }"#,
+    )
+    .await;
+    nexus
+}
+
+async fn evidence_view(nexus: &CognitiveNexus, id: &str) -> Json {
+    let element = nexus
+        .store
+        .get_element(id.parse::<ElementId>().unwrap())
+        .await
+        .unwrap();
+    anda_cognitive_nexus::view::render(&element)
+}
+
+#[tokio::test]
+async fn a_payload_purge_destroys_the_bytes_and_keeps_the_evidence() {
+    // §60.6: the data-minimization instrument. A Space can discard observed raw
+    // bytes after digesting them without destroying the evidence event, its
+    // citations, or its provenance role — which is exactly what makes it usable
+    // where element purge is not.
+    let nexus = with_cited_evidence("purge_payload").await;
+    let before = evidence_view(&nexus, "E-1").await;
+    let digest = before["content_digest"].as_str().unwrap().to_string();
+    assert_eq!(
+        before["payload"]["inline"],
+        "I prefer dark mode, and my address is 12 Elm Street."
+    );
+
+    let response = run(&nexus, r#"PURGE PAYLOAD "E-1" CONFIRM "PURGE""#).await;
+    assert_eq!(
+        response.status,
+        TopLevelStatus::Succeeded,
+        "{:#?}",
+        response.error
+    );
+
+    let after = evidence_view(&nexus, "E-1").await;
+    // Gone: the bytes, and nothing but the bytes.
+    assert_eq!(after["payload"]["mode"], "purged");
+    assert_eq!(after["payload"]["inline"], Json::Null);
+    assert_eq!(after["payload"]["content_ref"], Json::Null);
+    // Kept: everything §60.6 lists, so corroboration grouping and independence
+    // counting keep operating on the surviving digest and provenance (§23).
+    assert_eq!(after["content_digest"], json!(digest));
+    assert_eq!(after["evidence_class"], "user_statement");
+    assert_eq!(after["media_type"], "text/plain");
+    assert_eq!(after["observed_at"], "2026-08-16T09:00:00.000Z");
+    assert_eq!(after["_system"]["state"], "active", "the record survives");
+
+    // The search index is the other copy of the payload. A purge that left it
+    // behind would keep the bytes retrievable by the very words the caller was
+    // minimizing away.
+    let found = ok(&nexus, r#"SEARCH EVIDENCE "Elm""#).await;
+    assert!(
+        found["hits"].as_array().unwrap().is_empty(),
+        "the purged payload must leave the search index: {found:#?}"
+    );
+
+    // The change stream names it `purge_payload`, not `purge`: a follower that
+    // could not tell the two apart would read a data-minimization decision as
+    // the loss of the record (§36).
+    let history = ok(&nexus, r#"HISTORY ELEMENT "E-1""#).await;
+    let ops: Vec<&str> = history
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|entry| entry["changes"].as_array().unwrap())
+        .filter_map(|change| change["op"].as_str())
+        .collect();
+    assert_eq!(ops, vec!["create", "purge_payload"], "{history:#?}");
+
+    // The citation still resolves: an Assertion whose Evidence went to a stub
+    // would be a history pointing at nothing, which is the failure element
+    // purge exists to refuse and this operation never risks.
+    let cited = ok(
+        &nexus,
+        r#"FIND(?a.evidence) WHERE { ?a ASSERTION {id: "A-1"} }"#,
+    )
+    .await;
+    assert_eq!(cited[0][0]["id"], "E-1", "{cited:#?}");
+}
+
+#[tokio::test]
+async fn a_payload_purge_reaches_the_version_log() {
+    // The half that is easy to forget and fatal to skip: every commit appends
+    // the whole row it wrote, so a payload cleared only in the current row
+    // stays fully readable through `AS OF`.
+    let nexus = with_cited_evidence("purge_payload_history").await;
+    let seq_before = ok(&nexus, "SNAPSHOT").await["snapshot_seq"]
+        .as_u64()
+        .unwrap();
+    ok(&nexus, r#"PURGE PAYLOAD "E-1" CONFIRM "PURGE""#).await;
+
+    let historical = ok(
+        &nexus,
+        &format!(
+            r#"FIND(?e.payload) WHERE {{ ?e EVIDENCE {{id: "E-1"}} }} AS OF SEQ {seq_before}"#
+        ),
+    )
+    .await;
+    let payload = &historical[0];
+    assert_eq!(
+        payload["mode"], "purged",
+        "a past coordinate must not hand back the bytes: {historical:#?}"
+    );
+    assert_eq!(payload["inline"], Json::Null);
+}
+
+#[tokio::test]
+async fn purging_an_already_purged_payload_is_a_no_effect() {
+    // §60.6 states it outright, and it matters for a retry: a sweep that ran
+    // twice must not burn a second version or emit a second change record.
+    let nexus = with_cited_evidence("purge_payload_twice").await;
+    ok(&nexus, r#"PURGE PAYLOAD "E-1" CONFIRM "PURGE""#).await;
+    let version = evidence_view(&nexus, "E-1").await["_system"]["version"]
+        .as_u64()
+        .unwrap();
+
+    let again = run(&nexus, r#"PURGE PAYLOAD "E-1" CONFIRM "PURGE""#).await;
+    assert_eq!(again.status, TopLevelStatus::Succeeded);
+    assert_eq!(
+        again.receipt.as_ref().map(|r| r.status),
+        Some(ReceiptStatus::NoEffect)
+    );
+    assert_eq!(
+        evidence_view(&nexus, "E-1").await["_system"]["version"]
+            .as_u64()
+            .unwrap(),
+        version,
+        "a repeat purge must not burn a version"
+    );
+}
+
+#[tokio::test]
+async fn only_evidence_has_a_payload_to_purge() {
+    // §60.6: other kinds have no payload. Succeeding vacuously over a set of
+    // Concepts would read as "the bytes are gone" when nothing was there.
+    let nexus = with_cited_evidence("purge_payload_kind").await;
+    let response = run(&nexus, r#"PURGE PAYLOAD "C-1" CONFIRM "PURGE""#).await;
+    assert_eq!(response.status, TopLevelStatus::Failed);
+    assert_eq!(
+        response.error.as_ref().unwrap().code.as_str(),
+        "ConstraintViolation"
+    );
+
+    // And the refusal erased nothing on the way to refusing.
+    assert_eq!(
+        evidence_view(&nexus, "E-1").await["payload"]["mode"],
+        "inline"
+    );
+}
+
+#[tokio::test]
+async fn a_legal_hold_blocks_a_payload_purge_exactly_as_it_blocks_an_element_purge() {
+    // §163: a hold is most often placed precisely to preserve the bytes.
+    let nexus = with_cited_evidence("purge_payload_hold").await;
+    ok(
+        &nexus,
+        r#"SET RETENTION "E-1" {retention_class: "standard", legal_hold: true}"#,
+    )
+    .await;
+    let response = run(&nexus, r#"PURGE PAYLOAD "E-1" CONFIRM "PURGE""#).await;
+    assert_eq!(response.status, TopLevelStatus::Failed);
+    assert_eq!(
+        response.error.as_ref().unwrap().code.as_str(),
+        "LegalHoldConflict"
+    );
+}

@@ -13,6 +13,7 @@
 
 import { errors } from '../errors.js'
 import {
+  compareElementId,
   ELEMENT_KINDS,
   formatElementId,
   parseElementId,
@@ -42,6 +43,7 @@ import {
 import { elementReferences } from './references.js'
 import { indexElement } from './search.js'
 import {
+  erasePayload,
   State,
   TABLES,
   type ActivityRow,
@@ -69,6 +71,7 @@ export type ChangeOp =
   | 'quarantine'
   | 'release'
   | 'purge'
+  | 'purge_payload'
   | 'retract'
   | 'supersede'
   | 'correct'
@@ -579,6 +582,61 @@ export class Store {
       space,
       formatElementId(id),
     ).rowsWritten
+  }
+
+  /**
+   * Strips the Evidence payload out of an element's recorded versions.
+   *
+   * The half of a payload purge that is easy to forget and fatal to skip: a
+   * payload cleared only in the current row stays fully readable through
+   * `AS OF`, which would make §60.6 a promise the engine does not keep.
+   *
+   * Rewritten rather than deleted, unlike {@link purgeVersions}: the Evidence
+   * record survives a payload purge, so its lifecycle history is not what is
+   * being erased and destroying it would take more than the caller asked for.
+   */
+  scrubPayloadVersions(space: string, id: ElementId): number {
+    const named = formatElementId(id)
+    const rows = this.sql
+      .exec<{ id: number; row: string }>(
+        'SELECT id, row FROM element_versions WHERE space = ? AND element = ?',
+        space,
+        named,
+      )
+      .toArray()
+    for (const version of rows) {
+      const stored = JSON.parse(version.row) as Record<string, unknown>
+      erasePayload(stored as unknown as EvidenceRow)
+      this.sql.exec(
+        'UPDATE element_versions SET row = ? WHERE id = ?',
+        JSON.stringify(stored),
+        version.id,
+      )
+    }
+    return rows.length
+  }
+
+  /**
+   * Every Activity in a Space that names one element among its `inputs`.
+   *
+   * The reverse of the provenance edge `Activity.inputs`, which is what
+   * `LIST DEPENDENTS` walks (§63.5). An index seek on `element_refs` rather
+   * than a scan, and sorted, because two engines answering the same question
+   * must agree on which Activity first reached a shared dependent.
+   */
+  activitiesWithInput(space: string, id: ElementId): ElementId[] {
+    return this.sql
+      .exec<{ from_id: string }>(
+        `SELECT DISTINCT from_id FROM element_refs
+           WHERE space = ? AND to_id = ? AND field = 'inputs'
+           ORDER BY from_id`,
+        space,
+        formatElementId(id),
+      )
+      .toArray()
+      .map((row) => parseElementId(row.from_id))
+      .filter((from) => from.kind === 'Activity')
+      .sort(compareElementId)
   }
 
   // --- the transaction journal -------------------------------------------

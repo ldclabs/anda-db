@@ -16,9 +16,11 @@ export {
 } from './ddl.js'
 
 export {
+  PAYLOAD_PURGED,
   State,
   TABLES,
   classificationOf,
+  erasePayload,
   schemaRefOf,
   type ActivityRow,
   type AssertionRow,

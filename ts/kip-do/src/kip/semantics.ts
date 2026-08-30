@@ -327,6 +327,17 @@ function analyzeClause(clause: MutationClause, out: Diagnostic[]): void {
       !!clause.Purge.limit,
       out,
     )
+    return
+  }
+  if ('PurgePayload' in clause) {
+    // §60.5 names PURGE PAYLOAD alongside PURGE: byte destruction over an
+    // unbounded WHERE is exactly the sweep that must not run by accident.
+    warnUnbounded(
+      'PURGE PAYLOAD',
+      !!clause.PurgePayload.where_clauses,
+      !!clause.PurgePayload.limit,
+      out,
+    )
   }
 }
 

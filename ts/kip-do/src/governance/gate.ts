@@ -168,7 +168,10 @@ export function clausePermissions(clause: MutationClause): Permission[] {
   if ('SetRetention' in clause) return ['manage_retention']
   if ('Archive' in clause) return ['archive']
   if ('Tombstone' in clause) return ['tombstone']
-  if ('Purge' in clause) return ['purge']
+  // Payload purge asks for the same authority element purge asks for (§60.6);
+  // a policy that wants the two scoped apart does it through the element-scoped
+  // approval, not through a second permission name.
+  if ('Purge' in clause || 'PurgePayload' in clause) return ['purge']
   if ('MergeConcept' in clause) return ['merge_identity', 'maintain']
   return FALLBACK
 }

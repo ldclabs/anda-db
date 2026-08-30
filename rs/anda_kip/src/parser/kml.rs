@@ -168,6 +168,12 @@ fn mutation_clause(input: &str) -> VResult<'_, ClauseGroup> {
             |i| removal("TOMBSTONE", i),
             |c| single(MutationClause::Tombstone(c)),
         ),
+        // Before `purge_statement`, which cuts after its verb: `PURGE PAYLOAD`
+        // would otherwise reach `cut(element_ref)` on the word `PAYLOAD` and
+        // abort the whole alternation instead of falling through.
+        map(purge_payload_statement, |c| {
+            single(MutationClause::PurgePayload(c))
+        }),
         map(purge_statement, |c| single(MutationClause::Purge(c))),
         map(merge_concept, |c| single(MutationClause::MergeConcept(c))),
     ))
@@ -1076,6 +1082,33 @@ fn purge_statement(input: &str) -> VResult<'_, crate::ast::PurgeStatement> {
     ))
 }
 
+/// `PURGE PAYLOAD` — Evidence bytes only (Spec §60.6).
+///
+/// No `REFERENCE POLICY`: the Evidence record survives a payload purge, so no
+/// reference can be left dangling and there is nothing for a policy to decide.
+fn purge_payload_statement(input: &str) -> VResult<'_, crate::ast::PurgePayloadStatement> {
+    let (input, _) = ws(words(&["PURGE", "PAYLOAD"])).parse(input)?;
+    let (input, target) = cut(ws(element_ref)).parse(input)?;
+    let (input, where_clauses) =
+        opt_after(&["WHERE"], |i| where_block(i, Flavor::Exact)).parse(input)?;
+    let (input, limit) = opt_after(&["LIMIT"], ws(scalar)).parse(input)?;
+    let (input, _) = cut(ws(word("CONFIRM"))).parse(input)?;
+    let (rest, confirm) = cut(ws(quoted_string)).parse(input)?;
+    if confirm != "PURGE" {
+        return fail(input, "the exact confirmation literal \"PURGE\"");
+    }
+
+    Ok((
+        rest,
+        crate::ast::PurgePayloadStatement {
+            target,
+            where_clauses,
+            limit,
+            confirm,
+        },
+    ))
+}
+
 fn merge_concept(input: &str) -> VResult<'_, MergeConcept> {
     let (input, _) = ws(words(&["MERGE", "CONCEPT"])).parse(input)?;
     let (input, source) = cut(ws(element_ref)).parse(input)?;
@@ -1283,6 +1316,9 @@ fn validate_clause(clause: &MutationClause) -> Result<(), KipError> {
         MutationClause::Purge(c) if c.confirm != "PURGE" => {
             return bad("PURGE must be confirmed with the exact literal \"PURGE\"");
         }
+        MutationClause::PurgePayload(c) if c.confirm != "PURGE" => {
+            return bad("PURGE PAYLOAD must be confirmed with the exact literal \"PURGE\"");
+        }
         _ => {}
     }
     Ok(())
@@ -1427,6 +1463,7 @@ fn clause_where(clause: &MutationClause) -> Option<&Vec<WhereClause>> {
         MutationClause::SetRetention(c) => c.where_clauses.as_ref(),
         MutationClause::Archive(c) | MutationClause::Tombstone(c) => c.where_clauses.as_ref(),
         MutationClause::Purge(c) => c.where_clauses.as_ref(),
+        MutationClause::PurgePayload(c) => c.where_clauses.as_ref(),
         MutationClause::MergeConcept(c) => c.where_clauses.as_ref(),
         _ => None,
     }
@@ -1503,6 +1540,7 @@ fn collect_clause_handles(clause: &MutationClause, out: &mut BTreeSet<String>) {
         }
         MutationClause::Archive(c) | MutationClause::Tombstone(c) => element(&c.target),
         MutationClause::Purge(c) => element(&c.target),
+        MutationClause::PurgePayload(c) => element(&c.target),
         MutationClause::MergeConcept(c) => {
             element(&c.source);
             element(&c.into);
@@ -1556,6 +1594,43 @@ mod tests {
     #[test]
     fn mutate_needs_at_least_one_mutation() {
         assert!(parse_kml_statement("MUTATE { }").is_err());
+    }
+
+    #[test]
+    fn purge_payload_is_its_own_statement_not_a_purge_of_something_named_payload() {
+        // §60.6: `PURGE PAYLOAD` erases Evidence bytes while the element
+        // survives. The verb overlaps with element purge, so the two are one
+        // lookahead apart — and getting that wrong would turn a payload purge
+        // into a syntax error, or worse, into an element purge.
+        let statement = kml(r#"PURGE PAYLOAD :e CONFIRM "PURGE""#);
+        assert!(matches!(
+            statement.clauses.as_slice(),
+            [MutationClause::PurgePayload(_)]
+        ));
+
+        let element = kml(r#"PURGE :e CONFIRM "PURGE""#);
+        assert!(matches!(
+            element.clauses.as_slice(),
+            [MutationClause::Purge(_)]
+        ));
+    }
+
+    #[test]
+    fn purge_payload_takes_no_reference_policy() {
+        // The Evidence record survives, so no reference can dangle and there
+        // is nothing for a policy to decide (§60.6).
+        assert!(
+            parse_kml_statement(
+                r#"PURGE PAYLOAD :e REFERENCE POLICY "tombstone_reference" CONFIRM "PURGE""#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn purge_payload_freezes_its_confirmation_spelling() {
+        assert!(parse_kml_statement(r#"PURGE PAYLOAD :e CONFIRM "purge""#).is_err());
+        assert!(parse_kml_statement(r#"PURGE PAYLOAD :e"#).is_err());
     }
 
     #[test]

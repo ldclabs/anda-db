@@ -2,6 +2,7 @@ import { env, runInDurableObject } from 'cloudflare:test'
 import { describe, expect, it } from 'vitest'
 import { CognitiveNexus } from '../src/nexus.js'
 import { COGNITIVE_MEMORY } from '../src/schema/index.js'
+import { parseElementId } from '../src/id.js'
 
 /**
  * META, and the five-layer discipline it exists to keep apart.
@@ -387,6 +388,143 @@ describe('Capsules', () => {
           c: '{}',
         }),
       ).toThrowError(/import path, which this engine has not built/)
+    })
+  })
+
+  // --- LIST DEPENDENTS (§63.5) ----------------------------------------------
+
+  /**
+   * Two derivation hops recorded as Activity provenance.
+   *
+   * ```text
+   * Event ──inputs──▸ consolidation ──outputs──▸ Insight
+   *                   Insight ──inputs──▸ compilation ──outputs──▸ Skill
+   * ```
+   */
+  const DERIVED = [
+    `MUTATE {
+      CREATE CONCEPT ?event {
+        TYPE "Event"
+        NAME "Migration meeting"
+        SET ATTRIBUTES {summary: "The team agreed to migrate on Friday"}
+      }
+      CREATE CONCEPT ?insight {
+        TYPE "Insight"
+        NAME "Migrations need a rollback plan"
+        SET ATTRIBUTES {summary: "Every migration ships with a rollback"}
+      }
+      CREATE ACTIVITY ?consolidate {
+        SET FIELDS {activity_class: "semantic_consolidation", status: "completed"}
+        SET STRUCTURAL {
+          ("inputs", ?event)
+          ("outputs", ?insight)
+        }
+      }
+    }`,
+    `MUTATE {
+      CREATE CONCEPT ?skill {
+        TYPE "Skill"
+        NAME "Plan a migration"
+        SET ATTRIBUTES {
+          skill_class: "workflow",
+          summary: "Write the rollback first",
+          procedure: "1. write the rollback 2. migrate",
+          status: "candidate"
+        }
+      }
+      CREATE ACTIVITY ?compile {
+        SET FIELDS {activity_class: "procedural_consolidation", status: "completed"}
+        SET STRUCTURAL {
+          ("inputs", "C-4")
+          ("outputs", ?skill)
+        }
+      }
+    }`,
+  ]
+
+  interface Dependent {
+    id: string
+    kind: string
+    distance: number
+    via: { activity: string }
+  }
+
+  it('walks the provenance DAG in the derived direction', async () => {
+    // §63.5: X ∈ Activity.inputs → that Activity → each element in its outputs.
+    // This is the read §57.5 asks a Brain to make after revising a root: the
+    // cognition built on the old claim is still active state, and it has to be
+    // findable before it can be reviewed.
+    await withNexus('dependents', (nexus) => {
+      for (const statement of DERIVED) nexus.execute(statement)
+
+      const one = nexus.describe('LIST DEPENDENTS "C-3"') as unknown as Dependent[]
+      expect(one).toHaveLength(1)
+      expect(one[0]!.id).toBe('C-4')
+      expect(one[0]!.kind).toBe('concept')
+      expect(one[0]!.distance).toBe(1)
+      // The row names the Activity it was reached through.
+      expect(one[0]!.via.activity).toBe('X-1')
+
+      // DEPTH is what turns one hop into the closure. Default is one hop, so
+      // the Skill two derivations away is out of reach until it is asked for.
+      const two = nexus.describe(
+        'LIST DEPENDENTS "C-3" DEPTH 2',
+      ) as unknown as Dependent[]
+      expect(two).toHaveLength(2)
+      expect(two[1]!.id).toBe('C-5')
+      expect(two[1]!.distance).toBe(2)
+      expect(two[1]!.via.activity).toBe('X-2')
+
+      // Reachability is provenance topology, not judgment (§57.5): nothing
+      // about the listed element changed.
+      const insight = nexus.store.load(parseElementId('C-4'))
+      expect(insight?.row.state).toBe('active')
+      expect(insight?.row.version).toBe(1)
+    })
+  })
+
+  it('pages a dependents closure like every other LIST', async () => {
+    await withNexus('dependents-paging', (nexus) => {
+      for (const statement of DERIVED) nexus.execute(statement)
+      const page = nexus.describe(
+        'LIST DEPENDENTS "C-3" DEPTH 2 LIMIT 1',
+      ) as unknown as Dependent[]
+      expect(page).toHaveLength(1)
+      expect(page[0]!.id).toBe('C-4')
+    })
+  })
+
+  it('cannot discover a transformation that recorded no Activity lineage', async () => {
+    // §63.5's own caveat, and the reason the Profile's consolidation guidance
+    // insists on citing the inputs you actually relied on: an uncited input is
+    // an invisible dependency, and this command cannot invent the edge.
+    await withNexus('dependents-unlinked', (nexus) => {
+      nexus.execute(`MUTATE {
+        CREATE CONCEPT ?event {
+          TYPE "Event"
+          NAME "Meeting"
+          SET ATTRIBUTES {summary: "A meeting happened"}
+        }
+        CREATE CONCEPT ?insight {
+          TYPE "Insight"
+          NAME "Undeclared derivation"
+          SET ATTRIBUTES {summary: "Derived from the meeting, but nobody said so"}
+        }
+      }`)
+      expect(nexus.describe('LIST DEPENDENTS "C-3" DEPTH 4')).toEqual([])
+    })
+  })
+
+  it('answers an unknown dependents root exactly as an absent one', async () => {
+    // §30.4: omission is indistinguishable from absence. An error here would
+    // turn the command into an existence oracle.
+    await withNexus('dependents-absent', (nexus) => {
+      expect(nexus.describe('LIST DEPENDENTS "C-999"')).toEqual([])
+      // A string that is not an element id at all is a different mistake, and
+      // is reported as one.
+      expect(() => nexus.describe('LIST DEPENDENTS "not-an-id"')).toThrowError(
+        /is not a Nexus element id/,
+      )
     })
   })
 })

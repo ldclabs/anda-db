@@ -6,3 +6,4 @@ allowBuilds:
   workerd: true
 minimumReleaseAgeExclude:
   - '@ldclabs/kip-lang@2.0.2'
+  - '@ldclabs/kip-lang@2.1.0'

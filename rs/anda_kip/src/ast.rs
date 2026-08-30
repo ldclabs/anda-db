@@ -781,6 +781,8 @@ pub enum MutationClause {
     Tombstone(RemovalStatement),
     /// `PURGE target ... CONFIRM "PURGE"`
     Purge(PurgeStatement),
+    /// `PURGE PAYLOAD target ... CONFIRM "PURGE"`
+    PurgePayload(PurgePayloadStatement),
     /// `MERGE CONCEPT source INTO target`
     MergeConcept(MergeConcept),
 }
@@ -1129,6 +1131,23 @@ pub struct PurgeStatement {
     pub confirm: String,
 }
 
+/// `PURGE PAYLOAD` — Evidence bytes only (Spec §60.6).
+///
+/// The element survives, so there is no `REFERENCE POLICY` clause: nothing can
+/// dangle. The confirmation literal is the same `CONFIRM "PURGE"` element purge
+/// takes, because the byte destruction is just as irreversible.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct PurgePayloadStatement {
+    /// The Evidence whose payload is erased.
+    pub target: ElementRef,
+    /// The selection block, when the target is bound by one.
+    pub where_clauses: Option<Vec<WhereClause>>,
+    /// The bound on how many matched elements may be erased.
+    pub limit: Option<Scalar>,
+    /// Always the literal `PURGE`; the grammar freezes the spelling.
+    pub confirm: String,
+}
+
 /// `MERGE CONCEPT` — non-destructive: the source stays addressable as merged
 /// history (Spec §11.1).
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -1260,6 +1279,10 @@ pub struct ListCommand {
     pub target: ListTarget,
     /// `LIST SCHEMA PACKAGES STATUS ...` only.
     pub status: Option<Scalar>,
+    /// `LIST DEPENDENTS :id` only — the traversal root.
+    pub element: Option<Scalar>,
+    /// `LIST DEPENDENTS ... DEPTH :n` only — the traversal bound (§63.5).
+    pub depth: Option<Scalar>,
     /// The page size.
     pub limit: Option<Scalar>,
     /// The page cursor.
@@ -1283,6 +1306,8 @@ pub enum ListTarget {
     StructuralFields,
     /// `LIST EPISTEMIC POLICIES`
     EpistemicPolicies,
+    /// `LIST DEPENDENTS :id [DEPTH :n]` (§63.5)
+    Dependents,
 }
 
 /// `SEARCH ...`

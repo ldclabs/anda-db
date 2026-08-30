@@ -32,6 +32,7 @@ import {
   type AuthContext,
 } from '../governance/index.js'
 import {
+  compareElementId,
   elementId,
   formatElementId,
   parseElementId,
@@ -56,6 +57,7 @@ import { Context } from '../kql/context.js'
 import { bindCoordinate, type KqlContext } from '../kql/index.js'
 import { scalarValue, type ReadBindings } from '../kql/matching.js'
 import { baseline, forecast } from '../projection/policy.js'
+import { endpointFromJson, endpointLocal } from '../term.js'
 import {
   conceptTypeDef,
   facetDef,
@@ -76,7 +78,11 @@ import {
   type PageCursor,
   type Store,
 } from '../store/index.js'
-import { capabilities, KIP_VERSION } from './capabilities.js'
+import {
+  capabilities,
+  KIP_VERSION,
+  MAX_DEPENDENTS_DEPTH,
+} from './capabilities.js'
 import {
   describeCapsule,
   exportCapsule,
@@ -564,7 +570,143 @@ function list(command: ListCommand, cx: MetaContext, b: ReadBindings): Json {
       return page(symbolList(cx.env, 'StructuralField'))
     case 'EpistemicPolicies':
       return page([baseline().id, forecast().id])
+    case 'Dependents':
+      return page(dependents(command, cx, b))
   }
+}
+
+/**
+ * `LIST DEPENDENTS :id [DEPTH :n]` — bounded reverse provenance closure
+ * (§63.5).
+ *
+ * The traversal is the one §63.5 spells out and nothing more:
+ *
+ * ```text
+ * X ∈ Activity.inputs → that Activity → each element in Activity.outputs
+ * ```
+ *
+ * Each output is a dependent of `X` at distance 1, and the walk repeats from
+ * each dependent up to `DEPTH` (default 1).
+ *
+ * The Structural-Field extension §63.5 permits — traversing fields the Schema
+ * Environment *documents* as derivation lineage — is deliberately not taken. A
+ * Schema Package carries no machine-readable lineage marker, so honouring it
+ * would mean this Core engine hard-coding the names of one Profile's fields
+ * (`derived_from`, `compiled_from`, `consolidated_to`) and guessing each one's
+ * direction. Guessing wrong yields an element's *sources* where it promised its
+ * dependents, which is worse than not answering: §57.5 asks for a review list,
+ * and a review list with the arrows reversed sends the reviewer to the wrong
+ * artifacts.
+ *
+ * Reachability is topology, not judgment (§57.5): a listed dependent is not
+ * thereby stale, wrong, or in need of change.
+ *
+ * @see rs/anda_cognitive_nexus/src/meta/describe.rs
+ */
+function dependents(
+  command: ListCommand,
+  cx: MetaContext,
+  b: ReadBindings,
+): Json[] {
+  if (command.element === null) {
+    // The grammar requires the operand, so reaching here means an AST arrived
+    // from somewhere that does not.
+    throw errors.invalidSyntax(
+      'LIST DEPENDENTS requires the element whose dependents are listed',
+    )
+  }
+  const named = text(command.element, b, 'LIST DEPENDENTS')
+  const depth =
+    command.depth === null ? 1 : depthBound(scalarValue(command.depth, b))
+
+  const root = parseElementId(named)
+  const context = reader(cx)
+  // §30.4: a root this caller may not discover is answered exactly as an absent
+  // one is. Refusing here would turn the command into an existence oracle for
+  // elements the caller cannot read.
+  if (context.load(root) === null) return []
+
+  // Everything below is walked in sorted id order, and each level's frontier is
+  // sorted before the next one runs. Two engines answering the same question
+  // must agree on which Activity first reached a dependent that two of them
+  // produced, or the `via` they report — and the paging that slices this list —
+  // would depend on storage layout.
+  const seen = new Set<string>([formatElementId(root)])
+  let frontier = [root]
+  const rows: Json[] = []
+
+  for (let distance = 1; distance <= depth; distance += 1) {
+    const next: ElementId[] = []
+    for (const source of frontier) {
+      for (const activity of cx.store.activitiesWithInput(cx.space, source)) {
+        // An Activity the caller may not read is not a route: naming it in
+        // `via` would disclose it, and walking through it would disclose that
+        // it exists (§30.4).
+        const element = context.load(activity)
+        if (element === null || element.kind !== 'Activity') continue
+        for (const output of element.row.outputs) {
+          let id: ElementId | null = null
+          try {
+            id = endpointLocal(endpointFromJson(output))
+          } catch {
+            continue
+          }
+          if (id === null) continue
+          const key = formatElementId(id)
+          // First reach wins, so a dependent is reported at its shortest
+          // distance and a DAG that converges does not report it twice.
+          if (seen.has(key)) continue
+          seen.add(key)
+          if (context.load(id) === null) continue
+          next.push(id)
+          rows.push({
+            id: key,
+            kind: id.kind.toLowerCase(),
+            distance,
+            via: { activity: formatElementId(activity) },
+          })
+        }
+      }
+    }
+    if (next.length === 0) break
+    frontier = next.sort(compareElementId)
+  }
+  return rows
+}
+
+/**
+ * Reads the `DEPTH` bound, capped at {@link MAX_DEPENDENTS_DEPTH}.
+ *
+ * The two engines have to refuse the same bound with the same code, so the
+ * shape is stated rather than inherited from whatever coercion was convenient:
+ * anything that is not a non-negative integer is a `TypeMismatch`, and only
+ * zero is a `ConstraintViolation`. A numeric string is accepted for the same
+ * reason `LIMIT` accepts one — a caller binding a parameter from JSON may not
+ * control its type.
+ *
+ * @see rs/anda_cognitive_nexus/src/meta/describe.rs — `depth_bound`
+ */
+function depthBound(value: Json): number {
+  // `Number()` is not the parse the Rust engine runs: it reads `""` as zero,
+  // `" 2 "` as two and `"0x10"` as sixteen, none of which `str::parse::<u64>`
+  // accepts. A string is therefore matched as digits before it is converted.
+  const asked =
+    typeof value === 'number'
+      ? value
+      : typeof value === 'string' && /^\d+$/.test(value)
+        ? Number(value)
+        : Number.NaN
+  if (!Number.isSafeInteger(asked) || asked < 0) {
+    throw errors.typeMismatch(
+      `DEPTH takes a non-negative integer, got ${JSON.stringify(value)}`,
+    )
+  }
+  if (asked === 0) {
+    throw errors.constraintViolation(
+      'DEPTH 0 asks for the element itself, which is not one of its dependents',
+    )
+  }
+  return Math.min(asked, MAX_DEPENDENTS_DEPTH)
 }
 
 // --- VALIDATE and PREVIEW ---------------------------------------------------

@@ -1,5 +1,5 @@
 {
- "source": "@ldclabs/kip-lang 2.0.0 — lower(parse(command).ast)",
+ "source": "@ldclabs/kip-lang 2.1.0 — lower(parse(command).ast)",
  "note": "Regenerate with tests/fixtures/README.md; every entry must decode to the same anda_kip AST.",
  "cases": [
   {
@@ -2392,6 +2392,8 @@
      "List": {
       "target": "Spaces",
       "status": null,
+      "element": null,
+      "depth": null,
       "limit": {
        "Literal": {
         "Number": 5
@@ -2415,6 +2417,8 @@
         "String": "active"
        }
       },
+      "element": null,
+      "depth": null,
       "limit": null,
       "cursor": null
      }
@@ -2428,6 +2432,8 @@
      "List": {
       "target": "Types",
       "status": null,
+      "element": null,
+      "depth": null,
       "limit": null,
       "cursor": null
      }
@@ -2441,6 +2447,8 @@
      "List": {
       "target": "Predicates",
       "status": null,
+      "element": null,
+      "depth": null,
       "limit": null,
       "cursor": null
      }
@@ -2454,6 +2462,8 @@
      "List": {
       "target": "Facets",
       "status": null,
+      "element": null,
+      "depth": null,
       "limit": null,
       "cursor": null
      }
@@ -2467,6 +2477,8 @@
      "List": {
       "target": "StructuralFields",
       "status": null,
+      "element": null,
+      "depth": null,
       "limit": null,
       "cursor": null
      }
@@ -2480,6 +2492,8 @@
      "List": {
       "target": "EpistemicPolicies",
       "status": null,
+      "element": null,
+      "depth": null,
       "limit": null,
       "cursor": null
      }
@@ -2890,6 +2904,107 @@
        "Tx": {
         "Param": "tx"
        }
+      }
+     }
+    }
+   }
+  },
+  {
+   "command": "PURGE PAYLOAD :e CONFIRM \"PURGE\"",
+   "ast": {
+    "Kml": {
+     "explicit_transaction": false,
+     "clauses": [
+      {
+       "PurgePayload": {
+        "target": {
+         "Param": "e"
+        },
+        "where_clauses": null,
+        "limit": null,
+        "confirm": "PURGE"
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "command": "PURGE PAYLOAD ?e WHERE { ?e {type: \"T\"} } LIMIT 5 CONFIRM \"PURGE\"",
+   "ast": {
+    "Kml": {
+     "explicit_transaction": false,
+     "clauses": [
+      {
+       "PurgePayload": {
+        "target": {
+         "Handle": "e"
+        },
+        "where_clauses": [
+         {
+          "Concept": {
+           "variable": "e",
+           "matcher": {
+            "type": {
+             "Literal": {
+              "String": "T"
+             }
+            }
+           }
+          }
+         }
+        ],
+        "limit": {
+         "Literal": {
+          "Number": 5
+         }
+        },
+        "confirm": "PURGE"
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "command": "LIST DEPENDENTS :root",
+   "ast": {
+    "Meta": {
+     "List": {
+      "target": "Dependents",
+      "status": null,
+      "element": {
+       "Param": "root"
+      },
+      "depth": null,
+      "limit": null,
+      "cursor": null
+     }
+    }
+   }
+  },
+  {
+   "command": "LIST DEPENDENTS :root DEPTH 2 LIMIT 50 CURSOR :c",
+   "ast": {
+    "Meta": {
+     "List": {
+      "target": "Dependents",
+      "status": null,
+      "element": {
+       "Param": "root"
+      },
+      "depth": {
+       "Literal": {
+        "Number": 2
+       }
+      },
+      "limit": {
+       "Literal": {
+        "Number": 50
+       }
+      },
+      "cursor": {
+       "Param": "c"
       }
      }
     }

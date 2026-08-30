@@ -235,6 +235,7 @@ pub async fn list(cx: &mut Context<'_>, command: &ListCommand) -> Result<Answer,
             policy(&Policy::baseline().id)?,
             policy(&Policy::forecast().id)?,
         ],
+        ListTarget::Dependents => dependents(cx, command).await?,
     };
 
     let total = items.len();
@@ -244,6 +245,173 @@ pub async fn list(cx: &mut Context<'_>, command: &ListCommand) -> Result<Answer,
         result: Json::Array(items),
         next_cursor: super::next_cursor(cx, CursorFamily::List, consumed, total),
     })
+}
+
+/// How deep a `LIST DEPENDENTS` closure this engine will walk (§63.5).
+///
+/// The traversal is bounded by construction: each level is a fan-out over the
+/// provenance DAG, and a depth nobody bounded is a whole-Space scan wearing a
+/// `LIMIT`. A caller that needs further walks the closure a page at a time.
+///
+/// Read by `DESCRIBE CAPABILITIES` rather than restated there, so the number a
+/// caller plans against is the number the walk actually stops at.
+pub(crate) const MAX_DEPENDENTS_DEPTH: u64 = 8;
+
+/// `LIST DEPENDENTS :id [DEPTH :n]` — bounded reverse provenance closure
+/// (§63.5).
+///
+/// The traversal is the one §63.5 spells out and nothing more:
+///
+/// ```text
+/// X ∈ Activity.inputs → that Activity → each element in Activity.outputs
+/// ```
+///
+/// Each output is a dependent of `X` at distance 1, and the walk repeats from
+/// each dependent up to `DEPTH` (default 1).
+///
+/// The Structural-Field extension §63.5 permits — traversing fields the Schema
+/// Environment *documents* as derivation lineage — is deliberately not taken.
+/// A Schema Package carries no machine-readable lineage marker, so honouring it
+/// would mean this Core engine hard-coding the names of one Profile's fields
+/// (`derived_from`, `compiled_from`, `consolidated_to`) and guessing each one's
+/// direction. Guessing wrong yields an element's *sources* where it promised
+/// its dependents, which is worse than not answering: §57.5 asks for a review
+/// list, and a review list with the arrows reversed sends the reviewer to the
+/// wrong artifacts. Activity lineage is the direction the protocol defines, and
+/// the Profile's own consolidation guidance already requires it.
+///
+/// Reachability is topology, not judgment (§57.5): a listed dependent is not
+/// thereby stale, wrong, or in need of change.
+async fn dependents(cx: &mut Context<'_>, command: &ListCommand) -> Result<Vec<Json>, KipError> {
+    let Some(operand) = &command.element else {
+        // The grammar requires the operand, so reaching here means an AST
+        // arrived from somewhere that does not.
+        return Err(KipError::invalid_syntax(
+            "LIST DEPENDENTS requires the element whose dependents are listed",
+        ));
+    };
+    let named = scalar_str(cx, operand, "LIST DEPENDENTS")?;
+    let depth = match &command.depth {
+        Some(scalar) => depth_bound(cx, scalar)?,
+        None => 1,
+    };
+
+    let Ok(root) = named.parse::<crate::id::ElementId>() else {
+        return Err(KipError::invalid_identifier(format!(
+            "{named:?} is not an element id"
+        )));
+    };
+    // §30.4: a root this caller may not discover is answered exactly as an
+    // absent one is. Refusing here would turn the command into an existence
+    // oracle for elements the caller cannot read.
+    if cx.load(root).await?.is_none() {
+        return Ok(Vec::new());
+    }
+
+    // Everything below is walked in sorted id order, and each level's frontier
+    // is sorted before the next one runs. Two engines answering the same
+    // question must agree on which Activity first reached a dependent that two
+    // of them produced, or the `via` they report — and the paging that slices
+    // this list — would depend on storage layout.
+    let mut seen: std::collections::BTreeSet<crate::id::ElementId> =
+        std::collections::BTreeSet::from([root]);
+    let mut frontier = vec![root];
+    let mut rows: Vec<Json> = Vec::new();
+
+    for distance in 1..=depth {
+        let mut next = std::collections::BTreeSet::new();
+        for source in std::mem::take(&mut frontier) {
+            for activity in activities_consuming(cx, source).await? {
+                // An Activity the caller may not read is not a route: naming it
+                // in `via` would disclose it, and walking through it would
+                // disclose that it exists (§30.4).
+                let Some(crate::store::Element::Activity(row)) = cx.load(activity).await? else {
+                    continue;
+                };
+                // The outputs are the wide part of the traversal: one Activity
+                // may name any number, and each costs a parse and a load. A
+                // budget that saw only the Activities would let the fan-out run
+                // unbounded, which is the shape a read is supposed to refuse
+                // rather than stall on.
+                cx.charge(row.outputs.len())?;
+                for output in &row.outputs {
+                    let Some(id) = crate::term::Endpoint::from_json(output)
+                        .ok()
+                        .and_then(|endpoint| endpoint.local())
+                    else {
+                        continue;
+                    };
+                    // First reach wins, so a dependent is reported at its
+                    // shortest distance and a DAG that converges does not
+                    // report the same element twice.
+                    if !seen.insert(id) {
+                        continue;
+                    }
+                    if cx.load(id).await?.is_none() {
+                        continue;
+                    }
+                    next.insert(id);
+                    rows.push(serde_json::json!({
+                        "id": id.to_string(),
+                        "kind": id.kind.to_string(),
+                        "distance": distance,
+                        "via": {"activity": activity.to_string()},
+                    }));
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next.into_iter().collect();
+    }
+    Ok(rows)
+}
+
+/// Reads the `DEPTH` bound, capped at [`MAX_DEPENDENTS_DEPTH`].
+///
+/// Not [`scalar_usize`]: that helper is shared with `LIMIT` and `CURSOR`, and
+/// its string branch reports a non-numeric value as `CursorInvalidated` —
+/// "DEPTH is not a cursor this engine issued" is the wrong sentence and the
+/// wrong code. The two engines have to refuse the same bound with the same
+/// code, so the shape is stated here: anything that is not a non-negative
+/// integer is a `TypeMismatch`, and only zero is a `ConstraintViolation`.
+fn depth_bound(cx: &Context<'_>, scalar: &Scalar) -> Result<u64, KipError> {
+    let value = scalar_json(cx, scalar)?;
+    let asked = match &value {
+        Json::Number(number) => number.as_u64(),
+        // A numeric string is accepted for the same reason `LIMIT` accepts one:
+        // a caller binding a parameter from JSON may not control its type.
+        Json::String(text) => text.parse::<u64>().ok(),
+        _ => None,
+    };
+    let Some(asked) = asked else {
+        return Err(KipError::type_mismatch(format!(
+            "DEPTH takes a non-negative integer, got {value}"
+        )));
+    };
+    if asked == 0 {
+        return Err(KipError::constraint_violation(
+            "DEPTH 0 asks for the element itself, which is not one of its dependents",
+        ));
+    }
+    Ok(asked.min(MAX_DEPENDENTS_DEPTH))
+}
+
+/// Every Activity in this Space that names one element among its `inputs`.
+///
+/// An index lookup on the provenance key column rather than a scan: the
+/// `input_keys` index exists precisely so the DAG can be walked in the derived
+/// direction (§62).
+async fn activities_consuming(
+    cx: &mut Context<'_>,
+    id: crate::id::ElementId,
+) -> Result<Vec<crate::id::ElementId>, KipError> {
+    let key = crate::term::Endpoint::Local(id).key();
+    let mut ids = cx.store.activities_with_input(&cx.space, &key).await?;
+    ids.sort_unstable();
+    cx.charge(ids.len())?;
+    Ok(ids)
 }
 
 async fn execution_context(cx: &mut Context<'_>) -> Result<Json, KipError> {
