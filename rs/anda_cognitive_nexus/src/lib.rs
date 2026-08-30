@@ -105,6 +105,11 @@
 //! worse lie than an absent one.
 
 #![doc(html_root_url = "https://docs.rs/anda_cognitive_nexus")]
+// `DESCRIBE CAPABILITIES` is one `serde_json::json!` literal describing every
+// promise this engine makes, and `json!` recurses once per nesting level. The
+// honest answer to "what can you do" is long, and splitting it across helpers
+// to fit a default would scatter the one document a caller reads as a whole.
+#![recursion_limit = "256"]
 
 pub mod capsule;
 pub mod error;

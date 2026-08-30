@@ -77,6 +77,7 @@ import {
   type CursorFamily,
   type PageCursor,
   type Store,
+  type TransactionRow,
 } from '../store/index.js'
 import {
   capabilities,
@@ -854,27 +855,62 @@ function history(
       throw errors.notFoundOrNotVisible(`no element ${formatElementId(id)}`)
     }
     const { from, to, limit } = range(command.Element)
-    return cx.store
-      .versionsOf(cx.space, id, from, to, limit)
-      .map((row) => ({
-        element: row.element,
-        version: row.version,
-        space_seq: row.seq,
-        tx_id: row.tx_id,
-        op: row.op,
-      })) as unknown as Json
+    // The version log answers *which transitions touched this element* with an
+    // index seek; the journal then supplies the transition itself. Going
+    // through both is what makes an element's chronology the same grain as a
+    // Space's — §68.1 calls HISTORY a transition chronology, and §36.2 makes a
+    // transition one envelope, not one row per element per commit.
+    const touched = cx.store.versionsOf(cx.space, id, from, to, limit)
+    const named = formatElementId(id)
+    const envelopes: TransactionRow[] = []
+    for (const version of touched) {
+      const row = cx.store.transaction(version.tx_id)
+      if (row !== null) envelopes.push(row)
+    }
+    return visibleChanges(cx, envelopes).map((row) =>
+      changeEnvelope(row, named),
+    ) as unknown as Json
   }
   const { from, to, limit } = range(command.Space)
   return visibleChanges(
     cx,
-    cx.store.transactionsInSpace(cx.space, from, to, limit).map((row) => ({
-      tx_id: row.tx_id,
-      space_seq: row.seq,
-      committed_at: row.committed_at,
-      status: row.status,
-      changes: row.changes,
-    })),
-  ) as unknown as Json
+    cx.store.transactionsInSpace(cx.space, from, to, limit),
+  ).map((row) => changeEnvelope(row, null)) as unknown as Json
+}
+
+/**
+ * One journal row as the Change Envelope §36.1 fixes.
+ *
+ * `HISTORY ELEMENT`, `HISTORY SPACE` and `CHANGES` all answer in this shape,
+ * because they are the same unit — one committed transition — asked for over
+ * different ranges. Emitting one grain in one and another in the next would
+ * make "what happened to this element" and "what happened here" two
+ * incomparable answers, and would cost a consumer the §36.3 deduplication key
+ * `space_id + space_seq + tx_id`.
+ *
+ * `element` narrows the `changes` list to the one the caller asked about. The
+ * envelope still describes the whole transition, because that is what a
+ * transition is (§36.2); what is narrowed is which of its changes this
+ * chronology is about.
+ *
+ * @see rs/anda_cognitive_nexus/src/meta/history.rs — `entry`
+ * @see anda_kip::ChangeEnvelope
+ */
+function changeEnvelope(row: TransactionRow, element: string | null): Json {
+  return {
+    space_id: row.space,
+    space_seq: row.seq,
+    tx_id: row.tx_id,
+    committed_at: row.committed_at,
+    transaction_class: row.transaction_class,
+    snapshot_seq: row.snapshot_seq,
+    status: row.status,
+    schema_environment_version: row.schema_environment_version,
+    changes:
+      element === null
+        ? row.changes
+        : row.changes.filter((change) => change.id === element),
+  } as unknown as Json
 }
 
 /** A read context, for the META paths that have to resolve an element. */
@@ -959,19 +995,26 @@ function changes(
     Number.MAX_SAFE_INTEGER,
     limit,
   )
+  // One envelope per committed transition, never a flattened list of changes:
+  // §36.2 makes the envelope the unit of atomicity, so a consumer handed the
+  // changes loose cannot tell which of them happened together — and §36.3's
+  // deduplication key needs the `tx_id` and `space_id` that flattening drops.
   const rows = visibleChanges(cx, journal)
-  return {
-    changes: rows.flatMap((row) =>
-      row.changes.map((change) => ({ ...change, space_seq: row.seq })),
-    ),
-    // The cursor advances to the last coordinate this page *consumed*, not to
-    // the last one it could show. They differ for a restricted caller whose
-    // authority hides a whole page of transactions: taking the cursor from the
-    // visible rows would leave it exactly where it started, and the follower
-    // would re-read the same hidden window forever instead of walking past it.
-    // A caller that saw nothing because there was nothing holds its place.
-    cursor: journal[journal.length - 1]?.seq ?? after,
-  } as unknown as Json
+  // The cursor advances to the last coordinate this page *consumed*, not to the
+  // last one it could show. They differ for a restricted caller whose authority
+  // hides a whole page of transactions: taking the cursor from the visible rows
+  // would leave it exactly where it started, and the follower would re-read the
+  // same hidden window forever instead of walking past it. A caller that saw
+  // nothing because there was nothing holds its place.
+  //
+  // It rides the paging slot every other META command uses rather than a field
+  // inside the body, so a caller reads one page the same way whatever it asked
+  // for.
+  const consumed = journal[journal.length - 1]?.seq
+  if (cx.page !== undefined && consumed !== undefined) {
+    cx.page.next_cursor = String(consumed)
+  }
+  return rows.map((row) => changeEnvelope(row, null)) as unknown as Json
 }
 
 // --- SEARCH -----------------------------------------------------------------

@@ -9,7 +9,8 @@ All notable changes to this workspace are documented in this file.
 unpublished, so this accumulates into the same version).
 
 Syncs upstream [KIP 2.0 `40e655f`](https://github.com/ldclabs/kip) and
-implements the two statements it adds, in both engines.
+implements the two statements it adds, in both engines — and, following the
+same sections, unifies the shape `HISTORY` and `CHANGES` answer in.
 
 The gap the upstream commit names is this: a Brain that only answers when asked
 cannot notice that something *did not* happen, and a Brain that revises a claim
@@ -88,6 +89,45 @@ and neither has an opinion about them.
   last instant that digest could have been computed, and §60.6 promises the
   surviving record keeps one. Neither engine mints a substitute — two engines
   would have to agree on the exact bytes for it to mean anything.
+
+### Changed — breaking: `HISTORY` and `CHANGES` answer in Change Envelopes
+
+§68.1 defines `HISTORY` as *transition chronology* and §36.2 defines a
+transition as one Change Envelope, so `HISTORY ELEMENT`, `HISTORY SPACE` and
+`CHANGES` are the same unit asked for over different ranges. They were three
+shapes across two engines. Now they are one, built from
+`anda_kip::ChangeEnvelope` on the Rust side and a mirrored builder in
+`@ldclabs/kip-do` — the type existed since the last release and neither engine
+used it.
+
+- **`@ldclabs/kip-do`'s `CHANGES` no longer flattens the envelope away.** It
+  returned a bare list of changes with the transaction stripped off, so a
+  consumer could not tell which of them were one transition (§36.2) and did not
+  have `space_id` or `tx_id` to deduplicate with (§36.3). It now returns one
+  envelope per commit, and its cursor moved from a field inside the body to the
+  paging slot every other META command uses.
+- **`@ldclabs/kip-do`'s `HISTORY ELEMENT` was version-grained** — one row per
+  element version, `{element, version, space_seq, tx_id, op}` — where the Rust
+  engine answered in transactions. It now answers in envelopes whose `changes`
+  are narrowed to the element asked about.
+- **The change cursor is the coordinate the page consumed**, issued whenever it
+  consumed one. The Rust engine took it from the rows that survived the
+  visibility filter and only issued it when the stream was truncated, so a
+  reader whose whole page was hidden was handed back where it started and
+  re-read the same window forever.
+- **`HISTORY ELEMENT` on an element that is not there refuses** rather than
+  answering with an empty chronology. Both engines were non-disclosing already —
+  Rust returned `[]` for absent and invisible alike, kip-do refused both — but
+  an empty page already means "nothing in this range", so silence was the less
+  useful of the two equally compliant answers.
+- **A change record's `kind` is lowercase** in both engines. kip-do spelled it
+  `"Assertion"` in the change stream while spelling it `"assertion"` everywhere
+  else, including in the elements the stream describes.
+- The envelope carries `snapshot_seq`, `status` and
+  `schema_environment_version` beyond §36.1's conceptual shape. They are on the
+  shared type rather than added per engine: an envelope is the one artifact two
+  engines hand the same consumer, so a field one invents is a field the other
+  silently lacks.
 
 ### Fixed — `@ldclabs/kip-do` stored no scalar Evidence payload
 

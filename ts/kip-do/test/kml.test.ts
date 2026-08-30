@@ -708,10 +708,10 @@ describe('KML', () => {
       // The change stream names it `purge_payload`, not `purge`: a follower
       // that could not tell the two apart would read a data-minimization
       // decision as the loss of the record (§36).
-      const history = nexus.describe('HISTORY ELEMENT "E-1"') as {
-        op: string
+      const history = nexus.describe('HISTORY ELEMENT "E-1"') as unknown as {
+        changes: { op: string }[]
       }[]
-      expect(history.map((entry) => entry.op)).toEqual([
+      expect(history.flatMap((e) => e.changes.map((c) => c.op))).toEqual([
         'create',
         'purge_payload',
       ])

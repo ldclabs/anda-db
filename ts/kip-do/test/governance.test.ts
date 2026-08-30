@@ -334,10 +334,10 @@ describe('review regressions', () => {
     const suspended = await withRegression('history-control', (nexus) => {
       nexus.execute('CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }')
       nexus.systemSession().classify(parseElementId('C-1'), 'secret')
-      const changes = nexus.describe('CHANGES AFTER SEQ 1') as {
+      const changes = nexus.describe('CHANGES AFTER SEQ 1') as unknown as {
         changes: { id: string; op: string }[]
-      }
-      expect(changes.changes).toContainEqual(
+      }[]
+      expect(changes.flatMap((envelope) => envelope.changes)).toContainEqual(
         expect.objectContaining({ id: 'C-1', op: 'classify' }),
       )
       return nexus.store.governance.setPrincipalStatus(
@@ -1340,17 +1340,22 @@ describe('the read path', () => {
       'changes',
       { actions: ['read', 'read_history'], scope: { elements: ['C-1'] } },
       (nexus, session) => {
-        const all = nexus.describe('CHANGES SINCE 0') as { changes: { id: string }[] }
-        expect(all.changes.map((change) => change.id).sort()).toEqual([
-          'C-1',
-          'C-2',
-          'P-1',
-        ])
-
-        const mine = session.describe('CHANGES SINCE 0') as {
+        const all = nexus.describe('CHANGES SINCE 0') as unknown as {
           changes: { id: string }[]
-        }
-        expect(mine.changes.map((change) => change.id)).toEqual(['C-1'])
+        }[]
+        expect(
+          all
+            .flatMap((envelope) => envelope.changes)
+            .map((change) => change.id)
+            .sort(),
+        ).toEqual(['C-1', 'C-2', 'P-1'])
+
+        const mine = session.describe('CHANGES SINCE 0') as unknown as {
+          changes: { id: string }[]
+        }[]
+        expect(
+          mine.flatMap((envelope) => envelope.changes).map((c) => c.id),
+        ).toEqual(['C-1'])
       },
     )
   })
@@ -1365,23 +1370,24 @@ describe('the read path', () => {
         nexus.execute('CREATE CONCEPT ?c { TYPE "Person" NAME "Bob" }')
         nexus.execute('CREATE CONCEPT ?c { TYPE "Person" NAME "Carol" }')
 
-        const first = session.describe('CHANGES SINCE 0') as {
-          changes: { id: string }[]
-          cursor: number
-        }
-        expect(first.changes.map((change) => change.id)).toEqual(['C-1'])
+        const first = session.describePage('CHANGES SINCE 0')
+        const seen = first.result as unknown as { changes: { id: string }[] }[]
+        expect(
+          seen.flatMap((envelope) => envelope.changes).map((c) => c.id),
+        ).toEqual(['C-1'])
         // The cursor names the coordinate the page consumed, not the last one
         // it could show. Taking it from the visible rows would leave a reader
         // whose page was entirely hidden exactly where it started, re-reading
         // the same window forever.
-        expect(first.cursor).toBe(nexus.store.currentSeq(nexus.space))
+        expect(first.nextCursor).toBe(
+          String(nexus.store.currentSeq(nexus.space)),
+        )
 
-        const next = session.describe(`CHANGES SINCE ${first.cursor}`) as {
-          changes: { id: string }[]
-          cursor: number
-        }
-        expect(next.changes).toEqual([])
-        expect(next.cursor).toBe(first.cursor)
+        const next = session.describePage(`CHANGES SINCE ${first.nextCursor}`)
+        expect(next.result).toEqual([])
+        // Caught up: nothing was consumed, so no new coordinate is issued and
+        // the follower keeps the one it holds.
+        expect(next.nextCursor).toBeNull()
       },
     )
   })
@@ -1890,8 +1896,13 @@ describe('classification and influence authority', () => {
 
       // The two logs answer different questions: the version log says what the
       // element looked like, the audit says who decided that and why (§177).
-      const versions = nexus.describe('HISTORY ELEMENT "C-1"') as { op: string }[]
-      expect(versions.map((v) => v.op)).toEqual(['create', 'classify'])
+      const versions = nexus.describe('HISTORY ELEMENT "C-1"') as unknown as {
+        changes: { op: string }[]
+      }[]
+      expect(versions.flatMap((e) => e.changes.map((c) => c.op))).toEqual([
+        'create',
+        'classify',
+      ])
 
       const entries = session.readAudit()
       const classified = entries.find((entry) => entry.operation === 'classify')
@@ -2032,8 +2043,12 @@ describe('erasure', () => {
       // An element scrubbed only in its current row stays fully readable
       // through the version log, which would make the purge a purge in name
       // only (§19.3).
-      const versions = nexus.describe('HISTORY ELEMENT "C-2"') as { op: string }[]
-      expect(versions.map((v) => v.op)).toEqual(['purge'])
+      const versions = nexus.describe('HISTORY ELEMENT "C-2"') as unknown as {
+        changes: { op: string }[]
+      }[]
+      expect(versions.flatMap((e) => e.changes.map((c) => c.op))).toEqual([
+        'purge',
+      ])
     })
   })
 

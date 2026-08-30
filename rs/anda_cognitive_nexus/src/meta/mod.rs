@@ -234,6 +234,27 @@ pub fn capabilities(authority: Option<&EffectiveAuthority>, auth: &AuthContext) 
                 "note": "a transformation that recorded no Activity provenance is not \
                          discoverable here"
             },
+            // §36.1, §68.1: HISTORY and CHANGES are the same unit — one
+            // committed transition — asked for over different ranges, so they
+            // answer in one shape. Stated because a consumer that assumed a
+            // flat change list would lose the atomicity §36.2 guarantees and
+            // the deduplication key §36.3 needs.
+            "change_stream": {
+                "grain": "one Change Envelope per committed transition",
+                "envelope": [
+                    "space_id", "space_seq", "tx_id", "committed_at",
+                    "transaction_class", "snapshot_seq", "status",
+                    "schema_environment_version", "changes"
+                ],
+                "change": ["id", "kind", "op", "version"],
+                "deduplicate_by": "space_id + space_seq + tx_id",
+                "shared_by": ["HISTORY ELEMENT", "HISTORY SPACE", "CHANGES"],
+                // The cursor is the coordinate the page consumed, issued
+                // whenever it consumed one — not only when the stream was
+                // truncated, and never taken from the rows that survived the
+                // visibility filter.
+                "cursor": "the last space_seq consumed, opaque to nobody"
+            },
             "paging": {
                 // §44.8 and §88.4: a cursor is opaque, carries the coordinate the
                 // traversal began at, and belongs to the family that issued it.

@@ -185,41 +185,70 @@ describe('META', () => {
     })
   })
 
-  it('answers HISTORY from the version log and the journal', async () => {
+  it('answers HISTORY in transition envelopes, for an element and for a Space', async () => {
+    // §68.1 calls HISTORY a transition chronology and §36.2 makes a transition
+    // one envelope, so an element's history is the same grain as a Space's —
+    // narrowed to the changes that element took part in, not re-grained into
+    // one row per version.
     await withNexus('history', (nexus) => {
       const [id] = nexus.query(
         'FIND(?c.id) WHERE { ?c CONCEPT {name: "Alice"} }',
       ) as string[]
       nexus.execute(`ARCHIVE "${id!}"`)
 
-      const versions = nexus.describe(`HISTORY ELEMENT "${id!}"`) as {
-        version: number
-        op: string
+      const element = nexus.describe(`HISTORY ELEMENT "${id!}"`) as {
+        space_id: string
+        space_seq: number
+        tx_id: string
+        status: string
+        changes: { id: string; kind: string; op: string; version: number }[]
       }[]
-      expect(versions.map((v) => v.op)).toEqual(['create', 'archive'])
-      expect(versions.map((v) => v.version)).toEqual([1, 2])
+      expect(element.map((e) => e.changes.map((c) => c.op))).toEqual([
+        ['create'],
+        ['archive'],
+      ])
+      expect(element.map((e) => e.changes.map((c) => c.version))).toEqual([
+        [1],
+        [2],
+      ])
+      // §36.3's deduplication key is present on every envelope, which is what
+      // a follower needs and what a flattened change list cannot offer.
+      for (const envelope of element) {
+        expect(envelope.space_id).toBe('kip:space:default')
+        expect(envelope.tx_id).not.toBe('')
+        expect(envelope.status).toBe('committed')
+        // Narrowed to the element asked about, not to the whole transition.
+        expect(envelope.changes.every((c) => c.id === id)).toBe(true)
+      }
 
       const space = nexus.describe('HISTORY SPACE') as { space_seq: number }[]
       expect(space).toHaveLength(2)
+      expect(space.map((s) => s.space_seq)).toEqual([1, 2])
     })
   })
 
-  it('reports CHANGES after a coordinate and hands back where it got to', async () => {
+  it('reports CHANGES as envelopes and hands back where it got to', async () => {
     await withNexus('changes', (nexus) => {
-      const first = nexus.describe('CHANGES AFTER SEQ 0') as {
-        changes: { id: string; op: string }[]
-        cursor: number
-      }
-      expect(first.changes).toHaveLength(4)
-      expect(first.cursor).toBe(1)
+      // One envelope per committed transition. The setup is a single MUTATE, so
+      // its four changes arrive together rather than as four loose rows: a
+      // consumer handed them loose could not tell they were one transition
+      // (§36.2).
+      const first = nexus.describePage('CHANGES AFTER SEQ 0')
+      const envelopes = first.result as unknown as {
+        space_seq: number
+        changes: unknown[]
+      }[]
+      expect(envelopes).toHaveLength(1)
+      expect(envelopes[0]!.changes).toHaveLength(4)
+      expect(envelopes[0]!.space_seq).toBe(1)
+      // The cursor rides the paging slot every other META command uses.
+      expect(first.nextCursor).toBe('1')
+
       // A caller that saw nothing holds the same place rather than starting
       // over.
-      const again = nexus.describe('CHANGES AFTER SEQ 1') as {
-        changes: unknown[]
-        cursor: number
-      }
-      expect(again.changes).toEqual([])
-      expect(again.cursor).toBe(1)
+      const again = nexus.describePage('CHANGES AFTER SEQ 1')
+      expect(again.result).toEqual([])
+      expect(again.nextCursor).toBeNull()
     })
   })
 

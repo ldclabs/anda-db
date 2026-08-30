@@ -428,7 +428,10 @@ export class Store {
     // rolled back rolled its index entry back with it.
     indexElement(this.sql, element)
 
-    return { id, kind: element.kind, op, version: row.version }
+    // Lowercase, as every other wire tag: `?c.kind` answers "concept", and a
+    // change record that said "Concept" would be the one place the stream
+    // spelled a Core kind differently from the elements it describes.
+    return { id, kind: element.kind.toLowerCase(), op, version: row.version }
   }
 
   /** Replaces the reverse-index entries for one element. */

@@ -2715,6 +2715,56 @@ async fn element_governance_changes_join_the_transaction_journal() {
 }
 
 #[tokio::test]
+async fn a_change_cursor_walks_past_a_window_the_reader_may_not_see() {
+    // The cursor names the coordinate the page *consumed*, not the last one it
+    // could show. Taken from the rows that survived the visibility filter, a
+    // reader whose whole page is hidden would be handed back where it started
+    // and would re-read the same window forever instead of walking past it.
+    let nexus = stocked("change_cursor").await;
+    let owner = nexus.system_session();
+    run_as(
+        &owner,
+        r#"CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }"#,
+    )
+    .await;
+
+    let reader = agent(nexus.governance(), "kip:principal:reader").await;
+    grant(
+        &nexus,
+        &reader,
+        &["read", "read_history"],
+        AuthorityScope {
+            elements: vec!["C-999".to_string()],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // Every transaction in the Space touches something this reader may not see.
+    let session = nexus.session(AuthContext::principal(&reader));
+    let response = run_as(&session, "CHANGES AFTER SEQ 0").await;
+    assert!(
+        response
+            .first_result()
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "the reader may see none of it"
+    );
+
+    let seq = nexus.store.get_space(DEFAULT_SPACE).await.unwrap().seq;
+    assert_eq!(
+        response
+            .results
+            .first()
+            .and_then(|result| result.next_cursor.clone()),
+        Some(seq.to_string()),
+        "and is still told where the page got to, or it never advances"
+    );
+}
+
+#[tokio::test]
 async fn elevation_honours_the_grants_influence_ceiling() {
     let nexus = stocked("elevation_ceiling").await;
     run_as(

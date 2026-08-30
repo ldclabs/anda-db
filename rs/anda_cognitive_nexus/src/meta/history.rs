@@ -77,6 +77,20 @@ pub async fn history(cx: &mut Context<'_>, command: &HistoryCommand) -> Result<A
         ),
     };
 
+    // Through the read path's choke point, so an element this caller may not
+    // read answers exactly as one that was never written does (§103, §30.4).
+    // Answering `[]` for both would be equally non-disclosing but less useful:
+    // an empty page already means "nothing in this range", so a mistyped id
+    // would come back as silence instead of as a mistake.
+    if let Some(named) = &element {
+        let id = named.parse::<crate::id::ElementId>()?;
+        if cx.load(id).await?.is_none() {
+            return Err(KipError::not_found_or_not_visible(format!(
+                "no element {id}"
+            )));
+        }
+    }
+
     let from = bound(cx, from_seq, 0)?;
     let to = bound(cx, to_seq, u64::MAX)?;
     let limit = match limit {
@@ -155,21 +169,25 @@ pub async fn changes(cx: &mut Context<'_>, command: &ChangesCommand) -> Result<A
     )
     .await?;
     rows.sort_by_key(|row| row.seq);
+    rows.truncate(limit);
+
+    // The coordinate this page *consumed*, read before the visibility filter
+    // and not after it. They differ for a restricted caller whose authority
+    // hides a whole page of transactions: a cursor taken from the visible rows
+    // would leave it exactly where it started, and the follower would re-read
+    // the same hidden window forever instead of walking past it.
+    let consumed = rows.last().map(|row| row.seq);
     visible_changes(cx, &mut rows).await;
 
-    let last = rows.iter().take(limit).map(|row| row.seq).next_back();
-    let more = rows.len() > limit;
-    let page: Vec<Json> = rows
-        .into_iter()
-        .take(limit)
-        .map(|row| entry(&row, None))
-        .collect();
+    let page: Vec<Json> = rows.iter().map(|row| entry(row, None)).collect();
 
     Ok(Answer {
         result: Json::Array(page),
-        // The cursor advances to the last sequence delivered, so resuming
-        // never redelivers and never skips.
-        next_cursor: more.then(|| last.unwrap_or(after).to_string()),
+        // Issued whenever the page consumed anything, not only when the stream
+        // was truncated: a follower that has caught up still needs to know
+        // where it got to, and deriving that from the envelopes is work only it
+        // can get wrong.
+        next_cursor: consumed.map(|seq| seq.to_string()),
     })
 }
 
@@ -261,6 +279,17 @@ async fn visible_changes(cx: &mut Context<'_>, rows: &mut Vec<TransactionRow>) {
     rows.retain(|row| !row.changes.is_empty());
 }
 
+/// One journal row as the Change Envelope §36.1 fixes.
+///
+/// Built through [`anda_kip::ChangeEnvelope`] rather than by hand so `HISTORY
+/// ELEMENT`, `HISTORY SPACE` and `CHANGES` cannot answer the same question in
+/// three shapes — and so the other engine, which builds the same type, cannot
+/// answer it in a fourth.
+///
+/// `element` narrows the `changes` list to the one the caller asked about. The
+/// envelope still describes the whole transition, because that is what a
+/// transition is (§36.2); what is filtered is which of its changes are
+/// relevant to this chronology.
 fn entry(row: &TransactionRow, element: Option<&str>) -> Json {
     let changes: Vec<Json> = match element {
         Some(id) => row
@@ -271,17 +300,18 @@ fn entry(row: &TransactionRow, element: Option<&str>) -> Json {
             .collect(),
         None => row.changes.clone(),
     };
-    serde_json::json!({
-        "tx_id": row.tx_id,
-        "space_id": row.space,
-        "space_seq": row.seq,
-        "snapshot_seq": row.snapshot_seq,
-        "committed_at": row.committed_at,
-        "status": row.status,
-        "transaction_class": row.transaction_class,
-        "schema_environment_version": row.schema_environment_version,
-        "changes": changes,
-    })
+    let envelope = anda_kip::ChangeEnvelope {
+        space_id: row.space.clone(),
+        space_seq: row.seq,
+        tx_id: row.tx_id.clone(),
+        committed_at: Some(row.committed_at.clone()),
+        transaction_class: Some(row.transaction_class.clone()),
+        snapshot_seq: Some(row.snapshot_seq),
+        status: Some(row.status.clone()),
+        schema_environment_version: Some(row.schema_environment_version),
+        changes,
+    };
+    serde_json::to_value(&envelope).unwrap_or(Json::Null)
 }
 
 fn bound(cx: &Context<'_>, scalar: Option<&Scalar>, default: u64) -> Result<u64, KipError> {

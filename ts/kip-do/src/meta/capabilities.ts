@@ -124,6 +124,32 @@ export function capabilities(): Json {
           'a CREATE under a client_key already used resolves to that element ' +
           'instead of creating a second (§52.1)',
       },
+      // §36.1, §68.1: HISTORY and CHANGES are the same unit — one committed
+      // transition — asked for over different ranges, so they answer in one
+      // shape. Stated because a consumer that assumed a flat change list would
+      // lose the atomicity §36.2 guarantees and the deduplication key §36.3
+      // needs.
+      change_stream: {
+        grain: 'one Change Envelope per committed transition',
+        envelope: [
+          'space_id',
+          'space_seq',
+          'tx_id',
+          'committed_at',
+          'transaction_class',
+          'snapshot_seq',
+          'status',
+          'schema_environment_version',
+          'changes',
+        ],
+        change: ['id', 'kind', 'op', 'version'],
+        deduplicate_by: 'space_id + space_seq + tx_id',
+        shared_by: ['HISTORY ELEMENT', 'HISTORY SPACE', 'CHANGES'],
+        // The cursor is the coordinate the page consumed, issued whenever it
+        // consumed one — not only when the stream was truncated, and never
+        // taken from the rows that survived the visibility filter.
+        cursor: 'the last space_seq consumed, opaque to nobody',
+      },
       // §60.6: the data-minimization instrument. Byte destruction that keeps
       // the evidence event, which is a different promise from element purge and
       // worth stating as one.

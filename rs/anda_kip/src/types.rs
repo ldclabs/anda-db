@@ -684,6 +684,18 @@ pub const SCORE_SEMANTICS: &[&str] = &[
 /// at-least-once, so `space_id + space_seq + tx_id` is the deduplication key
 /// (§36.3) — and a replayed envelope must not become new Evidence,
 /// reinforcement or a duplicated Experience (§36.4).
+///
+/// **`HISTORY` answers in envelopes too.** §68.1 defines `HISTORY` as
+/// *transition chronology*, and §36.2 defines a transition as one envelope, so
+/// `HISTORY ELEMENT` and `HISTORY SPACE` are the same unit asked for over a
+/// different range — an element's, or a Space's. Emitting one grain there and
+/// another in `CHANGES` would make "what happened to this element" and "what
+/// happened here" two incomparable answers to the same question.
+///
+/// The fields past §36.1's conceptual shape are optional and carried here
+/// rather than added per engine: an envelope is the one artifact two engines
+/// hand the same consumer, so a field one of them invents is a field the other
+/// silently lacks.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct ChangeEnvelope {
     /// The Space that committed.
@@ -698,6 +710,23 @@ pub struct ChangeEnvelope {
     /// The transaction class, e.g. `cognitive`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transaction_class: Option<String>,
+    /// The coordinate the transaction read from, when the runtime records one.
+    ///
+    /// `space_seq` says what this commit produced; this says what it was
+    /// decided against, which is what a reader needs to tell a stale write
+    /// from a serial one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_seq: Option<u64>,
+    /// `committed`, `aborted` or `no_effect`, when the runtime journals it.
+    ///
+    /// A `no_effect` transition is a real entry in a chronology — the caller
+    /// asked and nothing moved — and dropping it would make the absence of a
+    /// change indistinguishable from the absence of a request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// The Schema Environment version in force when it committed (§144).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_environment_version: Option<u64>,
     /// What changed. Shapes are engine-defined; the atomicity is not.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub changes: Vec<Json>,
@@ -833,12 +862,28 @@ mod tests {
             tx_id: "tx-900".into(),
             committed_at: Some("2026-01-01T00:00:00Z".into()),
             transaction_class: Some("cognitive".into()),
+            snapshot_seq: Some(1500),
+            status: Some("committed".into()),
+            schema_environment_version: Some(1),
             changes: vec![serde_json::json!({ "kind": "concept", "op": "create" })],
         };
         assert_eq!(envelope.dedup_key(), ("space-1", 1501, "tx-900"));
 
         let replayed = envelope.clone();
         assert_eq!(replayed.dedup_key(), envelope.dedup_key());
+
+        // The fields past §36.1's conceptual shape are optional, so an engine
+        // that journals none of them still produces a legal envelope — and the
+        // wire form omits them rather than reporting a guess.
+        let minimal = ChangeEnvelope {
+            space_id: "space-1".into(),
+            space_seq: 1501,
+            tx_id: "tx-900".into(),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&minimal).unwrap();
+        assert_eq!(json.as_object().unwrap().len(), 3);
+        assert_eq!(json["space_seq"], 1501);
     }
 
     #[test]
