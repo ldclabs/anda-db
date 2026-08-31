@@ -612,9 +612,10 @@ async fn derived(name: &str) -> CognitiveNexus {
                 NAME "Plan a migration"
                 SET ATTRIBUTES {
                     skill_class: "workflow",
+                    task_family: "migration/rollback",
                     summary: "Write the rollback first",
                     procedure: "1. write the rollback 2. migrate",
-                    status: "candidate"
+                    status: "proposed"
                 }
             }
             CREATE ACTIVITY ?compile {

@@ -2,7 +2,7 @@
 
 All notable changes to this workspace are documented in this file.
 
-## [Unreleased] — the proactivity gap: watches, working state, derivation review, payload purge
+## [Unreleased] — the proactivity gap, and the consequence channel that closes the loop
 
 `anda_kip` 0.13.0, `anda_cognitive_nexus` 0.13.0,
 `anda_cognitive_nexus_server` 0.13.0, `@ldclabs/kip-do` 0.13.0 (still
@@ -153,14 +153,71 @@ payload the observation and invariant 33 forbids re-typing a transport-supplied
 one. The reference engine always stored it. A conformance case now pins the
 inline payload across both engines, which is what would have caught this.
 
+### Added — the consequence channel (§15.7) and the outcome-graded Skill lifecycle
+
+Syncs upstream [KIP 2.0 `12cfd4d`](https://github.com/ldclabs/kip). Everything
+the draft had so far let the system watch the world; nothing let the world vote
+back. A signal in this memory can now be held three ways: asserted by whoever
+claimed it (`confidence`), metabolized by use and disuse (`memory_strength`),
+or **earned** — changed because a recorded consequence graded it.
+
+- **Outcome Evidence** joins the Core baseline registry: `evidence_class:
+  "outcome"` (§15.2, §15.7) is what the world did after a decision, an action
+  or a trialed procedure. Invariant 36 is the discipline around it — an actor's
+  report about its own action is `agent_statement`, never `outcome`, and
+  re-typed instrument output is `derived_result`. That separation is auditable
+  rather than enforceable: engine origin already records which Principal wrote
+  an element, and it is Governance, not Core, that restricts who may write the
+  class.
+- The Cognitive Memory Profile gains the **`OutcomeRecord`** Facet — the graded
+  index over an untouched payload: `task_family` (the join key grading
+  subscribes to), `outcome_status` (`success | partial | failure | aborted |
+  unknown`) and optional `magnitude`. It is the first Facet the Profile ships
+  that declares members `required` and `mutable: false`, and both engines now
+  hold that declaration (below).
+- Two Activity classes: `outcome_observation` (the instrument's record of
+  writing an outcome) and `lifecycle_verdict` (one deterministic, recomputable
+  evaluation of a graded stream). Appendix F.6 spells the transition out as one
+  guarded statement — a verdict Activity pinning `parameters_digest` and its
+  graded `inputs`, plus an `UPDATE ... EXPECT VERSION` — and needs no new
+  syntax; the existing plumbing was already suited to it.
+
+Neither engine implements a verdict rule, and neither should: how a comparison
+is constructed is Brain policy. What the engines owe is the schema discipline
+and the guarantee that the transition lands as one recomputable commit.
+
+### Changed — breaking: the Skill lifecycle vocabulary
+
+The Cognitive Memory Profile moves to an outcome-graded lifecycle, so a Space
+holding Skills written against the old vocabulary needs a migration:
+
+- `Skill.task_family` is **required**: the outcome stream that can prove the
+  Skill wrong. A pattern no stream could grade is refused at creation — store
+  it as an `Insight`.
+- `Skill.status` becomes `proposed | trialed | adopted | revoked`. The old
+  `candidate | validated | needs_review | deprecated | archived` values are
+  gone, and a write carrying one is a `ConstraintViolation`.
+- `Skill.last_validated_at` is removed. `SkillUtility` drops
+  `last_validated_at` and gains `graded_count` and `last_verdict_at`; the
+  tallies count graded outcomes under the Skill's `task_family`, never the
+  acting model's own report.
+- §31.4: an imported Skill enters `proposed` with no transferred lifecycle
+  standing, exactly as source trust (§39.5) and source authority (§41.4) never
+  transfer.
+
 ### Changed — vendored artifacts
 
 - `rs/anda_kip/{SPECIFICATION,KIPSyntax,SelfInstructions,SystemInstructions}.md`,
   `grammar/{KML,META}.ebnf`, `profiles/CognitiveMemoryProfile-2.0.md` and
-  `brain/*.md` re-synced from upstream `v2/`.
+  `brain/*.md` re-synced from upstream `v2/`, through `12cfd4d`.
 - `rs/anda_cognitive_nexus/profiles/cognitive-memory-2.0.0.json` re-copied
   verbatim; its `content_digest` moves to
-  `sha256:16c21c2888130b1e1b1d2a7899a83a063b40b1d3d75549532121bef1d5395ac8`.
+  `sha256:7a3a62d0b2257ea1b30d3be184eb7c791419d104d03fc328b70c875e76183384`.
+  The Profile stays at `2.0.0`: KIP 2.0 is unreleased, and a draft that moved a
+  version for every revision would spend the version space it exists to
+  protect. §150 means what it says all the same — a Space that already
+  installed the previous `@2.0.0` bytes refuses these with `DigestMismatch`, so
+  a development Space carried across this change has to be recreated.
 - `@ldclabs/kip-lang` moves to `^2.1.0`, which parses and lowers both new
   statements. The WASM parser oracle and the generated fixtures/corpus are
   rebuilt with it, and the AST parity fixture is regenerated: `ListCommand`

@@ -543,6 +543,7 @@ pub const EVIDENCE_CLASSES: &[&str] = &[
     "external_assertion",
     "human_feedback",
     "derived_result",
+    "outcome",
 ];
 
 /// The baseline Activity classes (Spec §16.2).

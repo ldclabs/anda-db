@@ -485,7 +485,7 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
       "Skill": {
         "ref": "kip://profiles/cognitive-memory@2.0.0/Skill",
         "kind": "ConceptType",
-        "description": "Reusable procedural cognition compiled from Experience, Evidence, or validated instruction.",
+        "description": "Reusable procedural cognition compiled from Experience, Evidence, or validated instruction. Carries a required task_family (its scoring handle) and an outcome-graded lifecycle: proposed | trialed | adopted | revoked.",
         "attributes": {
           "open": true,
           "fields": {
@@ -505,6 +505,11 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
                 "code_pattern",
                 "subagent_pattern"
               ]
+            },
+            "task_family": {
+              "type": "string",
+              "required": true,
+              "mutable": true
             },
             "summary": {
               "type": "string",
@@ -577,22 +582,13 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
               "required": true,
               "mutable": true,
               "enum": [
-                "candidate",
-                "validated",
-                "needs_review",
-                "deprecated",
-                "archived"
+                "proposed",
+                "trialed",
+                "adopted",
+                "revoked"
               ]
             },
             "created_at": {
-              "type": [
-                "timestamp",
-                "null"
-              ],
-              "required": false,
-              "mutable": true
-            },
-            "last_validated_at": {
               "type": [
                 "timestamp",
                 "null"
@@ -603,7 +599,8 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
           }
         },
         "model_hints": {
-          "authority_invariant": "Validated Skill != executable authority."
+          "authority_invariant": "Adopted Skill != executable authority.",
+          "lifecycle_invariant": "Transitions execute only as deterministic lifecycle_verdict Activities over graded Outcome Evidence; the acting model never promotes, and revocation is never harder than adoption."
         }
       },
       "SleepTask": {
@@ -995,7 +992,7 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
       "SkillUtility": {
         "ref": "kip://profiles/cognitive-memory@2.0.0/SkillUtility",
         "kind": "FacetDefinition",
-        "description": "Mutable empirical/procedural usefulness state for Skill; not epistemic probability or authority.",
+        "description": "Mutable empirical/procedural usefulness state for Skill: tallies of graded Outcome Evidence under the Skill's task_family, maintained by verdict/grading Activities, never by the acting model's own report. Not epistemic probability or authority.",
         "closed": true,
         "applicable_to": {
           "concept_types": [
@@ -1022,7 +1019,13 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
             "mutable": true,
             "minimum": 0
           },
-          "last_validated_at": {
+          "graded_count": {
+            "type": "integer",
+            "required": false,
+            "mutable": true,
+            "minimum": 0
+          },
+          "last_verdict_at": {
             "type": [
               "timestamp",
               "null"
@@ -1073,6 +1076,49 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
         },
         "model_hints": {
           "epistemic_invariant": "DerivationState != Assertion lifecycle; stale != retracted, wrong, or excluded from recall."
+        }
+      },
+      "OutcomeRecord": {
+        "ref": "kip://profiles/cognitive-memory@2.0.0/OutcomeRecord",
+        "kind": "FacetDefinition",
+        "description": "Graded index over Outcome Evidence (evidence_class outcome): the consequence channel entry. task_family is the join key grading subscribes to; the raw instrument output stays untouched in the Evidence payload.",
+        "closed": true,
+        "applicable_to": {
+          "kinds": [
+            "Evidence"
+          ]
+        },
+        "fields": {
+          "task_family": {
+            "type": "string",
+            "required": true,
+            "mutable": false
+          },
+          "outcome_status": {
+            "type": "string",
+            "required": true,
+            "mutable": false,
+            "enum": [
+              "success",
+              "partial",
+              "failure",
+              "aborted",
+              "unknown"
+            ]
+          },
+          "magnitude": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "required": false,
+            "mutable": false,
+            "minimum": 0,
+            "maximum": 1
+          }
+        },
+        "model_hints": {
+          "origin_invariant": "Written by instrumentation, never by the actor whose action it grades; the actor's account is agent_statement, citable as context only."
         }
       }
     },
@@ -1400,9 +1446,11 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
           "watch_fire",
           "action_gate",
           "derivation_review",
-          "working_state_refresh"
+          "working_state_refresh",
+          "outcome_observation",
+          "lifecycle_verdict"
         ],
-        "description": "Recommended Profile activity_class values; Activity remains a KIP Core kind. action_gate outcomes: act | ask | defer | silence."
+        "description": "Recommended Profile activity_class values; Activity remains a KIP Core kind. action_gate outcomes: act | ask | defer | silence. outcome_observation is the instrument's record of writing Outcome Evidence; lifecycle_verdict is the deterministic, recomputable evaluation that moves a Skill between lifecycle states."
       }
     }
   },
@@ -1484,6 +1532,18 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
       "scope": "kip://profiles/cognitive-memory@2.0.0/WorkingState",
       "kind": "epistemic_boundary",
       "description": "WorkingState is a derived view served with its basis_seq; it is never cited as Evidence and never corroborates its inputs."
+    },
+    {
+      "id": "cognitive-memory.outcome-origin-separation",
+      "scope": "kip://profiles/cognitive-memory@2.0.0/OutcomeRecord",
+      "kind": "provenance_invariant",
+      "description": "Outcome Evidence is written by instrumentation; an actor's self-report about its own action's result is never Outcome Evidence, and re-typed instrument output is derived_result, not outcome."
+    },
+    {
+      "id": "cognitive-memory.skill-lifecycle-verdict",
+      "scope": "kip://profiles/cognitive-memory@2.0.0/Skill",
+      "kind": "profile_invariant",
+      "description": "Skill lifecycle transitions (proposed | trialed | adopted | revoked) execute only as deterministic lifecycle_verdict Activities over graded Outcome Evidence under the Skill's task_family; trial entry requires a task_family; revocation is never harder than adoption; adoption is provisional; lifecycle standing does not survive import."
     }
   ],
   "aliases": {
@@ -1507,14 +1567,16 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
       "Experience = goal-directed state/action/observation trajectory",
       "ExperienceStep = ordered observable step; no hidden chain-of-thought",
       "caused_by = explicit effect->cause claim between steps; edge order alone is not causality",
-      "Skill = reusable procedure; not execution authority",
+      "Skill = reusable procedure with a task_family; proposed|trialed|adopted|revoked; not execution authority",
       "Commitment = prospective memory; not automatic scheduling",
       "Watch = armed attention (delta or silence); firing grants nothing",
       "SelfModel = cognition about self; not Governance",
       "WorkingState = what matters now, with its basis_seq; never Evidence",
       "MnemonicState = accessibility/importance/expected usefulness; not confidence",
-      "SkillUtility = procedural usefulness; not authority",
-      "DerivationState = review state relative to provenance roots; not belief"
+      "SkillUtility = graded outcome tallies + utility; not authority",
+      "DerivationState = review state relative to provenance roots; not belief",
+      "OutcomeRecord = task_family + outcome_status on Outcome Evidence; instruments write it, never the graded actor",
+      "lifecycle_verdict = deterministic recorded evaluation; the only path between Skill lifecycle states"
     ],
     "common_confusions": [
       "Event != Experience",
@@ -1531,7 +1593,9 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
       "same_as claim != merged identity",
       "fired Watch != authorized action",
       "stale != retracted",
-      "WorkingState != Evidence"
+      "WorkingState != Evidence",
+      "Outcome Evidence != the acting model's self-report",
+      "adopted != authorized"
     ]
   },
   "canonicalization": {
@@ -1541,7 +1605,7 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
   },
   "integrity": {
     "digest_profile": "kip-draft-canonical-json-v1",
-    "content_digest": "sha256:16c21c2888130b1e1b1d2a7899a83a063b40b1d3d75549532121bef1d5395ac8",
+    "content_digest": "sha256:7a3a62d0b2257ea1b30d3be184eb7c791419d104d03fc328b70c875e76183384",
     "covers": "all top-level fields except integrity",
     "signatures": []
   }
