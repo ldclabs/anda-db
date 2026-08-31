@@ -26,7 +26,7 @@
  * candidate elements therefore costs one control-plane load, not ten thousand.
  *
  * It also means authority is re-resolved on every request, which is what makes
- * revocation take effect for a session that started before it (§188, §245).
+ * revocation take effect for a session that started before it (§28.6).
  *
  * ## Why one allow is chosen rather than all of them merged
  *
@@ -37,7 +37,7 @@
  *
  * Obligations go the other way and accumulate across every matching Policy
  * statement, because an obligation is what the deployment requires of the
- * operation rather than a limit on one authority (§184).
+ * operation rather than a limit on one authority (§86.1).
  *
  * @see rs/anda_cognitive_nexus/src/governance/decision.rs
  */
@@ -219,10 +219,10 @@ export interface Authorization {
    *
    * What a Space-wide answer — a count, a total — may be built from. A permitted
    * decision under a narrowed authority is still permitted; it just cannot be
-   * the basis for a number that speaks for the whole Space (§106).
+   * the basis for a number that speaks for the whole Space (§88.6).
    */
   unrestricted: boolean
-  /** Why, in one line. Safe to return to the caller (§267). */
+  /** Why, in one line. Safe to return to the caller (§30.4). */
   reason: string
 }
 
@@ -232,7 +232,7 @@ export interface Authorization {
  * The message names the permission and nothing else. It does not say whether the
  * target exists, which policy statement matched, or who else holds the
  * permission — a denial that explained itself fully would be a disclosure channel
- * for the state it was protecting (§107, §267).
+ * for the state it was protecting (§30.4).
  */
 export function requirePermitted(decision: Authorization): Authorization {
   if (isPermitted(decision.decision)) {
@@ -360,12 +360,12 @@ export class EffectiveAuthority {
   }
 
   /**
-   * Reads the control plane as it stood at a past instant (§176, §177).
+   * Reads the control plane as it stood at a past instant (§48.5).
    *
    * Answers *who had access at time T*, which is a different question from *who
    * has access now* and must never be mistaken for it: an auditor who observes
    * that a Principal could read something in January learns nothing about today
-   * (§179). Nothing here is cached and nothing here authorizes — this is a
+   * (§48.5). Nothing here is cached and nothing here authorizes — this is a
    * reconstruction for an authorized reader, not a decision path.
    *
    * Delegations are resolved against the *present* authority of their delegator,
@@ -602,7 +602,7 @@ export class EffectiveAuthority {
    *
    * A Space-wide count is only honest when it is: a caller whose Grant is
    * narrowed to one classification must not be told how many elements exist
-   * outside it (§106). Answered from the authority rather than by scanning,
+   * outside it (§88.6). Answered from the authority rather than by scanning,
    * because the point is to avoid producing the number at all.
    */
   readsWholeSpace(auth: AuthContext): boolean {
@@ -640,7 +640,7 @@ export class EffectiveAuthority {
   /**
    * When the first of this Principal's authorities lapses, if any does.
    *
-   * §266 lists this among the things an Agent must be able to learn about
+   * §67.2 lists this among the things an Agent must be able to learn about
    * itself: autonomous planning that does not know when its Delegation expires
    * plans work it will not be allowed to finish.
    */
@@ -852,7 +852,7 @@ export class EffectiveAuthority {
    * Each link must name the previous as its parent and the last must name the
    * caller as its delegate. A chain that does not link is not a narrower
    * authority — it is two unrelated Delegations presented as one, which is how
-   * §238's amplification would be spelled if the linkage went unchecked.
+   * §28.5's amplification would be spelled if the linkage went unchecked.
    */
   static #resolveNamedChain(
     store: Store,
@@ -911,7 +911,7 @@ export class EffectiveAuthority {
   /**
    * The obligations that hold before any policy is consulted.
    *
-   * §172 lists operations whose absence from an audit log is itself the
+   * §29 lists operations whose absence from an audit log is itself the
    * incident. A deployment may audit more than this; it cannot audit less.
    */
   private baselineObligations(permission: Permission): PolicyObligations {

@@ -5,8 +5,8 @@
  * from it:
  *
  * ```text
- * field mask       a Grant may allow `read` over some members only (§109)
- * raw origin       `_system.origin` needs its own permission (§110)
+ * field mask       a Grant may allow `read` over some members only (§29.2)
+ * raw origin       `_system.origin` needs its own permission (§29)
  * ```
  *
  * ## Why the mask is applied at load, not at projection
@@ -52,7 +52,7 @@ const ALWAYS_VISIBLE = ['id', 'kind', 'space_id']
  * the field mask, because engine origin is a different disclosure from content:
  * it names the Principal that wrote the element and the channel it arrived on,
  * which is operational information about the deployment rather than about the
- * memory (§110).
+ * memory (§29).
  *
  * Mutates in place. The view it is handed was rendered for this query and is
  * cached by it, so a copy would be a second object to keep in step.
@@ -77,7 +77,7 @@ export function redactView(
  * Removing `origin` entirely would say "this element has no recorded origin",
  * which is a claim — and a false one, since every element here has one. What is
  * withheld is *whose*: the reader learns the write was attributed, not to whom
- * (§110).
+ * (§29).
  */
 function redactOrigin(system: unknown): void {
   if (system === null || typeof system !== 'object' || Array.isArray(system)) return

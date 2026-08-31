@@ -157,7 +157,7 @@ export const isQualified = (name: string): boolean => name.startsWith(SCHEME)
  * The kinds of symbol a Schema Package defines (Spec §17).
  *
  * Core element kinds are not in this list: a package cannot redefine what an
- * Assertion is (§240.22).
+ * Assertion is (§20.13).
  */
 export type SymbolKind =
   | 'ConceptType'

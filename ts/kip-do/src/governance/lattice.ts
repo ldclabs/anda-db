@@ -41,7 +41,7 @@
  */
 
 /**
- * The Principal the engine itself acts as (§212).
+ * The Principal the engine itself acts as (§28.2).
  *
  * It exists so that engine-performed maintenance is attributable to something
  * rather than to nobody. `$self` / `$system` semantic identity is a different
@@ -51,7 +51,7 @@ export const SYSTEM_PRINCIPAL = 'kip:principal:system'
 
 /**
  * The Principal an unauthenticated caller runs as, where a Space admits one
- * (§217).
+ * (§30.2).
  *
  * Named rather than absent: "no Principal" and "the anonymous Principal" must
  * not be the same value, or a bug that dropped the identity would look like a
@@ -123,7 +123,7 @@ export const classification = {
    *
    * This is what derived content inherits (§98). A summary of secret Evidence
    * is secret until somebody with `declassify` says otherwise — summarizing is
-   * not a declassification mechanism (§242).
+   * not a declassification mechanism (§31.2).
    */
   join(a: string, b: string): string {
     return classification.rank(a) >= classification.rank(b) ? a : b
@@ -131,7 +131,7 @@ export const classification = {
 } as const
 
 /**
- * How strongly a memory may influence action (§117–§122).
+ * How strongly a memory may influence action (§31.3).
  *
  * This is an authority ceiling, not a truth score. A memory can be certainly
  * true and still be `descriptive`: believing something and being permitted to
@@ -140,7 +140,7 @@ export const classification = {
  *
  * And the top of this ladder is still not permission to do anything: an
  * `executable` Skill may be *supplied* to an action runtime, which must
- * independently authorize the actual tool call (§122). Memory authority never
+ * independently authorize the actual tool call (§31.3). Memory authority never
  * becomes tool authority.
  */
 export const authority = {
@@ -153,7 +153,7 @@ export const authority = {
   /** May be supplied to an execution runtime as a procedure. */
   EXECUTABLE: 'executable',
 
-  /** What memory gets when nothing says otherwise, imports included (§125). */
+  /** What memory gets when nothing says otherwise, imports included (§31.4). */
   DEFAULT: 'descriptive',
 
   /**
@@ -180,7 +180,7 @@ export const authority = {
    * The lower of two authority classes.
    *
    * Derivation uses this, which is the whole of the non-amplification rule
-   * (§127): a summary of an advisory Skill is at most advisory, and no chain of
+   * (§31.5): a summary of an advisory Skill is at most advisory, and no chain of
    * reformatting turns a descriptive note into an executable one.
    */
   meet(a: string, b: string): string {
@@ -259,11 +259,11 @@ export const principalClass = {
   HUMAN: 'human',
   /** An autonomous agent acting under its own or a delegated identity. */
   AGENT: 'agent',
-  /** A machine identity for service-to-service calls (§218). */
+  /** A machine identity for service-to-service calls (§28.2). */
   SERVICE: 'service',
-  /** The engine's own identity for maintenance it performs itself (§212). */
+  /** The engine's own identity for maintenance it performs itself (§28.2). */
   SYSTEM: 'system',
-  /** An unauthenticated caller, where a Space's policy admits one (§217). */
+  /** An unauthenticated caller, where a Space's policy admits one (§30.2). */
   ANONYMOUS: 'anonymous',
 } as const
 

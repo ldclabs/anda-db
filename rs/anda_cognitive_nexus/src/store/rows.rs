@@ -40,9 +40,9 @@ pub mod state {
     /// says *where the identity went*, which is what lets a reader follow
     /// `merged_into` instead of concluding the Concept was retired.
     pub const MERGED: &str = "merged";
-    /// Held out of ordinary use by Governance, pending review (§133).
+    /// Held out of ordinary use by Governance, pending review (§39.2).
     ///
-    /// Distinct from `archived`, and the distinction is the point (§134).
+    /// Distinct from `archived`, and the distinction is the point (§39.2).
     /// Archiving says *this is no longer in ordinary recall*; quarantine says
     /// *local Governance does not currently allow ordinary use of this*. Both
     /// leave the element readable to an authorized reviewer, and neither says
@@ -428,7 +428,7 @@ pub struct SpaceRow {
     ///
     /// Kept apart from `default_policy_id` because trust and access are
     /// different questions: what this Brain believes and what a caller may see
-    /// are decided by different state under different authority (§111, §116).
+    /// are decided by different state under different authority (§22.5, §22.3).
     pub trust_policy_id: String,
     /// The classification an element gets when nothing else assigns one.
     ///
@@ -459,9 +459,9 @@ pub struct SpaceRow {
 ///
 /// Immutable: `package_id + version` identifies one canonical content forever,
 /// and the same reference arriving with different content is an integrity
-/// error rather than an update (§240.4, §240.5). Installation is also not
+/// error rather than an update (§20.4). Installation is also not
 /// activation — an installed package takes no part in resolution until
-/// Governance says so (§240.18).
+/// Governance says so (§20.12).
 #[derive(Clone, Debug, Default, Deserialize, Serialize, AndaDBSchema)]
 pub struct SchemaPackageRow {
     /// The row id.
@@ -476,7 +476,7 @@ pub struct SchemaPackageRow {
     /// The engine's own digest over the stored artifact.
     ///
     /// Distinct from `declared_digest`: this one is computed here and is what
-    /// detects a same-version replacement (§150). The artifact's own digest is
+    /// detects a same-version replacement (§20.11). The artifact's own digest is
     /// recorded but not treated as verified.
     pub content_digest: String,
     /// The digest the artifact claims for itself, verbatim.
@@ -485,14 +485,14 @@ pub struct SchemaPackageRow {
     pub artifact: Json,
     /// When this Nexus installed it.
     pub installed_at: String,
-    /// Where it came from. Transport is not verification (§240.42).
+    /// Where it came from. Transport is not verification (§20.11).
     pub source: String,
 }
 
-/// One immutable version of a Space's Schema Environment (Spec §23, §143).
+/// One immutable version of a Space's Schema Environment (Spec §20.8).
 ///
 /// Appended, never updated: a transaction records which environment version it
-/// ran under (§144), and rewriting an environment in place would retroactively
+/// ran under (§20.9), and rewriting an environment in place would retroactively
 /// change what those transactions meant.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, AndaDBSchema)]
 pub struct SchemaEnvRow {

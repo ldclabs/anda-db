@@ -20,6 +20,12 @@ async function post(name: string, body: unknown): Promise<Response> {
 
 const request = (...commands: string[]) => ({
   kip: '2.0',
+  // §75: a multi-operation request declares how its operations relate, so the
+  // helper says `independent` rather than letting the object guess — which it
+  // no longer does.
+  ...(commands.length > 1
+    ? { execution: { mode: 'independent' as const } }
+    : {}),
   operations: commands.map((command) => ({ command })),
 })
 
@@ -35,7 +41,8 @@ describe('the Durable Object', () => {
     expect(response.status).toBe(200)
     const body = (await response.json()) as KipResponse
     expect(body.kip).toBe('2.0')
-    expect(body.results[0]?.receipt?.status).toBe('committed')
+    expect(body.results[0]?.status).toBe('succeeded')
+    expect(body.receipt?.status).toBe('committed')
   })
 
   it('runs each language through the surface it belongs to', async () => {
@@ -48,7 +55,8 @@ describe('the Durable Object', () => {
       ),
     )
     const body = (await response.json()) as KipResponse
-    expect(body.results[0]?.receipt?.status).toBe('committed')
+    expect(body.results[0]?.status).toBe('succeeded')
+    expect(body.receipt?.status).toBe('committed')
     expect(body.results[1]?.result).toEqual(['Alice'])
     expect((body.results[2]?.result as { kip: string }).kip).toBe('2.0')
   })
@@ -97,7 +105,8 @@ describe('the Durable Object', () => {
     )
     expect(response.status).toBe(207)
     const body = (await response.json()) as KipResponse
-    expect(body.results[0]?.receipt?.status).toBe('committed')
+    expect(body.results[0]?.status).toBe('succeeded')
+    expect(body.receipt?.status).toBe('committed')
     expect(body.results[1]?.error?.code).toBe('SchemaSymbolNotFound')
   })
 
@@ -235,5 +244,204 @@ describe('a host that authenticates its callers', () => {
     expect(response.status).toBe(403)
     const body = (await response.json()) as KipResponse
     expect(body.results[0]?.error?.code).toBe('NotAuthorized')
+  })
+  it('answers in the envelope §81 fixes, not a shape of its own', async () => {
+    // The normative response schema makes `status` required at both levels.
+    // A consumer that read "no error" as "committed" would count a
+    // `no_effect` — a transaction that changed nothing — as a write.
+    const response = await post('envelope', {
+      kip: '2.0',
+      request_id: 'req-42',
+      operations: [
+        { op_id: 'op-1', command: 'CREATE CONCEPT ?c { TYPE "Person" NAME "Ann" }' },
+      ],
+    })
+    const body = (await response.json()) as KipResponse
+    expect(body.kip).toBe('2.0')
+    expect(body.request_id).toBe('req-42')
+    expect(body.status).toBe('succeeded')
+    expect(body.results[0]?.op_id).toBe('op-1')
+    expect(body.results[0]?.status).toBe('succeeded')
+    expect(body.context?.space_id).toBe('kip:space:default')
+    // §81 puts one receipt on the envelope, and the schema closes an operation
+    // result to the fields it names — so the per-operation detail is namespaced.
+    expect(body.receipt?.status).toBe('committed')
+    expect(body.receipt?.transaction_class).toBe('cognitive')
+    expect(
+      body.results[0]?.extensions?.['kip-do/outcome']?.handles,
+    ).toBeDefined()
+  })
+
+  it('refuses a request that declares another protocol version', async () => {
+    // §87.1. Executing it anyway is the failure this exists for: the caller
+    // believes it is talking to the version it named.
+    const response = await post('version', {
+      kip: '1.0',
+      operations: [{ command: 'DESCRIBE PROTOCOL' }],
+    })
+    expect(response.status).toBe(400)
+    const body = (await response.json()) as KipResponse
+    expect(body.status).toBe('failed')
+    expect(body.error?.code).toBe('UnsupportedProtocolVersion')
+  })
+
+  it('makes a multi-operation request say how its operations relate', async () => {
+    // §75: whether earlier commits survive a later failure is not a detail to
+    // leave to an engine default.
+    const response = await post('mode', {
+      kip: '2.0',
+      operations: [
+        { command: 'DESCRIBE PROTOCOL' },
+        { command: 'DESCRIBE CAPABILITIES' },
+      ],
+    })
+    expect(response.status).toBe(400)
+    const body = (await response.json()) as KipResponse
+    expect(body.error?.code).toBe('InvalidRequestEnvelope')
+  })
+
+  it('stops a sequence after a failure, and says the rest was skipped', async () => {
+    const response = await post('sequence', {
+      kip: '2.0',
+      execution: { mode: 'sequence', on_error: 'stop' },
+      operations: [
+        { command: 'CREATE CONCEPT ?c { TYPE "Person" NAME "Ann" }' },
+        { command: 'CREATE CONCEPT ?x { TYPE "Spaceship" NAME "Enterprise" }' },
+        { command: 'CREATE CONCEPT ?d { TYPE "Person" NAME "Bo" }' },
+      ],
+    })
+    const body = (await response.json()) as KipResponse
+    // §75.2: the earlier commit stays durable, so the request is `partial` and
+    // not `failed` — telling the client it all failed invites a re-send.
+    expect(body.status).toBe('partial')
+    expect(body.results.map((r) => r.status)).toEqual([
+      'succeeded',
+      'failed',
+      'skipped',
+    ])
+  })
+
+  it('will not silently satisfy a request for stronger isolation', async () => {
+    // §32.2. Echoing the field back while providing something weaker is the
+    // one thing the clause forbids.
+    const response = await post('isolation', {
+      kip: '2.0',
+      execution: { mode: 'independent', isolation: 'linearizable' },
+      operations: [{ command: 'DESCRIBE PROTOCOL' }],
+    })
+    const body = (await response.json()) as KipResponse
+    expect(body.error?.code).toBe('UnsupportedIsolation')
+  })
+
+  it('honours envelope preconditions and top-level parameters', async () => {
+    // §35.4: a precondition the engine ignored is a guard the caller believes
+    // it set.
+    const stale = await post('preconditions', {
+      kip: '2.0',
+      preconditions: { space_seq: 9999 },
+      operations: [{ command: 'DESCRIBE PROTOCOL' }],
+    })
+    expect(stale.status).toBe(409)
+    expect(((await stale.json()) as KipResponse).error?.code).toBe(
+      'PreconditionFailed',
+    )
+
+    // §74: a top-level `parameters` block is the request's binding
+    // environment, and an operation's own block narrows it.
+    const bound = await post('preconditions', {
+      kip: '2.0',
+      parameters: { who: 'Cass' },
+      operations: [
+        { command: 'CREATE CONCEPT ?c { TYPE "Person" NAME :who }' },
+        { command: 'FIND(?c.name) WHERE { ?c CONCEPT {name: :who} }' },
+      ],
+      execution: { mode: 'sequence' },
+    })
+    const body = (await bound.json()) as KipResponse
+    expect(body.results[1]?.result).toEqual(['Cass'])
+  })
+
+  it('refuses an ingestion context rather than dropping it', async () => {
+    // §71.1 is not built here. Running the command without the minted Evidence
+    // would fail on an unbound `:msg` and report a syntax problem for what is
+    // a missing runtime feature.
+    const response = await post('ingest', {
+      kip: '2.0',
+      ingest: { evidence: [{ key: 'msg', evidence_class: 'user_statement', payload: 'hi' }] },
+      operations: [{ command: 'DESCRIBE PROTOCOL' }],
+    })
+    const body = (await response.json()) as KipResponse
+    expect(body.error?.code).toBe('UnsupportedCapability')
+  })
+
+  it('fails fast on a capability requirement it cannot meet', async () => {
+    // §67. A requirement nobody recognized must not pass: the caller believes
+    // the check ran.
+    const unknown = await post('requires', {
+      kip: '2.0',
+      requires: { read_everything: true },
+      operations: [{ command: 'DESCRIBE PROTOCOL' }],
+    })
+    expect(((await unknown.json()) as KipResponse).error?.code).toBe(
+      'UnsupportedCapability',
+    )
+
+    const known = await post('requires', {
+      kip: '2.0',
+      requires: { keyword_search: true, semantic_search: false },
+      operations: [{ command: 'DESCRIBE PROTOCOL' }],
+    })
+    expect(((await known.json()) as KipResponse).status).toBe('succeeded')
+  })
+  it('is failed, not partial, when nothing succeeded', async () => {
+    // §82: `partial` says some writes landed. A sequence that fails on its
+    // first operation lands none, and reporting partial is what stops a client
+    // making the retry it should make.
+    const response = await post('nothing-succeeded', {
+      kip: '2.0',
+      execution: { mode: 'sequence', on_error: 'stop' },
+      operations: [
+        { command: 'CREATE CONCEPT ?x { TYPE "Spaceship" NAME "Enterprise" }' },
+        { command: 'CREATE CONCEPT ?c { TYPE "Person" NAME "Ann" }' },
+      ],
+    })
+    const body = (await response.json()) as KipResponse
+    expect(body.results.map((r) => r.status)).toEqual(['failed', 'skipped'])
+    expect(body.status).toBe('failed')
+    expect(response.status).not.toBe(207)
+  })
+
+  it('refuses an on_error it does not recognize rather than defaulting', async () => {
+    // Falling through to the default would mean `continue`: a sequence meant to
+    // stop would commit the writes the caller asked to have skipped.
+    const response = await post('on-error', {
+      kip: '2.0',
+      execution: { mode: 'sequence', on_error: 'halt' },
+      operations: [{ command: 'DESCRIBE PROTOCOL' }],
+    })
+    const body = (await response.json()) as KipResponse
+    expect(body.error?.code).toBe('InvalidRequestEnvelope')
+  })
+
+  it('requires a request to say which protocol version it speaks', async () => {
+    // `kip` is in the request schema's `required` list. Running a request that
+    // named no version is the same silent mismatch as running one that named
+    // the wrong one, minus the evidence.
+    const response = await post('no-version', {
+      operations: [{ command: 'DESCRIBE PROTOCOL' }],
+    })
+    const body = (await response.json()) as KipResponse
+    expect(body.error?.code).toBe('UnsupportedProtocolVersion')
+  })
+
+  it('answers a requires check about a capability it does implement', async () => {
+    // A name the engine supports but forgot to register reads as "unrecognized"
+    // and fails the request — the opposite of what the fail-fast check is for.
+    const response = await post('requires-supported', {
+      kip: '2.0',
+      requires: { snapshot_token: true, ingest: false },
+      operations: [{ command: 'DESCRIBE PROTOCOL' }],
+    })
+    expect(((await response.json()) as KipResponse).status).toBe('succeeded')
   })
 })

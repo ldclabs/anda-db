@@ -240,7 +240,7 @@ export function options(
  * write reports success. An object that already looks like a reference is left
  * exactly as written, including a canonical or cross-Space one.
  */
-export function referenceValue(value: Json, field: string): Json {
+export function referenceValue(value: Json, field: string): JsonMap {
   if (isJsonMap(value)) return value
   if (typeof value === 'string' && tryParseElementId(value) !== null) {
     return { id: value }

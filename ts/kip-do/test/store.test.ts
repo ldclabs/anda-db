@@ -489,7 +489,7 @@ describe('the store', () => {
       install('aaaa')
       // package_id + version identifies one canonical content forever; the
       // same reference with different content is an integrity error, not an
-      // update (§240.4).
+      // update (§20.4).
       expect(() => install('bbbb')).toThrowError(/UNIQUE/)
       expect(
         store.packageByRef('kip://example/only-here@2.0.0')?.content_digest,

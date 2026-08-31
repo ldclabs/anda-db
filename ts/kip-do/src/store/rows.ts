@@ -31,9 +31,9 @@ export const State = {
    */
   MERGED: 'merged',
   /**
-   * Held out of ordinary use by Governance, pending review (§133).
+   * Held out of ordinary use by Governance, pending review (§39.2).
    *
-   * Distinct from `archived`, and the distinction is the point (§134).
+   * Distinct from `archived`, and the distinction is the point (§39.2).
    * Archiving says *this is no longer in ordinary recall*; quarantine says
    * *local Governance does not currently allow ordinary use of this*. Neither
    * says the original actor took anything back.
@@ -368,7 +368,7 @@ export interface SpaceRow {
    *
    * Kept apart from `default_policy_id` because trust and access are different
    * questions: what this Brain believes and what a caller may see are decided
-   * by different state under different authority (§111, §116).
+   * by different state under different authority (§22.5, §22.3).
    */
   trust_policy_id: string
   /**
@@ -408,18 +408,18 @@ export interface SchemaPackageRow {
    * The engine's own digest over the stored artifact.
    *
    * Distinct from `declared_digest`: this one is computed here and is what
-   * detects a same-version replacement (§150). The artifact's own digest is
+   * detects a same-version replacement (§20.11). The artifact's own digest is
    * recorded but not treated as verified.
    */
   content_digest: string
   declared_digest: string
   artifact: JsonMap
   installed_at: string
-  /** Where it came from. Transport is not verification (§240.42). */
+  /** Where it came from. Transport is not verification (§20.11). */
   source: string
 }
 
-/** One immutable version of a Space's Schema Environment (Spec §23, §143). */
+/** One immutable version of a Space's Schema Environment (Spec §20.8). */
 export interface SchemaEnvRow {
   id: number
   space: string
@@ -429,7 +429,7 @@ export interface SchemaEnvRow {
   created_at: string
   tx_id: string
   /**
-   * The first Space coordinate this environment could have applied to (§144).
+   * The first Space coordinate this environment could have applied to (§20.9).
    *
    * The bootstrap environment first applies to the first cognitive coordinate;
    * every later activation is a Governance transaction and owns this coordinate

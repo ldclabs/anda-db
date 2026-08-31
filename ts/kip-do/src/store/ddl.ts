@@ -49,7 +49,7 @@ import { rebuildSearch } from './search.js'
  *
  * 3 — `schema_envs.seq`, the Space coordinate an activation took effect at. A
  * historical read resolves symbols through the environment that was in force
- * *then* (§144), and answering that from a timestamp would be guessing at a
+ * *then* (§20.9), and answering that from a timestamp would be guessing at a
  * coordinate the engine can simply record.
  *
  * 4 — `idx_concepts_key` widened from `(space, key)` to
@@ -389,9 +389,9 @@ export const SCHEMA_STATEMENTS: readonly string[] = [
   //
   // Immutable: `package_id + version` identifies one canonical content
   // forever, and the same reference arriving with different content is an
-  // integrity error rather than an update (§240.4). Installation is also not
+  // integrity error rather than an update (§20.4). Installation is also not
   // activation — an installed package takes no part in resolution until
-  // Governance says so (§240.18).
+  // Governance says so (§20.12).
   `CREATE TABLE IF NOT EXISTS schema_packages (
      id              INTEGER PRIMARY KEY AUTOINCREMENT,
      package_ref     TEXT NOT NULL,
@@ -411,7 +411,7 @@ export const SCHEMA_STATEMENTS: readonly string[] = [
   // --- Schema Environment versions ---------------------------------------
   //
   // Appended, never updated: a transaction records which environment version
-  // it ran under (§144), and rewriting an environment in place would
+  // it ran under (§20.9), and rewriting an environment in place would
   // retroactively change what those transactions meant.
   `CREATE TABLE IF NOT EXISTS schema_envs (
      id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -421,7 +421,7 @@ export const SCHEMA_STATEMENTS: readonly string[] = [
      created_at TEXT NOT NULL,
      tx_id      TEXT NOT NULL DEFAULT '',
      -- The first Space coordinate this environment could have applied to, so a
-     -- historical read resolves symbols through what was in force then (§144).
+     -- historical read resolves symbols through what was in force then (§20.9).
      -- Recorded as "the next sequence" rather than the current one: everything
      -- already committed was written under the environment before this.
      seq        INTEGER NOT NULL DEFAULT 0
@@ -463,7 +463,7 @@ export const SCHEMA_STATEMENTS: readonly string[] = [
   // Eight tables beside the cognitive ones, and the boundary between them is
   // the security property: **no KML clause reaches these**. They are written
   // through host APIs only, which is what keeps a prompt injection into
-  // ordinary memory formation off the control plane (§264).
+  // ordinary memory formation off the control plane (§20.10).
   //
   // Three shapes repeat across all of them and each is load-bearing:
   //
@@ -475,7 +475,7 @@ export const SCHEMA_STATEMENTS: readonly string[] = [
   //   control plane is answered from these, which is why revocation stamps
   //   `revoked_at` rather than only flipping `status`.
   // - **`version` counts changes**, so a cached decision can be invalidated
-  //   (§187).
+  //   (§28.6).
 
   // --- Principals ---------------------------------------------------------
   //
@@ -505,7 +505,7 @@ export const SCHEMA_STATEMENTS: readonly string[] = [
   // `json_each`, not an index seek — acceptable because a deployment has few
   // groups and every authorization asks the question once, and *correct*
   // because the historical answer is replayed from the audit rather than from
-  // this list anyway (§177). A join table would give the live question an index
+  // this list anyway (§48.5). A join table would give the live question an index
   // and give the historical one a second thing to keep in step.
   `CREATE TABLE IF NOT EXISTS gov_principal_groups (
      id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -629,7 +629,7 @@ export const SCHEMA_STATEMENTS: readonly string[] = [
   //
   // `subject_digest` binds an approval to one concrete operation. Without it an
   // approval for "purge this one Evidence record" would authorize purging
-  // anything (§246).
+  // anything (§28.5).
   `CREATE TABLE IF NOT EXISTS gov_approvals (
      id                  INTEGER PRIMARY KEY AUTOINCREMENT,
      space_id            TEXT NOT NULL,
@@ -654,7 +654,7 @@ export const SCHEMA_STATEMENTS: readonly string[] = [
   //
   // Append-only, and it stores whole records rather than diffs for the same
   // reason the element version log does: a diff chain with one missing link
-  // answers a historical question wrongly instead of refusing (§175). It is
+  // answers a historical question wrongly instead of refusing (§2.12). It is
   // also what a Principal's *past* group membership is replayed from, since the
   // group row only says who is in it now.
   `CREATE TABLE IF NOT EXISTS gov_audit (

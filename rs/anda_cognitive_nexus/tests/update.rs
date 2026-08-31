@@ -849,7 +849,7 @@ async fn upsert_applies_every_action_it_accepts() {
 /// rather than reading as an unimplemented corner.
 #[tokio::test]
 async fn purge_refuses_by_default_while_the_target_is_still_referenced() {
-    // §173, §175: in a cognitive history an Assertion, an Activity or an
+    // §60.3, §2.12: in a cognitive history an Assertion, an Activity or an
     // Experience may point at the target, and erasing the dependency chain
     // falsifies history. KIP 1.x made destructive cascade ordinary; 2.0 does
     // not, and the default reference policy is where that shows.

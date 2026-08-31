@@ -187,19 +187,24 @@ impl Bindings<'_> {
 
     /// Resolves a tuple endpoint.
     ///
-    /// A `Term::Match` — an inline `{field: value}` matcher — is a *query*, and
-    /// resolving one needs the pattern matcher that KQL owns. `ENSURE
-    /// PROPOSITION` therefore accepts only endpoints that already name
-    /// something.
+    /// An inline `{field: value}` matcher resolves only when it *names* an
+    /// endpoint — `{id: ...}` or `{canonical_id: ...}`. Matching one by
+    /// description is a *query*, and resolving that needs the pattern matcher
+    /// KQL owns; more to the point, a mutation that picked among the Concepts a
+    /// description matches would write to whichever one it guessed.
     pub fn term(&self, term: &Term) -> Result<Endpoint, KipError> {
         match term {
             Term::Variable(name) => Ok(Endpoint::Local(self.handle(name)?)),
             Term::Param(name) => endpoint_from_json(&self.param(name)?),
             Term::Literal(value) => endpoint_from_json(&Json::from(value.clone())),
-            Term::Match(_) | Term::Proposition(_) => Err(KipError::unsupported_capability(
-                "this engine resolves a mutation endpoint only from a handle, a parameter or a \
-                 literal; matching an endpoint by pattern needs the KQL solver, which is not \
-                 wired into the mutation path yet",
+            Term::Match(matcher) => {
+                crate::term::matcher_endpoint(matcher, "a mutation endpoint", |name| {
+                    self.param(name)
+                })
+            }
+            Term::Proposition(_) => Err(KipError::unsupported_capability(
+                "a nested Proposition in a mutation endpoint (§43.2) is not supported by this \
+                 engine yet; create or bind the Proposition first and pass its handle",
             )),
         }
     }
@@ -533,7 +538,63 @@ mod tests {
         let operation = Map::new();
         let handles = handles();
         let b = bindings(&request, &operation, &handles);
+        // `IdentitySelectorRequired`, not `UnsupportedCapability`: no engine
+        // should ever resolve a description to one endpoint, so this is not a
+        // gap a later version closes.
         let err = b.term(&Term::Match(Default::default())).unwrap_err();
+        assert_eq!(err.name(), "IdentitySelectorRequired");
+
+        // A description is a search, not a name: two Concepts may share one.
+        let mut by_name = anda_kip::ObjectMatcher::new();
+        by_name.insert(
+            "name".into(),
+            anda_kip::MatchValue::Literal(KipValue::String("Alice".into())),
+        );
+        let err = b.term(&Term::Match(by_name)).unwrap_err();
+        assert_eq!(err.name(), "IdentitySelectorRequired");
+    }
+
+    #[test]
+    fn an_identity_matcher_endpoint_resolves() {
+        let request = Map::new();
+        let operation = Map::new();
+        let handles = handles();
+        let b = bindings(&request, &operation, &handles);
+
+        let mut by_id = anda_kip::ObjectMatcher::new();
+        by_id.insert(
+            "id".into(),
+            anda_kip::MatchValue::Literal(KipValue::String("C-1".into())),
+        );
+        assert!(matches!(
+            b.term(&Term::Match(by_id)).unwrap(),
+            Endpoint::Local(_)
+        ));
+
+        let mut by_canonical = anda_kip::ObjectMatcher::new();
+        by_canonical.insert(
+            "canonical_id".into(),
+            anda_kip::MatchValue::Literal(KipValue::String("urn:alice".into())),
+        );
+        assert!(matches!(
+            b.term(&Term::Match(by_canonical)).unwrap(),
+            Endpoint::Canonical(_)
+        ));
+    }
+
+    #[test]
+    fn a_nested_proposition_endpoint_is_refused_rather_than_ignored() {
+        let request = Map::new();
+        let operation = Map::new();
+        let handles = handles();
+        let b = bindings(&request, &operation, &handles);
+        let err = b
+            .term(&Term::Proposition(Box::new(
+                anda_kip::PropositionMatcher::Id(anda_kip::Scalar::Literal(KipValue::String(
+                    "P-1".into(),
+                ))),
+            )))
+            .unwrap_err();
         assert_eq!(err.name(), "UnsupportedCapability");
     }
 }

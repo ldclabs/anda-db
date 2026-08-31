@@ -192,6 +192,19 @@ pub fn capabilities(authority: Option<&EffectiveAuthority>, auth: &AuthContext) 
                 "SET RETENTION", "ARCHIVE", "TOMBSTONE", "PURGE", "PURGE PAYLOAD",
                 "MERGE CONCEPT", "WHERE selection blocks", "LIMIT"
             ],
+            // §11: identity consolidation is non-destructive, and the three
+            // rules that make it so are stated because a caller who assumed
+            // any of them backwards would read a forwarded write as a lost one.
+            "merge": {
+                "source": "stays addressable, in state `merged`, forwarding via merged_into",
+                "history": "a Proposition written before the merge keeps referring to what it \
+                            referred to (§11.2); raw history is not rewritten",
+                "new_writes": "canonicalized to the surviving identity (§11.3) — tuple endpoints, \
+                               asserted_by, and structural references on create and on \
+                               SET STRUCTURAL",
+                "cycles": "a merge whose target already resolves back to the source is refused \
+                           (§11.1), so following merged_into to its fixpoint always terminates"
+            },
             "selection": {
                 // §52.7: a bounded sweep may be assumed repeatable only where
                 // the runtime documents an order. This one does.
@@ -209,10 +222,19 @@ pub fn capabilities(authority: Option<&EffectiveAuthority>, auth: &AuthContext) 
             ],
             "epistemic": {
                 // §49's settings, honored rather than parsed and dropped.
+                // Every member `WITH EPISTEMIC` accepts, and what each does —
+                // an unlisted one is refused (SchemaFieldNotFound), so the list
+                // is the contract rather than a sample.
                 "settings": [
                     "policy", "accept", "material", "modes",
-                    "include_hypothetical", "include_predicted", "explanation"
+                    "include_hypothetical", "include_predicted", "explanation",
+                    "purpose", "risk", "include_historical"
                 ],
+                "settings_note": "`purpose` and `risk` are the caller's own non-authoritative \
+                                  context and do not move a verdict; `include_historical` is \
+                                  accepted and refused, because admitting retracted and \
+                                  superseded Assertions would let a withdrawn claim decide a \
+                                  current belief",
                 "explanation_levels": ["none", "summary", "ledger"],
                 // §25.1 and §92: both conflict shapes, not just the strong one.
                 "conflicts": ["functional", "exclusive values"]
@@ -445,10 +467,11 @@ pub fn capabilities(authority: Option<&EffectiveAuthority>, auth: &AuthContext) 
                 "capability": "capsule_digest_profiles",
                     "detail": "verifying a Capsule digested under an algorithm other than sha3-256",
                     "reason": "this engine digests a Capsule as sha3-256 over RFC 8785 canonical \
-                               JSON. An artifact under another profile — ts/kip-do writes sha256 — \
-                               is refused as an unsupported profile rather than reported as a digest \
-                               mismatch, because the second is an accusation of tampering and the \
-                               first is the truth"
+                               JSON, and so does ts/kip-do — the two interoperate, and each pins \
+                               the algorithm with a literal in its own tests. An artifact from \
+                               somewhere else under another profile is refused as an unsupported \
+                               profile rather than reported as a digest mismatch, because the \
+                               second is an accusation of tampering and the first is the truth"
                 },
                 {
                     "capability": "structural_core_fields",
@@ -473,6 +496,17 @@ pub fn capabilities(authority: Option<&EffectiveAuthority>, auth: &AuthContext) 
                            does not distinguish yet — setting canonical_id needs only `update`, \
                            and a moderator uses ARCHIVE or TOMBSTONE. ts/kip-do has the same gap, \
                            so closing it is a change both engines make together"
+            },
+            {
+                "capability": "nested_proposition_endpoint",
+                "detail": "?meta (?p, \"contradicts\", (id: :other_proposition_id))",
+                "reason": "§43.2 makes the id form usable wherever a triple is, including as a \
+                           tuple endpoint — which is how a statement about a statement names an \
+                           existing Proposition. Not built here. Refused rather than ignored: an \
+                           endpoint nobody constrained matches every tuple under its predicate, \
+                           which is a wrong answer wearing the shape of a right one. An object \
+                           endpoint still resolves through {id: …} or {canonical_id: …}. \
+                           ts/kip-do has the same gap"
             },
             {
                 "capability": "historical_search",
@@ -514,7 +548,7 @@ pub fn capabilities(authority: Option<&EffectiveAuthority>, auth: &AuthContext) 
             },
             {
                 "capability": "retention_policy",
-                "detail": "Space-level retention defaults by kind, type or classification (§162)",
+                "detail": "Space-level retention defaults by kind, type or classification (§19.1)",
                 "reason": "retention is set per element and enforced per element; a Space cannot \
                            yet declare that raw Experiences expire in 90 days and audit records \
                            in 7 years"
@@ -528,17 +562,24 @@ pub fn capabilities(authority: Option<&EffectiveAuthority>, auth: &AuthContext) 
 /// The §89 profiles this engine claims.
 ///
 /// A claim, not a wish: each of these is exercised by the shared conformance
-/// fixtures both engines run. `KIP-High-Assurance` is absent because this
-/// engine signs nothing (§101), and `KIP-1-Migration` is present because it
-/// does migrate a 1.x database (§103).
+/// fixtures both engines run, and the three §89 names that are absent are
+/// absent for a reason a caller can check in `unsupported`:
+///
+/// ```text
+/// KIP-KQL             §96 requires aggregation, and §44.6 defines it with
+///                     implicit grouping — see `grouped_aggregation`
+/// KIP-Transactions    §94 requires idempotency — see `idempotent_replay`
+/// KIP-High-Assurance  this engine signs nothing (§101)
+/// ```
+///
+/// `KIP-1-Migration` is present because this engine does migrate a 1.x
+/// database (§103).
 pub const CONFORMANCE_PROFILES: &[anda_kip::ConformanceProfile] = &[
     anda_kip::ConformanceProfile::Core,
     anda_kip::ConformanceProfile::Schema,
     anda_kip::ConformanceProfile::Epistemic,
     anda_kip::ConformanceProfile::Governance,
-    anda_kip::ConformanceProfile::Transactions,
     anda_kip::ConformanceProfile::Capsule,
-    anda_kip::ConformanceProfile::Kql,
     anda_kip::ConformanceProfile::Kml,
     anda_kip::ConformanceProfile::Meta,
     anda_kip::ConformanceProfile::Runtime,
@@ -552,7 +593,7 @@ pub const CONFORMANCE_PROFILES: &[anda_kip::ConformanceProfile] = &[
 /// family will not be refused at the Space gate, never that every element
 /// inside it is readable. Without an authority resolved — the capability
 /// answer is reachable unauthenticated, which is how a caller learns *how* to
-/// authenticate (§266) — the list is omitted rather than guessed.
+/// authenticate (§67.2) — the list is omitted rather than guessed.
 fn available(authority: Option<&EffectiveAuthority>, auth: &AuthContext) -> Map<String, Json> {
     let Some(authority) = authority else {
         return Map::new();
@@ -645,6 +686,7 @@ const UNSUPPORTED_NAMES: &[&str] = &[
     "retention_policy",
     "deadlines",
     "artifact_store",
+    "nested_proposition_endpoint",
 ];
 
 /// The protocol this engine speaks.
@@ -686,6 +728,30 @@ mod tests {
         // check that passed because nobody recognized it is the failure mode
         // this exists to prevent.
         assert_eq!(capability_state("read_everything"), None);
+    }
+
+    /// The prose gap list and the `requires` registry name the same gaps.
+    ///
+    /// `DESCRIBE CAPABILITIES` answers two audiences from one set of facts: an
+    /// Agent reading `unsupported` for a reason, and a `requires` check asking
+    /// a yes/no question (§67). A gap documented in the first and missing from
+    /// the second reports itself as *unrecognized* rather than as absent — and
+    /// §67's whole point is that an unrecognized requirement must not pass.
+    #[test]
+    fn every_documented_gap_is_a_capability_requires_can_ask_about() {
+        let declared = capabilities(None, &AuthContext::system());
+        let listed = declared["unsupported"]
+            .as_array()
+            .expect("an unsupported list");
+        assert!(!listed.is_empty());
+        for entry in listed {
+            let name = entry["capability"].as_str().expect("a capability name");
+            assert_eq!(
+                capability_state(name),
+                Some(false),
+                "{name} is documented as a gap but `requires` does not know it"
+            );
+        }
     }
 
     /// §89 makes declaring the profiles a MUST, and the names are §89's.

@@ -109,7 +109,7 @@ export interface MetaContext {
   /** Who the caller is. */
   auth: AuthContext
   /**
-   * The Schema Environment of a past coordinate (§144).
+   * The Schema Environment of a past coordinate (§20.9).
    *
    * `SNAPSHOT AS OF` and `DESCRIBE SCHEMA ENVIRONMENT AS OF` both answer about
    * a coordinate, and both have to answer about the schema that was in force at
@@ -202,7 +202,7 @@ function describe(
         purpose: cx.auth.purpose,
         purpose_assurance: cx.auth.purpose_assurance,
       },
-      // §266: an Agent that does not know when its Delegation expires plans
+      // §67.2: an Agent that does not know when its Delegation expires plans
       // work it will not be allowed to finish.
       authority_expires_at: cx.authority.earliestExpiry(),
       governance: {
@@ -249,7 +249,7 @@ function describe(
     return { ...row, id: undefined } as unknown as Json
   }
   if ('SchemaEnvironment' in target) {
-    // §144: at a coordinate, the environment that was in force *then*. A
+    // §20.9: at a coordinate, the environment that was in force *then*. A
     // historical answer under today's schema would describe a resolution that
     // never happened.
     const env =
@@ -280,7 +280,7 @@ function describe(
       installed_at: row.installed_at,
       source: row.source,
       // Whether it takes part in resolution is a different question from
-      // whether it is here (§240.18).
+      // whether it is here (§20.12).
       active: cx.env.packageRefs().includes(row.package_ref),
       artifact: row.artifact as unknown as Json,
     } as Json
@@ -356,7 +356,7 @@ function describe(
         'read as a judgement that nothing is trusted',
     )
   }
-  // §266: an Agent must be able to learn what it may do without first being
+  // §67.2: an Agent must be able to learn what it may do without first being
   // permitted to do it, so this asks for no permission of its own.
   //
   // Deliberately coarse. It answers "could this ever be allowed here" rather
@@ -384,6 +384,19 @@ function describe(
         'because a per-element access report is an existence oracle',
       expires_at: cx.authority.earliestExpiry(),
     } as Json
+  }
+  if ('Snapshot' in target) {
+    // The same answer `SNAPSHOT` gives, because it is the same question asked
+    // through the DESCRIBE family (§68). Falling through to the COMPATIBILITY
+    // refusal below would have named the wrong command in the error.
+    const seq =
+      bindCoordinate(target.Snapshot, readContext(cx), b) ??
+      cx.store.currentSeq(cx.space)
+    return snapshotJson(
+      cx.space,
+      { seq },
+      cx.store.schemaVersionAt(cx.space, seq),
+    )
   }
   if ('Capsule' in target) {
     const source = scalarValue(target.Capsule, b)
@@ -503,7 +516,7 @@ function symbol(cx: MetaContext, kind: SymbolKind, name: string): Json {
             ? facetDef(artifact, resolved.name)
             : structuralFieldDef(artifact, resolved.name)
   return {
-    // The canonical identity, never the local name the caller wrote (§106):
+    // The canonical identity, never the local name the caller wrote (§65):
     // a local name means nothing outside the environment that resolved it.
     ref: formatSymbolRef(resolved),
     kind,
@@ -1031,7 +1044,7 @@ function changes(
  *
  * Every hit goes through the same read decision a `FIND` would, and carries the
  * **redacted** view: a field a Grant masked out of a query must not come back
- * through a search snippet (§105).
+ * through a search snippet (§88.5).
  */
 function search(command: SearchCommand, cx: MetaContext, b: ReadBindings): Json {
   const term = text(command.term, b, 'SEARCH')
@@ -1120,7 +1133,7 @@ function search(command: SearchCommand, cx: MetaContext, b: ReadBindings): Json 
       // Applies the read decision and returns the **redacted** view; `null` is
       // an element this caller may not read, which is indistinguishable from
       // one that does not exist and must stay that way (§95). A field a Grant
-      // masked out of a query must not come back through a search hit (§105).
+      // masked out of a query must not come back through a search hit (§88.5).
       const view = context.view(id)
       if (view === null) continue
       if (withType !== null && view.schema_ref !== withType) continue

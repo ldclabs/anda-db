@@ -830,6 +830,62 @@ export const FIXTURES: readonly Fixture[] = [
         "expect": {
           "error": "SchemaFieldNotFound"
         }
+      },
+      {
+        "name": "BELIEF SLOT takes a subject an earlier pattern bound",
+        "command": "FIND(?slot.status) WHERE {\n  ?s CONCEPT {name: \"Alice\"}\n  ?slot BELIEF SLOT (?s, \"prefers\")\n}",
+        "expect": {
+          "result": [
+            "insufficient"
+          ]
+        }
+      },
+      {
+        "name": "a bound BELIEF SLOT stays joined to the row it came from",
+        "command": "FIND(?s.name, ?slot.status) WHERE {\n  ?s CONCEPT {type: \"Person\", name: \"Alice\"}\n  ?slot BELIEF SLOT (?s, \"prefers\")\n}",
+        "expect": {
+          "result": [
+            [
+              "Alice",
+              "insufficient"
+            ]
+          ]
+        }
+      },
+      {
+        "name": "a BELIEF triple stays joined to the row its endpoints came from",
+        "command": "FIND(?s.name, ?o.name, ?b.status) WHERE {\n  ?s CONCEPT {name: \"Alice\"}\n  ?o CONCEPT {name: \"Quiet\"}\n  ?b BELIEF (?s, \"prefers\", ?o)\n}",
+        "expect": {
+          "result": [
+            [
+              "Alice",
+              "Quiet",
+              "insufficient"
+            ]
+          ]
+        }
+      },
+      {
+        "name": "a BELIEF triple with an open object answers one belief per Proposition",
+        "command": "FIND(?o.name) WHERE {\n  ?s CONCEPT {name: \"Alice\"}\n  ?b BELIEF (?s, \"prefers\", ?o)\n}",
+        "expect": {
+          "result": [
+            "Loud",
+            "Quiet"
+          ]
+        }
+      },
+      {
+        "name": "a BELIEF SLOT subject bound to a Literal answers insufficient, and keeps its row",
+        "command": "FIND(?n, ?slot.status) WHERE {\n  ?c CONCEPT {type: \"Person\", name: ?n}\n  FILTER(?n == \"Carol\")\n  ?slot BELIEF SLOT (?n, \"prefers\")\n}",
+        "expect": {
+          "result": [
+            [
+              "Carol",
+              "insufficient"
+            ]
+          ]
+        }
       }
     ]
   },
@@ -1165,6 +1221,79 @@ export const FIXTURES: readonly Fixture[] = [
     ]
   },
   {
+    "name": "merge-identity",
+    "description": "Non-destructive identity consolidation (§11). The merged-away Concept stays addressable and keeps forwarding; the history that referenced it keeps referencing it (§11.2); ordinary new writes land on the identity that survived (§11.3); and no merge may make canonical resolution — following `merged_into` to its fixpoint — cycle (§11.1).",
+    "setup": [
+      "MUTATE {\n  CREATE CONCEPT ?a { TYPE \"Person\" NAME \"Al\" SET FIELDS {key: \"al\"} }\n  CREATE CONCEPT ?b { TYPE \"Person\" NAME \"Alice\" SET FIELDS {key: \"alice\"} }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" SET FIELDS {key: \"dark\"} }\n  ENSURE PROPOSITION ?old (?a, \"prefers\", ?dark)\n}",
+      "MERGE CONCEPT ?source INTO ?target WHERE {\n  ?source CONCEPT {key: \"al\"}\n  ?target CONCEPT {key: \"alice\"}\n}",
+      "MUTATE {\n  UPSERT CONCEPT ?a { MATCH {type: \"Person\", key: \"al\"} }\n  UPSERT CONCEPT ?dark { MATCH {type: \"Preference\", key: \"dark\"} }\n  ENSURE PROPOSITION ?new (?a, \"prefers\", ?dark)\n}",
+      "MUTATE {\n  UPSERT CONCEPT ?a { MATCH {type: \"Person\", key: \"al\"} }\n  UPSERT CONCEPT ?dark { MATCH {type: \"Preference\", key: \"dark\"} }\n  ENSURE PROPOSITION ?again (?a, \"prefers\", ?dark)\n}"
+    ],
+    "cases": [
+      {
+        "name": "the merged-away Concept keeps its own name and leaves ordinary recall",
+        "command": "FIND(?c.name, ?c._system.state) WHERE { ?c CONCEPT {key: \"al\", state: \"merged\"} }",
+        "expect": {
+          "result": [
+            [
+              "Al",
+              "merged"
+            ]
+          ]
+        }
+      },
+      {
+        "name": "it forwards to the identity that survived",
+        "command": "FIND(?merged.key) WHERE {\n  ?c CONCEPT {key: \"al\", state: \"merged\"}\n  ?merged CONCEPT {id: ?target}\n  FILTER(?target == ?c.merged_into)\n}",
+        "expect": {
+          "result": [
+            "alice"
+          ]
+        }
+      },
+      {
+        "name": "history keeps referring to what it referred to",
+        "command": "FIND(?s.key) WHERE { ?p PROPOSITION (?s, \"prefers\", ?o) }",
+        "expect": {
+          "result": [
+            "al",
+            "alice"
+          ]
+        }
+      },
+      {
+        "name": "two post-merge writes resolve to one canonical Proposition on the survivor",
+        "command": "FIND(COUNT(?p)) WHERE { ?p PROPOSITION (?s, \"prefers\", ?o) }",
+        "expect": {
+          "result": [
+            2
+          ]
+        }
+      },
+      {
+        "name": "re-sending the same merge is a no_effect, not a conflict",
+        "command": "MERGE CONCEPT ?source INTO ?target WHERE {\n  ?source CONCEPT {key: \"al\", state: \"merged\"}\n  ?target CONCEPT {key: \"alice\"}\n}",
+        "expect": {
+          "result": null
+        }
+      },
+      {
+        "name": "merging back would make canonical resolution cycle",
+        "command": "MERGE CONCEPT ?source INTO ?target WHERE {\n  ?source CONCEPT {key: \"alice\"}\n  ?target CONCEPT {key: \"al\", state: \"merged\"}\n}",
+        "expect": {
+          "error": "IdentityMergeConflict"
+        }
+      },
+      {
+        "name": "a Concept cannot be merged into itself",
+        "command": "MERGE CONCEPT ?source INTO ?target WHERE {\n  ?source CONCEPT {key: \"alice\"}\n  ?target CONCEPT {key: \"alice\"}\n}",
+        "expect": {
+          "error": "IdentityMergeConflict"
+        }
+      }
+    ]
+  },
+  {
     "name": "mutation-selection",
     "description": "A mutation may choose what it acts on. The judgement calls an engine has to make here are what this fixture pins down: UPDATE reaches mutable state and nothing else, a bounded sweep takes a documented order, a selection block reads the transaction's starting state, and a merge consolidates identity without copying or erasing anything.",
     "setup": [
@@ -1403,6 +1532,17 @@ export const FIXTURES: readonly Fixture[] = [
       {
         "name": "nulls sort last under ASC",
         "command": "FIND(?c.name) WHERE { ?c CONCEPT {type: \"Person\"} } ORDER BY ?c.attributes.display_name ASC",
+        "ordered": true,
+        "expect": {
+          "result": [
+            "Alice",
+            "Bob"
+          ]
+        }
+      },
+      {
+        "name": "nulls sort last under DESC too, because absent is not a large value",
+        "command": "FIND(?c.name) WHERE { ?c CONCEPT {type: \"Person\"} } ORDER BY ?c.attributes.display_name DESC",
         "ordered": true,
         "expect": {
           "result": [
@@ -1884,8 +2024,85 @@ export const FIXTURES: readonly Fixture[] = [
         }
       }
     ]
+  },
+  {
+    "name": "tuple-endpoints",
+    "description": "What may stand in a Proposition tuple's subject/object slot, and what happens to the ones an engine cannot resolve. The grammar's `term` admits an object pattern and a nested Proposition expression; only two spellings of an object pattern name an endpoint (§8.1, §8.2), and a term an engine cannot resolve has to be refused rather than treated as an open slot — an unconstrained endpoint silently matches every tuple under its predicate (§43.2).",
+    "setup": [
+      "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?bob { TYPE \"Person\" NAME \"Bob\" }\n  ENSURE PROPOSITION ?p (?alice, \"same_as\", {canonical_id: \"urn:x:alice\"})\n  ENSURE PROPOSITION ?q (?bob, \"same_as\", {canonical_id: \"urn:x:bob\"})\n}"
+    ],
+    "cases": [
+      {
+        "name": "an object endpoint written as {canonical_id: ...} names one endpoint, not every tuple",
+        "command": "FIND(?s.name) WHERE { ?p PROPOSITION (?s, \"same_as\", {canonical_id: \"urn:x:alice\"}) }",
+        "expect": {
+          "result": [
+            "Alice"
+          ]
+        }
+      },
+      {
+        "name": "a canonical endpoint nobody wrote matches nothing rather than everything",
+        "command": "FIND(?s.name) WHERE { ?p PROPOSITION (?s, \"same_as\", {canonical_id: \"urn:x:nobody\"}) }",
+        "expect": {
+          "result": []
+        }
+      },
+      {
+        "name": "an object endpoint that describes rather than names is refused",
+        "command": "FIND(?s.name) WHERE { ?p PROPOSITION (?s, \"same_as\", {name: \"Alice\"}) }",
+        "expect": {
+          "error": "IdentitySelectorRequired"
+        }
+      },
+      {
+        "name": "an identity member that is itself a pattern is refused",
+        "command": "FIND(?s.name) WHERE { ?p PROPOSITION (?s, \"same_as\", {canonical_id: ?whatever}) }",
+        "expect": {
+          "error": "IdentitySelectorRequired"
+        }
+      },
+      {
+        "name": "a nested Proposition endpoint is refused, never silently unconstrained",
+        "command": "FIND(?s.name) WHERE { ?meta PROPOSITION (?s, \"same_as\", (id: :other)) }",
+        "params": {
+          "other": "P-1"
+        },
+        "expect": {
+          "error": "UnsupportedCapability"
+        }
+      },
+      {
+        "name": "the same refusal on the mutation path",
+        "command": "ENSURE PROPOSITION ?p (:subject, \"same_as\", (id: :other))",
+        "params": {
+          "subject": "C-1",
+          "other": "P-1"
+        },
+        "expect": {
+          "error": "UnsupportedCapability"
+        }
+      },
+      {
+        "name": "a mutation endpoint that describes rather than names is refused",
+        "command": "ENSURE PROPOSITION ?p (:subject, \"same_as\", {name: \"Bob\"})",
+        "params": {
+          "subject": "C-1"
+        },
+        "expect": {
+          "error": "IdentitySelectorRequired"
+        }
+      },
+      {
+        "name": "an identity endpoint carrying more than the identity is refused, never half-honoured",
+        "command": "FIND(?s.name) WHERE { ?p PROPOSITION (?s, \"same_as\", {canonical_id: \"urn:x:alice\", name: \"Zed\"}) }",
+        "expect": {
+          "error": "IdentitySelectorRequired"
+        }
+      }
+    ]
   }
 ] as unknown as Fixture[]
 
 /** The total number of cases, so a silent shrink is visible. */
-export const CASE_COUNT = 162
+export const CASE_COUNT = 183

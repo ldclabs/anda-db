@@ -138,7 +138,7 @@ pub async fn merge(
         }
         let mut element = build(record, id, space_id, digest, &mapping)?;
         if isolate {
-            // §176: an isolate import lands in quarantine rather than in
+            // §48.5: an isolate import lands in quarantine rather than in
             // ordinary recall. The records are durable and auditable and a
             // reviewer can read them; nothing recalls, projects or acts on them
             // until somebody releases them.
@@ -636,7 +636,7 @@ fn endpoint(
 /// Resolves a single required reference slot onto a destination id.
 ///
 /// The slot holds a reference object — `{"id": …}` — as every reference slot
-/// in the wire shape does (§8, §13.2). A bare id string is accepted too,
+/// in the wire shape does (§8.1, §13.2). A bare id string is accepted too,
 /// because `rewrite_reference` emits one for a value that arrived that way.
 fn reference_id(
     value: Option<&Json>,

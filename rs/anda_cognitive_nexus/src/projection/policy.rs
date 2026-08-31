@@ -229,7 +229,7 @@ impl Policy {
         }
     }
 
-    /// The exclusion reason a rejected mode carries (§137).
+    /// The exclusion reason a rejected mode carries (§26.1).
     pub fn mode_exclusion(&self, mode: Option<AssertionMode>) -> &'static str {
         match mode {
             Some(AssertionMode::Hypothetical) => "hypothetical_not_requested",

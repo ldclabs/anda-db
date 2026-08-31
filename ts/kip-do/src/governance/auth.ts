@@ -16,14 +16,14 @@
  * The one place the two meet is purpose, and they meet asymmetrically: a
  * declared purpose can *narrow* what a session may do and can never widen it
  * (§12). Writing `purpose: "emergency"` gets a caller nothing. Break-glass is an
- * explicit capability on the session, not a string in a request (§171).
+ * explicit capability on the session, not a string in a request (§28.2).
  *
  * ## Sessions do not outlive revocation
  *
  * An `AuthContext` is identity, not authority. Authority is resolved from the
  * control plane on every request, so a long-lived agent session that was granted
  * export in January and had it revoked in February gets a denial in March — the
- * session did not cache what it was allowed to do (§188, §245).
+ * session did not cache what it was allowed to do (§28.6).
  *
  * @see rs/anda_cognitive_nexus/src/governance/auth.rs
  */
@@ -41,7 +41,7 @@ import {
  * Build it from authenticated transport state. {@link anonymousAuth} is the
  * unauthenticated case: no principal, no strength, no purpose — which under
  * default deny is a caller that can do nothing until a Space's policy says
- * otherwise (§217).
+ * otherwise (§30.2).
  */
 export interface AuthContext {
   /** The authenticated Principal id. */
@@ -69,7 +69,7 @@ export interface AuthContext {
   /** The transport or client the request arrived on. */
   client: string
   /**
-   * Whether this session carries emergency access (§171).
+   * Whether this session carries emergency access (§28.2).
    *
    * A capability the host grants deliberately, never a purpose string a caller
    * writes. It does not bypass anything on its own; a policy is what decides
@@ -94,7 +94,7 @@ export function anonymousAuth(): AuthContext {
   }
 }
 
-/** The engine's own identity, for host-initiated work (§212). */
+/** The engine's own identity, for host-initiated work (§28.2). */
 export function systemAuth(): AuthContext {
   return {
     ...anonymousAuth(),

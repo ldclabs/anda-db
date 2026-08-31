@@ -4,11 +4,11 @@
  * `PURGE` is the one operation that destroys rather than records. Everything
  * else in this engine appends: an archive moves a lifecycle state, a retraction
  * leaves the Assertion standing, a correction supersedes. Erasure exists
- * because a legal obligation can require it, and for no other reason (§170).
+ * because a legal obligation can require it, and for no other reason (§28.5).
  *
  * It lives in the Governance plane rather than beside the other KML clauses
  * because of what it needs and what it owes. It needs an element-scoped
- * approval — §167 lists purging critical Evidence among the operations a policy
+ * approval — §88.11 lists purging critical Evidence among the operations a policy
  * may demand independent sign-off for — and it owes the Governance audit a
  * receipt per erased element. A clause executor is not a module that reaches
  * for either, which is exactly how the reference engine and this one drifted
@@ -34,7 +34,7 @@ import { requireApproved } from './approval.js'
 import { resourceOfElement } from './decision.js'
 
 /**
- * `PURGE` — physical erasure, leaving an identity stub (§19.3, §170–§177).
+ * `PURGE` — physical erasure, leaving an identity stub (§19.3, §60.3, §60.4).
  *
  * Two orderings matter and neither is arbitrary.
  *
@@ -55,7 +55,7 @@ export function stage(
   const named = formatElementId(id)
   const element = tx.load(id)
 
-  // §167 lists purging critical Evidence among the operations a policy may
+  // §88.11 lists purging critical Evidence among the operations a policy may
   // require independent approval for, and this is where such an approval is
   // resolved — bound to this element, not merely to the permission.
   const approved = requireApproved(
@@ -66,7 +66,7 @@ export function stage(
     tx.auth,
   )
 
-  // §163: a legal hold is exactly the thing purge must not walk past, and it is
+  // §19.1: a legal hold is exactly the thing purge must not walk past, and it is
   // checked before anything destructive is decided. Lifting the hold is a
   // separate Governance decision under its own permission.
   if (hasLegalHold(element)) {
@@ -171,7 +171,7 @@ export function stagePayload(
     tx.auth,
   )
 
-  // §163: a legal hold blocks payload purge exactly as it blocks element
+  // §19.1: a legal hold blocks payload purge exactly as it blocks element
   // purge. The bytes are the thing a hold most often exists to preserve.
   if (hasLegalHold(element)) {
     throw errors.legalHoldConflict(
@@ -206,7 +206,7 @@ export function stagePayload(
   erasePayload(element.row)
   tx.markChanged(id, 'purge_payload')
 
-  // The receipt §164 permits: enough to audit the erasure, and nothing of what
+  // The receipt §19.3 permits: enough to audit the erasure, and nothing of what
   // was erased. The digest was already public — it is what the surviving record
   // keeps — so naming it here discloses nothing new and lets an auditor tie the
   // entry to the Evidence it names.
@@ -232,7 +232,7 @@ export function stagePayload(
 }
 
 /**
- * Whether an element is held against erasure (§82, §163).
+ * Whether an element is held against erasure (§19.1).
  *
  * A cognitive writer cannot set this: `legal_hold` in a `retention` block needs
  * the `legal_hold` permission of its own, precisely so that content cannot make
@@ -309,7 +309,7 @@ function scrub(tx: Transaction, id: ElementId, policy: ReferencePolicy): void {
   element.row.governance = { purged: true, content_digest: digest }
   tx.markChanged(id, 'purge')
 
-  // The receipt §164 permits: enough to audit the erasure, and nothing of what
+  // The receipt §19.3 permits: enough to audit the erasure, and nothing of what
   // was erased.
   tx.store.governance.recordMutation({
     operation: 'purge',
@@ -327,11 +327,11 @@ function scrub(tx: Transaction, id: ElementId, policy: ReferencePolicy): void {
 }
 
 /**
- * How a purge treats elements that still point at the target (§173).
+ * How a purge treats elements that still point at the target (§60.3).
  *
  * The default refuses, because in a cognitive history an Assertion, an Activity
  * or an Experience may point at the target, and erasing the whole dependency
- * chain falsifies history (§175). KIP 1.x made destructive cascade ordinary —
+ * chain falsifies history (§2.12). KIP 1.x made destructive cascade ordinary —
  * `DELETE ... DETACH` — and 2.0 deliberately does not.
  */
 export type ReferencePolicy =

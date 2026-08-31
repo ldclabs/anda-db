@@ -181,7 +181,7 @@ describe('symbol resolution', () => {
   })
 
   it('names the candidates when a local name is ambiguous', () => {
-    // Spec §184: tell the Agent how to recover, by name.
+    // Spec §86.1: tell the Agent how to recover, by name.
     const lock = activeLock()
     lock.packages['kip://rival'] = '1.0.0'
     lock.states['kip://rival'] = 'active'
@@ -279,7 +279,7 @@ describe('symbol resolution', () => {
 
 describe('package validation', () => {
   it('rejects a member a closed Facet never declared', () => {
-    // Spec §60 and §240.31: a Facet is a validated namespaced extension, not
+    // Spec §60 and §18.1: a Facet is a validated namespaced extension, not
     // the untyped metadata bag KIP 1.x had.
     const def = facetDef(COGNITIVE_MEMORY, 'MnemonicState')
     expect(def).toBeDefined()
@@ -452,7 +452,7 @@ describe('package validation', () => {
   })
 
   it('does not turn a functional predicate into a write rejection', () => {
-    // §95, §240.28: a functional predicate with two competing objects is a
+    // §95, §25.1: a functional predicate with two competing objects is a
     // contested belief the Nexus has to be able to store in order to report it.
     // The bundled profile leaves `prefers` non-functional and open-world, so
     // an absent claim there is unknown and never false (§51)…

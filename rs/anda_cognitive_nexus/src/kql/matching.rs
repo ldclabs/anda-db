@@ -33,6 +33,13 @@ use crate::schema::{Intent, SymbolKind};
 use crate::store::eq_field;
 use crate::term::Endpoint;
 
+/// The internal handle a `BELIEF (triple)` binds its resolved Proposition to.
+///
+/// Named rather than spelled inline because it is a variable name that must not
+/// collide with a caller's: it is stripped from the result before the join, and
+/// a query that happened to use the same spelling would lose its own column.
+const BELIEF_TARGET: &str = "__belief_target";
+
 /// One matcher entry, once its value has been classified.
 enum Slot {
     /// A concrete value the pattern constrains.
@@ -206,7 +213,7 @@ impl Context<'_> {
             }
             // The cached view, not a fresh render: `load` redacted it, and a
             // matcher reading the unredacted row would let a masked field be
-            // probed through which rows come back (§109).
+            // probed through which rows come back (§29.2).
             let rendered = self.view_of(id);
             let mut row = vec![Binding::Element(id)];
             row.resize(vars.len(), Binding::Null);
@@ -566,10 +573,22 @@ impl Context<'_> {
             Term::Literal(literal) => {
                 EndpointSlot::Fixed(endpoint_of(&Json::from(literal.clone()))?)
             }
-            Term::Match(_) | Term::Proposition(_) => {
+            // An inline matcher is an endpoint only when it *names* one; the
+            // rest are searches, and `matcher_endpoint` says so rather than
+            // matching everything (§8.1, §8.2).
+            Term::Match(matcher) => EndpointSlot::Fixed(crate::term::matcher_endpoint(
+                matcher,
+                "a tuple endpoint",
+                |name| self.param_ref(name),
+            )?),
+            // §43.2 blesses `(id: ...)` as a `term`, which is how a statement
+            // about a statement names an existing Proposition. Refused rather
+            // than ignored: an unconstrained endpoint would silently match
+            // every tuple under the predicate.
+            Term::Proposition(_) => {
                 return Err(KipError::unsupported_capability(
-                    "an inline matcher or a nested Proposition in a tuple endpoint is not \
-                     supported by this engine yet",
+                    "a nested Proposition in a tuple endpoint (§43.2) is not supported by this \
+                     engine yet; bind the Proposition with its own pattern and pass the variable",
                 ));
             }
         })
@@ -1094,13 +1113,6 @@ impl Context<'_> {
         let policy = self.policy.clone();
         let at = self.at.clone();
 
-        // A fully grounded tuple that resolves to no Proposition still gets an
-        // answer (§46.4). The alternative — no row — makes the Agent infer
-        // "unknown" from "the pattern did not match", which is the inference
-        // §24 exists to prevent, and it reads exactly like a query that was
-        // written wrong.
-        let mut ungrounded = false;
-
         // When the target is a variable an earlier pattern bound, the result
         // has to carry that variable too, or the join would cross-product every
         // projection against every Proposition.
@@ -1126,29 +1138,36 @@ impl Context<'_> {
             anda_kip::BeliefTarget::Tuple(triple) => {
                 // A tuple names the Proposition structurally, and a Space keeps
                 // one canonical Proposition per semantic tuple.
+                //
+                // Matched against the solutions the block has already produced,
+                // exactly as a Proposition pattern would be (§46.3): a subject
+                // an earlier pattern bound narrows the projection *and* stays
+                // joined to it. Against a bare unit table instead, the tuple
+                // would range over the whole Space and the resulting beliefs
+                // would cross-product with every row the block had — an answer
+                // about tuples the caller never named.
                 let found = self
-                    .match_tuple(Some("__belief_target"), triple, &Solutions::unit())
+                    .match_tuple(Some(BELIEF_TARGET), triple, solutions)
                     .await?;
-                let ids = found.elements_of("__belief_target");
                 // Only a *fully grounded* tuple earns the §46.4 answer. A
                 // tuple with an unbound end asked about a family of slots, and
                 // "no Proposition" there is an empty match, not one belief
-                // about nothing.
-                ungrounded = ids.is_empty() && self.tuple_is_grounded(triple)?;
-                (None, ids)
+                // about nothing. A grounded tuple binds no variable, so the
+                // one answer applies to every row the block already had.
+                if found.is_empty() && self.tuple_is_grounded(triple)? {
+                    let belief = self.ungrounded_belief(&policy, &at);
+                    return Ok(Solutions::column(
+                        variable,
+                        vec![Binding::Literal(belief.to_json())],
+                    ));
+                }
+                return self.project_table(variable, found, &policy, &at).await;
             }
         };
 
         let mut vars = vec![variable.to_string()];
         if let Some(name) = &carried {
             vars.push(name.clone());
-        }
-        if ungrounded {
-            let belief = self.ungrounded_belief(&policy, &at);
-            return Ok(Solutions::table(
-                vars,
-                vec![vec![Binding::Literal(belief.to_json())]],
-            ));
         }
         let mut rows = Vec::with_capacity(propositions.len());
         for id in propositions {
@@ -1158,6 +1177,49 @@ impl Context<'_> {
                 row.push(Binding::Element(id));
             }
             rows.push(row);
+        }
+        Ok(Solutions::table(vars, rows))
+    }
+
+    /// Projects every row of a tuple match, keeping the bindings it carried.
+    ///
+    /// The tuple's own variables — its endpoints, and the handle on the
+    /// Proposition — travel with the belief, so the caller's join re-attaches
+    /// each projection to the row it came from instead of crossing all of them
+    /// with all of it.
+    async fn project_table(
+        &mut self,
+        variable: &str,
+        found: Solutions,
+        policy: &crate::projection::Policy,
+        at: &str,
+    ) -> Result<Solutions, KipError> {
+        let header = found.header();
+        let mut vars: Vec<String> = vec![variable.to_string()];
+        vars.extend(
+            found
+                .vars
+                .iter()
+                .filter(|name| name.as_str() != BELIEF_TARGET)
+                .cloned(),
+        );
+
+        let mut rows = Vec::with_capacity(found.rows.len());
+        for row in &found.rows {
+            let Some(id) = header
+                .get(row, BELIEF_TARGET)
+                .and_then(|binding| binding.element())
+            else {
+                continue;
+            };
+            let belief = self.project_belief(id, policy, at).await?;
+            let mut out = vec![Binding::Literal(belief.to_json())];
+            for (index, name) in found.vars.iter().enumerate() {
+                if name.as_str() != BELIEF_TARGET {
+                    out.push(row.get(index).cloned().unwrap_or(Binding::Null));
+                }
+            }
+            rows.push(out);
         }
         Ok(Solutions::table(vars, rows))
     }
@@ -1173,21 +1235,12 @@ impl Context<'_> {
         variable: &str,
         subject: &Term,
         predicate: &PredAtom,
+        solutions: &Solutions,
     ) -> Result<Solutions, KipError> {
         self.projected = true;
         let policy = self.policy.clone();
         let at = self.at.clone();
 
-        let subject = match self.endpoint_slot(subject)? {
-            EndpointSlot::Fixed(endpoint) => endpoint,
-            EndpointSlot::Bind(name) => {
-                return Err(KipError::projection_target_unbounded(format!(
-                    "?{name} is unbound, so this would project every slot in the Space; identify \
-                     the subject first"
-                )));
-            }
-        };
-        let subject_key = subject.key();
         let predicate_ref = match self.predicate_atom(predicate)? {
             PredicateSlot::Fixed(mut symbols) if symbols.len() == 1 => symbols.remove(0),
             _ => {
@@ -1197,13 +1250,58 @@ impl Context<'_> {
             }
         };
 
-        let slot = self
-            .project_slot(&subject_key, &predicate_ref, &policy, &at)
-            .await?;
-        let rendered = crate::projection::slot_to_json(&subject, &predicate_ref, &slot);
-        Ok(Solutions::table(
-            vec![variable.to_string()],
-            vec![vec![Binding::Literal(rendered)]],
-        ))
+        // §46.3 asks the subject to be *groundable or bound*, and §47.1 writes
+        // it as `?subject` — so a variable an earlier pattern pinned is a
+        // legal subject, not an unbounded projection. What is refused is a
+        // variable nothing bound, which would range over every slot in the
+        // Space.
+        // Each subject travels with the binding it was read from, never with
+        // one re-derived from its endpoint. A Literal subject round-trips
+        // through `Endpoint::Literal` into the canonical `{value, datatype}`
+        // object, which is not what the incoming row holds — so re-deriving it
+        // would make the caller's join drop exactly the rows this branch exists
+        // to answer.
+        let (carried, subjects): (Option<String>, Vec<(Endpoint, Option<Binding>)>) =
+            match self.endpoint_slot(subject)? {
+                EndpointSlot::Fixed(endpoint) => (None, vec![(endpoint, None)]),
+                EndpointSlot::Bind(name) => {
+                    if !solutions.binds(&name) {
+                        return Err(KipError::projection_target_unbounded(format!(
+                            "?{name} is unbound, so this would project every slot in the Space; \
+                             bind the subject with a pattern first"
+                        )));
+                    }
+                    let mut subjects = Vec::new();
+                    for binding in solutions.values_of(&name) {
+                        // A Literal keys to a slot no Proposition can have —
+                        // a subject is never a Literal (§8.4) — and that slot
+                        // projects `insufficient`, which is the honest answer
+                        // rather than a dropped row.
+                        let endpoint = endpoint_of(&binding.to_json())?;
+                        subjects.push((endpoint, Some(binding)));
+                    }
+                    (Some(name), subjects)
+                }
+            };
+
+        // One projection per distinct subject, carrying the subject variable so
+        // the caller's join re-attaches each slot to the row it came from.
+        let mut vars = vec![variable.to_string()];
+        if let Some(name) = &carried {
+            vars.push(name.clone());
+        }
+        let mut rows = Vec::with_capacity(subjects.len());
+        for (endpoint, binding) in subjects {
+            let slot = self
+                .project_slot(&endpoint.key(), &predicate_ref, &policy, &at)
+                .await?;
+            let rendered = crate::projection::slot_to_json(&endpoint, &predicate_ref, &slot);
+            let mut row = vec![Binding::Literal(rendered)];
+            if let Some(binding) = binding {
+                row.push(binding);
+            }
+            rows.push(row);
+        }
+        Ok(Solutions::table(vars, rows))
     }
 }

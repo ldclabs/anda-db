@@ -5,14 +5,14 @@
  * and this module is only the second one: attribute shape, Literal datatype,
  * Facet shape, structural cardinality. Element shape, same-Space closure and
  * `_system` protection are Core's, enforced in the store and the mutation
- * layer, and a package cannot weaken them (§92, §240.32).
+ * layer, and a package cannot weaken them (§18.2).
  *
  * ## What must *not* be rejected here
  *
  * A `functional` predicate says one subject has at most one true object. It is
  * an **epistemic** statement, so two competing objects are a contested belief —
  * something the Nexus has to be able to store in order to report it (§95,
- * §240.28). Turning it into a write rejection would mean the system could never
+ * §25.1). Turning it into a write rejection would mean the system could never
  * record disagreement, which is most of what a memory system is for.
  *
  * Likewise `open_world: true` means an absent claim is unknown, not false.
@@ -21,7 +21,7 @@
  * ## Severity
  *
  * Only deterministic declared constraints produce errors (§98). Model hints are
- * advisory and never become hard validators (§240.34), so nothing in
+ * advisory and never become hard validators (§20.5), so nothing in
  * `model_hints` is read by this module at all.
  */
 

@@ -5,7 +5,7 @@
  * `$PropositionType` nodes, which meant an ordinary write could change what a
  * type meant. KIP 2.0 moves it out: authoritative Schema is an **immutable
  * versioned Package Artifact**, and a graph node that mirrors one is a mirror,
- * never the authority (Spec §5, §240.1–§240.3).
+ * never the authority (Spec §20.1, §20.11).
  *
  * - `symbol` — canonical identity, `kip://<path>@<version>/<Symbol>`, and the
  *   rule that every persisted reference names an exact version;
@@ -19,8 +19,7 @@
  * ## The line this module will not cross
  *
  * A Schema Package declares what things *are*. It never declares what is
- * *true*, who may read anything, or how much anything is trusted (§33, §96,
- * §240.23–§240.25). Concretely: a `functional` predicate does not reject a
+ * *true*, who may read anything, or how much anything is trusted (§20.1). Concretely: a `functional` predicate does not reject a
  * second competing object, it creates a conflict for the Epistemic Projection
  * to report — because a memory system that cannot store disagreement cannot
  * report it either.

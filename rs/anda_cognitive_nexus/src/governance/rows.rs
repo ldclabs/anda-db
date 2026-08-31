@@ -9,14 +9,14 @@
 //!
 //! - **No KML clause can reach them.** They are written through host APIs only,
 //!   which is what stops a prompt injection into ordinary memory formation from
-//!   having a path to privilege escalation (§264).
+//!   having a path to privilege escalation (§20.10).
 //! - **Revocation is a status change, never a delete.** A revoked Grant must
 //!   stop authorizing future operations without rewriting the audit that says
 //!   it authorized a past one (§36, §49).
 //! - **Every mutation is mirrored into [`GovernanceAuditRow`] with the complete
 //!   new record.** Whole records rather than diffs, for the same reason the
 //!   element version log stores whole rows: a diff chain with one missing link
-//!   answers a historical question wrongly instead of refusing (§175).
+//!   answers a historical question wrongly instead of refusing (§2.12).
 //!
 //! Ids are minted from the `anda_db` row id rather than carried in a column,
 //! because `anda_db` assigns the row id at insert and a second write to store
@@ -34,11 +34,11 @@ pub mod principal_class {
     pub const HUMAN: &str = "human";
     /// An autonomous agent acting under its own or a delegated identity.
     pub const AGENT: &str = "agent";
-    /// A machine identity for service-to-service calls (§218).
+    /// A machine identity for service-to-service calls (§28.2).
     pub const SERVICE: &str = "service";
-    /// The engine's own identity for maintenance it performs itself (§212).
+    /// The engine's own identity for maintenance it performs itself (§28.2).
     pub const SYSTEM: &str = "system";
-    /// An unauthenticated caller, where a Space's policy admits one (§217).
+    /// An unauthenticated caller, where a Space's policy admits one (§30.2).
     pub const ANONYMOUS: &str = "anonymous";
 }
 
@@ -157,7 +157,7 @@ pub struct PrincipalRow {
     pub principal_class: String,
     /// One of [`status`].
     pub status: String,
-    /// A human-readable label. Carries no authority (§203).
+    /// A human-readable label. Carries no authority (§2.6).
     pub display_name: String,
     /// Which deployment subsystem authenticated this identity.
     pub auth_provider: String,
@@ -169,7 +169,7 @@ pub struct PrincipalRow {
     pub updated_at: String,
     /// When it was revoked; empty while it is not.
     pub revoked_at: String,
-    /// Bumped on every change, so a cached decision can be invalidated (§187).
+    /// Bumped on every change, so a cached decision can be invalidated (§28.6).
     pub version: u64,
 }
 
@@ -368,7 +368,7 @@ pub struct GovernancePolicyRow {
     pub created_by: String,
 }
 
-/// A pending or satisfied multi-party approval (§167–§170).
+/// A pending or satisfied multi-party approval (§28.5).
 ///
 /// Approval is control state, not a semantic statement: a Concept saying "Alice
 /// approved this" satisfies nothing. What satisfies it is an approving
@@ -376,7 +376,7 @@ pub struct GovernancePolicyRow {
 ///
 /// `subject_digest` binds the approval to one concrete operation. Without it an
 /// approval for "purge this one Evidence record" would authorize purging
-/// anything, which is the failure mode §246 tests for.
+/// anything, which is the failure mode §28.5 tests for.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, AndaDBSchema)]
 pub struct ApprovalRow {
     /// The row id, which also mints `kip:approval:{_id}`.
@@ -398,7 +398,7 @@ pub struct ApprovalRow {
     pub approver_ids: Vec<String>,
     /// Whether the requester may also approve. False by default: the same
     /// Principal proposing and approving is the separation-of-duties failure
-    /// §170 names first.
+    /// §28.5 names first.
     pub allow_self_approval: bool,
     /// `pending`, `granted`, `denied`, `expired` or `consumed`.
     pub status: String,
@@ -414,7 +414,7 @@ pub struct ApprovalRow {
     pub version: u64,
 }
 
-/// One append-preserved Governance audit entry (§172–§175).
+/// One append-preserved Governance audit entry (§29).
 ///
 /// Two things are recorded here and deliberately tagged apart:
 ///
@@ -424,7 +424,7 @@ pub struct ApprovalRow {
 /// ```
 ///
 /// Corrections append; nothing here is ever rewritten. An audit that could be
-/// edited would answer §247 — *which policy version authorized this?* — with
+/// edited would answer §33.1 — *which policy version authorized this?* — with
 /// today's answer rather than the one that was true.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, AndaDBSchema)]
 pub struct GovernanceAuditRow {
@@ -447,7 +447,7 @@ pub struct GovernanceAuditRow {
     /// `allow`, `allow_with_constraints`, `deny`, `require_approval`, or the
     /// mutation verb for a `mutation` entry.
     pub decision: String,
-    /// Why, in one line. Safe to show a caller (§267).
+    /// Why, in one line. Safe to show a caller (§30.4).
     pub reason: String,
     /// The policy id that decided it.
     pub policy_id: String,
@@ -533,7 +533,7 @@ impl AuthorityConditions {
     /// Whether `other` is at least as restrictive as this.
     ///
     /// Time is the subtle one: a child that outlives its parent is the classic
-    /// delegation amplification (§238), so an empty child `valid_until` against
+    /// delegation amplification (§28.5), so an empty child `valid_until` against
     /// a bounded parent fails.
     pub fn contains(&self, other: &Self) -> bool {
         narrows(&self.purpose, &other.purpose)
@@ -657,7 +657,7 @@ pub struct PolicyStatement {
     pub obligations: PolicyObligations,
 }
 
-/// What an allow requires the runtime to do as well (§184).
+/// What an allow requires the runtime to do as well (§86.1).
 ///
 /// An obligation that cannot be satisfied denies the operation. A policy that
 /// requires an audit record, on a runtime whose audit is unavailable, must not
@@ -793,7 +793,7 @@ mod tests {
         };
         assert!(parent.contains(&inside));
         assert!(!parent.contains(&beyond));
-        // §238: "read + export, valid 1 year" under a one-day parent.
+        // §28.5: "read + export, valid 1 year" under a one-day parent.
         assert!(!parent.contains(&AuthorityConditions::default()));
     }
 

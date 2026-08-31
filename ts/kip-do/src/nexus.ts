@@ -25,7 +25,7 @@ import { formatElementId } from './id.js'
 export interface RetentionSweep {
   /** The elements it acted on. */
   swept: string[]
-  /** How many were kept because a legal hold blocks removal (§163). */
+  /** How many were kept because a legal hold blocks removal (§19.1). */
   held: number
   /** How many the caller was not authorized to act on. */
   refused: number
@@ -98,7 +98,7 @@ export interface NexusOptions {
   /**
    * Whether to install the bundled Schema Package artifacts.
    *
-   * Installing is not activating (§240.18): a host still has to say which
+   * Installing is not activating (§20.12): a host still has to say which
    * packages its Space resolves through.
    */
   installBundled?: boolean
@@ -138,7 +138,7 @@ export class CognitiveNexus {
       // the system Principal exists and owns the default Space. That is not a
       // bypass: the in-process host runs with owner authority *through* the
       // authorization path, so a Space whose policy denies something denies it
-      // here too (§212).
+      // here too (§28.2).
       store.governance.ensurePrincipal({
         principal_id: SYSTEM_PRINCIPAL,
         principal_class: principalClass.SYSTEM,
@@ -168,7 +168,7 @@ export class CognitiveNexus {
    * Installs one Schema Package artifact.
    *
    * Immutable by reference: the same `package_id@version` arriving with
-   * different content is an integrity error rather than an update (§240.4), so
+   * different content is an integrity error rather than an update (§20.4), so
    * a re-install of identical bytes is a no-op and a changed one is refused.
    */
   installPackage(artifact: SchemaPackage, source: string): void {
@@ -203,7 +203,7 @@ export class CognitiveNexus {
    * Activates a Schema Lock, minting a new environment version.
    *
    * An identical lock is not re-activated: every activation mints a version
-   * that transactions record (§144), and a restart is not a schema change.
+   * that transactions record (§20.9), and a restart is not a schema change.
    */
   ensureSchema(lock: SchemaLock, space = this.space): SchemaEnvironment {
     return this.storage.transactionSync(() => {
@@ -288,7 +288,7 @@ export class CognitiveNexus {
   }
 
   /**
-   * A Space's Schema Environment at one version (§144).
+   * A Space's Schema Environment at one version (§20.9).
    *
    * What a historical read resolves symbols through. Version 0 is the Core-only
    * environment a Space has before it activates anything — an honest answer
@@ -331,7 +331,7 @@ export class CognitiveNexus {
    *
    * A session holds identity, not authority. Authority is resolved from the
    * control plane on each request, so a session that has been running since
-   * January does not still hold what January's Grants said (§188, §245).
+   * January does not still hold what January's Grants said (§28.6).
    */
   session(auth: AuthContext): Session {
     return new Session(this, auth)
@@ -473,7 +473,7 @@ export class CognitiveNexus {
  *
  * The session caches identity and nothing else. Authority is resolved from the
  * control plane on every command, which is what makes a revocation take effect
- * for a session that started before it (§188, §245).
+ * for a session that started before it (§28.6).
  */
 /**
  * The `read` block of a request envelope (§85).
@@ -661,10 +661,10 @@ export class Session {
   }
 
   /**
-   * What this Principal could do in a Space at a past instant (§176, §177).
+   * What this Principal could do in a Space at a past instant (§48.5).
    *
    * A historical answer, and nothing more: that a Principal could read something
-   * in January says nothing about whether it can today (§179). Reading it needs
+   * in January says nothing about whether it can today (§48.5). Reading it needs
    * `read_governance_history`, which is separate from `read_audit` — one is what
    * the control plane *was*, the other is what people *did*.
    */
@@ -715,7 +715,7 @@ export class Session {
   }
 
   /**
-   * Reads the Governance audit for a Space (§89, §172).
+   * Reads the Governance audit for a Space (§29).
    *
    * Its own permission, because the audit says what everyone else did: a caller
    * who may read a Space's cognition has not thereby earned the right to read
@@ -747,9 +747,9 @@ export class Session {
    * Raises or lowers how strongly one element may influence action.
    *
    * Raising is bounded by the element's authority lineage, so no chain of
-   * summarizing turns a descriptive note into an executable one (§127). Lowering
+   * summarizing turns a descriptive note into an executable one (§31.5). Lowering
    * is deliberately as easy as the permission itself: an incident response that
-   * had to wait for an approval would arrive late (§132).
+   * had to wait for an approval would arrive late (§31.5).
    *
    * Returns the ceiling the element carried before.
    */
@@ -760,11 +760,11 @@ export class Session {
   }
 
   /**
-   * Holds an element out of ordinary use, pending review (§133).
+   * Holds an element out of ordinary use, pending review (§39.2).
    *
    * Not a retraction: it says this Brain does not currently allow ordinary use
    * of the element, which is a statement about this Brain and not about whoever
-   * wrote it (§134).
+   * wrote it (§39.2).
    */
   quarantine(element: ElementId, reason: string, space = this.nexus.space): void {
     this.nexus.transact(() =>
@@ -842,7 +842,7 @@ export class Session {
    * the engine decides what may be forgotten.
    *
    * Four gates, in this order: `manage_retention` at Space scope, the action's
-   * own permission per element, the legal hold (§163), and per-element
+   * own permission per element, the legal hold (§19.1), and per-element
    * authorization. A held or unauthorized element is **skipped and counted**,
    * not silently dropped: "swept 4" when 9 expired is the shape of a compliance
    * failure nobody notices.
@@ -875,7 +875,7 @@ export class Session {
         }
         const element = this.nexus.store.load(id)
         if (element === null) continue
-        // §163: a hold blocks removal for everyone, including a sweep the
+        // §19.1: a hold blocks removal for everyone, including a sweep the
         // holder authorized. Reported as held rather than as failed, because
         // nothing went wrong — the record is being kept on purpose.
         if (element.row.retention.legal_hold === true) {
@@ -988,7 +988,7 @@ export class Session {
    * Best effort by design at this layer: a denial that could not be logged is
    * still a denial, and failing the request a second time over the log would turn
    * an audit outage into an availability outage. An obligation that genuinely
-   * must not proceed unlogged is the caller's to enforce (§184).
+   * must not proceed unlogged is the caller's to enforce (§86.1).
    */
   private audit(authority: EffectiveAuthority, decision: Authorization): void {
     try {
@@ -1011,7 +1011,7 @@ export class Session {
 }
 
 /**
- * The access-decision provenance a high-impact receipt carries (§178).
+ * The access-decision provenance a high-impact receipt carries (§33.1).
  *
  * Only for high-impact statements. Attaching it to every commit would bury the
  * cases that matter under the ones that do not, and the point of the record is

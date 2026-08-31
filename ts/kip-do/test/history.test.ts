@@ -154,7 +154,7 @@ describe('AS OF', () => {
       nexus.activatePackages([])
       expect(nexus.environment().version).toBe(before + 1)
 
-      // §144: the Concept at coordinate 1 was written under the environment
+      // §20.9: the Concept at coordinate 1 was written under the environment
       // before the activation, and that is what a read there resolves through.
       // Reconstructing the past under today's schema would return different
       // elements rather than an error.

@@ -15,7 +15,7 @@
 //! ## Every mutation is mirrored into the audit
 //!
 //! [`GovernanceStore::record_mutation`] runs on the way out of each write, with
-//! the complete new record. That is what makes §176's questions answerable —
+//! the complete new record. That is what makes §48.5's questions answerable —
 //! *who had access at time T, which policy version authorized this* — without a
 //! second temporal index to keep in step with the first.
 
@@ -148,7 +148,7 @@ async fn init_policies(c: &mut Collection) -> Result<(), DBError> {
     c.create_btree_index_nx(&["policy_ref"]).await?;
     c.create_btree_index_nx(&["policy_id"]).await?;
     c.create_btree_index_nx(&["space_id"]).await?;
-    // `AS OF` over policy versions ranges on this (§177).
+    // `AS OF` over policy versions ranges on this (§48.5).
     c.create_btree_index_nx(&["created_at"]).await?;
     Ok(())
 }
@@ -763,13 +763,13 @@ impl GovernanceStore {
         Ok(rows)
     }
 
-    /// The Grants that were in force at a past instant (§177).
+    /// The Grants that were in force at a past instant (§48.5).
     ///
     /// Reads the same rows as the live lookup and judges them by their own
     /// timestamps instead of by their current status — which is exactly what
     /// "revoke, never delete" was for. An auditor asking *who could read this
     /// in January* gets January's answer, and gets it without that being a
-    /// claim about today (§179).
+    /// claim about today (§48.5).
     pub async fn grants_at(
         &self,
         space_id: &str,
@@ -847,7 +847,7 @@ impl GovernanceStore {
     ///
     /// Replayed from the audit rather than read off the group rows, because a
     /// group's membership is stored as one current list: the row says who is in
-    /// it now and the audit says who was in it then. §177 needs the second, and
+    /// it now and the audit says who was in it then. §48.5 needs the second, and
     /// the audit carrying whole records rather than diffs is what makes the
     /// replay a lookup instead of a reconstruction.
     pub async fn groups_of_at(
@@ -1053,7 +1053,7 @@ impl GovernanceStore {
         Ok(rows.pop())
     }
 
-    /// The version of a Policy that was in force at an instant (§177).
+    /// The version of a Policy that was in force at an instant (§48.5).
     pub async fn policy_at(
         &self,
         policy_id: &str,
@@ -1135,7 +1135,7 @@ impl GovernanceStore {
     /// Adds one Principal's approval.
     ///
     /// Refuses a second approval from the same Principal, and — unless the
-    /// request opted out — refuses the requester's own (§170). Both are the same
+    /// request opted out — refuses the requester's own (§28.5). Both are the same
     /// rule: *independent* approvals, or the count means nothing.
     pub async fn approve(
         &self,

@@ -162,7 +162,7 @@ async fn capabilities_report_the_gaps_as_data_not_as_errors() {
 
 #[tokio::test]
 async fn describe_answers_with_canonical_identity_not_the_local_name() {
-    // Spec §106. A caller that stored the local name would have stored
+    // Spec §88.6. A caller that stored the local name would have stored
     // something whose meaning changes when the Space's schema does.
     let nexus = fresh("canonical").await;
     let described = ok(&nexus, r#"DESCRIBE TYPE "Person""#).await;

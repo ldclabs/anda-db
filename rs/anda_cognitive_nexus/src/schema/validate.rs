@@ -4,14 +4,14 @@
 //! and this module is only the second one: attribute shape, Literal datatype,
 //! Facet shape, structural cardinality. Element shape, same-Space closure and
 //! `_system` protection are Core's, enforced in [`crate::store`], and a package
-//! cannot weaken them (§92, §240.32).
+//! cannot weaken them (§18.2).
 //!
 //! ## What must *not* be rejected here
 //!
 //! A `functional` predicate says one subject has at most one true object. It is
 //! an **epistemic** statement, so two competing objects are a contested belief —
 //! something the Nexus has to be able to store in order to report it (§95,
-//! §240.28). Turning it into a write rejection would mean the system could
+//! §25.1). Turning it into a write rejection would mean the system could
 //! never record disagreement, which is most of what a memory system is for.
 //!
 //! Likewise `open_world: true` means an absent claim is unknown, not false.
@@ -20,7 +20,7 @@
 //! ## Severity
 //!
 //! Only deterministic declared constraints produce errors (§98). Model hints
-//! are advisory and never become hard validators (§240.34), so nothing in
+//! are advisory and never become hard validators (§20.5), so nothing in
 //! `model_hints` is read by this module at all.
 
 use anda_kip::{Json, KipError, KipErrorCode, Map};
@@ -437,7 +437,7 @@ mod tests {
 
     #[test]
     fn a_closed_facet_rejects_a_member_it_never_declared() {
-        // Spec §60 and §240.31: a Facet is a validated namespaced extension,
+        // Spec §60 and §18.1: a Facet is a validated namespaced extension,
         // not the untyped metadata bag KIP 1.x had.
         let package = profile();
         let def = package.facet("MnemonicState").unwrap();

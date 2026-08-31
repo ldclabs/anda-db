@@ -78,7 +78,7 @@ pub async fn history(cx: &mut Context<'_>, command: &HistoryCommand) -> Result<A
     };
 
     // Through the read path's choke point, so an element this caller may not
-    // read answers exactly as one that was never written does (§103, §30.4).
+    // read answers exactly as one that was never written does (§30.4).
     // Answering `[]` for both would be equally non-disclosing but less useful:
     // an empty page already means "nothing in this range", so a mistyped id
     // would come back as silence instead of as a mistake.

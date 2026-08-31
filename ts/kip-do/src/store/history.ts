@@ -182,7 +182,7 @@ function hexDecode(hex: string): string {
  * The stored value is the whole row as it was written, so this is a cast rather
  * than a reconstruction — which is the point of storing whole rows instead of
  * diffs: a diff chain with one missing link answers a historical question
- * wrongly instead of refusing (§175).
+ * wrongly instead of refusing (§2.12).
  */
 export function elementOfVersion(row: ElementVersionRow): Element {
   const kind = kindOfTag(row.kind)
@@ -293,7 +293,7 @@ export function seqAtTime(sql: SqlStorage, space: string, at: string): number {
 }
 
 /**
- * The Schema Environment version that was in force at a coordinate (§144).
+ * The Schema Environment version that was in force at a coordinate (§20.9).
  *
  * The environment a historical read resolves symbols through is the last one
  * activated at or before the coordinate — never today's. Reconstructing the past

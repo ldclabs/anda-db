@@ -11,18 +11,18 @@
 //! element's id is Nexus-local (§7.1), and honouring a foreign one would let
 //! an arriving Capsule claim an identity the destination already uses.
 //!
-//! **Not inherit the source's engine origin** (§27, §240.22). `_system.origin`
+//! **Not inherit the source's engine origin** (§2.5, §20.13). `_system.origin`
 //! records what *this* runtime observed. The source's origin is preserved as
 //! import provenance instead — a claim about where the data came from, which is
 //! exactly what it is.
 //!
-//! **Not activate schema** (§88, §240.20). A Capsule may name the packages its
+//! **Not activate schema** (§41.3). A Capsule may name the packages its
 //! records are bound to; it may not decide that this Space trusts them. Import
 //! validates that the schema is available and refuses otherwise, because
 //! importing records whose types cannot be resolved would store cognition with
 //! no recoverable meaning.
 //!
-//! **Not treat a legacy export as a Capsule** (§240.14). Nothing here reads
+//! **Not treat a legacy export as a Capsule** (§103.8). Nothing here reads
 //! KIP 1.x `UPSERT` scripts.
 
 use anda_kip::{
@@ -108,7 +108,7 @@ pub async fn export(
         };
         // The redacted view, for the same reason SEARCH uses it: a field the
         // caller may not read must not leave the Space in a Capsule either
-        // (§144). Elements it may not read at all were already dropped by
+        // (§20.9). Elements it may not read at all were already dropped by
         // `load`, which is what makes the manifest's `partial` honest.
         // No fallback to the raw renderer: `load` caches a redacted view for
         // every element it admits, so an absent one means the element was not
@@ -188,7 +188,7 @@ pub async fn export(
             target_seq: Some(space.seq),
             schema_environment_version: Some(cx.env.version),
         },
-        // §240.47: the exact refs travel with the records. A Capsule that
+        // §20.4: the exact refs travel with the records. A Capsule that
         // exported local names would arrive meaning whatever the destination
         // happens to call them.
         schema: if include_schema {
@@ -421,7 +421,7 @@ pub fn verify(capsule: &Capsule) -> Result<Json, KipError> {
 /// Imports a Capsule into a Space.
 ///
 /// Two-phase by necessity: every schema reference is resolved before anything
-/// is written (§240.48), because a half-imported graph bound to types the
+/// is written (§41.2), because a half-imported graph bound to types the
 /// destination cannot resolve is cognition with no recoverable meaning.
 pub async fn import(
     nexus: &crate::CognitiveNexus,

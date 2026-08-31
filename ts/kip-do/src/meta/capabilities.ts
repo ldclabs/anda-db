@@ -31,9 +31,107 @@ export const KIP_VERSION = '2.0'
  */
 export const MAX_DEPENDENTS_DEPTH = 8
 
+/**
+ * The capability names `requires` may ask about and get `true` for (§67).
+ *
+ * Spelled out rather than derived from the `supported` map, because the map is
+ * organized for a reader and this list is a contract: a name here is one a
+ * caller may build a fail-fast check on. The same list the reference engine
+ * keeps, so a `requires` block is portable between the two.
+ */
+const SUPPORTED_NAMES: readonly string[] = [
+  'kql',
+  'kml',
+  'meta',
+  'governance',
+  'projection',
+  'historical_read',
+  'keyword_search',
+  'capsule_export',
+  'client_key_retry',
+  'preconditions',
+  'dry_run',
+  'snapshot_token',
+  'ordered_structural',
+  'structural_edge_binding',
+  'exclusive_conflict',
+  'space_self_identity',
+  'discover_read_separation',
+  'retention_expiry',
+  'opaque_cursors',
+  'payload_purge',
+  'list_dependents',
+]
+
+/**
+ * The capability names this engine reports as *not* implemented.
+ *
+ * Kept beside {@link SUPPORTED_NAMES} so the two cannot drift into claiming and
+ * disclaiming the same thing, and checked against the `unsupported` prose list
+ * by `test/meta.test.ts`: a gap documented for a reader but missing here would
+ * answer a `requires` check as *unrecognized* rather than as absent.
+ */
+const UNSUPPORTED_NAMES: readonly string[] = [
+  'atomic_batch',
+  'idempotent_replay',
+  'grouped_aggregation',
+  'structural_core_fields',
+  'ungated_permissions',
+  'capsule_digest_profiles',
+  'capsule_import',
+  'capsule_signatures',
+  'historical_search',
+  'semantic_search',
+  'search_over_assertions_and_activities',
+  'hop_quantifiers',
+  'nested_proposition_endpoint',
+  'trust_model',
+  'set_retention',
+  'ingest',
+  'deadlines',
+  'artifact_store',
+]
+
+/**
+ * Whether `requires` can answer for a capability name, and how.
+ *
+ * `undefined` is not "supported by omission" (§67): a fail-fast check that
+ * passed because nobody recognized the name is the failure mode the mechanism
+ * exists to prevent, because the caller believes it ran.
+ */
+export function capabilityState(name: string): boolean | undefined {
+  if (UNSUPPORTED_NAMES.includes(name)) return false
+  return SUPPORTED_NAMES.includes(name) ? true : undefined
+}
+
+/** The gap names this engine documents, for the drift test. */
+export function unsupportedCapabilityNames(): string[] {
+  return [...UNSUPPORTED_NAMES]
+}
+
 export function capabilities(): Json {
   return {
     kip: KIP_VERSION,
+    // §89 makes declaring the conformance profiles a MUST. A claim, not a
+    // wish — each of these is exercised by the shared conformance fixtures both
+    // engines run, and the four §89 names that are absent are absent for a
+    // reason a caller can check in `unsupported`:
+    //
+    //   KIP-KQL             §96 requires aggregation, and §44.6 defines it
+    //                       with implicit grouping — see `grouped_aggregation`
+    //   KIP-Transactions    §94 requires idempotency — see `idempotent_replay`
+    //   KIP-Capsule         export and verification are built, import is not
+    //   KIP-High-Assurance  this engine signs nothing (§101)
+    profiles: [
+      'KIP-Core',
+      'KIP-Schema',
+      'KIP-Epistemic',
+      'KIP-Governance',
+      'KIP-KML',
+      'KIP-META',
+      'KIP-Runtime',
+      'KIP-Historical',
+    ],
     languages: ['KQL', 'KML', 'META'],
     supported: {
       kml: [
@@ -54,9 +152,28 @@ export function capabilities(): Json {
         'MERGE CONCEPT',
         'PURGE, with all three reference policies',
         'PURGE PAYLOAD',
+        // §52.7 names exactly these six. `MERGE CONCEPT` is deliberately not
+        // among them: its source and target are already named, and its WHERE
+        // only guards them — so it takes no LIMIT, and the grammar has no
+        // field for one.
         'selection blocks: WHERE and LIMIT on UPDATE, ARCHIVE, TOMBSTONE, ' +
-          'RETRACT, PURGE, PURGE PAYLOAD and MERGE CONCEPT',
+          'RETRACT, PURGE and PURGE PAYLOAD; WHERE alone on MERGE CONCEPT',
       ],
+      // §11: identity consolidation is non-destructive, and the three rules
+      // that make it so are stated because a caller who assumed any of them
+      // backwards would read a forwarded write as a lost one.
+      merge: {
+        source: 'stays addressable, in state `merged`, forwarding via merged_into',
+        history:
+          'a Proposition written before the merge keeps referring to what it ' +
+          'referred to (§11.2); raw history is not rewritten',
+        new_writes:
+          'canonicalized to the surviving identity (§11.3) — tuple endpoints, ' +
+          'asserted_by, and structural references on create and on SET STRUCTURAL',
+        cycles:
+          'a merge whose target already resolves back to the source is refused ' +
+          '(§11.1), so following merged_into to its fixpoint always terminates',
+      },
       transaction: {
         // Not a claim about this engine's care, but about the platform: a
         // Durable Object's `transactionSync` either commits the statement whole
@@ -88,7 +205,9 @@ export function capabilities(): Json {
         'global aggregates',
       ],
       epistemic: {
-        // §49's settings, honored rather than parsed and dropped.
+        // Every member `WITH EPISTEMIC` accepts, and what each does — an
+        // unlisted one is refused (SchemaFieldNotFound), so the list is the
+        // contract rather than a sample.
         settings: [
           'policy',
           'accept',
@@ -97,7 +216,15 @@ export function capabilities(): Json {
           'include_hypothetical',
           'include_predicted',
           'explanation',
+          'purpose',
+          'risk',
+          'include_historical',
         ],
+        settings_note:
+          '`purpose` and `risk` are the caller’s own non-authoritative context ' +
+          'and do not move a verdict; `include_historical` is accepted and ' +
+          'refused, because admitting retracted and superseded Assertions ' +
+          'would let a withdrawn claim decide a current belief',
         explanation_levels: ['none', 'summary', 'ledger'],
         // §25.1 and §92: both conflict shapes, not just the strong one.
         conflicts: ['functional', 'exclusive values'],
@@ -265,7 +392,7 @@ export function capabilities(): Json {
           'and not an error',
         schema:
           'symbols resolve through the Schema Environment in force at the ' +
-          'coordinate (§144), never today’s',
+          'coordinate (§20.9), never today’s',
         projection:
           'a belief at a coordinate is projected from the Assertions of that ' +
           'coordinate',
@@ -402,7 +529,7 @@ export function capabilities(): Json {
         audit: {
           records:
             'every control-plane mutation with its whole new record, plus every ' +
-            'decision §172 or a policy obligation asks for — allows and denials ' +
+            'decision §29 or a policy obligation asks for — allows and denials ' +
             'alike. An ordinary read is not audited: a log that recorded every ' +
             'read would bury the entries that matter',
           reading:
@@ -416,7 +543,7 @@ export function capabilities(): Json {
             'is what the control plane was, the other is what people did',
           receipt:
             'a high-impact statement carries the deciding identity, delegation ' +
-            'chain and policy version on its receipt (§178); an ordinary write ' +
+            'chain and policy version on its receipt (§33.1); an ordinary write ' +
             'carries none',
         },
       },
@@ -496,6 +623,18 @@ export function capabilities(): Json {
         reason: 'transitive traversal is not implemented',
       },
       {
+        capability: 'nested_proposition_endpoint',
+        detail: '?meta (?p, "contradicts", (id: :other_proposition_id))',
+        reason:
+          '§43.2 makes the id form usable wherever a triple is, including as a ' +
+          'tuple endpoint — which is how a statement about a statement names ' +
+          'an existing Proposition. Not built here. Refused rather than ' +
+          'ignored: an endpoint nobody constrained matches every tuple under ' +
+          'its predicate, which is a wrong answer wearing the shape of a right ' +
+          'one. An object endpoint still resolves through {id: …} or ' +
+          '{canonical_id: …}. The reference engine has the same gap',
+      },
+      {
         capability: 'idempotent_replay',
         detail:
           'execution.idempotency_key returning the original outcome on a resend',
@@ -559,7 +698,37 @@ export function capabilities(): Json {
         detail: 'execution.mode "atomic" over several operations',
         reason:
           'one transaction across several operations is not implemented; a ' +
-          'batch runs operation by operation, each atomic on its own',
+          'batch runs operation by operation, each atomic on its own. Asking ' +
+          'for it is refused rather than run as a sequence that looks like one',
+      },
+      {
+        capability: 'ingest',
+        detail: 'the request envelope’s `ingest.evidence` block (§71.1)',
+        reason:
+          'observed payloads still have to arrive inside CREATE EVIDENCE, ' +
+          'which means through model-generated command text — the fidelity ' +
+          'risk §88.12 names. A request carrying `ingest` is refused rather ' +
+          'than run without it, because the ASSERT that cited `:msg` would ' +
+          'otherwise fail on an unbound parameter and report a syntax problem ' +
+          'for a missing runtime feature. The reference engine implements it',
+      },
+      {
+        capability: 'artifact_store',
+        detail: 'ArtifactRef handles (§85), including `ingest.payload_artifact`',
+        reason:
+          'there is no artifact store, so a handle would name bytes this ' +
+          'engine cannot read. Minting an Evidence record with an empty ' +
+          'payload under one would be exactly the fabrication the mechanism ' +
+          'exists to prevent',
+      },
+      {
+        capability: 'deadlines',
+        detail: 'options.deadline_ms (§80.1)',
+        reason:
+          'a statement runs to completion inside the Durable Object and is ' +
+          'not cancellable mid-commit, and §80.2 is explicit that a client ' +
+          'timeout is not an abort. Accepting the deadline would promise a ' +
+          'cancellation that never happens',
       },
     ],
   } as Json

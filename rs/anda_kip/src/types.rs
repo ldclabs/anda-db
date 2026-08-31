@@ -725,7 +725,7 @@ pub struct ChangeEnvelope {
     /// change indistinguishable from the absence of a request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
-    /// The Schema Environment version in force when it committed (§144).
+    /// The Schema Environment version in force when it committed (§33.2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_environment_version: Option<u64>,
     /// What changed. Shapes are engine-defined; the atomicity is not.

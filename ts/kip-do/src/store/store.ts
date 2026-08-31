@@ -567,7 +567,7 @@ export class Store {
     return seqAtTime(this.sql, space, at)
   }
 
-  /** The Schema Environment version that was in force at a coordinate (§144). */
+  /** The Schema Environment version that was in force at a coordinate (§20.9). */
   schemaVersionAt(space: string, seq: number): number {
     return schemaVersionAt(this.sql, space, seq)
   }

@@ -2,7 +2,7 @@
 //!
 //! A Space that has activated nothing resolves Core and nothing else, and Core
 //! declares no Concept types at all — it carries the element kinds and the open
-//! registries (§158). So a Nexus with no activated profile can read and write
+//! registries (§20.13). So a Nexus with no activated profile can read and write
 //! Assertions about types it does not have, which is to say: it cannot create a
 //! Concept.
 //!
@@ -14,7 +14,7 @@
 //! to support, and the point of a profile is that two engines mean the same
 //! thing by `Preference`.
 //!
-//! Installing is not activating (§240.18). Bundling the bytes says nothing
+//! Installing is not activating (§20.12). Bundling the bytes says nothing
 //! about which Space may resolve symbols through them; that stays a decision
 //! the host makes with
 //! [`CognitiveNexus::ensure_schema`](crate::CognitiveNexus::ensure_schema).

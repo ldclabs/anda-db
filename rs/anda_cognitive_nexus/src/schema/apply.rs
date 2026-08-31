@@ -177,7 +177,7 @@ impl SchemaEnvironment {
     ///
     /// Returns the exact `schema_ref` to persist alongside the findings: the
     /// caller writes the canonical reference, never the local name it passed in
-    /// (§13, §240.6).
+    /// (§20.4).
     pub fn prepare_concept(
         &self,
         type_name: &str,
@@ -208,7 +208,7 @@ impl SchemaEnvironment {
     ///
     /// A Facet is a validated namespaced extension, so an unresolvable Facet
     /// symbol is an error rather than a pass-through: letting it through would
-    /// restore exactly the untyped metadata bag KIP 2.0 removed (§240.31).
+    /// restore exactly the untyped metadata bag KIP 2.0 removed (§18.1).
     pub fn validate_facets(
         &self,
         facets: &Map<String, Json>,
@@ -248,7 +248,7 @@ impl SchemaEnvironment {
     /// A `functional` predicate produces no violation here even when the
     /// subject already has another object: that is a contested belief for the
     /// Epistemic Projection to report, and refusing the write would mean the
-    /// Nexus could not record disagreement at all (§95, §240.28).
+    /// Nexus could not record disagreement at all (§25.1).
     pub fn prepare_proposition(
         &self,
         predicate_name: &str,
@@ -339,7 +339,7 @@ mod tests {
 
     #[test]
     fn a_local_type_name_becomes_the_exact_reference_that_gets_persisted() {
-        // Spec §13, §240.6: what the caller wrote is sugar; what is stored is
+        // Spec §20.4: what the caller wrote is sugar; what is stored is
         // the exact version, so the element's meaning cannot drift later.
         let (symbol, result) = env()
             .prepare_concept(
@@ -355,7 +355,7 @@ mod tests {
 
     #[test]
     fn a_functional_predicate_never_blocks_a_write() {
-        // Spec §95, §240.28: two competing objects are a contested belief.
+        // Spec §25.1: two competing objects are a contested belief.
         // Refusing the write would leave the Nexus unable to record
         // disagreement, which is most of what it exists to do.
         let env = env();
@@ -510,7 +510,7 @@ mod tests {
 
     #[test]
     fn an_unknown_facet_symbol_is_refused_rather_than_carried() {
-        // Spec §240.31: letting an unresolvable Facet through would restore
+        // Spec §18.1: letting an unresolvable Facet through would restore
         // the untyped metadata bag this version removed.
         let err = env()
             .validate_facets(

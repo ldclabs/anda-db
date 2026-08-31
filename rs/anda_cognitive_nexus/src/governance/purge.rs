@@ -4,7 +4,7 @@
 //! in KIP 2.0 is additive or lifecycle: archiving removes from recall,
 //! tombstoning removes logically, superseding replaces, and all three leave the
 //! record of what happened intact. Purge exists because privacy and legal
-//! obligations sometimes outrank that (§164), and it is deliberately the most
+//! obligations sometimes outrank that (§19.3), and it is deliberately the most
 //! guarded operation in the engine.
 //!
 //! ## What is erased, and what survives
@@ -31,9 +31,9 @@
 //!
 //! ## Why the default refuses
 //!
-//! `REFERENCE POLICY` defaults to `deny_if_referenced` (§173) because in a
+//! `REFERENCE POLICY` defaults to `deny_if_referenced` (§60.3) because in a
 //! cognitive history an Assertion, an Activity or an Experience may point at the
-//! target, and erasing the whole dependency chain falsifies history (§175). KIP
+//! target, and erasing the whole dependency chain falsifies history (§2.12). KIP
 //! 1.x made destructive cascade ordinary; 2.0 deliberately does not.
 
 use anda_kip::{Json, KipError};
@@ -46,7 +46,7 @@ use crate::id::ElementId;
 use crate::store::{Element, Store};
 use crate::tx::Transaction;
 
-/// How a purge treats elements that still point at the target (§173).
+/// How a purge treats elements that still point at the target (§60.3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReferencePolicy {
     /// Refuse while anything references the target. The default.
@@ -103,7 +103,7 @@ pub async fn stage(
     let element = tx.load(id).await?.clone();
     let resource = ResourceContext::of_element(&element);
     tx.authorize_element(id, Permission::Read).await?;
-    // §167 lists purging critical Evidence among the operations a policy may
+    // §88.11 lists purging critical Evidence among the operations a policy may
     // require independent approval for, and this is where such an approval is
     // consumed — bound to this element, and spent by using it.
     let approved = super::approval::require(
@@ -116,7 +116,7 @@ pub async fn stage(
     )
     .await?;
 
-    // §163: a legal hold is exactly the thing purge must not walk past, and it
+    // §19.1: a legal hold is exactly the thing purge must not walk past, and it
     // is checked before anything else destructive is decided.
     if has_legal_hold(&element) {
         return Err(KipError::legal_hold_conflict(format!(
@@ -170,7 +170,7 @@ pub async fn stage(
             space_id: space_id.to_string(),
             resource: target.to_string(),
             principal_id: tx.auth.principal_id.clone(),
-            // The receipt §164 permits: enough to audit the erasure, and
+            // The receipt §19.3 permits: enough to audit the erasure, and
             // nothing of what was erased.
             record: serde_json::json!({
                 "element": target.to_string(),
@@ -241,7 +241,7 @@ pub async fn stage_payload(
     )
     .await?;
 
-    // §163: a legal hold blocks payload purge exactly as it blocks element
+    // §19.1: a legal hold blocks payload purge exactly as it blocks element
     // purge. The bytes are the thing a hold most often exists to preserve.
     if has_legal_hold(&element) {
         return Err(KipError::legal_hold_conflict(format!(
@@ -285,7 +285,7 @@ pub async fn stage_payload(
         space_id: space_id.to_string(),
         resource: id.to_string(),
         principal_id: tx.auth.principal_id.clone(),
-        // The receipt §164 permits: enough to audit the erasure, and nothing
+        // The receipt §19.3 permits: enough to audit the erasure, and nothing
         // of what was erased. The digest was already public — it is what the
         // surviving record keeps — so naming it here discloses nothing new and
         // lets an auditor tie the entry to the Evidence it names.
@@ -303,7 +303,7 @@ pub async fn stage_payload(
     })
 }
 
-/// Whether an element is held against erasure (§82, §163).
+/// Whether an element is held against erasure (§19.1).
 pub fn has_legal_hold(element: &Element) -> bool {
     element
         .retention()
@@ -316,7 +316,7 @@ pub fn has_legal_hold(element: &Element) -> bool {
 ///
 /// Index lookups rather than a scan: each reference an element can hold has a
 /// key column beside it, which is what makes a provenance-aware purge planner
-/// possible at all (§166).
+/// possible at all (§60.3).
 async fn referrers_of(
     store: &Store,
     space_id: &str,
@@ -393,7 +393,7 @@ mod tests {
 
     #[test]
     fn the_default_reference_policy_refuses() {
-        // §173, §174: KIP 1.x made destructive cascade ordinary. 2.0 does not.
+        // §60.3, §60.4: KIP 1.x made destructive cascade ordinary. 2.0 does not.
         assert_eq!(
             ReferencePolicy::parse(None).unwrap(),
             ReferencePolicy::DenyIfReferenced

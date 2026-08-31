@@ -279,6 +279,77 @@ impl Endpoint {
     }
 }
 
+/// The endpoint an inline `{...}` matcher names, when it names one (§8.1, §8.2).
+///
+/// A tuple endpoint may be written as an object pattern — `term` admits
+/// `object_pattern` in the grammar — but only two spellings of one *name*
+/// something already: `{id: ...}` is a Local Element Reference and
+/// `{canonical_id: ...}` is a Canonical Identity Reference. Every other matcher
+/// describes a search, and resolving one would mean picking a winner among the
+/// Concepts a description is allowed to match — the arbitrary choice §7.2
+/// forbids for names.
+///
+/// The refusal is `IdentitySelectorRequired` and not `UnsupportedCapability`:
+/// no engine should ever resolve a description to one endpoint, so this is not
+/// a gap that a later version closes.
+///
+/// `resolve` reads a `:parameter`, because the two callers bind parameters from
+/// different places (a query's request/operation maps, a mutation's bindings)
+/// and neither should have to know about the other.
+pub fn matcher_endpoint(
+    matcher: &anda_kip::ObjectMatcher,
+    what: &str,
+    mut resolve: impl FnMut(&str) -> Result<Json, KipError>,
+) -> Result<Endpoint, KipError> {
+    for field in ["id", "canonical_id"] {
+        let Some(value) = matcher.get(field) else {
+            continue;
+        };
+        // An identity resolves the endpoint; it does not also filter it. A
+        // matcher carrying more than the identity asked for something this
+        // position cannot do, and answering it by dropping the rest would let
+        // `{id: "C-1", name: "Zed"}` match C-1 whatever C-1 is called — the
+        // silent wrong answer an unconstrained endpoint gives, one member in.
+        if matcher.len() > 1 {
+            let extra: Vec<&str> = matcher
+                .keys()
+                .filter(|key| key.as_str() != field)
+                .map(String::as_str)
+                .collect();
+            return Err(KipError::identity_selector_required(format!(
+                "{what} names `{field}`, so it is resolved by identity and not matched by \
+                 description; {} would be silently ignored. Drop {} or bind the element with its \
+                 own pattern",
+                extra.join(", "),
+                if extra.len() == 1 { "it" } else { "them" }
+            )));
+        }
+        let resolved = match value {
+            anda_kip::MatchValue::Literal(literal) => Json::from(literal.clone()),
+            anda_kip::MatchValue::Param(name) => resolve(name)?,
+            _ => {
+                return Err(KipError::identity_selector_required(format!(
+                    "`{field}` in {what} must be a literal identity or a parameter, not a pattern"
+                )));
+            }
+        };
+        let Json::String(id) = resolved else {
+            return Err(KipError::identity_selector_required(format!(
+                "`{field}` in {what} must be a string, got {resolved}"
+            )));
+        };
+        let mut map = Map::new();
+        map.insert(field.to_string(), Json::String(id));
+        return Endpoint::from_json(&Json::Object(map));
+    }
+
+    Err(KipError::identity_selector_required(format!(
+        "{what} written as an object must name a stable identity: {{id: \"…\"}} or \
+         {{canonical_id: \"…\"}}; matching one by description would pick a winner among the \
+         Concepts a description is allowed to share"
+    )))
+}
+
 /// The structural identity of a Proposition tuple within its Space (§12.5).
 ///
 /// Digested rather than concatenated because the raw key of a Literal endpoint

@@ -845,7 +845,7 @@ describe('KML', () => {
   })
 
   it('lets a legal hold block a payload purge, as it blocks an element purge', async () => {
-    // §163: a hold is most often placed precisely to preserve the bytes.
+    // §19.1: a hold is most often placed precisely to preserve the bytes.
     await withNexus('purge-payload-hold', (nexus) => {
       nexus.execute(CITED_EVIDENCE)
       // This engine has no `SET RETENTION` clause yet, so the hold is placed

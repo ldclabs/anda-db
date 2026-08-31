@@ -11,7 +11,7 @@
  *
  * - **`EXPORT CAPSULE` asks for `export`, not `read`.** A caller who may read
  *   every element in a Space still may not package them and take them away
- *   (§78, and the `read ≠ export` equation in §271).
+ *   (§78, and the `read ≠ export` equation in §102).
  * - **A historical read asks for `read_history` on top of `read`.** What the
  *   Brain contained in January is a different disclosure from what it contains
  *   now — it can include elements since archived, and origins since revoked.
@@ -107,7 +107,7 @@ function describePermissions(target: DescribeTarget): Permission[] {
   ) {
     return []
   }
-  // About the caller itself. §266: an Agent must be able to learn what it may do
+  // About the caller itself. §67.2: an Agent must be able to learn what it may do
   // without first being permitted to do it.
   if (target === 'ExecutionContext') return []
   if (typeof target === 'string') return ['discover']

@@ -71,7 +71,7 @@ export class Context {
   readonly asOf: number | null
 
   /**
-   * Whether `_system.origin` may be returned at all (§110).
+   * Whether `_system.origin` may be returned at all (§29).
    *
    * Space-scoped and decided once: engine origin is operational information
    * about the deployment rather than about any one element, so a caller either
@@ -151,7 +151,7 @@ export class Context {
    *
    * A Space-wide answer — a count, a total — is only honest when it is: a caller
    * whose Grant is narrowed must not be told how many elements exist outside it
-   * (§106). Answered from the authority rather than by scanning, because the
+   * (§88.6). Answered from the authority rather than by scanning, because the
    * point is to avoid producing the number at all.
    */
   readsWholeSpace(): boolean {
@@ -199,7 +199,7 @@ export class Context {
    * Returns `null` for an element this caller may not *discover*, and caches
    * the **redacted** view for one it may — so a `FILTER` or an `ORDER BY` on a
    * masked field sees what the projection would, rather than being able to probe
-   * the value through row membership (§109).
+   * the value through row membership (§29.2).
    *
    * An element the caller may discover but not read comes back with its
    * identity and nothing else (§29.2). It still exists, is still counted and

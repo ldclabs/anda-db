@@ -341,7 +341,7 @@ async fn supersession_must_stay_inside_one_lineage() {
 
 #[tokio::test]
 async fn an_unknown_type_is_refused_and_writes_nothing() {
-    // Spec §110: define-before-use. A data mutation never creates schema.
+    // Spec §29: define-before-use. A data mutation never creates schema.
     let nexus = nexus("define_before_use").await;
     let before = nexus.store.get_space(DEFAULT_SPACE).await.unwrap().seq;
 
@@ -463,7 +463,7 @@ async fn retraction_withdraws_a_claim_without_deleting_it() {
 
 #[tokio::test]
 async fn a_facet_member_the_schema_never_declared_is_refused() {
-    // Spec §240.31: a Facet is a validated namespaced extension, not the
+    // Spec §18.1: a Facet is a validated namespaced extension, not the
     // untyped metadata bag KIP 1.x ended up with.
     let nexus = nexus("facet_validation").await;
     let ok_response = run(
@@ -1082,7 +1082,7 @@ async fn only_evidence_has_a_payload_to_purge() {
 
 #[tokio::test]
 async fn a_legal_hold_blocks_a_payload_purge_exactly_as_it_blocks_an_element_purge() {
-    // §163: a hold is most often placed precisely to preserve the bytes.
+    // §19.1: a hold is most often placed precisely to preserve the bytes.
     let nexus = with_cited_evidence("purge_payload_hold").await;
     ok(
         &nexus,

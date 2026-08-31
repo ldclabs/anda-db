@@ -32,7 +32,7 @@
 //! state and are semantically a different plane: **no KML clause reaches
 //! them**. They are written by host APIs on [`CognitiveNexus`](crate::CognitiveNexus)
 //! only, which is what keeps a prompt injection into ordinary memory formation
-//! from having a route into policy (§264).
+//! from having a route into policy (§20.10).
 //!
 //! ## Default deny, and why the engine still works out of the box
 //!
@@ -63,7 +63,7 @@ pub use auth::AuthContext;
 pub use decision::{Authorization, EffectiveAuthority, ResourceContext};
 pub use permission::{Family, Permission};
 
-/// The Principal the engine itself acts as (§212).
+/// The Principal the engine itself acts as (§28.2).
 ///
 /// It exists so that engine-performed maintenance is attributable to something
 /// rather than to nobody. `$system` semantic identity is a different thing and
@@ -71,7 +71,7 @@ pub use permission::{Family, Permission};
 pub const SYSTEM_PRINCIPAL: &str = "kip:principal:system";
 
 /// The Principal an unauthenticated caller runs as, where a Space admits one
-/// (§217).
+/// (§30.2).
 ///
 /// Named rather than absent: "no Principal" and "the anonymous Principal" must
 /// not be the same value, or a bug that dropped the identity would look like a
@@ -126,13 +126,13 @@ pub mod classification {
     ///
     /// This is what derived content inherits (§98). A summary of secret
     /// Evidence is secret until somebody with `declassify` says otherwise —
-    /// summarizing is not a declassification mechanism (§242).
+    /// summarizing is not a declassification mechanism (§31.2).
     pub fn join<'a>(a: &'a str, b: &'a str) -> &'a str {
         if rank(a) >= rank(b) { a } else { b }
     }
 }
 
-/// How strongly a memory may influence action (§117–§122).
+/// How strongly a memory may influence action (§31.3).
 ///
 /// This is an authority ceiling, not a truth score. A memory can be certainly
 /// true and still be `descriptive`: believing something and being permitted to
@@ -141,7 +141,7 @@ pub mod classification {
 ///
 /// And the top of this ladder is still not permission to do anything: an
 /// `executable` Skill may be *supplied* to an action runtime, which must
-/// independently authorize the actual tool call (§122). Memory authority never
+/// independently authorize the actual tool call (§31.3). Memory authority never
 /// becomes tool authority.
 pub mod authority {
     /// May be read, quoted and reasoned over — but is not a recommendation.
@@ -153,7 +153,7 @@ pub mod authority {
     /// May be supplied to an execution runtime as a procedure.
     pub const EXECUTABLE: &str = "executable";
 
-    /// What memory gets when nothing says otherwise, imports included (§125).
+    /// What memory gets when nothing says otherwise, imports included (§31.4).
     pub const DEFAULT: &str = DESCRIPTIVE;
 
     /// Where a class sits in the ladder.
@@ -174,7 +174,7 @@ pub mod authority {
     /// The lower of two authority classes.
     ///
     /// Derivation uses this, which is the whole of the non-amplification rule
-    /// (§127): a summary of an advisory Skill is at most advisory, and no chain
+    /// (§31.5): a summary of an advisory Skill is at most advisory, and no chain
     /// of reformatting turns a descriptive note into an executable one.
     pub fn meet<'a>(a: &'a str, b: &'a str) -> &'a str {
         if rank(a) <= rank(b) { a } else { b }
@@ -234,7 +234,7 @@ mod tests {
 
     #[test]
     fn derived_content_inherits_the_more_restrictive_label() {
-        // §242: a summary of secret Evidence does not become public by being
+        // §31.2: a summary of secret Evidence does not become public by being
         // a summary.
         assert_eq!(
             classification::join(classification::SECRET, classification::PUBLIC),
@@ -244,7 +244,7 @@ mod tests {
 
     #[test]
     fn derived_authority_never_rises() {
-        // §243: reformatting a descriptive Skill does not make it executable.
+        // §31.5: reformatting a descriptive Skill does not make it executable.
         assert_eq!(
             authority::meet(authority::DESCRIPTIVE, authority::EXECUTABLE),
             authority::DESCRIPTIVE
@@ -259,7 +259,7 @@ mod tests {
 
     #[test]
     fn require_approval_is_not_an_allow() {
-        // §40, and the §246 fixture: one approval where two are required is
+        // §28.5: one approval where two are required is
         // not partial activation.
         assert!(!Decision::RequireApproval.is_permitted());
         assert!(!Decision::Deny.is_permitted());

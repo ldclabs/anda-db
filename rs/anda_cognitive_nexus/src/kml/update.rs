@@ -2,7 +2,7 @@
 //!
 //! The parser already refuses the rewrites it can see: `UPDATE ?a SET FIELDS
 //! {confidence: …}` never reaches an engine when the block types `?a` as an
-//! Assertion (§76). But it can only see what the command spells out, and
+//! Assertion (§58.1). But it can only see what the command spells out, and
 //! `UPDATE :A-7 SET FIELDS {confidence: 0.1}` spells out nothing — the target
 //! is an id, and only the engine knows what kind of element wears it. So the
 //! same rules are enforced again here, against the element actually loaded.

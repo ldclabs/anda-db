@@ -10,14 +10,14 @@
  *
  * - **No KML clause can reach them.** They are written through host APIs only,
  *   which is what stops a prompt injection into ordinary memory formation from
- *   having a path to privilege escalation (§264).
+ *   having a path to privilege escalation (§20.10).
  * - **Revocation is a status change, never a delete.** A revoked Grant must stop
  *   authorizing future operations without rewriting the audit that says it
  *   authorized a past one (§36, §49).
  * - **Every mutation is mirrored into {@link GovernanceAuditRow} with the
  *   complete new record.** Whole records rather than diffs, for the same reason
  *   the element version log stores whole rows: a diff chain with one missing
- *   link answers a historical question wrongly instead of refusing (§175).
+ *   link answers a historical question wrongly instead of refusing (§2.12).
  *
  * Ids are minted from the SQLite row id rather than carried in a column, because
  * the row id is assigned at insert and a second write to store the derived
@@ -85,7 +85,7 @@ export interface PrincipalRow {
   principal_class: string
   /** One of `govStatus`. */
   status: string
-  /** A human-readable label. Carries no authority (§203). */
+  /** A human-readable label. Carries no authority (§2.6). */
   display_name: string
   /** Which deployment subsystem authenticated this identity. */
   auth_provider: string
@@ -95,7 +95,7 @@ export interface PrincipalRow {
   updated_at: string
   /** When it was revoked; empty while it is not. */
   revoked_at: string
-  /** Bumped on every change, so a cached decision can be invalidated (§187). */
+  /** Bumped on every change, so a cached decision can be invalidated (§28.6). */
   version: number
 }
 
@@ -274,7 +274,7 @@ export interface GovernancePolicyRow {
 }
 
 /**
- * A pending or satisfied multi-party approval (§167–§170).
+ * A pending or satisfied multi-party approval (§28.5).
  *
  * Approval is control state, not a semantic statement: a Concept saying "Alice
  * approved this" satisfies nothing. What satisfies it is an approving Principal
@@ -282,7 +282,7 @@ export interface GovernancePolicyRow {
  *
  * `subject_digest` binds the approval to one concrete operation. Without it an
  * approval for "purge this one Evidence record" would authorize purging
- * anything, which is the failure mode §246 tests for.
+ * anything, which is the failure mode §28.5 tests for.
  */
 export interface ApprovalRow {
   id: number
@@ -304,7 +304,7 @@ export interface ApprovalRow {
   approver_ids: string[]
   /**
    * Whether the requester may also approve. False by default: the same Principal
-   * proposing and approving is the separation-of-duties failure §170 names
+   * proposing and approving is the separation-of-duties failure §28.5 names
    * first.
    */
   allow_self_approval: number
@@ -320,7 +320,7 @@ export interface ApprovalRow {
 }
 
 /**
- * One append-preserved Governance audit entry (§172–§175).
+ * One append-preserved Governance audit entry (§29).
  *
  * Two things are recorded here and deliberately tagged apart:
  *
@@ -330,7 +330,7 @@ export interface ApprovalRow {
  * ```
  *
  * Corrections append; nothing here is ever rewritten. An audit that could be
- * edited would answer §247 — *which policy version authorized this?* — with
+ * edited would answer §33.1 — *which policy version authorized this?* — with
  * today's answer rather than the one that was true.
  */
 export interface GovernanceAuditRow {
@@ -351,7 +351,7 @@ export interface GovernanceAuditRow {
    * mutation verb for a `mutation` entry.
    */
   decision: string
-  /** Why, in one line. Safe to show a caller (§267). */
+  /** Why, in one line. Safe to show a caller (§30.4). */
   reason: string
   policy_id: string
   policy_version: number
@@ -424,7 +424,7 @@ export interface AuthorityConstraints {
 }
 
 /**
- * What an allow requires the runtime to do as well (§184).
+ * What an allow requires the runtime to do as well (§86.1).
  *
  * An obligation that cannot be satisfied denies the operation. A policy that
  * requires an audit record, on a runtime whose audit is unavailable, must not
@@ -626,7 +626,7 @@ export function scopeIsEmpty(scope: AuthorityScope): boolean {
  * Whether `other` is at least as restrictive as `conditions`.
  *
  * Time is the subtle one: a child that outlives its parent is the classic
- * delegation amplification (§238), so an empty child `valid_until` against a
+ * delegation amplification (§28.5), so an empty child `valid_until` against a
  * bounded parent fails.
  */
 export function conditionsContain(
@@ -739,7 +739,7 @@ function lowerNamed(a: string, b: string, rank: (name: string) => number): strin
  * The opposite direction from constraints, and for a different reason: a
  * constraint is one authority's limit, so an independently sufficient authority
  * must not inherit another's. An obligation is what the *deployment* requires of
- * the operation, so every matching statement's obligation applies (§184).
+ * the operation, so every matching statement's obligation applies (§86.1).
  */
 export function mergeObligations(
   a: PolicyObligations,

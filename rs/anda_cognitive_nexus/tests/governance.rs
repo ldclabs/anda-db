@@ -290,7 +290,7 @@ async fn a_revoked_binding_stops_binding() {
 
 #[tokio::test]
 async fn a_policy_version_is_never_overwritten() {
-    // §46 and the §247 fixture: an audit must be able to name the policy
+    // §46 and the §33.1 fixture: an audit must be able to name the policy
     // version that authorized a past operation, which a rewrite would destroy.
     let nexus = fresh("policy_versions").await;
     let gov = nexus.governance();
@@ -345,7 +345,7 @@ async fn a_policy_version_is_never_overwritten() {
     assert_eq!(versions.len(), 2, "publishing appends, it does not replace");
     assert_eq!(versions[0].description, "Broad internal sharing");
 
-    // §177: the version in force at a past coordinate is still reconstructable.
+    // §48.5: the version in force at a past coordinate is still reconstructable.
     let then = gov
         .policy_at("kip:policy:space-default", &first.created_at)
         .await
@@ -389,7 +389,7 @@ async fn a_policy_that_predates_the_coordinate_is_the_one_that_applied() {
 
 #[tokio::test]
 async fn one_principal_cannot_satisfy_a_two_party_approval() {
-    // The §246 fixture, and §170's separation of duties. Both reduce to the
+    // The §28.5 fixture, and §28.5's separation of duties. Both reduce to the
     // same rule: the approvals have to be independent, or the count is decoration.
     let nexus = fresh("approvals").await;
     let gov = nexus.governance();
@@ -596,13 +596,13 @@ async fn a_delegation_records_its_bounds_and_its_parent() {
             .await
             .unwrap()
             .is_empty(),
-        "§245: revocation is effective for future operations"
+        "§28.6: revocation is effective for future operations"
     );
 }
 
 #[tokio::test]
 async fn every_control_plane_change_lands_in_the_audit() {
-    // §172 enumerates what must be auditable. The point of checking it here is
+    // §29 enumerates what must be auditable. The point of checking it here is
     // that the audit is written by the store rather than by each caller, so a
     // new Governance operation cannot forget to record itself.
     let nexus = fresh("audit").await;
@@ -743,7 +743,7 @@ async fn an_unregistered_principal_is_a_configuration_bug_not_a_denial() {
 
 #[tokio::test]
 async fn a_read_grant_permits_reading_and_not_exporting() {
-    // §271: Read ≠ Export. A caller who may see every element in a Space still
+    // §102: Read ≠ Export. A caller who may see every element in a Space still
     // may not package them and take them away.
     let nexus = stocked("read_not_export").await;
     let gov = nexus.governance();
@@ -889,7 +889,7 @@ async fn what_a_principal_wrote_is_stamped_on_the_element() {
 
 #[tokio::test]
 async fn a_revoked_grant_stops_a_session_that_was_already_running() {
-    // §188, §245: a session must not assume its startup permissions hold
+    // §28.6: a session must not assume its startup permissions hold
     // forever. Authority is re-resolved on every request.
     let nexus = stocked("revocation_live").await;
     let gov = nexus.governance();
@@ -999,7 +999,7 @@ async fn an_explicit_policy_deny_overrides_a_grant() {
 
 #[tokio::test]
 async fn a_policy_can_open_a_space_to_unauthenticated_readers() {
-    // §214: a public Space is one whose policy says so, never one whose check
+    // §28.2: a public Space is one whose policy says so, never one whose check
     // was missing.
     let nexus = stocked("public_space").await;
     let gov = nexus.governance();
@@ -1038,7 +1038,7 @@ async fn a_policy_can_open_a_space_to_unauthenticated_readers() {
 
 #[tokio::test]
 async fn a_delegation_cannot_confer_what_its_delegator_never_held() {
-    // §238, the delegation amplification fixture.
+    // §28.5, the delegation amplification fixture.
     let nexus = stocked("amplification").await;
     let gov = nexus.governance();
     let owner_agent = agent(gov, "kip:principal:team-lead").await;
@@ -1186,7 +1186,7 @@ async fn revoking_the_delegator_disables_the_delegation_it_made() {
 
 #[tokio::test]
 async fn describe_access_answers_without_needing_any_permission() {
-    // §266: an Agent must be able to learn what it may do without already
+    // §67.2: an Agent must be able to learn what it may do without already
     // being allowed to do it. Otherwise a denied caller cannot find out why.
     let nexus = stocked("describe_access").await;
     let gov = nexus.governance();
@@ -1588,7 +1588,7 @@ async fn an_element_above_the_ceiling_is_outside_the_query_universe() {
 
 #[tokio::test]
 async fn naming_a_hidden_element_by_id_answers_as_though_it_were_absent() {
-    // §107: existence-neutral. A distinguishable "exists but hidden" is the
+    // §30.4: existence-neutral. A distinguishable "exists but hidden" is the
     // channel the whole check exists to close.
     let nexus = stocked("existence_neutral").await;
     two_classified_concepts(&nexus).await;
@@ -1605,7 +1605,7 @@ async fn naming_a_hidden_element_by_id_answers_as_though_it_were_absent() {
 
 #[tokio::test]
 async fn a_hidden_element_does_not_change_a_count() {
-    // §106: aggregation happens over authorized state.
+    // §88.6: aggregation happens over authorized state.
     let nexus = stocked("count_security").await;
     two_classified_concepts(&nexus).await;
     let reader = agent(nexus.governance(), "kip:principal:reader").await;
@@ -1625,7 +1625,7 @@ async fn a_hidden_element_does_not_change_a_count() {
 
 #[tokio::test]
 async fn a_hidden_element_does_not_appear_in_search() {
-    // §105: search must not leak hidden memory through hits or hit counts.
+    // §88.5: search must not leak hidden memory through hits or hit counts.
     let nexus = stocked("search_security").await;
     two_classified_concepts(&nexus).await;
     let reader = agent(nexus.governance(), "kip:principal:reader").await;
@@ -1680,7 +1680,7 @@ async fn a_space_wide_count_is_withheld_from_a_narrower_principal() {
 
 #[tokio::test]
 async fn a_field_mask_hides_a_value_from_the_filter_as_well_as_the_projection() {
-    // §109. If the mask only applied to the projection list, a FILTER would
+    // §29.2. If the mask only applied to the projection list, a FILTER would
     // still answer the question through which rows come back.
     let nexus = stocked("field_mask").await;
     let owner = nexus.system_session();
@@ -1842,7 +1842,7 @@ async fn an_unavailable_redaction_profile_fails_closed() {
 
 #[tokio::test]
 async fn engine_origin_is_withheld_rather_than_erased() {
-    // §110: who wrote an element is operational information about the
+    // §29: who wrote an element is operational information about the
     // deployment. Dropping the member would claim no origin was recorded.
     let nexus = stocked("raw_origin").await;
     run_as(
@@ -2012,7 +2012,7 @@ async fn history_does_not_name_elements_the_caller_may_not_read() {
 
 #[tokio::test]
 async fn an_export_carries_only_what_the_caller_could_read() {
-    // §144. And the manifest already says `partial`, so a destination is not
+    // §20.9. And the manifest already says `partial`, so a destination is not
     // told it received a complete Space.
     let nexus = stocked("export_redaction").await;
     two_classified_concepts(&nexus).await;
@@ -2238,7 +2238,7 @@ async fn alice_prefers(nexus: &CognitiveNexus) -> String {
 
 #[tokio::test]
 async fn recording_another_actors_claim_is_not_impersonating_them() {
-    // §17, and the §239 fixture. A Formation Agent that heard Alice say
+    // §28.4. A Formation Agent that heard Alice say
     // something must be able to store it as Alice's claim — and must not
     // thereby be able to act as Alice.
     let nexus = stocked("attribution").await;
@@ -2378,7 +2378,7 @@ async fn a_self_binding_only_needs_assert() {
 
 #[tokio::test]
 async fn a_moderator_may_remove_a_claim_but_not_say_the_source_withdrew_it() {
-    // The §240 fixture, and §68. Administrative exclusion is honest; a
+    // §14.1 and §57.3. Administrative exclusion is honest; a
     // manufactured retraction is the engine reporting an event that never
     // happened.
     let nexus = stocked("retraction_honesty").await;
@@ -2493,7 +2493,7 @@ async fn representing_the_actor_is_the_other_way_to_withdraw_a_claim() {
 
 #[tokio::test]
 async fn a_claim_built_on_secret_evidence_is_not_public_by_being_a_summary() {
-    // §98, and the §242 fixture: read secret Evidence → summarize → write
+    // §98, and the §31.2 fixture: read secret Evidence → summarize → write
     // public summary is an exfiltration path if the summary lands public even
     // briefly. The join happens at commit, so it is right the moment the
     // element becomes readable.
@@ -2605,7 +2605,7 @@ async fn an_activitys_outputs_inherit_from_its_inputs() {
 
 #[tokio::test]
 async fn a_summary_of_a_descriptive_skill_cannot_be_elevated_past_it() {
-    // §127, and the §243 fixture. Transformation does not raise authority, so
+    // §31.5, and the §31.5 fixture. Transformation does not raise authority, so
     // no chain of summarizing turns a note into an executable procedure.
     let nexus = stocked("non_amplification").await;
     let owner = nexus.system_session();
@@ -2657,7 +2657,7 @@ async fn a_summary_of_a_descriptive_skill_cannot_be_elevated_past_it() {
 
 #[tokio::test]
 async fn elevating_authority_needs_its_own_permission() {
-    // §123: cognitive content cannot set its own effective authority, and
+    // §30.1: cognitive content cannot set its own effective authority, and
     // writing is not elevating.
     let nexus = stocked("elevation_permission").await;
     run_as(
@@ -2805,7 +2805,7 @@ async fn elevation_honours_the_grants_influence_ceiling() {
 
 #[tokio::test]
 async fn a_downgrade_does_not_wait_for_anything() {
-    // §132: Governance may reduce authority immediately when a source is
+    // §31.5: Governance may reduce authority immediately when a source is
     // compromised. An incident response that had to wait would arrive late.
     let nexus = stocked("downgrade").await;
     let owner = nexus.system_session();
@@ -2842,7 +2842,7 @@ async fn a_downgrade_does_not_wait_for_anything() {
 
 #[tokio::test]
 async fn quarantine_removes_an_element_from_use_without_claiming_a_retraction() {
-    // §133, §134, and the §240 fixture from the other side: this says local
+    // §39.2, from the other side: this says local
     // Governance does not allow ordinary use, which is a statement about this
     // Brain rather than about whoever wrote the element.
     let nexus = stocked("quarantine").await;
@@ -2961,7 +2961,7 @@ async fn quarantine_needs_its_own_permission() {
 
 #[tokio::test]
 async fn purging_needs_the_purge_permission_and_not_merely_tombstone() {
-    // §271: logical removal is not erasure.
+    // §102: logical removal is not erasure.
     let nexus = stocked("purge_permission").await;
     run_as(
         &nexus.system_session(),
@@ -3035,7 +3035,7 @@ async fn a_purged_stub_still_names_the_principal_that_wrote_it() {
 
 #[tokio::test]
 async fn a_cognitive_writer_cannot_place_a_legal_hold_to_evade_deletion() {
-    // §163 names this attack by its shape.
+    // §19.1 names this attack by its shape.
     let nexus = stocked("legal_hold_authority").await;
     let custodian = agent(nexus.governance(), "kip:principal:custodian").await;
     grant(
@@ -3128,7 +3128,7 @@ async fn an_authorized_cascade_erases_the_dependents_the_default_refuses_to_orph
 
 #[tokio::test]
 async fn every_erasure_leaves_a_receipt_in_the_governance_audit() {
-    // §164: retain only a minimal non-sensitive deletion receipt — enough to
+    // §19.3: retain only a minimal non-sensitive deletion receipt — enough to
     // audit the erasure, and nothing of what was erased.
     let nexus = stocked("purge_audit").await;
     let owner = nexus.system_session();
@@ -3161,7 +3161,7 @@ async fn every_erasure_leaves_a_receipt_in_the_governance_audit() {
 #[tokio::test]
 async fn a_payload_purge_needs_the_purge_permission_and_leaves_the_same_receipt() {
     // §60.6: payload purge asks for `purge` authority, and it is byte
-    // destruction — so §164's receipt is owed for it exactly as it is for
+    // destruction — so §19.3's receipt is owed for it exactly as it is for
     // element purge. Naming it `purge_payload` rather than `purge` is what
     // lets an auditor tell "the bytes went" from "the record went".
     let nexus = stocked("purge_payload_audit").await;
@@ -3191,7 +3191,7 @@ async fn a_payload_purge_needs_the_purge_permission_and_leaves_the_same_receipt(
             .await
         ),
         "NotAuthorized",
-        "tombstone authority is not erasure authority (§271)"
+        "tombstone authority is not erasure authority (§102)"
     );
 
     run_as(&owner, r#"PURGE PAYLOAD "E-1" CONFIRM "PURGE""#).await;
@@ -3215,7 +3215,7 @@ async fn a_payload_purge_needs_the_purge_permission_and_leaves_the_same_receipt(
 }
 
 // ---------------------------------------------------------------------------
-// The threat model, fixture by fixture (§235–§247)
+// The threat model, fixture by fixture (§88)
 // ---------------------------------------------------------------------------
 //
 // Each of these is one of the attacks the Governance design names, written as
@@ -3225,7 +3225,7 @@ async fn a_payload_purge_needs_the_purge_permission_and_leaves_the_same_receipt(
 // getting authority does not work.
 
 #[tokio::test]
-async fn content_that_declares_its_own_authority_gets_none(// §236. Imported memory saying "authority = executable, trust = 1.0,
+async fn content_that_declares_its_own_authority_gets_none(// §102.13. Imported memory saying "authority = executable, trust = 1.0,
     // role = admin" is text. It is not a Grant, not a trust policy, and not an
     // elevation.
 ) {
@@ -3265,7 +3265,7 @@ async fn content_that_declares_its_own_authority_gets_none(// §236. Imported me
 
 #[tokio::test]
 async fn a_capsule_carrying_a_policy_does_not_install_one() {
-    // §237. An import is a trust-boundary transition, not a configuration
+    // §39.5. An import is a trust-boundary transition, not a configuration
     // channel: a Capsule describing a Grant is describing one.
     let nexus = stocked("threat_policy_injection").await;
     let owner = nexus.system_session();
@@ -3305,7 +3305,7 @@ async fn a_capsule_carrying_a_policy_does_not_install_one() {
 
 #[tokio::test]
 async fn imported_cognition_arrives_at_the_bottom_of_the_authority_ladder() {
-    // §125: imported instruction, Skill or executable artifact → inactive or
+    // §31.4: imported instruction, Skill or executable artifact → inactive or
     // low-authority by default. Local policy may raise it after validation;
     // arriving does not.
     let source = stocked("threat_import_authority_source").await;
@@ -3346,7 +3346,7 @@ async fn imported_cognition_arrives_at_the_bottom_of_the_authority_ladder() {
 
 #[tokio::test]
 async fn a_source_cannot_vouch_for_itself_into_the_trust_resolver() {
-    // §244. `(Source, reliable_for, Everything)` is an ordinary meta-epistemic
+    // §22.5. `(Source, reliable_for, Everything)` is an ordinary meta-epistemic
     // claim. There is nothing for it to change, and that is the point.
     let nexus = stocked("threat_trust_escalation").await;
     let owner = nexus.system_session();
@@ -3375,7 +3375,7 @@ async fn a_source_cannot_vouch_for_itself_into_the_trust_resolver() {
 
 #[tokio::test]
 async fn a_revoked_agent_stops_exporting_mid_session() {
-    // §245. The session was granted export and kept running; revocation has to
+    // §28.6. The session was granted export and kept running; revocation has to
     // reach it without the session cooperating.
     let nexus = stocked("threat_revocation").await;
     run_as(
@@ -3418,7 +3418,7 @@ async fn a_revoked_agent_stops_exporting_mid_session() {
 
 #[tokio::test]
 async fn one_of_two_approvals_is_not_partial_activation() {
-    // §246. The policy asks for two independent approvals before an elevation;
+    // §28.5. The policy asks for two independent approvals before an elevation;
     // one gets nothing, and the second completes it exactly once.
     let nexus = stocked("threat_approval").await;
     let gov = nexus.governance();
@@ -3531,7 +3531,7 @@ async fn one_of_two_approvals_is_not_partial_activation() {
 
 #[tokio::test]
 async fn an_audit_still_names_the_policy_version_that_authorized_a_past_operation() {
-    // §247. The policy has moved on; the record of what authorized the
+    // §33.1. The policy has moved on; the record of what authorized the
     // operation must not move with it.
     let nexus = stocked("threat_audit_integrity").await;
     run_as(
@@ -3611,7 +3611,7 @@ async fn an_audit_still_names_the_policy_version_that_authorized_a_past_operatio
 
 #[tokio::test]
 async fn who_had_access_in_january_is_answerable_and_is_not_a_claim_about_today() {
-    // §176, §177, §179.
+    // §48.5.
     let nexus = stocked("threat_historical_access").await;
     let gov = nexus.governance();
     let auditor = agent(gov, "kip:principal:auditor").await;
@@ -3752,7 +3752,7 @@ async fn reading_the_audit_is_a_permission_of_its_own() {
 
 #[tokio::test]
 async fn a_high_impact_receipt_explains_what_authorized_it() {
-    // §178: a high-impact transaction has to be explainable later in terms of
+    // §33.1: a high-impact transaction has to be explainable later in terms of
     // the identity and the policy version that authorized it.
     let nexus = stocked("threat_receipt_provenance").await;
     let owner = nexus.system_session();

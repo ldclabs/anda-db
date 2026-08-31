@@ -2,7 +2,7 @@
  * # The permission registry
  *
  * One name per distinction the protocol requires an implementation to keep
- * (Spec §29, Governance §52–§89, §249). The names may be refined; the
+ * (Spec §29). The names may be refined; the
  * distinctions may not, and every one of them exists because collapsing it
  * silently widens authority:
  *
@@ -244,7 +244,7 @@ export const PERMISSIONS = {
     description: 'install a Schema Package or activate a Schema Lock',
   },
 
-  // Authority (§87, §129)
+  // Authority (§29, §31.5)
   elevate_authority: {
     family: 'authority',
     description: 'raise how strongly a memory may influence action',
@@ -307,9 +307,9 @@ export function isPermission(name: string): name is Permission {
 
 /**
  * Whether this permission is high-impact enough that a Space's audit obligation
- * applies to it even when no policy statement says so (§172).
+ * applies to it even when no policy statement says so (§29).
  *
- * The list is the one §172 enumerates: changing the control plane, moving
+ * The list is the one §29 enumerates: changing the control plane, moving
  * cognition across the Space boundary, erasing, and raising authority. A
  * deployment may audit more; it may not audit less, because these are the
  * operations whose absence from a log is itself the incident.

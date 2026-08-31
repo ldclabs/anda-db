@@ -1,6 +1,6 @@
 //! # `DESCRIBE` and `LIST`
 //!
-//! Introspection returns **canonical identity** (Spec §106): a `DESCRIBE TYPE
+//! Introspection returns **canonical identity** (Spec §65): a `DESCRIBE TYPE
 //! "Person"` answers with `kip://profiles/cognitive-memory@2.0.0/Person`, not
 //! with the local name the caller happened to write. A caller that stored the
 //! local name would have stored something whose meaning changes when the
@@ -49,7 +49,7 @@ pub async fn run(cx: &mut Context<'_>, target: &DescribeTarget) -> Result<Answer
         DescribeTarget::SchemaEnvironment { as_of } => {
             // The environment a past coordinate resolved through, not today's:
             // reconstructing history under current schema would answer a
-            // question nobody asked (§144).
+            // question nobody asked (§20.9).
             if let Some(as_of) = as_of {
                 let seq = cx.resolve_as_of(as_of).await?;
                 let version = cx.store.schema_version_at(&cx.space, seq).await?;
@@ -118,13 +118,13 @@ pub async fn run(cx: &mut Context<'_>, target: &DescribeTarget) -> Result<Answer
     })
 }
 
-/// `DESCRIBE ACCESS` — what this caller may do here (§229, §230, §266).
+/// `DESCRIBE ACCESS` — what this caller may do here (§63.3, §67.2).
 ///
 /// Answers about the caller's own authority and nothing else. It names the
 /// permissions held and the Grants that carry them, and it does **not** list
 /// policy statements, other Principals, or which elements exist — an access
 /// report that explained the whole policy would be a disclosure channel for
-/// the state the policy protects (§267).
+/// the state the policy protects (§30.4).
 ///
 /// The permission list is Space-scoped and deliberately coarse: it answers
 /// "could this ever be allowed here", not "is it allowed on element X". The
@@ -149,7 +149,7 @@ fn access(cx: &mut Context<'_>, with: Option<&anda_kip::BoundObject>) -> Result<
             "assurance": auth.purpose_assurance,
         },
         "delegation_chain": auth.delegation_chain,
-        // §266: an Agent planning its own work needs to know when what it
+        // §67.2: an Agent planning its own work needs to know when what it
         // holds runs out, not only that it holds it.
         "expires_at": authority.earliest_expiry(),
         "permissions": authority.permission_names(auth),
@@ -426,7 +426,7 @@ async fn execution_context(cx: &mut Context<'_>) -> Result<Json, KipError> {
         // asking; the other is who this Brain is.
         "cognitive_identity": self_identity(&space),
         // Who this request is running as. An Agent that cannot see its own
-        // identity cannot reason about why something was refused (§266).
+        // identity cannot reason about why something was refused (§67.2).
         "principal": {
             "id": cx.auth.principal_id,
             "authenticated": cx.auth.is_authenticated(),
@@ -548,7 +548,7 @@ async fn primer(cx: &mut Context<'_>, mode: Option<&Scalar>) -> Result<Json, Kip
 /// How many elements of each kind the Space holds.
 ///
 /// Only answered for a caller whose read authority reaches the whole Space
-/// (§106). A count is a fact about elements a narrower Principal may not
+/// (§88.6). A count is a fact about elements a narrower Principal may not
 /// discover, and a Space-wide number is exactly the leak §103 lists — so a
 /// restricted caller is told that the number is being withheld, and why,
 /// rather than being handed a smaller one that reads as the whole truth.
@@ -697,7 +697,7 @@ fn package(cx: &Context<'_>, reference: &str) -> Result<Json, KipError> {
     }))
 }
 
-/// Describes one schema symbol, always by its canonical identity (§106).
+/// Describes one schema symbol, always by its canonical identity (§65).
 fn symbol(cx: &mut Context<'_>, kind: SymbolKind, scalar: &Scalar) -> Result<Json, KipError> {
     let name = scalar_str(cx, scalar, "DESCRIBE")?;
     let symbol = cx.env.resolve_symbol(kind, &name, Intent::Read)?;

@@ -11,7 +11,7 @@
 //! creates a tuple and records no confidence, no source and no stance, because
 //! those belong to Assertions about it.
 //!
-//! **An Assertion's epistemic payload is immutable** (§76). There is no clause
+//! **An Assertion's epistemic payload is immutable** (§58.1). There is no clause
 //! that edits stance, mode, confidence or evidence — correcting a claim is
 //! `CREATE ASSERTION` plus `SUPERSEDE`, which is why the parser rejects
 //! `UPDATE ?a SET FIELDS {confidence: ...}` before an engine ever sees it.
@@ -796,7 +796,7 @@ fn attribution_permission(tx: &Transaction, actor_key: &str) -> Permission {
     }
 }
 
-/// `PURGE` — physical erasure (§170–§177).
+/// `PURGE` — physical erasure (§60.3, §60.4).
 ///
 /// The identity stub is staged like every other write. Destruction of the old
 /// version log is deferred until commit, after every clause and every purge
@@ -933,7 +933,7 @@ fn require_retention_authority(tx: &Transaction, retention: &Json) -> Result<(),
 
 /// Refuses a legal hold written by a caller who may not place one.
 ///
-/// §163 names this attack by its shape: a cognitive writer must not be able to
+/// §19.1 names this attack by its shape: a cognitive writer must not be able to
 /// evade deletion by setting `legal_hold = true`. Placing a hold blocks erasure
 /// for everyone, so it is its own permission rather than part of retention
 /// management.

@@ -33,6 +33,7 @@ import {
   formatElementId,
   parseElementId,
   parseElementIdOfKind,
+  tryParseElementId,
   type ElementId,
   type ElementKind,
   elementIdEquals,
@@ -430,7 +431,9 @@ function createRecord(
     }
     case 'Assertion': {
       const proposition = fields.reference('proposition', 'CREATE ASSERTION')
-      const assertedBy = fields.json('asserted_by')
+      // §11.3: a claim recorded now is attributed to the identity that
+      // survived the merge, or the two would never meet again.
+      const assertedBy = canonicalizeReference(tx, fields.json('asserted_by'))
       // Each citation keeps the role it was cited in: Core records that this
       // Assertion cites E *as supporting*, and never that E proves anything —
       // that judgement belongs to the Projection (§8.4).
@@ -761,8 +764,18 @@ function ensureProposition(
   b: Bindings,
   clause: EnsureProposition,
 ): ElementId {
-  const subject = endpointFromJson(termValue(b, clause.subject, 'subject'))
-  const object = endpointFromJson(termValue(b, clause.object, 'object'))
+  // §11.3: a new write canonicalizes a merged reference to the surviving
+  // Concept. Without this a merge would be decorative — every later claim about
+  // the merged-away Concept would accumulate on the identity the merge said was
+  // the same one, and the two would never meet again.
+  const subject = canonicalizeEndpoint(
+    tx,
+    endpointFromJson(termValue(b, clause.subject, 'subject')),
+  )
+  const object = canonicalizeEndpoint(
+    tx,
+    endpointFromJson(termValue(b, clause.object, 'object')),
+  )
   const predicate = tx.env.resolveSymbol(
     'PredicateType',
     predicateName(b, clause.predicate),
@@ -1048,9 +1061,29 @@ function merge(
 
   const from = requireKind(tx, source, 'Concept')
   requireKind(tx, target, 'Concept')
+
+  // §11.1: canonical resolution follows `merged_into` to its fixpoint, so a
+  // cycle would make that walk run forever. The check is on the target's
+  // chain, before anything is written.
+  if (
+    canonicalChain(tx, target).some((step) => elementIdEquals(step, source))
+  ) {
+    throw errors.identityMergeConflict(
+      `${formatElementId(target)} already resolves back to ` +
+        `${formatElementId(source)}; merging would make canonical resolution cycle`,
+    )
+  }
+
+  // Already pointing where this statement wants it: the merge happened, so
+  // saying so again changes nothing. A client that lost the response to a
+  // MERGE and re-sent it (§80.4) gets `no_effect` rather than a conflict —
+  // which is the answer the reference engine gives, and the only one that
+  // makes the retry §80.4 recommends safe.
+  if (from.row.merged_into === formatElementId(target)) return
+
   if (from.row.merged_into !== '') {
-    // Re-pointing an already-merged Concept would make the forwarding chain
-    // say two different things about where the identity went.
+    // Re-pointing an already-merged Concept somewhere *else* would make the
+    // forwarding chain say two different things about where the identity went.
     throw errors.identityMergeConflict(
       `${formatElementId(source)} was already merged into ${from.row.merged_into}`,
     )
@@ -1058,6 +1091,75 @@ function merge(
   from.row.merged_into = formatElementId(target)
   from.row.state = State.MERGED
   tx.markChanged(source, 'merge')
+}
+
+// --- merged identity --------------------------------------------------------
+
+/**
+ * The `merged_into` chain above one Concept, ending at its canonical id.
+ *
+ * Bounded independently of the cycle check that maintains it: a chain longer
+ * than this is corrupt state, and walking it forever would turn corruption
+ * into a hang.
+ */
+function canonicalChain(tx: Transaction, from: ElementId): ElementId[] {
+  const MAX_HOPS = 64
+  const chain: ElementId[] = [from]
+  let cursor = from
+  for (let hop = 0; hop < MAX_HOPS; hop += 1) {
+    const element = tx.peek(cursor)
+    if (element === null || element.kind !== 'Concept') return chain
+    if (element.row.merged_into === '') return chain
+    const next = tryParseElementId(element.row.merged_into)
+    if (next === null) return chain
+    if (chain.some((step) => elementIdEquals(step, next))) return chain
+    chain.push(next)
+    cursor = next
+  }
+  throw errors.internalError(
+    `the merged_into chain above ${formatElementId(from)} is longer than ` +
+      `${MAX_HOPS} hops`,
+  )
+}
+
+/**
+ * Follows a merged Concept's forwarding pointer to the identity that survived.
+ *
+ * Only for endpoints of a *new* write (§11.3). A historical Proposition keeps
+ * referring to what it referred to (§11.2): rewriting those would erase what
+ * the memory used to say, which is the whole reason merge is non-destructive.
+ */
+function canonicalizeEndpoint(tx: Transaction, endpoint: Endpoint): Endpoint {
+  if (endpoint.kind !== 'local' || endpoint.id.kind !== 'Concept') {
+    return endpoint
+  }
+  const chain = canonicalChain(tx, endpoint.id)
+  const canonical = chain[chain.length - 1] as ElementId
+  return elementIdEquals(canonical, endpoint.id)
+    ? endpoint
+    : { kind: 'local', id: canonical }
+}
+
+/**
+ * Rewrites one reference value onto the Concept a merge made canonical.
+ *
+ * §11.3: ordinary new writes canonicalize merged references. Doing it only for
+ * `ENSURE PROPOSITION` endpoints makes a merge decorative for everything else:
+ * new Assertions keep accumulating under `asserted_by: :A` after A was merged
+ * into B, and the two identities the merge declared to be one never meet again.
+ *
+ * A reference this cannot resolve is left exactly as written. Canonicalizing is
+ * a rewrite toward an identity the Space already declared; it is not a place to
+ * invent one.
+ */
+export function canonicalizeReference(tx: Transaction, value: JsonMap): JsonMap {
+  if (!isJsonMap(value) || typeof value.id !== 'string') return value
+  const id = tryParseElementId(value.id)
+  if (id === null || id.kind !== 'Concept') return value
+  const chain = canonicalChain(tx, id)
+  const canonical = chain[chain.length - 1] as ElementId
+  if (elementIdEquals(canonical, id)) return value
+  return { ...value, id: formatElementId(canonical) }
 }
 
 // --- targets ----------------------------------------------------------------
@@ -1606,7 +1708,12 @@ function collectStructural(
 
   for (const edge of edges) {
     const name = symbolName(b, edge.field)
-    const value = referenceValue(mutationValue(b, edge.value), name)
+    // §11.3, as for a tuple endpoint: a record created now points at the
+    // identity that survived, not at the one a merge retired.
+    const value = canonicalizeReference(
+      tx,
+      referenceValue(mutationValue(b, edge.value), name),
+    )
     if (coreFields.includes(name)) {
       const list = out.core.get(name) ?? []
       list.push([value, options(b, edge.options)])
@@ -1694,6 +1801,17 @@ function matcherIdentity(
   for (const field of ['id', 'canonical_id']) {
     const value = matcher[field]
     if (value === undefined) continue
+    // An identity resolves the endpoint; it does not also filter it. Dropping
+    // the rest would let `{id: "C-1", name: "Zed"}` write against C-1 whatever
+    // C-1 is called.
+    const extra = Object.keys(matcher).filter((key) => key !== field)
+    if (extra.length > 0) {
+      throw errors.identitySelectorRequired(
+        `${what} names \`${field}\`, so it is resolved by identity and not ` +
+          `matched by description; ${extra.join(', ')} would be silently ` +
+          `ignored. Drop ${extra.length === 1 ? 'it' : 'them'}`,
+      )
+    }
     if ('Literal' in value) {
       const literal = kipValue(value.Literal)
       if (typeof literal === 'string') return { [field]: literal }
@@ -1748,7 +1866,7 @@ function authorizeRetention(tx: Transaction, retention: JsonMap): void {
   if (Object.keys(retention).length === 0) return
   checkRetention(retention)
   tx.require('manage_retention')
-  // §163: a legal hold blocks erasure, so a cognitive writer that could set one
+  // §19.1: a legal hold blocks erasure, so a cognitive writer that could set one
   // could make its own content undeletable. Placing or lifting a hold is its
   // own permission, above ordinary retention management.
   if (Object.hasOwn(retention, 'legal_hold')) tx.require('legal_hold')

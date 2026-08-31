@@ -164,6 +164,62 @@
       "expect": {
         "error": "SchemaFieldNotFound"
       }
+    },
+    {
+      "name": "BELIEF SLOT takes a subject an earlier pattern bound",
+      "command": "FIND(?slot.status) WHERE {\n  ?s CONCEPT {name: \"Alice\"}\n  ?slot BELIEF SLOT (?s, \"prefers\")\n}",
+      "expect": {
+        "result": [
+          "insufficient"
+        ]
+      }
+    },
+    {
+      "name": "a bound BELIEF SLOT stays joined to the row it came from",
+      "command": "FIND(?s.name, ?slot.status) WHERE {\n  ?s CONCEPT {type: \"Person\", name: \"Alice\"}\n  ?slot BELIEF SLOT (?s, \"prefers\")\n}",
+      "expect": {
+        "result": [
+          [
+            "Alice",
+            "insufficient"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "a BELIEF triple stays joined to the row its endpoints came from",
+      "command": "FIND(?s.name, ?o.name, ?b.status) WHERE {\n  ?s CONCEPT {name: \"Alice\"}\n  ?o CONCEPT {name: \"Quiet\"}\n  ?b BELIEF (?s, \"prefers\", ?o)\n}",
+      "expect": {
+        "result": [
+          [
+            "Alice",
+            "Quiet",
+            "insufficient"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "a BELIEF triple with an open object answers one belief per Proposition",
+      "command": "FIND(?o.name) WHERE {\n  ?s CONCEPT {name: \"Alice\"}\n  ?b BELIEF (?s, \"prefers\", ?o)\n}",
+      "expect": {
+        "result": [
+          "Loud",
+          "Quiet"
+        ]
+      }
+    },
+    {
+      "name": "a BELIEF SLOT subject bound to a Literal answers insufficient, and keeps its row",
+      "command": "FIND(?n, ?slot.status) WHERE {\n  ?c CONCEPT {type: \"Person\", name: ?n}\n  FILTER(?n == \"Carol\")\n  ?slot BELIEF SLOT (?n, \"prefers\")\n}",
+      "expect": {
+        "result": [
+          [
+            "Carol",
+            "insufficient"
+          ]
+        ]
+      }
     }
   ]
 }

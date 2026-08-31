@@ -9,59 +9,121 @@
       "name": "a pattern finds by type",
       "command": "FIND(?c.name) WHERE { ?c CONCEPT {type: \"Person\"} } ORDER BY ?c.name",
       "ordered": true,
-      "expect": { "result": ["Alice", "Bob"] }
+      "expect": {
+        "result": [
+          "Alice",
+          "Bob"
+        ]
+      }
     },
     {
       "name": "a tuple pattern binds both ends and joins on them",
       "command": "FIND(?person.name, ?thing.name) WHERE { ?p PROPOSITION (?person, \"prefers\", ?thing) }",
-      "expect": { "result": [["Alice", "Dark"]] }
+      "expect": {
+        "result": [
+          [
+            "Alice",
+            "Dark"
+          ]
+        ]
+      }
     },
     {
       "name": "NOT keeps what the pattern could not extend",
       "command": "FIND(?c.name) WHERE {\n  ?c CONCEPT {type: \"Person\"}\n  NOT { ?p PROPOSITION (?c, \"prefers\", ?o) }\n}",
-      "expect": { "result": ["Bob"] }
+      "expect": {
+        "result": [
+          "Bob"
+        ]
+      }
     },
     {
       "name": "OPTIONAL pads rather than drops",
       "command": "FIND(COUNT(?c)) WHERE {\n  ?c CONCEPT {type: \"Person\"}\n  OPTIONAL { ?p PROPOSITION (?c, \"prefers\", ?o) }\n}",
-      "expect": { "result": [2] }
+      "expect": {
+        "result": [
+          2
+        ]
+      }
     },
     {
       "name": "UNION widens rather than filtering",
       "command": "FIND(?c.name) WHERE {\n  ?c CONCEPT {name: \"Alice\"}\n  UNION { ?c CONCEPT {name: \"Dark\"} }\n} ORDER BY ?c.name",
       "ordered": true,
-      "expect": { "result": ["Alice", "Dark"] }
+      "expect": {
+        "result": [
+          "Alice",
+          "Dark"
+        ]
+      }
     },
     {
       "name": "a comparison between unlike types decides nothing",
       "command": "FIND(?c.name) WHERE { ?c CONCEPT {type: \"Person\"} FILTER(?c.name > 5) }",
-      "expect": { "result": [] }
+      "expect": {
+        "result": []
+      }
     },
     {
       "name": "nulls sort last under ASC",
       "command": "FIND(?c.name) WHERE { ?c CONCEPT {type: \"Person\"} } ORDER BY ?c.attributes.display_name ASC",
       "ordered": true,
-      "expect": { "result": ["Alice", "Bob"] }
+      "expect": {
+        "result": [
+          "Alice",
+          "Bob"
+        ]
+      }
+    },
+    {
+      "name": "nulls sort last under DESC too, because absent is not a large value",
+      "command": "FIND(?c.name) WHERE { ?c CONCEPT {type: \"Person\"} } ORDER BY ?c.attributes.display_name DESC",
+      "ordered": true,
+      "expect": {
+        "result": [
+          "Alice",
+          "Bob"
+        ]
+      }
     },
     {
       "name": "a missing attribute reads as null, not as an error",
       "command": "FIND(?c.attributes.display_name) WHERE { ?c CONCEPT {name: \"Bob\"} }",
-      "expect": { "result": [null] }
+      "expect": {
+        "result": [
+          null
+        ]
+      }
     },
     {
       "name": "COUNT over nothing is zero, and zero is not a falsehood",
       "command": "FIND(COUNT(?c)) WHERE { ?c CONCEPT {name: \"Nobody\"} }",
-      "expect": { "result": [0] }
+      "expect": {
+        "result": [
+          0
+        ]
+      }
     },
     {
       "name": "an archived element is out of recall by default",
       "command": "FIND(COUNT(?c)) WHERE { ?c CONCEPT {type: \"Person\", state: \"archived\"} }",
-      "expect": { "result": [0] }
+      "expect": {
+        "result": [
+          0
+        ]
+      }
     },
     {
       "name": "a bare variable projects the whole element",
       "command": "FIND(?c.id, ?c.kind) WHERE { ?c CONCEPT {name: \"Bob\"} }",
-      "expect": { "result": [["C:<1>", "concept"]] }
+      "expect": {
+        "result": [
+          [
+            "C:<1>",
+            "concept"
+          ]
+        ]
+      }
     }
   ]
 }

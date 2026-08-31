@@ -107,7 +107,7 @@ function assertion(id: ElementId, row: AssertionRow): JsonMap {
     ...envelope(id, row),
     ...present({
       // The wire form of a reference is an object, never a bare id string
-      // (§8, §13.2): a string can spell a local id and nothing else, and a
+      // (§8.1, §13.2): a string can spell a local id and nothing else, and a
       // reader cannot tell one that was resolved from one that was guessed.
       proposition: { id: row.proposition_id },
       asserted_by: row.asserted_by,

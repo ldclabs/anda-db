@@ -2,7 +2,7 @@
  * # Satisfying an approval
  *
  * A policy can require that an operation be independently approved before it
- * runs (§167). The decision engine says so by returning `require_approval`,
+ * runs (§88.11). The decision engine says so by returning `require_approval`,
  * which is **not** a soft allow: the operation does not happen while it is
  * outstanding (§40). This module is what turns it into an allow, and only when a
  * real approval exists.
@@ -12,7 +12,7 @@
  * An approval is matched by a digest over *what is being approved* — this Space,
  * this permission, this element. An approval for "purge E-1" therefore does
  * nothing for "purge E-2". Without that binding, one approval would become a
- * standing licence, which is the failure §246 tests for from the other side.
+ * standing licence, which is the failure §28.5 tests for from the other side.
  *
  * ## Consumed, not merely counted
  *
@@ -79,7 +79,7 @@ export function resolveApproval(
 
   const approvers = new Set(granted.flatMap((row) => row.approver_ids)).size
   if (approvers < decision.obligations.approvals_required) {
-    // §246: one approval where two are required is not partial activation. The
+    // §28.5: one approval where two are required is not partial activation. The
     // decision stays `require_approval`, and the reason says how far along it is.
     return {
       ...decision,

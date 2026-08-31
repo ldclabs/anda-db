@@ -85,7 +85,7 @@ impl CognitiveNexus {
             .await?;
         // Registered rather than special-cased, so that "unauthenticated" is a
         // Principal a policy can name — which is how a Space becomes publicly
-        // readable on purpose (§214) instead of by an absent check.
+        // readable on purpose (§28.2) instead of by an absent check.
         store
             .governance
             .ensure_principal(PrincipalDraft {
@@ -179,7 +179,7 @@ impl CognitiveNexus {
         }
     }
 
-    /// A session as the engine's own Principal (§212).
+    /// A session as the engine's own Principal (§28.2).
     pub fn system_session(&self) -> Session {
         self.session(AuthContext::system())
     }
@@ -194,7 +194,7 @@ impl CognitiveNexus {
     ///
     /// Which is also why Governance mutation lives here rather than in KML: a
     /// language a model writes must not be a language that can change who
-    /// controls the Space (§264).
+    /// controls the Space (§20.10).
     pub fn governance(&self) -> &crate::governance::store::GovernanceStore {
         &self.store.governance
     }
@@ -229,7 +229,7 @@ impl CognitiveNexus {
     /// dropping an artifact from the list deactivates it — and is activated
     /// only when it differs from the one already in force.
     ///
-    /// Installing is still not activating (§240.18): this activates because the
+    /// Installing is still not activating (§20.12): this activates because the
     /// caller said which packages to activate, not because they were installed.
     pub async fn install_and_activate(
         &self,
@@ -259,7 +259,7 @@ impl CognitiveNexus {
     /// already in force.
     ///
     /// This is what a host calls on every start. Every activation mints a new
-    /// environment version (§143), so a host that unconditionally re-activated
+    /// environment version (§20.8), so a host that unconditionally re-activated
     /// its baseline lock would walk the version forward on each restart —
     /// invalidating clients' `preconditions.schema_environment_version` and
     /// filling `HISTORY` with schema changes that changed nothing.
@@ -366,7 +366,7 @@ impl CognitiveNexus {
 ///
 /// A session holds identity, not authority. Authority is resolved from the
 /// control plane on each request, so a session that has been running since
-/// January does not still hold what January's Grants said (§188, §245).
+/// January does not still hold what January's Grants said (§28.6).
 #[derive(Clone)]
 pub struct Session {
     nexus: CognitiveNexus,
@@ -400,7 +400,7 @@ impl Session {
         EffectiveAuthority::resolve(&self.nexus.store, space_id, &self.auth).await
     }
 
-    /// Reads the Governance audit for a Space (§89, §172).
+    /// Reads the Governance audit for a Space (§29).
     ///
     /// Its own permission, because the audit says what everyone else did: a
     /// caller who may read a Space's cognition has not thereby earned the right
@@ -426,10 +426,10 @@ impl Session {
             .await
     }
 
-    /// What this Principal could do in a Space at a past instant (§176, §177).
+    /// What this Principal could do in a Space at a past instant (§48.5).
     ///
     /// A historical answer, and nothing more: that a Principal could read
-    /// something in January says nothing about whether it can today (§179).
+    /// something in January says nothing about whether it can today (§48.5).
     /// Reading it needs `read_governance_history`, which is separate from
     /// `read_audit` — one is what the control plane *was*, the other is what
     /// people *did*.
@@ -453,9 +453,9 @@ impl Session {
     /// Raises or lowers how strongly one element may influence action.
     ///
     /// Raising is bounded by the element's authority lineage, so no chain of
-    /// summarizing turns a descriptive note into an executable one (§127).
+    /// summarizing turns a descriptive note into an executable one (§31.5).
     /// Lowering is deliberately as easy as the permission itself: an incident
-    /// response that had to wait for an approval would arrive late (§132).
+    /// response that had to wait for an approval would arrive late (§31.5).
     ///
     /// Returns the ceiling the element carried before.
     pub async fn elevate_authority(
@@ -478,11 +478,11 @@ impl Session {
         .await
     }
 
-    /// Holds an element out of ordinary use, pending review (§133).
+    /// Holds an element out of ordinary use, pending review (§39.2).
     ///
     /// Not a retraction: it says this Brain does not currently allow ordinary
     /// use of the element, which is a statement about this Brain and not about
-    /// whoever wrote it (§134).
+    /// whoever wrote it (§39.2).
     pub async fn quarantine(
         &self,
         space_id: &str,
@@ -543,7 +543,7 @@ impl Session {
     ///    is not something an element-scoped Grant should confer;
     /// 2. the action's own permission per element (`archive`, `tombstone`,
     ///    `purge`), because expiry is not an exemption from what those cost;
-    /// 3. `legal_hold`, which stops erasure for everyone (§163);
+    /// 3. `legal_hold`, which stops erasure for everyone (§19.1);
     /// 4. per-element authorization, so a sweep cannot reach what the caller
     ///    cannot see.
     ///
@@ -585,7 +585,7 @@ impl Session {
                 Ok(element) => element,
                 Err(_) => continue,
             };
-            // §163: a hold blocks removal for everyone, including a sweep the
+            // §19.1: a hold blocks removal for everyone, including a sweep the
             // holder authorized. Reported as held rather than as failed, because
             // nothing went wrong — the record is being kept on purpose.
             if element
@@ -898,7 +898,7 @@ pub enum RetentionAction {
 pub struct RetentionSweep {
     /// The elements it acted on.
     pub swept: Vec<String>,
-    /// How many were kept because a legal hold blocks removal (§163).
+    /// How many were kept because a legal hold blocks removal (§19.1).
     pub held: usize,
     /// How many the caller was not authorized to act on.
     pub refused: usize,
@@ -1089,7 +1089,7 @@ impl Session {
     /// is still a denial, and failing the request a second time over the log
     /// would turn an audit outage into an availability outage. An obligation
     /// that genuinely must not proceed unlogged is the caller's to enforce
-    /// (§184), and those paths check the write.
+    /// (§86.1), and those paths check the write.
     async fn audit(
         &self,
         authority: &EffectiveAuthority,

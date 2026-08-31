@@ -51,7 +51,7 @@ pub struct Transaction {
     /// The Schema Environment this transaction is bound to.
     ///
     /// Captured once at the start: a transaction evaluates against one
-    /// consistent environment snapshot (§240.45), so an activation racing
+    /// consistent environment snapshot (§32.5), so an activation racing
     /// alongside cannot change what half of it means.
     pub env: SchemaEnvironment,
     /// Whether this run may become durable.
@@ -565,7 +565,7 @@ impl Transaction {
     /// Classification is applied here because it must be right the moment the
     /// element becomes readable — *read secret Evidence, summarize, write
     /// public summary* is an exfiltration path if the summary lands public even
-    /// briefly (§98, and the §242 fixture). Authority is only *recorded* here,
+    /// briefly (§31.2). Authority is only *recorded* here,
     /// because everything is created at the bottom of the ladder and cannot
     /// exceed anything; the lineage is what
     /// [`elevate_authority`](crate::governance::element::elevate_authority)

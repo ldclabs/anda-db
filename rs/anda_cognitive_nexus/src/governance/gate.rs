@@ -11,7 +11,7 @@
 //!
 //! - **`EXPORT CAPSULE` asks for `export`, not `read`.** A caller who may read
 //!   every element in a Space still may not package them and take them away
-//!   (§78, and the `Read ≠ Export` equation in §271).
+//!   (§29, §102).
 //! - **A historical read asks for `read_history` on top of `read`.** What the
 //!   Brain contained in January is a different disclosure from what it contains
 //!   now — it can include elements since archived, and origins since revoked.
@@ -77,7 +77,7 @@ fn describe_permissions(target: &DescribeTarget) -> Vec<Permission> {
         | DescribeTarget::Compatibility { .. }
         | DescribeTarget::ProjectionCapability
         | DescribeTarget::EpistemicPolicy { .. } => Vec::new(),
-        // About the caller itself. §266: an Agent must be able to learn what it
+        // About the caller itself. §67.2: an Agent must be able to learn what it
         // may do without first being permitted to do it.
         DescribeTarget::ExecutionContext | DescribeTarget::Access { .. } => Vec::new(),
         DescribeTarget::Trust { .. } => vec![Permission::Read],
@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn export_is_not_read() {
-        // §271: the equation this whole table exists to preserve.
+        // §102: the equation this whole table exists to preserve.
         let needed = meta_permissions(&meta(
             r#"EXPORT CAPSULE :out WHERE { ?c CONCEPT {type: "T"} }"#,
         ));
@@ -228,7 +228,7 @@ mod tests {
 
     #[test]
     fn removal_and_erasure_ask_for_different_things() {
-        // §271 again: logical removal is not erasure.
+        // §102 again: logical removal is not erasure.
         assert_eq!(
             kml_permissions(&kml("TOMBSTONE :x")),
             vec![Permission::Tombstone]

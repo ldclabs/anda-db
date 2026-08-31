@@ -12,7 +12,7 @@
 //! ## What a SEARCH result is not
 //!
 //! A relevance score is not a confidence and not a belief, and a miss is not an
-//! absence (§77 of the Core model, §109 of KQL). The result therefore carries
+//! absence (§2.10, §66.6). The result therefore carries
 //! its score semantics and its index freshness, and never a `confidence` field
 //! — a caller that copied a score into an Assertion would be inventing an
 //! epistemic commitment out of a text match.
@@ -165,7 +165,7 @@ pub async fn search(cx: &mut Context<'_>, command: &SearchCommand) -> Result<Ans
             }
             // The redacted view `load` cached, not a fresh render: a search
             // snippet is a read, and a mask that hid a field from FIND must
-            // hide it from SEARCH too (§105).
+            // hide it from SEARCH too (§88.5).
             let rendered = cx.view_of(id);
             if let Some(expected) = &with_type
                 && rendered["schema_ref"].as_str() != Some(expected.as_str())

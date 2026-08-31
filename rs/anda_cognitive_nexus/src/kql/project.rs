@@ -195,7 +195,19 @@ impl Context<'_> {
 
         decorated.sort_by(|(left_keys, left), (right_keys, right)| {
             for (index, (_, direction)) in keys.iter().enumerate() {
-                let ordering = compare_json(&left_keys[index], &right_keys[index]);
+                let (left_key, right_key) = (&left_keys[index], &right_keys[index]);
+                // Null sorts last in *both* directions (§44.7). Reversing it
+                // with the rest would put the unbound rows first under `DESC`,
+                // and an absent value is not a large value any more than it is
+                // a small one — it is the answer "this row has nothing here",
+                // which belongs at the end whichever way the key runs.
+                if let Some(ordering) = null_order(left_key, right_key) {
+                    if ordering != Ordering::Equal {
+                        return ordering;
+                    }
+                    continue;
+                }
+                let ordering = compare_json(left_key, right_key);
                 if ordering != Ordering::Equal {
                     return match direction {
                         OrderDirection::Asc => ordering,
@@ -294,6 +306,21 @@ fn aggregate(func: AggregationFunction, column: &[Json]) -> Result<Json, KipErro
 }
 
 /// Total order over projected values, with nulls last.
+/// The order between two sort keys when either is null, direction-independent.
+///
+/// `None` means neither is null and the ordinary comparison applies. Kept apart
+/// from [`compare_json`] because that one is also the tie-breaker's comparator,
+/// where a total order over *every* value — nulls included — is what makes
+/// paging safe; here the question is the different one §44.7 answers.
+fn null_order(left: &Json, right: &Json) -> Option<Ordering> {
+    match (left.is_null(), right.is_null()) {
+        (false, false) => None,
+        (true, true) => Some(Ordering::Equal),
+        (true, false) => Some(Ordering::Greater),
+        (false, true) => Some(Ordering::Less),
+    }
+}
+
 pub fn compare_json(left: &Json, right: &Json) -> Ordering {
     match (left, right) {
         (Json::Null, Json::Null) => Ordering::Equal,

@@ -221,7 +221,7 @@ pub fn is_qualified(name: &str) -> bool {
 /// The kinds of symbol a Schema Package defines (Spec §17).
 ///
 /// Core element kinds are not in this list: a package cannot redefine what an
-/// Assertion is (§240.22).
+/// Assertion is (§20.13).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SymbolKind {
     /// A Concept type, referenced by `schema_ref`.

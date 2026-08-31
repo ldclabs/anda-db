@@ -20,7 +20,7 @@
 //! privileged direction: the one that *reveals* or *empowers*. An agent that
 //! notices it has written something sensitive should be able to say so without a
 //! Governance ticket, and an agent that has decided a Skill is dangerous should
-//! be able to demote it immediately (§132). Making the cautious direction
+//! be able to demote it immediately (§31.5). Making the cautious direction
 //! privileged would make caution rare.
 //!
 //! ## Why non-amplification is checked at elevation, not at derivation
@@ -30,14 +30,14 @@
 //! anything. It becomes load-bearing only when somebody asks to *raise* one, and
 //! that is where the lineage recorded at commit is read: a summary of a
 //! descriptive Skill cannot become behavioral, however locally it was written
-//! (§127, §128, and the §243 fixture).
+//! (§31.5).
 //!
 //! ## Why these commit as transactions
 //!
 //! Each writes a new element version and takes a Space sequence, exactly as a
-//! cognitive write does. That is what keeps §177 answerable — *what
+//! cognitive write does. That is what keeps §48.5 answerable — *what
 //! classification did this element have then* — and what puts the change in the
-//! authorized change stream (§186). Each is recorded in the Governance audit as
+//! authorized change stream (§36.1). Each is recorded in the Governance audit as
 //! well, because the two logs answer different questions: the version log says
 //! what the element looked like, the audit says who decided that and why.
 
@@ -59,7 +59,7 @@ pub const LINEAGE_KEY: &str = "authority_lineage";
 /// The `governance` member recording why an element is held out of use.
 pub const QUARANTINE_KEY: &str = "quarantine_reason";
 
-/// The influence-authority ceiling an element carries (§124).
+/// The influence-authority ceiling an element carries (§31.3).
 pub fn ceiling_of(element: &Element) -> &str {
     let stated = element
         .governance()
@@ -73,7 +73,7 @@ pub fn ceiling_of(element: &Element) -> &str {
     }
 }
 
-/// The elements a derived artifact inherits its ceiling from (§128).
+/// The elements a derived artifact inherits its ceiling from (§31.5).
 pub fn lineage_of(element: &Element) -> Vec<String> {
     element
         .governance()
@@ -135,7 +135,7 @@ pub async fn classify(
     Ok(current)
 }
 
-/// Raises or lowers how strongly one element may influence action (§129, §132).
+/// Raises or lowers how strongly one element may influence action (§31.5).
 ///
 /// Raising is checked against the element's authority lineage: a derived
 /// artifact cannot be elevated past the lowest ceiling it was derived from, so
@@ -157,8 +157,8 @@ pub async fn elevate_authority(
     }
     let element = readable(store, space_id, id, authority_state, auth).await?;
     let resource = ResourceContext::of_element(&element);
-    // §129: elevation is exactly the operation a policy asks for independent
-    // approval on, and §246 requires that one approval of two is not partial
+    // §31.5: elevation is exactly the operation a policy asks for independent
+    // approval on, and §28.5 requires that one approval of two is not partial
     // activation. That is decided here rather than by the caller.
     let approved = decide(
         store,
@@ -203,7 +203,7 @@ pub async fn elevate_authority(
         },
         None,
         patch,
-        // §130: an elevation record names the artifact, both ceilings, who
+        // §31.5: an elevation record names the artifact, both ceilings, who
         // decided, and when. The transaction and the audit entry supply the
         // rest between them.
         |version| serde_json::json!({"from": current, "to": class, "version": version}),
@@ -214,11 +214,11 @@ pub async fn elevate_authority(
     Ok(current)
 }
 
-/// Holds an element out of ordinary use, pending review (§133).
+/// Holds an element out of ordinary use, pending review (§39.2).
 ///
 /// Not a retraction and not an archive: it says *local Governance does not
 /// currently allow ordinary use of this*, which is a statement about this Brain
-/// and not about the source (§134).
+/// and not about the source (§39.2).
 pub async fn quarantine(
     store: &Store,
     space_id: &str,

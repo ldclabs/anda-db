@@ -102,7 +102,7 @@ pub async fn execute(
     }
 }
 
-/// The access-decision provenance a high-impact receipt carries (§178).
+/// The access-decision provenance a high-impact receipt carries (§33.1).
 ///
 /// Only for high-impact statements. Attaching it to every commit would bury the
 /// cases that matter under the ones that do not, and the point of the record is

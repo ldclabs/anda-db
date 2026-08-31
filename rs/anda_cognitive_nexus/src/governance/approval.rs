@@ -1,7 +1,7 @@
 //! # Satisfying an approval
 //!
 //! A policy can require that an operation be independently approved before it
-//! runs (§167). The decision engine says so by returning
+//! runs (§88.11). The decision engine says so by returning
 //! [`Decision::RequireApproval`], which is **not** a soft allow: the operation
 //! does not happen while it is outstanding (§40). This module is what turns it
 //! into an allow, and only when a real approval exists.
@@ -11,7 +11,7 @@
 //! An approval is matched by a digest over *what is being approved* — this
 //! Space, this permission, this element. An approval for "purge E-1" therefore
 //! does nothing for "purge E-2". Without that binding, one approval would
-//! become a standing licence, which is the failure §246 tests for from the
+//! become a standing licence, which is the failure §28.5 tests for from the
 //! other side.
 //!
 //! ## Consumed, not merely counted

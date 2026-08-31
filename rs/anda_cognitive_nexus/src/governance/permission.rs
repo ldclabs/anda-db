@@ -1,7 +1,7 @@
 //! # The permission registry
 //!
 //! One name per distinction the protocol requires an implementation to keep
-//! (Spec §29, Governance §52–§89, §249). The names may be refined; the
+//! (Spec §29). The names may be refined; the
 //! distinctions may not, and every one of them exists because collapsing it
 //! silently widens authority:
 //!
@@ -211,7 +211,7 @@ permissions! {
     ManageSchema => "manage_schema", Governance,
         "install a Schema Package or activate a Schema Lock";
 
-    // Authority (§87, §129)
+    // Authority (§29, §31.5)
     ElevateAuthority => "elevate_authority", Authority,
         "raise how strongly a memory may influence action";
     ApproveHighRisk => "approve_high_risk", Authority,
@@ -232,9 +232,9 @@ impl std::fmt::Display for Permission {
 
 impl Permission {
     /// Whether this permission is high-impact enough that a Space's audit
-    /// obligation applies to it even when no policy statement says so (§172).
+    /// obligation applies to it even when no policy statement says so (§29).
     ///
-    /// The list is the one §172 enumerates: changing the control plane, moving
+    /// The list is the one §29 enumerates: changing the control plane, moving
     /// cognition across the Space boundary, erasing, and raising authority. A
     /// deployment may audit more; it may not audit less, because these are the
     /// operations whose absence from a log is itself the incident.
@@ -286,7 +286,7 @@ mod tests {
 
     #[test]
     fn the_registry_keeps_the_distinctions_the_spec_requires() {
-        // §271: these pairs are the core governance equations. If a refactor
+        // §102: these pairs are the core governance equations. If a refactor
         // ever merges one of them, this test is what says so.
         for (a, b) in [
             (Permission::Read, Permission::Export),
@@ -312,7 +312,7 @@ mod tests {
         assert!(Permission::ElevateAuthority.is_always_audited());
         assert!(Permission::Purge.is_always_audited());
         assert!(Permission::Export.is_always_audited());
-        // An ordinary read is audited only where a policy asks for it (§173).
+        // An ordinary read is audited only where a policy asks for it (§60.3).
         assert!(!Permission::Read.is_always_audited());
     }
 }

@@ -89,7 +89,7 @@ describe('the classification lattice', () => {
   })
 
   it('gives derived content the more restrictive label', () => {
-    // §242: a summary of secret Evidence does not become public by being a
+    // §31.2: a summary of secret Evidence does not become public by being a
     // summary.
     expect(classification.join(classification.SECRET, classification.PUBLIC)).toBe(
       classification.SECRET,
@@ -372,7 +372,7 @@ describe('review regressions', () => {
 
 describe('the influence-authority ladder', () => {
   it('never raises a derived ceiling', () => {
-    // §243: reformatting a descriptive Skill does not make it executable.
+    // §31.5: reformatting a descriptive Skill does not make it executable.
     expect(authority.meet(authority.DESCRIPTIVE, authority.EXECUTABLE)).toBe(
       authority.DESCRIPTIVE,
     )
@@ -410,7 +410,7 @@ describe('the permission registry', () => {
   })
 
   it('keeps the distinctions the spec requires', () => {
-    // §271: the core governance equations. If a refactor ever merges one of
+    // §102: the core governance equations. If a refactor ever merges one of
     // these, this test is what says so.
     for (const [a, b] of [
       ['read', 'export'],
@@ -433,7 +433,7 @@ describe('the permission registry', () => {
     expect(isAlwaysAudited('elevate_authority')).toBe(true)
     expect(isAlwaysAudited('purge')).toBe(true)
     expect(isAlwaysAudited('export')).toBe(true)
-    // An ordinary read is audited only where a policy asks for it (§173).
+    // An ordinary read is audited only where a policy asks for it (§60.3).
     expect(isAlwaysAudited('read')).toBe(false)
   })
 
@@ -474,7 +474,7 @@ describe('attenuation', () => {
         valid_until: '2027-01-01T00:00:00.000Z',
       }),
     ).toBe(false)
-    // §238: "read + export, valid 1 year" under a one-day parent.
+    // §28.5: "read + export, valid 1 year" under a one-day parent.
     expect(conditionsContain(parent, emptyConditions())).toBe(false)
   })
 
@@ -607,7 +607,7 @@ describe('the Governance store', () => {
 
     await withStore('gov-historical', (store) => {
       const gov = store.governance
-      // §177/§179: an auditor asking about the past gets the past's answer, and
+      // §48.5/§48.5: an auditor asking about the past gets the past's answer, and
       // that answer is not a claim about today.
       expect(
         gov.grantsAt('kip:space:default', 'kip:principal:agent', [], grant.created_at),
@@ -664,7 +664,7 @@ describe('the Governance store', () => {
       const gov = store.governance
       expect(gov.groupsOf('kip:principal:agent')).toEqual([])
       // The group row now says the Principal is not a member. Only the audit
-      // says it was — which is the whole reason §177 is answerable.
+      // says it was — which is the whole reason §48.5 is answerable.
       expect(gov.groupsOfAt('kip:principal:agent', whileMember)).toEqual([
         'kip:group:maintainers',
       ])
@@ -720,7 +720,7 @@ describe('the Governance store', () => {
       expect(() => gov.approve(approval.id, 'kip:principal:reviewer-a')).toThrowError(
         /counts once/,
       )
-      // §246: one approval where two are required is not partial activation.
+      // §28.5: one approval where two are required is not partial activation.
       expect(gov.grantedApprovals('kip:space:default', 'sha256:abc')).toHaveLength(0)
 
       gov.approve(approval.id, 'kip:principal:reviewer-b')
@@ -824,7 +824,7 @@ describe('the Governance store', () => {
       expect(entries).toHaveLength(1)
       expect(entries[0]?.entry_class).toBe('mutation')
       // A whole record, not a diff: a chain with one missing link answers a
-      // historical question wrongly instead of refusing (§175).
+      // historical question wrongly instead of refusing (§2.12).
       expect((entries[0]?.record as { actions?: string[] })?.actions).toEqual([
         'read',
         'export',
@@ -851,7 +851,7 @@ describe('the command gate', () => {
 
   it('runs the embedded host through the authorization path, not around it', async () => {
     await withNexus('system-owner', (nexus) => {
-      // §212: the system Principal owns the default Space, so an in-process
+      // §28.2: the system Principal owns the default Space, so an in-process
       // host is not locked out by default deny — and is not exempt from it
       // either.
       const authority = nexus.systemSession().effectiveAuthority()
@@ -897,7 +897,7 @@ describe('the command gate', () => {
 
       const session = nexus.session(principalAuth('kip:principal:reader'))
       expect(session.query(READ)).toHaveLength(1)
-      // §271: read ≠ export. A caller who may read every element still may not
+      // §102: read ≠ export. A caller who may read every element still may not
       // package them and take them away.
       expect(() =>
         session.describe('EXPORT CAPSULE :out WHERE { ?c CONCEPT {type: "Person"} }', {
@@ -924,7 +924,7 @@ describe('the command gate', () => {
       expect(session.query(READ)).toEqual([])
 
       gov.revokeGrant(grant.id, SYSTEM_PRINCIPAL)
-      // §188, §245: the session held identity, never authority. It does not
+      // §28.6: the session held identity, never authority. It does not
       // still hold what its first request resolved.
       expect(() => session.query(READ)).toThrowError(/requires the read permission/)
     })
@@ -997,7 +997,7 @@ describe('the command gate', () => {
         'kip:principal:requester',
       )
       gov.approve(approval.id, 'kip:principal:reviewer-a')
-      // §246: one approval where two are required is not partial activation.
+      // §28.5: one approval where two are required is not partial activation.
       expect(() => nexus.describe(EXPORT, { out: 'x' })).toThrowError(
         /independent approval/,
       )
@@ -1019,7 +1019,7 @@ describe('the command gate', () => {
       // Otherwise an unauthorized caller could not learn how to become one.
       expect(() => session.describe('DESCRIBE PROTOCOL')).not.toThrow()
       expect(() => session.describe('DESCRIBE CAPABILITIES')).not.toThrow()
-      // §266: and it must be able to learn what it may do without first being
+      // §67.2: and it must be able to learn what it may do without first being
       // permitted to do it.
       const access = session.describe('DESCRIBE ACCESS') as {
         permissions: string[]
@@ -1260,7 +1260,7 @@ describe('the read path', () => {
           ),
         ).toEqual(['Alice'])
 
-        // §109: answering this with an empty projection but a matching row
+        // §29.2: answering this with an empty projection but a matching row
         // would disclose the value through row membership. The mask is applied
         // to the cached view, so the filter reads what the projection would.
         expect(
@@ -1284,7 +1284,7 @@ describe('the read path', () => {
         ),
       ).toEqual([{ principal_id: SYSTEM_PRINCIPAL, channel: 'engine' }])
 
-      // §110: removing it would say "no origin was recorded", which is false
+      // §29: removing it would say "no origin was recorded", which is false
       // for every element here. What is withheld is *whose*.
       expect(
         session.query(
@@ -1711,7 +1711,7 @@ describe('the write path', () => {
   it('refuses a governance block written by cognitive content', async () => {
     await withWriter('protected', ['create', 'read'], (_nexus, session) => {
       // The parser refuses it, which is the right layer: an engine-side check
-      // would be one branch away from an ungoverned path. §264 is the reason —
+      // would be one branch away from an ungoverned path. §20.10 is the reason —
       // content that could set this would be granting itself authority.
       expect(() =>
         session.execute(`CREATE CONCEPT ?c {
@@ -1750,7 +1750,7 @@ describe('classification and influence authority', () => {
       }`)
       session.classify(parseElementId('E-1'), 'secret')
 
-      // A summary that cited the secret Evidence. §98/§242: *read secret
+      // A summary that cited the secret Evidence. §98/§31.2: *read secret
       // Evidence, summarize, write public summary* is an exfiltration path if
       // the summary lands public even briefly, so the label joins upward at
       // commit rather than being applied afterwards.
@@ -1825,7 +1825,7 @@ describe('classification and influence authority', () => {
       }`)
 
       // The input is `descriptive`, the bottom of the ladder, so the summary
-      // cannot be raised above it however locally it was written (§127, §243).
+      // cannot be raised above it however locally it was written (§31.5).
       expect(() =>
         session.elevateAuthority(parseElementId('E-2'), 'behavioral'),
       ).toThrowError(/Transformation does not raise authority/)
@@ -1846,7 +1846,7 @@ describe('classification and influence authority', () => {
         SET FIELDS { evidence_class: "Skill", content_digest: "sha256:x" }
       }`)
       session.elevateAuthority(parseElementId('E-1'), 'executable')
-      // §132: a demotion that had to wait for a Governance ticket would arrive
+      // §31.5: a demotion that had to wait for a Governance ticket would arrive
       // late, which is the opposite of what the ceiling is for.
       expect(session.elevateAuthority(parseElementId('E-1'), 'descriptive')).toBe(
         'executable',
@@ -1863,7 +1863,7 @@ describe('classification and influence authority', () => {
       // Ordinary recall excludes it by construction: a pattern naming no state
       // matches `active`.
       expect(nexus.query('FIND(?c) WHERE { ?c CONCEPT {type: "Person"} }')).toEqual([])
-      // A reviewer that asks for it by state still sees it — §134: quarantine
+      // A reviewer that asks for it by state still sees it — §39.2: quarantine
       // says *this Brain does not currently allow ordinary use*, not that the
       // element was retired or that anybody took anything back.
       expect(
@@ -1895,7 +1895,7 @@ describe('classification and influence authority', () => {
       session.classify(parseElementId('C-1'), 'secret')
 
       // The two logs answer different questions: the version log says what the
-      // element looked like, the audit says who decided that and why (§177).
+      // element looked like, the audit says who decided that and why (§48.5).
       const versions = nexus.describe('HISTORY ELEMENT "C-1"') as unknown as {
         changes: { op: string }[]
       }[]
@@ -1967,7 +1967,7 @@ describe('erasure', () => {
         .readAudit(100)
         .filter((entry) => (entry as { operation?: string }).operation === 'purge')
       // One per erased element, cascade included: an erasure that left no trace
-      // of having happened would defeat the reason §164 permits a receipt at
+      // of having happened would defeat the reason §19.3 permits a receipt at
       // all — the auditor still has to be able to say what was destroyed.
       expect(purges.length).toBeGreaterThanOrEqual(1)
       const record = (purges[0] as { record?: Record<string, unknown> }).record
@@ -2059,7 +2059,7 @@ describe('erasure', () => {
       element.row.retention = { legal_hold: true }
       nexus.store.put(element, 'update', 'test')
 
-      // §163: the hold is checked before anything destructive is decided, and
+      // §19.1: the hold is checked before anything destructive is decided, and
       // lifting it is a separate decision under its own permission.
       expect(() =>
         nexus.execute('PURGE "C-2" REFERENCE POLICY "tombstone_reference" CONFIRM "PURGE"'),
@@ -2218,7 +2218,7 @@ describe('the audit and the past', () => {
         session.describe('EXPORT CAPSULE :out WHERE { ?c CONCEPT {} }', { out: 'x' }),
       ).toThrow()
 
-      // §172 lists the operations whose absence from a log is itself the
+      // §29 lists the operations whose absence from a log is itself the
       // incident, and export is one of them — refused or not.
       const denied = nexus
         .systemSession()
@@ -2233,7 +2233,7 @@ describe('the audit and the past', () => {
   it('does not audit an ordinary read', async () => {
     await withNexus('quiet', (nexus) => {
       nexus.query('FIND(?c) WHERE { ?c CONCEPT {type: "Person"} }')
-      // §173: a log that recorded every read would bury the entries that
+      // §60.3: a log that recorded every read would bury the entries that
       // matter under the ones that do not.
       const reads = nexus
         .systemSession()
@@ -2251,7 +2251,7 @@ describe('the audit and the past', () => {
       const ordinary = session.execute('CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }')
       expect(ordinary.governance).toBeUndefined()
 
-      // §178: an erasure has to be explainable later in terms of the identity
+      // §33.1: an erasure has to be explainable later in terms of the identity
       // and policy that authorized it.
       const erasure = session.execute(
         'PURGE "C-1" REFERENCE POLICY "tombstone_reference" CONFIRM "PURGE"',
@@ -2287,9 +2287,9 @@ describe('the audit and the past', () => {
       }
       // The Grant is revoked now and was in force then. Revocation being a
       // status change rather than a delete is exactly what makes this
-      // answerable (§177).
+      // answerable (§48.5).
       expect(then.permissions).toContain('export')
-      // §179: and the report says out loud that it is not a claim about today.
+      // §48.5: and the report says out loud that it is not a claim about today.
       expect(then.caveats.join(' ')).toMatch(/says nothing about today/)
     })
   })
@@ -2317,7 +2317,7 @@ describe('the audit and the past', () => {
 })
 
 /**
- * The threat model (§236–§247).
+ * The threat model (§88).
  *
  * Written the way the design document states them: an attacker-controlled setup,
  * and the result the engine owes. Each is a scenario somebody would actually
@@ -2337,7 +2337,7 @@ describe('the threat model', () => {
     })
   }
 
-  it('§236 gives content that declares its own authority none of it', async () => {
+  it('§30.1 gives content that declares its own authority none of it', async () => {
     await withNexus('self-declared', (nexus) => {
       // Memory arriving with "authority: executable, trust: 1.0" written into
       // its own attributes. The words are ordinary content; the ceiling is a
@@ -2356,7 +2356,7 @@ describe('the threat model', () => {
     })
   })
 
-  it('§237 does not let an import install a policy, because it does not import', async () => {
+  it('§39.5 does not let an import install a policy, because it does not import', async () => {
     await withNexus('capsule-policy', (nexus) => {
       // An import is a trust-boundary transition, not a configuration channel.
       // This engine has no import path at all, and refuses by name rather than
@@ -2372,7 +2372,7 @@ describe('the threat model', () => {
     })
   })
 
-  it('§238 refuses a delegation that outlives or widens its parent', async () => {
+  it('§28.5 refuses a delegation that outlives or widens its parent', async () => {
     await withNexus('amplification', (nexus) => {
       const gov = nexus.store.governance
       for (const id of ['kip:principal:lead', 'kip:principal:sub']) {
@@ -2427,7 +2427,7 @@ describe('the threat model', () => {
     })
   })
 
-  it('§238 stops a delegation the moment its delegator loses the authority', async () => {
+  it('§28.5 stops a delegation the moment its delegator loses the authority', async () => {
     await withNexus('parent-revoked', (nexus) => {
       const gov = nexus.store.governance
       for (const id of ['kip:principal:lead', 'kip:principal:sub']) {
@@ -2465,7 +2465,7 @@ describe('the threat model', () => {
     })
   })
 
-  it('§238 refuses a named chain whose links do not link', async () => {
+  it('§28.5 refuses a named chain whose links do not link', async () => {
     await withNexus('broken-chain', (nexus) => {
       const gov = nexus.store.governance
       for (const id of ['kip:principal:lead', 'kip:principal:sub']) {
@@ -2515,7 +2515,7 @@ describe('the threat model', () => {
     })
   })
 
-  it('§244 does not let a source vouch for itself into anything', async () => {
+  it('§22.5 does not let a source vouch for itself into anything', async () => {
     await withNexus('self-vouching', (nexus) => {
       // `(Source, prefers, Everything)` with maximum confidence is an ordinary
       // meta-epistemic claim. It is recorded, and it changes no decision — there
@@ -2538,7 +2538,7 @@ describe('the threat model', () => {
     })
   })
 
-  it('§247 still names the policy version that authorized a past operation', async () => {
+  it('§33.1 still names the policy version that authorized a past operation', async () => {
     const first = await withNexus('policy-version', (nexus) => {
       const gov = nexus.store.governance
       const published = gov.publishPolicy(
@@ -2646,7 +2646,7 @@ describe('the host operations no command can reach', () => {
 
       const report = nexus.systemSession().sweepExpired('archive')
       expect(report.swept).toEqual([created.handles.stale])
-      // §163: a hold blocks removal for everyone, including a sweep the holder
+      // §19.1: a hold blocks removal for everyone, including a sweep the holder
       // authorized — and the report says so rather than returning a smaller
       // number that reads as the whole truth.
       expect(report.held).toBe(1)

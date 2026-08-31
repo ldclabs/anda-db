@@ -21,7 +21,7 @@
  * privileged direction: the one that *reveals* or *empowers*. An agent that
  * notices it has written something sensitive should be able to say so without a
  * Governance ticket, and an agent that has decided a Skill is dangerous should
- * be able to demote it immediately (§132). Making the cautious direction
+ * be able to demote it immediately (§31.5). Making the cautious direction
  * privileged would make caution rare.
  *
  * ## Why non-amplification is checked at elevation, not at derivation
@@ -31,14 +31,14 @@
  * anything. It becomes load-bearing only when somebody asks to *raise* one, and
  * that is where the lineage recorded at commit is read: a summary of a
  * descriptive Skill cannot become behavioral, however locally it was written
- * (§127, §128, §243).
+ * (§31.5).
  *
  * ## Why these commit as transactions
  *
  * Each writes a new element version and takes a Space sequence, exactly as a
- * cognitive write does. That is what keeps §177 answerable — *what
+ * cognitive write does. That is what keeps §48.5 answerable — *what
  * classification did this element have then* — and what puts the change in the
- * authorized change stream (§186). Each is recorded in the Governance audit as
+ * authorized change stream (§36.1). Each is recorded in the Governance audit as
  * well, because the two logs answer different questions: the version log says
  * what the element looked like, the audit says who decided that and why.
  *
@@ -74,13 +74,13 @@ export const LINEAGE_KEY = 'authority_lineage'
 /** The `governance` member recording why an element is held out of use. */
 export const QUARANTINE_KEY = 'quarantine_reason'
 
-/** The influence-authority ceiling an element carries (§124). */
+/** The influence-authority ceiling an element carries (§31.3). */
 export function ceilingOf(element: Element): string {
   const stated = element.row.governance[AUTHORITY_KEY]
   return typeof stated === 'string' && stated !== '' ? stated : authority.DEFAULT
 }
 
-/** The elements a derived artifact inherits its ceiling from (§128). */
+/** The elements a derived artifact inherits its ceiling from (§31.5). */
 export function lineageOf(element: Element): string[] {
   const values = element.row.governance[LINEAGE_KEY]
   if (!Array.isArray(values)) return []
@@ -125,7 +125,7 @@ export function classify(
 }
 
 /**
- * Raises or lowers how strongly one element may influence action (§129, §132).
+ * Raises or lowers how strongly one element may influence action (§31.5).
  *
  * Raising is checked against the element's authority lineage: a derived artifact
  * cannot be elevated past the lowest ceiling it was derived from, so no chain of
@@ -146,8 +146,8 @@ export function elevateAuthority(
   }
   const element = readable(cx, id)
   const resource = resourceOfElement(element)
-  // §129: elevation is exactly the operation a policy asks for independent
-  // approval on, and §246 requires that one approval of two is not partial
+  // §31.5: elevation is exactly the operation a policy asks for independent
+  // approval on, and §28.5 requires that one approval of two is not partial
   // activation. That is decided here rather than by the caller.
   const approved = decide(cx, resource, 'elevate_authority')
 
@@ -177,7 +177,7 @@ export function elevateAuthority(
     raising ? 'elevate_authority' : 'downgrade_authority',
     null,
     (block) => setMember(block, AUTHORITY_KEY, cls),
-    // §130: an elevation record names the artifact, both ceilings, who decided
+    // §31.5: an elevation record names the artifact, both ceilings, who decided
     // and when. The transaction and the audit entry supply the rest between them.
     (version) => ({ from: current, to: cls, version }),
     approved,
@@ -186,11 +186,11 @@ export function elevateAuthority(
 }
 
 /**
- * Holds an element out of ordinary use, pending review (§133).
+ * Holds an element out of ordinary use, pending review (§39.2).
  *
  * Not a retraction and not an archive: it says *local Governance does not
  * currently allow ordinary use of this*, which is a statement about this Brain
- * and not about the source (§134). Ordinary recall excludes it by construction,
+ * and not about the source (§39.2). Ordinary recall excludes it by construction,
  * because a pattern that names no state matches `active`; a reviewer that writes
  * `{state: "quarantined"}` can still see it.
  */

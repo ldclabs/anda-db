@@ -88,7 +88,7 @@ pub struct Context<'a> {
     pub authority: &'a EffectiveAuthority,
     /// Who the caller is.
     pub auth: &'a AuthContext,
-    /// Whether `_system.origin` may be returned at all (§110).
+    /// Whether `_system.origin` may be returned at all (§29).
     ///
     /// Space-scoped and decided once: engine origin is operational information
     /// about the deployment rather than about any one element, so a caller
@@ -181,7 +181,7 @@ impl<'a> Context<'a> {
     /// Returns `None` for an element this caller may not *discover*, and caches
     /// the **redacted** view for one it may — so a `FILTER` or an `ORDER BY` on
     /// a masked field sees what the projection would, rather than being able to
-    /// probe the value through row membership (§109).
+    /// probe the value through row membership (§29.2).
     ///
     /// An element the caller may discover but not read comes back with its
     /// identity and nothing else (§29.2). It still exists, is still counted and
@@ -421,7 +421,7 @@ impl<'a> Context<'a> {
         }
         // The Schema that was in force then is what a historical read resolves
         // symbols through: reconstructing the past under today's schema would
-        // answer a question nobody asked (§144).
+        // answer a question nobody asked (§20.9).
         if let Some(seq) = self.as_of {
             let version = self.store.schema_version_at(&self.space, seq).await?;
             self.env = self
@@ -568,7 +568,9 @@ impl<'a> Context<'a> {
                 subject,
                 predicate,
             } => {
-                let table = self.match_belief_slot(variable, subject, predicate).await?;
+                let table = self
+                    .match_belief_slot(variable, subject, predicate, &solutions)
+                    .await?;
                 solutions.join(table)
             }
         })

@@ -64,6 +64,7 @@ import {
   literalBinding,
   symbolBinding,
   type Binding,
+  type MutableSolution,
   type Solution,
 } from './solution.js'
 
@@ -148,6 +149,16 @@ const COLUMNS: Readonly<Record<ElementKind, Readonly<Record<string, string>>>> =
       state: 'state',
     },
   }
+
+/**
+ * The internal handle a `BELIEF (triple)` binds its resolved Proposition to.
+ *
+ * Named rather than spelled inline because it is a variable name that must not
+ * collide with a caller's: it is stripped from the row before the belief is
+ * bound, and a query that happened to use the same spelling would lose its own
+ * column.
+ */
+const BELIEF_TARGET = '__belief_target'
 
 /** The matcher fields whose value is a schema symbol to resolve. */
 const SYMBOL_FIELDS = new Set(['type', 'schema_ref', 'predicate'])
@@ -636,7 +647,17 @@ function pinnedKey(
   return endpoint === null ? null : endpointKey(endpointFromJson(endpoint))
 }
 
-/** The endpoint JSON a term denotes, when it denotes one already. */
+/**
+ * The endpoint JSON a term denotes, when it denotes one already.
+ *
+ * `null` means exactly one thing: **not pinned yet** — an unbound variable the
+ * pattern will bind from whatever it matches. It is not a place to put "this
+ * engine cannot resolve that", because every caller reads `null` as an open
+ * slot: `pinnedKey` omits the SQL predicate, `bindTerm` checks nothing, and
+ * `tupleIsGrounded` answers "not grounded". A term the engine cannot resolve
+ * therefore throws rather than returning `null`, or the tuple pattern would
+ * quietly match every Proposition under its predicate (§43.2).
+ */
 function termEndpoint(
   term: Term,
   solution: Solution,
@@ -656,11 +677,78 @@ function termEndpoint(
       ? { id: value }
       : value
   }
-  if ('Match' in term) {
-    const id = literalOf(term.Match.id, solution, b)
-    return typeof id === 'string' ? { id } : null
+  if ('Match' in term) return matcherEndpoint(term.Match, b)
+  // §43.2 blesses `(id: …)` as a `term`, which is how a statement about a
+  // statement names an existing Proposition. Not built here yet — and refused
+  // rather than ignored, for the reason above.
+  throw errors.unsupportedCapability(
+    'a nested Proposition in a tuple endpoint (§43.2) is not implemented by ' +
+      'this engine yet; bind the Proposition with its own pattern and pass ' +
+      'the variable',
+  )
+}
+
+/**
+ * The endpoint an inline `{...}` matcher names (§8.1, §8.2).
+ *
+ * Only two spellings of an object pattern *name* something: `{id: …}` is a
+ * Local Element Reference and `{canonical_id: …}` is a Canonical Identity
+ * Reference. Every other matcher describes a search, and resolving one would
+ * pick a winner among the Concepts a description is allowed to match — the
+ * arbitrary choice §7.2 forbids for names. The same two fields, in the same
+ * order, that `termValue` accepts on the mutation path.
+ *
+ * The refusal is `IdentitySelectorRequired` and not `UnsupportedCapability`:
+ * no engine should ever resolve a description to one endpoint, so this is not
+ * a gap that a later version closes.
+ */
+function matcherEndpoint(matcher: ObjectMatcher, b: ReadBindings): Json {
+  for (const field of ['id', 'canonical_id'] as const) {
+    const member = matcher[field]
+    if (member === undefined) continue
+    // An identity resolves the endpoint; it does not also filter it. A matcher
+    // carrying more than the identity asked for something this position cannot
+    // do, and answering it by dropping the rest would let
+    // `{id: "C-1", name: "Zed"}` match C-1 whatever C-1 is called — the silent
+    // wrong answer an unconstrained endpoint gives, one member in.
+    const extra = Object.keys(matcher).filter((key) => key !== field)
+    if (extra.length > 0) {
+      throw errors.identitySelectorRequired(
+        `a tuple endpoint names \`${field}\`, so it is resolved by identity ` +
+          `and not matched by description; ${extra.join(', ')} would be ` +
+          `silently ignored. Drop ${extra.length === 1 ? 'it' : 'them'} or ` +
+          `bind the element with its own pattern`,
+      )
+    }
+    // Read off the member itself rather than through `literalOf`, which
+    // collapses an unbound variable to `undefined` — indistinguishable here
+    // from "no such field", and this position has no open-slot reading: an
+    // identity is written down or it is not one.
+    const value =
+      'Literal' in member
+        ? kipLiteral(member.Literal)
+        : 'Param' in member
+          ? parameterValue(b, member.Param)
+          : undefined
+    if (value === undefined) {
+      throw errors.identitySelectorRequired(
+        `\`${field}\` in a tuple endpoint must be a literal identity or a ` +
+          `parameter, not a pattern`,
+      )
+    }
+    if (typeof value !== 'string') {
+      throw errors.identitySelectorRequired(
+        `\`${field}\` in a tuple endpoint must be a string, got ` +
+          JSON.stringify(value),
+      )
+    }
+    return { [field]: value }
   }
-  return null
+  throw errors.identitySelectorRequired(
+    'a tuple endpoint written as an object must name a stable identity: ' +
+      '{id: "…"} or {canonical_id: "…"}; matching one by description would ' +
+      'pick a winner among the Concepts a description is allowed to share',
+  )
 }
 
 /** Binds a tuple endpoint's variable, or checks it against what it holds. */
@@ -841,19 +929,58 @@ function belief(
 ): Solution[] {
   const out: Solution[] = []
   for (const solution of incoming) {
-    const target = beliefTarget(cx, clause.target, solution, b)
-    // A fully grounded tuple that resolves to no Proposition still gets an
-    // answer (§46.4): `insufficient` with a null id. Refusing, or returning no
-    // row, makes the Agent infer "unknown" from "the pattern did not match" —
-    // the inference §24 exists to prevent.
-    const projected =
-      target === null
-        ? ungroundedBelief(cx, b.policy, nowTime())
-        : project(cx, target, b.policy)
+    // A tuple is matched the way a Proposition pattern is, and its bindings
+    // travel with the belief: `?b BELIEF (?s, "prefers", ?o)` asks about every
+    // object ?s prefers, and answering with one belief and an unbound ?o would
+    // report a projection the caller cannot tell the subject of. One row per
+    // Proposition it matched, each carrying the endpoints it matched them at.
+    if ('Tuple' in clause.target) {
+      const matched = propositions(
+        cx,
+        BELIEF_TARGET,
+        { Tuple: clause.target.Tuple },
+        [solution],
+        b,
+      )
+      if (matched.length === 0) {
+        // Only a *fully grounded* tuple earns the §46.4 answer. A tuple with
+        // an unbound end asked about a family of slots, and "no Proposition"
+        // there is an empty match, not one belief about nothing.
+        if (!tupleIsGrounded(clause.target.Tuple, solution, b)) {
+          throw errors.notFoundOrNotVisible(
+            'the BELIEF tuple names no Proposition on record here',
+          )
+        }
+        const next = extend(
+          solution,
+          clause.variable,
+          literalBinding(
+            beliefToJson(ungroundedBelief(cx, b.policy, nowTime())) as Json,
+          ),
+        )
+        if (next !== null) out.push(next)
+        continue
+      }
+      for (const row of matched) {
+        const bound = row.get(BELIEF_TARGET)
+        if (bound === undefined || bound.kind !== 'element') continue
+        const carried: MutableSolution = new Map(row)
+        carried.delete(BELIEF_TARGET)
+        const next = extend(
+          carried,
+          clause.variable,
+          literalBinding(beliefToJson(project(cx, bound.id, b.policy)) as Json),
+        )
+        if (next !== null) out.push(next)
+      }
+      continue
+    }
+
+    const target = beliefTarget(clause.target, solution, b)
     const next = extend(
       solution,
       clause.variable,
-      literalBinding(beliefToJson(projected) as Json),
+      literalBinding(beliefToJson(project(cx, target, b.policy)) as Json),
     )
     if (next !== null) out.push(next)
   }
@@ -861,17 +988,17 @@ function belief(
 }
 
 /**
- * The Proposition a BELIEF clause names.
+ * The Proposition a BELIEF clause names by identity.
  *
- * `null` means a fully grounded tuple that no Proposition matches — the §46.4
- * case, which is an answer rather than an error.
+ * Only the two single-target forms — a bound Proposition variable and the
+ * `(id: …)` form. A tuple is resolved by {@link belief} itself, which needs the
+ * bindings the match made and not only the Proposition it landed on.
  */
 function beliefTarget(
-  cx: Context,
   target: BeliefTarget,
   solution: Solution,
   b: ReadBindings,
-): ElementId | null {
+): ElementId {
   if ('Proposition' in target) {
     const bound = solution.get(target.Proposition)
     if (bound === undefined || bound.kind !== 'element') {
@@ -892,19 +1019,9 @@ function beliefTarget(
     }
     return parseElementId(value)
   }
-  // An inline tuple: resolved the way a pattern would.
-  const tuple = propositions(cx, '__belief', { Tuple: target.Tuple }, [solution], b)
-  const first = tuple[0]?.get('__belief')
-  if (first === undefined || first.kind !== 'element') {
-    // Only a *fully grounded* tuple earns the §46.4 answer. A tuple with an
-    // unbound end asked about a family of slots, and "no Proposition" there is
-    // an empty match, not one belief about nothing.
-    if (tupleIsGrounded(target.Tuple, solution, b)) return null
-    throw errors.notFoundOrNotVisible(
-      'the BELIEF tuple names no Proposition on record here',
-    )
-  }
-  return first.id
+  // A tuple never reaches here: `belief` resolves one itself, because it needs
+  // the bindings the match made and not only the Proposition it landed on.
+  throw errors.internalError('a BELIEF tuple reached the single-target path')
 }
 
 /**

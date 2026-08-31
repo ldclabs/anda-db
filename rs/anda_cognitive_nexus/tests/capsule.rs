@@ -130,7 +130,7 @@ async fn an_export_carries_the_referential_closure_of_its_roots() {
 
 #[tokio::test]
 async fn an_export_carries_exact_schema_refs_and_the_packages_they_need() {
-    // Spec §240.47. A Capsule that exported local names would arrive meaning
+    // Spec §20.4. A Capsule that exported local names would arrive meaning
     // whatever the destination happens to call them.
     let nexus = seeded("schema_refs").await;
     let capsule = ok(&nexus, r#"EXPORT CAPSULE ?c WHERE { ?c CONCEPT {} }"#).await;
@@ -197,7 +197,7 @@ async fn a_modified_capsule_fails_verification() {
 
 #[tokio::test]
 async fn an_import_preview_refuses_a_capsule_whose_schema_is_not_here() {
-    // Spec §88, §240.20: an import cannot activate schema on the artifact's
+    // Spec §88, §41.3: an import cannot activate schema on the artifact's
     // own say-so, and importing records whose types cannot be resolved would
     // store cognition nobody can read back.
     let source = seeded("import_source").await;
@@ -260,7 +260,7 @@ async fn an_import_preview_refuses_a_capsule_whose_schema_is_not_here() {
 
 #[tokio::test]
 async fn a_capsule_from_a_different_build_of_the_same_package_is_refused() {
-    // Spec §240.5 applied across a boundary: the same package version must be
+    // Spec §20.4 applied across a boundary: the same package version must be
     // the same content, so a digest mismatch means one of them is not what it
     // claims.
     let source = seeded("digest_source").await;

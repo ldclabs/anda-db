@@ -144,7 +144,7 @@ export interface Outcome {
   changes: ChangeEntry[]
   warnings: string[]
   /**
-   * The access decision that authorized this statement (§178).
+   * The access decision that authorized this statement (§33.1).
    *
    * Present only on high-impact statements — an erasure, an export, a
    * Governance change. Attaching it to every commit would bury the cases that
@@ -176,7 +176,7 @@ export class Transaction {
    * The Schema Environment this transaction is bound to.
    *
    * Captured once at the start: a transaction evaluates against one consistent
-   * environment snapshot (§240.45), so an activation racing alongside cannot
+   * environment snapshot (§32.5), so an activation racing alongside cannot
    * change what half of it means.
    */
   readonly env: SchemaEnvironment
@@ -446,6 +446,23 @@ export class Transaction {
   }
 
   /**
+   * Reads an element without staging it or failing when it is absent.
+   *
+   * Read-your-writes like {@link load}, and deliberately weaker in both other
+   * respects: a walk that only *follows* references — the `merged_into` chain
+   * (§11.1) — should neither enlist every Concept it passed through in the
+   * transaction nor abort because one of them is gone. A reference that
+   * resolves to nothing is left as written, which is what §11.3 asks for.
+   */
+  peek(id: ElementId): Element | null {
+    const found = this.staged.get(formatElementId(id))
+    if (found !== undefined) return found.element
+    const element = this.store.load(id)
+    if (element === null || element.row.space !== this.cx.space) return null
+    return element
+  }
+
+  /**
    * The Concept type of a staged element, when this transaction staged one.
    *
    * Endpoint validation has to see the transaction's own writes: a Proposition
@@ -640,9 +657,9 @@ export class Transaction {
    * Classification is applied here because it has to be right the moment the
    * element becomes readable — *read secret Evidence, summarize, write public
    * summary* is an exfiltration path if the summary lands public even briefly
-   * (§98, §242). Authority is only *recorded*, because everything is created at
+   * (§31.2). Authority is only *recorded*, because everything is created at
    * the bottom of the ladder and so cannot exceed anything; the lineage is what
-   * an elevation reads when somebody asks to raise it (§127).
+   * an elevation reads when somebody asks to raise it (§31.5).
    */
   private propagateGovernance(pending: [string, Staged][]): void {
     const derived = this.derivations()

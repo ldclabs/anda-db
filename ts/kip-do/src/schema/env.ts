@@ -26,7 +26,7 @@ import {
   type SymbolRef,
 } from './symbol.js'
 
-/** The reserved package that describes Core itself (§158). */
+/** The reserved package that describes Core itself (§20.13). */
 export const CORE_PACKAGE_ID = 'kip://core'
 
 /** The Core package this engine implements. */
@@ -87,7 +87,7 @@ const registry = (values: readonly string[], description: string) => ({
  * The built-in `kip://core@2.0.0` artifact.
  *
  * Core defines the open registries and nothing else: element kinds are fixed
- * and not redefinable (§240.22), and Concept types are schema-defined, so Core
+ * and not redefinable (§20.13), and Concept types are schema-defined, so Core
  * deliberately declares none. A Space with only Core installed can therefore
  * hold Propositions and Assertions but cannot type a Concept until a profile is
  * activated — which is define-before-use working as intended.
@@ -197,7 +197,7 @@ export function lockFromJson(value: JsonMap): SchemaLock {
 
 /** A resolved Schema Environment, ready to answer symbol questions. */
 export class SchemaEnvironment {
-  /** The environment version. Every activation mints a new one (§143). */
+  /** The environment version. Every activation mints a new one (§20.8). */
   readonly version: number
   readonly lock: SchemaLock
   /** The artifacts, keyed by canonical package reference. */
@@ -231,7 +231,7 @@ export class SchemaEnvironment {
    * A lock naming a package whose artifact is absent fails here rather than at
    * the first query: an environment that resolves some of its own lock is worse
    * than one that refuses to exist, because the failure would surface as a
-   * missing symbol somewhere unrelated (§182).
+   * missing symbol somewhere unrelated (§20.9).
    */
   static resolve(
     version: number,
@@ -341,7 +341,7 @@ export class SchemaEnvironment {
           `first`,
       )
     }
-    // Spec §184: tell the Agent how to recover, by name.
+    // Spec §86.1: tell the Agent how to recover, by name.
     const listed = candidates.map(formatSymbolRef)
     throw errors.schemaSymbolAmbiguous(
       `the ${KIND_NAMES[kind]} ${JSON.stringify(name)} is defined by more ` +

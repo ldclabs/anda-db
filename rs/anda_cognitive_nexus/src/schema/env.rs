@@ -10,12 +10,12 @@
 //!
 //! Three rules shape the answer.
 //!
-//! **Ambiguity fails; it never guesses** (§20, §240.10). If two installed
+//! **Ambiguity fails; it never guesses** (§20.7). If two installed
 //! packages both define `Person`, the runtime says so and lists the
 //! candidates. Picking one would silently bind data to a meaning the caller
 //! did not choose, and the binding is persisted.
 //!
-//! **Define-before-use** (§110). An unknown type in an ordinary write is an
+//! **Define-before-use** (§10.3). An unknown type in an ordinary write is an
 //! error, not an invitation to create a schema. Schema authoring is a separate
 //! governance process, which is the whole point of moving Schema out of the
 //! graph.
@@ -35,7 +35,7 @@ use std::{
 use super::package::{Definitions, Manifest, SchemaPackage};
 use super::symbol::{PackageRef, SymbolKind, SymbolRef, is_qualified};
 
-/// The reserved package that describes Core itself (§158).
+/// The reserved package that describes Core itself (§20.13).
 pub const CORE_PACKAGE_ID: &str = "kip://core";
 
 /// The Core package this engine implements.
@@ -45,7 +45,7 @@ pub static CORE_PACKAGE_REF: LazyLock<PackageRef> =
 /// The built-in `kip://core@2.0.0` artifact.
 ///
 /// Core defines the open registries and nothing else: element kinds are fixed
-/// and not redefinable (§240.22), and Concept types are schema-defined, so
+/// and not redefinable (§20.13), and Concept types are schema-defined, so
 /// Core deliberately declares none (Core Data Model §49). A Space with only
 /// Core installed can therefore hold Propositions and Assertions but cannot
 /// type a Concept until a profile is activated — which is define-before-use
@@ -186,7 +186,7 @@ pub struct SchemaLock {
 /// A resolved Schema Environment, ready to answer symbol questions.
 #[derive(Clone, Debug)]
 pub struct SchemaEnvironment {
-    /// The environment version. Every activation mints a new one (§143).
+    /// The environment version. Every activation mints a new one (§20.8).
     pub version: u64,
     /// The lock this environment resolved.
     pub lock: SchemaLock,
@@ -220,7 +220,7 @@ impl SchemaEnvironment {
     /// A lock naming a package whose artifact is absent fails here rather than
     /// at the first query: an environment that resolves some of its own lock is
     /// worse than one that refuses to exist, because the failure would surface
-    /// as a missing symbol somewhere unrelated (§182).
+    /// as a missing symbol somewhere unrelated (§20.9).
     pub fn resolve(
         version: u64,
         lock: SchemaLock,
@@ -344,7 +344,7 @@ impl SchemaEnvironment {
                 ),
             )),
             _ => {
-                // Spec §184: tell the Agent how to recover, by name.
+                // Spec §86.1: tell the Agent how to recover, by name.
                 let listed = candidates
                     .iter()
                     .map(SymbolRef::to_string)
@@ -492,7 +492,7 @@ mod tests {
 
     #[test]
     fn an_ambiguous_local_name_fails_and_names_the_candidates() {
-        // Spec §20 and §240.10: the runtime must not guess. Guessing would
+        // Spec §20.7: the runtime must not guess. Guessing would
         // bind persisted data to a meaning nobody chose.
         let env = SchemaEnvironment::resolve(
             2,
@@ -512,7 +512,7 @@ mod tests {
             .resolve_symbol(SymbolKind::ConceptType, "Person", Intent::Write)
             .unwrap_err();
         assert_eq!(err.name(), "SchemaSymbolAmbiguous");
-        // §184: the recovery hint has to be actionable, which means naming
+        // §86.1: the recovery hint has to be actionable, which means naming
         // both candidates.
         assert!(err.effective_hint().contains("kip://acme/hr@1.0.0/Person"));
         assert!(
@@ -538,7 +538,7 @@ mod tests {
 
     #[test]
     fn an_unknown_type_is_an_error_not_a_new_definition() {
-        // Spec §110: define-before-use. A data write that could create schema
+        // Spec §10.3: define-before-use. A data write that could create schema
         // would put schema authority back inside ordinary cognition, which is
         // the 1.x mistake this version exists to fix.
         let env = profile_env();
@@ -674,7 +674,7 @@ mod tests {
 
     #[test]
     fn a_lock_that_names_a_missing_artifact_refuses_to_resolve() {
-        // Spec §182: a half-resolved environment would surface its failure as
+        // Spec §20.9: a half-resolved environment would surface its failure as
         // a missing symbol somewhere unrelated.
         let err = SchemaEnvironment::resolve(
             7,
@@ -687,7 +687,7 @@ mod tests {
 
     #[test]
     fn core_is_present_without_being_installed_and_types_nothing() {
-        // Spec §158: conformance to Core does not depend on package
+        // Spec §20.13: conformance to Core does not depend on package
         // activation. Core Data Model §49: Concept types are schema-defined,
         // so Core declares none — a Space with only Core cannot type a
         // Concept, and that is define-before-use working.
@@ -716,7 +716,7 @@ mod tests {
     #[test]
     fn a_write_default_can_differ_from_the_read_version() {
         // Spec §80: a Space may read one version while binding new data to
-        // another during a dual-version period (§136).
+        // another during a dual-version period (§20.9).
         let mut lock = lock(&[(
             "kip://profiles/cognitive-memory",
             "2.0.0",

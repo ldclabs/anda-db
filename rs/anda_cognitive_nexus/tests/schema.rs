@@ -64,7 +64,7 @@ fn lock(entries: &[(&str, &str, PackageState)]) -> SchemaLock {
 
 #[tokio::test]
 async fn installing_a_package_does_not_activate_it() {
-    // Spec §240.18 and §88: activation is a Governance operation. If arriving
+    // Spec §20.12 and §88: activation is a Governance operation. If arriving
     // data could activate its own schema, it could redefine what the Space's
     // existing data means.
     let store = fresh_store("install_is_not_activate").await;
@@ -105,7 +105,7 @@ async fn installing_a_package_does_not_activate_it() {
 
 #[tokio::test]
 async fn a_published_version_cannot_be_replaced_with_different_content() {
-    // Spec §150, §240.5: the same-version replacement attack. Every element
+    // Spec §20.11, §20.4: the same-version replacement attack. Every element
     // bound to `@2.0.0` would change meaning with no transaction recording it.
     let store = fresh_store("immutable_versions").await;
     let profile = SchemaPackage::parse(COGNITIVE_MEMORY).unwrap();
@@ -135,7 +135,7 @@ async fn a_published_version_cannot_be_replaced_with_different_content() {
 
 #[tokio::test]
 async fn a_historical_environment_version_stays_reconstructible() {
-    // Spec §144, §240.44: a transaction records the environment it ran under,
+    // Spec §20.9, §20.4: a transaction records the environment it ran under,
     // and rolling defaults forward must not change what past reads meant.
     let store = fresh_store("historical_env").await;
     store
@@ -197,7 +197,7 @@ async fn a_historical_environment_version_stays_reconstructible() {
 
 #[tokio::test]
 async fn activating_an_uninstalled_package_leaves_the_space_untouched() {
-    // Spec §240.43: activation is atomic at the environment boundary. A
+    // Spec §20.9: activation is atomic at the environment boundary. A
     // half-applied upgrade would surface later as a missing symbol somewhere
     // unrelated to the upgrade.
     let store = fresh_store("atomic_activation").await;
@@ -236,7 +236,7 @@ async fn activating_an_uninstalled_package_leaves_the_space_untouched() {
 
 #[tokio::test]
 async fn core_is_installable_and_introspectable_without_being_activated() {
-    // Spec §158: conformance to Core does not depend on package activation,
+    // Spec §20.13: conformance to Core does not depend on package activation,
     // but having the artifact installed is what lets META describe it beside
     // every other package.
     let store = fresh_store("core_package").await;

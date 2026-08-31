@@ -274,7 +274,7 @@ impl Store {
     ///
     /// An activation is a transaction like any other, so the environment a
     /// historical read resolves symbols through is the last one activated at
-    /// or before the coordinate — never today's (§144).
+    /// or before the coordinate — never today's (§20.9).
     pub async fn schema_version_at(&self, space_id: &str, seq: u64) -> Result<u64, KipError> {
         let ids = self
             .schema_envs()

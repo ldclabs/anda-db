@@ -118,7 +118,7 @@ export function exportCapsule(
     // The *redacted* view, not a fresh render: a field mask that applied to a
     // query and not to an export would make `EXPORT CAPSULE` the way around it,
     // and export is meant to be a further permission over what a read already
-    // reached (§78, §109).
+    // reached (§29.2).
     const view = context.view(id)
     if (element === null || view === null) continue
     collectSchemaRefs(view, schemaRefs)
@@ -178,7 +178,7 @@ export function exportCapsule(
       snapshot_seq: space?.seq ?? 0,
       schema_environment_version: cx.env.version,
     },
-    // §240.47: the exact refs travel with the records. A Capsule exporting
+    // §20.4: the exact refs travel with the records. A Capsule exporting
     // local names would arrive meaning whatever the destination happens to
     // call them.
     schema: includeSchema ? schemaDependencies(cx, schemaRefs) : [],

@@ -2,7 +2,7 @@
  * # The Schema Package artifact
  *
  * Authoritative Schema in KIP 2.0 is an immutable versioned artifact, not a set
- * of graph nodes (Spec §1, §240.1). This is the difference from 1.x that costs
+ * of graph nodes (Spec §20.1, §20.11). This is the difference from 1.x that costs
  * the most to get wrong: in 1.x an ordinary `UPSERT` could reshape what a type
  * meant, so cognition and the rules governing cognition sat in the same mutable
  * store. Here a package is content-addressed and read-only, and changing
@@ -128,7 +128,7 @@ export interface PredicateDef {
  * A Facet definition (§58).
  *
  * A Facet is a validated namespaced extension, not an untyped metadata bag
- * (§240.31) — which is exactly what KIP 1.x `metadata` had become.
+ * (§18.1) — which is exactly what KIP 1.x `metadata` had become.
  */
 export interface FacetDef {
   ref?: string
@@ -205,7 +205,7 @@ export interface Manifest {
   package_ref?: string
   name?: string
   description?: string
-  /** Who published it. Namespace identity does not prove this (§240.41). */
+  /** Who published it. Namespace identity does not prove this (§20.11). */
   publisher?: Json
   [extra: string]: Json | undefined
 }
@@ -240,7 +240,7 @@ export interface SchemaPackage {
   aliases?: JsonMap
   compatibility?: Json
   migrations?: Json
-  /** Advisory guidance for an Agent. Never a validator (§240.34). */
+  /** Advisory guidance for an Agent. Never a validator (§20.5). */
   model_hints?: Json
   canonicalization?: Json
   integrity?: Integrity

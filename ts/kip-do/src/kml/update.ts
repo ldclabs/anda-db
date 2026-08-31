@@ -18,6 +18,7 @@
  */
 
 import {
+  canonicalizeReference,
   edgeIndex,
   orderedField,
   placeReference,
@@ -237,7 +238,12 @@ export function applyAction(
     }
     for (const edge of action.SetStructural) {
       const field = resolveStructural(tx, b, edge)
-      const value = referenceValue(mutationValue(b, edge.value, read), field)
+      // §11.3: adding a reference now is a new write, so it points at the
+      // identity that survived a merge rather than the one it retired.
+      const value = canonicalizeReference(
+        tx,
+        referenceValue(mutationValue(b, edge.value, read), field),
+      )
       const current = row.structural[field]
       const items = Array.isArray(current) ? [...current] : []
       const index = edgeIndex(b, edge)

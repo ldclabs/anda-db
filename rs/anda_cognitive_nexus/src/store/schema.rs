@@ -1,6 +1,6 @@
 //! # Installing packages and activating environments
 //!
-//! Two operations that are deliberately not the same one (Spec §240.18):
+//! Two operations that are deliberately not the same one (Spec §20.12):
 //!
 //! ```text
 //! install   the artifact is available locally, and inert
@@ -77,10 +77,10 @@ pub fn content_digest(artifact: &Json) -> String {
 impl Store {
     /// Installs a Schema Package artifact, or confirms it is already installed.
     ///
-    /// Installing does not activate (§240.18, §240.20). Re-installing the same
+    /// Installing does not activate (§20.12, §41.3). Re-installing the same
     /// reference with different content is refused: `package_id + version`
     /// identifies one immutable content forever, and silently accepting a
-    /// replacement is the same-version replacement attack of §150 — every
+    /// replacement is the same-version replacement attack of §20.11 — every
     /// element already bound to that reference would change meaning with no
     /// transaction recording it.
     pub async fn install_package(
@@ -192,12 +192,12 @@ impl Store {
 
     /// Activates a Schema Lock, minting the next environment version.
     ///
-    /// Atomic at the environment boundary (§240.43): the lock is resolved in
+    /// Atomic at the environment boundary (§20.9): the lock is resolved in
     /// full before anything is written, so a lock naming an uninstalled
     /// package fails without leaving the Space half-upgraded.
     ///
     /// Rolling defaults back later does not erase data written under the newer
-    /// schema (§240.44) — persisted elements carry exact references, so they
+    /// schema (§20.4) — persisted elements carry exact references, so they
     /// keep resolving through whichever environment version they were written
     /// under.
     pub async fn activate_schema(
@@ -269,7 +269,7 @@ impl Store {
     /// The Schema Environment as it was at one version.
     ///
     /// This is what `AS OF` reads against and what a transaction receipt names
-    /// (§144, §145): reconstructing a historical read under today's schema
+    /// (§20.9, §33.2): reconstructing a historical read under today's schema
     /// would answer a question nobody asked.
     pub async fn schema_environment_at(
         &self,
@@ -313,7 +313,7 @@ impl Store {
 
     /// Installs the built-in Core package if it is not already present.
     ///
-    /// Core is foundational rather than optional (§158), so a Space that has
+    /// Core is foundational rather than optional (§20.13), so a Space that has
     /// never activated anything still resolves Core symbols; installing the
     /// artifact makes it introspectable through META alongside every other
     /// package.

@@ -1,7 +1,7 @@
 //! # Epistemic Projection
 //!
 //! What is *currently believed*, computed from the Assertions on record under a
-//! named policy. It is a view, never stored state (Spec §48, §240.40): storing
+//! named policy. It is a view, never stored state (Spec §21.2): storing
 //! it would create a second answer that could disagree with the Assertions it
 //! came from, and nothing would say which one was right.
 //!

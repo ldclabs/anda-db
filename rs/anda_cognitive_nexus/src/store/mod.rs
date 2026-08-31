@@ -126,8 +126,8 @@ pub struct Store {
     /// Resolved Schema Environments, keyed by Space and version.
     ///
     /// Safe to keep forever, and that is a property of the data rather than a
-    /// bet: activation only ever mints a *new* version (§143), and an installed
-    /// package is immutable by reference (§240.4). So one `(space, version)`
+    /// bet: activation only ever mints a *new* version (§20.8), and an installed
+    /// package is immutable by reference (§20.4). So one `(space, version)`
     /// resolves to one environment for the life of the database. Without this,
     /// every KQL, KML and META command re-read every installed artifact and
     /// re-parsed it — tens of KB of JSON before the command looked at any data.

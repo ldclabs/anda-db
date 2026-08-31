@@ -3,6 +3,28 @@ import { describe, expect, it } from 'vitest'
 import { CognitiveNexus } from '../src/nexus.js'
 import { COGNITIVE_MEMORY } from '../src/schema/index.js'
 import { parseElementId } from '../src/id.js'
+import {
+  capabilities,
+  capabilityState,
+  unsupportedCapabilityNames,
+} from '../src/meta/capabilities.js'
+
+/** The thirteen profile names §89 lists, in the order it lists them. */
+const KIP_CONFORMANCE_PROFILES = [
+  'KIP-Core',
+  'KIP-Schema',
+  'KIP-Epistemic',
+  'KIP-Governance',
+  'KIP-Transactions',
+  'KIP-Capsule',
+  'KIP-KQL',
+  'KIP-KML',
+  'KIP-META',
+  'KIP-Runtime',
+  'KIP-Historical',
+  'KIP-High-Assurance',
+  'KIP-1-Migration',
+]
 
 /**
  * META, and the five-layer discipline it exists to keep apart.
@@ -74,6 +96,39 @@ describe('META', () => {
     })
   })
 
+  it('answers `requires` about every gap it documents', async () => {
+    // `DESCRIBE CAPABILITIES` answers two audiences from one set of facts: an
+    // Agent reading `unsupported` for a reason, and a `requires` check asking
+    // a yes/no question (§67). A gap documented in the first and missing from
+    // the second reports itself as *unrecognized* rather than as absent — and
+    // §67's whole point is that an unrecognized requirement must not pass.
+    const report = capabilities() as unknown as {
+      unsupported: { capability: string }[]
+    }
+    for (const entry of report.unsupported) {
+      expect(capabilityState(entry.capability), entry.capability).toBe(false)
+    }
+    for (const name of unsupportedCapabilityNames()) {
+      expect(capabilityState(name), name).toBe(false)
+    }
+    // An unknown name is not "supported by omission".
+    expect(capabilityState('read_everything')).toBeUndefined()
+  })
+
+  it('declares the §89 conformance profiles, by their §89 names', async () => {
+    const report = capabilities() as unknown as { profiles: string[] }
+    expect(report.profiles.length).toBeGreaterThan(0)
+    for (const name of report.profiles) {
+      expect(KIP_CONFORMANCE_PROFILES, name).toContain(name)
+    }
+    // Claimed only where it is true. Each absence has an entry in
+    // `unsupported` a caller can read the reason from.
+    expect(report.profiles).not.toContain('KIP-High-Assurance')
+    expect(report.profiles).not.toContain('KIP-KQL')
+    expect(report.profiles).not.toContain('KIP-Transactions')
+    expect(report.profiles).not.toContain('KIP-Capsule')
+  })
+
   it('orients an Agent before its first command', async () => {
     await withNexus('primer', (nexus) => {
       const primer = nexus.describe('DESCRIBE PRIMER') as {
@@ -89,7 +144,7 @@ describe('META', () => {
 
   it('answers about a symbol with its canonical identity, never a local name', async () => {
     await withNexus('symbol', (nexus) => {
-      // §106: a local name means nothing outside the environment that
+      // §88.6: a local name means nothing outside the environment that
       // resolved it, so what comes back is the exact reference.
       const answer = nexus.describe('DESCRIBE TYPE "Person"') as {
         ref: string
@@ -343,7 +398,7 @@ describe('Capsules', () => {
       expect(capsule.payload.records.propositions).toHaveLength(1)
       expect(capsule.payload.records.concepts).toHaveLength(2)
       expect(capsule.payload.manifest.completeness).toBe('referential_closure')
-      // §240.47: the exact refs travel with the records, or the Capsule
+      // §20.4: the exact refs travel with the records, or the Capsule
       // arrives meaning whatever the destination happens to call them. The
       // split into `package` + `version` is the frame `anda_kip` decodes —
       // both are required there, so a single `package_ref` would make the

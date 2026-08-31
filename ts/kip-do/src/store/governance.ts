@@ -15,9 +15,9 @@
  * ```
  *
  * The historical form deliberately ignores `status`, because that is the whole
- * reason revocation is a status change rather than a delete (§36, §177). An
+ * reason revocation is a status change rather than a delete (§28.6, §48.5). An
  * auditor asking *who could read this in January* gets January's answer, and
- * gets it without that being a claim about today (§179).
+ * gets it without that being a claim about today (§48.5).
  *
  * ## The historical view has millisecond resolution, and on this platform that
  * is coarser than it sounds
@@ -38,7 +38,7 @@
  * ## Every mutation is mirrored into the audit
  *
  * Whole records, not diffs. A control-plane change that is not in the audit is
- * a change nothing can attribute, and §172 lists the operations whose absence
+ * a change nothing can attribute, and §29 lists the operations whose absence
  * from a log is itself the incident.
  *
  * @see rs/anda_cognitive_nexus/src/governance/store.rs
@@ -330,7 +330,7 @@ export class GovernanceStore {
     }
     // The audit entry is what `groupsOfAt` replays, so it carries the whole
     // membership list rather than the delta: the row says who is in the group
-    // now, and only this says who was in it then (§177).
+    // now, and only this says who was in it then (§48.5).
     this.recordMutation({
       operation: 'put_group',
       at: row.updated_at,
@@ -365,7 +365,7 @@ export class GovernanceStore {
   }
 
   /**
-   * Which groups a Principal belonged to at a past instant (§177).
+   * Which groups a Principal belonged to at a past instant (§48.5).
    *
    * Replayed from the audit rather than read off the group rows, because a
    * group's membership is stored as one current list: the row says who is in it
@@ -571,7 +571,7 @@ export class GovernanceStore {
   }
 
   /**
-   * The Grants that were in force at a past instant (§177).
+   * The Grants that were in force at a past instant (§48.5).
    *
    * Reads the same rows as the live lookup and judges them by their own
    * timestamps instead of by their current status.
@@ -728,7 +728,7 @@ export class GovernanceStore {
     )
   }
 
-  /** The version of a Policy that was in force at an instant (§177). */
+  /** The version of a Policy that was in force at an instant (§48.5). */
   policyAt(policyId: string, at: string): GovernancePolicyRow | null {
     return this.one<GovernancePolicyRow>(
       'gov_policies',
@@ -786,7 +786,7 @@ export class GovernanceStore {
    * Adds one Principal's approval.
    *
    * Refuses a second approval from the same Principal, and — unless the request
-   * opted out — refuses the requester's own (§170). Both are the same rule:
+   * opted out — refuses the requester's own (§28.5). Both are the same rule:
    * *independent* approvals, or the count means nothing.
    */
   approve(id: number, approver: string, note = ''): ApprovalRow {

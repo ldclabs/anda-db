@@ -66,7 +66,7 @@ export interface KqlContext {
    */
   snapshotToken?: string
   /**
-   * The Schema Environment of a past coordinate (§144).
+   * The Schema Environment of a past coordinate (§20.9).
    *
    * A historical read resolves symbols through the environment that was in
    * force *then*, never today's: reconstructing the past under today's schema
