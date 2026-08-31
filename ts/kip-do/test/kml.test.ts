@@ -428,15 +428,67 @@ describe('KML', () => {
     })
   })
 
-  it('reports a clause it has not built rather than reporting success', async () => {
-    await withNexus('unsupported', (nexus) => {
-      // The clauses that are still refused are refused by name, so a caller
-      // learns what to do instead rather than watching a write report success
-      // and change nothing.
-      const result = nexus.tryExecute('SET RETENTION "C-1" { expires_at: "x" }')
-      expect('error' in result && result.error.code).toBe('UnsupportedCapability')
+  describe('SET RETENTION', () => {
+    it('records storage lifecycle without touching what the element says', async () => {
+      await withNexus('set-retention', (nexus) => {
+        const alice = nexus.execute(SETUP).handles.alice!
+        const before = concept(nexus, alice)
+        nexus.execute(
+          `SET RETENTION "${alice}" {retention_class: "short", expires_at: "2030-01-01T00:00:00Z"}`,
+        )
+        const after = concept(nexus, alice)
+        expect(after.retention).toEqual({
+          retention_class: 'short',
+          expires_at: '2030-01-01T00:00:00Z',
+        })
+        // Lifted out of the block so the sweep can index it (§19.2), and
+        // normalized on the way — the sweep compares strings.
+        expect(after.expires_at).toBe('2030-01-01T00:00:00.000Z')
+        // Storage lifecycle, never content: the Concept still says what it said.
+        expect(after.name).toBe(before.name)
+        expect(after.version).toBe(before.version + 1)
+      })
+    })
+
+    it('takes no version when the block says what is already recorded', async () => {
+      await withNexus('set-retention-idempotent', (nexus) => {
+        const alice = nexus.execute(SETUP).handles.alice!
+        const block = `SET RETENTION "${alice}" {retention_class: "short"}`
+        nexus.execute(block)
+        const once = concept(nexus, alice).version
+        // Restating a policy is not a change to it.
+        const again = nexus.execute(block)
+        expect(again.status).toBe('no_effect')
+        expect(concept(nexus, alice).version).toBe(once)
+      })
+    })
+
+    it('sweeps the set its own WHERE selects, and nothing beside it', async () => {
+      await withNexus('set-retention-sweep', (nexus) => {
+        const handles = nexus.execute(SETUP).handles
+        nexus.execute(
+          `SET RETENTION ?c {retention_class: "short"}
+           WHERE { ?c CONCEPT {type: "Person"} }`,
+        )
+        expect(concept(nexus, handles.alice!).retention).toEqual({
+          retention_class: 'short',
+        })
+        // The Preference is not a Person, so the sweep never reached it.
+        expect(concept(nexus, handles.dark!).retention).toEqual({})
+      })
+    })
+
+    it('refuses a member the hook does not have, rather than losing it', async () => {
+      await withNexus('set-retention-shape', (nexus) => {
+        const alice = nexus.execute(SETUP).handles.alice!
+        const result = nexus.tryExecute(
+          `SET RETENTION "${alice}" {retention_class: "standard", review_at: "2030-01-01T00:00:00Z"}`,
+        )
+        expect('error' in result && result.error.code).toBe('SchemaFieldNotFound')
+      })
     })
   })
+
 
   it('refuses to erase something references still point at', async () => {
     await withNexus('purge-denied', (nexus) => {
@@ -475,14 +527,11 @@ describe('KML', () => {
     })
   })
 
-  it('refuses a resend under the same key rather than replaying it', async () => {
-    // This pins the gap `DESCRIBE CAPABILITIES` names as `idempotent_replay`
-    // (§34.3). The write path never looks the key up, so a resend is not
-    // replayed. What saves it from committing twice is the unique index, which
-    // means the caller gets a failure instead of the original receipt — worth
-    // pinning, because the reference engine has no such index and commits the
-    // duplicate. When replay lands, this test fails and forces it and the
-    // capability declaration to move together.
+  it('replays a resend under the same key instead of writing again', async () => {
+    // §26, §33: a timeout is not an abort. A client that lost its response
+    // resends the same key and gets back the outcome its first attempt
+    // produced — the receipt it needs — rather than a second Alice or a
+    // constraint failure about its own write.
     await withNexus('idempotency-resend', (nexus) => {
       const statement = parseKip(
         'CREATE CONCEPT ?x { TYPE "Person" NAME "Alice" }',
@@ -492,15 +541,51 @@ describe('KML', () => {
       const first = nexus.mutate(statement.Kml, {}, { idempotencyKey: 'key-1' })
       expect(first.status).toBe('committed')
 
-      expect(() =>
-        nexus.mutate(statement.Kml, {}, { idempotencyKey: 'key-1' }),
-      ).toThrow()
+      const again = nexus.mutate(statement.Kml, {}, { idempotencyKey: 'key-1' })
+      // The whole receipt, member for member: a replay that reconstructed one
+      // field through a second expression is exactly how the two would drift.
+      // Warnings are the one honest difference, and they are checked below.
+      expect({ ...again, warnings: [] }).toEqual({ ...first, warnings: [] })
+      // And it says so, because the caller resent precisely to find out.
+      expect(again.warnings.join(' ')).toMatch(/replayed/)
 
-      // And the refusal left no second Alice behind.
-      const found = nexus.query(
-        'FIND(COUNT(?c)) WHERE { ?c CONCEPT {type: "Person", name: "Alice"} }',
+      // Nothing ran a second time.
+      expect(
+        nexus.query(
+          'FIND(COUNT(?c)) WHERE { ?c CONCEPT {type: "Person", name: "Alice"} }',
+        ),
+      ).toEqual([1])
+
+      // A different key is a different write, which is the whole point of the
+      // key being the caller's to choose.
+      const other = nexus.mutate(statement.Kml, {}, { idempotencyKey: 'key-2' })
+      expect(other.tx_id).not.toBe(first.tx_id)
+      expect(
+        nexus.query(
+          'FIND(COUNT(?c)) WHERE { ?c CONCEPT {type: "Person", name: "Alice"} }',
+        ),
+      ).toEqual([2])
+    })
+  })
+
+  it('does not let a dry run replay, or be replayed', async () => {
+    // A preview establishes no durable commit (§69.3), so there is nothing to
+    // replay and nothing to record — and a dry run that answered from an
+    // earlier real commit would report a write as a preview of itself.
+    await withNexus('idempotency-dry-run', (nexus) => {
+      const statement = parseKip(
+        'CREATE CONCEPT ?x { TYPE "Person" NAME "Alice" }',
       )
-      expect(found).toEqual([1])
+      if (!('Kml' in statement)) throw new Error('the setup is a KML statement')
+
+      nexus.mutate(statement.Kml, {}, { idempotencyKey: 'key-1' })
+      const preview = nexus.mutate(
+        statement.Kml,
+        {},
+        { idempotencyKey: 'key-1', dryRun: true },
+      )
+      expect(preview.status).toBe('no_effect')
+      expect(preview.warnings.join(' ')).not.toMatch(/replayed/)
     })
   })
 
@@ -848,12 +933,7 @@ describe('KML', () => {
     // §19.1: a hold is most often placed precisely to preserve the bytes.
     await withNexus('purge-payload-hold', (nexus) => {
       nexus.execute(CITED_EVIDENCE)
-      // This engine has no `SET RETENTION` clause yet, so the hold is placed
-      // where the clause would place it. What is under test is the purge.
-      const held = nexus.store.load(parseElementId('E-1'))
-      if (held === null) throw new Error('E-1 should exist')
-      held.row.retention = { legal_hold: true }
-      nexus.store.put(held, 'update', 'test')
+      nexus.execute('SET RETENTION "E-1" {legal_hold: true}')
       expect(() =>
         nexus.execute('PURGE PAYLOAD "E-1" CONFIRM "PURGE"'),
       ).toThrowError(/legal hold/)

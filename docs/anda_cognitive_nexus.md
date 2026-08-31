@@ -221,13 +221,22 @@ filter, projection, aggregate, search hit and capsule root reaches an element
 through it, so an element the caller may not read is outside the query universe
 for the whole query — see §10.
 
-### A known gap
+### Both structural planes
 
-`STRUCTURAL (?src, "field", ?dst)` walks **Profile** structural fields only. The
-Core reference fields — an Assertion's `evidence`/`context`, an Evidence
-record's `source`/`generated_by`, an Activity's `inputs`/`outputs` — are
-unreachable, so *which Assertions cite this Evidence* cannot be asked even
-though `evidence_ids` is indexed.
+`STRUCTURAL (?src, "field", ?dst)` reads both. A **Profile** field is addressed
+by its resolved symbol; a **Core** field (§8.2) — an Assertion's
+`evidence`/`context`, an Evidence record's `source`/`generated_by`, an
+Activity's `inputs`/`outputs`/`associated_actors` — is addressed by its plain
+name. So *which Assertions cite this Evidence* is
+`STRUCTURAL (?a, "evidence", :e)`.
+
+The two are looked up independently and never merged, and `?edge.field` carries
+the full symbol for a Profile field and the plain name for a Core one — so a
+Profile that declares a field named `evidence` *adds* edges rather than changing
+what an Assertion cites, and a caller that wants only the Profile one addresses
+it by its full symbol. A Core field reports no `index`: its order is storage
+order, not a declared position, and the write path appends rather than honouring
+`AT`.
 
 `?edge STRUCTURAL (…)` binds the edge itself. §43.7 calls it "virtual
 structural query state, not necessarily a durable Cognitive Element", which is
@@ -255,16 +264,22 @@ that coordinate as `snapshot_seq` in its result context (§50).
 and `LIMIT`, plus
 handles, `EXPECT VERSION` / `EXPECT STATE`, receipts and dry runs.
 
-An idempotency key is **recorded, not replayed**: it is stored on the committed
-transaction and `DESCRIBE TRANSACTION BY IDEMPOTENCY KEY` finds it, which is
-what lets a client that lost a response discover the outcome — but the write
-path does not look it up first, so a resend commits a second time.
-`DESCRIBE CAPABILITIES` says so under `idempotent_replay`.
+An idempotency key is **replayed** (§26, §33): a timeout is not an abort, so a
+resend under a key this Space already committed hands back that transaction's
+receipt — same `tx_id`, `space_seq`, `committed_at` and handles — instead of
+writing a second time. The reply carries a warning saying it is a replay,
+because the caller resent precisely to find out whether the first attempt
+landed. An operation's own key wins over the request's, so a batch sharing one
+key does not have its second write replay the first. A dry run neither replays
+nor is replayed: a preview establishes no durable commit (§69.3), and answering
+one from an earlier real commit would report a write as a preview of itself.
+`DESCRIBE TRANSACTION BY IDEMPOTENCY KEY` still finds the transaction, which is
+the other way to recover.
 
-`CLIENT KEY` is the mechanism that *is* retry-safe (§52.1): a `CREATE` under a
-key some earlier attempt already used resolves to that element and writes
-nothing at all. The same key on a request-level `ingest` entry does the same
-for the Evidence it mints.
+`CLIENT KEY` is the finer-grained mechanism (§52.1): a `CREATE` under a key some
+earlier attempt already used resolves to that element and writes nothing at all,
+which makes one *clause* retry-safe rather than one transaction. The same key on
+a request-level `ingest` entry does the same for the Evidence it mints.
 
 Planning runs in three passes (`clauses::plan_pass`): `CREATE CONCEPT`, then
 `UPSERT`/`ENSURE`, then everything else. `ENSURE` needs to see a Concept the
@@ -534,16 +549,39 @@ nexus.install_package(&package, "source")      // installing is not activating
 nexus.activate_schema(space_id, lock)
 nexus.ensure_schema(space_id, lock)            // no-op when the lock is unchanged
 nexus.install_and_activate(&artifacts, space)  // the ordinary bootstrap
-nexus.import_capsule(&capsule, space_id)
-nexus.import_capsule_isolated(&capsule, space) // lands in quarantine
-nexus.governance()                             // the control plane, host-trusted
+nexus.governance()                             // the raw control plane, unguarded
 nexus.session(auth)                            // an authenticated caller
 
 // on a Session, because each is a Governance decision with a Principal behind it
 session.designate_self(space_id, Some(concept)) // the Space's semantic $self (§5.6)
 session.sweep_expired(space_id, action, limit)  // retention expiry (§19.1)
 session.expire_lapsed_assertions(space_id, n)   // the `expired` lifecycle (§14.3)
+session.classify / elevate_authority / quarantine / release_quarantine
+
+// the control plane, authorized as the Session's Principal (§29)
+session.create_grant / revoke_grant                      // manage_grants
+session.create_delegation                                // delegate | manage_delegation
+session.revoke_delegation                                // manage_delegation
+session.put_group / set_principal_status                 // manage_membership
+session.create_binding / revoke_binding                  // manage_actor_binding
+session.publish_policy                                   // manage_policy
+session.approve                                          // approve_high_risk
+session.install_package / activate_schema                // manage_schema
+session.import_capsule(space, &capsule, isolate)         // import
 ```
+
+The control-plane methods do **not** put the plane in reach of cognition: no
+KML clause and no META command resolves to any of them, which is what keeps a
+prompt injection off it. They exist because a host call made *as a Principal*
+should be authorized as that Principal — a Grant listing `manage_grants` has to
+confer something, or it is authority that looks conferred and is not.
+`nexus.governance()` stays the unguarded path underneath, because a Space has to
+be able to write its first Grant.
+
+`delegate` and `manage_delegation` are kept apart: conferring part of one's
+*own* authority is the first, and administering a Delegation between two other
+Principals is the second. Collapsing them would let anyone who may delegate
+their own authority hand out somebody else's.
 
 `designate_self` is a host API and not a KML clause because §5.6 makes the
 designation protected Space configuration: cognitive content that could name
@@ -579,8 +617,7 @@ refused rather than answered wrongly:
 | trust / evidence quality     | stages 9 and 10 of the projection; every projection says so in its warnings |
 | Space-level retention policy | retention is set per element and swept on request, not defaulted by kind or class |
 | grouped aggregation          | `FIND(?c.name, COUNT(?x))` and `ORDER BY COUNT(?x)` need grouping; answering either without it returns one global row where a caller asked for one per group |
-| idempotent replay            | the key is recorded and findable, and the write path does not look it up first; a resend commits again |
-| `STRUCTURAL` over Core fields | the pattern walks Profile fields only, so *which Assertions cite this Evidence* cannot be asked |
+| `SEARCH ASSERTION` / `ACTIVITY` | neither carries free text to index; refused rather than answered empty, which would read as "no such claim exists" |
 | Capsule digest profiles      | both engines digest as sha3-256 over RFC 8785 canonical JSON and interoperate; an artifact from elsewhere under another profile is refused as unreadable, never reported as tampered with |
 | `options.deadline_ms`        | §80.2 makes a client timeout not an abort, and a commit here is not cancellable; accepting one would promise a cancellation that never happens |
 | artifact handles             | there is nowhere to fetch bytes from, so `payload_artifact` names content this engine cannot read |

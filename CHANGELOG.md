@@ -40,6 +40,172 @@ task class and four Activity classes (`watch_fire`, `action_gate`,
 not engine behaviour: both engines resolve them because they ship the artifact,
 and neither has an opinion about them.
 
+### Added — closing the gaps `anda-brain` found between the two engines
+
+An audit from the client side compared what each engine *declares* in
+`DESCRIBE CAPABILITIES` and took the difference. Six gaps came out of it, and
+the ones that mattered were the ones where the two deployments would answer the
+same command differently. Every one of them is now closed in **both** engines,
+and each closure is pinned by a cross-engine fixture rather than by two sets of
+tests that could drift apart again.
+
+**`SET RETENTION`** (§19) is built in `@ldclabs/kip-do`. The column and the
+expiry sweep were already there; only the clause that sets the block was
+missing, so a Worker deployment had no way to express a retention policy at
+all. It takes the same selection block every other sweep does — `WHERE`,
+`LIMIT`, `EXPECT VERSION` — and restating a block that is already recorded is a
+`no_effect` rather than a version bump.
+
+**`STRUCTURAL` reads both structural planes** (§8.2, §17). It used to walk
+Profile fields only, so "which Assertions cite this Evidence" had no spelling —
+the reverse index held the answer and the pattern was what did not ask it. A
+Core field is now addressed by its plain name (`evidence`, `context`, `source`,
+`generated_by`, `inputs`, `outputs`, `associated_actors`) and a Profile field by
+its resolved symbol. The two are looked up independently and never merged, so a
+Profile that declares a field named `evidence` *adds* edges rather than changing
+what an Assertion cites, and `?edge.field` says which plane answered. A Core
+field reports no `index`: its order is storage order, not a declared position.
+
+**`ingest.evidence`** (§71.1) is built in `@ldclabs/kip-do`. The observation now
+rides the request envelope and the command cites `:key`, which is the whole
+point — §88.12's fidelity risk is a model retyping what it saw into command
+text, truncating or paraphrasing it, so the record says the source said
+something it did not. The Evidence is minted inside the statement's own
+transaction, so a statement that fails takes it with it.
+
+**`execution.idempotency_key` replays** (§26, §33). A timeout is not an abort: a
+resend under a key the Space already committed hands back that transaction's
+receipt — same `tx_id`, `space_seq`, `committed_at`, handles — instead of
+writing a second time. `@ldclabs/kip-do` used to trip its unique index and
+answer a constraint failure; `anda_cognitive_nexus` used to commit the
+duplicate. A replay carries a warning saying it is one, because the caller
+resent precisely to find out whether the first attempt landed. A dry run
+neither replays nor is replayed.
+
+**The control plane is authorized** (§29). `manage_grants`, `manage_delegation`,
+`delegate`, `manage_membership`, `manage_actor_binding`, `manage_policy`,
+`manage_schema`, `approve_high_risk` and `import` were registered names no gate
+asked for, so a Grant listing one conferred nothing — authority that looks
+conferred and is not, discovered during an incident. A `Session` now carries a
+governed method for each, gated on the name §29 gives it. This does **not** put
+the control plane in reach of cognition: no KML clause and no META command
+resolves to any of them, which is what keeps a prompt injection off the plane.
+What changed is that a host call made *as a Principal* is authorized as that
+Principal, while the raw store handle (`nexus.governance()` /
+`nexus.store.governance`) stays the unguarded path a Space needs before it has
+any Grants.
+
+`delegate` and `manage_delegation` are kept apart, and the distinction is why
+both names exist: conferring part of one's *own* authority is `delegate`, and
+administering a Delegation between two other Principals is `manage_delegation`.
+Collapsing them would let anyone who may delegate their own authority hand out
+somebody else's.
+
+**Two more permissions now gate what they name.** `bind_canonical_identity` is
+asked for when a Concept's `canonical_id` is written or cleared — §5.4 makes it
+a high-assurance claim that this Concept *is* the thing another system names,
+which is more authority than editing a label. `moderate_assertion` is asked for
+when `ARCHIVE` or `TOMBSTONE` reaches an Assertion the caller neither wrote nor
+represents — archiving one's own record is tidying, and administratively
+excluding a third party's claim is moderation.
+
+The gap that remains under `ungated_permissions` is now three names with three
+different reasons, none of them an oversight: `share` and `manage_trust` name
+operations neither engine has a surface for, and `derive` is a judgement — §29.6
+makes derived output its own permission, and neither engine separates a create
+that cites what it read from one that does not, so requiring it would tax every
+ordinary Assertion.
+
+### Changed — breaking: META reads answer in one shape
+
+Two `LIST` families disagreed between the engines, and both disagreements were
+silent — a reader written for one shape gets an *empty result* from the other,
+which reads as an empty Space rather than as a wrong path. No error, no clue.
+That is the most expensive kind of divergence to find, so the shapes are now
+pinned by a shared `meta-shapes` fixture rather than by each engine's own tests.
+
+- **`LIST TYPES | PREDICATES | FACETS | STRUCTURAL FIELDS`** answer with rows —
+  `{ref, local_name, package_ref, status}` — in both engines. `@ldclabs/kip-do`
+  used to answer with bare reference strings. `local_name` is what a command may
+  write and `ref` is what it resolves to; `status` is why both are needed,
+  because a deprecated package still resolves a qualified reference while no
+  longer answering a bare local name. Sorted by `ref` in both, so a `LIMIT` cuts
+  the same rows twice.
+- **`LIST EPISTEMIC POLICIES`** and **`DESCRIBE EPISTEMIC POLICY`** answer with
+  the policy, in the wire names `anda_cognitive_nexus` already wrote:
+  `eligible_modes`, `accept_threshold`, `material_threshold`,
+  `unstated_confidence_weight`, `conflict_set_expansion`, plus the two notes
+  that keep a caller from reading a projection score as a probability.
+  `@ldclabs/kip-do` used to answer with bare policy ids from `LIST` and with its
+  internal field names from `DESCRIBE`.
+- **`DESCRIBE PRIMER`** has one key structure. `@ldclabs/kip-do` was flat where
+  the reference engine nests: `primer.types` against `primer.schema.types` is
+  the same silent-empty failure. It now answers `execution_context`,
+  `cognitive_identity`, `space`, `contents`, `schema`, `safety_invariants` and
+  `golden_path`, honours `MODE "compact" | "full"`, and reports `contents` keyed
+  by the lowercase wire tag. `anda_cognitive_nexus`'s `schema` block gains
+  `facets`, `structural_fields` and the note about types being schema-defined,
+  and its `packages` is a flat list of `package_id@version` rather than a map to
+  reassemble.
+
+### Fixed — a legal hold could be lifted by a block that never mentioned it
+
+`SET RETENTION` replaces the retention block rather than patching it, so a
+caller holding only `manage_retention` could clear a hold by simply omitting
+`legal_hold` — which is §19.1's attack, stated plainly: a cognitive writer must
+not be able to evade deletion through the retention hook. Both directions are
+now gated on the transition rather than on the words in the block, so placing a
+hold needs `legal_hold` and so does any `SET RETENTION` over an element that
+currently holds one.
+
+### Fixed — a search that can never work told the caller to retry
+
+`anda_cognitive_nexus` refused `SEARCH ASSERTION` and `SEARCH ACTIVITY` with
+`SearchIndexUnavailable`, whose registry entry carries the `safe_same_request`
+retry class and the hint "the index is temporarily unavailable". Neither kind
+carries free text to index and neither ever will, so a permanent absence was
+being reported as a transient one — a retry loop wearing a diagnosis. It now
+answers `UnsupportedCapability`, matching `@ldclabs/kip-do` and matching the
+capability the engine declares.
+
+### Fixed — an ingest key could be shadowed by an operation parameter
+
+`anda_cognitive_nexus` checked an ingest key against the *request*-level
+parameters only. §74 merges request-level and operation-level parameters into
+one binding environment, so an operation-level parameter of the same name would
+shadow the ingested reference and leave the Evidence minted, unused and uncited.
+Both levels are checked now.
+
+### Fixed — the journal recorded the key but not the answer
+
+`anda_cognitive_nexus`'s `TransactionRow.result` was documented as "the response
+this transaction produced, replayed on idempotent retry" and nothing populated
+it, so a caller that found its transaction still could not learn what it bound.
+The result body is now journalled through the same function that builds the
+response, so the two are one shape by construction.
+
+### Changed — the capability registries answer the same questions
+
+`requires` (§67) is a fail-fast check, and a name one engine does not recognize
+fails the request rather than answering it — so a `requires` block written
+against one engine has to be answerable by the other. Every name either engine
+knows is now known to both: `anda_cognitive_nexus` registers
+`search_over_assertions_and_activities`, `hop_quantifiers` and `set_retention`,
+and `@ldclabs/kip-do` registers `trust_governance`, `retention_policy` and
+`capsule_restore_mode`. Two names still answer *differently*, and both are real:
+`capsule_import` and `hop_quantifiers` are built in `anda_cognitive_nexus` and
+not in `@ldclabs/kip-do`.
+
+### Added — conformance: `retention`, `structural-core-fields`, `meta-shapes`, `request-envelope`
+
+Four fixtures, and one harness change that made two of them possible: a case may
+now carry an `envelope` block, merged over the request the harness builds. Most
+behaviour is decided by the command, but `ingest` and
+`execution.idempotency_key` are decided by the envelope around it, and those are
+cross-engine contracts too.
+
+The suite is 224 cases across 17 fixtures, and both engines pass all of them.
+
 ### Added — `LIST DEPENDENTS` (§63.5)
 
 - Both engines walk the closure, bounded by `DEPTH` (default 1, capped at 8)

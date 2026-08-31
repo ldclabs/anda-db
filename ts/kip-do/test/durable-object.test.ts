@@ -361,17 +361,130 @@ describe('a host that authenticates its callers', () => {
     expect(body.results[1]?.result).toEqual(['Cass'])
   })
 
-  it('refuses an ingestion context rather than dropping it', async () => {
-    // §71.1 is not built here. Running the command without the minted Evidence
-    // would fail on an unbound `:msg` and report a syntax problem for what is
-    // a missing runtime feature.
+  it('mints ingested Evidence from the envelope, not from command text', async () => {
+    // §71.1, and §88.12 is the reason: a model retyping an observation into
+    // command text truncates it, normalizes its whitespace or paraphrases it,
+    // and the record then says the source said something it did not. So the
+    // payload rides the envelope and the command only cites `:msg`.
+    const observed = 'I prefer   dark mode.\nAnd my address is 12 Elm Street.'
     const response = await post('ingest', {
       kip: '2.0',
-      ingest: { evidence: [{ key: 'msg', evidence_class: 'user_statement', payload: 'hi' }] },
+      ingest: {
+        evidence: [
+          {
+            key: 'msg',
+            evidence_class: 'user_statement',
+            payload: observed,
+            media_type: 'text/plain',
+          },
+        ],
+      },
+      operations: [
+        {
+          command: `MUTATE {
+            CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
+            CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+            ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
+            CREATE ASSERTION ?a {
+              SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: "support", mode: "observed" }
+              SET STRUCTURAL { ("evidence", :msg) {role: "support"} }
+            }
+          }`,
+        },
+      ],
+    })
+    const body = (await response.json()) as KipResponse
+    expect(body.status).toBe('succeeded')
+
+    // Byte for byte from the transport, whitespace and all.
+    const read = await post('ingest', {
+      kip: '2.0',
+      operations: [{ command: 'FIND(?e.payload.inline) WHERE { ?e EVIDENCE {} }' }],
+    })
+    expect(((await read.json()) as KipResponse).results[0]?.result).toEqual([
+      observed,
+    ])
+  })
+
+  it('takes the ingested Evidence with the statement that failed', async () => {
+    // Minted inside the statement's own transaction, so a Space never
+    // accumulates observations whose claims were never recorded — Evidence for
+    // nothing, indistinguishable later from an observation somebody chose not
+    // to act on.
+    const response = await post('ingest-abort', {
+      kip: '2.0',
+      ingest: {
+        evidence: [{ key: 'msg', evidence_class: 'user_statement', payload: 'hi' }],
+      },
+      operations: [
+        {
+          command: `MUTATE {
+            CREATE CONCEPT ?c { TYPE "Spaceship" NAME "Nope" }
+            CREATE ASSERTION ?a {
+              SET FIELDS { proposition: "P-1", stance: "support", mode: "observed" }
+              SET STRUCTURAL { ("evidence", :msg) }
+            }
+          }`,
+        },
+      ],
+    })
+    expect(((await response.json()) as KipResponse).status).toBe('failed')
+
+    const read = await post('ingest-abort', {
+      kip: '2.0',
+      operations: [{ command: 'FIND(?e) WHERE { ?e EVIDENCE {} }' }],
+    })
+    expect(((await read.json()) as KipResponse).results[0]?.result).toEqual([])
+  })
+
+  it('refuses an ingest key a request parameter already claims', async () => {
+    // One is a caller-supplied value and the other is an element this request
+    // created; a command citing `:msg` could mean either, and the two cannot
+    // be reconciled.
+    const response = await post('ingest-clash', {
+      kip: '2.0',
+      parameters: { msg: 'a plain value' },
+      ingest: {
+        evidence: [{ key: 'msg', evidence_class: 'user_statement', payload: 'hi' }],
+      },
+      operations: [{ command: 'CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }' }],
+    })
+    const body = (await response.json()) as KipResponse
+    expect(body.results[0]?.error?.code).toBe('InvalidRequestEnvelope')
+  })
+
+  it('refuses an artifact handle rather than minting an empty record under it', async () => {
+    // §85.2: a handle would name bytes this engine cannot read, and an Evidence
+    // record with an empty payload under one is exactly the fabrication the
+    // mechanism exists to prevent.
+    const response = await post('ingest-artifact', {
+      kip: '2.0',
+      ingest: {
+        evidence: [
+          {
+            key: 'msg',
+            evidence_class: 'user_statement',
+            payload_artifact: 'artifact:whatever',
+          },
+        ],
+      },
+      operations: [{ command: 'CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }' }],
+    })
+    const body = (await response.json()) as KipResponse
+    expect(body.results[0]?.error?.code).toBe('UnsupportedCapability')
+  })
+
+  it('checks an ingest block before any operation of the batch runs', async () => {
+    // The block decides what every operation can cite, so discovering it
+    // malformed after the first statement committed would leave durable writes
+    // behind a request that was never valid.
+    const response = await post('ingest-shape', {
+      kip: '2.0',
+      ingest: { evidence: [{ key: 'msg', evidence_class: '', payload: 'hi' }] },
       operations: [{ command: 'DESCRIBE PROTOCOL' }],
     })
     const body = (await response.json()) as KipResponse
-    expect(body.error?.code).toBe('UnsupportedCapability')
+    expect(body.error?.code).toBe('InvalidRequestEnvelope')
   })
 
   it('fails fast on a capability requirement it cannot meet', async () => {
@@ -439,7 +552,7 @@ describe('a host that authenticates its callers', () => {
     // and fails the request — the opposite of what the fail-fast check is for.
     const response = await post('requires-supported', {
       kip: '2.0',
-      requires: { snapshot_token: true, ingest: false },
+      requires: { snapshot_token: true, ingest: true },
       operations: [{ command: 'DESCRIBE PROTOCOL' }],
     })
     expect(((await response.json()) as KipResponse).status).toBe('succeeded')

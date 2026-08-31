@@ -16,6 +16,7 @@ import { DurableObject } from 'cloudflare:workers'
 import { KipError, type KipErrorJSON } from './errors.js'
 import type { Json, JsonMap } from './json.js'
 import { parseKip } from './kip/parser.js'
+import { checkIngest, type IngestContext } from './kml/index.js'
 import {
   mergeRequestContext,
   systemAuth,
@@ -184,12 +185,17 @@ export class KipDatabase<Env = KipDatabaseEnv> extends DurableObject<Env> {
     params: JsonMap = {},
     context?: RequestContext,
     read?: ReadOptions,
+    ingest?: IngestContext,
+    idempotencyKey?: string,
   ): KipResult {
     try {
       const session = this.nexus.session(this.authenticate(context))
       const parsed = parseKip(command)
       if ('Kml' in parsed) {
-        const outcome = session.mutate(parsed.Kml, params)
+        const outcome = session.mutate(parsed.Kml, params, {
+          ingest,
+          idempotencyKey,
+        })
         return {
           // §32.8: a transaction whose durable state is unchanged reports
           // `no_effect`, and it is a different answer from `succeeded` — it
@@ -246,6 +252,7 @@ export class KipDatabase<Env = KipDatabaseEnv> extends DurableObject<Env> {
       op_id?: string
       command: string
       parameters?: JsonMap
+      idempotencyKey?: string
     }[],
     context?: RequestContext,
     read?: ReadOptions,
@@ -253,6 +260,7 @@ export class KipDatabase<Env = KipDatabaseEnv> extends DurableObject<Env> {
       mode: 'independent',
       onError: 'stop',
     },
+    ingest?: IngestContext,
   ): KipResult[] {
     const results: KipResult[] = []
     let stopped = false
@@ -272,6 +280,8 @@ export class KipDatabase<Env = KipDatabaseEnv> extends DurableObject<Env> {
         operation.parameters ?? {},
         context,
         read,
+        ingest,
+        operation.idempotencyKey,
       )
       if (operation.op_id !== undefined) result.op_id = operation.op_id
       // `independent` isolates failures by definition; only `sequence` with
@@ -330,10 +340,21 @@ export class KipDatabase<Env = KipDatabaseEnv> extends DurableObject<Env> {
         // than in the engine, because binding is an envelope concern and the
         // engine only ever sees one map.
         parameters: { ...(envelope.parameters ?? {}), ...(operation.parameters ?? {}) },
+        // §71.3: an operation's own key wins over the request's. A batch that
+        // shared one key across several writes would have the second replay
+        // the first, so the narrower one is the one that means anything.
+        ...(operation.idempotency_key ?? envelope.execution?.idempotency_key) ===
+        undefined
+          ? {}
+          : {
+              idempotencyKey:
+                operation.idempotency_key ?? envelope.execution?.idempotency_key,
+            },
       })),
       envelope.context,
       envelope.read,
       { mode, onError },
+      envelope.ingest,
     )
     return this.envelope(
       {
@@ -529,16 +550,11 @@ export class KipDatabase<Env = KipDatabaseEnv> extends DurableObject<Env> {
       )
     }
 
-    // §71.1. Refused rather than dropped: an ASSERT citing `:msg` would
-    // otherwise fail on an unbound parameter and report a syntax problem for
-    // what is a missing runtime feature.
-    if (envelope.ingest !== undefined) {
-      throw new KipError(
-        'UnsupportedCapability',
-        'this engine has no ingestion context: Evidence is created by CREATE ' +
-          'EVIDENCE inside the command. See DESCRIBE CAPABILITIES',
-      )
-    }
+    // §71.1. Checked here rather than at mint time, because the block decides
+    // what every operation of the batch can cite: discovering it malformed
+    // after the first statement committed would leave durable writes behind a
+    // request that was never valid.
+    if (envelope.ingest !== undefined) checkIngest(envelope.ingest)
   }
 
   private envelope(
@@ -590,11 +606,21 @@ interface KipRequestEnvelope {
   kip?: string
   request_id?: string
   space?: { id?: string }
-  execution?: { mode?: string; on_error?: OnError; isolation?: string }
+  execution?: {
+    mode?: string
+    on_error?: OnError
+    isolation?: string
+    idempotency_key?: string
+  }
   read?: ReadOptions
-  ingest?: unknown
+  ingest?: IngestContext
   preconditions?: { space_seq?: number; schema_environment_version?: number }
-  operations?: { op_id?: string; command?: string; parameters?: JsonMap }[]
+  operations?: {
+    op_id?: string
+    command?: string
+    parameters?: JsonMap
+    idempotency_key?: string
+  }[]
   parameters?: JsonMap
   context?: RequestContext
   requires?: Record<string, boolean>

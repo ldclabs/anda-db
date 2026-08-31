@@ -46,6 +46,14 @@ export interface Case {
   expect: Expectation
   /** Whether the order of a top-level result array is part of the contract. */
   ordered?: boolean
+  /**
+   * Extra request-envelope members, merged over the ones the harness builds.
+   *
+   * Most behaviour is decided by the command, but some of it is decided by the
+   * envelope around the command — ingest, execution.idempotency_key — and
+   * those are cross-engine contracts too.
+   */
+  envelope?: Record<string, unknown>
 }
 
 export interface Fixture {

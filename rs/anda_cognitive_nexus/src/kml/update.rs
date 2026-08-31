@@ -34,6 +34,7 @@ use anda_kip::{
 
 use super::clauses::{Applied, bindings, resolve_facets, resolve_structural_field};
 use super::value::{Bindings, assignments_to_json, structural_value};
+use crate::governance::Permission;
 use crate::id::ElementId;
 use crate::store::Element;
 use crate::tx::Transaction;
@@ -102,6 +103,15 @@ async fn set_fields(
     id: ElementId,
     fields: Map<String, Json>,
 ) -> Result<Applied, KipError> {
+    // §5.4: a `canonical_id` says this Concept *is* the thing another system
+    // names — the identity a Capsule import resolves on and a merge follows.
+    // Deciding that is more authority than editing a label, and clearing one
+    // is the same decision as setting one: a binding anybody who may rename
+    // the Concept could drop would be no binding at all.
+    if fields.contains_key("canonical_id") {
+        tx.require(Permission::BindCanonicalIdentity)?;
+    }
+
     let element = tx.load(id).await?;
     let Element::Concept(row) = element else {
         return Err(immutable_target(element.kind(), id, "SET FIELDS"));

@@ -27,7 +27,13 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::governance::approval::Approved;
 use crate::governance::rows::principal_class;
-use crate::governance::store::PrincipalDraft;
+use crate::governance::rows::{
+    ActorBindingRow, ApprovalRow, DelegationRow, GovernancePolicyRow, GrantRow,
+    PrincipalGroupRow, PrincipalRow,
+};
+use crate::governance::store::{
+    ActorBindingDraft, DelegationDraft, GrantDraft, GroupDraft, PolicyDraft, PrincipalDraft,
+};
 use crate::governance::{
     ANONYMOUS_PRINCIPAL, AuthContext, Authorization, EffectiveAuthority, Permission,
     ResourceContext, SYSTEM_PRINCIPAL, gate,
@@ -730,6 +736,345 @@ impl Session {
         self.nexus.store.put_space(&row).await
     }
 
+    // --- the governed control plane -------------------------------------
+    //
+    // §29 registers a name for each control-plane operation, and until these
+    // existed no gate asked for any of them: a Grant listing `manage_grants`
+    // conferred nothing, which is the failure mode the registry exists to
+    // prevent — authority that looks conferred and is not, discovered during
+    // an incident.
+    //
+    // These do not put the control plane in reach of cognition. No KML clause
+    // and no META command resolves to any of them, which is what keeps a
+    // prompt injection off the plane; they are host calls, and what changed is
+    // that a host call made *as a Principal* is now authorized as that
+    // Principal. `nexus.governance()` remains the host's own unguarded path,
+    // for the bootstrap that has to happen before any Grant exists.
+
+    /// Takes the one approval a control-plane operation needs, at Space scope.
+    async fn gate_control_plane(
+        &self,
+        space_id: &str,
+        permission: Permission,
+    ) -> Result<Vec<Approved>, KipError> {
+        let authority = self.authority(space_id, &self.auth).await?;
+        let resource = ResourceContext::default();
+        let decision = authority.authorize(permission, &resource, &self.auth);
+        self.gate(&authority, &self.auth, vec![decision]).await
+    }
+
+    /// Spends approvals only after the operation they authorized succeeded.
+    async fn spend(&self, approvals: Vec<Approved>) -> Result<(), KipError> {
+        for approved in approvals {
+            approved.spend(&self.nexus.store).await?;
+        }
+        Ok(())
+    }
+
+    /// Creates a Grant in this Space (§29, `manage_grants`).
+    ///
+    /// The actions are checked against the registry before the record is
+    /// written: a Grant naming a permission this engine does not implement
+    /// confers nothing, and the holder must learn that here rather than during
+    /// an incident.
+    pub async fn create_grant(
+        &self,
+        space_id: &str,
+        draft: GrantDraft,
+    ) -> Result<GrantRow, KipError> {
+        let _guard = self.nexus.lock.write().await;
+        self.nexus.store.reopen_if_poisoned().await?;
+        let approvals = self
+            .gate_control_plane(space_id, Permission::ManageGrants)
+            .await?;
+        for action in &draft.actions {
+            Permission::parse(action)?;
+        }
+        let row = self
+            .nexus
+            .governance()
+            .create_grant(
+                GrantDraft {
+                    space_id: space_id.to_string(),
+                    ..draft
+                },
+                &self.auth.principal_id,
+            )
+            .await?;
+        self.spend(approvals).await?;
+        Ok(row)
+    }
+
+    /// Revokes a Grant (§29, `manage_grants`). Revoked, never deleted.
+    pub async fn revoke_grant(&self, space_id: &str, id: u64) -> Result<(), KipError> {
+        let _guard = self.nexus.lock.write().await;
+        self.nexus.store.reopen_if_poisoned().await?;
+        let approvals = self
+            .gate_control_plane(space_id, Permission::ManageGrants)
+            .await?;
+        self.nexus
+            .governance()
+            .revoke_grant(id, &self.auth.principal_id)
+            .await?;
+        self.spend(approvals).await
+    }
+
+    /// Creates a Delegation (§29).
+    ///
+    /// Which permission this asks for depends on whose authority is being
+    /// passed on, and the distinction is the whole reason both names exist:
+    /// conferring part of *one's own* authority is `delegate`, and
+    /// administering a Delegation between two other Principals is
+    /// `manage_delegation`. Collapsing them would let anyone who may delegate
+    /// their own authority hand out somebody else's.
+    pub async fn create_delegation(
+        &self,
+        space_id: &str,
+        draft: DelegationDraft,
+    ) -> Result<DelegationRow, KipError> {
+        let _guard = self.nexus.lock.write().await;
+        self.nexus.store.reopen_if_poisoned().await?;
+        let permission = if draft.delegator_principal == self.auth.principal_id {
+            Permission::Delegate
+        } else {
+            Permission::ManageDelegation
+        };
+        let approvals = self.gate_control_plane(space_id, permission).await?;
+        for action in &draft.actions {
+            Permission::parse(action)?;
+        }
+        let row = self
+            .nexus
+            .governance()
+            .create_delegation(
+                DelegationDraft {
+                    space_id: space_id.to_string(),
+                    ..draft
+                },
+                &self.auth.principal_id,
+            )
+            .await?;
+        self.spend(approvals).await?;
+        Ok(row)
+    }
+
+    /// Revokes a Delegation (§29, `manage_delegation`).
+    ///
+    /// Revoking one's own asks for the same thing as revoking another's:
+    /// unlike conferring, withdrawing authority is never the more dangerous
+    /// direction, and a caller who could not reach the record could not
+    /// withdraw at all.
+    pub async fn revoke_delegation(&self, space_id: &str, id: u64) -> Result<(), KipError> {
+        let _guard = self.nexus.lock.write().await;
+        self.nexus.store.reopen_if_poisoned().await?;
+        let approvals = self
+            .gate_control_plane(space_id, Permission::ManageDelegation)
+            .await?;
+        self.nexus
+            .governance()
+            .revoke_delegation(id, &self.auth.principal_id)
+            .await?;
+        self.spend(approvals).await
+    }
+
+    /// Creates or replaces a Principal group (§29, `manage_membership`).
+    pub async fn put_group(
+        &self,
+        space_id: &str,
+        draft: GroupDraft,
+    ) -> Result<PrincipalGroupRow, KipError> {
+        let _guard = self.nexus.lock.write().await;
+        self.nexus.store.reopen_if_poisoned().await?;
+        let approvals = self
+            .gate_control_plane(space_id, Permission::ManageMembership)
+            .await?;
+        let row = self
+            .nexus
+            .governance()
+            .put_group(draft, &self.auth.principal_id)
+            .await?;
+        self.spend(approvals).await?;
+        Ok(row)
+    }
+
+    /// Suspends or restores a Principal (§29, `manage_membership`).
+    pub async fn set_principal_status(
+        &self,
+        space_id: &str,
+        principal_id: &str,
+        status: &str,
+    ) -> Result<PrincipalRow, KipError> {
+        let _guard = self.nexus.lock.write().await;
+        self.nexus.store.reopen_if_poisoned().await?;
+        let approvals = self
+            .gate_control_plane(space_id, Permission::ManageMembership)
+            .await?;
+        let row = self
+            .nexus
+            .governance()
+            .set_principal_status(principal_id, status, &self.auth.principal_id)
+            .await?;
+        self.spend(approvals).await?;
+        Ok(row)
+    }
+
+    /// Binds a Principal to a semantic actor (§17, `manage_actor_binding`).
+    ///
+    /// The record that decides whether writing `asserted_by: ?alice` is
+    /// attributed recording or speaking as Alice, so writing one is more
+    /// authority than either — a writer who could bind itself could authorize
+    /// its own impersonation.
+    pub async fn create_binding(
+        &self,
+        space_id: &str,
+        draft: ActorBindingDraft,
+    ) -> Result<ActorBindingRow, KipError> {
+        let _guard = self.nexus.lock.write().await;
+        self.nexus.store.reopen_if_poisoned().await?;
+        let approvals = self
+            .gate_control_plane(space_id, Permission::ManageActorBinding)
+            .await?;
+        let row = self
+            .nexus
+            .governance()
+            .create_binding(draft, &self.auth.principal_id)
+            .await?;
+        self.spend(approvals).await?;
+        Ok(row)
+    }
+
+    /// Revokes an ActorBinding (§17, `manage_actor_binding`).
+    pub async fn revoke_binding(&self, space_id: &str, id: u64) -> Result<(), KipError> {
+        let _guard = self.nexus.lock.write().await;
+        self.nexus.store.reopen_if_poisoned().await?;
+        let approvals = self
+            .gate_control_plane(space_id, Permission::ManageActorBinding)
+            .await?;
+        self.nexus
+            .governance()
+            .revoke_binding(id, &self.auth.principal_id)
+            .await?;
+        self.spend(approvals).await
+    }
+
+    /// Publishes a Governance Policy version (§29, `manage_policy`).
+    pub async fn publish_policy(
+        &self,
+        space_id: &str,
+        draft: PolicyDraft,
+    ) -> Result<GovernancePolicyRow, KipError> {
+        let _guard = self.nexus.lock.write().await;
+        self.nexus.store.reopen_if_poisoned().await?;
+        let approvals = self
+            .gate_control_plane(space_id, Permission::ManagePolicy)
+            .await?;
+        let row = self
+            .nexus
+            .governance()
+            .publish_policy(draft, &self.auth.principal_id)
+            .await?;
+        self.spend(approvals).await?;
+        Ok(row)
+    }
+
+    /// Supplies one of the independent approvals a high-risk operation needs
+    /// (§40, `approve_high_risk`).
+    ///
+    /// Its own permission rather than the operation's: the point of an
+    /// independent approval is that the approver is not the one asking, so the
+    /// authority to approve cannot be the authority to act.
+    pub async fn approve(
+        &self,
+        space_id: &str,
+        id: u64,
+        note: &str,
+    ) -> Result<ApprovalRow, KipError> {
+        let _guard = self.nexus.lock.write().await;
+        self.nexus.store.reopen_if_poisoned().await?;
+        let approvals = self
+            .gate_control_plane(space_id, Permission::ApproveHighRisk)
+            .await?;
+        let row = self
+            .nexus
+            .governance()
+            .approve(id, &self.auth.principal_id, note)
+            .await?;
+        self.spend(approvals).await?;
+        Ok(row)
+    }
+
+    /// Installs a Schema Package artifact (§20, `manage_schema`).
+    ///
+    /// Installing does not activate: what a symbol means in this Space is
+    /// decided by the Schema Lock, and this only makes an artifact available
+    /// to be locked onto.
+    pub async fn install_package(
+        &self,
+        space_id: &str,
+        artifact: &SchemaPackage,
+        source: &str,
+    ) -> Result<crate::schema::PackageRef, KipError> {
+        let approvals = self
+            .gate_control_plane(space_id, Permission::ManageSchema)
+            .await?;
+        let package_ref = self.nexus.install_package(artifact, source).await?;
+        self.spend(approvals).await?;
+        Ok(package_ref)
+    }
+
+    /// Activates a Schema Lock over the installed artifacts (§20,
+    /// `manage_schema`).
+    ///
+    /// The operation that changes what every stored symbol resolves to, which
+    /// is why it is gated rather than treated as configuration: a package
+    /// swapped underneath a Space rewrites the meaning of cognition already
+    /// written.
+    pub async fn activate_schema(
+        &self,
+        space_id: &str,
+        lock: crate::schema::SchemaLock,
+    ) -> Result<SchemaEnvironment, KipError> {
+        let approvals = self
+            .gate_control_plane(space_id, Permission::ManageSchema)
+            .await?;
+        let env = self.nexus.activate_schema(space_id, lock).await?;
+        self.spend(approvals).await?;
+        Ok(env)
+    }
+
+    /// Accepts another Brain's cognition into a Space (§29, `import`).
+    ///
+    /// Its own permission, and not `create`: the difference between writing
+    /// what this Brain concluded and admitting what another one did is the
+    /// whole of §78, and an importer running under a writer's Grant would
+    /// erase it. `isolate` lands the records in quarantine (§39.2), which is
+    /// the honest answer to "should I accept this?" — accept it where it
+    /// cannot do anything, and decide afterwards.
+    pub async fn import_capsule(
+        &self,
+        space_id: &str,
+        capsule: &anda_kip::Capsule,
+        isolate: bool,
+    ) -> Result<crate::capsule::ImportReport, KipError> {
+        let approvals = self
+            .gate_control_plane(space_id, Permission::Import)
+            .await?;
+        let guard = self.nexus.lock.write().await;
+        self.nexus.store.reopen_if_poisoned().await?;
+        let report = crate::capsule::import(
+            &self.nexus,
+            capsule,
+            space_id,
+            false,
+            (*self.auth).clone(),
+            isolate,
+        )
+        .await?;
+        drop(guard);
+        self.spend(approvals).await?;
+        Ok(report)
+    }
+
     /// Sets one element's classification (§93, §100).
     ///
     /// A Governance operation rather than a KML clause, because an element's
@@ -794,10 +1139,23 @@ impl Executor for Session {
                     Ok(authority) => authority,
                     Err(err) => return Response::from(err),
                 };
+                let permissions = gate::kml_permissions(&statement);
+
+                // §26, §33: a timeout is not an abort. A client that lost its
+                // response resends the same key and gets the outcome its first
+                // attempt produced, rather than writing a second time or being
+                // told its own write is a conflict.
+                match self.replay(&space, request, operation, &authority, &auth, &permissions)
+                    .await
+                {
+                    Ok(Some(response)) => return response,
+                    Ok(None) => {}
+                    Err(err) => return Response::from(err),
+                }
+
                 // No approval guard here: the exclusive write lock above
                 // already serializes everything that could spend an approval.
-                let base =
-                    base_authorizations(&authority, &auth, gate::kml_permissions(&statement));
+                let base = base_authorizations(&authority, &auth, permissions);
                 let decisions = match self.gate(&authority, &auth, base).await {
                     Ok(decisions) => decisions,
                     Err(err) => return Response::from(err),
@@ -924,6 +1282,56 @@ fn base_authorizations(
 }
 
 impl Session {
+    /// The recorded outcome of a write this key already committed (§26, §33).
+    ///
+    /// `None` when there is nothing to replay — no key, a dry run, or a key
+    /// this Space has not seen. A dry run is excluded in both directions: a
+    /// preview establishes no durable commit (§69.3), so there is nothing to
+    /// replay and nothing to record, and answering one from an earlier real
+    /// commit would report a write as a preview of itself.
+    ///
+    /// The permission is checked exactly as it would be for the write itself,
+    /// so a caller who could not have run the command cannot learn what it did.
+    /// An outstanding *approval* obligation deliberately does not block it: an
+    /// approval authorizes the work, and on a replay the work already happened
+    /// — demanding a second one to learn the outcome of the first is what would
+    /// make a lost response unrecoverable.
+    async fn replay(
+        &self,
+        space: &str,
+        request: &Request,
+        operation: &Operation,
+        authority: &EffectiveAuthority,
+        auth: &AuthContext,
+        permissions: &[Permission],
+    ) -> Result<Option<Response>, KipError> {
+        if request.is_dry_run() {
+            return Ok(None);
+        }
+        let key = crate::kml::idempotency_key(request, operation);
+        if key.is_empty() {
+            return Ok(None);
+        }
+        let Some(row) = self
+            .nexus
+            .store
+            .find_transaction_by_idempotency_key(space, &key)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        let resource = ResourceContext::default();
+        for permission in permissions {
+            let decision = authority.authorize(*permission, &resource, auth);
+            if decision.decision == crate::governance::Decision::RequireApproval {
+                continue;
+            }
+            decision.into_result()?;
+        }
+        Ok(Some(crate::kml::replay(&row)))
+    }
+
     /// Checks the envelope fields that decide whether a command may run at all.
     ///
     /// `anda_kip::Executor` asks an implementation to honor every applicable

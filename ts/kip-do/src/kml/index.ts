@@ -25,6 +25,7 @@ import type { SchemaEnvironment } from '../schema/index.js'
 import type { Store } from '../store/index.js'
 import { Transaction, type Outcome } from '../tx.js'
 import { apply, declareHandles, PLAN_PASSES, planPass } from './clauses.js'
+import { mintIngestedEvidence, type IngestContext } from './ingest.js'
 
 /** What one KML execution needs from its caller. */
 export interface KmlContext {
@@ -35,6 +36,14 @@ export interface KmlContext {
   origin: JsonMap
   /** Request-level parameters. */
   request?: JsonMap
+  /**
+   * The request envelope's ingestion context (§71.1).
+   *
+   * Minted into this statement's transaction before the plan runs, so a
+   * command can cite `:key` and an abort takes the Evidence with everything
+   * else.
+   */
+  ingest?: IngestContext
   /** Operation-level parameters, which win over request-level ones. */
   operation?: JsonMap
   /** The key that makes a lost response recoverable without writing again. */
@@ -72,6 +81,13 @@ export function executeKml(
     cx.auth,
   )
 
+  // §71.1: ingested Evidence is minted before the plan runs, inside this same
+  // transaction, so a command can cite it as `:key` and an abort takes it with
+  // everything else.
+  const ingested = mintIngestedEvidence(tx, cx.ingest, cx.request)
+  const request =
+    ingested === null ? cx.request : { ...(cx.request ?? {}), ...ingested }
+
   for (const clause of statement.clauses) {
     declareHandles(tx, clause)
   }
@@ -80,7 +96,7 @@ export function executeKml(
   for (let pass = 0; pass < PLAN_PASSES; pass++) {
     for (const clause of statement.clauses) {
       if (planPass(clause) !== pass) continue
-      apply(tx, clause, cx.request, cx.operation)
+      apply(tx, clause, request, cx.operation)
     }
   }
 
@@ -112,6 +128,13 @@ export {
   declareHandles,
   planPass,
 } from './clauses.js'
+
+export {
+  checkIngest,
+  mintIngestedEvidence,
+  type IngestContext,
+  type IngestEvidence,
+} from './ingest.js'
 
 export {
   assignments,

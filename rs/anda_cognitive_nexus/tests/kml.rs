@@ -835,37 +835,55 @@ async fn a_committed_transaction_is_recoverable_by_its_idempotency_key() {
 }
 
 #[tokio::test]
-async fn a_resend_under_the_same_key_re_executes_rather_than_replaying() {
-    // This pins the gap `DESCRIBE CAPABILITIES` names as `idempotent_replay`
-    // (§34.3): the key is journalled, but the write path never looks it up, so
-    // the same logical write commits twice. The test asserts the behaviour the
-    // engine actually has rather than the one the spec asks for, because a
-    // capability document that says `recorded_not_replayed` has to be checkable
-    // — and when replay does land, this test fails and forces both it and the
-    // declaration to move together.
+async fn a_resend_under_the_same_key_replays_instead_of_writing_again() {
+    // §26, §33: a timeout is not an abort. A client that lost its response
+    // resends the same key and gets back the outcome its first attempt
+    // produced — the receipt it needs — rather than a second Alice.
     let nexus = nexus("idempotency_resend").await;
-    let request = serde_json::from_value::<Request>(json!({
-        "kip": "2.0",
-        "execution": {"mode": "independent", "idempotency_key": "key-1"},
-        "operations": [{"command": r#"CREATE CONCEPT ?x { TYPE "Person" NAME "Alice" }"#}]
-    }))
-    .unwrap();
-
-    let mut tx_ids = Vec::new();
-    for _ in 0..2 {
+    async fn send(nexus: &CognitiveNexus, key: &str) -> anda_kip::Response {
+        let request = serde_json::from_value::<Request>(json!({
+            "kip": "2.0",
+            "execution": {"mode": "independent", "idempotency_key": key},
+            "operations": [{"command": r#"CREATE CONCEPT ?x { TYPE "Person" NAME "Alice" }"#}]
+        }))
+        .unwrap();
         let parsed = request.operations[0].parse().unwrap();
-        let response = nexus
+        nexus
             .execute(parsed, &request, &request.operations[0])
-            .await;
-        assert_eq!(response.status, TopLevelStatus::Succeeded);
-        tx_ids.push(response.receipt.as_ref().unwrap().tx_id.clone().unwrap());
+            .await
     }
 
-    // Two transactions, not one replayed twice.
-    assert_ne!(tx_ids[0], tx_ids[1]);
+    let first = send(&nexus, "key-1").await;
+    assert_eq!(first.status, TopLevelStatus::Succeeded);
+    let again = send(&nexus, "key-1").await;
+    assert_eq!(again.status, TopLevelStatus::Succeeded);
 
-    // And two Concepts: the duplicate cognition a retry policy reading
-    // `"idempotency": true` would have caused.
+    // The same receipt, down to the transaction it names: a caller that
+    // compares them can tell its write landed.
+    let (a, b) = (
+        first.receipt.as_ref().unwrap(),
+        again.receipt.as_ref().unwrap(),
+    );
+    // The whole receipt, member for member: a replay that reconstructed one
+    // field through a second expression is exactly how the two would drift.
+    assert_eq!(a, b);
+    assert_eq!(first.results[0].result, again.results[0].result);
+    // And it says so, because the caller resent precisely to find out.
+    assert!(!again.warnings.is_empty());
+
+    // Nothing ran a second time.
+    let found = ok(
+        &nexus,
+        r#"FIND(COUNT(?c)) WHERE { ?c CONCEPT {type: "Person", name: "Alice"} }"#,
+    )
+    .await;
+    assert_eq!(found, json!([1]));
+
+    // A different key is a different write, which is the whole point of the
+    // key being the caller's to choose.
+    let other = send(&nexus, "key-2").await;
+    assert_eq!(other.status, TopLevelStatus::Succeeded);
+    assert_ne!(other.receipt.as_ref().unwrap().tx_id, a.tx_id);
     let found = ok(
         &nexus,
         r#"FIND(COUNT(?c)) WHERE { ?c CONCEPT {type: "Person", name: "Alice"} }"#,

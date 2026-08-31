@@ -824,6 +824,11 @@ impl Transaction {
         } else {
             ReceiptStatus::Committed
         };
+        // The response body, journalled rather than only returned: it is what
+        // a resend under the same idempotency key replays, and a journal that
+        // recorded the key but not the answer would let a caller find its
+        // transaction and still not learn what it bound (§26, §33).
+        let result = result_body(&self.handles, &changes);
         let journalled = self
             .store
             .journal(
@@ -833,6 +838,7 @@ impl Transaction {
                     transaction_class: "cognitive".to_string(),
                     schema_environment_version: self.env.version,
                     changes: changes.clone(),
+                    result,
                     ..entry
                 },
             )
@@ -988,15 +994,23 @@ pub struct Outcome {
 impl Outcome {
     /// The result body a KML response carries.
     pub fn result(&self) -> Json {
-        let mut handles = Map::new();
-        for (handle, id) in &self.handles {
-            handles.insert(handle.clone(), Json::String(id.to_string()));
-        }
-        serde_json::json!({
-            "handles": handles,
-            "changes": self.changes,
-        })
+        result_body(&self.handles, &self.changes)
     }
+}
+
+/// The result body a KML response carries, and the journal records.
+///
+/// One function, so the answer a caller gets and the answer a replay gets are
+/// the same shape by construction rather than by two call sites agreeing.
+fn result_body(handles: &BTreeMap<String, ElementId>, changes: &[Json]) -> Json {
+    let mut bound = Map::new();
+    for (handle, id) in handles {
+        bound.insert(handle.clone(), Json::String(id.to_string()));
+    }
+    serde_json::json!({
+        "handles": bound,
+        "changes": changes,
+    })
 }
 
 fn change_record(id: ElementId, op: &str, version: u64) -> Json {
@@ -1008,7 +1022,12 @@ fn change_record(id: ElementId, op: &str, version: u64) -> Json {
     })
 }
 
-fn summarize(changes: &[Json]) -> Json {
+/// The `change_summary` a receipt carries.
+///
+/// `pub(crate)` because a replayed receipt has to carry the same summary the
+/// original did — reconstructing it from the journal through a second
+/// expression is how the two would come to differ.
+pub(crate) fn summarize(changes: &[Json]) -> Json {
     let mut counts: BTreeMap<String, u64> = BTreeMap::new();
     for change in changes {
         if let Some(op) = change.get("op").and_then(Json::as_str) {

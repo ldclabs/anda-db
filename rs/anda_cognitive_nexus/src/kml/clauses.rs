@@ -510,6 +510,11 @@ async fn create_concept(
     );
     let key = fields.text("key")?;
     let canonical_id = fields.text("canonical_id")?;
+    // §5.4, and the same gate `UPDATE ... SET FIELDS` runs: binding a
+    // cross-system identity is its own authority, not a side effect of `create`.
+    if !canonical_id.is_empty() {
+        tx.require(Permission::BindCanonicalIdentity)?;
+    }
     let aliases = fields
         .array("aliases")?
         .into_iter()
@@ -924,26 +929,35 @@ fn require_retention_authority(tx: &Transaction, retention: &Json) -> Result<(),
         return Ok(());
     }
     tx.require(Permission::ManageRetention)?;
-    // The shape check lives in `require_legal_hold_authority`, which is also
-    // `SET RETENTION`'s entry point — so every path that writes a retention
-    // block runs it exactly once, and it runs after the permission rather than
-    // telling an unauthorized caller which member it got wrong.
-    require_legal_hold_authority(tx, retention)
+    // A creation has nothing to lift, so the "before" is the empty block. The
+    // shape check runs after the permission rather than telling an unauthorized
+    // caller which member it got wrong.
+    check_retention(retention)?;
+    require_legal_hold_authority(tx, &Json::Null, retention)
 }
 
-/// Refuses a legal hold written by a caller who may not place one.
+/// Refuses a change to an element's legal hold by a caller who may not make it.
 ///
 /// §19.1 names this attack by its shape: a cognitive writer must not be able to
-/// evade deletion by setting `legal_hold = true`. Placing a hold blocks erasure
-/// for everyone, so it is its own permission rather than part of retention
-/// management.
-fn require_legal_hold_authority(tx: &Transaction, retention: &Json) -> Result<(), KipError> {
-    check_retention(retention)?;
-    let held = retention
-        .get("legal_hold")
-        .and_then(Json::as_bool)
-        .unwrap_or(false);
-    if !held {
+/// evade deletion through the retention hook. So both directions are gated, and
+/// both for the same reason. *Placing* a hold blocks erasure for everyone, which
+/// is more authority than deciding how long a record is kept. *Lifting* one is
+/// the attack stated plainly — and lifting does not require naming the member,
+/// because `SET RETENTION` replaces the block rather than patching it: a hold
+/// disappears when the next block simply omits it. Gating on the transition
+/// rather than on the words in the block is what closes that.
+fn require_legal_hold_authority(
+    tx: &Transaction,
+    current: &Json,
+    next: &Json,
+) -> Result<(), KipError> {
+    let held = |block: &Json| {
+        block
+            .get("legal_hold")
+            .and_then(Json::as_bool)
+            .unwrap_or(false)
+    };
+    if !held(next) && !held(current) {
         return Ok(());
     }
     tx.require(Permission::LegalHold)
@@ -1619,19 +1633,22 @@ async fn set_retention(
     // *record* stops being retained, never when the claim stops applying —
     // that is `valid_time.until`, on an Assertion, and nothing here touches it.
     let retention = Json::Object(values);
-    require_legal_hold_authority(tx, &retention)?;
+    check_retention(&retention)?;
     let expires = expires_at(&retention)?;
     for id in targets.authorized(tx).await? {
         if let Some(expected) = expected {
             tx.expect_version(id, expected).await?;
         }
-        let element = tx.load(id).await?;
-        let (current, current_expires) = retention_mut(element);
-        if *current == retention {
+        let current = retention_mut(tx.load(id).await?).0.clone();
+        // The hold gate needs what is recorded, not only what was written: the
+        // block replaces rather than patches, so omitting `legal_hold` lifts one.
+        require_legal_hold_authority(tx, &current, &retention)?;
+        if current == retention {
             continue;
         }
-        *current = retention.clone();
-        *current_expires = expires.clone();
+        let (slot, slot_expires) = retention_mut(tx.load(id).await?);
+        *slot = retention.clone();
+        *slot_expires = expires.clone();
         tx.mark_changed(id, "set_retention");
     }
     Ok(())
@@ -1672,6 +1689,18 @@ async fn remove(
     for id in targets.authorized(tx).await? {
         if let Some(expected) = &expect_state {
             tx.expect_state(id, expected).await?;
+        }
+
+        // §29: administratively excluding somebody else's claim is a
+        // different act from tidying one's own, and only the first is
+        // moderation. Asked for on top of `archive`/`tombstone`, never
+        // instead of it, so a Grant listing only `moderate_assertion` confers
+        // nothing.
+        if let Element::Assertion(row) = tx.load(id).await? {
+            let row = row.clone();
+            if !tx.may_represent_assertion(&row) {
+                tx.require(Permission::ModerateAssertion)?;
+            }
         }
 
         // Neither archive nor tombstone erases anything: references keep

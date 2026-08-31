@@ -76,7 +76,7 @@ export type ChangeOp =
   | 'supersede'
   | 'correct'
   | 'transition'
-  | 'retention'
+  | 'set_retention'
 
 export class Store {
   readonly sql: SqlStorage

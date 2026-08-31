@@ -49,6 +49,10 @@ const SUPPORTED_NAMES: readonly string[] = [
   'keyword_search',
   'capsule_export',
   'client_key_retry',
+  'set_retention',
+  'structural_core_fields',
+  'ingest',
+  'idempotent_replay',
   'preconditions',
   'dry_run',
   'snapshot_token',
@@ -73,9 +77,7 @@ const SUPPORTED_NAMES: readonly string[] = [
  */
 const UNSUPPORTED_NAMES: readonly string[] = [
   'atomic_batch',
-  'idempotent_replay',
   'grouped_aggregation',
-  'structural_core_fields',
   'ungated_permissions',
   'capsule_digest_profiles',
   'capsule_import',
@@ -86,8 +88,9 @@ const UNSUPPORTED_NAMES: readonly string[] = [
   'hop_quantifiers',
   'nested_proposition_endpoint',
   'trust_model',
-  'set_retention',
-  'ingest',
+  'trust_governance',
+  'retention_policy',
+  'capsule_restore_mode',
   'deadlines',
   'artifact_store',
 ]
@@ -119,7 +122,8 @@ export function capabilities(): Json {
     //
     //   KIP-KQL             §96 requires aggregation, and §44.6 defines it
     //                       with implicit grouping — see `grouped_aggregation`
-    //   KIP-Transactions    §94 requires idempotency — see `idempotent_replay`
+    //   KIP-Transactions    §94 also requires one transaction across several
+    //                       operations — see `atomic_batch`
     //   KIP-Capsule         export and verification are built, import is not
     //   KIP-High-Assurance  this engine signs nothing (§101)
     profiles: [
@@ -146,18 +150,20 @@ export function capabilities(): Json {
         'SUPERSEDE ASSERTION',
         'CORRECT EVIDENCE',
         'TRANSITION ACTIVITY',
+        'SET RETENTION',
         'ARCHIVE',
         'TOMBSTONE',
         'UPDATE',
         'MERGE CONCEPT',
         'PURGE, with all three reference policies',
         'PURGE PAYLOAD',
-        // §52.7 names exactly these six. `MERGE CONCEPT` is deliberately not
+        // §52.7 names exactly these seven. `MERGE CONCEPT` is deliberately not
         // among them: its source and target are already named, and its WHERE
         // only guards them — so it takes no LIMIT, and the grammar has no
         // field for one.
-        'selection blocks: WHERE and LIMIT on UPDATE, ARCHIVE, TOMBSTONE, ' +
-          'RETRACT, PURGE and PURGE PAYLOAD; WHERE alone on MERGE CONCEPT',
+        'selection blocks: WHERE and LIMIT on UPDATE, SET RETENTION, ARCHIVE, ' +
+          'TOMBSTONE, RETRACT, PURGE and PURGE PAYLOAD; WHERE alone on ' +
+          'MERGE CONCEPT',
       ],
       // §11: identity consolidation is non-destructive, and the three rules
       // that make it so are stated because a caller who assumed any of them
@@ -181,9 +187,32 @@ export function capabilities(): Json {
         atomicity: 'all-or-none per statement, from SQLite',
         versioning: 'one version increment per element per transaction',
         no_effect: 'a transaction that changes nothing takes no Space sequence',
-        // Recorded, not replayed — see the `idempotent_replay` gap below.
-        // Stated here too because this is the block a retry policy reads.
-        idempotency: 'recorded_not_replayed',
+        // §26, §33, and this is the block a retry policy reads: a timeout is
+        // not an abort, so a resend under a key this Space already committed
+        // hands back that transaction's receipt instead of writing again.
+        idempotency: {
+          mode: 'replayed',
+          scope:
+            'per Space; an operation’s own key wins over the request’s, so a ' +
+            'batch sharing one key does not have its second write replay the ' +
+            'first',
+          answer:
+            'the recorded receipt — same tx_id, space_seq, committed_at and ' +
+            'handles — plus a warning saying it is a replay, because the ' +
+            'caller resent precisely to find out whether the first attempt ' +
+            'landed',
+          warnings:
+            'the original run’s own warnings are not persisted and are not ' +
+            'reconstructed; inventing them would be worse than saying nothing',
+          dry_run:
+            'never replays and is never replayed: a preview establishes no ' +
+            'durable commit (§69.3), and answering one from an earlier real ' +
+            'commit would report a write as a preview of itself',
+          authorization:
+            'the command’s own permissions, checked as they would be for the ' +
+            'write; an outstanding approval obligation does not block a ' +
+            'replay, because the approval authorized work that already happened',
+        },
       },
       kql: [
         'CONCEPT',
@@ -191,7 +220,7 @@ export function capabilities(): Json {
         'ASSERTION',
         'EVIDENCE',
         'ACTIVITY',
-        'STRUCTURAL (Profile fields)',
+        'STRUCTURAL (Profile fields and Core fields alike)',
         'BELIEF',
         'BELIEF SLOT',
         'FILTER',
@@ -238,6 +267,20 @@ export function capabilities(): Json {
         families: ['find', 'search', 'list'],
       },
       structural: {
+        // §8.2 and §17: the pattern reads both planes. A Profile field is
+        // addressed by its resolved symbol, a Core one by its plain name, and
+        // `?edge.field` says which answered — so a Profile that declares a
+        // field named `evidence` adds edges rather than changing what an
+        // Assertion cites.
+        planes: {
+          profile: 'addressed by resolved symbol; ordered where declared',
+          core:
+            'Assertion.evidence and .context, Evidence.source and ' +
+            '.generated_by, Activity.inputs, .outputs and ' +
+            '.associated_actors — addressed by plain name, and reporting no ' +
+            '`index`, because their order is storage order rather than a ' +
+            'declared position',
+        },
         // §17.4: an ordered field keeps one dense zero-based order per source
         // element, and exposes each reference's position.
         ordered_fields: true,
@@ -250,6 +293,25 @@ export function capabilities(): Json {
         client_key:
           'a CREATE under a client_key already used resolves to that element ' +
           'instead of creating a second (§52.1)',
+        // §71.1, and §88.12 is the reason: a model retyping an observation
+        // into command text truncates it, normalizes it, or paraphrases it,
+        // and the record then says the source said something it did not.
+        ingest: {
+          mints: 'Evidence, from the payload the transport carried',
+          binds: 'each entry as :key, so the command cites rather than retypes',
+          scope:
+            'inside the statement’s own transaction, so an aborted statement ' +
+            'takes its ingested Evidence with it',
+          retry:
+            'an entry’s client_key resolves to the Evidence the first attempt ' +
+            'minted, exactly as CLIENT KEY does on a CREATE (§52.1)',
+          source_actor:
+            'resolved to a Concept in this Space, by id or canonical_id, and ' +
+            'refused rather than stored as a name nothing resolves',
+          payload_artifact:
+            'refused — see `artifact_store`; a handle would name bytes this ' +
+            'engine cannot read',
+        },
       },
       // §36.1, §68.1: HISTORY and CHANGES are the same unit — one committed
       // transition — asked for over different ranges, so they answer in one
@@ -312,6 +374,16 @@ export function capabilities(): Json {
           'alarm: forgetting happens when a Principal asks for it and is ' +
           'accountable for it',
         actions: ['archive', 'tombstone'],
+        // §19.1. Stated because the replacement semantics and the gate are one
+        // contract: a caller who read only the first would expect an omitted
+        // `legal_hold` to leave the hold alone.
+        set:
+          'SET RETENTION replaces the whole block rather than patching it, so ' +
+          'an omitted member is cleared',
+        legal_hold:
+          'gated in both directions — placing a hold needs `legal_hold`, and ' +
+          'so does any SET RETENTION over an element that currently holds one, ' +
+          'because replacement would otherwise lift it silently',
       },
       capsule: {
         // §37.7, and the same profile rs/anda_cognitive_nexus writes: a
@@ -564,33 +636,25 @@ export function capabilities(): Json {
       },
       {
         capability: 'ungated_permissions',
-        detail:
-          'derive, moderate_assertion, share, bind_canonical_identity, and the ' +
-          'control-plane management names: manage_membership, manage_grants, ' +
-          'manage_delegation, delegate, manage_actor_binding, manage_trust, ' +
-          'manage_schema, approve_high_risk',
+        detail: 'derive, share, manage_trust',
         reason:
-          'these are registered names that no gate currently asks for, so a ' +
-          'Grant listing one confers nothing — the failure mode the registry ' +
-          'exists to prevent, named here rather than discovered during an ' +
-          'incident. Two different causes. The control-plane management names ' +
-          'are host APIs by design: no KML clause reaches the plane, which is ' +
-          'what keeps a prompt injection off it, and the consequence is that ' +
-          'managing the plane cannot be delegated *through* KIP. The rest name ' +
-          'operations this engine does not distinguish yet — setting ' +
-          '`canonical_id` currently needs only `update`, and a moderator uses ' +
-          'ARCHIVE or TOMBSTONE rather than `moderate_assertion`. The reference ' +
-          'engine has the same gap, so closing it is a change both engines make ' +
+          'these are registered names that no gate asks for, so a Grant ' +
+          'listing one confers nothing — the failure mode the registry exists ' +
+          'to prevent, named here rather than discovered during an incident. ' +
+          'Three different causes, and none of them is an oversight any more. ' +
+          '`share` and `manage_trust` name operations this engine has no ' +
+          'surface for at all: there is no controlled cross-Space view to ' +
+          'expose and no trust policy to version. `derive` is the one that is ' +
+          'a judgement rather than an absence: §29.6 makes derived output its ' +
+          'own permission, and this engine does not separate a create that ' +
+          'cites what it read from one that does not, so requiring it would ' +
+          'tax every ordinary Assertion. The control-plane management names ' +
+          'are no longer here: a `Session` now authorizes each of them, while ' +
+          '`nexus.store.governance` stays the host\'s unguarded bootstrap ' +
+          'path — no KML clause or META command reaches either, which is what ' +
+          'keeps a prompt injection off the plane. The reference engine has ' +
+          'the same three gaps, so closing them is a change both engines make ' +
           'together or the two disagree about what a command costs',
-      },
-      {
-        capability: 'set_retention',
-        detail: 'the SET RETENTION clause',
-        reason:
-          'storage-lifecycle policy is not implemented; the clause is refused ' +
-          'by name rather than accepted and ignored. `retention.expires_at` is ' +
-          'stored and indexed, so what is missing is the clause that sets it ' +
-          'and the sweep that acts on it — not the column',
       },
       {
         capability: 'semantic_search',
@@ -635,22 +699,6 @@ export function capabilities(): Json {
           '{canonical_id: …}. The reference engine has the same gap',
       },
       {
-        capability: 'idempotent_replay',
-        detail:
-          'execution.idempotency_key returning the original outcome on a resend',
-        reason:
-          'the key is recorded on the committed transaction and is findable ' +
-          'with DESCRIBE TRANSACTION BY IDEMPOTENCY KEY, but the write path ' +
-          'does not look it up before executing. A resend does not replay: it ' +
-          'trips the unique index and fails, which at least refuses rather ' +
-          'than committing twice, but the caller gets a constraint failure ' +
-          'instead of the original receipt. A client that lost a response ' +
-          'must look the transaction up before retrying — which is what the ' +
-          'outcome_lookup_required retry class is telling it to do. The ' +
-          'reference engine has the same gap, and lacking the unique index it ' +
-          'commits the duplicate instead of refusing it',
-      },
-      {
         capability: 'grouped_aggregation',
         detail: 'FIND(?c.name, COUNT(?x)) and ORDER BY COUNT(?x)',
         reason:
@@ -659,16 +707,6 @@ export function capabilities(): Json {
           'one global row where the caller asked for one per group, or sorts by ' +
           'the bare variable instead of the aggregate. The reference engine has ' +
           'the same gap',
-      },
-      {
-        capability: 'structural_core_fields',
-        detail:
-          'STRUCTURAL over an Assertion’s evidence, an Activity’s ' +
-          'inputs/outputs, an Evidence record’s source',
-        reason:
-          'the pattern walks Profile structural fields only. The reverse index ' +
-          'holds the answer to "which Assertions cite this Evidence"; the ' +
-          'pattern is what does not ask it. The reference engine has the same gap',
       },
       {
         capability: 'capsule_import',
@@ -687,6 +725,37 @@ export function capabilities(): Json {
           '`signed` separately from `valid` rather than conflating them',
       },
       {
+        capability: 'trust_governance',
+        detail: 'DESCRIBE TRUST',
+        reason:
+          'the trust policy binding is Governance state, but this engine ' +
+          'evaluates no source trust, so there is no trust judgement to ' +
+          'report — see `trust_model`. Named here as well as there so a ' +
+          '`requires` block written against either engine gets an answer ' +
+          'rather than an unrecognized name',
+      },
+      {
+        capability: 'retention_policy',
+        detail:
+          'Space-level retention defaults by kind, type or classification ' +
+          '(§19.1)',
+        reason:
+          'retention is set per element and enforced per element; a Space ' +
+          'cannot yet declare that raw Experiences expire in 90 days and ' +
+          'audit records in 7 years. `SET RETENTION` and the expiry sweep are ' +
+          'both built — what is missing is the default a new element would ' +
+          'inherit',
+      },
+      {
+        capability: 'capsule_restore_mode',
+        detail: 'the "restore" import mode (§39.4)',
+        reason:
+          'no import mode is built here at all — see `capsule_import`. Named ' +
+          'separately because the reference engine builds the others and not ' +
+          'this one, so a `requires` block asking about restore gets the same ' +
+          'answer from both',
+      },
+      {
         capability: 'trust_model',
         detail: 'source trust and evidence-quality evaluation in the projection',
         reason:
@@ -700,17 +769,6 @@ export function capabilities(): Json {
           'one transaction across several operations is not implemented; a ' +
           'batch runs operation by operation, each atomic on its own. Asking ' +
           'for it is refused rather than run as a sequence that looks like one',
-      },
-      {
-        capability: 'ingest',
-        detail: 'the request envelope’s `ingest.evidence` block (§71.1)',
-        reason:
-          'observed payloads still have to arrive inside CREATE EVIDENCE, ' +
-          'which means through model-generated command text — the fidelity ' +
-          'risk §88.12 names. A request carrying `ingest` is refused rather ' +
-          'than run without it, because the ASSERT that cited `:msg` would ' +
-          'otherwise fail on an unbound parameter and report a syntax problem ' +
-          'for a missing runtime feature. The reference engine implements it',
       },
       {
         capability: 'artifact_store',

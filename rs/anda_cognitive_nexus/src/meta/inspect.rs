@@ -119,9 +119,14 @@ pub async fn search(cx: &mut Context<'_>, command: &SearchCommand) -> Result<Ans
         // An Assertion's content is a stance and a number, and an Activity's is
         // a class and two timestamps. Neither carries text worth indexing, and
         // returning nothing would read as "no such claim exists".
+        //
+        // `UnsupportedCapability`, not `SearchIndexUnavailable`: the second
+        // carries the `safe_same_request` retry class, which would send an
+        // Agent back to re-run a search that can never work. A permanent
+        // absence reported as a transient one is a retry loop.
         SearchTarget::Assertion | SearchTarget::Activity => {
             return Err(KipError::new(
-                KipErrorCode::SearchIndexUnavailable,
+                KipErrorCode::UnsupportedCapability,
                 "Assertions and Activities carry no free text, so this engine builds no \
                  full-text index over them; reach them through the Proposition or Evidence they \
                  are about",

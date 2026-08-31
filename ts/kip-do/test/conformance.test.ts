@@ -74,6 +74,7 @@ async function post(
   stub: DurableObjectStub<ConformanceKipDatabase>,
   command: string,
   params: JsonMap,
+  extra: Record<string, unknown> = {},
 ): Promise<Flat> {
   const response = await stub.fetch('https://kip-conformance/', {
     method: 'POST',
@@ -81,6 +82,7 @@ async function post(
     body: JSON.stringify({
       kip: '2.0',
       operations: [{ command, parameters: params }],
+      ...extra,
     }),
   })
   const envelope = (await response.json()) as KipResponse
@@ -107,6 +109,7 @@ async function runCase(
     stub,
     testCase.command,
     (testCase.params ?? {}) as JsonMap,
+    testCase.envelope ?? {},
   )
   const expectedError = testCase.expect.error
 
@@ -176,8 +179,8 @@ describe('KIP 2.0 conformance', () => {
   it('runs the same fixtures the reference engine runs', () => {
     // A shrinking suite is a silent loss of coverage; the generator reads the
     // fixture directory, so a bad path shows up here first.
-    expect(FIXTURES).toHaveLength(13)
-    expect(CASE_COUNT).toBe(183)
+    expect(FIXTURES).toHaveLength(17)
+    expect(CASE_COUNT).toBe(224)
   })
 
   for (const fixture of FIXTURES) {

@@ -24,7 +24,7 @@ than an absent one. It is recoverable from this branch's history.
 What works today: the storage layer, Schema Packages and symbol resolution,
 transactions and the KML mutation clauses, KQL, the Epistemic Projection, META,
 Capsule export and verification, the Governance control plane, and the
-historical read path. **All 62 shared conformance cases pass** — the list in
+historical read path. **All 224 shared conformance cases pass** — the list in
 `test/conformance.test.ts` names what is not built rather than counting it, so
 closing the last gap meant deleting a name and a new one cannot hide inside a
 number that happens to match.
@@ -49,9 +49,13 @@ here:
 
   The plane's own records are written through host APIs and are reachable from no
   KML clause, which is what keeps a prompt injection into ordinary memory
-  formation off the control plane. `DESCRIBE CAPABILITIES` names what that costs
-  and what is still missing, rather than letting the word "governance" imply
-  more than is there.
+  formation off the control plane. Those APIs are themselves authorized: a
+  `Session` carries a governed method for each control-plane operation, gated on
+  the name §29 gives it, so a Grant listing `manage_grants` confers something
+  and one that does not, does not. The raw store handle stays unguarded — a
+  Space has to be able to write its first Grant. `DESCRIBE CAPABILITIES` names
+  what that costs and what is still missing, rather than letting the word
+  "governance" imply more than is there.
 - **Semantic and hybrid `SEARCH`.** There is no embedding model here, so
   `MODE "semantic"` and `MODE "hybrid"` are refused by name. Keyword search is
   built and is the portable baseline §66.3 asks for.

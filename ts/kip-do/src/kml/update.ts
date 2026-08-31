@@ -18,6 +18,7 @@
  */
 
 import {
+  authorizeCanonicalIdentity,
   canonicalizeReference,
   edgeIndex,
   orderedField,
@@ -146,8 +147,11 @@ export function applyAction(
       assignments(b, action.SetFields, read),
     )) {
       switch (name) {
-        case 'name':
         case 'canonical_id':
+          // Setting one and clearing one are the same decision (§5.4).
+          authorizeCanonicalIdentity(tx)
+        // falls through
+        case 'name':
           if (typeof value !== 'string') {
             throw errors.typeMismatch(`\`${name}\` must be a string`)
           }

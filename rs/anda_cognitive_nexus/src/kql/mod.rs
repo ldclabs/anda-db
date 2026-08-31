@@ -275,16 +275,22 @@ impl<'a> Context<'a> {
 
     /// Every active Concept in the Space, for patterns no index narrows.
     pub async fn active_concepts(&mut self) -> Result<Vec<ElementId>, KipError> {
+        self.active_of(ElementKind::Concept).await
+    }
+
+    /// Every active element of one kind in this Space.
+    ///
+    /// The generalization `active_concepts` used to be: a Core structural field
+    /// belongs to an Assertion, an Evidence record or an Activity, so a
+    /// `STRUCTURAL` pattern with an unbound source has to be able to start from
+    /// the kind that could carry the field rather than always from Concepts.
+    pub async fn active_of(&mut self, kind: ElementKind) -> Result<Vec<ElementId>, KipError> {
         if self.as_of.is_some() {
-            return Ok(self
-                .candidates(ElementKind::Concept, None)
-                .await?
-                .into_iter()
-                .collect());
+            return Ok(self.candidates(kind, None).await?.into_iter().collect());
         }
         let ids = self
             .store
-            .concepts()
+            .elements(kind)
             .query_all_ids(anda_db::query::Filter::And(vec![
                 Box::new(eq_field("space", Fv::Text(self.space.clone()))),
                 Box::new(eq_field("state", Fv::Text("active".to_string()))),
@@ -293,7 +299,7 @@ impl<'a> Context<'a> {
             .map_err(db_error)?;
         Ok(ids
             .into_iter()
-            .map(|seq| ElementId::new(ElementKind::Concept, seq))
+            .map(|seq| ElementId::new(kind, seq))
             .collect())
     }
 

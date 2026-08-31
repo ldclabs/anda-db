@@ -284,6 +284,19 @@ pub fn capabilities(authority: Option<&EffectiveAuthority>, auth: &AuthContext) 
                 "families": ["find", "search", "list", "history"]
             },
             "structural": {
+                // §8.2 and §17: the pattern reads both planes. A Profile field
+                // is addressed by its resolved symbol, a Core one by its plain
+                // name, and `?edge.field` says which answered — so a Profile
+                // that declares a field named `evidence` adds edges rather
+                // than changing what an Assertion cites.
+                "planes": {
+                    "profile": "addressed by resolved symbol; ordered where declared",
+                    "core": "Assertion.evidence and .context, Evidence.source and \
+                             .generated_by, Activity.inputs, .outputs and \
+                             .associated_actors — addressed by plain name, and reporting \
+                             no `index`, because their order is storage order rather \
+                             than a declared position"
+                },
                 // §17.4: an ordered field keeps one dense zero-based order per
                 // source element, and exposes each reference's position.
                 "ordered_fields": true,
@@ -308,7 +321,16 @@ pub fn capabilities(authority: Option<&EffectiveAuthority>, auth: &AuthContext) 
                 "expiry": "enforced by an explicit sweep the host runs, not by a \
                            background timer: forgetting happens when a Principal \
                            asks for it and is accountable for it",
-                "actions": ["archive", "tombstone"]
+                "actions": ["archive", "tombstone"],
+                // §19.1. Stated because the replacement semantics and the gate
+                // are one contract: a caller who read only the first would
+                // expect an omitted `legal_hold` to leave the hold alone.
+                "set": "SET RETENTION replaces the whole block rather than \
+                        patching it, so an omitted member is cleared",
+                "legal_hold": "gated in both directions — placing a hold needs \
+                               `legal_hold`, and so does any SET RETENTION over \
+                               an element that currently holds one, because \
+                               replacement would otherwise lift it silently"
             },
             "capsule": {
                 // The import itself is a host operation: KML has no import
@@ -365,12 +387,32 @@ pub fn capabilities(authority: Option<&EffectiveAuthority>, auth: &AuthContext) 
                 "atomic_visibility": "in_process",
                 // Recorded, not replayed. A key is stored on the committed
                 // transaction and `DESCRIBE TRANSACTION BY IDEMPOTENCY KEY`
-                // will find it, which is what lets a client that lost a
-                // response discover the outcome — but the write path does not
-                // check the key first, so re-sending re-executes. Stated as
-                // what it is: reporting `true` here is what a retry policy
-                // reads before deciding a resend is free.
-                "idempotency": "recorded_not_replayed",
+                // will find it. §26 and §33: a timeout is not an abort, so a
+                // resend under a key this Space already committed hands back
+                // that transaction's receipt instead of writing again. This is
+                // the block a retry policy reads before deciding a resend is
+                // free.
+                "idempotency": {
+                    "mode": "replayed",
+                    "scope": "per Space; an operation's own key wins over the request's, \
+                              so a batch sharing one key does not have its second write \
+                              replay the first",
+                    "answer": "the recorded receipt — same tx_id, space_seq, committed_at \
+                               and handles — plus a warning saying it is a replay, because \
+                               the caller resent precisely to find out whether the first \
+                               attempt landed",
+                    "warnings": "the original run's own warnings are not persisted and are \
+                                 not reconstructed; inventing them would be worse than \
+                                 saying nothing",
+                    "dry_run": "never replays and is never replayed: a preview establishes \
+                                no durable commit (§69.3), and answering one from an \
+                                earlier real commit would report a write as a preview of \
+                                itself",
+                    "authorization": "the command's own permissions, checked as they would \
+                                      be for the write; an outstanding approval obligation \
+                                      does not block a replay, because the approval \
+                                      authorized work that already happened"
+                },
                 "preconditions": ["EXPECT VERSION", "EXPECT STATE"],
                 "dry_run": true
             },
@@ -444,18 +486,6 @@ pub fn capabilities(authority: Option<&EffectiveAuthority>, auth: &AuthContext) 
                            operations are not implemented; a batch runs operation by operation"
             },
             {
-                "capability": "idempotent_replay",
-                "detail": "execution.idempotency_key returning the original outcome on a resend",
-                "reason": "the key is recorded on the committed transaction and is findable with \
-                           DESCRIBE TRANSACTION BY IDEMPOTENCY KEY, but the write path does not \
-                           look it up before executing: a resend commits a second time rather \
-                           than replaying the first, and a resend under a key that named a \
-                           different request is not detected either. A client that lost a \
-                           response must look the transaction up before retrying — which is what \
-                           the outcome_lookup_required retry class is telling it to do. \
-                           ts/kip-do has the same gap"
-            },
-            {
                 "capability": "grouped_aggregation",
                 "detail": "FIND(?c.name, COUNT(?x)) and ORDER BY COUNT(?x)",
                 "reason": "a plain variable projected beside an aggregate, or an aggregate used \
@@ -474,28 +504,22 @@ pub fn capabilities(authority: Option<&EffectiveAuthority>, auth: &AuthContext) 
                                second is an accusation of tampering and the first is the truth"
                 },
                 {
-                    "capability": "structural_core_fields",
-                "detail": "STRUCTURAL over an Assertion's evidence, an Activity's inputs/outputs, \
-                           an Evidence record's source",
-                "reason": "the pattern walks Profile structural fields only, so it cannot ask \
-                           which Assertions cite a given Evidence. The derived index holds the \
-                           answer; the pattern is what does not ask it. ts/kip-do has the same gap"
-            },
-            {
                 "capability": "ungated_permissions",
-                "detail": "derive, moderate_assertion, share, bind_canonical_identity, and the \
-                           control-plane management names: manage_membership, manage_grants, \
-                           manage_delegation, delegate, manage_actor_binding, manage_trust, \
-                           manage_schema, approve_high_risk",
-                "reason": "these are registered names that no gate currently asks for, so a Grant \
-                           listing one confers nothing — named here rather than discovered during \
-                           an incident. Two causes. The control-plane names are host APIs by \
-                           design: no KML clause reaches the plane, which is what keeps a prompt \
-                           injection off it, and the consequence is that managing the plane \
-                           cannot be delegated through KIP. The rest name operations this engine \
-                           does not distinguish yet — setting canonical_id needs only `update`, \
-                           and a moderator uses ARCHIVE or TOMBSTONE. ts/kip-do has the same gap, \
-                           so closing it is a change both engines make together"
+                "detail": "derive, share, manage_trust",
+                "reason": "these are registered names that no gate asks for, so a Grant listing \
+                           one confers nothing — named here rather than discovered during an \
+                           incident. Three different causes, and none of them is an oversight \
+                           any more. `share` and `manage_trust` name operations this engine has \
+                           no surface for at all: there is no controlled cross-Space view to \
+                           expose and no trust policy to version — see `trust_governance`. \
+                           `derive` is the one that is a judgement rather than an absence: §29.6 \
+                           makes derived output its own permission, and this engine does not \
+                           separate a create that cites what it read from one that does not, so \
+                           requiring it would tax every ordinary Assertion. The control-plane \
+                           names are no longer here: `Session` now authorizes each of them, \
+                           while `nexus.governance()` stays the host's unguarded bootstrap path. \
+                           ts/kip-do has the same three gaps, so closing them is a change both \
+                           engines make together"
             },
             {
                 "capability": "nested_proposition_endpoint",
@@ -507,6 +531,15 @@ pub fn capabilities(authority: Option<&EffectiveAuthority>, auth: &AuthContext) 
                            which is a wrong answer wearing the shape of a right one. An object \
                            endpoint still resolves through {id: …} or {canonical_id: …}. \
                            ts/kip-do has the same gap"
+            },
+            {
+                "capability": "search_over_assertions_and_activities",
+                "detail": "SEARCH ASSERTION | ACTIVITY",
+                "reason": "an Assertion carries a stance, a mode and a number, and an Activity a \
+                           class and two timestamps — neither has free text to index. Refusing \
+                           says so; an empty answer would read as 'no such claim exists'. Reach \
+                           them through the Proposition or Evidence they are about. ts/kip-do \
+                           has the same gap"
             },
             {
                 "capability": "historical_search",
@@ -568,7 +601,8 @@ pub fn capabilities(authority: Option<&EffectiveAuthority>, auth: &AuthContext) 
 /// ```text
 /// KIP-KQL             §96 requires aggregation, and §44.6 defines it with
 ///                     implicit grouping — see `grouped_aggregation`
-/// KIP-Transactions    §94 requires idempotency — see `idempotent_replay`
+/// KIP-Transactions    §94 also requires one transaction across several
+///                     operations — see `atomic_batch`
 /// KIP-High-Assurance  this engine signs nothing (§101)
 /// ```
 ///
@@ -651,6 +685,10 @@ const SUPPORTED_NAMES: &[&str] = &[
     "capsule_export",
     "capsule_import",
     "client_key_retry",
+    "set_retention",
+    "structural_core_fields",
+    "hop_quantifiers",
+    "idempotent_replay",
     "ingest",
     "preconditions",
     "dry_run",
@@ -672,13 +710,12 @@ const SUPPORTED_NAMES: &[&str] = &[
 /// disclaiming the same thing; the unit test below checks they do not overlap.
 const UNSUPPORTED_NAMES: &[&str] = &[
     "atomic_batch",
-    "idempotent_replay",
     "grouped_aggregation",
-    "structural_core_fields",
     "ungated_permissions",
     "capsule_digest_profiles",
     "historical_search",
     "semantic_search",
+    "search_over_assertions_and_activities",
     "trust_model",
     "trust_governance",
     "capsule_restore_mode",

@@ -3070,6 +3070,315 @@ async fn a_cognitive_writer_cannot_place_a_legal_hold_to_evade_deletion() {
 }
 
 #[tokio::test]
+async fn moderating_somebody_elses_claim_asks_for_more_than_tidying_ones_own() {
+    // §29 keeps the two apart: archiving one's own record is tidying, and
+    // administratively excluding a third party's claim is moderation. A Grant
+    // that confers only the first must not buy the second.
+    let nexus = stocked("moderation").await;
+    let owner = nexus.system_session();
+    assert_eq!(
+        run_as(
+            &owner,
+            r#"MUTATE {
+                CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
+                CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+                ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
+                CREATE ASSERTION ?a {
+                    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: "support",
+                                 mode: "stated", confidence: 0.9 }
+                }
+            }"#,
+        )
+        .await
+        .status,
+        TopLevelStatus::Succeeded
+    );
+
+    let moderator = agent(nexus.governance(), "kip:principal:moderator").await;
+    grant(
+        &nexus,
+        &moderator,
+        &[
+            "read",
+            "create",
+            "assert",
+            "record_attributed_assertion",
+            "archive",
+            "tombstone",
+        ],
+        AuthorityScope::default(),
+    )
+    .await;
+    let session = nexus.session(AuthContext::principal(&moderator));
+
+    let denied = run_as(&session, r#"ARCHIVE "A-1""#).await;
+    assert_eq!(error_code(&denied), "NotAuthorized");
+    assert!(
+        denied
+            .results
+            .first()
+            .and_then(|r| r.error.as_ref())
+            .is_some_and(|e| e.message.contains("moderate_assertion"))
+    );
+    assert_eq!(
+        error_code(&run_as(&session, r#"TOMBSTONE "A-1""#).await),
+        "NotAuthorized"
+    );
+
+    // A Concept is not an Assertion, so nothing about it is moderation — the
+    // gate narrows what it asks for rather than taxing every sweep.
+    assert_eq!(
+        run_as(&session, r#"ARCHIVE "C-2""#).await.status,
+        TopLevelStatus::Succeeded
+    );
+
+    // And an Assertion this Principal wrote itself is its own to archive.
+    assert_eq!(
+        run_as(
+            &session,
+            r#"CREATE ASSERTION ?a {
+                SET FIELDS { proposition: "P-1", stance: "support", mode: "inferred",
+                             confidence: 0.5 }
+            }"#,
+        )
+        .await
+        .status,
+        TopLevelStatus::Succeeded
+    );
+    assert_eq!(
+        run_as(&session, r#"ARCHIVE "A-2""#).await.status,
+        TopLevelStatus::Succeeded
+    );
+}
+
+#[tokio::test]
+async fn binding_a_canonical_identity_asks_for_more_than_editing_a_label() {
+    // §5.4: a `canonical_id` says this Concept *is* the thing another system
+    // names — the identity a Capsule import resolves on and a merge follows.
+    let nexus = stocked("canonical_identity").await;
+    let writer = agent(nexus.governance(), "kip:principal:writer").await;
+    grant(
+        &nexus,
+        &writer,
+        &["read", "create", "update"],
+        AuthorityScope::default(),
+    )
+    .await;
+    let session = nexus.session(AuthContext::principal(&writer));
+
+    let denied = run_as(
+        &session,
+        r#"CREATE CONCEPT ?c { TYPE "Person" NAME "Alice"
+           SET FIELDS {canonical_id: "urn:x:alice"} }"#,
+    )
+    .await;
+    assert_eq!(error_code(&denied), "NotAuthorized");
+    assert!(
+        denied
+            .results
+            .first()
+            .and_then(|r| r.error.as_ref())
+            .is_some_and(|e| e.message.contains("bind_canonical_identity"))
+    );
+
+    // Ordinary grounding state is what `create` and `update` cover.
+    let created = run_as(&session, r#"CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }"#).await;
+    assert_eq!(created.status, TopLevelStatus::Succeeded);
+    let alice = created.results[0].result.as_ref().unwrap()["handles"]["c"]
+        .as_str()
+        .expect("a handle")
+        .to_string();
+    assert_eq!(
+        run_as(
+            &session,
+            &format!(r#"UPDATE "{alice}" SET FIELDS {{name: "Alicia"}}"#),
+        )
+        .await
+        .status,
+        TopLevelStatus::Succeeded
+    );
+    assert_eq!(
+        error_code(
+            &run_as(
+                &session,
+                &format!(r#"UPDATE "{alice}" SET FIELDS {{canonical_id: "urn:x:alice"}}"#),
+            )
+            .await
+        ),
+        "NotAuthorized"
+    );
+
+    // And the permission that names the act performs it, in both directions:
+    // clearing a binding is the same decision as making one.
+    let binder = agent(nexus.governance(), "kip:principal:binder").await;
+    grant(
+        &nexus,
+        &binder,
+        &["read", "create", "update", "bind_canonical_identity"],
+        AuthorityScope::default(),
+    )
+    .await;
+    let bound = nexus.session(AuthContext::principal(&binder));
+    assert_eq!(
+        run_as(
+            &bound,
+            &format!(r#"UPDATE "{alice}" SET FIELDS {{canonical_id: "urn:x:alice"}}"#),
+        )
+        .await
+        .status,
+        TopLevelStatus::Succeeded
+    );
+    assert_eq!(
+        run_as(
+            &bound,
+            &format!(r#"UPDATE "{alice}" SET FIELDS {{canonical_id: ""}}"#),
+        )
+        .await
+        .status,
+        TopLevelStatus::Succeeded
+    );
+}
+
+#[tokio::test]
+async fn a_control_plane_call_made_as_a_principal_is_authorized_as_that_principal() {
+    // §29 registers a name for each control-plane operation; until these gates
+    // existed a Grant listing `manage_grants` conferred nothing, which is
+    // authority that looks conferred and is not.
+    let nexus = stocked("control_plane").await;
+    let steward = agent(nexus.governance(), "kip:principal:steward").await;
+    let subject = agent(nexus.governance(), "kip:principal:subject").await;
+    grant(
+        &nexus,
+        &steward,
+        &["read", "create"],
+        AuthorityScope::default(),
+    )
+    .await;
+    let session = nexus.session(AuthContext::principal(&steward));
+
+    let draft = || GrantDraft {
+        space_id: DEFAULT_SPACE.into(),
+        grantee_principal: subject.clone(),
+        actions: vec!["read".into()],
+        ..Default::default()
+    };
+
+    // Reading and writing cognition is not administering who may.
+    let denied = session
+        .create_grant(DEFAULT_SPACE, draft())
+        .await
+        .expect_err("a Grant is not something `create` confers");
+    assert_eq!(denied.code, anda_kip::KipErrorCode::NotAuthorized);
+
+    // The name the registry gives the operation is the name that buys it.
+    grant(
+        &nexus,
+        &steward,
+        &["manage_grants"],
+        AuthorityScope::default(),
+    )
+    .await;
+    let written = session.create_grant(DEFAULT_SPACE, draft()).await.unwrap();
+    // Attributed to the Principal that asked, not to the host.
+    assert_eq!(written.granted_by, steward);
+
+    // A Grant naming a permission this engine does not implement confers
+    // nothing, so it is refused where it is written rather than in an incident.
+    let typo = session
+        .create_grant(
+            DEFAULT_SPACE,
+            GrantDraft {
+                actions: vec!["reed".into()],
+                ..draft()
+            },
+        )
+        .await
+        .expect_err("an unimplemented permission name is not a Grant");
+    assert_eq!(typo.code, anda_kip::KipErrorCode::NotAuthorized);
+
+    // The host's own path stays unguarded: it is what bootstraps a Space that
+    // has no Grants yet.
+    nexus
+        .governance()
+        .create_grant(draft(), SYSTEM_PRINCIPAL)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_cognitive_writer_cannot_lift_a_legal_hold_by_writing_around_it() {
+    // The other half of §19.1, and the one a block-replacing clause makes easy
+    // to miss: `SET RETENTION` replaces rather than patches, so a caller who
+    // never mentions `legal_hold` still clears one.
+    let nexus = stocked("legal_hold_lifting").await;
+    let owner = nexus.system_session();
+    let created = run_as(
+        &owner,
+        r#"CREATE CONCEPT ?c { TYPE "Person" NAME "Alice"
+           SET FIELDS {retention: {retention_class: "standard", legal_hold: true}} }"#,
+    )
+    .await;
+    assert_eq!(created.status, TopLevelStatus::Succeeded);
+
+    let custodian = agent(nexus.governance(), "kip:principal:custodian").await;
+    grant(
+        &nexus,
+        &custodian,
+        &["read", "create", "manage_retention", "update"],
+        AuthorityScope::default(),
+    )
+    .await;
+    let session = nexus.session(AuthContext::principal(&custodian));
+
+    // Not naming the member is not a way around the gate on it.
+    let lifted = run_as(
+        &session,
+        r#"SET RETENTION "C-1" {retention_class: "standard"}"#,
+    )
+    .await;
+    assert_eq!(error_code(&lifted), "NotAuthorized");
+    assert!(lifted.error.as_ref().unwrap().message.contains("legal_hold"));
+
+    // Neither is naming it as false.
+    assert_eq!(
+        error_code(
+            &run_as(
+                &session,
+                r#"SET RETENTION "C-1" {retention_class: "standard", legal_hold: false}"#,
+            )
+            .await
+        ),
+        "NotAuthorized"
+    );
+
+    // The hold is still there, and still blocks the erasure it was placed for.
+    assert_eq!(
+        error_code(&run_as(&owner, r#"PURGE "C-1" CONFIRM "PURGE""#).await),
+        "LegalHoldConflict"
+    );
+
+    // A caller who holds `legal_hold` lifts it, which is the point of gating
+    // rather than forbidding.
+    let holder = agent(nexus.governance(), "kip:principal:holder").await;
+    grant(
+        &nexus,
+        &holder,
+        &["read", "manage_retention", "legal_hold"],
+        AuthorityScope::default(),
+    )
+    .await;
+    assert_eq!(
+        run_as(
+            &nexus.session(AuthContext::principal(&holder)),
+            r#"SET RETENTION "C-1" {retention_class: "standard"}"#,
+        )
+        .await
+        .status,
+        TopLevelStatus::Succeeded
+    );
+}
+
+#[tokio::test]
 async fn an_authorized_cascade_erases_the_dependents_the_default_refuses_to_orphan() {
     let nexus = stocked("cascade").await;
     let owner = nexus.system_session();

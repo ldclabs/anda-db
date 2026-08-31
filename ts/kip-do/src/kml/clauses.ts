@@ -295,6 +295,37 @@ export function apply(
     }
     return
   }
+  if ('SetRetention' in clause) {
+    const { target, values, where_clauses, limit, expect_version } = clause.SetRetention
+    const selected = select(
+      target,
+      where_clauses,
+      limit,
+      'SET RETENTION',
+      'manage_retention',
+    )
+    // §19: retention is storage lifecycle. `expires_at` here is when the
+    // *record* stops being kept, never when the claim stops applying — that is
+    // `valid_time.until` on an Assertion, and nothing here touches it.
+    const retention = assignments(b, values)
+    checkRetention(retention)
+    const expires = expiresAt(retention)
+    for (const id of selected.authorized(tx)) {
+      if (expect_version !== null) {
+        tx.expectVersion(id, numberOf(b, expect_version, 'EXPECT VERSION'))
+      }
+      const element = tx.load(id)
+      authorizeLegalHold(tx, element.row.retention, retention)
+      // A block that says what is already recorded is a no-op rather than a
+      // version bump: retention is policy, and restating a policy is not a
+      // change to it.
+      if (jsonEquals(element.row.retention, retention)) continue
+      element.row.retention = retention
+      element.row.expires_at = expires
+      tx.markChanged(id, 'set_retention')
+    }
+    return
+  }
   if ('MergeConcept' in clause) {
     const { source, into, where_clauses, expect_version } = clause.MergeConcept
     const sources = select(source, where_clauses, null, 'MERGE CONCEPT', 'merge_identity').authorized(tx)
@@ -302,9 +333,10 @@ export function apply(
     return merge(tx, b, sources, targets, expect_version)
   }
 
-  // Everything below is a clause this stage has not built yet. Refusing by name
-  // beats accepting and doing nothing: a mutation that reports success and
-  // writes nothing is the defect this project keeps finding.
+  // Every clause the grammar produces is handled above, so this is a guard
+  // against a grammar that grows rather than a list of things left to build.
+  // It refuses by name: a mutation that reports success and writes nothing is
+  // the defect this project keeps finding.
   const name = Object.keys(clause)[0] ?? 'this clause'
   throw errors.unsupportedCapability(
     `${name} is not implemented by this engine yet; see DESCRIBE CAPABILITIES`,
@@ -340,6 +372,7 @@ function createConcept(tx: Transaction, b: Bindings, clause: ConceptCreate): voi
 
   const key = fields.text('key')
   const canonicalId = fields.text('canonical_id')
+  if (canonicalId !== '') authorizeCanonicalIdentity(tx)
   const aliases = fields
     .array('aliases')
     .filter((value): value is string => typeof value === 'string')
@@ -1013,6 +1046,13 @@ function changeState(
   op: 'archive' | 'tombstone',
 ): void {
   const element = tx.load(id)
+  // §29: administratively excluding somebody else's claim is a different act
+  // from tidying one's own, and only the first is moderation. `archive` is
+  // still asked for — this is on top of it, not instead of it, so a moderator
+  // needs both and a Grant listing only `moderate_assertion` confers nothing.
+  if (element.kind === 'Assertion' && !tx.mayRepresentAssertion(element.row)) {
+    tx.require('moderate_assertion')
+  }
   if (element.row.state === state) return
   element.row.state = state
   tx.markChanged(id, op)
@@ -1433,7 +1473,10 @@ function applyConceptFields(tx: Transaction, row: ConceptRow, fields: Fields): v
   const name = fields.text('name')
   if (name !== '') row.name = name
   const canonical = fields.text('canonical_id')
-  if (canonical !== '') row.canonical_id = canonical
+  if (canonical !== '') {
+    authorizeCanonicalIdentity(tx)
+    row.canonical_id = canonical
+  }
   const aliases = fields.array('aliases')
   if (aliases.length > 0) {
     row.aliases = aliases.filter((v): v is string => typeof v === 'string')
@@ -1864,12 +1907,47 @@ function numberOf(b: Bindings, value: { Literal: unknown } | { Param: string }, 
  */
 function authorizeRetention(tx: Transaction, retention: JsonMap): void {
   if (Object.keys(retention).length === 0) return
-  checkRetention(retention)
   tx.require('manage_retention')
-  // §19.1: a legal hold blocks erasure, so a cognitive writer that could set one
-  // could make its own content undeletable. Placing or lifting a hold is its
-  // own permission, above ordinary retention management.
-  if (Object.hasOwn(retention, 'legal_hold')) tx.require('legal_hold')
+  checkRetention(retention)
+  authorizeLegalHold(tx, {}, retention)
+}
+
+/**
+ * Gates a change to an element's legal hold (§19.1).
+ *
+ * §19.1 names this attack by its shape: a cognitive writer must not be able to
+ * evade deletion through the retention hook. So both directions are gated, and
+ * both for the same reason. *Placing* a hold blocks erasure for everyone, which
+ * is more authority than deciding how long a record is kept. *Lifting* one is
+ * the attack stated plainly — and lifting does not require naming the member,
+ * because `SET RETENTION` replaces the block rather than patching it: a hold
+ * disappears when the next block simply omits it. Gating on the transition
+ * rather than on the words in the block is what closes that.
+ */
+function authorizeLegalHold(
+  tx: Transaction,
+  current: JsonMap,
+  next: JsonMap,
+): void {
+  const held = (block: JsonMap) => block.legal_hold === true
+  if (held(next) || held(current)) tx.require('legal_hold')
+}
+
+/**
+ * Authorizes writing a Concept's canonical identity (§5.4).
+ *
+ * A `canonical_id` is a high-assurance claim that this Concept *is* the thing
+ * some other system names — the identity a Capsule import resolves on, and the
+ * one a merge follows. Deciding that is more authority than editing a label,
+ * so it is its own permission rather than a side effect of `create` or
+ * `update`.
+ *
+ * Clearing one asks for the same thing as setting one: an identity binding
+ * that could be dropped by anyone who may rename the Concept would be no
+ * binding at all.
+ */
+export function authorizeCanonicalIdentity(tx: Transaction): void {
+  tx.require('bind_canonical_identity')
 }
 
 /** The members §19.1 gives the retention hook. */

@@ -39,6 +39,7 @@ import {
   Approved,
   elevateAuthority,
   isPermitted,
+  parsePermission,
   principalClass,
   expireAssertion,
   quarantine,
@@ -48,10 +49,17 @@ import {
   resolveApproval,
   spaceResource,
   systemAuth,
+  type ActorBindingRow,
+  type ApprovalRow,
   type AuthContext,
   type Authorization,
+  type DelegationRow,
   type ElementGovernanceContext,
+  type GovernancePolicyRow,
+  type GrantRow,
   type Permission,
+  type PrincipalGroupRow,
+  type PrincipalRow,
 } from './governance/index.js'
 import { kmlPermissions, kqlPermissions, metaPermissions } from './governance/gate.js'
 import { isAlwaysAudited } from './governance/index.js'
@@ -59,7 +67,7 @@ import type { Json, JsonMap } from './json.js'
 import { parseKip } from './kip/parser.js'
 import type { ElementId } from './id.js'
 import type { Command, KmlStatement, KqlQuery } from './kip/ast.js'
-import { executeKml, type KmlContext } from './kml/index.js'
+import { executeKml, type IngestContext, type KmlContext } from './kml/index.js'
 import {
   executeKqlPage,
   type KqlAnswer,
@@ -79,7 +87,16 @@ import {
   type SchemaLock,
   type SchemaPackage,
 } from './schema/index.js'
-import { Store, type SpaceRow } from './store/index.js'
+import {
+  Store,
+  type TransactionRow,
+  type ActorBindingDraft,
+  type DelegationDraft,
+  type GrantDraft,
+  type GroupDraft,
+  type PolicyDraft,
+  type SpaceRow,
+} from './store/index.js'
 import { canonicalJson } from './json.js'
 import { sha256Text } from './digest.js'
 import { normalizeTime, nowTime } from './time.js'
@@ -492,6 +509,13 @@ export interface MutationOptions {
   operation?: JsonMap
   idempotencyKey?: string
   dryRun?: boolean
+  /**
+   * The request envelope's ingestion context (§71.1).
+   *
+   * Minted into this statement's transaction, so the command cites `:key`
+   * rather than retyping the observation into its own text.
+   */
+  ingest?: IngestContext
 }
 
 export class Session {
@@ -633,7 +657,31 @@ export class Session {
   ): Outcome {
     const space = options.space ?? this.nexus.space
     const authority = this.effectiveAuthority(space)
-    const decisions = this.gate(authority, kmlPermissions(statement))
+    const needed = kmlPermissions(statement)
+
+    // §26, §33: a timeout is not an abort. A client that lost its response
+    // resends the same key and gets the outcome its first attempt produced,
+    // rather than writing a second time or being told its own write is a
+    // conflict.
+    //
+    // Authorized before it answers — a replay is still a read of what this
+    // Space did — but deliberately *without* resolving approvals: nothing is
+    // being done a second time, and an approval the first attempt already
+    // spent must not make a lost response unrecoverable.
+    const replayed =
+      options.idempotencyKey === undefined || options.dryRun === true
+        ? null
+        : this.nexus.store.transactionByKey(space, options.idempotencyKey)
+    if (replayed !== null) {
+      for (const permission of needed) {
+        requirePermittedForReplay(
+          authority.authorize(permission, spaceResource(), this.auth),
+        )
+      }
+      return replay(replayed)
+    }
+
+    const decisions = this.gate(authority, needed)
     const provenance = accessProvenance(statement, authority, this.auth)
     const cx: KmlContext = {
       store: this.nexus.store,
@@ -644,6 +692,7 @@ export class Session {
       // written under a revoked identity stays attributable to it.
       origin: this.origin(),
       request: params,
+      ingest: options.ingest,
       operation: options.operation,
       idempotencyKey: options.idempotencyKey,
       dryRun: options.dryRun,
@@ -925,6 +974,212 @@ export class Session {
     })
   }
 
+  // --- the governed control plane -----------------------------------------
+  //
+  // §29 registers a name for each control-plane operation, and until these
+  // existed no gate asked for any of them: a Grant listing `manage_grants`
+  // conferred nothing, which is the failure mode the registry exists to
+  // prevent — authority that looks conferred and is not, discovered during an
+  // incident.
+  //
+  // These do not put the control plane in reach of cognition. No KML clause
+  // and no META command resolves to any of them, which is what keeps a prompt
+  // injection off the plane; they are host calls, and what changed is that a
+  // host call made *as a Principal* is now authorized as that Principal.
+  // `nexus.store.governance` remains the host's own unguarded path, for the
+  // bootstrap that has to happen before any Grant exists.
+
+  /**
+   * Creates a Grant in this Space (§29, `manage_grants`).
+   *
+   * The actions are checked against the registry before the record is written:
+   * a Grant naming a permission this engine does not implement confers nothing,
+   * and the holder must learn that here rather than during an incident.
+   */
+  createGrant(draft: GrantDraft, space = this.nexus.space): GrantRow {
+    return this.nexus.transact(() => {
+      const approvals = this.gate(this.effectiveAuthority(space), ['manage_grants'])
+      for (const action of draft.actions) parsePermission(action)
+      const row = this.nexus.store.governance.createGrant(
+        { ...draft, space_id: space },
+        this.auth.principal_id,
+      )
+      this.consume(approvals)
+      return row
+    })
+  }
+
+  /** Revokes a Grant (§29, `manage_grants`). Revoked, never deleted. */
+  revokeGrant(id: number, space = this.nexus.space): void {
+    this.nexus.transact(() => {
+      const approvals = this.gate(this.effectiveAuthority(space), ['manage_grants'])
+      this.nexus.store.governance.revokeGrant(id, this.auth.principal_id)
+      this.consume(approvals)
+    })
+  }
+
+  /**
+   * Creates a Delegation (§29).
+   *
+   * Which permission this asks for depends on whose authority is being passed
+   * on, and the distinction is the whole reason both names exist: conferring
+   * part of *one's own* authority is `delegate`, and administering a
+   * Delegation between two other Principals is `manage_delegation`. Collapsing
+   * them would let anyone who may delegate their own authority hand out
+   * somebody else's.
+   */
+  createDelegation(draft: DelegationDraft, space = this.nexus.space): DelegationRow {
+    return this.nexus.transact(() => {
+      const own = draft.delegator_principal === this.auth.principal_id
+      const approvals = this.gate(this.effectiveAuthority(space), [
+        own ? 'delegate' : 'manage_delegation',
+      ])
+      for (const action of draft.actions) parsePermission(action)
+      const row = this.nexus.store.governance.createDelegation(
+        { ...draft, space_id: space },
+        this.auth.principal_id,
+      )
+      this.consume(approvals)
+      return row
+    })
+  }
+
+  /**
+   * Revokes a Delegation (§29, `manage_delegation`).
+   *
+   * Revoking one's own asks for the same thing as revoking another's: unlike
+   * conferring, withdrawing authority is never the more dangerous direction,
+   * and a caller who could not reach the record could not withdraw at all.
+   */
+  revokeDelegation(id: number, space = this.nexus.space): void {
+    this.nexus.transact(() => {
+      const approvals = this.gate(this.effectiveAuthority(space), ['manage_delegation'])
+      this.nexus.store.governance.revokeDelegation(id, this.auth.principal_id)
+      this.consume(approvals)
+    })
+  }
+
+  /** Creates or replaces a Principal group (§29, `manage_membership`). */
+  putGroup(draft: GroupDraft, space = this.nexus.space): PrincipalGroupRow {
+    return this.nexus.transact(() => {
+      const approvals = this.gate(this.effectiveAuthority(space), ['manage_membership'])
+      const row = this.nexus.store.governance.putGroup(draft, this.auth.principal_id)
+      this.consume(approvals)
+      return row
+    })
+  }
+
+  /** Suspends or restores a Principal (§29, `manage_membership`). */
+  setPrincipalStatus(
+    principalId: string,
+    status: string,
+    space = this.nexus.space,
+  ): PrincipalRow {
+    return this.nexus.transact(() => {
+      const approvals = this.gate(this.effectiveAuthority(space), ['manage_membership'])
+      const row = this.nexus.store.governance.setPrincipalStatus(
+        principalId,
+        status,
+        this.auth.principal_id,
+      )
+      this.consume(approvals)
+      return row
+    })
+  }
+
+  /**
+   * Binds a Principal to a semantic actor (§17, `manage_actor_binding`).
+   *
+   * The record that decides whether writing `asserted_by: ?alice` is attributed
+   * recording or speaking as Alice, so writing one is more authority than
+   * either — a writer who could bind itself could authorize its own
+   * impersonation.
+   */
+  createBinding(draft: ActorBindingDraft, space = this.nexus.space): ActorBindingRow {
+    return this.nexus.transact(() => {
+      const approvals = this.gate(this.effectiveAuthority(space), ['manage_actor_binding'])
+      const row = this.nexus.store.governance.createBinding(
+        draft,
+        this.auth.principal_id,
+      )
+      this.consume(approvals)
+      return row
+    })
+  }
+
+  /** Revokes an ActorBinding (§17, `manage_actor_binding`). */
+  revokeBinding(id: number, space = this.nexus.space): void {
+    this.nexus.transact(() => {
+      const approvals = this.gate(this.effectiveAuthority(space), ['manage_actor_binding'])
+      this.nexus.store.governance.revokeBinding(id, this.auth.principal_id)
+      this.consume(approvals)
+    })
+  }
+
+  /** Publishes a Governance Policy version (§29, `manage_policy`). */
+  publishPolicy(draft: PolicyDraft, space = this.nexus.space): GovernancePolicyRow {
+    return this.nexus.transact(() => {
+      const approvals = this.gate(this.effectiveAuthority(space), ['manage_policy'])
+      const row = this.nexus.store.governance.publishPolicy(
+        { ...draft, space_id: draft.space_id ?? space },
+        this.auth.principal_id,
+      )
+      this.consume(approvals)
+      return row
+    })
+  }
+
+  /**
+   * Supplies one of the independent approvals a high-risk operation needs
+   * (§40, `approve_high_risk`).
+   *
+   * Its own permission rather than the operation's: the point of an
+   * independent approval is that the approver is not the one asking, so the
+   * authority to approve cannot be the authority to act.
+   */
+  approve(id: number, note = '', space = this.nexus.space): ApprovalRow {
+    return this.nexus.transact(() => {
+      const approvals = this.gate(this.effectiveAuthority(space), ['approve_high_risk'])
+      const row = this.nexus.store.governance.approve(id, this.auth.principal_id, note)
+      this.consume(approvals)
+      return row
+    })
+  }
+
+  /**
+   * Installs a Schema Package artifact (§20, `manage_schema`).
+   *
+   * Installing does not activate: what a symbol means in this Space is decided
+   * by the Schema Lock, and this only makes an artifact available to be locked
+   * onto.
+   */
+  installPackage(artifact: SchemaPackage, source: string, space = this.nexus.space): void {
+    this.nexus.transact(() => {
+      const approvals = this.gate(this.effectiveAuthority(space), ['manage_schema'])
+      this.nexus.installPackage(artifact, source)
+      this.consume(approvals)
+    })
+  }
+
+  /**
+   * Activates a Schema Lock over the installed artifacts (§20, `manage_schema`).
+   *
+   * The operation that changes what every stored symbol resolves to, which is
+   * why it is gated rather than treated as configuration: a package swapped
+   * underneath a Space rewrites the meaning of cognition already written.
+   */
+  activatePackages(
+    artifacts: readonly (SchemaPackage | string)[],
+    space = this.nexus.space,
+  ): SchemaEnvironment {
+    return this.nexus.transact(() => {
+      const approvals = this.gate(this.effectiveAuthority(space), ['manage_schema'])
+      const env = this.nexus.activatePackages(artifacts, space)
+      this.consume(approvals)
+      return env
+    })
+  }
+
   private governanceContext(space: string): ElementGovernanceContext {
     return {
       store: this.nexus.store,
@@ -1007,6 +1262,54 @@ export class Session {
     } catch {
       // See above: an audit failure does not become a second failure mode.
     }
+  }
+}
+
+/**
+ * Whether this caller may be handed the outcome of a write it already made.
+ *
+ * The permission is checked exactly as it would be for the write itself, so a
+ * caller who could not have run the command cannot learn what it did.
+ *
+ * An outstanding *approval* obligation deliberately does not block it. An
+ * approval authorizes the work, and on a replay the work already happened —
+ * demanding a second one to learn the outcome of the first is what would make
+ * a lost response unrecoverable, which is the failure §33 exists to prevent.
+ */
+function requirePermittedForReplay(decision: Authorization): void {
+  if (decision.decision === 'require_approval') return
+  requirePermitted(decision)
+}
+
+/**
+ * The outcome a recorded transaction produced, handed back on a resend.
+ *
+ * Everything a receipt carries was written at commit, so this reconstructs the
+ * original answer rather than approximating it. Two things are honestly
+ * different from the first response and say so:
+ *
+ * - `warnings` carries a replay notice. A caller that reads it learns its first
+ *   attempt landed, which is the fact it resent to find out.
+ * - The original run's own warnings are not persisted and are therefore gone. A
+ *   replay that invented them would be worse than one that says nothing.
+ */
+function replay(row: TransactionRow): Outcome {
+  const result = (row.result ?? {}) as { handles?: Record<string, string> }
+  return {
+    status: row.status === 'committed' ? 'committed' : 'no_effect',
+    tx_id: row.tx_id,
+    space_id: row.space,
+    space_seq: row.status === 'committed' ? row.seq : null,
+    snapshot_seq: row.snapshot_seq,
+    committed_at: row.status === 'committed' ? row.committed_at : null,
+    schema_environment_version: row.schema_environment_version,
+    handles: result.handles ?? {},
+    changes: row.changes,
+    warnings: [
+      `this is the recorded outcome of transaction ${row.tx_id}, replayed ` +
+        `under the idempotency key it committed with: nothing ran a second ` +
+        `time, and any warnings the first attempt reported are not kept`,
+    ],
   }
 }
 

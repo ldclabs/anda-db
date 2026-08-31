@@ -19,6 +19,14 @@ export interface Case {
   expect: Expectation
   /** Whether the order of a top-level result array is part of the contract. */
   ordered?: boolean
+  /**
+   * Extra request-envelope members, merged over the ones the harness builds.
+   *
+   * Most behaviour is decided by the command, but some of it is decided by the
+   * envelope around the command — ingest, execution.idempotency_key — and
+   * those are cross-engine contracts too.
+   */
+  envelope?: Record<string, unknown>
 }
 
 export interface Fixture {
@@ -1294,6 +1302,228 @@ export const FIXTURES: readonly Fixture[] = [
     ]
   },
   {
+    "name": "meta-shapes",
+    "description": "The shape a META read answers in, which is a contract and not an engine choice. A client that talks to both engines parses one answer, and a divergence here is the most expensive kind to find: a reader written for one shape gets an empty result from the other, and an empty result reads as an empty Space rather than as a wrong shape — no error, no clue. So the `LIST` families pin their row shape and their order here rather than in either engine's own tests, which is where the two drifted apart in the first place. The Primer is not pinned whole here: most of it is deployment fact — a Space's name, its sequence, how many packages a host installed — and the fixtures are for behaviour, not for one engine's bootstrap. Its key structure is asserted in each engine's own tests instead.",
+    "packages": [
+      {
+        "format": "KIP-Schema-Package",
+        "manifest": {
+          "package_id": "kip://test/meta-shapes",
+          "version": "1.0.0"
+        },
+        "definitions": {
+          "concept_types": {
+            "Widget": {
+              "kind": "ConceptType",
+              "description": "Something to list."
+            }
+          },
+          "predicates": {
+            "fits_in": {
+              "kind": "PredicateType",
+              "description": "Where a Widget fits.",
+              "subject": {
+                "kinds": [
+                  "Concept"
+                ]
+              },
+              "object": {
+                "kinds": [
+                  "Concept"
+                ]
+              }
+            }
+          },
+          "facets": {
+            "Fit": {
+              "kind": "FacetDefinition",
+              "description": "How well it fits.",
+              "fields": {
+                "snug": {
+                  "type": "boolean",
+                  "required": false,
+                  "mutable": true
+                }
+              }
+            }
+          },
+          "structural_fields": {
+            "packed_with": {
+              "kind": "StructuralFieldDefinition",
+              "description": "Other Widgets in the same box.",
+              "source": {
+                "kinds": [
+                  "Concept"
+                ]
+              },
+              "target": {
+                "kinds": [
+                  "Concept"
+                ]
+              },
+              "ordered": false
+            }
+          }
+        }
+      }
+    ],
+    "setup": [],
+    "cases": [
+      {
+        "name": "a listed symbol is a row, not a bare reference",
+        "command": "LIST PREDICATES",
+        "ordered": true,
+        "expect": {
+          "result": [
+            {
+              "ref": "kip://profiles/cognitive-memory@2.0.0/caused_by",
+              "local_name": "caused_by",
+              "package_ref": "kip://profiles/cognitive-memory@2.0.0",
+              "status": "active"
+            },
+            {
+              "ref": "kip://profiles/cognitive-memory@2.0.0/prefers",
+              "local_name": "prefers",
+              "package_ref": "kip://profiles/cognitive-memory@2.0.0",
+              "status": "active"
+            },
+            {
+              "ref": "kip://profiles/cognitive-memory@2.0.0/same_as",
+              "local_name": "same_as",
+              "package_ref": "kip://profiles/cognitive-memory@2.0.0",
+              "status": "active"
+            },
+            {
+              "ref": "kip://test/meta-shapes@1.0.0/fits_in",
+              "local_name": "fits_in",
+              "package_ref": "kip://test/meta-shapes@1.0.0",
+              "status": "active"
+            }
+          ]
+        }
+      },
+      {
+        "name": "the row carries both names because they answer different questions",
+        "command": "LIST FACETS",
+        "ordered": true,
+        "expect": {
+          "result": [
+            {
+              "ref": "kip://profiles/cognitive-memory@2.0.0/DerivationState",
+              "local_name": "DerivationState",
+              "package_ref": "kip://profiles/cognitive-memory@2.0.0",
+              "status": "active"
+            },
+            {
+              "ref": "kip://profiles/cognitive-memory@2.0.0/MnemonicState",
+              "local_name": "MnemonicState",
+              "package_ref": "kip://profiles/cognitive-memory@2.0.0",
+              "status": "active"
+            },
+            {
+              "ref": "kip://profiles/cognitive-memory@2.0.0/OutcomeRecord",
+              "local_name": "OutcomeRecord",
+              "package_ref": "kip://profiles/cognitive-memory@2.0.0",
+              "status": "active"
+            },
+            {
+              "ref": "kip://profiles/cognitive-memory@2.0.0/SkillUtility",
+              "local_name": "SkillUtility",
+              "package_ref": "kip://profiles/cognitive-memory@2.0.0",
+              "status": "active"
+            },
+            {
+              "ref": "kip://test/meta-shapes@1.0.0/Fit",
+              "local_name": "Fit",
+              "package_ref": "kip://test/meta-shapes@1.0.0",
+              "status": "active"
+            }
+          ]
+        }
+      },
+      {
+        "name": "the list is ordered by ref, so a LIMIT cuts the same rows twice",
+        "command": "LIST PREDICATES LIMIT 1",
+        "ordered": true,
+        "expect": {
+          "result": [
+            {
+              "ref": "kip://profiles/cognitive-memory@2.0.0/caused_by",
+              "local_name": "caused_by",
+              "package_ref": "kip://profiles/cognitive-memory@2.0.0",
+              "status": "active"
+            }
+          ]
+        }
+      },
+      {
+        "name": "a policy list carries the policy, in the wire names both engines write",
+        "command": "LIST EPISTEMIC POLICIES",
+        "ordered": true,
+        "expect": {
+          "result": [
+            {
+              "id": "kip:policy:baseline",
+              "version": 1,
+              "eligible_modes": [
+                "observed",
+                "stated",
+                "inferred",
+                "imported"
+              ],
+              "accept_threshold": 0.7,
+              "material_threshold": 0.3,
+              "unstated_confidence_weight": 0.5,
+              "conflict_set_expansion": true,
+              "notes": [
+                "mode gates eligibility and never weights a claim: a mode does not grant trust",
+                "corroboration groups are counted once; repetition is not evidence"
+              ]
+            },
+            {
+              "id": "kip:policy:forecast",
+              "version": 1,
+              "eligible_modes": [
+                "predicted",
+                "inferred"
+              ],
+              "accept_threshold": 0.7,
+              "material_threshold": 0.3,
+              "unstated_confidence_weight": 0.5,
+              "conflict_set_expansion": true,
+              "notes": [
+                "mode gates eligibility and never weights a claim: a mode does not grant trust",
+                "corroboration groups are counted once; repetition is not evidence"
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "name": "and DESCRIBE answers about one in exactly the same shape",
+        "command": "DESCRIBE EPISTEMIC POLICY \"kip:policy:forecast\"",
+        "expect": {
+          "result": {
+            "id": "kip:policy:forecast",
+            "version": 1,
+            "eligible_modes": [
+              "predicted",
+              "inferred"
+            ],
+            "accept_threshold": 0.7,
+            "material_threshold": 0.3,
+            "unstated_confidence_weight": 0.5,
+            "conflict_set_expansion": true,
+            "notes": [
+              "mode gates eligibility and never weights a claim: a mode does not grant trust",
+              "corroboration groups are counted once; repetition is not evidence"
+            ]
+          }
+        }
+      }
+    ]
+  },
+  {
     "name": "mutation-selection",
     "description": "A mutation may choose what it acts on. The judgement calls an engine has to make here are what this fixture pins down: UPDATE reaches mutable state and nothing else, a bounded sweep takes a documented order, a selection block reads the transaction's starting state, and a merge consolidates identity without copying or erasing anything.",
     "setup": [
@@ -1586,6 +1816,297 @@ export const FIXTURES: readonly Fixture[] = [
             [
               "C:<1>",
               "concept"
+            ]
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "name": "request-envelope",
+    "description": "Two things the envelope decides rather than the command (§71, §26, §33). `ingest` mints Evidence from the payload the transport carried, so the observation never passes through model-generated command text — the fidelity risk §88.12 names, where a model retyping what it saw truncates or paraphrases it and the record then says the source said something it did not. `execution.idempotency_key` makes a lost response recoverable: a timeout is not an abort, so a resend replays the outcome the first attempt produced rather than writing a second time. Both are envelope contracts, so both are pinned through the envelope.",
+    "setup": [
+      "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" SET FIELDS {canonical_id: \"urn:x:alice\"} }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n}"
+    ],
+    "cases": [
+      {
+        "name": "an ingested payload reaches a command without passing through its text",
+        "command": "CREATE ASSERTION ?a {\n  SET FIELDS { proposition: \"P-1\", asserted_by: \"C-1\", stance: \"support\", mode: \"observed\" }\n  SET STRUCTURAL { (\"evidence\", :msg) {role: \"support\"} }\n}",
+        "envelope": {
+          "ingest": {
+            "evidence": [
+              {
+                "key": "msg",
+                "evidence_class": "user_statement",
+                "payload": "I prefer   dark mode.",
+                "media_type": "text/plain",
+                "source_actor": "urn:x:alice"
+              }
+            ]
+          }
+        },
+        "expect": {}
+      },
+      {
+        "name": "and arrives byte for byte, whitespace and all",
+        "command": "FIND(?e.payload.inline) WHERE { ?e EVIDENCE {} }",
+        "expect": {
+          "result": [
+            "I prefer   dark mode."
+          ]
+        }
+      },
+      {
+        "name": "the source actor is resolved to something a reader can follow",
+        "command": "FIND(?c.name) WHERE { STRUCTURAL (?e, \"source\", ?c) ?c CONCEPT {} }",
+        "expect": {
+          "result": [
+            "Alice"
+          ]
+        }
+      },
+      {
+        "name": "an ingest key a request parameter already claims is refused",
+        "command": "CREATE CONCEPT ?c { TYPE \"Person\" NAME \"Bob\" }",
+        "params": {
+          "msg": "a plain value"
+        },
+        "envelope": {
+          "ingest": {
+            "evidence": [
+              {
+                "key": "msg",
+                "evidence_class": "user_statement",
+                "payload": "hi"
+              }
+            ]
+          }
+        },
+        "expect": {
+          "error": "InvalidRequestEnvelope"
+        }
+      },
+      {
+        "name": "an ingest entry that names neither a payload nor a handle is refused",
+        "command": "CREATE CONCEPT ?c { TYPE \"Person\" NAME \"Bob\" }",
+        "envelope": {
+          "ingest": {
+            "evidence": [
+              {
+                "key": "msg",
+                "evidence_class": "user_statement"
+              }
+            ]
+          }
+        },
+        "expect": {
+          "error": "InvalidRequestEnvelope"
+        }
+      },
+      {
+        "name": "a source actor that resolves to nothing is refused rather than stored as a name",
+        "command": "CREATE CONCEPT ?c { TYPE \"Person\" NAME \"Bob\" }",
+        "envelope": {
+          "ingest": {
+            "evidence": [
+              {
+                "key": "msg",
+                "evidence_class": "user_statement",
+                "payload": "hi",
+                "source_actor": "urn:x:nobody"
+              }
+            ]
+          }
+        },
+        "expect": {
+          "error": "NotFoundOrNotVisible"
+        }
+      },
+      {
+        "name": "a first write under an idempotency key commits",
+        "command": "CREATE CONCEPT ?c { TYPE \"Person\" NAME \"Cass\" }",
+        "envelope": {
+          "execution": {
+            "mode": "independent",
+            "idempotency_key": "key-1"
+          }
+        },
+        "expect": {}
+      },
+      {
+        "name": "a resend under the same key replays rather than writing again",
+        "command": "CREATE CONCEPT ?c { TYPE \"Person\" NAME \"Cass\" }",
+        "envelope": {
+          "execution": {
+            "mode": "independent",
+            "idempotency_key": "key-1"
+          }
+        },
+        "expect": {}
+      },
+      {
+        "name": "so there is one Cass, not two",
+        "command": "FIND(COUNT(?c)) WHERE { ?c CONCEPT {type: \"Person\", name: \"Cass\"} }",
+        "expect": {
+          "result": [
+            1
+          ]
+        }
+      },
+      {
+        "name": "a different key is a different write, which is why the caller chooses it",
+        "command": "CREATE CONCEPT ?c { TYPE \"Person\" NAME \"Cass\" }",
+        "envelope": {
+          "execution": {
+            "mode": "independent",
+            "idempotency_key": "key-2"
+          }
+        },
+        "expect": {}
+      },
+      {
+        "name": "and that one landed",
+        "command": "FIND(COUNT(?c)) WHERE { ?c CONCEPT {type: \"Person\", name: \"Cass\"} }",
+        "expect": {
+          "result": [
+            2
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "name": "retention",
+    "description": "`SET RETENTION` writes storage lifecycle and nothing else (§19). The judgement calls pinned here are the ones an engine gets to make wrong quietly: the block replaces rather than patches, a member outside §19.1's shape is refused rather than stored and lost, and a lapsed `expires_at` changes what a sweep may collect without changing what recall returns — retention says how long the record is kept, never whether the claim still holds.",
+    "setup": [
+      "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?bob { TYPE \"Person\" NAME \"Bob\" }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" }\n}"
+    ],
+    "cases": [
+      {
+        "name": "a retention block is written onto the element the target names",
+        "command": "SET RETENTION ?c {retention_class: \"short\", expires_at: \"2030-01-01T00:00:00Z\"} WHERE { ?c CONCEPT {name: \"Alice\"} }",
+        "expect": {}
+      },
+      {
+        "name": "and reads back through the element's retention hook",
+        "command": "FIND(?c.retention.retention_class) WHERE { ?c CONCEPT {name: \"Alice\"} }",
+        "expect": {
+          "result": [
+            "short"
+          ]
+        }
+      },
+      {
+        "name": "storage lifecycle is not content: the Concept still says what it said",
+        "command": "FIND(?c.name) WHERE { ?c CONCEPT {name: \"Alice\"} }",
+        "expect": {
+          "result": [
+            "Alice"
+          ]
+        }
+      },
+      {
+        "name": "an element the selection block did not reach carries no retention",
+        "command": "FIND(?c.retention.retention_class) WHERE { ?c CONCEPT {name: \"Bob\"} }",
+        "expect": {
+          "result": [
+            null
+          ]
+        }
+      },
+      {
+        "name": "a member outside the hook's shape is refused, not stored and lost",
+        "command": "SET RETENTION ?c {retention_class: \"standard\", review_at: \"2030-01-01T00:00:00Z\"} WHERE { ?c CONCEPT {name: \"Alice\"} }",
+        "expect": {
+          "error": "SchemaFieldNotFound"
+        }
+      },
+      {
+        "name": "a retention_class that is not a string is refused",
+        "command": "SET RETENTION ?c {retention_class: 7} WHERE { ?c CONCEPT {name: \"Alice\"} }",
+        "expect": {
+          "error": "TypeMismatch"
+        }
+      },
+      {
+        "name": "an expires_at that is not a timestamp is refused",
+        "command": "SET RETENTION ?c {expires_at: \"whenever\"} WHERE { ?c CONCEPT {name: \"Alice\"} }",
+        "expect": {
+          "error": "TypeMismatch"
+        }
+      },
+      {
+        "name": "the refused blocks left the recorded one alone",
+        "command": "FIND(?c.retention.retention_class) WHERE { ?c CONCEPT {name: \"Alice\"} }",
+        "expect": {
+          "result": [
+            "short"
+          ]
+        }
+      },
+      {
+        "name": "the block replaces rather than patches",
+        "command": "SET RETENTION ?c {expires_at: \"2031-01-01T00:00:00Z\"} WHERE { ?c CONCEPT {name: \"Alice\"} }",
+        "expect": {}
+      },
+      {
+        "name": "so a member the new block omits is cleared, not carried forward",
+        "command": "FIND(?c.retention.retention_class) WHERE { ?c CONCEPT {name: \"Alice\"} }",
+        "expect": {
+          "result": [
+            null
+          ]
+        }
+      },
+      {
+        "name": "a lapsed retention is a sweep's business, not recall's",
+        "command": "SET RETENTION ?c {retention_class: \"short\", expires_at: \"2020-01-01T00:00:00Z\"} WHERE { ?c CONCEPT {name: \"Bob\"} }",
+        "expect": {}
+      },
+      {
+        "name": "the element is still active and still recalled until a Principal asks",
+        "command": "FIND(?c.name) WHERE { ?c CONCEPT {name: \"Bob\"} }",
+        "expect": {
+          "result": [
+            "Bob"
+          ]
+        }
+      },
+      {
+        "name": "a direct target needs no selection block",
+        "command": "SET RETENTION :target {retention_class: \"standard\"}",
+        "params": {
+          "target": "C-3"
+        },
+        "expect": {}
+      },
+      {
+        "name": "and writes the block it was given",
+        "command": "FIND(?c.retention.retention_class) WHERE { ?c CONCEPT {name: \"Dark\"} }",
+        "expect": {
+          "result": [
+            "standard"
+          ]
+        }
+      },
+      {
+        "name": "a bounded sweep takes as many as LIMIT allows and no more",
+        "command": "SET RETENTION ?c {retention_class: \"capped\"} WHERE { ?c CONCEPT {type: \"Person\"} } LIMIT 1",
+        "expect": {}
+      },
+      {
+        "name": "LIMIT cuts in ascending element id, so the cut is repeatable",
+        "command": "FIND(?c.name, ?c.retention.retention_class) WHERE { ?c CONCEPT {type: \"Person\"} } ORDER BY ?c.name",
+        "ordered": true,
+        "expect": {
+          "result": [
+            [
+              "Alice",
+              "capped"
+            ],
+            [
+              "Bob",
+              "short"
             ]
           ]
         }
@@ -1947,6 +2468,159 @@ export const FIXTURES: readonly Fixture[] = [
     ]
   },
   {
+    "name": "structural-core-fields",
+    "description": "`STRUCTURAL` reaches both structural planes (§8.2, §17). A Profile field is addressed by its resolved symbol; a Core field — an Assertion's `evidence` and `context`, an Evidence record's `source` and `generated_by`, an Activity's `inputs`, `outputs` and `associated_actors` — is addressed by its plain name. That is what gives \"which Assertions cite this Evidence\" a spelling. The two planes are told apart by name and never merged, so a Profile field cannot redefine what an Assertion cites, and a Core field reports no `index`: its order is storage order, not a declared position.",
+    "packages": [
+      {
+        "format": "KIP-Schema-Package",
+        "manifest": {
+          "package_id": "kip://test/structural-core-probe",
+          "version": "1.0.0"
+        },
+        "definitions": {
+          "concept_types": {
+            "Note": {
+              "kind": "ConceptType",
+              "description": "A note that cites other notes."
+            }
+          },
+          "structural_fields": {
+            "evidence": {
+              "kind": "StructuralFieldDefinition",
+              "description": "A Profile field that happens to share a Core field's name, to prove the two planes stay apart.",
+              "source": {
+                "concept_types": [
+                  "kip://test/structural-core-probe@1.0.0/Note"
+                ]
+              },
+              "target": {
+                "kinds": [
+                  "Concept"
+                ]
+              },
+              "ordered": true
+            },
+            "reviewed": {
+              "kind": "StructuralFieldDefinition",
+              "description": "What an element was reviewed against. Carried by any kind, to prove a Profile field is not a Concept's alone.",
+              "source": {
+                "kinds": [
+                  "Concept",
+                  "Assertion",
+                  "Activity",
+                  "Evidence"
+                ]
+              },
+              "target": {
+                "kinds": [
+                  "Concept"
+                ]
+              },
+              "ordered": false
+            }
+          }
+        }
+      }
+    ],
+    "setup": [
+      "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" }\n  CREATE CONCEPT ?note { TYPE \"Note\" NAME \"A note\" }\n  CREATE CONCEPT ?citing {\n    TYPE \"Note\"\n    NAME \"Citing note\"\n    SET STRUCTURAL { (\"evidence\", ?note) }\n  }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE EVIDENCE ?e {\n    SET FIELDS {\n      evidence_class: \"user_statement\",\n      payload: \"I prefer dark mode.\",\n      content_digest: \"sha3-256:d1ge5t\",\n      media_type: \"text/plain\",\n      observed_at: \"2026-08-16T09:00:00Z\"\n    }\n  }\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 }\n    SET STRUCTURAL { (\"evidence\", ?e) {role: \"support\"} }\n  }\n  CREATE ACTIVITY ?run {\n    SET FIELDS {activity_class: \"semantic_consolidation\", status: \"completed\"}\n    SET STRUCTURAL {\n      (\"inputs\", ?alice)\n      (\"outputs\", ?dark)\n      (\"associated_actors\", ?alice)\n      (\"reviewed\", ?note)\n    }\n  }\n}"
+    ],
+    "cases": [
+      {
+        "name": "which Assertions cite this Evidence has a spelling",
+        "command": "FIND(?a.id) WHERE { ?a ASSERTION {} STRUCTURAL (?a, \"evidence\", ?e) ?e EVIDENCE {} }",
+        "expect": {
+          "result": [
+            "A:<1>"
+          ]
+        }
+      },
+      {
+        "name": "and it answers the other way round too",
+        "command": "FIND(?e.evidence_class) WHERE { STRUCTURAL (:a, \"evidence\", ?e) ?e EVIDENCE {} }",
+        "params": {
+          "a": "A-1"
+        },
+        "expect": {
+          "result": [
+            "user_statement"
+          ]
+        }
+      },
+      {
+        "name": "an Activity's inputs and outputs are the same kind of field",
+        "command": "FIND(?c.name) WHERE { STRUCTURAL (?x, \"inputs\", ?c) ?c CONCEPT {} }",
+        "expect": {
+          "result": [
+            "Alice"
+          ]
+        }
+      },
+      {
+        "name": "so are its outputs",
+        "command": "FIND(?c.name) WHERE { STRUCTURAL (?x, \"outputs\", ?c) ?c CONCEPT {} }",
+        "expect": {
+          "result": [
+            "Dark"
+          ]
+        }
+      },
+      {
+        "name": "a Core field an element does not carry matches nothing rather than erroring",
+        "command": "FIND(?c) WHERE { STRUCTURAL (?e, \"source\", ?c) }",
+        "expect": {
+          "result": []
+        }
+      },
+      {
+        "name": "the bound edge names the Core field plainly, and reports no declared position",
+        "command": "FIND(?edge.field, ?edge.index) WHERE { ?edge STRUCTURAL (:a, \"evidence\", ?e) }",
+        "params": {
+          "a": "A-1"
+        },
+        "expect": {
+          "result": [
+            [
+              "evidence",
+              null
+            ]
+          ]
+        }
+      },
+      {
+        "name": "a Profile field of the same name is a different edge, and keeps its symbol",
+        "command": "FIND(?edge.field, ?edge.index) WHERE { ?edge STRUCTURAL (?n, \"evidence\", ?t) ?n CONCEPT {name: \"Citing note\"} }",
+        "expect": {
+          "result": [
+            [
+              "kip://test/structural-core-probe@1.0.0/evidence",
+              0
+            ]
+          ]
+        }
+      },
+      {
+        "name": "a name that is neither a Core field nor a declared symbol is refused",
+        "command": "FIND(?c) WHERE { STRUCTURAL (?x, \"not_a_field\", ?c) }",
+        "expect": {
+          "error": "SchemaSymbolNotFound"
+        }
+      },
+      {
+        "name": "a Profile field on a record is reachable from a bound source, not just from a Concept",
+        "command": "FIND(?edge.field) WHERE { ?edge STRUCTURAL (:run, \"reviewed\", ?t) }",
+        "params": {
+          "run": "X-1"
+        },
+        "expect": {
+          "result": [
+            "kip://test/structural-core-probe@1.0.0/reviewed"
+          ]
+        }
+      }
+    ]
+  },
+  {
     "name": "transactions",
     "description": "A MUTATE block is one transaction, not a script that happens to run in order: everything in it commits or none of it does. A precondition that fails leaves the element exactly as the caller last saw it, and the two guards ask different questions — EXPECT VERSION about what the caller read, EXPECT STATE about the engine state, which is not an Assertion's epistemic status.",
     "setup": [
@@ -2105,4 +2779,4 @@ export const FIXTURES: readonly Fixture[] = [
 ] as unknown as Fixture[]
 
 /** The total number of cases, so a silent shrink is visible. */
-export const CASE_COUNT = 183
+export const CASE_COUNT = 224

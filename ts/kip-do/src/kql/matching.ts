@@ -777,13 +777,44 @@ function bindTerm(
 // --- structural patterns ----------------------------------------------------
 
 /**
- * `STRUCTURAL (?src, "field", ?dst)` — Profile record topology.
+ * Which element kind owns each Core structural field (§8.2), and where the
+ * rendered view keeps it.
  *
- * Profile fields only, which is a known gap rather than a design: an
- * Assertion's `evidence` and an Activity's `inputs` are Core structural fields
- * living in typed columns, and this pattern cannot reach them, so "which
- * Assertions cite this Evidence" has no spelling yet. The reverse index in
- * `element_refs` already holds the answer; the pattern is what does not ask it.
+ * These are the fields the protocol defines rather than a Profile: they live in
+ * typed columns, KML routes them apart from the generic `structural` map, and
+ * `STRUCTURAL` reaches them by the same plain names the write path uses. A
+ * Profile field is addressed by its resolved symbol and can therefore never
+ * collide with one of these, which is what stops a Profile named `evidence`
+ * from quietly redefining what an Assertion cites.
+ */
+const CORE_STRUCTURAL_FIELDS: Readonly<
+  Record<string, { kind: ElementKind; view: string }>
+> = {
+  evidence: { kind: 'Assertion', view: 'evidence' },
+  context: { kind: 'Assertion', view: 'context_refs' },
+  source: { kind: 'Evidence', view: 'source' },
+  generated_by: { kind: 'Evidence', view: 'generated_by' },
+  inputs: { kind: 'Activity', view: 'inputs' },
+  outputs: { kind: 'Activity', view: 'outputs' },
+  associated_actors: { kind: 'Activity', view: 'associated_actors' },
+}
+
+/**
+ * `STRUCTURAL (?src, "field", ?dst)` — record topology.
+ *
+ * Both planes, addressed the same way: a Profile structural field resolves
+ * through the Schema Environment to a symbol, and a Core one (§8.2) is named
+ * plainly. So "which Assertions cite this Evidence" is
+ * `STRUCTURAL (?a, "evidence", :e)`, and it reads the same reverse index a
+ * purge planner walks rather than a second enumeration that could disagree
+ * with it.
+ *
+ * The two are never merged. A name is looked up on each plane independently,
+ * and `?edge.field` carries the full symbol for a Profile field and the plain
+ * name for a Core one, so a result says which plane it came from. A Profile
+ * that declares a field named `evidence` therefore adds edges rather than
+ * changing what an Assertion cites — and a caller that wants only the Profile
+ * one addresses it by its full symbol.
  */
 function structural(
   cx: Context,
@@ -797,115 +828,207 @@ function structural(
   b: ReadBindings,
 ): Solution[] {
   const name = 'Name' in clause.field ? clause.field.Name : String(parameterValue(b, clause.field.Param))
-  const symbol = cx.env.resolveSymbol('StructuralField', name, 'read')
-  const field = formatSymbolRef(symbol)
-  // §17.4: an ordered field exposes each reference's current position as
-  // `?edge.index`; an unordered one exposes no index at all, so the member
-  // reads null there rather than reporting a position the field does not have.
-  const pkg = cx.env.definitionPackage(symbol)
-  const ordered =
-    (pkg === undefined ? undefined : structuralFieldDef(pkg, symbol.name))
-      ?.ordered === true
+
+  // Both planes are consulted, and a name resolves on each independently. In
+  // the ordinary case exactly one answers, so this reads as one lookup. When
+  // both do — a Profile that declared a field named `source` — the pattern
+  // reports the edges of both rather than picking a winner, and `?edge.field`
+  // says which plane each came from: the Core one plainly, the Profile one by
+  // its full symbol. Silently preferring either would be the failure this
+  // routing exists to prevent, in one direction or the other.
+  const core = Object.hasOwn(CORE_STRUCTURAL_FIELDS, name)
+    ? CORE_STRUCTURAL_FIELDS[name]!
+    : null
+  let symbol: ReturnType<Context['env']['resolveSymbol']> | null = null
+  try {
+    symbol = cx.env.resolveSymbol('StructuralField', name, 'read')
+  } catch (err) {
+    // A name that answers on neither plane is the caller's mistake, and the
+    // schema layer's message is the one that says what to do about it.
+    if (core === null) throw err
+  }
+
+  /** One structural plane, and how to read it. */
+  interface Plane {
+    /** What `?edge.field` reports: a plain Core name or a full symbol. */
+    field: string
+    /** How the reverse index spells it. */
+    indexed: string
+    /** Whether §17.4 gives this field a declared position. */
+    ordered: boolean
+    /**
+     * The kind that can carry it.
+     *
+     * Two different uses, and they are not the same question. For an unbound
+     * source it is the kind to scan — Profile fields are scanned over Concepts
+     * because that is where they are declared in practice, and scanning one
+     * kind is what keeps an unbound source from walking the whole Space. For a
+     * *bound* source it filters only when `exclusive`: a Core field lives in a
+     * column its owning kind alone has, but every element carries the generic
+     * `structural` map, so an Assertion with a Profile field is a real answer.
+     */
+    holder: ElementKind
+    /** Whether `holder` is the only kind that can carry this field at all. */
+    exclusive: boolean
+    /** Where a rendered view keeps it. */
+    read: (view: JsonMap) => Json | undefined
+  }
+
+  const planes: Plane[] = []
+  if (core !== null) {
+    planes.push({
+      field: name,
+      // Core fields are recorded under their plain names; Profile ones are
+      // prefixed, so a Profile `inputs` and an Activity's stay different edges.
+      indexed: name,
+      // A Core field declares no order — the write path appends rather than
+      // honoring `AT` — so it reports none, and a caller is not invited to
+      // treat storage order as a position.
+      ordered: false,
+      holder: core.kind,
+      exclusive: true,
+      read: (view) => view[core.view],
+    })
+  }
+  if (symbol !== null) {
+    const field = formatSymbolRef(symbol)
+    const pkg = cx.env.definitionPackage(symbol)
+    planes.push({
+      field,
+      indexed: `structural:${field}`,
+      // §17.4: an ordered field exposes each reference's current position as
+      // `?edge.index`; an unordered one exposes no index at all, so the member
+      // reads null there rather than reporting a position the field lacks.
+      ordered:
+        (pkg === undefined ? undefined : structuralFieldDef(pkg, symbol.name))
+          ?.ordered === true,
+      // Every element carries the generic `structural` map, but only a Concept
+      // is ever a Profile field's source in practice, and scanning one kind is
+      // what keeps an unbound source from being a whole-Space walk.
+      holder: 'Concept',
+      exclusive: false,
+      read: (view) =>
+        isJsonMap(view.structural) ? view.structural[field] : undefined,
+    })
+  }
+
   // §43.7: the bound edge is *virtual* structural query state, explicitly "not
   // necessarily a durable Cognitive Element" — so it binds as the value it is,
   // describing the reference rather than standing in for a record Core does
   // not keep.
-  const edge = (source: string, target: Json, index: number | null): Json =>
+  const edge = (
+    plane: Plane,
+    source: string,
+    target: Json,
+    index: number | null,
+  ): Json =>
     ({
       source: { id: source },
-      field,
+      field: plane.field,
       target,
-      index: ordered ? index : null,
+      index: plane.ordered ? index : null,
     }) as Json
 
   const out: Solution[] = []
   if (cx.historical) {
-    for (const solution of incoming) {
-      const fixedSource = termEndpoint(clause.subject, solution, b)
-      const fixedId =
-        isJsonMap(fixedSource) && typeof fixedSource.id === 'string'
-          ? tryParseElementId(fixedSource.id)
-          : null
-      const sources =
-        fixedSource === null
-          ? cx.reconstruct('Concept').map((element) => ({
-              kind: element.kind,
-              seq: element.row.id,
-            } as ElementId))
-          : fixedId?.kind === 'Concept'
-            ? [fixedId]
-            : []
+    for (const plane of planes) {
+      for (const solution of incoming) {
+        const fixedSource = termEndpoint(clause.subject, solution, b)
+        const fixedId =
+          isJsonMap(fixedSource) && typeof fixedSource.id === 'string'
+            ? tryParseElementId(fixedSource.id)
+            : null
+        const sources =
+          fixedSource === null
+            ? cx.reconstruct(plane.holder).map((element) => ({
+                kind: element.kind,
+                seq: element.row.id,
+              } as ElementId))
+            : fixedId === null || (plane.exclusive && fixedId.kind !== plane.holder)
+              ? []
+              : [fixedId]
 
-      for (const src of sources) {
-        const view = cx.view(src)
-        const structural = view === null ? null : view.structural
-        const references = isJsonMap(structural) ? structural[field] : null
-        if (!Array.isArray(references)) continue
-        for (const [position, reference] of references.entries()) {
-          if (!isJsonMap(reference) || typeof reference.id !== 'string') continue
-          const dst = tryParseElementId(reference.id)
-          if (dst === null || cx.view(dst) === null) continue
-          let current: Solution | null = solution
-          current = bindTerm(current, clause.subject, { id: formatElementId(src) }, b)
-          if (current === null) continue
-          current = bindTerm(current, clause.object, reference as Json, b)
-          if (current === null) continue
-          if (clause.variable !== null) {
-            current = extend(
-              current,
-              clause.variable,
-              literalBinding(edge(formatElementId(src), reference as Json, position)),
-            )
+        for (const src of sources) {
+          const view = cx.view(src)
+          const carried = view === null ? undefined : plane.read(view)
+          // `generated_by` is single-cardinality and renders as one reference
+          // rather than a list; a field with at most one edge is still a field.
+          const references = Array.isArray(carried)
+            ? carried
+            : isJsonMap(carried)
+              ? [carried as Json]
+              : null
+          if (references === null) continue
+          for (const [position, reference] of references.entries()) {
+            if (!isJsonMap(reference) || typeof reference.id !== 'string') continue
+            const dst = tryParseElementId(reference.id)
+            if (dst === null || cx.view(dst) === null) continue
+            let current: Solution | null = solution
+            current = bindTerm(current, clause.subject, { id: formatElementId(src) }, b)
             if (current === null) continue
+            current = bindTerm(current, clause.object, reference as Json, b)
+            if (current === null) continue
+            if (clause.variable !== null) {
+              current = extend(
+                current,
+                clause.variable,
+                literalBinding(
+                  edge(plane, formatElementId(src), reference as Json, position),
+                ),
+              )
+              if (current === null) continue
+            }
+            out.push(current)
           }
-          out.push(current)
         }
       }
     }
     return out
   }
 
-  for (const solution of incoming) {
-    const wheres = ['space = ?', 'field = ?']
-    const values: SqlStorageValue[] = [cx.space, `structural:${field}`]
-    const from = termEndpoint(clause.subject, solution, b)
-    if (isJsonMap(from) && typeof from.id === 'string') {
-      wheres.push('from_id = ?')
-      values.push(from.id)
-    }
-    const to = termEndpoint(clause.object, solution, b)
-    if (isJsonMap(to) && typeof to.id === 'string') {
-      wheres.push('to_id = ?')
-      values.push(to.id)
-    }
-
-    const rows = cx.store.sql
-      .exec<{ from_id: string; to_id: string; ord: number }>(
-        `SELECT from_id, to_id, ord FROM element_refs
-           WHERE ${wheres.join(' AND ')} ORDER BY from_id, ord`,
-        ...values,
-      )
-      .toArray()
-    cx.spend('scans', rows.length)
-
-    for (const row of rows) {
-      const src = parseElementId(row.from_id)
-      const dst = parseElementId(row.to_id)
-      if (cx.view(src) === null || cx.view(dst) === null) continue
-      let current: Solution | null = solution
-      current = bindTerm(current, clause.subject, { id: row.from_id }, b)
-      if (current === null) continue
-      current = bindTerm(current, clause.object, { id: row.to_id }, b)
-      if (current === null) continue
-      if (clause.variable !== null) {
-        current = extend(
-          current,
-          clause.variable,
-          literalBinding(edge(row.from_id, { id: row.to_id } as Json, row.ord)),
-        )
-        if (current === null) continue
+  for (const plane of planes) {
+    for (const solution of incoming) {
+      const wheres = ['space = ?', 'field = ?']
+      const values: SqlStorageValue[] = [cx.space, plane.indexed]
+      const from = termEndpoint(clause.subject, solution, b)
+      if (isJsonMap(from) && typeof from.id === 'string') {
+        wheres.push('from_id = ?')
+        values.push(from.id)
       }
-      out.push(current)
+      const to = termEndpoint(clause.object, solution, b)
+      if (isJsonMap(to) && typeof to.id === 'string') {
+        wheres.push('to_id = ?')
+        values.push(to.id)
+      }
+
+      const rows = cx.store.sql
+        .exec<{ from_id: string; to_id: string; ord: number }>(
+          `SELECT from_id, to_id, ord FROM element_refs
+             WHERE ${wheres.join(' AND ')} ORDER BY from_id, ord`,
+          ...values,
+        )
+        .toArray()
+      cx.spend('scans', rows.length)
+
+      for (const row of rows) {
+        const src = parseElementId(row.from_id)
+        const dst = parseElementId(row.to_id)
+        if (cx.view(src) === null || cx.view(dst) === null) continue
+        let current: Solution | null = solution
+        current = bindTerm(current, clause.subject, { id: row.from_id }, b)
+        if (current === null) continue
+        current = bindTerm(current, clause.object, { id: row.to_id }, b)
+        if (current === null) continue
+        if (clause.variable !== null) {
+          current = extend(
+            current,
+            clause.variable,
+            literalBinding(edge(plane, row.from_id, { id: row.to_id } as Json, row.ord)),
+          )
+          if (current === null) continue
+        }
+        out.push(current)
+      }
     }
   }
   return out

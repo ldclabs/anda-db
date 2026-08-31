@@ -73,7 +73,6 @@ describe('META', () => {
       // A partial capability names what is left rather than shrinking to one
       // word: Governance is enforced at command scope, so the gaps that remain
       // are the element-scope ones, and they are listed as themselves.
-      expect(gaps).toContain('set_retention')
       expect(gaps).toContain('trust_model')
       expect(gaps).toContain('capsule_import')
       expect(gaps).toContain('hop_quantifiers')
@@ -89,6 +88,7 @@ describe('META', () => {
       // reads it and does not try.
       expect(gaps).not.toContain('space_self_identity')
       expect(gaps).not.toContain('retention_expiry')
+      expect(gaps).not.toContain('set_retention')
       // Every gap carries a reason, not just a name.
       for (const entry of report.unsupported) {
         expect(entry.reason.length, entry.capability).toBeGreaterThan(20)
@@ -131,14 +131,47 @@ describe('META', () => {
 
   it('orients an Agent before its first command', async () => {
     await withNexus('primer', (nexus) => {
+      // The key structure is the reference engine's, member for member: a
+      // Primer is the one document every client parses, and `primer.types`
+      // where the other engine writes `primer.schema.types` reads as a Space
+      // with no types rather than as a wrong path.
       const primer = nexus.describe('DESCRIBE PRIMER') as {
-        types: string[]
-        predicates: string[]
-        packages: string[]
+        execution_context: { principal: { authentication_strength: string } }
+        space: { id: string; seq: number }
+        contents: Record<string, number>
+        schema: {
+          environment_version: number
+          types: string[]
+          predicates: string[]
+          facets: string[]
+          structural_fields: string[]
+          packages: string[]
+        }
+        golden_path: string[]
+        capabilities?: unknown
       }
-      expect(primer.types).toContain(`${CM}/Person`)
-      expect(primer.predicates).toContain(`${CM}/prefers`)
-      expect(primer.packages).toContain(CM)
+      expect(primer.schema.types).toContain(`${CM}/Person`)
+      expect(primer.schema.predicates).toContain(`${CM}/prefers`)
+      expect(primer.schema.packages).toContain(CM)
+      expect(primer.space.id).toBe(nexus.space)
+      // A count is a fact about elements a narrower Principal may not
+      // discover, so it is answered whole or withheld with a reason (§88.6).
+      expect(primer.contents.concept).toBe(2)
+      expect(primer.golden_path[0]).toBe('SEARCH or FIND to ground')
+      expect(primer.execution_context.principal.authentication_strength).toBe(
+        'strong',
+      )
+      // `compact` leaves the long documents out; `full` is where they arrive.
+      expect(primer.capabilities).toBeUndefined()
+      expect(
+        (nexus.describe('DESCRIBE PRIMER MODE "full"') as { capabilities: unknown })
+          .capabilities,
+      ).toBeDefined()
+      // The grammar already closes the enum, so this is the parser refusing
+      // before the engine ever sees a mode it does not know.
+      expect(() => nexus.describe('DESCRIBE PRIMER MODE "verbose"')).toThrowError(
+        /compact \| full/,
+      )
     })
   })
 
@@ -168,11 +201,23 @@ describe('META', () => {
       }[]
       const core = packages.find((p) => p.package_ref === 'kip://core@2.0.0')
       expect(core?.state).toBe('active')
-      expect(nexus.describe('LIST TYPES')).toContain(`${CM}/Person`)
-      expect(nexus.describe('LIST EPISTEMIC POLICIES')).toEqual([
-        'kip:policy:baseline',
-        'kip:policy:forecast',
-      ])
+      // A `LIST` row names the symbol both ways — what a command may write,
+      // and what it resolves to — and says which package answers, which is the
+      // same row the reference engine returns.
+      expect(nexus.describe('LIST TYPES')).toContainEqual({
+        ref: `${CM}/Person`,
+        local_name: 'Person',
+        package_ref: CM,
+        status: 'active',
+      })
+      // A policy is listed as the policy, in the wire names the reference
+      // engine writes: `accept` is a threshold and says so, and `modes` gates
+      // eligibility rather than weighting a claim.
+      expect(
+        (nexus.describe('LIST EPISTEMIC POLICIES') as { id: string }[]).map(
+          (policy) => policy.id,
+        ),
+      ).toEqual(['kip:policy:baseline', 'kip:policy:forecast'])
     })
   })
 

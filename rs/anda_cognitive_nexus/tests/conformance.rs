@@ -52,6 +52,13 @@ struct Case {
     /// Whether the order of a top-level result array is part of the contract.
     #[serde(default)]
     ordered: bool,
+    /// Extra request-envelope members, merged over the ones the harness builds.
+    ///
+    /// Most behaviour is decided by the command, but some of it is decided by
+    /// the envelope around the command — `ingest`, `execution.idempotency_key`
+    /// — and those are cross-engine contracts too.
+    #[serde(default)]
+    envelope: Map<String, Json>,
 }
 
 #[derive(Deserialize)]
@@ -115,12 +122,18 @@ async fn execute(
     nexus: &CognitiveNexus,
     command: &str,
     params: &Map<String, Json>,
+    envelope: &Map<String, Json>,
 ) -> (Option<Json>, Option<String>) {
-    let request: Request = serde_json::from_value(json!({
+    let mut body = json!({
         "kip": "2.0",
         "operations": [{"command": command, "parameters": params}]
-    }))
-    .expect("a fixture command must build a request");
+    });
+    let object = body.as_object_mut().expect("the harness builds an object");
+    for (key, value) in envelope {
+        object.insert(key.clone(), value.clone());
+    }
+    let request: Request =
+        serde_json::from_value(body).expect("a fixture command must build a request");
 
     let parsed = match request.operations[0].parse() {
         Ok(parsed) => parsed,
@@ -257,7 +270,7 @@ async fn kip_2_conformance() {
         let nexus = open(&fixture).await;
 
         for (index, command) in fixture.setup.iter().enumerate() {
-            let (_, error) = execute(&nexus, command, &Map::new()).await;
+            let (_, error) = execute(&nexus, command, &Map::new(), &Map::new()).await;
             if let Some(error) = error {
                 failures.push(format!(
                     "{} setup[{index}] failed with {error}:\n{command}",
@@ -268,7 +281,8 @@ async fn kip_2_conformance() {
 
         for case in &fixture.cases {
             cases += 1;
-            let (result, error) = execute(&nexus, &case.command, &case.params).await;
+            let (result, error) =
+                execute(&nexus, &case.command, &case.params, &case.envelope).await;
 
             if let Some(expected) = &case.expect.error {
                 if error.as_deref() != Some(expected.as_str()) {

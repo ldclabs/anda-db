@@ -60,7 +60,7 @@ pub async fn execute(
     // Ingested Evidence is minted before the plan runs, inside this same
     // transaction, so a command can cite it as `:key` and an abort takes it
     // with everything else (§71.1).
-    let ingested = match mint_ingested_evidence(store, &mut tx, request).await {
+    let ingested = match mint_ingested_evidence(store, &mut tx, request, operation).await {
         Ok(bound) => bound,
         Err(err) => {
             tx.abort().await;
@@ -205,6 +205,7 @@ async fn mint_ingested_evidence(
     store: &Store,
     tx: &mut Transaction,
     request: &Request,
+    operation: &Operation,
 ) -> Result<Map<String, Json>, KipError> {
     let Some(ingest) = &request.ingest else {
         return Ok(Map::new());
@@ -216,11 +217,15 @@ async fn mint_ingested_evidence(
         // A request parameter of the same name would make it ambiguous which
         // value the command cited, and the two cannot be reconciled: one is a
         // caller-supplied value, the other is an element this request created.
-        if request
-            .parameters
-            .as_ref()
-            .is_some_and(|parameters| parameters.contains_key(&entry.key))
-        {
+        //
+        // Both levels, because §74 merges them into one binding environment:
+        // checking only the request's would let an operation-level parameter
+        // shadow the ingested reference and leave the Evidence minted, unused
+        // and uncited.
+        let claimed = |parameters: Option<&Map<String, Json>>| {
+            parameters.is_some_and(|parameters| parameters.contains_key(&entry.key))
+        };
+        if claimed(request.parameters.as_ref()) || claimed(operation.parameters.as_ref()) {
             return Err(KipError::invalid_request_envelope(format!(
                 "the ingest key {:?} is also a request parameter; a command citing :{} could \
                  mean either",
@@ -318,6 +323,56 @@ async fn resolve_source_actor(
     )))
 }
 
+/// The response a recorded transaction produced, handed back on a resend.
+///
+/// Everything a receipt carries was written at commit, so this reconstructs the
+/// original answer rather than approximating it. Two things are honestly
+/// different from the first response and say so:
+///
+/// - a replay warning, because a caller that reads it learns its first attempt
+///   landed, which is the fact it resent to find out;
+/// - the original run's own warnings are not persisted and are therefore gone.
+///   A replay that invented them would be worse than one that says nothing.
+pub(crate) fn replay(row: &crate::store::rows::TransactionRow) -> Response {
+    let committed = row.status == "committed";
+    let receipt = anda_kip::Receipt {
+        status: if committed {
+            anda_kip::ReceiptStatus::Committed
+        } else {
+            anda_kip::ReceiptStatus::NoEffect
+        },
+        tx_id: Some(row.tx_id.clone()),
+        space_id: Some(row.space.clone()),
+        snapshot_seq: Some(row.snapshot_seq),
+        space_seq: committed.then_some(row.seq),
+        committed_at: committed.then(|| row.committed_at.clone()),
+        transaction_class: Some(row.transaction_class.clone()),
+        request_digest: None,
+        semantic_plan_digest: None,
+        result_digest: None,
+        schema_environment_version: Some(row.schema_environment_version),
+        change_summary: Some(crate::tx::summarize(&row.changes)),
+        proofs: Vec::new(),
+        extensions: None,
+    };
+    Response {
+        receipt: Some(receipt),
+        warnings: vec![Warning::Message(format!(
+            "this is the recorded outcome of transaction {}, replayed under the idempotency key \
+             it committed with: nothing ran a second time, and any warnings the first attempt \
+             reported are not kept",
+            row.tx_id
+        ))],
+        context: Some(ResponseContext {
+            space_id: Some(row.space.clone()),
+            schema_environment_version: Some(row.schema_environment_version),
+            compatibility_profile_used: None,
+            extensions: None,
+        }),
+        ..Response::ok(row.result.clone())
+    }
+}
+
 fn success(outcome: Outcome, space_id: &str, schema_environment_version: u64) -> Response {
     let warnings: Vec<Warning> = outcome
         .warnings
@@ -368,7 +423,12 @@ fn origin_of(request: &Request, auth: &AuthContext) -> Json {
     Json::Object(origin)
 }
 
-fn idempotency_key(request: &Request, operation: &Operation) -> String {
+/// The key this request commits under, and the one a resend replays.
+///
+/// An operation's own key wins over the request's: a batch that shared one key
+/// across several writes would have the second replay the first, so the
+/// narrower one is the one that means anything.
+pub(crate) fn idempotency_key(request: &Request, operation: &Operation) -> String {
     operation
         .idempotency_key
         .clone()

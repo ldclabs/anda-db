@@ -1650,6 +1650,7 @@ describe('the write path', () => {
         'record_attributed_assertion',
         'retract_own',
         'archive',
+        'moderate_assertion',
       ],
       (nexus, session) => {
         // Written by the system Principal, attributed to Alice. The agent
@@ -1671,6 +1672,86 @@ describe('the write path', () => {
         )
         // The honest alternative is available and needs no impersonation.
         expect(session.execute('ARCHIVE "A-1"').status).toBe('committed')
+      },
+    )
+  })
+
+  it('asks for moderation authority before excluding somebody else\'s claim', async () => {
+    // §29 keeps the two apart: archiving one's own record is tidying, and
+    // administratively excluding a third party's claim is moderation. A Grant
+    // that confers only the first must not buy the second.
+    await withWriter(
+      'moderation',
+      ['create', 'read', 'assert', 'record_attributed_assertion', 'archive', 'tombstone'],
+      (nexus, session) => {
+        nexus.execute(`MUTATE {
+          CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
+          CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+          ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
+          CREATE ASSERTION ?a {
+            SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: "support", mode: "stated", confidence: 0.9 }
+          }
+        }`)
+
+        expect(() => session.execute('ARCHIVE "A-1"')).toThrowError(
+          /requires the moderate_assertion permission/,
+        )
+        expect(() => session.execute('TOMBSTONE "A-1"')).toThrowError(
+          /requires the moderate_assertion permission/,
+        )
+
+        // The Concepts are not Assertions, so nothing about them is moderation
+        // — the gate narrows what it asks for rather than taxing every sweep.
+        expect(session.execute('ARCHIVE "C-2"').status).toBe('committed')
+
+        // And an Assertion this Principal wrote itself is its own to archive.
+        session.execute(`CREATE ASSERTION ?a {
+          SET FIELDS { proposition: "P-1", stance: "support", mode: "inferred", confidence: 0.5 }
+        }`)
+        expect(session.execute('ARCHIVE "A-2"').status).toBe('committed')
+      },
+    )
+  })
+
+  it('asks for identity authority before binding a canonical id', async () => {
+    // §5.4: a `canonical_id` says this Concept *is* the thing another system
+    // names — the identity a Capsule import resolves on and a merge follows.
+    // Deciding that is more authority than editing a label.
+    await withWriter(
+      'canonical-identity',
+      ['create', 'read', 'update'],
+      (_nexus, session) => {
+        expect(() =>
+          session.execute(`CREATE CONCEPT ?c {
+            TYPE "Person" NAME "Alice" SET FIELDS {canonical_id: "urn:x:alice"}
+          }`),
+        ).toThrowError(/requires the bind_canonical_identity permission/)
+
+        // Ordinary grounding state is what `create` and `update` cover.
+        session.execute('CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }')
+        expect(
+          session.execute('UPDATE "C-1" SET FIELDS {name: "Alicia"}').status,
+        ).toBe('committed')
+        expect(() =>
+          session.execute('UPDATE "C-1" SET FIELDS {canonical_id: "urn:x:alice"}'),
+        ).toThrowError(/requires the bind_canonical_identity permission/)
+      },
+    )
+  })
+
+  it('lets the permission that names the act perform it, in both directions', async () => {
+    await withWriter(
+      'canonical-identity-granted',
+      ['create', 'read', 'update', 'bind_canonical_identity'],
+      (_nexus, session) => {
+        session.execute(`CREATE CONCEPT ?c {
+          TYPE "Person" NAME "Alice" SET FIELDS {canonical_id: "urn:x:alice"}
+        }`)
+        // Clearing a binding is the same decision as making one: one that
+        // anybody who may rename the Concept could drop would be no binding.
+        expect(
+          session.execute('UPDATE "C-1" SET FIELDS {canonical_id: ""}').status,
+        ).toBe('committed')
       },
     )
   })
@@ -2054,10 +2135,7 @@ describe('erasure', () => {
 
   it('does not walk past a legal hold', async () => {
     await withNexus('legal-hold', (nexus) => {
-      const element = nexus.store.load(parseElementId('C-2'))
-      if (element === null) throw new Error('C-2 should exist')
-      element.row.retention = { legal_hold: true }
-      nexus.store.put(element, 'update', 'test')
+      nexus.execute('SET RETENTION "C-2" {legal_hold: true}')
 
       // §19.1: the hold is checked before anything destructive is decided, and
       // lifting it is a separate decision under its own permission.
@@ -2097,6 +2175,50 @@ describe('erasure', () => {
           SET FIELDS { retention: {legal_hold: true} }
         }`),
       ).toThrowError(/requires the legal_hold permission/)
+    })
+  })
+
+  it('needs that same permission to lift one, however the block is written', async () => {
+    // The other half of §19.1, and the one a block-replacing clause makes easy
+    // to miss: `SET RETENTION` replaces rather than patches, so a caller who
+    // never mentions `legal_hold` still clears one.
+    await withNexus('hold-lifting', (nexus) => {
+      nexus.execute('SET RETENTION "C-2" {retention_class: "standard", legal_hold: true}')
+
+      const gov = nexus.store.governance
+      gov.ensurePrincipal({ principal_id: 'kip:principal:agent' })
+      gov.createGrant(
+        {
+          space_id: nexus.space,
+          grantee_principal: 'kip:principal:agent',
+          actions: ['read', 'update', 'manage_retention'],
+        },
+        SYSTEM_PRINCIPAL,
+      )
+      const session = nexus.session(principalAuth('kip:principal:agent'))
+
+      // Not naming the member is not a way around the gate on it.
+      expect(() =>
+        session.execute('SET RETENTION "C-2" {retention_class: "standard"}'),
+      ).toThrowError(/requires the legal_hold permission/)
+      // Neither is naming it as false.
+      expect(() =>
+        session.execute(
+          'SET RETENTION "C-2" {retention_class: "standard", legal_hold: false}',
+        ),
+      ).toThrowError(/requires the legal_hold permission/)
+
+      // The hold is still there, and still blocks the erasure it was placed for.
+      expect(() =>
+        nexus.execute('PURGE "C-2" REFERENCE POLICY "tombstone_reference" CONFIRM "PURGE"'),
+      ).toThrowError(/under a legal hold/)
+
+      // A caller who holds `legal_hold` lifts it, which is the point of gating
+      // rather than forbidding.
+      nexus.execute('SET RETENTION "C-2" {retention_class: "standard"}')
+      expect(() =>
+        nexus.execute('PURGE "C-2" REFERENCE POLICY "tombstone_reference" CONFIRM "PURGE"'),
+      ).not.toThrow()
     })
   })
 

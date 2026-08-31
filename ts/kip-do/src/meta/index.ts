@@ -56,7 +56,7 @@ import { executeKml } from '../kml/index.js'
 import { Context } from '../kql/context.js'
 import { bindCoordinate, type KqlContext } from '../kql/index.js'
 import { scalarValue, type ReadBindings } from '../kql/matching.js'
-import { baseline, forecast } from '../projection/policy.js'
+import { baseline, forecast, type Policy } from '../projection/policy.js'
 import { endpointFromJson, endpointLocal } from '../term.js'
 import {
   conceptTypeDef,
@@ -69,6 +69,8 @@ import {
   type SymbolKind,
 } from '../schema/index.js'
 import {
+  State,
+  TABLES,
   pageCursorFromToken,
   pageToken,
   searchIndex,
@@ -238,7 +240,14 @@ function describe(
     } as Json
   }
 
-  if ('Primer' in target) return primer(cx)
+  if ('Primer' in target) {
+    return primer(
+      cx,
+      target.Primer.mode === null
+        ? 'compact'
+        : text(target.Primer.mode, b, 'DESCRIBE PRIMER MODE'),
+    )
+  }
   if ('Space' in target) {
     const name =
       target.Space.value === null ? cx.space : text(target.Space.value, b, 'SPACE')
@@ -340,7 +349,7 @@ function describe(
         ? baseline().id
         : text(target.EpistemicPolicy.value, b, 'DESCRIBE EPISTEMIC POLICY')
     for (const policy of [baseline(), forecast()]) {
-      if (policy.id === named) return policy as unknown as Json
+      if (policy.id === named) return policyJson(policy)
     }
     throw errors.projectionPolicyUnavailable(
       `no Epistemic Policy named ${JSON.stringify(named)} is available here`,
@@ -411,11 +420,26 @@ function describe(
   )
 }
 
-/** The orientation an Agent needs before its first command. */
-function primer(cx: MetaContext): Json {
+/**
+ * The orientation an Agent reads first (§64).
+ *
+ * Ordered by what a caller has to know before it can do anything useful: where
+ * it is, what the schema lets it say, what the engine can do, and the
+ * invariants that will otherwise bite it.
+ *
+ * The key structure is the reference engine's, member for member. A Primer is
+ * the one document every client parses, so two shapes for it is the divergence
+ * that costs the most: `primer.schema.types` on one engine and `primer.types`
+ * on the other reads as a Space with no types rather than as a wrong path.
+ */
+function primer(cx: MetaContext, mode: string): Json {
+  if (mode !== 'compact' && mode !== 'full') {
+    throw errors.invalidSyntax(
+      `DESCRIBE PRIMER MODE takes "compact" or "full", got ${JSON.stringify(mode)}`,
+    )
+  }
   const space = cx.store.space(cx.space)
-  return {
-    kip: KIP_VERSION,
+  const primer: JsonMap = {
     // §64.2 is a MUST: the Primer distinguishes the authenticated Principal
     // from the semantic `$self`. They answer different questions — who is
     // asking, and who this Brain is — and an Agent that conflates them will
@@ -424,28 +448,39 @@ function primer(cx: MetaContext): Json {
       principal: {
         id: cx.authority.principal.principal_id,
         authenticated: cx.authority.principal.principal_class !== 'anonymous',
+        authentication_strength: cx.auth.auth_strength,
       },
       note:
         'the Principal is the authenticated caller, never the semantic actor ' +
         'a claim is attributed to (§13.3)',
     },
     cognitive_identity: selfIdentity(space?.self_concept ?? ''),
-    space_id: cx.space,
-    schema_environment_version: cx.env.version,
-    packages: cx.env.packageRefs(),
-    types: symbolList(cx.env, 'ConceptType'),
-    predicates: symbolList(cx.env, 'PredicateType'),
-    facets: symbolList(cx.env, 'Facet'),
-    structural_fields: symbolList(cx.env, 'StructuralField'),
-    grammar: { parser: parserVersion(), spec_revision: specRevision() },
+    space: {
+      id: cx.space,
+      name: space?.name ?? '',
+      description: space?.description ?? '',
+      seq: space?.seq ?? 0,
+    },
+    contents: contents(cx),
+    schema: {
+      environment_version: cx.env.version,
+      packages: cx.env.packageRefs(),
+      types: symbolRefs(cx.env, 'ConceptType'),
+      predicates: symbolRefs(cx.env, 'PredicateType'),
+      facets: symbolRefs(cx.env, 'Facet'),
+      structural_fields: symbolRefs(cx.env, 'StructuralField'),
+      note:
+        'Concept types are schema-defined: a mutation never creates one. ' +
+        'Activate a Schema Package first.',
+    },
     // §64.3's list, in full. Each one is a distinction a caller will otherwise
     // collapse, and collapsing any of them is how a memory system starts
     // asserting things nobody said.
     safety_invariants: [
       'a Proposition existing is not the Proposition being true; use BELIEF ' +
         'for belief and raw patterns for audit',
-      'a missing visible match is not falsehood; insufficient means "not ' +
-        'enough basis", never "no"',
+      "a missing visible match is not falsehood; insufficient means 'not " +
+        "enough basis', never 'no'",
       'a SEARCH score is not a confidence, and a miss is not an absence',
       'confidence is how strongly an assertor took its own stance; it is not ' +
         'trust in the source',
@@ -461,10 +496,55 @@ function primer(cx: MetaContext): Json {
       'retention.expires_at is when the record stops being kept, not when the ' +
         'claim stops applying',
     ],
-    note:
-      'Concept types are schema-defined: a mutation never creates one. ' +
-      'Activate a Schema Package first.',
-  } as Json
+    golden_path: [
+      'SEARCH or FIND to ground',
+      'exact id',
+      'BELIEF or FIND',
+      'MUTATE',
+    ],
+  }
+  if (mode === 'full') {
+    primer.capabilities = capabilities()
+    primer.protocol = protocol()
+  }
+  return primer as Json
+}
+
+/**
+ * How many elements of each kind the Space holds.
+ *
+ * Only answered for a caller whose read authority reaches the whole Space
+ * (§88.6). A count is a fact about elements a narrower Principal may not
+ * discover, and a Space-wide number is exactly the leak §103 lists — so a
+ * restricted caller is told the number is being withheld, and why, rather than
+ * being handed a smaller one that reads as the whole truth.
+ *
+ * Answered from the authority rather than by counting what survives the
+ * filter, because producing the number and then hiding it is one accident away
+ * from returning it.
+ */
+function contents(cx: MetaContext): Json {
+  if (!cx.authority.readsWholeSpace(cx.auth)) {
+    return {
+      withheld:
+        "this Principal's read authority is narrower than the Space, and a " +
+        'Space-wide count would report elements it may not discover',
+    }
+  }
+  const out: JsonMap = {}
+  for (const [kind, table] of Object.entries(TABLES)) {
+    const row = cx.store.sql
+      .exec<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM ${table} WHERE space = ? AND state = ?`,
+        cx.space,
+        State.ACTIVE,
+      )
+      .toArray()[0]
+    // Keyed by the wire tag, lowercase, the way `?c.kind` answers and the way
+    // the reference engine writes it.
+    out[kind.toLowerCase()] = row?.n ?? 0
+  }
+  return out as Json
 }
 
 /**
@@ -524,14 +604,78 @@ function symbol(cx: MetaContext, kind: SymbolKind, name: string): Json {
   } as Json
 }
 
-function symbolList(env: SchemaEnvironment, kind: SymbolKind): string[] {
-  const out: string[] = []
+/**
+ * Every symbol of one kind the environment resolves, as `LIST` reports them.
+ *
+ * A row rather than a bare reference, and the same row
+ * `rs/anda_cognitive_nexus` produces — a `LIST` answer is read by clients that
+ * talk to both engines, and two shapes for one command is the divergence that
+ * costs the most to find: a reader written for objects gets an empty result
+ * from an engine that hands back strings, and an empty result reads as an
+ * empty Space rather than as a wrong shape.
+ *
+ * `local_name` is what a command may write and `ref` is what it resolves to;
+ * `status` is why both are needed, because a deprecated package still resolves
+ * a qualified reference while no longer answering a bare local name (§20.12).
+ */
+/**
+ * One Epistemic Policy, in the shape `DESCRIBE` and `LIST` both report.
+ *
+ * The wire names, which are not this engine's internal ones: `accept` is a
+ * threshold and says so, and `modes` is an eligibility gate rather than a
+ * weighting — the two notes are carried because a reader that assumed
+ * otherwise would read a projection's score as a probability. The same shape
+ * `rs/anda_cognitive_nexus` writes, so a client parses one policy document
+ * whichever engine answered.
+ */
+function policyJson(policy: Policy): Json {
+  return {
+    id: policy.id,
+    version: policy.version,
+    eligible_modes: policy.modes,
+    accept_threshold: policy.accept,
+    material_threshold: policy.material,
+    unstated_confidence_weight: policy.unstated_confidence,
+    conflict_set_expansion: policy.expand_conflicts,
+    notes: [
+      'mode gates eligibility and never weights a claim: a mode does not ' +
+        'grant trust',
+      'corroboration groups are counted once; repetition is not evidence',
+    ],
+  } as Json
+}
+
+function symbolList(env: SchemaEnvironment, kind: SymbolKind): Json[] {
+  const out: Json[] = []
   for (const reference of env.packageRefs()) {
     const artifact = env.artifact(reference)
     if (artifact === undefined) continue
-    for (const name of symbols(artifact, kind)) out.push(`${reference}/${name}`)
+    const packageId = packageIdOf(reference)
+    for (const name of symbols(artifact, kind)) {
+      out.push({
+        ref: `${reference}/${name}`,
+        local_name: name,
+        package_ref: reference,
+        status: env.state(packageId),
+      })
+    }
   }
-  return out.sort()
+  return out.sort((a, b) =>
+    String((a as { ref: string }).ref).localeCompare(
+      String((b as { ref: string }).ref),
+    ),
+  )
+}
+
+/** The package id half of a `package_id@version` reference. */
+function packageIdOf(packageRef: string): string {
+  const at = packageRef.lastIndexOf('@')
+  return at === -1 ? packageRef : packageRef.slice(0, at)
+}
+
+/** The same symbols as bare references, for the places that report names. */
+function symbolRefs(env: SchemaEnvironment, kind: SymbolKind): string[] {
+  return symbolList(env, kind).map((entry) => (entry as { ref: string }).ref)
 }
 
 // --- LIST -------------------------------------------------------------------
@@ -583,7 +727,7 @@ function list(command: ListCommand, cx: MetaContext, b: ReadBindings): Json {
     case 'StructuralFields':
       return page(symbolList(cx.env, 'StructuralField'))
     case 'EpistemicPolicies':
-      return page([baseline().id, forecast().id])
+      return page([policyJson(baseline()), policyJson(forecast())])
     case 'Dependents':
       return page(dependents(command, cx, b))
   }

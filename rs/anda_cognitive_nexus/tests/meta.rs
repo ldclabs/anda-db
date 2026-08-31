@@ -280,10 +280,14 @@ async fn an_unavailable_search_mode_is_refused_rather_than_downgraded() {
     );
 
     // And a kind with no text index says so rather than returning nothing.
+    //
+    // `UnsupportedCapability`, not `SearchIndexUnavailable`: the second carries
+    // the `safe_same_request` retry class, and telling an Agent to re-run a
+    // search that can never work is a retry loop wearing a diagnosis.
     let no_index = run(&nexus, r#"SEARCH ASSERTION "anything""#).await;
     assert_eq!(
         no_index.error.as_ref().unwrap().code.as_str(),
-        "SearchIndexUnavailable"
+        "UnsupportedCapability"
     );
 }
 

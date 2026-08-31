@@ -502,9 +502,13 @@ async fn primer(cx: &mut Context<'_>, mode: Option<&Scalar>) -> Result<Json, Kip
         "contents": counts,
         "schema": {
             "environment_version": cx.env.version,
-            "packages": cx.env.lock.packages,
+            "packages": package_refs(cx),
             "types": symbol_names(cx, SymbolKind::ConceptType),
             "predicates": symbol_names(cx, SymbolKind::PredicateType),
+            "facets": symbol_names(cx, SymbolKind::Facet),
+            "structural_fields": symbol_names(cx, SymbolKind::StructuralField),
+            "note": "Concept types are schema-defined: a mutation never creates one. \
+                     Activate a Schema Package first.",
         },
         // These are the distinctions a caller will otherwise get wrong, and
         // getting them wrong is how a memory system starts asserting things
@@ -728,6 +732,21 @@ fn symbol(cx: &mut Context<'_>, kind: SymbolKind, scalar: &Scalar) -> Result<Jso
     }))
 }
 
+/// Every symbol of one kind the environment resolves, as `LIST` reports them.
+///
+/// A row rather than a bare reference, and the same row `ts/kip-do` produces —
+/// a `LIST` answer is read by clients that talk to both engines, and two shapes
+/// for one command is the divergence that costs the most to find: a reader
+/// written for objects gets an empty result from an engine that hands back
+/// strings, and an empty result reads as an empty Space rather than as a wrong
+/// shape.
+///
+/// `local_name` is what a command may write and `ref` is what it resolves to;
+/// `status` is why both are needed, because a deprecated package still resolves
+/// a qualified reference while no longer answering a bare local name (§20.12).
+///
+/// Sorted by `ref`, so a `LIMIT` cuts the same rows twice and the two engines
+/// page the same list.
 fn symbols(cx: &Context<'_>, kind: SymbolKind) -> Vec<Json> {
     let mut out = Vec::new();
     for (package_id, version) in &cx.env.lock.packages {
@@ -744,7 +763,30 @@ fn symbols(cx: &Context<'_>, kind: SymbolKind) -> Vec<Json> {
             }));
         }
     }
+    out.sort_by(|a, b| {
+        a["ref"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(b["ref"].as_str().unwrap_or_default())
+    });
     out
+}
+
+/// The package references this environment resolves.
+///
+/// A flat list of `package_id@version`, which is what `ts/kip-do` reports and
+/// what a caller can hand straight back as a qualified symbol's prefix — the
+/// `{id: version}` map it used to be needed reassembling before it was usable.
+fn package_refs(cx: &Context<'_>) -> Vec<String> {
+    let mut refs: Vec<String> = cx
+        .env
+        .lock
+        .packages
+        .iter()
+        .map(|(package_id, version)| format!("{package_id}@{version}"))
+        .collect();
+    refs.sort();
+    refs
 }
 
 fn symbol_names(cx: &Context<'_>, kind: SymbolKind) -> Vec<String> {

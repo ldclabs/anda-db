@@ -364,6 +364,19 @@ impl Context<'_> {
 
     /// Matches `?edge STRUCTURAL (?src, "field", ?dst)` — record topology.
     ///
+    /// Both planes, addressed the same way: a Profile structural field resolves
+    /// through the Schema Environment to a symbol, and a Core one (§8.2) is
+    /// named plainly. So "which Assertions cite this Evidence" is
+    /// `STRUCTURAL (?a, "evidence", :e)`.
+    ///
+    /// The two are never merged. A name is looked up on each plane
+    /// independently, and `?edge.field` carries the full symbol for a Profile
+    /// field and the plain name for a Core one, so a result says which plane
+    /// it came from. A Profile that declares a field named `evidence`
+    /// therefore adds edges rather than changing what an Assertion cites — and
+    /// a caller that wants only the Profile one addresses it by its full
+    /// symbol.
+    ///
     /// A structural reference is never a semantic Proposition (§17.3): this
     /// pattern reports how records are assembled, and a claim *about* that
     /// relation would be a separate Proposition plus Assertion.
@@ -385,30 +398,64 @@ impl Context<'_> {
                 }
             },
         };
-        let symbol = self
+        // Both planes are consulted, and a name resolves on each independently.
+        // In the ordinary case exactly one answers, so this reads as one
+        // lookup. When both do — a Profile that declared a field named
+        // `source` — the pattern reports the edges of both rather than picking
+        // a winner. Silently preferring either would be the failure this
+        // routing exists to prevent, in one direction or the other.
+        let core = core_structural_field(&name);
+        let resolved = self
             .env
-            .resolve_symbol(SymbolKind::StructuralField, &name, Intent::Read)?;
-        // §17.4: an ordered field exposes each reference's current position as
-        // `?edge.index`; an unordered one exposes no index at all, so the
-        // member reads null there rather than reporting a position the field
-        // does not have.
-        let ordered = self
-            .env
-            .structural_field_def(&symbol)
-            .map(|def| def.ordered)
-            .unwrap_or(false);
+            .resolve_symbol(SymbolKind::StructuralField, &name, Intent::Read);
+        // A name that answers on neither plane is the caller's mistake, and the
+        // schema layer's message is the one that says what to do about it.
+        let symbol = match resolved {
+            Ok(symbol) => Some(symbol),
+            Err(err) if core.is_none() => return Err(err),
+            Err(_) => None,
+        };
+
+        let mut planes: Vec<StructuralPlane> = Vec::new();
+        if let Some((kind, member)) = core {
+            planes.push(StructuralPlane {
+                field: name.clone(),
+                member: member.to_string(),
+                in_structural_map: false,
+                // A Core field declares no order — the write path appends
+                // rather than honoring `AT` — so it reports none, and a caller
+                // is not invited to treat storage order as a position.
+                ordered: false,
+                holder: kind,
+                exclusive: true,
+            });
+        }
+        if let Some(symbol) = &symbol {
+            // §17.4: an ordered field exposes each reference's current position
+            // as `?edge.index`; an unordered one exposes no index at all, so
+            // the member reads null there rather than reporting a position the
+            // field does not have.
+            let ordered = self
+                .env
+                .structural_field_def(symbol)
+                .map(|def| def.ordered)
+                .unwrap_or(false);
+            planes.push(StructuralPlane {
+                field: symbol.to_string(),
+                member: symbol.to_string(),
+                in_structural_map: true,
+                ordered,
+                // Every element carries the generic map, but only a Concept is
+                // ever a Profile field's source in practice, and scanning one
+                // kind is what keeps an unbound source from being a whole-Space
+                // walk.
+                holder: ElementKind::Concept,
+                exclusive: false,
+            });
+        }
 
         let source = self.endpoint_slot(subject)?;
         let target = self.endpoint_slot(object)?;
-
-        // Structural fields live in one map per element, so the source side is
-        // the only one an index narrows; an unbound source means scanning the
-        // Space's Concepts.
-        let sources: Vec<ElementId> = match &source {
-            EndpointSlot::Fixed(Endpoint::Local(id)) => vec![*id],
-            _ => self.active_concepts().await?,
-        };
-        self.charge(sources.len())?;
 
         let mut vars: Vec<String> = Vec::new();
         if let Some(edge) = edge {
@@ -423,54 +470,81 @@ impl Context<'_> {
         }
 
         let mut rows = Vec::new();
-        for id in sources {
-            let Some(element) = self.load(id).await? else {
-                continue;
+        for plane in &planes {
+            // Structural fields live on one element each, so the source side is
+            // the only one an index narrows; an unbound source means scanning
+            // the kind that could carry the field.
+            let sources: Vec<ElementId> = match &source {
+                EndpointSlot::Fixed(Endpoint::Local(id)) => {
+                    if plane.exclusive && id.kind != plane.holder {
+                        vec![]
+                    } else {
+                        vec![*id]
+                    }
+                }
+                _ => self.active_of(plane.holder).await?,
             };
-            if element.space() != self.space || !element.is_active() {
-                continue;
-            }
-            let rendered = self.view_of(id);
-            let Some(refs) = rendered
-                .get("structural")
-                .and_then(|value| value.get(symbol.to_string()))
-                .and_then(Json::as_array)
-            else {
-                continue;
-            };
-            for (position, reference) in refs.iter().enumerate() {
-                let bound = endpoint_binding(reference);
-                if let EndpointSlot::Fixed(expected) = &target
-                    && endpoint_binding(&expected.to_json()) != bound
-                {
+            self.charge(sources.len())?;
+
+            for id in sources {
+                let Some(element) = self.load(id).await? else {
+                    continue;
+                };
+                if element.space() != self.space || !element.is_active() {
                     continue;
                 }
-                let mut solution = vec![Binding::Null; vars.len()];
-                if let Some(edge) = edge {
-                    // §43.7: the bound edge is *virtual* structural query
-                    // state, explicitly "not necessarily a durable Cognitive
-                    // Element" — so it binds as the value it is, describing
-                    // the reference rather than standing in for a record Core
-                    // does not keep.
-                    set(
-                        &vars,
-                        &mut solution,
-                        edge,
-                        Binding::Literal(serde_json::json!({
-                            "source": {"id": id.to_string()},
-                            "field": symbol.to_string(),
-                            "target": reference.clone(),
-                            "index": ordered.then_some(position),
-                        })),
-                    );
+                let rendered = self.view_of(id);
+                // A Core field is a column of its own; a Profile one lives in
+                // the generic map under its resolved symbol.
+                let carried = if plane.in_structural_map {
+                    rendered
+                        .get("structural")
+                        .and_then(|value| value.get(&plane.member))
+                } else {
+                    rendered.get(&plane.member)
+                };
+                // `generated_by` is single-cardinality and renders as one
+                // reference rather than a list; a field with at most one edge
+                // is still a field.
+                let refs: Vec<Json> = match carried {
+                    Some(Json::Array(items)) => items.clone(),
+                    Some(value @ Json::Object(_)) => vec![value.clone()],
+                    _ => continue,
+                };
+                for (position, reference) in refs.iter().enumerate() {
+                    let bound = endpoint_binding(reference);
+                    if let EndpointSlot::Fixed(expected) = &target
+                        && endpoint_binding(&expected.to_json()) != bound
+                    {
+                        continue;
+                    }
+                    let mut solution = vec![Binding::Null; vars.len()];
+                    if let Some(edge) = edge {
+                        // §43.7: the bound edge is *virtual* structural query
+                        // state, explicitly "not necessarily a durable
+                        // Cognitive Element" — so it binds as the value it is,
+                        // describing the reference rather than standing in for
+                        // a record Core does not keep.
+                        set(
+                            &vars,
+                            &mut solution,
+                            edge,
+                            Binding::Literal(serde_json::json!({
+                                "source": {"id": id.to_string()},
+                                "field": plane.field.clone(),
+                                "target": reference.clone(),
+                                "index": plane.ordered.then_some(position),
+                            })),
+                        );
+                    }
+                    if let EndpointSlot::Bind(name) = &source {
+                        set(&vars, &mut solution, name, Binding::Element(id));
+                    }
+                    if let EndpointSlot::Bind(name) = &target {
+                        set(&vars, &mut solution, name, bound);
+                    }
+                    rows.push(solution);
                 }
-                if let EndpointSlot::Bind(name) = &source {
-                    set(&vars, &mut solution, name, Binding::Element(id));
-                }
-                if let EndpointSlot::Bind(name) = &target {
-                    set(&vars, &mut solution, name, bound);
-                }
-                rows.push(solution);
             }
         }
         if vars.is_empty() {
@@ -1304,4 +1378,56 @@ impl Context<'_> {
         }
         Ok(Solutions::table(vars, rows))
     }
+}
+
+/// The Core structural fields (§8.2), by the kind that owns each and the view
+/// member that carries it.
+///
+/// These are the fields the protocol defines rather than a Profile: they live
+/// in typed columns, KML routes them apart from the generic `structural` map,
+/// and `STRUCTURAL` reaches them by the same plain names the write path uses.
+const CORE_STRUCTURAL_FIELDS: &[(&str, ElementKind, &str)] = &[
+    ("evidence", ElementKind::Assertion, "evidence"),
+    ("context", ElementKind::Assertion, "context_refs"),
+    ("source", ElementKind::Evidence, "source"),
+    ("generated_by", ElementKind::Evidence, "generated_by"),
+    ("inputs", ElementKind::Activity, "inputs"),
+    ("outputs", ElementKind::Activity, "outputs"),
+    (
+        "associated_actors",
+        ElementKind::Activity,
+        "associated_actors",
+    ),
+];
+
+/// Which kind owns a Core structural field, and where its view keeps it.
+fn core_structural_field(name: &str) -> Option<(ElementKind, &'static str)> {
+    CORE_STRUCTURAL_FIELDS
+        .iter()
+        .find(|(field, _, _)| *field == name)
+        .map(|(_, kind, member)| (*kind, *member))
+}
+
+/// One structural plane a `STRUCTURAL` pattern reads, and how to read it.
+struct StructuralPlane {
+    /// What `?edge.field` reports: a plain Core name or a full symbol.
+    field: String,
+    /// Where the rendered view keeps it.
+    member: String,
+    /// Whether that member sits inside the generic `structural` map.
+    in_structural_map: bool,
+    /// Whether §17.4 gives this field a declared position.
+    ordered: bool,
+    /// The kind that can carry it.
+    ///
+    /// Two different uses, and they are not the same question. For an unbound
+    /// source it is the kind to scan — Profile fields are scanned over Concepts
+    /// because that is where they are declared in practice, and scanning one
+    /// kind is what keeps an unbound source from walking the whole Space. For a
+    /// *bound* source it filters only when `exclusive`: a Core field lives in a
+    /// column its owning kind alone has, but every element carries the generic
+    /// `structural` map, so an Assertion with a Profile field is a real answer.
+    holder: ElementKind,
+    /// Whether `holder` is the only kind that can carry this field at all.
+    exclusive: bool,
 }
