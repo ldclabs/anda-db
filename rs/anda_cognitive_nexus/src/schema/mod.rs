@@ -33,6 +33,10 @@ pub mod validate;
 
 pub use apply::EndpointFacts;
 pub use env::{Intent, PackageState, SchemaEnvironment, SchemaLock};
+pub use package::FacetDef;
 pub use package::SchemaPackage;
 pub use symbol::{PackageRef, SymbolKind, SymbolRef, Version};
-pub use validate::{Severity, Validation, Violation};
+pub use validate::{
+    Severity, Validation, Violation, validate_attribute_mutability, validate_attributes,
+    validate_facet_mutability,
+};

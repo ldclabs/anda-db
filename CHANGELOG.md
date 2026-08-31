@@ -205,6 +205,189 @@ holding Skills written against the old vocabulary needs a migration:
   standing, exactly as source trust (§39.5) and source authority (§41.4) never
   transfer.
 
+### Fixed — a Facet assignment is judged as the merge it is
+
+Both engines validated `UPDATE ... SET FACET` in ways that no Profile had yet
+exercised, because no shipped Facet had required or immutable members. The
+first one that does — `OutcomeRecord` — found three things:
+
+- **`anda_cognitive_nexus` validated the assignment, not the result.** A Facet
+  assignment merges (§59), so `SET FACET "OutcomeRecord" {magnitude: 0.25}`
+  read as a Facet missing the two required members the element already carried.
+  The merged state is now what the schema is shown, which is what `@ldclabs/
+  kip-do` already did.
+- **Neither engine held `mutable: false`.** Both had written the checker and
+  neither called it. A declared-immutable member may now be established once
+  and never rewritten, and erasing it through `UNSET FACET` is refused as the
+  rewrite-to-absent it is. A grade its subject can edit is not a grade.
+- **`@ldclabs/kip-do` refused every `UPDATE` on a record.** The gate was per
+  element, so an Evidence's Facets were write-once-at-creation and
+  `OutcomeRecord` could never establish an optional member. Gating is now per
+  action, matching the Rust engine: `SET FIELDS`, `SET ATTRIBUTES` and
+  structural mutation still refuse a record with the code that names the legal
+  ritual (`EpistemicRevisionRequired`, `EvidenceCorrectionRequired`,
+  `InvalidLifecycleTransition`), and Facets — representation-local state, none
+  of it truth (§18.1) — are reachable on every kind.
+
+### Fixed — a schema contract that only held at creation
+
+Both engines validated a Concept's attributes when it was created and never
+again, so every constraint a type declares was one `UPDATE` away from being
+bypassed:
+
+```prolog
+UPDATE :skill SET ATTRIBUTES {status: "validated"}   -- succeeded
+```
+
+`validated` has not been a lifecycle state since this release, and the write
+went through anyway. So did a required attribute unset out of existence, a
+string attribute overwritten with a number, and a value outside a declared
+range. Both engines now validate the attribute map a statement *leaves behind*
+against the Concept's type, and both wire up the `mutable: false` checkers they
+had already written and never called (the Facet twins landed with
+`OutcomeRecord`, above).
+
+- Validated once per element after every action, not per action:
+  `UNSET ATTRIBUTES {summary} SET ATTRIBUTES {summary: …}` passes through a
+  state with no `summary` at all, and what a type requires is a statement about
+  the element when the statement ends, not about the order its clauses were
+  written in.
+- Only when the statement writes attributes. An `UPDATE` that decays a Facet
+  was not asked anything about the attributes, and refusing it for drift that
+  predates it would make an unrelated clause the place a stale element finally
+  fails.
+- Immutability is judged against the element as the statement found it, so a
+  `mutable: false` attribute can still be established once and never rewritten.
+- A Concept whose type this environment cannot resolve is not refused: a type
+  that cannot be read declares no contract to hold the write to, which is the
+  stance a Proposition already takes on an unresolvable predicate.
+  Deactivating a package stops validating its elements; it does not start
+  refusing them.
+- `UPSERT CONCEPT` goes through the same check on both halves in both engines.
+
+### Fixed — `@ldclabs/kip-do` never asked what a reference pointed at
+
+A Schema Package says what may occupy each end of a tuple and what kind of
+element may carry a Facet (§41–§44, §58). The reference engine checks those;
+`@ldclabs/kip-do` had the `EndpointSpec` type, exported an `isUnconstrained`
+nobody called, and checked nothing. So the two engines disagreed about every
+package that constrains an endpoint — including the bundled Profile, where
+`prefers` relates a Person to a Concept:
+
+```prolog
+ENSURE PROPOSITION ?p (?alice, "prefers", "dark")   -- refused by one engine only
+```
+
+`@ldclabs/kip-do` now carries `checkEndpoint` with the reference engine's
+semantics, including the parts that are easy to get subtly wrong: an endpoint
+this Space cannot resolve is reported as unknown rather than as wrong, because
+inventing a violation out of a failed lookup would refuse legitimate
+cross-Space data; a Concept whose type was never looked up is not a Concept of
+the wrong type; a disallowed *kind* is refused before the Concept-type question
+is asked, since an Activity is not a Concept of the wrong type but not a
+Concept at all; and an element the same transaction just created resolves,
+or a block that mints a Concept and then points at it would look untyped to
+itself. It is wired at the two places the reference engine wires it — a
+predicate's subject and object, and a Facet's carrier — and violations arrive
+as `ConstraintViolation` like every other schema refusal.
+
+### Fixed — a Facet is state about the Concept type it names, not just the kind
+
+The carrier check only ever saw the element's Core kind, in both engines: the
+reference engine passed `schema_ref: None`, so `SkillUtility` — which declares
+`concept_types: [Skill]` — was refused on an Evidence and accepted on a Person.
+Half of the declaration was unenforceable. Both engines now supply the
+carrier's own type, so a Facet declaring Concept types refuses a record (which
+cannot be a Concept of any type) *and* a Concept of another type. A carrier
+whose type was not supplied is still not a Concept of the wrong one.
+
+### Fixed — structural fields are held to the ends they declare
+
+`has_step` says an Experience holds ordered, distinct ExperienceSteps. Neither
+engine checked the ends: `@ldclabs/kip-do` validated cardinality and uniqueness
+and never endpoint types, and the reference engine validated none of the three
+on a write — `prepare_structural` existed and was called only from its own unit
+tests. Both engines now validate a Concept's Profile structural map against the
+declarations, endpoints and cardinality and uniqueness together, because they
+are one declaration: an engine that counted references without asking what they
+were would admit the wrong kind of element as long as it came alone.
+
+Judged on the element's whole structural map after the statement rather than on
+the clause, since a minimum cardinality is a statement about what the element
+holds and `UNSET STRUCTURAL` can break it as easily as `SET` can. A field this
+environment cannot resolve declares nothing to hold the write to and is skipped,
+the stance a Proposition already takes on an unresolvable predicate. Writing the
+same reference twice remains one edge rather than a duplicate — which is why a
+`unique` declaration is not violable through a set clause, and the suite now
+says so.
+
+### Fixed — `UPSERT CONCEPT` no longer mints an unvalidated Concept
+
+An upsert's insert half wrote a Concept without checking it against its type in
+either engine, so required attributes could be skipped by spelling a create as
+an upsert. `CREATE CONCEPT` has always been held to §36; the insert half now is
+too, whether or not the clause writes attributes.
+
+### Fixed — `@ldclabs/kip-do` had two spellings of "write mutable Concept state"
+
+Its `UPSERT` merged Facets inline instead of running the clauses `UPDATE` runs,
+so an upsert skipped the merged-result validation and the §39 immutability check
+that the update path applies. Both now go through the same applier — which is
+the arrangement the reference engine already had, and the reason `UNSET FACET`
+was once accepted, parsed and silently dropped.
+
+Two smaller divergences in the same area, also `@ldclabs/kip-do` moving to the
+reference engine's behaviour:
+
+- **The element is rendered once per statement, not once per action** (§52.4).
+  Re-rendering let two clauses on the same Facet member compound, so what the
+  second one was refused for depended on what the first had just written.
+- **An emptied Facet is removed rather than left as `{}`.** A Facet present
+  with no members reads as "carried, and every member unknown".
+
+### Fixed — an endpoint declaration now reads the same in both directions
+
+An `EndpointSpec` naming only `datatypes` refused a Literal of the wrong
+datatype and then let an element reference through, in both engines: the
+element branch checked `kinds` and `concept_types`, found neither declared, and
+returned. So the same declaration meant "this end carries text" when a Literal
+arrived and "this end carries anything" when a reference did.
+
+Both engines now refuse a reference on a datatype-only end, exactly as they
+already refused a Literal on an end that names kinds or Concept types. An end
+that names both still accepts both, and an end this Space cannot resolve is
+still unknown rather than wrong. Only a package that declares a datatype-only
+endpoint is affected; nothing in the bundled Profile does.
+
+### Added — conformance: `schema-endpoints`
+
+`fixtures/kip-conformance-2.0/schema-endpoints.json`, 21 cases over a Schema
+Package the fixture declares itself: a tuple whose ends match, a subject and an
+object of the wrong Concept type, a Literal where a reference is declared and a
+reference where a Literal is, a Literal of the wrong datatype, an end that
+declares both forms and takes both, an unresolvable end that is unknown rather
+than wrong, a Concept the same transaction just minted, a Facet carried by the
+kind it declares and by neither a record nor a Concept of another type, a
+structural edge held to both of its ends, and the cardinality and idempotent-set
+behaviour of a field declared unique.
+
+### Added — conformance: `consequence`
+
+`fixtures/kip-conformance-2.0/consequence.json`, 24 cases run by both engines:
+the graded index and the family it joins on, the scoring handle a Skill cannot
+be compiled without, the retired lifecycle words refused at creation *and* at
+update, a grade that cannot be rewritten or erased or extended, an optional
+member established once, a statement judged by the state it ends in rather than
+its clause order, and the F.6 verdict landing as one guarded statement whose
+rule and graded inputs are still on the record afterwards. It is also the first
+fixture to declare a Schema Package of its own — a `GradedRun` type with an
+immutable `run_id`, because a verdict binds to what it actually graded and
+relabelling the run afterwards would move a grade onto something else. Two
+further cases place each Facet on the kind it is about: the graded index on the
+Evidence rather than on the cognition it grades, the tallies on the Skill rather
+than on the outcome that moved them. With `schema-endpoints`, the suite goes
+115 → 162 cases.
+
 ### Changed — vendored artifacts
 
 - `rs/anda_kip/{SPECIFICATION,KIPSyntax,SelfInstructions,SystemInstructions}.md`,

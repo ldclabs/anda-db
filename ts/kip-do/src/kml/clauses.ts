@@ -55,10 +55,15 @@ import type {
 import {
   facetDef,
   formatSymbolRef,
+  predicateDef,
   structuralFieldDef,
   validateAttributes,
   validateFacet,
+  validateFacetCarrier,
+  validatePredicateEndpoints,
   validateStructural,
+  validateStructuralEndpoints,
+  type EndpointFacts,
   type StructuralFieldDef,
   type SymbolKind,
 } from '../schema/index.js'
@@ -75,11 +80,19 @@ import {
   endpointKey,
   endpointToJson,
   tupleKey,
+  type Endpoint,
 } from '../term.js'
 import { normalizeTime } from '../time.js'
+import { render } from '../view.js'
 import type { Transaction } from '../tx.js'
 import { resolveTargets } from './select.js'
-import { applyAction, requireUpdatable } from './update.js'
+import {
+  applyAction,
+  carrierOf,
+  checkAttributes,
+  touchesAttributes,
+  touchesStructural,
+} from './update.js'
 import {
   assignments,
   bindings,
@@ -233,9 +246,17 @@ export function apply(
         tx.expectVersion(id, numberOf(b, expect_version, 'EXPECT VERSION'))
       }
       const element = tx.load(id)
-      requireUpdatable(id, element)
       const before = JSON.stringify(element.row)
-      for (const action of actions) applyAction(tx, b, element, action)
+      const attributesBefore =
+        element.kind === 'Concept' ? { ...element.row.attributes } : {}
+      // Rendered once: every action of one UPDATE reads the element as it was
+      // when the statement began (§52.4).
+      const view = render(element)
+      for (const action of actions) applyAction(tx, b, element, action, view)
+      if (touchesAttributes(actions)) {
+        checkAttributes(tx, element, attributesBefore)
+      }
+      if (touchesStructural(actions)) checkStructural(tx, element)
       if (JSON.stringify(element.row) !== before) tx.markChanged(id, 'update')
     }
     return
@@ -307,7 +328,13 @@ function createConcept(tx: Transaction, b: Bindings, clause: ConceptCreate): voi
   )
   const attributes =
     clause.set_attributes === null ? {} : assignments(b, clause.set_attributes)
-  const facets = resolveFacets(tx, b, clause.set_facets)
+  // Kind only: these Facets are re-checked against the Concept's resolved type
+  // by `validateAttributes`' neighbour below, once the type symbol is known.
+  const facets = resolveFacets(tx, b, clause.set_facets, {
+    kind: 'element',
+    elementKind: 'Concept',
+    schemaRef: formatSymbolRef(symbol),
+  })
   const structural = collectStructural(tx, b, clause.set_structural, [])
 
   const key = fields.text('key')
@@ -349,6 +376,7 @@ function createConcept(tx: Transaction, b: Bindings, clause: ConceptCreate): voi
   const element: Element = { kind: 'Concept', row }
   tx.authorizeCreated(element, 'create')
   tx.stageNew(id, element)
+  checkStructural(tx, element)
 }
 
 function createRecord(
@@ -364,7 +392,11 @@ function createRecord(
   const fields = new Fields(
     clause.set_fields === null ? {} : assignments(b, clause.set_fields),
   )
-  const facets = resolveFacets(tx, b, clause.set_facets)
+  // A record is not a Concept and has no type to name.
+  const facets = resolveFacets(tx, b, clause.set_facets, {
+    kind: 'element',
+    elementKind: kind,
+  })
   const structural = collectStructural(tx, b, clause.set_structural, CORE_STRUCTURAL[kind])
   const retention = fields.json('retention')
   authorizeRetention(tx, retention)
@@ -486,6 +518,7 @@ function createRecord(
     tx.authorizeCreated(element, 'create')
   }
   tx.stageNew(id, element)
+  checkStructural(tx, element)
 }
 
 /**
@@ -608,6 +641,7 @@ function upsertConcept(tx: Transaction, b: Bindings, clause: ConceptUpsert): voi
     tx.authorizeElement(existing, 'update')
   }
   const before = JSON.stringify(element.row)
+  const attributesBefore = { ...element.row.attributes }
 
   if (clause.set_attributes !== null) {
     Object.assign(element.row.attributes, assignments(b, clause.set_attributes))
@@ -618,20 +652,15 @@ function upsertConcept(tx: Transaction, b: Bindings, clause: ConceptUpsert): voi
   if (clause.set_fields !== null) {
     applyConceptFields(tx, element.row, new Fields(assignments(b, clause.set_fields)))
   }
-  for (const [symbolText, values] of Object.entries(resolveFacets(tx, b, clause.set_facets))) {
-    element.row.facets[symbolText] = {
-      ...(element.row.facets[symbolText] as JsonMap | undefined),
-      ...(values as JsonMap),
-    }
+  // An upsert's Facet clauses are the same clauses `UPDATE` runs, so they go
+  // through the same applier: merged-result validation and §39 immutability
+  // are not something a second spelling of the same write may skip.
+  const upsertView = render(element)
+  for (const assignment of clause.set_facets) {
+    applyAction(tx, b, element, { SetFacet: assignment }, upsertView)
   }
   for (const unset of clause.unset_facets) {
-    const symbolText = formatSymbolRef(
-      tx.env.resolveSymbol('Facet', symbolName(b, unset.facet), 'write'),
-    )
-    const facet = element.row.facets[symbolText]
-    if (isJsonMap(facet)) {
-      for (const field of unset.fields) delete facet[field]
-    }
+    applyAction(tx, b, element, { UnsetFacet: unset }, upsertView)
   }
   if (clause.set_structural !== null) {
     const edges = collectStructural(tx, b, clause.set_structural, [])
@@ -656,6 +685,22 @@ function upsertConcept(tx: Transaction, b: Bindings, clause: ConceptUpsert): voi
         )
       }
     }
+  }
+
+  // An upsert is a create or an update (§51), and either half leaves a Concept
+  // its type has to still accept. The insert half is checked even when the
+  // clause writes no attributes: a create leaves a Concept its type accepts or
+  // it does not happen (§36), and `CREATE CONCEPT` has always been held to
+  // that.
+  if (
+    found === null ||
+    clause.set_attributes !== null ||
+    clause.unset_attributes !== null
+  ) {
+    checkAttributes(tx, element, attributesBefore)
+  }
+  if (clause.set_structural !== null || clause.unset_structural !== null) {
+    checkStructural(tx, element)
   }
 
   // A clause that computes the state an element is already in changes nothing:
@@ -724,6 +769,16 @@ function ensureProposition(
     'write',
   )
   const predicateRef = formatSymbolRef(predicate)
+  const definition = tx.env.definitionPackage(predicate)
+  const def = definition === undefined ? undefined : predicateDef(definition, predicate.name)
+  if (def !== undefined) {
+    validatePredicateEndpoints(
+      predicateRef,
+      def,
+      factsFor(tx, subject),
+      factsFor(tx, object),
+    ).throwIfInvalid()
+  }
   const key = tupleKey(tx.cx.space, subject, predicateRef, object)
 
   const found = tx.store.propositionByTuple(key)
@@ -1298,11 +1353,24 @@ function applyConceptFields(tx: Transaction, row: ConceptRow, fields: Fields): v
 
 // --- facets and structural fields -------------------------------------------
 
-/** Resolves each Facet symbol to its exact reference and validates its members. */
+/**
+ * Resolves each Facet symbol to its exact reference and validates it.
+ *
+ * `carrier` is what the Facet is being attached to: a Facet declares what it
+ * is state *about*, so `OutcomeRecord` — the graded index over an instrument's
+ * output — is refused on anything but Evidence rather than stored under a name
+ * that would then mean something the Profile never said (§58).
+ *
+ * The check reads the carrier's Core kind, not which Concept type it is: a
+ * Facet declaring `concept_types` refuses a record, which cannot be a Concept
+ * of any type, and accepts any Concept. The reference engine draws the line in
+ * the same place, and `schema-endpoints` in the conformance suite pins it.
+ */
 function resolveFacets(
   tx: Transaction,
   b: Bindings,
   list: readonly FacetAssignment[],
+  carrier: EndpointFacts,
 ): JsonMap {
   const out: JsonMap = {}
   for (const entry of list) {
@@ -1311,7 +1379,11 @@ function resolveFacets(
     const values = assignments(b, entry.values)
     const definition = tx.env.definitionPackage(symbol)
     const def = definition === undefined ? undefined : facetDef(definition, symbol.name)
-    if (def !== undefined) validateFacet(text, def, values).throwIfInvalid()
+    if (def !== undefined) {
+      validateFacetCarrier(text, def, carrier)
+        .extend(validateFacet(text, def, values))
+        .throwIfInvalid()
+    }
     out[text] = { ...(out[text] as JsonMap | undefined), ...values }
   }
   return out
@@ -1457,6 +1529,71 @@ export function sameReference(stored: Json, given: Json): boolean {
   return jsonEquals(stored, given)
 }
 
+/**
+ * Validates one element's Profile structural fields against their declarations
+ * (§62–§66).
+ *
+ * Endpoint types, cardinality and uniqueness together, because they are one
+ * declaration: `has_step` says an Experience holds ordered, distinct
+ * ExperienceSteps, and an engine that counted them without asking what they
+ * were would admit the wrong kind of element as long as it came alone.
+ *
+ * Judged on the element's whole structural map after the statement, not on the
+ * clause: a minimum cardinality is a statement about what the element holds,
+ * and `UNSET STRUCTURAL` can break it as easily as `SET` can.
+ */
+export function checkStructural(tx: Transaction, element: Element): void {
+  const source = carrierOf(element)
+  for (const [field, refs] of Object.entries(element.row.structural)) {
+    if (!Array.isArray(refs)) continue
+    const symbol = tx.env.resolveSymbol('StructuralField', field, 'write')
+    const definition = tx.env.definitionPackage(symbol)
+    const def =
+      definition === undefined ? undefined : structuralFieldDef(definition, symbol.name)
+    // A field this environment cannot resolve declares nothing to hold the
+    // write to, the same stance a Proposition takes on an unresolvable
+    // predicate.
+    if (def === undefined) continue
+    const endpoints = refs.map((value) => endpointFromJson(value))
+    validateStructuralEndpoints(
+      field,
+      def,
+      source,
+      endpoints.map((endpoint) => factsFor(tx, endpoint)),
+    )
+      .extend(validateStructural(field, def, endpoints.map(endpointKey)))
+      .throwIfInvalid()
+  }
+}
+
+/**
+ * What this engine knows about one endpoint, for the schema to judge (§42–§44).
+ *
+ * A staged element is the authority: within a transaction, a reference to
+ * something an earlier clause just created must see it, or a Proposition whose
+ * subject the same block minted would look untyped.
+ *
+ * A canonical identity or a foreign Space reference resolves to nothing here,
+ * and that is reported as unknown rather than as wrong — inventing a violation
+ * from an unresolved lookup would reject legitimate cross-Space data.
+ */
+function factsFor(tx: Transaction, endpoint: Endpoint): EndpointFacts {
+  if (endpoint.kind === 'literal') {
+    return { kind: 'literal', datatype: endpoint.literal.datatype }
+  }
+  if (endpoint.kind !== 'local') return { kind: 'unresolved' }
+  const elementKind = endpoint.id.kind
+  if (elementKind !== 'Concept') return { kind: 'element', elementKind }
+  const staged = tx.stagedConceptType(endpoint.id)
+  const schemaRef =
+    staged ?? (tx.store.load(endpoint.id)?.row as ConceptRow | undefined)?.schema_ref
+  return {
+    kind: 'element',
+    elementKind,
+    schemaRef: schemaRef === undefined || schemaRef === '' ? undefined : schemaRef,
+  }
+}
+
 function collectStructural(
   tx: Transaction,
   b: Bindings,
@@ -1493,20 +1630,6 @@ function collectStructural(
     }
     placeReference(items, value, index, orderedField(tx, text), text)
     out.profile[text] = items
-  }
-
-  for (const [text, values] of Object.entries(out.profile)) {
-    const symbol = tx.env.resolveSymbol('StructuralField', text, 'write')
-    const definition = tx.env.definitionPackage(symbol)
-    const def =
-      definition === undefined ? undefined : structuralFieldDef(definition, symbol.name)
-    if (def !== undefined && Array.isArray(values)) {
-      validateStructural(
-        text,
-        def,
-        values.map((value) => endpointKey(endpointFromJson(value))),
-      ).throwIfInvalid()
-    }
   }
 
   const leftover = [...out.core.keys()].filter((f) => !coreFields.includes(f))

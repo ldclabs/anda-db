@@ -276,11 +276,38 @@ pub fn validate_attributes(
     result
 }
 
-/// Reports attributes that changed despite being declared immutable (§39).
+/// Reports members that changed despite being declared immutable (§39).
 ///
 /// Needs both states because immutability is a statement about a transition,
-/// not about a value: the same attribute map is fine on creation and illegal as
-/// an edit.
+/// not about a value: the same map is fine on creation and illegal as an edit.
+fn validate_mutability(
+    schema_ref: &str,
+    prefix: &str,
+    declared: &BTreeMap<String, FieldSpec>,
+    before: &Map<String, Json>,
+    after: &Map<String, Json>,
+    what: &str,
+    result: &mut Validation,
+) {
+    for (name, field) in declared {
+        if field.mutable {
+            continue;
+        }
+        let old = before.get(name);
+        // Setting an immutable member that was never set is establishing it,
+        // not changing it; only a change to an existing value is refused.
+        if old.is_some() && old != after.get(name) {
+            result.push(error(
+                "SCHEMA_IMMUTABLE_FIELD",
+                schema_ref,
+                &format!("{prefix}.{name}"),
+                format!("the schema declares this {what} immutable; record a new element instead of rewriting it"),
+            ));
+        }
+    }
+}
+
+/// Reports attributes that changed despite being declared immutable (§39).
 pub fn validate_attribute_mutability(
     schema_ref: &str,
     spec: &AttributeSpec,
@@ -288,24 +315,41 @@ pub fn validate_attribute_mutability(
     after: &Map<String, Json>,
 ) -> Validation {
     let mut result = Validation::default();
-    for (name, field) in &spec.fields {
-        if field.mutable {
-            continue;
-        }
-        let old = before.get(name);
-        // Setting an immutable attribute that was never set is establishing
-        // it, not changing it; only a change to an existing value is refused.
-        if old.is_some() && old != after.get(name) {
-            result.push(error(
-                "SCHEMA_IMMUTABLE_FIELD",
-                schema_ref,
-                &format!("attributes.{name}"),
-                "the schema declares this attribute immutable; record a new element or a new \
-                 Assertion instead of rewriting it"
-                    .to_string(),
-            ));
-        }
-    }
+    validate_mutability(
+        schema_ref,
+        "attributes",
+        &spec.fields,
+        before,
+        after,
+        "attribute",
+        &mut result,
+    );
+    result
+}
+
+/// Reports Facet members that changed despite being declared immutable (§39).
+///
+/// A Facet is representation-local state and most of it is meant to move —
+/// that is what metabolism does to `MnemonicState`. A member the Profile pins
+/// down is the exception, and it is the whole point of the ones that are
+/// pinned: `OutcomeRecord` is the graded index over what the world did, and an
+/// actor that can rewrite its own grade has not been graded.
+pub fn validate_facet_mutability(
+    schema_ref: &str,
+    def: &FacetDef,
+    before: &Map<String, Json>,
+    after: &Map<String, Json>,
+) -> Validation {
+    let mut result = Validation::default();
+    validate_mutability(
+        schema_ref,
+        "facets",
+        &def.fields,
+        before,
+        after,
+        "Facet member",
+        &mut result,
+    );
     result
 }
 
@@ -499,6 +543,49 @@ mod tests {
             &map(json!({"birth_date": "1970-01-01", "nickname": "A"})),
         );
         assert!(untouched.is_valid());
+    }
+
+    #[test]
+    fn an_immutable_facet_member_may_be_established_but_not_rewritten_or_erased() {
+        // The Facet twin of §39. `OutcomeRecord` is the case that needs it:
+        // the graded index over what the world did, on Evidence the graded
+        // actor can still reach with `SET FACET`.
+        let def: FacetDef = serde_json::from_value(json!({
+            "closed": true,
+            "fields": {
+                "outcome_status": {"type": "string", "mutable": false},
+                "magnitude": {"type": "number", "mutable": false}
+            }
+        }))
+        .unwrap();
+
+        let established = validate_facet_mutability(
+            "t",
+            &def,
+            &map(json!({"outcome_status": "failure"})),
+            &map(json!({"outcome_status": "failure", "magnitude": 0.25})),
+        );
+        assert!(
+            established.is_valid(),
+            "an optional member arriving late is established, not changed"
+        );
+
+        let rewritten = validate_facet_mutability(
+            "t",
+            &def,
+            &map(json!({"outcome_status": "failure"})),
+            &map(json!({"outcome_status": "success"})),
+        );
+        assert_eq!(codes(&rewritten), ["SCHEMA_IMMUTABLE_FIELD"]);
+
+        // Erasing it is rewriting it to absent.
+        let erased = validate_facet_mutability(
+            "t",
+            &def,
+            &map(json!({"outcome_status": "failure"})),
+            &map(json!({})),
+        );
+        assert_eq!(codes(&erased), ["SCHEMA_IMMUTABLE_FIELD"]);
     }
 
     #[test]

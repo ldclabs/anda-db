@@ -90,6 +90,18 @@ fn check_endpoint(
             kind,
             schema_ref: element_type,
         } => {
+            // The mirror of the Literal branch's first refusal. A spec that
+            // names only datatypes has said what may occupy this end, and it
+            // is not a reference — letting one through because the spec never
+            // spelled out a `kinds` list would make the two directions of the
+            // same declaration mean different things.
+            if spec.kinds.is_empty() && spec.concept_types.is_empty() {
+                into.push(refuse(format!(
+                    "the schema declares this endpoint a Literal of {}, not an element reference",
+                    spec.datatypes.join(", ")
+                )));
+                return;
+            }
             if !spec.kinds.is_empty()
                 && !spec
                     .kinds
@@ -177,7 +189,18 @@ impl SchemaEnvironment {
         let def = self.concept_type_def(&symbol)?;
         let mut result =
             validate::validate_attributes(&symbol.to_string(), &def.attributes, attributes);
-        result.extend(self.validate_facets(facets, ElementKind::Concept, intent)?);
+        // The carrier's own type is part of the facts: a Facet declaring
+        // `concept_types` is state about *those* Concepts, and a carrier whose
+        // type was never supplied would make that half of the declaration
+        // unenforceable.
+        result.extend(self.validate_facets(
+            facets,
+            &EndpointFacts::Element {
+                kind: ElementKind::Concept,
+                schema_ref: Some(symbol.to_string()),
+            },
+            intent,
+        )?);
         Ok((symbol, result))
     }
 
@@ -189,7 +212,7 @@ impl SchemaEnvironment {
     pub fn validate_facets(
         &self,
         facets: &Map<String, Json>,
-        carrier: ElementKind,
+        carrier: &EndpointFacts,
         intent: Intent,
     ) -> Result<Validation, KipError> {
         let mut result = Validation::default();
@@ -202,10 +225,7 @@ impl SchemaEnvironment {
                 &schema_ref,
                 &format!("facets.{name}"),
                 &def.applicable_to,
-                &EndpointFacts::Element {
-                    kind: carrier,
-                    schema_ref: None,
-                },
+                carrier,
                 &mut result,
             );
 
@@ -303,6 +323,13 @@ mod tests {
         value.as_object().cloned().unwrap()
     }
 
+    fn concept_carrier(schema_ref: Option<&str>) -> EndpointFacts {
+        EndpointFacts::Element {
+            kind: ElementKind::Concept,
+            schema_ref: schema_ref.map(str::to_string),
+        }
+    }
+
     fn person() -> EndpointFacts {
         EndpointFacts::Element {
             kind: ElementKind::Concept,
@@ -391,6 +418,81 @@ mod tests {
     }
 
     #[test]
+    fn a_datatype_only_endpoint_refuses_a_reference_as_a_reference_endpoint_refuses_a_literal() {
+        // §44: the declaration reads the same in both directions. A spec
+        // naming only datatypes says this end carries a value, so an element
+        // reference is as wrong there as a Literal is where a reference is
+        // declared — and an engine that refused one and not the other would
+        // make the same schema mean two things.
+        let spec: EndpointSpec =
+            serde_json::from_value(json!({"datatypes": ["kip:string"]})).unwrap();
+        let mut result = Validation::default();
+        check_endpoint(
+            "t",
+            "object",
+            &spec,
+            &EndpointFacts::Element {
+                kind: ElementKind::Concept,
+                schema_ref: None,
+            },
+            &mut result,
+        );
+        assert_eq!(result.violations[0].code, "SCHEMA_ENDPOINT_NOT_ALLOWED");
+        assert!(
+            result.violations[0]
+                .message
+                .contains("not an element reference")
+        );
+
+        // The Literal it does declare still passes, and an unresolvable end is
+        // still unknown rather than wrong.
+        let mut allowed = Validation::default();
+        check_endpoint(
+            "t",
+            "object",
+            &spec,
+            &EndpointFacts::Literal {
+                datatype: "kip:string".into(),
+            },
+            &mut allowed,
+        );
+        check_endpoint(
+            "t",
+            "object",
+            &spec,
+            &EndpointFacts::Unresolved,
+            &mut allowed,
+        );
+        assert!(allowed.is_valid());
+
+        // An endpoint that declares both accepts both.
+        let either: EndpointSpec =
+            serde_json::from_value(json!({"kinds": ["Concept"], "datatypes": ["kip:string"]}))
+                .unwrap();
+        let mut both = Validation::default();
+        check_endpoint(
+            "t",
+            "object",
+            &either,
+            &EndpointFacts::Element {
+                kind: ElementKind::Concept,
+                schema_ref: None,
+            },
+            &mut both,
+        );
+        check_endpoint(
+            "t",
+            "object",
+            &either,
+            &EndpointFacts::Literal {
+                datatype: "kip:string".into(),
+            },
+            &mut both,
+        );
+        assert!(both.is_valid());
+    }
+
+    #[test]
     fn an_unresolvable_endpoint_is_unknown_rather_than_wrong() {
         // A canonical or foreign reference is deliberately outside same-Space
         // closure, so its type is simply not knowable here. Inventing a
@@ -413,7 +515,7 @@ mod tests {
         let err = env()
             .validate_facets(
                 &map(json!({"WhateverIWant": {"secret": 1}})),
-                ElementKind::Concept,
+                &concept_carrier(None),
                 Intent::Write,
             )
             .unwrap_err();
@@ -426,7 +528,7 @@ mod tests {
         let ok = env
             .validate_facets(
                 &map(json!({"MnemonicState": {"memory_strength": 0.4}})),
-                ElementKind::Concept,
+                &concept_carrier(None),
                 Intent::Write,
             )
             .unwrap();
@@ -436,7 +538,7 @@ mod tests {
         let smuggled = env
             .validate_facets(
                 &map(json!({"MnemonicState": {"confidence": 0.9}})),
-                ElementKind::Concept,
+                &concept_carrier(None),
                 Intent::Write,
             )
             .unwrap();
@@ -446,7 +548,10 @@ mod tests {
         let wrong_carrier = env
             .validate_facets(
                 &map(json!({"MnemonicState": {"memory_strength": 0.4}})),
-                ElementKind::Assertion,
+                &EndpointFacts::Element {
+                    kind: ElementKind::Assertion,
+                    schema_ref: None,
+                },
                 Intent::Write,
             )
             .unwrap();
@@ -454,6 +559,45 @@ mod tests {
             wrong_carrier.violations[0].code,
             "SCHEMA_ENDPOINT_NOT_ALLOWED"
         );
+    }
+
+    #[test]
+    fn a_facet_declaring_concept_types_is_state_about_those_concepts() {
+        // §58: `SkillUtility` is procedural usefulness, so it belongs on a
+        // Skill. Checking only the carrier's *kind* would leave half the
+        // declaration unenforceable, and a Person carrying it would read as
+        // procedural memory nobody wrote.
+        let env = env();
+        let skill = format!("{PROFILE}@2.0.0/Skill");
+        let ok = env
+            .validate_facets(
+                &map(json!({"SkillUtility": {"utility": 0.5}})),
+                &concept_carrier(Some(&skill)),
+                Intent::Write,
+            )
+            .unwrap();
+        assert!(ok.is_valid());
+
+        let person = format!("{PROFILE}@2.0.0/Person");
+        let wrong = env
+            .validate_facets(
+                &map(json!({"SkillUtility": {"utility": 0.5}})),
+                &concept_carrier(Some(&person)),
+                Intent::Write,
+            )
+            .unwrap();
+        assert_eq!(wrong.violations[0].code, "SCHEMA_ENDPOINT_NOT_ALLOWED");
+
+        // A carrier whose type was not supplied is not a Concept of the wrong
+        // type, so it is not refused on that ground.
+        let unknown = env
+            .validate_facets(
+                &map(json!({"SkillUtility": {"utility": 0.5}})),
+                &concept_carrier(None),
+                Intent::Write,
+            )
+            .unwrap();
+        assert!(unknown.is_valid());
     }
 
     #[test]

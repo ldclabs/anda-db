@@ -1,7 +1,7 @@
 import { env, runInDurableObject } from 'cloudflare:test'
 import { describe, expect, it } from 'vitest'
 import { CognitiveNexus } from '../src/nexus.js'
-import { COGNITIVE_MEMORY } from '../src/schema/index.js'
+import { COGNITIVE_MEMORY, type SchemaPackage } from '../src/schema/index.js'
 import { parseElementId } from '../src/id.js'
 import { parseKip } from '../src/kip/parser.js'
 import { render } from '../src/view.js'
@@ -24,14 +24,33 @@ import type {
 async function withNexus(
   name: string,
   body: (nexus: CognitiveNexus) => void,
+  extra: readonly SchemaPackage[] = [],
 ): Promise<void> {
   const stub = env.KIP_DB.getByName(`kml-${name}`)
   await runInDurableObject(stub, (_instance, state) => {
     const nexus = CognitiveNexus.connect(state.storage)
-    nexus.activatePackages([COGNITIVE_MEMORY])
+    nexus.activatePackages([COGNITIVE_MEMORY, ...extra])
     body(nexus)
   })
 }
+
+/**
+ * A predicate that constrains neither end.
+ *
+ * Every predicate the Cognitive Memory Profile declares says what may occupy
+ * its ends — `prefers` takes a Concept, not a Literal — and that is a
+ * different question from how a value is *stored* once it is allowed there.
+ * A test about storage form needs a slot that permits both.
+ */
+const OPEN_PACKAGE = {
+  format: 'KIP-Schema-Package',
+  manifest: { package_id: 'kip://test/open', version: '1.0.0' },
+  definitions: {
+    predicates: {
+      notes: { kind: 'PredicateType', description: 'Anything, about anything.' },
+    },
+  },
+} as unknown as SchemaPackage
 
 const CM = 'kip://profiles/cognitive-memory@2.0.0'
 
@@ -183,17 +202,34 @@ describe('KML', () => {
   })
 
   it('keeps a bare string a Literal and an object a reference', async () => {
-    await withNexus('literal-vs-ref', (nexus) => {
-      const outcome = nexus.execute(`MUTATE {
+    await withNexus(
+      'literal-vs-ref',
+      (nexus) => {
+        const outcome = nexus.execute(`MUTATE {
+        CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
+        ENSURE PROPOSITION ?p (?alice, "notes", "dark")
+      }`)
+        const prop = nexus.store.load(parseElementId(outcome.handles.p!))
+          ?.row as PropositionRow
+        // The object is the *text* "dark", stored as an explicit Literal so a
+        // Schema-refined datatype would survive a round trip.
+        expect(prop.object).toEqual({ value: 'dark', datatype: 'kip:string' })
+        expect(prop.subject).toEqual({ id: outcome.handles.alice })
+      },
+      [OPEN_PACKAGE],
+    )
+  })
+
+  it('refuses a Literal where the predicate declares an element reference', async () => {
+    // §42–§44: `prefers` relates a Person to a Concept, so the text "dark" is
+    // not a quieter version of the Preference — it is a different endpoint,
+    // and storing it would leave a tuple nothing can traverse.
+    await withNexus('literal-where-ref', (nexus) => {
+      const result = nexus.tryExecute(`MUTATE {
         CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
         ENSURE PROPOSITION ?p (?alice, "prefers", "dark")
       }`)
-      const prop = nexus.store.load(parseElementId(outcome.handles.p!))
-        ?.row as PropositionRow
-      // The object is the *text* "dark", stored as an explicit Literal so a
-      // Schema-refined datatype would survive a round trip.
-      expect(prop.object).toEqual({ value: 'dark', datatype: 'kip:string' })
-      expect(prop.subject).toEqual({ id: outcome.handles.alice })
+      expect('error' in result && result.error.code).toBe('ConstraintViolation')
     })
   })
 
@@ -774,6 +810,37 @@ describe('KML', () => {
       ).toThrowError(/has no payload/)
       // And the refusal erased nothing on the way to refusing.
       expect(evidence(nexus, 'E-1').payload_mode).toBe('inline')
+    })
+  })
+
+  it('lets UPDATE reach a record\'s Facets while its payload stays immutable', async () => {
+    // §18.1: a Facet is representation-local state and none of it is truth, so
+    // a Facet on Evidence moves while what the Evidence observed does not.
+    // The Profile relies on this: `OutcomeRecord` — the consequence channel's
+    // graded index — lives on Evidence, and an optional member has to be
+    // establishable after the instrument first wrote the record.
+    await withNexus('record-facets', (nexus) => {
+      nexus.execute(CITED_EVIDENCE)
+      nexus.execute(
+        'UPDATE "E-1" SET FACET "OutcomeRecord" ' +
+          '{task_family: "prefs/stated", outcome_status: "unknown"}',
+      )
+      nexus.execute('UPDATE "E-1" SET FACET "OutcomeRecord" {magnitude: 0.5}')
+      expect(
+        nexus.query(
+          'FIND(?e.facets["OutcomeRecord"].magnitude) WHERE { ?e EVIDENCE {} }',
+        ),
+      ).toEqual([0.5])
+
+      // Established once, and not revised afterwards (§39).
+      expect(() =>
+        nexus.execute('UPDATE "E-1" SET FACET "OutcomeRecord" {magnitude: 0.9}'),
+      ).toThrowError(/immutable/)
+
+      // What the record itself says is still corrected, never edited.
+      expect(() =>
+        nexus.execute('UPDATE "E-1" SET FIELDS {payload: "something else"}'),
+      ).toThrowError(/CORRECT/)
     })
   })
 

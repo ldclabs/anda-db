@@ -176,8 +176,8 @@ describe('KIP 2.0 conformance', () => {
   it('runs the same fixtures the reference engine runs', () => {
     // A shrinking suite is a silent loss of coverage; the generator reads the
     // fixture directory, so a bad path shows up here first.
-    expect(FIXTURES).toHaveLength(9)
-    expect(CASE_COUNT).toBe(115)
+    expect(FIXTURES).toHaveLength(11)
+    expect(CASE_COUNT).toBe(162)
   })
 
   for (const fixture of FIXTURES) {

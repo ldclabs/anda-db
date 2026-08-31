@@ -32,8 +32,8 @@ use anda_kip::{
     StructuralRemoval, UpdateAction,
 };
 
-use super::clauses::{Applied, apply_facets, bindings, resolve_structural_field};
-use super::value::{assignments_to_json, structural_value};
+use super::clauses::{Applied, bindings, resolve_facets, resolve_structural_field};
+use super::value::{Bindings, assignments_to_json, structural_value};
 use crate::id::ElementId;
 use crate::store::Element;
 use crate::tx::Transaction;
@@ -167,15 +167,44 @@ async fn set_facet(
     operation: Option<&Map<String, Json>>,
 ) -> Result<Applied, KipError> {
     let kind = tx.load(id).await?.kind();
+    // The carrier's own type, when it has one: a Facet declaring
+    // `concept_types` is state about those Concepts (§58).
+    let carrier = crate::schema::EndpointFacts::Element {
+        kind,
+        schema_ref: view
+            .get("schema_ref")
+            .and_then(Json::as_str)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string),
+    };
     let b = bindings(tx, request, operation);
-    let facets = apply_facets(tx, &b, std::slice::from_ref(assignment), kind, Some(view)).await?;
+    let facets = resolve_facets(tx, &b, std::slice::from_ref(assignment), Some(view))?;
+    let pinned = facet_contract(tx, &b, &assignment.facet)?;
+
+    // A Facet assignment merges members rather than replacing the Facet:
+    // `SET FACET "MnemonicState" {salience: 0.4}` must not silently drop a
+    // `memory_strength` nobody mentioned. So the merged result is what the
+    // schema is shown, and what §39 immutability is judged against — an
+    // assignment read on its own would refuse every partial write to a Facet
+    // with required members.
+    let mut merged = Map::new();
+    for (facet, value) in &facets {
+        let Json::Object(members) = value else {
+            continue;
+        };
+        let existing = current_members(view, facet);
+        let mut after = existing.clone();
+        after.extend(members.clone());
+        pinned.check(&existing, &after)?;
+        merged.insert(facet.clone(), Json::Object(after));
+    }
+    tx.env
+        .validate_facets(&merged, &carrier, crate::schema::Intent::Write)?
+        .into_result()?;
 
     let target = facets_mut(tx, id).await?;
     let mut applied = Applied::default();
     for (facet, value) in facets {
-        // A Facet assignment merges members rather than replacing the Facet:
-        // `SET FACET "MnemonicState" {salience: 0.4}` must not silently drop a
-        // `memory_strength` nobody mentioned.
         let entry = target
             .entry(facet)
             .or_insert_with(|| Json::Object(Map::new()));
@@ -195,6 +224,128 @@ async fn set_facet(
     Ok(applied)
 }
 
+/// Whether any of these actions writes the attribute bag.
+///
+/// The gate on [`check_attributes`]: an `UPDATE` that only decays a Facet has
+/// not been asked anything about the attributes, and refusing it for drift
+/// that predates the statement would make an unrelated clause the place a
+/// stale element finally fails.
+pub fn touches_attributes(actions: &[UpdateAction]) -> bool {
+    actions.iter().any(|action| {
+        matches!(
+            action,
+            UpdateAction::SetAttributes(_) | UpdateAction::UnsetAttributes(_)
+        )
+    })
+}
+
+/// Whether any of these actions writes the structural map.
+pub fn touches_structural(actions: &[UpdateAction]) -> bool {
+    actions.iter().any(|action| {
+        matches!(
+            action,
+            UpdateAction::SetStructural(_) | UpdateAction::UnsetStructural(_)
+        )
+    })
+}
+
+/// Validates the attribute bag one statement's actions left behind (§34–§39).
+///
+/// Run once per element after every action, not per action: `UNSET ATTRIBUTES
+/// {status} SET ATTRIBUTES {status: "adopted"}` passes through a state with no
+/// `status` at all, and a required attribute is a statement about what the
+/// element *is* when the statement ends, not about the order its clauses were
+/// written in.
+///
+/// `view` is the element as the statement found it, which is what makes §39
+/// answerable: immutability constrains a transition, so establishing a value
+/// and rewriting one have to be told apart.
+pub async fn check_attributes(
+    tx: &mut Transaction,
+    id: ElementId,
+    view: &Json,
+) -> Result<(), KipError> {
+    let (schema_ref, after) = match tx.load(id).await? {
+        Element::Concept(row) => (row.schema_ref.clone(), row.attributes.clone()),
+        // No other kind has an author-writable attribute bag (§6.4), and the
+        // actions that would have written one were already refused.
+        _ => return Ok(()),
+    };
+    // A type this environment cannot resolve declares nothing, so it declares
+    // no contract to hold the write to — the same stance a Proposition takes
+    // on an unresolvable predicate. Deactivating a package stops validating
+    // its elements; it does not start refusing them.
+    let Ok(symbol) = schema_ref.parse::<crate::schema::SymbolRef>() else {
+        return Ok(());
+    };
+    let Ok(def) = tx.env.concept_type_def(&symbol) else {
+        return Ok(());
+    };
+    let before = match view.get("attributes") {
+        Some(Json::Object(attributes)) => attributes.clone(),
+        _ => Map::new(),
+    };
+    let mut result = crate::schema::validate_attributes(&schema_ref, &def.attributes, &after);
+    result.extend(crate::schema::validate_attribute_mutability(
+        &schema_ref,
+        &def.attributes,
+        &before,
+        &after,
+    ));
+    result.into_result()?;
+    Ok(())
+}
+
+/// The members an element already carries under one Facet symbol.
+///
+/// Read from the rendered view rather than the row, because that is the state
+/// the whole statement is judged against: every action of one `UPDATE` sees
+/// the element as it was when the statement began (§52.4).
+fn current_members(view: &Json, facet: &str) -> Map<String, Json> {
+    match view.get("facets").and_then(|facets| facets.get(facet)) {
+        Some(Json::Object(members)) => members.clone(),
+        _ => Map::new(),
+    }
+}
+
+/// The immutability contract of one Facet, as the Schema Environment reads it.
+///
+/// Resolved before the element is borrowed mutably, and empty when the Facet
+/// resolves to no definition this Space can read — an engine that cannot see
+/// the contract does not get to invent one.
+struct Pinned {
+    schema_ref: String,
+    def: Option<crate::schema::FacetDef>,
+}
+
+impl Pinned {
+    fn check(&self, before: &Map<String, Json>, after: &Map<String, Json>) -> Result<(), KipError> {
+        let Some(def) = &self.def else {
+            return Ok(());
+        };
+        crate::schema::validate_facet_mutability(&self.schema_ref, def, before, after)
+            .into_result()?;
+        Ok(())
+    }
+}
+
+fn facet_contract(
+    tx: &Transaction,
+    b: &Bindings<'_>,
+    facet: &anda_kip::SymbolRef,
+) -> Result<Pinned, KipError> {
+    let name = super::clauses::symbol_name(b, facet)?;
+    let symbol = tx.env.resolve_symbol(
+        crate::schema::SymbolKind::Facet,
+        &name,
+        crate::schema::Intent::Write,
+    )?;
+    Ok(Pinned {
+        schema_ref: symbol.to_string(),
+        def: tx.env.facet_def(&symbol).ok().cloned(),
+    })
+}
+
 async fn unset_facet(
     tx: &mut Transaction,
     id: ElementId,
@@ -211,11 +362,18 @@ async fn unset_facet(
     )?;
     let key = symbol.to_string();
 
+    let pinned = facet_contract(tx, &b, &unset.facet)?;
     let facets = facets_mut(tx, id).await?;
     let mut applied = Applied::default();
     let Some(Json::Object(members)) = facets.get_mut(&key) else {
         return Ok(applied);
     };
+    // Erasing an immutable member is rewriting it to absent.
+    let mut after = members.clone();
+    for field in &unset.fields {
+        after.remove(field);
+    }
+    pinned.check(members, &after)?;
     for field in &unset.fields {
         if members.remove(field).is_some() {
             applied.changed = true;

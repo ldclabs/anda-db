@@ -26,15 +26,24 @@ import {
   unorderedIndex,
 } from './clauses.js'
 import { errors } from '../errors.js'
-import { formatElementId, type ElementId } from '../id.js'
+import { formatElementId } from '../id.js'
 import { isJsonMap, jsonEquals, type Json, type JsonMap } from '../json.js'
 import type { FacetAssignment, StructuralEdge, UpdateAction } from '../kip/ast.js'
-import { facetDef, formatSymbolRef, validateFacet } from '../schema/index.js'
+import {
+  facetDef,
+  formatSymbolRef,
+  parseSymbolRef,
+  validateAttributeMutability,
+  validateAttributes,
+  validateFacet,
+  validateFacetCarrier,
+  validateFacetMutability,
+  type EndpointFacts,
+} from '../schema/index.js'
 import type { Element } from '../store/index.js'
 import { endpointFromJson, endpointKey } from '../term.js'
 import type { Transaction } from '../tx.js'
 import { readPath } from '../view.js'
-import { render } from '../view.js'
 import {
   assignments,
   mutationValue,
@@ -43,29 +52,44 @@ import {
   type Bindings,
 } from './value.js'
 
-/** Refuses an element whose payload is not rewritable, naming the way round. */
-export function requireUpdatable(id: ElementId, element: Element): void {
-  const named = formatElementId(id)
-  switch (element.kind) {
+/**
+ * The refusal for an element whose state this action may not reach.
+ *
+ * Per action rather than per element, because a Facet is representation-local
+ * state and none of it is truth (§18.1): decaying an Evidence's salience says
+ * nothing about what was observed, and `OutcomeRecord` — the graded index the
+ * consequence channel writes on Evidence — has to live somewhere an UPDATE can
+ * still reach to establish an optional member. What is immutable is the
+ * record's own payload, and each refusal names the ritual that *is* legal so
+ * an agent reading it knows what to do instead.
+ */
+function immutableTarget(element: Element, what: string) {
+  const named = formatElementId({ kind: element.kind, seq: element.row.id })
+  const kind = element.kind
+  switch (kind) {
     case 'Assertion':
       // An Assertion's epistemic payload is historically immutable: a changed
       // commitment is a new Assertion plus supersession, never a rewrite.
-      throw errors.epistemicRevisionRequired(
-        `${named} is an Assertion; record a new Assertion and SUPERSEDE this ` +
-          `one rather than rewriting what somebody committed to`,
+      return errors.epistemicRevisionRequired(
+        `${what} would rewrite ${named}'s epistemic payload; record a new ` +
+          `Assertion and SUPERSEDE this one rather than rewriting what ` +
+          `somebody committed to`,
       )
     case 'Evidence':
-      throw errors.evidenceCorrectionRequired(
-        `${named} is an Evidence record; wrong Evidence is corrected with ` +
-          `CORRECT ... BY, never edited — the original observation happened`,
+      return errors.evidenceCorrectionRequired(
+        `${what} would rewrite what ${named} observed; wrong Evidence is ` +
+          `corrected with CORRECT ... BY, never edited — the original ` +
+          `observation happened`,
       )
     case 'Activity':
-      throw errors.invalidLifecycleTransition(
-        `${named} is an Activity; its fields and topology are finalized ` +
-          `through TRANSITION ACTIVITY`,
+      return errors.invalidLifecycleTransition(
+        `${what} does not reach ${named}: an Activity finalizes its fields ` +
+          `and topology through TRANSITION ACTIVITY`,
       )
     default:
-      return
+      return errors.immutableField(
+        `${what} does not reach ${named}: ` + noAttributeBag(kind),
+      )
   }
 }
 
@@ -98,11 +122,14 @@ export function applyAction(
   b: Bindings,
   element: Element,
   action: UpdateAction,
+  view: Json,
 ): void {
   const row = element.row
-  // The target's own current values, which is all an update expression may
-  // read (§52.4).
-  const view = render(element)
+  // `view` is the element as the *statement* found it, rendered once by the
+  // caller: every action of one UPDATE reads the same starting state (§52.4).
+  // Re-rendering per action would let two clauses on the same Facet member
+  // compound, so the second would silently operate on what the first just
+  // wrote for reasons the author cannot see in the text.
   const read = (path: string[]): Json =>
     readPath(
       tx.env,
@@ -112,9 +139,7 @@ export function applyAction(
 
   if ('SetFields' in action) {
     if (element.kind !== 'Concept') {
-      throw errors.immutableField(
-        `a ${element.kind} has no rewritable top-level fields`,
-      )
+      throw immutableTarget(element, 'SET FIELDS')
     }
     for (const [name, value] of Object.entries(
       assignments(b, action.SetFields, read),
@@ -145,7 +170,7 @@ export function applyAction(
 
   if ('SetAttributes' in action) {
     if (element.kind !== 'Concept') {
-      throw errors.immutableField(noAttributeBag(element.kind))
+      throw immutableTarget(element, 'SET ATTRIBUTES')
     }
     Object.assign(
       element.row.attributes,
@@ -156,7 +181,7 @@ export function applyAction(
 
   if ('UnsetAttributes' in action) {
     if (element.kind !== 'Concept') {
-      throw errors.immutableField(noAttributeBag(element.kind))
+      throw immutableTarget(element, 'UNSET ATTRIBUTES')
     }
     for (const name of action.UnsetAttributes) {
       delete element.row.attributes[name]
@@ -165,15 +190,41 @@ export function applyAction(
   }
 
   if ('SetFacet' in action) {
-    mergeFacet(tx, b, row.facets, action.SetFacet, read)
+    mergeFacet(
+      tx,
+      b,
+      row.facets,
+      action.SetFacet,
+      read,
+      carrierOf(element),
+      facetMembers(view, resolveFacetText(tx, b, action.SetFacet.facet)),
+    )
     return
   }
 
   if ('UnsetFacet' in action) {
-    const symbolText = resolveFacet(tx, b, action.UnsetFacet.facet)
+    const symbol = tx.env.resolveSymbol(
+      'Facet',
+      symbolName(b, action.UnsetFacet.facet),
+      'write',
+    )
+    const symbolText = formatSymbolRef(symbol)
     const facet = row.facets[symbolText]
     if (isJsonMap(facet)) {
+      // Erasing an immutable member is rewriting it to absent (§39), judged
+      // against the state the statement started from.
+      const before = facetMembers(view, symbolText)
+      const after = { ...before }
+      for (const field of action.UnsetFacet.fields) delete after[field]
+      const definition = tx.env.definitionPackage(symbol)
+      const def = definition === undefined ? undefined : facetDef(definition, symbol.name)
+      if (def !== undefined) {
+        validateFacetMutability(symbolText, def, before, after).throwIfInvalid()
+      }
       for (const field of action.UnsetFacet.fields) delete facet[field]
+      // An emptied Facet is removed rather than left as `{}`: a Facet present
+      // with no members would read as "carried, and every member unknown".
+      if (Object.keys(facet).length === 0) delete row.facets[symbolText]
     }
     return
   }
@@ -182,9 +233,7 @@ export function applyAction(
     if (element.kind !== 'Concept') {
       // Assertion and Evidence citations are immutable, and an Activity's
       // topology is finalized by TRANSITION.
-      throw errors.immutableField(
-        `a ${element.kind}'s topology is not rewritable through UPDATE`,
-      )
+      throw immutableTarget(element, 'SET STRUCTURAL')
     }
     for (const edge of action.SetStructural) {
       const field = resolveStructural(tx, b, edge)
@@ -224,9 +273,7 @@ export function applyAction(
 
   // UnsetStructural.
   if (element.kind !== 'Concept') {
-    throw errors.immutableField(
-      `a ${element.kind}'s topology is not rewritable through UPDATE`,
-    )
+    throw immutableTarget(element, 'UNSET STRUCTURAL')
   }
   for (const removal of action.UnsetStructural) {
     const field = resolveStructural(tx, b, removal)
@@ -242,33 +289,27 @@ export function applyAction(
   }
 }
 
-/** Merges a Facet's members rather than replacing the Facet (§59). */
-function mergeFacet(
-  tx: Transaction,
-  b: Bindings,
-  facets: JsonMap,
-  assignment: FacetAssignment,
-  read: (path: string[]) => Json,
-): void {
-  const symbol = tx.env.resolveSymbol(
-    'Facet',
-    symbolName(b, assignment.facet),
-    'write',
-  )
-  const text = formatSymbolRef(symbol)
-  const merged = {
-    ...(isJsonMap(facets[text]) ? (facets[text] as JsonMap) : {}),
-    ...assignments(b, assignment.values, read),
+/**
+ * What a Facet is being attached to, for the schema to judge (§58).
+ *
+ * The carrier's own type is part of it when it has one: a Facet declaring
+ * `concept_types` is state about those Concepts, and a carrier whose type was
+ * never supplied would make that half of the declaration unenforceable.
+ */
+export function carrierOf(element: Element): EndpointFacts {
+  if (element.kind !== 'Concept') {
+    return { kind: 'element', elementKind: element.kind }
   }
-  const definition = tx.env.definitionPackage(symbol)
-  const def = definition === undefined ? undefined : facetDef(definition, symbol.name)
-  // Validated against the *merged* result, not the assignment: a member that
-  // is only legal beside another one is legal exactly when both are there.
-  if (def !== undefined) validateFacet(text, def, merged).throwIfInvalid()
-  facets[text] = merged
+  const schemaRef = element.row.schema_ref
+  return {
+    kind: 'element',
+    elementKind: 'Concept',
+    schemaRef: schemaRef === '' ? undefined : schemaRef,
+  }
 }
 
-function resolveFacet(
+/** The exact reference one Facet symbol slot resolves to. */
+export function resolveFacetText(
   tx: Transaction,
   b: Bindings,
   facet: FacetAssignment['facet'],
@@ -276,6 +317,112 @@ function resolveFacet(
   return formatSymbolRef(
     tx.env.resolveSymbol('Facet', symbolName(b, facet), 'write'),
   )
+}
+
+/** The members a rendered element carries under one Facet symbol. */
+export function facetMembers(view: Json, facet: string): JsonMap {
+  const facets = isJsonMap(view) ? view.facets : undefined
+  const found = isJsonMap(facets) ? facets[facet] : undefined
+  return isJsonMap(found) ? { ...found } : {}
+}
+
+/**
+ * Whether any of these actions writes the attribute bag.
+ *
+ * The gate on {@link checkAttributes}: an `UPDATE` that only decays a Facet has
+ * not been asked anything about the attributes, and refusing it for drift that
+ * predates the statement would make an unrelated clause the place a stale
+ * element finally fails.
+ */
+export function touchesAttributes(actions: readonly UpdateAction[]): boolean {
+  return actions.some(
+    (action) => 'SetAttributes' in action || 'UnsetAttributes' in action,
+  )
+}
+
+/** Whether any of these actions writes the structural map. */
+export function touchesStructural(actions: readonly UpdateAction[]): boolean {
+  return actions.some(
+    (action) => 'SetStructural' in action || 'UnsetStructural' in action,
+  )
+}
+
+/**
+ * Validates the attribute bag one statement's clauses left behind (§34–§39).
+ *
+ * Run once per element after every action, not per action: `UNSET ATTRIBUTES
+ * {status} SET ATTRIBUTES {status: "adopted"}` passes through a state with no
+ * `status` at all, and a required attribute is a statement about what the
+ * element *is* when the statement ends, not about the order its clauses were
+ * written in.
+ *
+ * `before` is the attribute map as the statement found it, which is what makes
+ * §39 answerable: immutability constrains a transition, so establishing a value
+ * and rewriting one have to be told apart.
+ */
+export function checkAttributes(
+  tx: Transaction,
+  element: Element,
+  before: JsonMap,
+): void {
+  // No other kind has an author-writable attribute bag (§6.4), and the actions
+  // that would have written one were already refused.
+  if (element.kind !== 'Concept') return
+  const schemaRef = element.row.schema_ref
+  let symbol
+  try {
+    symbol = parseSymbolRef(schemaRef)
+  } catch {
+    return
+  }
+  // A type this environment cannot resolve declares nothing, so it declares no
+  // contract to hold the write to. Deactivating a package stops validating its
+  // elements; it does not start refusing them.
+  const conceptType =
+    tx.env.definitionPackage(symbol)?.definitions?.concept_types?.[symbol.name]
+  if (conceptType === undefined) return
+  const after = element.row.attributes
+  validateAttributes(schemaRef, conceptType.attributes, after)
+    .extend(
+      validateAttributeMutability(schemaRef, conceptType.attributes, before, after),
+    )
+    .throwIfInvalid()
+}
+
+/** Merges a Facet's members rather than replacing the Facet (§59). */
+function mergeFacet(
+  tx: Transaction,
+  b: Bindings,
+  facets: JsonMap,
+  assignment: FacetAssignment,
+  read: (path: string[]) => Json,
+  carrier: EndpointFacts,
+  before: JsonMap,
+): void {
+  const symbol = tx.env.resolveSymbol(
+    'Facet',
+    symbolName(b, assignment.facet),
+    'write',
+  )
+  const text = formatSymbolRef(symbol)
+  const values = assignments(b, assignment.values, read)
+  const definition = tx.env.definitionPackage(symbol)
+  const def = definition === undefined ? undefined : facetDef(definition, symbol.name)
+  if (def !== undefined) {
+    // Validated against the *merged* result, not the assignment: a member that
+    // is only legal beside another one is legal exactly when both are there.
+    // Merged onto the statement's starting state rather than onto the row, so
+    // what a clause is refused for does not depend on which clause ran first.
+    const merged = { ...before, ...values }
+    validateFacetCarrier(text, def, carrier)
+      .extend(validateFacet(text, def, merged))
+      .extend(validateFacetMutability(text, def, before, merged))
+      .throwIfInvalid()
+  }
+  facets[text] = {
+    ...(isJsonMap(facets[text]) ? (facets[text] as JsonMap) : {}),
+    ...values,
+  }
 }
 
 function resolveStructural(

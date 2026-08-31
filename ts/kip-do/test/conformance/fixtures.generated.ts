@@ -32,6 +32,260 @@ export interface Fixture {
 
 export const FIXTURES: readonly Fixture[] = [
   {
+    "name": "consequence",
+    "description": "The consequence channel: what the world did after the Brain acted, and what a Skill's standing is spent from. Outcome Evidence (Spec §15.7) carries an OutcomeRecord Facet — the graded index over an untouched payload — and cognition subscribes to a stream by task family rather than by reference. What an engine owes here is the Profile's schema discipline: the scoring handle a Skill cannot be compiled without, the four lifecycle states, a graded index its subject cannot rewrite, and the one guarded statement (Appendix F.6) a lifecycle verdict executes as. The verdict rule itself is Brain policy; that it lands as one recomputable transition is not.",
+    "setup": [
+      "MUTATE {\n  CREATE CONCEPT ?skill {\n    TYPE \"Skill\"\n    NAME \"Deploy behind a pre-flight migration check\"\n    SET ATTRIBUTES {\n      skill_class: \"workflow\",\n      task_family: \"deploy/pre-flight\",\n      summary: \"Dry-run the migration before the deploy\",\n      procedure: \"1. dry-run the migration 2. deploy 3. verify\",\n      status: \"proposed\"\n    }\n    SET FACET \"SkillUtility\" {utility: 0.5}\n  }\n}",
+      "MUTATE {\n  CREATE EVIDENCE ?win {\n    SET FIELDS {\n      evidence_class: \"outcome\",\n      payload: \"deploy 41: the pre-flight check caught the drift, rollout clean\",\n      media_type: \"text/plain\",\n      observed_at: \"2026-08-20T09:00:00Z\"\n    }\n    SET FACET \"OutcomeRecord\" {task_family: \"deploy/pre-flight\", outcome_status: \"success\", magnitude: 0.8}\n  }\n  CREATE EVIDENCE ?loss {\n    SET FIELDS {\n      evidence_class: \"outcome\",\n      payload: \"deploy 42: pre-flight passed, rollout still failed on a stale replica\",\n      media_type: \"text/plain\",\n      observed_at: \"2026-08-21T09:00:00Z\"\n    }\n    SET FACET \"OutcomeRecord\" {task_family: \"deploy/pre-flight\", outcome_status: \"failure\"}\n  }\n  CREATE ACTIVITY ?observed {\n    SET FIELDS {activity_class: \"outcome_observation\", status: \"completed\"}\n    SET STRUCTURAL {\n      (\"outputs\", ?win)\n      (\"outputs\", ?loss)\n    }\n  }\n}"
+    ],
+    "cases": [
+      {
+        "name": "the channel is a graded index over Evidence, keyed by the family it grades",
+        "command": "FIND(?e.facets[\"OutcomeRecord\"].task_family, ?e.facets[\"OutcomeRecord\"].outcome_status) WHERE { ?e EVIDENCE {evidence_class: \"outcome\"} }",
+        "expect": {
+          "result": [
+            [
+              "deploy/pre-flight",
+              "success"
+            ],
+            [
+              "deploy/pre-flight",
+              "failure"
+            ]
+          ]
+        }
+      },
+      {
+        "name": "an optional grade member may be absent without the grade being incomplete",
+        "command": "FIND(?e.facets[\"OutcomeRecord\"].magnitude) WHERE { ?e EVIDENCE {evidence_class: \"outcome\"} }",
+        "expect": {
+          "result": [
+            0.8,
+            null
+          ]
+        }
+      },
+      {
+        "name": "a Skill must name the outcome stream that could prove it wrong",
+        "command": "MUTATE {\n  CREATE CONCEPT ?s {\n    TYPE \"Skill\"\n    NAME \"Be careful\"\n    SET ATTRIBUTES {skill_class: \"heuristic\", summary: \"Think first\", procedure: \"think\", status: \"proposed\"}\n  }\n}",
+        "expect": {
+          "error": "ConstraintViolation"
+        }
+      },
+      {
+        "name": "the retired lifecycle vocabulary is not a lifecycle state",
+        "command": "MUTATE {\n  CREATE CONCEPT ?s {\n    TYPE \"Skill\"\n    NAME \"Deploy on Fridays\"\n    SET ATTRIBUTES {skill_class: \"workflow\", task_family: \"deploy/pre-flight\", summary: \"Ship it\", procedure: \"ship\", status: \"validated\"}\n  }\n}",
+        "expect": {
+          "error": "ConstraintViolation"
+        }
+      },
+      {
+        "name": "a grade is not rewritable by the cognition it grades",
+        "command": "UPDATE \"E-1\" SET FACET \"OutcomeRecord\" {outcome_status: \"failure\"}",
+        "expect": {
+          "error": "ConstraintViolation"
+        }
+      },
+      {
+        "name": "and erasing a grade is rewriting it to absent",
+        "command": "UPDATE \"E-1\" UNSET FACET \"OutcomeRecord\" {outcome_status}",
+        "expect": {
+          "error": "ConstraintViolation"
+        }
+      },
+      {
+        "name": "the graded index is closed: an instrument cannot smuggle a verdict into it",
+        "command": "UPDATE \"E-1\" SET FACET \"OutcomeRecord\" {verdict: \"promote\"}",
+        "expect": {
+          "error": "ConstraintViolation"
+        }
+      },
+      {
+        "name": "an optional grade member may still be established after the fact, once",
+        "command": "MUTATE {\n  UPDATE \"E-2\"\n  SET FACET \"OutcomeRecord\" {magnitude: 0.25}\n}",
+        "expect": {}
+      },
+      {
+        "name": "establishing it is not a licence to revise it",
+        "command": "UPDATE \"E-2\" SET FACET \"OutcomeRecord\" {magnitude: 0.9}",
+        "expect": {
+          "error": "ConstraintViolation"
+        }
+      },
+      {
+        "name": "a lifecycle move is one guarded statement: the verdict Activity and the transition commit together",
+        "command": "MUTATE {\n  CREATE ACTIVITY ?verdict {\n    SET FIELDS {\n      activity_class: \"lifecycle_verdict\",\n      status: \"completed\",\n      parameters_digest: \"sha3-256:ru1e\"\n    }\n    SET STRUCTURAL {\n      (\"inputs\", \"E-1\")\n      (\"inputs\", \"E-2\")\n      (\"outputs\", \"C-1\")\n    }\n  }\n  UPDATE \"C-1\"\n  EXPECT VERSION 1\n  SET ATTRIBUTES {status: \"trialed\"}\n  SET FACET \"SkillUtility\" {success_count: 1, failure_count: 1, graded_count: 2}\n}",
+        "expect": {}
+      },
+      {
+        "name": "standing is what the verdict moved, and the tallies count graded outcomes",
+        "command": "FIND(?s.attributes.status, ?s.facets[\"SkillUtility\"].graded_count, ?s.facets[\"SkillUtility\"].utility) WHERE { ?s CONCEPT {type: \"Skill\"} }",
+        "expect": {
+          "result": [
+            [
+              "trialed",
+              2,
+              0.5
+            ]
+          ]
+        }
+      },
+      {
+        "name": "replaying the same verdict against the version it already consumed is refused",
+        "command": "MUTATE {\n  UPDATE \"C-1\"\n  EXPECT VERSION 1\n  SET ATTRIBUTES {status: \"adopted\"}\n}",
+        "expect": {
+          "error": "VersionConflict"
+        }
+      },
+      {
+        "name": "the verdict is recomputable: its rule and the outcomes it read are still on the record",
+        "command": "FIND(?v.parameters_digest, ?v.inputs) WHERE { ?v ACTIVITY {activity_class: \"lifecycle_verdict\"} }",
+        "expect": {
+          "result": [
+            [
+              "sha3-256:ru1e",
+              [
+                {
+                  "id": "E:<1>"
+                },
+                {
+                  "id": "E:<2>"
+                }
+              ]
+            ]
+          ]
+        }
+      },
+      {
+        "name": "the lifecycle enum is not only a creation-time contract",
+        "command": "UPDATE \"C-1\" SET ATTRIBUTES {status: \"validated\"}",
+        "expect": {
+          "error": "ConstraintViolation"
+        }
+      },
+      {
+        "name": "a refused UPDATE leaves the standing it failed to move",
+        "command": "FIND(?s.attributes.status) WHERE { ?s CONCEPT {type: \"Skill\"} }",
+        "expect": {
+          "result": [
+            "trialed"
+          ]
+        }
+      },
+      {
+        "name": "nor is the scoring handle: UPDATE cannot unset what the type requires",
+        "command": "UPDATE \"C-1\" UNSET ATTRIBUTES {task_family}",
+        "expect": {
+          "error": "ConstraintViolation"
+        }
+      },
+      {
+        "name": "nor is a declared type",
+        "command": "UPDATE \"C-1\" SET ATTRIBUTES {task_family: 7}",
+        "expect": {
+          "error": "ConstraintViolation"
+        }
+      },
+      {
+        "name": "a statement is judged by the state it ends in, not by the order of its clauses",
+        "command": "MUTATE {\n  UPDATE \"C-1\"\n  UNSET ATTRIBUTES {summary}\n  SET ATTRIBUTES {summary: \"Dry-run the migration, then deploy\"}\n}",
+        "expect": {}
+      },
+      {
+        "name": "and the transition the verdict licensed still goes through",
+        "command": "MUTATE {\n  UPDATE \"C-1\"\n  SET ATTRIBUTES {status: \"adopted\"}\n}",
+        "expect": {}
+      },
+      {
+        "name": "the Skill that came out the other side",
+        "command": "FIND(?s.attributes.status, ?s.attributes.summary) WHERE { ?s CONCEPT {type: \"Skill\"} }",
+        "expect": {
+          "result": [
+            [
+              "adopted",
+              "Dry-run the migration, then deploy"
+            ]
+          ]
+        }
+      },
+      {
+        "name": "an instrumented run records the identity the grading joined on",
+        "command": "MUTATE {\n  CREATE CONCEPT ?run {\n    TYPE \"GradedRun\"\n    NAME \"deploy 42\"\n    SET ATTRIBUTES {run_id: \"deploy-42\", note: \"stale replica\"}\n  }\n}",
+        "expect": {}
+      },
+      {
+        "name": "what a verdict actually graded cannot be relabelled afterwards",
+        "command": "UPDATE ?r SET ATTRIBUTES {run_id: \"deploy-99\"} WHERE { ?r CONCEPT {type: \"GradedRun\"} }",
+        "expect": {
+          "error": "ConstraintViolation"
+        }
+      },
+      {
+        "name": "what was only ever commentary still moves",
+        "command": "MUTATE {\n  UPDATE ?r\n  SET ATTRIBUTES {note: \"stale replica, since drained\"}\n  WHERE { ?r CONCEPT {type: \"GradedRun\"} }\n}",
+        "expect": {}
+      },
+      {
+        "name": "the run, after the one revision its type allowed",
+        "command": "FIND(?r.attributes.run_id, ?r.attributes.note) WHERE { ?r CONCEPT {type: \"GradedRun\"} }",
+        "expect": {
+          "result": [
+            [
+              "deploy-42",
+              "stale replica, since drained"
+            ]
+          ]
+        }
+      },
+      {
+        "name": "the graded index belongs on the Evidence, not on the cognition it grades",
+        "command": "MUTATE {\n  UPDATE \"C-1\"\n  SET FACET \"OutcomeRecord\" {task_family: \"deploy/pre-flight\", outcome_status: \"success\"}\n}",
+        "expect": {
+          "error": "ConstraintViolation"
+        }
+      },
+      {
+        "name": "and the tallies belong on the Skill, not on the outcome that moved them",
+        "command": "MUTATE {\n  UPDATE \"E-1\"\n  SET FACET \"SkillUtility\" {utility: 1.0}\n}",
+        "expect": {
+          "error": "ConstraintViolation"
+        }
+      }
+    ],
+    "packages": [
+      {
+        "format": "KIP-Schema-Package",
+        "manifest": {
+          "package_id": "kip://test/instrumentation",
+          "version": "1.0.0"
+        },
+        "definitions": {
+          "concept_types": {
+            "GradedRun": {
+              "kind": "ConceptType",
+              "description": "One instrumented run an outcome stream graded. `run_id` is immutable because a verdict binds to what it actually graded: relabelling the run afterwards would silently move a grade onto something else.",
+              "attributes": {
+                "open": false,
+                "fields": {
+                  "run_id": {
+                    "type": "string",
+                    "required": true,
+                    "mutable": false
+                  },
+                  "note": {
+                    "type": "string",
+                    "required": false,
+                    "mutable": true
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    ]
+  },
+  {
     "name": "core-truth-neutrality",
     "description": "The distinction the version exists for: a Proposition existing is not the Proposition being true. A tuple carries no confidence, the same tuple resolves to one Proposition, and a raw read reports claims rather than beliefs.",
     "setup": [
@@ -1199,6 +1453,360 @@ export const FIXTURES: readonly Fixture[] = [
     ]
   },
   {
+    "name": "schema-endpoints",
+    "description": "What a Schema Package says may occupy each end of a tuple, what may sit at each end of a structural edge, and what kind of element may carry a Facet (§41–§44, §58, §62–§66). An endpoint spec is a contract about what a reference points at, so it is checked where the reference is written rather than where it is read. Two judgement calls decide the shape: an endpoint this engine cannot resolve is reported as unknown rather than as wrong — inventing a violation out of a failed lookup would refuse legitimate cross-Space data — and an element the same transaction just created is resolvable, or a block that mints a Concept and then points at it would look untyped to itself. A declaration reads the same in both directions: an element reference on an end that names only datatypes is refused exactly as a Literal is on an end that names kinds, and an end that names both accepts both. A Facet's `applicable_to` is judged the same way, against the carrier: a Facet declaring `concept_types` refuses a record, which cannot be a Concept of any type, and refuses a Concept of another type.",
+    "packages": [
+      {
+        "format": "KIP-Schema-Package",
+        "manifest": {
+          "package_id": "kip://test/endpoints",
+          "version": "1.0.0"
+        },
+        "definitions": {
+          "concept_types": {
+            "Tool": {
+              "kind": "ConceptType",
+              "description": "Something used."
+            },
+            "Room": {
+              "kind": "ConceptType",
+              "description": "Somewhere a Tool is kept."
+            }
+          },
+          "predicates": {
+            "kept_in": {
+              "kind": "PredicateType",
+              "description": "Where a Tool is kept. Both ends are element references of a declared type.",
+              "subject": {
+                "concept_types": [
+                  "kip://test/endpoints@1.0.0/Tool"
+                ]
+              },
+              "object": {
+                "concept_types": [
+                  "kip://test/endpoints@1.0.0/Room"
+                ]
+              }
+            },
+            "engraved": {
+              "kind": "PredicateType",
+              "description": "The text engraved on a Tool. The object is a Literal of a declared datatype.",
+              "subject": {
+                "kinds": [
+                  "Concept"
+                ]
+              },
+              "object": {
+                "datatypes": [
+                  "kip:string"
+                ]
+              }
+            },
+            "labelled": {
+              "kind": "PredicateType",
+              "description": "A label for a Tool: either a Concept that stands for one, or the text itself.",
+              "subject": {
+                "kinds": [
+                  "Concept"
+                ]
+              },
+              "object": {
+                "kinds": [
+                  "Concept"
+                ],
+                "datatypes": [
+                  "kip:string"
+                ]
+              }
+            }
+          },
+          "facets": {
+            "Wear": {
+              "kind": "FacetDefinition",
+              "description": "How worn a Tool is. State about a Tool, and only a Tool.",
+              "closed": true,
+              "applicable_to": {
+                "concept_types": [
+                  "kip://test/endpoints@1.0.0/Tool"
+                ]
+              },
+              "fields": {
+                "level": {
+                  "type": "number",
+                  "required": false,
+                  "mutable": true,
+                  "minimum": 0,
+                  "maximum": 1
+                }
+              }
+            }
+          },
+          "structural_fields": {
+            "kept_with": {
+              "kind": "StructuralFieldDefinition",
+              "description": "Other Tools kept alongside this one. Both ends are Tools, at most two, and no Tool twice.",
+              "source": {
+                "concept_types": [
+                  "kip://test/endpoints@1.0.0/Tool"
+                ]
+              },
+              "target": {
+                "concept_types": [
+                  "kip://test/endpoints@1.0.0/Tool"
+                ]
+              },
+              "cardinality": {
+                "min": 0,
+                "max": 2
+              },
+              "ordered": false,
+              "unique": true
+            }
+          }
+        }
+      }
+    ],
+    "setup": [
+      "MUTATE {\n  CREATE CONCEPT ?hammer { TYPE \"Tool\" NAME \"Hammer\" }\n  CREATE CONCEPT ?shed { TYPE \"Room\" NAME \"Shed\" }\n}"
+    ],
+    "cases": [
+      {
+        "name": "a tuple whose ends are what the predicate declares",
+        "command": "MUTATE {\n  ENSURE PROPOSITION ?p (:tool, \"kept_in\", :room)\n}",
+        "params": {
+          "tool": {
+            "id": "C-1"
+          },
+          "room": {
+            "id": "C-2"
+          }
+        },
+        "expect": {}
+      },
+      {
+        "name": "an object of the wrong Concept type is refused where the reference is written",
+        "command": "MUTATE {\n  ENSURE PROPOSITION ?p (:tool, \"kept_in\", :tool)\n}",
+        "params": {
+          "tool": {
+            "id": "C-1"
+          }
+        },
+        "expect": {
+          "error": "ConstraintViolation"
+        }
+      },
+      {
+        "name": "and so is a subject of the wrong Concept type",
+        "command": "MUTATE {\n  ENSURE PROPOSITION ?p (:room, \"kept_in\", :room)\n}",
+        "params": {
+          "room": {
+            "id": "C-2"
+          }
+        },
+        "expect": {
+          "error": "ConstraintViolation"
+        }
+      },
+      {
+        "name": "a Literal cannot occupy an end the schema declares an element reference",
+        "command": "MUTATE {\n  ENSURE PROPOSITION ?p (:tool, \"kept_in\", \"the shed\")\n}",
+        "params": {
+          "tool": {
+            "id": "C-1"
+          }
+        },
+        "expect": {
+          "error": "ConstraintViolation"
+        }
+      },
+      {
+        "name": "an end this Space cannot resolve is unknown, not wrong",
+        "command": "MUTATE {\n  ENSURE PROPOSITION ?p (:tool, \"kept_in\", :elsewhere)\n}",
+        "params": {
+          "tool": {
+            "id": "C-1"
+          },
+          "elsewhere": {
+            "canonical_id": "urn:room:shed"
+          }
+        },
+        "expect": {}
+      },
+      {
+        "name": "a Literal of the declared datatype is what a datatype endpoint is for",
+        "command": "MUTATE {\n  ENSURE PROPOSITION ?p (:tool, \"engraved\", \"MMXXVI\")\n}",
+        "params": {
+          "tool": {
+            "id": "C-1"
+          }
+        },
+        "expect": {}
+      },
+      {
+        "name": "a Literal of another datatype is not",
+        "command": "MUTATE {\n  ENSURE PROPOSITION ?p (:tool, \"engraved\", 2026)\n}",
+        "params": {
+          "tool": {
+            "id": "C-1"
+          }
+        },
+        "expect": {
+          "error": "ConstraintViolation"
+        }
+      },
+      {
+        "name": "and an element reference is as wrong there as a Literal is on a reference end",
+        "command": "MUTATE {\n  ENSURE PROPOSITION ?p (:tool, \"engraved\", :room)\n}",
+        "params": {
+          "tool": {
+            "id": "C-1"
+          },
+          "room": {
+            "id": "C-2"
+          }
+        },
+        "expect": {
+          "error": "ConstraintViolation"
+        }
+      },
+      {
+        "name": "an end that declares both forms accepts both",
+        "command": "MUTATE {\n  ENSURE PROPOSITION ?a (:tool, \"labelled\", :room)\n  ENSURE PROPOSITION ?b (:tool, \"labelled\", \"the good one\")\n}",
+        "params": {
+          "tool": {
+            "id": "C-1"
+          },
+          "room": {
+            "id": "C-2"
+          }
+        },
+        "expect": {}
+      },
+      {
+        "name": "an element the same transaction just created is resolvable to itself",
+        "command": "MUTATE {\n  CREATE CONCEPT ?chisel { TYPE \"Tool\" NAME \"Chisel\" }\n  CREATE CONCEPT ?loft { TYPE \"Room\" NAME \"Loft\" }\n  ENSURE PROPOSITION ?p (?chisel, \"kept_in\", ?loft)\n}",
+        "expect": {}
+      },
+      {
+        "name": "including when what it just created is the wrong type for the slot",
+        "command": "MUTATE {\n  CREATE CONCEPT ?bench { TYPE \"Tool\" NAME \"Bench\" }\n  ENSURE PROPOSITION ?p (:tool, \"kept_in\", ?bench)\n}",
+        "params": {
+          "tool": {
+            "id": "C-1"
+          }
+        },
+        "expect": {
+          "error": "ConstraintViolation"
+        }
+      },
+      {
+        "name": "a Facet is state about the kind of element it declares",
+        "command": "MUTATE {\n  UPDATE \"C-1\"\n  SET FACET \"Wear\" {level: 0.4}\n}",
+        "expect": {}
+      },
+      {
+        "name": "and a record, which cannot be a Concept of any type, cannot carry it",
+        "command": "MUTATE {\n  CREATE EVIDENCE ?e {\n    SET FIELDS {evidence_class: \"observation\", payload: \"the handle is splitting\"}\n    SET FACET \"Wear\" {level: 0.4}\n  }\n}",
+        "expect": {
+          "error": "ConstraintViolation"
+        }
+      },
+      {
+        "name": "and a Concept of another type cannot carry it either",
+        "command": "MUTATE {\n  UPDATE \"C-2\"\n  SET FACET \"Wear\" {level: 0.4}\n}",
+        "expect": {
+          "error": "ConstraintViolation"
+        }
+      },
+      {
+        "name": "the tuples that survived",
+        "command": "FIND(?s.name, ?o.name) WHERE { ?p PROPOSITION (?s, \"kept_in\", ?o) }",
+        "expect": {
+          "result": [
+            [
+              "Hammer",
+              "Shed"
+            ],
+            [
+              "Chisel",
+              "Loft"
+            ],
+            [
+              "Hammer",
+              null
+            ]
+          ]
+        }
+      },
+      {
+        "name": "a structural edge is held to the ends its field declares",
+        "command": "MUTATE {\n  CREATE CONCEPT ?saw { TYPE \"Tool\" NAME \"Saw\" }\n  CREATE CONCEPT ?plane { TYPE \"Tool\" NAME \"Plane\" }\n  UPDATE ?saw SET STRUCTURAL { (\"kept_with\", ?plane) }\n}",
+        "expect": {}
+      },
+      {
+        "name": "a target of the wrong Concept type is refused there too",
+        "command": "MUTATE {\n  UPDATE \"C-1\"\n  SET STRUCTURAL { (\"kept_with\", :room) }\n}",
+        "params": {
+          "room": {
+            "id": "C-2"
+          }
+        },
+        "expect": {
+          "error": "ConstraintViolation"
+        }
+      },
+      {
+        "name": "and so is a source the field was never about",
+        "command": "MUTATE {\n  UPDATE \"C-2\"\n  SET STRUCTURAL { (\"kept_with\", :tool) }\n}",
+        "params": {
+          "tool": {
+            "id": "C-1"
+          }
+        },
+        "expect": {
+          "error": "ConstraintViolation"
+        }
+      },
+      {
+        "name": "stating the same reference twice is one edge, not a duplicate",
+        "command": "MUTATE {\n  CREATE CONCEPT ?awl {\n    TYPE \"Tool\"\n    NAME \"Awl\"\n    SET STRUCTURAL {\n      (\"kept_with\", :tool)\n      (\"kept_with\", :tool)\n    }\n  }\n}",
+        "params": {
+          "tool": {
+            "id": "C-1"
+          }
+        },
+        "expect": {}
+      },
+      {
+        "name": "which is why a field declared unique is not violable by writing to it",
+        "command": "FIND(?t.structural) WHERE { ?t CONCEPT {name: \"Awl\"} }",
+        "expect": {
+          "result": [
+            {
+              "kip://test/endpoints@1.0.0/kept_with": [
+                {
+                  "id": "C:<1>"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "name": "and more references than the declared cardinality permits is another",
+        "command": "MUTATE {\n  CREATE CONCEPT ?rasp { TYPE \"Tool\" NAME \"Rasp\" }\n  CREATE CONCEPT ?file { TYPE \"Tool\" NAME \"File\" }\n  CREATE CONCEPT ?vice {\n    TYPE \"Tool\"\n    NAME \"Vice\"\n    SET STRUCTURAL {\n      (\"kept_with\", :tool)\n      (\"kept_with\", ?rasp)\n      (\"kept_with\", ?file)\n    }\n  }\n}",
+        "params": {
+          "tool": {
+            "id": "C-1"
+          }
+        },
+        "expect": {
+          "error": "ConstraintViolation"
+        }
+      }
+    ]
+  },
+  {
     "name": "transactions",
     "description": "A MUTATE block is one transaction, not a script that happens to run in order: everything in it commits or none of it does. A precondition that fails leaves the element exactly as the caller last saw it, and the two guards ask different questions — EXPECT VERSION about what the caller read, EXPECT STATE about the engine state, which is not an Assertion's epistemic status.",
     "setup": [
@@ -1280,4 +1888,4 @@ export const FIXTURES: readonly Fixture[] = [
 ] as unknown as Fixture[]
 
 /** The total number of cases, so a silent shrink is visible. */
-export const CASE_COUNT = 115
+export const CASE_COUNT = 162

@@ -25,11 +25,15 @@ import {
   predicateDef,
   structuralFieldDef,
   symbols,
+  checkEndpoint,
   validateAttributeMutability,
+  validateFacetMutability,
   validateAttributes,
   validateFacet,
   validateStructural,
   version,
+  type EndpointFacts,
+  type EndpointSpec,
   type SchemaLock,
   type SchemaPackage,
 } from '../src/schema/index.js'
@@ -342,6 +346,97 @@ describe('package validation', () => {
     ).toEqual(['SCHEMA_IMMUTABLE_FIELD'])
   })
 
+  it('refuses a change to an immutable Facet member but allows establishing it', () => {
+    // The Facet twin of §39. `OutcomeRecord` is the case that needs it: the
+    // graded index over what the world did, on Evidence the graded actor can
+    // still reach with `SET FACET`.
+    const def = {
+      fields: {
+        outcome_status: { type: 'string', mutable: false },
+        magnitude: { type: 'number', mutable: false },
+      },
+    }
+    expect(
+      validateFacetMutability(
+        't',
+        def,
+        { outcome_status: 'failure' },
+        { outcome_status: 'failure', magnitude: 0.25 },
+      ).valid,
+    ).toBe(true)
+    expect(
+      validateFacetMutability(
+        't',
+        def,
+        { outcome_status: 'failure' },
+        { outcome_status: 'success' },
+      ).violations.map((v) => v.code),
+    ).toEqual(['SCHEMA_IMMUTABLE_FIELD'])
+    // Erasing it is rewriting it to absent.
+    expect(
+      validateFacetMutability('t', def, { outcome_status: 'failure' }, {})
+        .violations.map((v) => v.code),
+    ).toEqual(['SCHEMA_IMMUTABLE_FIELD'])
+  })
+
+  it('checks an endpoint against the kind, type or datatype it declares', () => {
+    // §42–§44. The order matters: a disallowed kind is refused before the
+    // Concept-type question is even asked, because an Assertion is not a
+    // Concept of the wrong type — it is not a Concept.
+    const check = (spec: EndpointSpec, facts: EndpointFacts): string[] => {
+      const result = new Validation()
+      checkEndpoint('t', 'object', spec, facts, result)
+      return result.violations.map((v) => v.code)
+    }
+    const CONCEPT = { kinds: ['Concept'] }
+    const TOOL = { concept_types: ['kip://test/e@1.0.0/Tool'] }
+
+    // An unconstrained endpoint accepts anything, including nothing known.
+    expect(check({}, { kind: 'literal', datatype: 'kip:string' })).toEqual([])
+    // An endpoint this engine cannot resolve is unknown, never wrong.
+    expect(check(TOOL, { kind: 'unresolved' })).toEqual([])
+    // A Concept whose type was not looked up is not a Concept of the wrong one.
+    expect(check(TOOL, { kind: 'element', elementKind: 'Concept' })).toEqual([])
+
+    expect(check(CONCEPT, { kind: 'element', elementKind: 'Concept' })).toEqual([])
+    expect(check(CONCEPT, { kind: 'element', elementKind: 'Evidence' })).toEqual([
+      'SCHEMA_ENDPOINT_NOT_ALLOWED',
+    ])
+    // Declared an element reference, handed a Literal.
+    expect(check(CONCEPT, { kind: 'literal', datatype: 'kip:string' })).toEqual([
+      'SCHEMA_ENDPOINT_NOT_ALLOWED',
+    ])
+    // Declared a Literal, handed one of another datatype.
+    expect(
+      check({ datatypes: ['kip:string'] }, { kind: 'literal', datatype: 'kip:integer' }),
+    ).toEqual(['SCHEMA_ENDPOINT_NOT_ALLOWED'])
+    expect(
+      check({ datatypes: ['kip:string'] }, { kind: 'literal', datatype: 'kip:string' }),
+    ).toEqual([])
+    // …and the declaration reads the same in both directions: an element
+    // reference is as wrong on a datatype-only end as a Literal is on a
+    // reference end. An endpoint declaring both accepts both.
+    expect(
+      check({ datatypes: ['kip:string'] }, { kind: 'element', elementKind: 'Concept' }),
+    ).toEqual(['SCHEMA_ENDPOINT_NOT_ALLOWED'])
+    expect(check({ datatypes: ['kip:string'] }, { kind: 'unresolved' })).toEqual([])
+    const either = { kinds: ['Concept'], datatypes: ['kip:string'] }
+    expect(check(either, { kind: 'element', elementKind: 'Concept' })).toEqual([])
+    expect(check(either, { kind: 'literal', datatype: 'kip:string' })).toEqual([])
+
+    expect(
+      check(TOOL, {
+        kind: 'element',
+        elementKind: 'Concept',
+        schemaRef: 'kip://test/e@1.0.0/Room',
+      }),
+    ).toEqual(['SCHEMA_ENDPOINT_NOT_ALLOWED'])
+    // A record cannot be a Concept of any type, and says so once, not twice.
+    expect(check(TOOL, { kind: 'element', elementKind: 'Activity' })).toEqual([
+      'SCHEMA_ENDPOINT_NOT_ALLOWED',
+    ])
+  })
+
   it('checks structural cardinality and uniqueness', () => {
     const def = { cardinality: { min: 1, max: 2 }, unique: true }
     expect(validateStructural('s', def, ['a']).valid).toBe(true)
@@ -363,11 +458,17 @@ describe('package validation', () => {
     // an absent claim there is unknown and never false (§51)…
     expect(predicateDef(COGNITIVE_MEMORY, 'prefers')?.open_world).toBe(true)
     // …and whatever a package declares, this layer offers no validator that
-    // could act on it. The absence is the contract, so it is asserted here
-    // rather than left to be noticed.
+    // could act on it. `validatePredicateEndpoints` comes closest and is not
+    // close: it asks what may occupy each end of a tuple, never how many
+    // claims about that subject already exist. The absence is the contract, so
+    // it is asserted here rather than left to be noticed.
     expect(Object.keys(validators).filter((n) => n.startsWith('validate'))).toEqual([
       'validateAttributes',
       'validateAttributeMutability',
+      'validateFacetMutability',
+      'validateFacetCarrier',
+      'validatePredicateEndpoints',
+      'validateStructuralEndpoints',
       'validateFacet',
       'validateStructural',
     ])

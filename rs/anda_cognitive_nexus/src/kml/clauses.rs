@@ -300,7 +300,28 @@ pub async fn apply_facets(
     tx: &Transaction,
     b: &Bindings<'_>,
     assignments: &[anda_kip::FacetAssignment],
-    carrier: ElementKind,
+    carrier: &crate::schema::EndpointFacts,
+    view: Option<&Json>,
+) -> Result<Map<String, Json>, KipError> {
+    let facets = resolve_facets(tx, b, assignments, view)?;
+    tx.env
+        .validate_facets(&facets, carrier, Intent::Write)?
+        .into_result()?;
+    Ok(facets)
+}
+
+/// Resolves each Facet symbol and its members, validating neither.
+///
+/// `UPDATE` needs this half on its own: a Facet assignment *merges* (§59), so
+/// what the schema has to be shown is the merged result, not the clause. A
+/// Facet with required members — `OutcomeRecord` is the first one the Cognitive
+/// Memory Profile ships — would otherwise be unwritable one member at a time,
+/// because every partial assignment would read as a Facet missing the members
+/// the element already carries.
+pub fn resolve_facets(
+    tx: &Transaction,
+    b: &Bindings<'_>,
+    assignments: &[anda_kip::FacetAssignment],
     view: Option<&Json>,
 ) -> Result<Map<String, Json>, KipError> {
     let mut facets = Map::new();
@@ -312,9 +333,6 @@ pub async fn apply_facets(
         let members = assignments_to_json(b, &assignment.values, view)?;
         facets.insert(symbol.to_string(), Json::Object(members));
     }
-    tx.env
-        .validate_facets(&facets, carrier, Intent::Write)?
-        .into_result()?;
     Ok(facets)
 }
 
@@ -502,7 +520,20 @@ async fn create_concept(
     let extra_name = fields.text("name")?;
     fields.rest("Concept")?;
 
-    let facets = apply_facets(tx, &b, &clause.set_facets, ElementKind::Concept, None).await?;
+    // Kind only here: the Concept's type symbol is resolved a few lines down by
+    // `prepare_concept`, which re-checks these Facets against it. Naming the
+    // type twice would mean resolving it twice and could disagree with itself.
+    let facets = apply_facets(
+        tx,
+        &b,
+        &clause.set_facets,
+        &crate::schema::EndpointFacts::Element {
+            kind: ElementKind::Concept,
+            schema_ref: None,
+        },
+        None,
+    )
+    .await?;
     // A Concept has no Core structural fields; every one is Profile-defined.
     let mut structural = collect_structural(tx, &b, clause.set_structural.as_ref(), &[])?;
     // §11.3: a new write resolves references through whatever merges the Space
@@ -533,7 +564,7 @@ async fn create_concept(
     let element = Element::Concept(Box::new(row));
     tx.authorize_created(&element, Permission::Create)?;
     tx.stage_new(id, element, "create");
-    Ok(())
+    check_structural(store, tx, id).await
 }
 
 async fn create_record(
@@ -564,7 +595,18 @@ async fn create_record(
             .transpose()?
             .unwrap_or_default(),
     );
-    let facets = apply_facets(tx, &b, &clause.set_facets, kind, None).await?;
+    // A record is not a Concept and has no type to name.
+    let facets = apply_facets(
+        tx,
+        &b,
+        &clause.set_facets,
+        &crate::schema::EndpointFacts::Element {
+            kind,
+            schema_ref: None,
+        },
+        None,
+    )
+    .await?;
     let mut structural =
         collect_structural(tx, &b, clause.set_structural.as_ref(), core_fields(kind))?;
     let retention = fields.json("retention");
@@ -716,7 +758,7 @@ async fn create_record(
         tx.authorize_created(&row, Permission::Create)?;
     }
     tx.stage_new(id, row, "create");
-    Ok(())
+    check_structural(store, tx, id).await
 }
 
 /// Wraps one Assertion row back into an [`Element`] for authorization.
@@ -1138,7 +1180,16 @@ async fn upsert_concept(
         tx.authorize_element(id, Permission::Update).await?;
     }
 
-    apply_concept_assignments(tx, clause, id, request, operation).await
+    apply_concept_assignments(
+        store,
+        tx,
+        clause,
+        id,
+        existing.is_none(),
+        request,
+        operation,
+    )
+    .await
 }
 
 /// Reads one `MATCH` member as a string.
@@ -1174,9 +1225,11 @@ fn match_text(b: &Bindings<'_>, value: &MatchValue, what: &str) -> Result<String
 /// dropped: a caller cannot tell a mutation that did nothing from one that was
 /// never implemented.
 async fn apply_concept_assignments(
+    store: &Store,
     tx: &mut Transaction,
     clause: &ConceptUpsert,
     id: ElementId,
+    created: bool,
     request: Option<&Map<String, Json>>,
     operation: Option<&Map<String, Json>>,
 ) -> Result<(), KipError> {
@@ -1212,6 +1265,15 @@ async fn apply_concept_assignments(
         changed |= update::apply_action(tx, id, action, &view, request, operation)
             .await?
             .changed;
+    }
+    // The insert half is a create, and a create leaves a Concept its type
+    // accepts or it does not happen (§36) — `CREATE CONCEPT` has always been
+    // held to that, and an upsert that mints one is not a quieter way in.
+    if created || update::touches_attributes(&actions) {
+        update::check_attributes(tx, id, &view).await?;
+    }
+    if update::touches_structural(&actions) {
+        check_structural(store, tx, id).await?;
     }
 
     // A no-effect final state changes nothing: no version bump, no change
@@ -1268,6 +1330,12 @@ async fn update_elements(
             changed |= update::apply_action(tx, id, action, &view, request, operation)
                 .await?
                 .changed;
+        }
+        if update::touches_attributes(&clause.actions) {
+            update::check_attributes(tx, id, &view).await?;
+        }
+        if update::touches_structural(&clause.actions) {
+            check_structural(store, tx, id).await?;
         }
         if changed {
             tx.mark_changed(id, "update");
@@ -2162,6 +2230,65 @@ async fn evidence_mut(tx: &mut Transaction, id: ElementId) -> Result<&mut Eviden
 }
 
 /// What the Schema Environment needs to know about one endpoint.
+/// Validates one element's Profile structural fields against their
+/// declarations (§62–§66).
+///
+/// Endpoint types, cardinality and uniqueness together, because they are one
+/// declaration: `has_step` says an Experience holds ordered, distinct
+/// ExperienceSteps, and an engine that counted them without asking what they
+/// were would admit the wrong kind of element as long as it came alone.
+///
+/// Judged on the element's whole structural map after the statement, not on
+/// the clause: a minimum cardinality is a statement about what the element
+/// holds, and `UNSET STRUCTURAL` can break it as easily as `SET` can.
+pub(crate) async fn check_structural(
+    store: &Store,
+    tx: &mut Transaction,
+    id: ElementId,
+) -> Result<(), KipError> {
+    let (source, structural) = {
+        let element = tx.load(id).await?;
+        let kind = element.kind();
+        let (schema_ref, structural) = match element {
+            Element::Concept(row) => (Some(row.schema_ref.clone()), row.structural.clone()),
+            Element::Proposition(row) => (None, row.structural.clone()),
+            Element::Assertion(row) => (None, row.structural.clone()),
+            Element::Evidence(row) => (None, row.structural.clone()),
+            Element::Activity(row) => (None, row.structural.clone()),
+        };
+        (
+            crate::schema::EndpointFacts::Element {
+                kind,
+                schema_ref: schema_ref.filter(|text| !text.is_empty()),
+            },
+            structural,
+        )
+    };
+
+    for (field, refs) in &structural {
+        let Json::Array(items) = refs else {
+            continue;
+        };
+        let mut targets = Vec::with_capacity(items.len());
+        for item in items {
+            let endpoint = Endpoint::from_json(item)?;
+            let facts = facts_for(store, tx, &endpoint).await?;
+            targets.push((endpoint.key(), facts));
+        }
+        // A field this environment cannot resolve declares nothing to hold the
+        // write to, the same stance a Proposition takes on an unresolvable
+        // predicate.
+        let Ok((_, validation)) =
+            tx.env
+                .prepare_structural(field, &source, &targets, Intent::Write)
+        else {
+            continue;
+        };
+        validation.into_result()?;
+    }
+    Ok(())
+}
+
 async fn facts_for(
     store: &Store,
     tx: &mut Transaction,

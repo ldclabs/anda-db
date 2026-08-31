@@ -95,10 +95,16 @@ export {
 
 export {
   Validation,
+  checkEndpoint,
   validateAttributeMutability,
   validateAttributes,
   validateFacet,
+  validateFacetCarrier,
+  validateFacetMutability,
+  validatePredicateEndpoints,
   validateStructural,
+  validateStructuralEndpoints,
+  type EndpointFacts,
   type Severity,
   type Violation,
 } from './validate.js'

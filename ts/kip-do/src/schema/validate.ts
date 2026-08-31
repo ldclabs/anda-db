@@ -27,7 +27,16 @@
 
 import { errors } from '../errors.js'
 import { canonicalJson, jsonEquals, type Json, type JsonMap } from '../json.js'
-import type { AttributeSpec, FacetDef, FieldSpec, StructuralFieldDef } from './package.js'
+import type {
+  AttributeSpec,
+  EndpointSpec,
+  FacetDef,
+  FieldSpec,
+  PredicateDef,
+  StructuralFieldDef,
+} from './package.js'
+import { isUnconstrained } from './package.js'
+import type { ElementKind } from '../id.js'
 
 /** How much a violation matters (Spec §98). */
 export type Severity = 'error' | 'warning' | 'info'
@@ -265,12 +274,42 @@ export function validateAttributes(
 }
 
 /**
- * Reports attributes that changed despite being declared immutable (§39).
+ * Reports members that changed despite being declared immutable (§39).
  *
  * Needs both states because immutability is a statement about a transition, not
- * about a value: the same attribute map is fine on creation and illegal as an
- * edit.
+ * about a value: the same map is fine on creation and illegal as an edit.
  */
+function validateMutability(
+  schemaRef: string,
+  prefix: string,
+  what: string,
+  declared: Record<string, FieldSpec>,
+  before: JsonMap,
+  after: JsonMap,
+  into: Validation,
+): void {
+  for (const [name, field] of Object.entries(declared)) {
+    if (field.mutable !== false) continue
+    // Setting an immutable member that was never set is establishing it, not
+    // changing it; only a change to an existing value is refused.
+    if (
+      Object.hasOwn(before, name) &&
+      !jsonEquals(before[name] as Json, (after[name] ?? null) as Json)
+    ) {
+      into.push(
+        error(
+          'SCHEMA_IMMUTABLE_FIELD',
+          schemaRef,
+          `${prefix}.${name}`,
+          `the schema declares this ${what} immutable; record a new element ` +
+            'instead of rewriting it',
+        ),
+      )
+    }
+  }
+}
+
+/** Reports attributes that changed despite being declared immutable (§39). */
 export function validateAttributeMutability(
   schemaRef: string,
   spec: AttributeSpec | undefined,
@@ -278,24 +317,195 @@ export function validateAttributeMutability(
   after: JsonMap,
 ): Validation {
   const result = new Validation()
-  for (const [name, field] of Object.entries(spec?.fields ?? {})) {
-    if (field.mutable !== false) continue
-    // Setting an immutable attribute that was never set is establishing it,
-    // not changing it; only a change to an existing value is refused.
-    if (
-      Object.hasOwn(before, name) &&
-      !jsonEquals(before[name] as Json, (after[name] ?? null) as Json)
-    ) {
-      result.push(
-        error(
-          'SCHEMA_IMMUTABLE_FIELD',
-          schemaRef,
-          `attributes.${name}`,
-          'the schema declares this attribute immutable; record a new element ' +
-            'or a new Assertion instead of rewriting it',
-        ),
-      )
+  validateMutability(
+    schemaRef,
+    'attributes',
+    'attribute',
+    spec?.fields ?? {},
+    before,
+    after,
+    result,
+  )
+  return result
+}
+
+/**
+ * Reports Facet members that changed despite being declared immutable (§39).
+ *
+ * A Facet is representation-local state and most of it is meant to move — that
+ * is what metabolism does to `MnemonicState`. A member the Profile pins down is
+ * the exception, and it is the whole point of the ones that are pinned:
+ * `OutcomeRecord` is the graded index over what the world did, and an actor
+ * that can rewrite its own grade has not been graded.
+ */
+export function validateFacetMutability(
+  schemaRef: string,
+  def: FacetDef,
+  before: JsonMap,
+  after: JsonMap,
+): Validation {
+  const result = new Validation()
+  validateMutability(
+    schemaRef,
+    'facets',
+    'Facet member',
+    def.fields ?? {},
+    before,
+    after,
+    result,
+  )
+  return result
+}
+
+/**
+ * What the caller knows about one end of a Proposition or structural edge.
+ *
+ * Supplied by the caller rather than looked up here, because deciding *what a
+ * reference points at* is a storage question and this module has no storage.
+ * That keeps schema validation a pure function of `(environment, facts)`,
+ * which is what makes it testable without a database and deterministic across
+ * engines (§99).
+ */
+export type EndpointFacts =
+  /** A reference to a Cognitive Element. */
+  | { kind: 'element'; elementKind: ElementKind; schemaRef?: string }
+  /** A Literal value, by its datatype symbol. */
+  | { kind: 'literal'; datatype: string }
+  /**
+   * A reference this engine cannot resolve locally — a canonical identity or a
+   * foreign Space reference.
+   *
+   * Unresolvable is not the same as wrong: the endpoint's type is simply
+   * unknown here, and inventing a violation from an unknown would reject
+   * legitimate data.
+   */
+  | { kind: 'unresolved' }
+
+/** Checks one endpoint against its declared constraints (§42–§44). */
+export function checkEndpoint(
+  schemaRef: string,
+  path: string,
+  spec: EndpointSpec | undefined,
+  facts: EndpointFacts,
+  into: Validation,
+): void {
+  if (isUnconstrained(spec)) return
+  const refuse = (message: string): void => {
+    into.push(error('SCHEMA_ENDPOINT_NOT_ALLOWED', schemaRef, path, message))
+  }
+  const kinds = spec?.kinds ?? []
+  const conceptTypes = spec?.concept_types ?? []
+  const datatypes = spec?.datatypes ?? []
+
+  switch (facts.kind) {
+    case 'unresolved':
+      return
+    case 'literal':
+      if (datatypes.length === 0) {
+        refuse(
+          'the schema declares this endpoint an element reference, not a Literal',
+        )
+      } else if (!datatypes.includes(facts.datatype)) {
+        refuse(
+          `a Literal of datatype ${facts.datatype} is not among the declared ` +
+            `datatypes: ${datatypes.join(', ')}`,
+        )
+      }
+      return
+    case 'element': {
+      // The mirror of the Literal branch's first refusal. A spec that names
+      // only datatypes has said what may occupy this end, and it is not a
+      // reference — letting one through because the spec never spelled out a
+      // `kinds` list would make the two directions of the same declaration
+      // mean different things.
+      if (kinds.length === 0 && conceptTypes.length === 0) {
+        refuse(
+          `the schema declares this endpoint a Literal of ${datatypes.join(', ')}, ` +
+            'not an element reference',
+        )
+        return
+      }
+      if (
+        kinds.length > 0 &&
+        !kinds.some(
+          (allowed) => allowed.toLowerCase() === facts.elementKind.toLowerCase(),
+        )
+      ) {
+        refuse(
+          `a ${facts.elementKind} is not among the declared kinds: ` +
+            kinds.join(', '),
+        )
+        return
+      }
+      if (conceptTypes.length === 0) return
+      if (facts.elementKind !== 'Concept') {
+        refuse(
+          'the schema declares this endpoint a Concept of a specific type, ' +
+            `and a ${facts.elementKind} cannot have one`,
+        )
+        return
+      }
+      // A Concept whose type this engine has not been told is not a Concept of
+      // the wrong type. Reporting one would turn a missing lookup into a
+      // schema violation.
+      if (facts.schemaRef !== undefined && !conceptTypes.includes(facts.schemaRef)) {
+        refuse(
+          `${facts.schemaRef} is not among the declared Concept types: ` +
+            conceptTypes.join(', '),
+        )
+      }
+      return
     }
+  }
+}
+
+/**
+ * Checks that this kind of element may carry this Facet (§58).
+ *
+ * A Facet declares what it is state *about*: `SkillUtility` is procedural
+ * usefulness and belongs on a Skill, `OutcomeRecord` is the graded index over
+ * an instrument's output and belongs on Evidence. Carrying one somewhere else
+ * would make the name mean something the Profile never said.
+ *
+ * The carrier's own type is part of the facts when it has one, so a Facet
+ * declaring `concept_types` refuses a record — which cannot be a Concept of
+ * any type — and refuses a Concept of another type. A carrier whose type was
+ * not supplied is not a Concept of the wrong type and is not refused for it.
+ */
+export function validateFacetCarrier(
+  schemaRef: string,
+  def: FacetDef,
+  carrier: EndpointFacts,
+): Validation {
+  const result = new Validation()
+  checkEndpoint(schemaRef, 'facets', def.applicable_to, carrier, result)
+  return result
+}
+
+/** Validates a tuple's endpoints against its predicate (§41–§44). */
+export function validatePredicateEndpoints(
+  schemaRef: string,
+  def: PredicateDef,
+  subject: EndpointFacts,
+  object: EndpointFacts,
+): Validation {
+  const result = new Validation()
+  checkEndpoint(schemaRef, 'subject', def.subject, subject, result)
+  checkEndpoint(schemaRef, 'object', def.object, object, result)
+  return result
+}
+
+/** Validates a structural field's endpoints against its declaration (§62–§66). */
+export function validateStructuralEndpoints(
+  schemaRef: string,
+  def: StructuralFieldDef,
+  source: EndpointFacts,
+  targets: readonly EndpointFacts[],
+): Validation {
+  const result = new Validation()
+  checkEndpoint(schemaRef, 'source', def.source, source, result)
+  for (const target of targets) {
+    checkEndpoint(schemaRef, 'target', def.target, target, result)
   }
   return result
 }
