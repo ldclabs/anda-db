@@ -9,7 +9,7 @@
 use anda_cognitive_nexus::{
     CognitiveNexus, ElementId,
     governance::{
-        AuthContext, SYSTEM_PRINCIPAL, classification,
+        AuthContext, Permission, SYSTEM_PRINCIPAL, classification,
         rows::{
             ActorBindingRow, AuthorityConditions, AuthorityConstraints, AuthorityScope, GrantRow,
             PolicyStatement, assurance, auth_strength, binding_class, principal_class,
@@ -3303,6 +3303,48 @@ async fn a_control_plane_call_made_as_a_principal_is_authorized_as_that_principa
         .create_grant(draft(), SYSTEM_PRINCIPAL)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn a_permission_no_gate_asks_for_is_refused_rather_than_accepted() {
+    // §29.6: a runtime that does not distinguish derived writes MUST refuse
+    // `derive` where a Grant names it. A permission that is accepted and gates
+    // nothing is authority that looks conferred and is not — worse than an
+    // unrecognized name, because the holder believes it has it, and finds out
+    // during an incident.
+    //
+    // The same reasoning covers `share` and `manage_trust`: this engine
+    // exposes no controlled cross-Space view and versions no trust policy, so
+    // nothing would ever ask for either.
+    for name in ["derive", "share", "manage_trust"] {
+        let error = Permission::parse(name)
+            .expect_err("a name no gate asks for is not in the registry");
+        assert_eq!(error.code, anda_kip::KipErrorCode::NotAuthorized, "{name}");
+    }
+
+    // And the check runs where the Grant is written, not at decision time.
+    let nexus = stocked("unregistered_permission").await;
+    let subject = agent(nexus.governance(), "kip:principal:subject").await;
+    let refused = nexus
+        .system_session()
+        .create_grant(
+            DEFAULT_SPACE,
+            GrantDraft {
+                space_id: DEFAULT_SPACE.into(),
+                grantee_principal: subject,
+                actions: vec!["read".into(), "derive".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("a Grant naming an unregistered permission is not a Grant");
+    assert_eq!(refused.code, anda_kip::KipErrorCode::NotAuthorized);
+
+    // Every name that *is* registered stays parseable: the rule is "no name
+    // without a gate", not "fewer names".
+    for name in ["create", "assert", "purge", "manage_grants", "import"] {
+        Permission::parse(name).unwrap_or_else(|err| panic!("{name}: {err}"));
+    }
 }
 
 #[tokio::test]

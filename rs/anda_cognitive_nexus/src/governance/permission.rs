@@ -18,6 +18,21 @@
 //! at Grant creation rather than ignored at decision time: a typo that silently
 //! confers nothing is a Grant that looks like authority and is not, and the
 //! holder discovers it during an incident.
+//!
+//! ## A name is here only when a gate asks for it
+//!
+//! The maintenance contract, and the reason `derive`, `share` and `manage_trust`
+//! are absent: this engine distinguishes no derived write, exposes no controlled
+//! cross-Space view, and versions no trust policy, so nothing would ever ask for
+//! them. Registering them anyway would fail in exactly the way an unrecognized
+//! name is rejected to prevent — a Grant that looks like authority and is not —
+//! except worse, because it would be *accepted*, and §29.6 makes refusing it a
+//! MUST for that reason.
+//!
+//! So a name is added here in the same change that adds the gate asking for it,
+//! never in advance. The absence is reported as a gap by
+//! `DESCRIBE CAPABILITIES`, which is where a caller looks to find out that this
+//! Space cannot express a distinction it wanted.
 
 use anda_kip::KipError;
 
@@ -142,8 +157,6 @@ permissions! {
         "create Concepts, Propositions, Evidence and Activities";
     Update => "update", CognitiveMutation,
         "change mutable, non-protected fields of an existing element";
-    Derive => "derive", CognitiveMutation,
-        "create derived output from content already read, under propagation rules";
 
     // Epistemic mutation (§63–§70)
     Assert => "assert", EpistemicMutation,
@@ -182,8 +195,6 @@ permissions! {
         "accept another Brain's cognition into this Space";
     Export => "export", Sharing,
         "take cognition out of the Space";
-    Share => "share", Sharing,
-        "expose a controlled view of this Space to another";
 
     // Lifecycle (§80–§82, §88, §100)
     ManageRetention => "manage_retention", Lifecycle,
@@ -206,8 +217,6 @@ permissions! {
         "confer part of one's own authority on another Principal";
     ManagePolicy => "manage_policy", Governance,
         "publish a new version of the Space's Governance Policy";
-    ManageTrust => "manage_trust", Governance,
-        "bind or version the trust policy the projection reads";
     ManageSchema => "manage_schema", Governance,
         "install a Schema Package or activate a Schema Lock";
 
@@ -244,7 +253,7 @@ impl Permission {
             Family::Governance | Family::Authority | Family::Identity
         ) || matches!(
             self,
-            Self::Import | Self::Export | Self::Share | Self::Purge | Self::LegalHold
+            Self::Import | Self::Export | Self::Purge | Self::LegalHold
         )
     }
 

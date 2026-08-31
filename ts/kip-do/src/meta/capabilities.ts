@@ -78,7 +78,7 @@ const SUPPORTED_NAMES: readonly string[] = [
 const UNSUPPORTED_NAMES: readonly string[] = [
   'atomic_batch',
   'grouped_aggregation',
-  'ungated_permissions',
+  'unregistered_permissions',
   'capsule_digest_profiles',
   'capsule_import',
   'capsule_signatures',
@@ -635,26 +635,24 @@ export function capabilities(): Json {
           'first is the truth',
       },
       {
-        capability: 'ungated_permissions',
+        capability: 'unregistered_permissions',
         detail: 'derive, share, manage_trust',
         reason:
-          'these are registered names that no gate asks for, so a Grant ' +
-          'listing one confers nothing — the failure mode the registry exists ' +
-          'to prevent, named here rather than discovered during an incident. ' +
-          'Three different causes, and none of them is an oversight any more. ' +
-          '`share` and `manage_trust` name operations this engine has no ' +
-          'surface for at all: there is no controlled cross-Space view to ' +
-          'expose and no trust policy to version. `derive` is the one that is ' +
-          'a judgement rather than an absence: §29.6 makes derived output its ' +
-          'own permission, and this engine does not separate a create that ' +
-          'cites what it read from one that does not, so requiring it would ' +
-          'tax every ordinary Assertion. The control-plane management names ' +
-          'are no longer here: a `Session` now authorizes each of them, while ' +
-          '`nexus.store.governance` stays the host\'s unguarded bootstrap ' +
-          'path — no KML clause or META command reaches either, which is what ' +
-          'keeps a prompt injection off the plane. The reference engine has ' +
-          'the same three gaps, so closing them is a change both engines make ' +
-          'together or the two disagree about what a command costs',
+          '§29.6 requires a runtime that does not distinguish derived writes ' +
+          'to refuse `derive` where a Grant names it, and the same reasoning ' +
+          'covers the other two: a permission that is accepted and gates ' +
+          'nothing is authority that looks conferred and is not, discovered ' +
+          'during an incident. So these three are not in the registry at all ' +
+          'and a Grant listing one is rejected where it is written. `share` ' +
+          'and `manage_trust` name operations this engine has no surface for ' +
+          '— no controlled cross-Space view to expose, no trust policy to ' +
+          'version. `derive` is the one that is a judgement rather than an ' +
+          'absence: §29.6 triggers it on an element recorded as an output of ' +
+          'an Activity that has at least one input, and this engine does not ' +
+          'make that distinction at the gate yet. Every other registered name ' +
+          'is asked for by a gate, which is the property this entry exists to ' +
+          'report the exceptions to. The reference engine registers exactly ' +
+          'the same set',
       },
       {
         capability: 'semantic_search',

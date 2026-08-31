@@ -109,12 +109,35 @@ when `ARCHIVE` or `TOMBSTONE` reaches an Assertion the caller neither wrote nor
 represents — archiving one's own record is tidying, and administratively
 excluding a third party's claim is moderation.
 
-The gap that remains under `ungated_permissions` is now three names with three
-different reasons, none of them an oversight: `share` and `manage_trust` name
-operations neither engine has a surface for, and `derive` is a judgement — §29.6
-makes derived output its own permission, and neither engine separates a create
-that cites what it read from one that does not, so requiring it would tax every
-ordinary Assertion.
+### Changed — breaking: a permission is registered only where a gate asks for it
+
+Three names were left over after the control-plane work: `derive`, `share` and
+`manage_trust`. Both engines accepted them in a Grant and no gate ever asked for
+any of them — which is worse than an unrecognized name, because an unrecognized
+name is refused where the Grant is written while these were *accepted*, and the
+holder would have discovered the difference during an incident.
+
+Upstream KIP 2.0 now makes that a MUST (§29.6), so both engines drop the three
+from the registry and a Grant naming one is refused where it is written. The
+registry's own doc comment carries the resulting maintenance contract: a name is
+added in the same change that adds the gate asking for it, never in advance.
+`DESCRIBE CAPABILITIES` reports the three under `unregistered_permissions`,
+which replaces the `ungated_permissions` entry — the distinction being reported
+moved from "accepted but inert" to "refused, and here is why".
+
+This is a breaking change only for a deployment whose Grants already list one of
+the three. Such a Grant conferred nothing, so nothing it could do stops working;
+what changes is that creating it now fails instead of succeeding emptily.
+
+`share` and `manage_trust` name operations neither engine has a surface for — no
+controlled cross-Space view, no trust policy to version. `derive` is the one
+that is a judgement rather than an absence, and it is the reason the spec moved:
+§29.6 said `derive` allows "creation of derived cognitive output" and never
+defined the term, while §63.5 had defined derivation operationally all along, as
+the provenance edge `LIST DEPENDENTS` traverses. The two now point at each other
+and the trigger is stated — an element recorded as an output of an Activity that
+has at least one input — which is Core-level, decidable at commit, and not every
+write. Neither engine gates on it yet; both say so.
 
 ### Changed — breaking: META reads answer in one shape
 

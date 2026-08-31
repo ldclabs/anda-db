@@ -2222,6 +2222,43 @@ describe('erasure', () => {
     })
   })
 
+  it('refuses a permission no gate asks for, rather than accepting it', async () => {
+    // §29.6: a runtime that does not distinguish derived writes MUST refuse
+    // `derive` where a Grant names it. A permission that is accepted and gates
+    // nothing is authority that looks conferred and is not — worse than an
+    // unrecognized name, because the holder believes it has it, and finds out
+    // during an incident.
+    //
+    // The same reasoning covers `share` and `manage_trust`: this engine exposes
+    // no controlled cross-Space view and versions no trust policy, so nothing
+    // would ever ask for either.
+    await withNexus('unregistered-permission', (nexus) => {
+      for (const name of ['derive', 'share', 'manage_trust']) {
+        expect(() => parsePermission(name), name).toThrowError(
+          /is not a permission this engine implements/,
+        )
+      }
+
+      // And the check runs where the Grant is written, not at decision time.
+      nexus.store.governance.ensurePrincipal({
+        principal_id: 'kip:principal:subject',
+      })
+      expect(() =>
+        nexus.systemSession().createGrant({
+          space_id: nexus.space,
+          grantee_principal: 'kip:principal:subject',
+          actions: ['read', 'derive'],
+        }),
+      ).toThrowError(/is not a permission this engine implements/)
+
+      // Every name that *is* registered stays parseable: the rule is "no name
+      // without a gate", not "fewer names".
+      for (const name of ['create', 'assert', 'purge', 'manage_grants', 'import']) {
+        expect(() => parsePermission(name), name).not.toThrow()
+      }
+    })
+  })
+
   it('authorizes every dependent before erasing any of them', async () => {
     await withNexus('cascade', (nexus) => {
       const gov = nexus.store.governance
