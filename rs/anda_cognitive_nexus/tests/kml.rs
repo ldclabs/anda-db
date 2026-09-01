@@ -1100,7 +1100,7 @@ async fn only_evidence_has_a_payload_to_purge() {
 
 #[tokio::test]
 async fn a_legal_hold_blocks_a_payload_purge_exactly_as_it_blocks_an_element_purge() {
-    // §19.1: a hold is most often placed precisely to preserve the bytes.
+    // §60.6: a hold is most often placed precisely to preserve the bytes.
     let nexus = with_cited_evidence("purge_payload_hold").await;
     ok(
         &nexus,

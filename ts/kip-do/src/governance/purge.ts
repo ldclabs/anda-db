@@ -66,7 +66,7 @@ export function stage(
     tx.auth,
   )
 
-  // §19.1: a legal hold is exactly the thing purge must not walk past, and it is
+  // §60.3: a legal hold is exactly the thing purge must not walk past, and it is
   // checked before anything destructive is decided. Lifting the hold is a
   // separate Governance decision under its own permission.
   if (hasLegalHold(element)) {
@@ -171,7 +171,7 @@ export function stagePayload(
     tx.auth,
   )
 
-  // §19.1: a legal hold blocks payload purge exactly as it blocks element
+  // §60.6: a legal hold blocks payload purge exactly as it blocks element
   // purge. The bytes are the thing a hold most often exists to preserve.
   if (hasLegalHold(element)) {
     throw errors.legalHoldConflict(
@@ -232,7 +232,7 @@ export function stagePayload(
 }
 
 /**
- * Whether an element is held against erasure (§19.1).
+ * Whether an element is held against erasure (§60.3).
  *
  * A cognitive writer cannot set this: `legal_hold` in a `retention` block needs
  * the `legal_hold` permission of its own, precisely so that content cannot make

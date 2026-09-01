@@ -374,7 +374,7 @@ export function capabilities(): Json {
           'alarm: forgetting happens when a Principal asks for it and is ' +
           'accountable for it',
         actions: ['archive', 'tombstone'],
-        // §19.1. Stated because the replacement semantics and the gate are one
+        // §19.1 and §60.3. Stated because the replacement semantics and the gate are one
         // contract: a caller who read only the first would expect an omitted
         // `legal_hold` to leave the hold alone.
         set:

@@ -938,13 +938,11 @@ fn require_retention_authority(tx: &Transaction, retention: &Json) -> Result<(),
 
 /// Refuses a change to an element's legal hold by a caller who may not make it.
 ///
-/// §19.1 gives the retention hook a `legal_hold` member and says nothing about
-/// what it does; §60.6 supplies the effect — it "blocks payload purge exactly as
-/// it blocks element purge", asserting an element-purge rule the specification
-/// never actually states anywhere. So the effect is settled by intent and the
-/// gate is this engine's own: §29 lets an implementation refine permission
-/// names, and `legal_hold` is one this registry adds, because blocking erasure
-/// for everyone is more authority than deciding how long a record is kept.
+/// §19.1 gives the retention hook its `legal_hold` member and §60.3 states what
+/// it does: a held element may not be purged, by anyone, whatever the reference
+/// policy says. §60.3 then draws the conclusion this gate implements — because a
+/// hold blocks erasure for everyone, the authority to set or lift one SHOULD be
+/// scoped apart from ordinary retention management.
 ///
 /// Both directions are gated. *Placing* a hold is that authority. *Lifting* one
 /// is a writer evading deletion — and lifting does not require naming the

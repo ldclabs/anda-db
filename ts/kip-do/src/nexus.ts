@@ -16,7 +16,7 @@ import { errors, KipError } from './errors.js'
 import { formatElementId } from './id.js'
 
 /**
- * What one retention sweep did, and what it left alone (§19.1).
+ * What one retention sweep did, and what it left alone (§19.1, §60.3).
  *
  * The counts are the point. A sweep that reported only what it touched would
  * read as complete, and "swept 4" when 9 expired is the shape of a compliance
@@ -25,7 +25,7 @@ import { formatElementId } from './id.js'
 export interface RetentionSweep {
   /** The elements it acted on. */
   swept: string[]
-  /** How many were kept because a legal hold blocks removal (§19.1). */
+  /** How many were kept because a legal hold blocks removal (§60.3). */
   held: number
   /** How many the caller was not authorized to act on. */
   refused: number
@@ -891,7 +891,7 @@ export class Session {
    * the engine decides what may be forgotten.
    *
    * Four gates, in this order: `manage_retention` at Space scope, the action's
-   * own permission per element, the legal hold (§19.1), and per-element
+   * own permission per element, the legal hold (§60.3), and per-element
    * authorization. A held or unauthorized element is **skipped and counted**,
    * not silently dropped: "swept 4" when 9 expired is the shape of a compliance
    * failure nobody notices.
@@ -924,7 +924,7 @@ export class Session {
         }
         const element = this.nexus.store.load(id)
         if (element === null) continue
-        // §19.1: a hold blocks removal for everyone, including a sweep the
+        // §60.3: a hold blocks removal for everyone, including a sweep the
         // holder authorized. Reported as held rather than as failed, because
         // nothing went wrong — the record is being kept on purpose.
         if (element.row.retention.legal_hold === true) {

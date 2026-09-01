@@ -322,7 +322,7 @@ pub fn capabilities(authority: Option<&EffectiveAuthority>, auth: &AuthContext) 
                            background timer: forgetting happens when a Principal \
                            asks for it and is accountable for it",
                 "actions": ["archive", "tombstone"],
-                // §19.1. Stated because the replacement semantics and the gate
+                // §19.1 and §60.3. Stated because the replacement semantics and the gate
                 // are one contract: a caller who read only the first would
                 // expect an omitted `legal_hold` to leave the hold alone.
                 "set": "SET RETENTION replaces the whole block rather than \

@@ -2137,7 +2137,7 @@ describe('erasure', () => {
     await withNexus('legal-hold', (nexus) => {
       nexus.execute('SET RETENTION "C-2" {legal_hold: true}')
 
-      // §19.1: the hold is checked before anything destructive is decided, and
+      // §60.3: the hold is checked before anything destructive is decided, and
       // lifting it is a separate decision under its own permission.
       expect(() =>
         nexus.execute('PURGE "C-2" REFERENCE POLICY "tombstone_reference" CONFIRM "PURGE"'),
@@ -2179,7 +2179,7 @@ describe('erasure', () => {
   })
 
   it('needs that same permission to lift one, however the block is written', async () => {
-    // The other half of §19.1, and the one a block-replacing clause makes easy
+    // The other half of §60.3's scoping rule, and the one a block-replacing clause makes easy
     // to miss: `SET RETENTION` replaces rather than patches, so a caller who
     // never mentions `legal_hold` still clears one.
     await withNexus('hold-lifting', (nexus) => {
@@ -2805,7 +2805,7 @@ describe('the host operations no command can reach', () => {
 
       const report = nexus.systemSession().sweepExpired('archive')
       expect(report.swept).toEqual([created.handles.stale])
-      // §19.1: a hold blocks removal for everyone, including a sweep the holder
+      // §60.3: a hold blocks removal for everyone, including a sweep the holder
       // authorized — and the report says so rather than returning a smaller
       // number that reads as the whole truth.
       expect(report.held).toBe(1)

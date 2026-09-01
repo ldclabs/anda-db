@@ -116,7 +116,7 @@ pub async fn stage(
     )
     .await?;
 
-    // §19.1: a legal hold is exactly the thing purge must not walk past, and it
+    // §60.3: a legal hold is exactly the thing purge must not walk past, and it
     // is checked before anything else destructive is decided.
     if has_legal_hold(&element) {
         return Err(KipError::legal_hold_conflict(format!(
@@ -241,7 +241,7 @@ pub async fn stage_payload(
     )
     .await?;
 
-    // §19.1: a legal hold blocks payload purge exactly as it blocks element
+    // §60.6: a legal hold blocks payload purge exactly as it blocks element
     // purge. The bytes are the thing a hold most often exists to preserve.
     if has_legal_hold(&element) {
         return Err(KipError::legal_hold_conflict(format!(
@@ -303,7 +303,7 @@ pub async fn stage_payload(
     })
 }
 
-/// Whether an element is held against erasure (§19.1).
+/// Whether an element is held against erasure (§60.3).
 pub fn has_legal_hold(element: &Element) -> bool {
     element
         .retention()

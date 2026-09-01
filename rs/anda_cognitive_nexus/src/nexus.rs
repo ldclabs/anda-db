@@ -549,7 +549,7 @@ impl Session {
     ///    is not something an element-scoped Grant should confer;
     /// 2. the action's own permission per element (`archive`, `tombstone`,
     ///    `purge`), because expiry is not an exemption from what those cost;
-    /// 3. `legal_hold`, which stops erasure for everyone (§19.1);
+    /// 3. `legal_hold`, which stops erasure for everyone (§60.3);
     /// 4. per-element authorization, so a sweep cannot reach what the caller
     ///    cannot see.
     ///
@@ -591,7 +591,7 @@ impl Session {
                 Ok(element) => element,
                 Err(_) => continue,
             };
-            // §19.1: a hold blocks removal for everyone, including a sweep the
+            // §60.3: a hold blocks removal for everyone, including a sweep the
             // holder authorized. Reported as held rather than as failed, because
             // nothing went wrong — the record is being kept on purpose.
             if element
@@ -1256,7 +1256,7 @@ pub enum RetentionAction {
 pub struct RetentionSweep {
     /// The elements it acted on.
     pub swept: Vec<String>,
-    /// How many were kept because a legal hold blocks removal (§19.1).
+    /// How many were kept because a legal hold blocks removal (§60.3).
     pub held: usize,
     /// How many the caller was not authorized to act on.
     pub refused: usize,

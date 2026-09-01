@@ -687,7 +687,7 @@ async fn a_retention_sweep_acts_on_what_lapsed_and_reports_what_it_left() {
         .await
         .unwrap();
     assert_eq!(report.swept, vec![alice.clone()]);
-    // §19.1: a hold blocks removal for everyone, and the sweep says so rather
+    // §60.3: a hold blocks removal for everyone, and the sweep says so rather
     // than reporting a smaller number that reads as the whole truth.
     assert_eq!(report.held, 1);
 

@@ -3035,8 +3035,9 @@ async fn a_purged_stub_still_names_the_principal_that_wrote_it() {
 
 #[tokio::test]
 async fn a_cognitive_writer_cannot_place_a_legal_hold_to_evade_deletion() {
-    // §19.1 names the member; §29 is what lets this engine give it a
-    // permission of its own, because a hold blocks erasure for everyone.
+    // §19.1 names the member, §60.3 says a hold blocks erasure for everyone
+    // and that the authority to set one SHOULD be scoped apart from ordinary
+    // retention management. This is that scoping.
     let nexus = stocked("legal_hold_authority").await;
     let custodian = agent(nexus.governance(), "kip:principal:custodian").await;
     grant(
@@ -3350,9 +3351,9 @@ async fn a_permission_no_gate_asks_for_is_refused_rather_than_accepted() {
 
 #[tokio::test]
 async fn a_cognitive_writer_cannot_lift_a_legal_hold_by_writing_around_it() {
-    // The other half of §19.1, and the one a block-replacing clause makes easy
-    // to miss: `SET RETENTION` replaces rather than patches, so a caller who
-    // never mentions `legal_hold` still clears one.
+    // The other half of §60.3's scoping rule, and the one a block-replacing
+    // clause makes easy to miss: `SET RETENTION` replaces rather than patches,
+    // so a caller who never mentions `legal_hold` still clears one.
     let nexus = stocked("legal_hold_lifting").await;
     let owner = nexus.system_session();
     let created = run_as(
