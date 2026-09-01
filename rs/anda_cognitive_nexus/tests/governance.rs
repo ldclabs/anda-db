@@ -3035,7 +3035,8 @@ async fn a_purged_stub_still_names_the_principal_that_wrote_it() {
 
 #[tokio::test]
 async fn a_cognitive_writer_cannot_place_a_legal_hold_to_evade_deletion() {
-    // §19.1 names this attack by its shape.
+    // §19.1 names the member; §29 is what lets this engine give it a
+    // permission of its own, because a hold blocks erasure for everyone.
     let nexus = stocked("legal_hold_authority").await;
     let custodian = agent(nexus.governance(), "kip:principal:custodian").await;
     grant(

@@ -1913,15 +1913,20 @@ function authorizeRetention(tx: Transaction, retention: JsonMap): void {
 }
 
 /**
- * Gates a change to an element's legal hold (§19.1).
+ * Gates a change to an element's legal hold.
  *
- * §19.1 names this attack by its shape: a cognitive writer must not be able to
- * evade deletion through the retention hook. So both directions are gated, and
- * both for the same reason. *Placing* a hold blocks erasure for everyone, which
- * is more authority than deciding how long a record is kept. *Lifting* one is
- * the attack stated plainly — and lifting does not require naming the member,
- * because `SET RETENTION` replaces the block rather than patching it: a hold
- * disappears when the next block simply omits it. Gating on the transition
+ * §19.1 gives the retention hook a `legal_hold` member and says nothing about
+ * what it does; §60.6 supplies the effect — it "blocks payload purge exactly as
+ * it blocks element purge", asserting an element-purge rule the specification
+ * never actually states anywhere. So the effect is settled by intent and the
+ * gate is this engine's own: §29 lets an implementation refine permission
+ * names, and `legal_hold` is one this registry adds, because blocking erasure
+ * for everyone is more authority than deciding how long a record is kept.
+ *
+ * Both directions are gated. *Placing* a hold is that authority. *Lifting* one
+ * is a writer evading deletion — and lifting does not require naming the
+ * member, because `SET RETENTION` replaces the block rather than patching it: a
+ * hold disappears when the next block simply omits it. Gating on the transition
  * rather than on the words in the block is what closes that.
  */
 function authorizeLegalHold(
