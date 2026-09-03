@@ -688,7 +688,7 @@ export class Session {
       // leave the work it asked for undone — silently, since the response
       // looks ordinary. An empty stored digest is a transaction journaled
       // before this check existed; those replay as they did.
-      const digest = requestDigest(statement, params)
+      const digest = requestDigest(statement, params, options.operation)
       if (replayed.request_digest !== '' && replayed.request_digest !== digest) {
         throw errors.idempotencyConflict(
           `idempotency key ${JSON.stringify(options.idempotencyKey)} already ` +
@@ -717,7 +717,7 @@ export class Session {
       requestDigest:
         options.idempotencyKey === undefined
           ? undefined
-          : requestDigest(statement, params),
+          : requestDigest(statement, params, options.operation),
       dryRun: options.dryRun,
       // After the spread, for the same reason as the read path: identity is not
       // one of the knobs an options object may turn.
@@ -1314,11 +1314,18 @@ export class Session {
 export function requestDigest(
   statement: KmlStatement,
   params: JsonMap,
+  operation?: JsonMap,
 ): string {
+  // Both parameter blocks, the way the reference engine merges
+  // `request.parameters` with `operation.parameters`: an operation block binds
+  // into the statement exactly as the request one does, so a resend that
+  // varies only that is a *different* request and must not collect the first
+  // one's receipt.
+  const merged = operation === undefined ? params : { ...params, ...operation }
   return sha3_256Text(
     canonicalJson({
       statement: statement as unknown as Json,
-      parameters: Object.keys(params).length === 0 ? null : params,
+      parameters: Object.keys(merged).length === 0 ? null : merged,
     }),
   )
 }
