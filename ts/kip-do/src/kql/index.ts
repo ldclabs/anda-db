@@ -32,6 +32,7 @@ import {
 } from '../store/index.js'
 import { normalizeTime } from '../time.js'
 import {
+  readCount,
   scalarValue,
   readVariable,
   solveAll,
@@ -157,38 +158,67 @@ export function executeKqlPage(query: KqlQuery, cx: KqlContext): KqlAnswer {
   const grouped =
     expressions.some((e) => 'Aggregation' in e) ||
     (query.order_by ?? []).some((item) => item.aggregation !== null)
-  if (grouped) {
-    // Groups page exactly as rows do — through the same window — so the
-    // cursor carries the offset over the same canonical snapshot and page two
-    // of an aggregate continues page one rather than repeating it.
-    const groups = aggregate(context, expressions, solutions, query.order_by)
-    const paged = page(groups, query, b, context.resultLimit(), cursor)
-    const consumed = paged.offset + paged.rows.length
-    return {
-      rows: paged.rows,
-      snapshotSeq: pinnedSeq,
-      validAt,
-      nextCursor:
-        query.limit !== null && consumed < paged.total
-          ? pageToken(cx.space, {
-              family: 'kql',
-              snapshotSeq: pinnedSeq,
-              offset: consumed,
-            })
-          : null,
-    }
-  }
+  // Groups page exactly as rows do — through the same window — so the cursor
+  // carries the offset over the same canonical snapshot and page two of an
+  // aggregate continues page one rather than repeating it. That is the whole
+  // difference between the two branches: what a row *is*, and nothing about
+  // how a page ends.
+  return grouped
+    ? answer(
+        cx,
+        query,
+        pinnedSeq,
+        validAt,
+        page(
+          aggregate(context, expressions, solutions, query.order_by),
+          query,
+          b,
+          context.resultLimit(),
+          cursor,
+        ),
+        (group) => group,
+      )
+    : answer(
+        cx,
+        query,
+        pinnedSeq,
+        validAt,
+        page(
+          sort(context, solutions, query.order_by, b),
+          query,
+          b,
+          context.resultLimit(),
+          cursor,
+        ),
+        (solution) => project(context, expressions, solution),
+      )
+}
 
-  const ordered = sort(context, solutions, query.order_by, b)
-  const paged = page(ordered, query, b, context.resultLimit(), cursor)
+/**
+ * One page of an answer, with the coordinates it was produced under.
+ *
+ * The cursor rule lives here and only here. Grouped projections and row ones
+ * used to carry a copy each, which is two chances to disagree about when a
+ * traversal is finished — and a `nextCursor` that goes `null` one page too
+ * early silently truncates an answer rather than failing.
+ *
+ * The token carries the coordinate this page was read at, so the next page
+ * continues over the same canonical snapshot rather than over whatever the
+ * Space holds by then (§44.8).
+ */
+function answer<T>(
+  cx: KqlContext,
+  query: KqlQuery,
+  pinnedSeq: number,
+  validAt: string | null,
+  paged: { rows: readonly T[]; total: number; offset: number },
+  render: (row: T) => Json,
+): KqlAnswer {
   const consumed = paged.offset + paged.rows.length
   return {
-    rows: paged.rows.map((solution) => project(context, expressions, solution)),
+    rows: paged.rows.map(render),
     snapshotSeq: pinnedSeq,
     validAt,
-    // The cursor carries the coordinate this page was read at, so the next one
-    // continues over the same canonical snapshot rather than over whatever the
-    // Space holds by then (§44.8).
     nextCursor:
       query.limit !== null && consumed < paged.total
         ? pageToken(cx.space, {
@@ -636,7 +666,7 @@ function page<T>(
   cursor: PageCursor | null,
 ): { rows: T[]; total: number; offset: number } {
   const offset = cursor?.offset ?? 0
-  const requested = query.limit === null ? null : count(query.limit, b, 'LIMIT')
+  const requested = query.limit === null ? null : readCount(query.limit, b, 'LIMIT')
   const limit =
     requested === null
       ? governedLimit
@@ -674,16 +704,6 @@ function readCursor(
   return pageCursorFromToken(value, space, 'kql')
 }
 
-function count(scalar: Scalar, b: ReadBindings, what: string): number {
-  const value = scalarValue(scalar, b)
-  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
-    throw errors.typeMismatch(
-      `${what} must be a non-negative integer, got ${JSON.stringify(value)}`,
-    )
-  }
-  return value
-}
-
 export { Context, LIMITS } from './context.js'
 export { evaluateFilter } from './filter.js'
 export {
@@ -694,7 +714,6 @@ export {
   type ReadBindings,
 } from './matching.js'
 export {
-  bindingValue,
   compareSolutions,
   distinct,
   elementBinding,

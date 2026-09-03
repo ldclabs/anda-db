@@ -127,14 +127,6 @@ export function spaceResource(): ResourceContext {
   return { kind: '', schema_ref: '', classification: '', element_id: '' }
 }
 
-/** A resource of one Core kind, optionally narrowed further. */
-export function resourceOf(
-  kind: string,
-  extra: Partial<ResourceContext> = {},
-): ResourceContext {
-  return { ...spaceResource(), kind, ...extra }
-}
-
 /**
  * The resource one Cognitive Element presents to an authorization.
  *

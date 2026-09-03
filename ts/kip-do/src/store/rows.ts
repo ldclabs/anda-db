@@ -60,8 +60,6 @@ export const State = {
   PENDING: 'pending',
 } as const
 
-export type ElementState = (typeof State)[keyof typeof State]
-
 /**
  * One counter per version plane (Spec §6.3, §35.1).
  *
@@ -162,6 +160,37 @@ export interface Envelope {
    * Storage lifecycle only — never `valid_until` (§34).
    */
   expires_at: string
+}
+
+/**
+ * The envelope a newly staged element starts from; commit fills the rest.
+ *
+ * Here rather than beside either caller, because there are two of them —
+ * ordinary KML creation and the request envelope's Evidence ingestion — and an
+ * envelope field added to one and forgotten in the other does not fail: the
+ * write path throws `${table}.${column} was not set` only for a *missing* key,
+ * so a second, stale spelling of this object is exactly the kind of drift that
+ * lands in production as one element kind quietly missing a plane counter.
+ */
+export function blankEnvelope(id: number): Envelope {
+  return {
+    id,
+    space: '',
+    state: State.ACTIVE,
+    version: 0,
+    plane_versions: emptyPlanes(),
+    seq: 0,
+    created_at: '',
+    updated_at: '',
+    created_tx: '',
+    updated_tx: '',
+    origin: {},
+    facets: {},
+    structural: {},
+    governance: {},
+    retention: {},
+    expires_at: '',
+  }
 }
 
 /** A Concept — a unit of meaning (Spec §10). */

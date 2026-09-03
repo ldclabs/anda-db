@@ -11,7 +11,6 @@ import { errors, KipError } from '../errors.js'
 import type { JsonMap } from '../json.js'
 import {
   defines,
-  packageRefOf,
   symbolRefOf,
   type SchemaPackage,
 } from './package.js'
@@ -21,7 +20,6 @@ import {
   isQualified,
   KIND_NAMES,
   parseSymbolRef,
-  type PackageRef,
   type SymbolKind,
   type SymbolRef,
 } from './symbol.js'
@@ -415,6 +413,3 @@ export class SchemaEnvironment {
   }
 }
 
-/** The package reference an artifact declares, as text. */
-export const packageRefText = (artifact: SchemaPackage): string =>
-  formatPackageRef(packageRefOf(artifact) as PackageRef)

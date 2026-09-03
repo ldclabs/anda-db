@@ -22,7 +22,6 @@
 import { errors } from '../errors.js'
 import { isJsonMap, type Json, type JsonMap } from '../json.js'
 import {
-  formatPackageRef,
   parsePackageRef,
   SECTIONS,
   type PackageRef,
@@ -469,11 +468,6 @@ export function symbolRefOf(
   return { package: packageRefOf(artifact), name }
 }
 
-/** The canonical reference text for one of this package's local names. */
-export function symbolTextOf(artifact: SchemaPackage, name: string): string {
-  return `${formatPackageRef(packageRefOf(artifact))}/${name}`
-}
-
 export const conceptTypeDef = (
   artifact: SchemaPackage,
   name: string,
@@ -521,15 +515,3 @@ export const structuralFieldDef = (
 ): StructuralFieldDef | undefined =>
   artifact.definitions?.structural_fields?.[name]
 
-/** The values one of Core's open registries accepts, as this package sees it. */
-export function registryValues(
-  artifact: SchemaPackage,
-  registry: string,
-): string[] {
-  const entry = artifact.definitions?.registry_extensions?.[registry]
-  if (!isJsonMap(entry)) return []
-  const values = entry.values
-  return Array.isArray(values)
-    ? values.filter((value): value is string => typeof value === 'string')
-    : []
-}

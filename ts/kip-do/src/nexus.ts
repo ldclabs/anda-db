@@ -48,6 +48,7 @@ import {
   requirePermitted,
   resolveApproval,
   spaceResource,
+  SYSTEM_PRINCIPAL,
   systemAuth,
   type ActorBindingRow,
   type ApprovalRow,
@@ -106,8 +107,15 @@ import type { Outcome } from './tx.js'
 /** The Space a Nexus uses when the caller names none. */
 export const DEFAULT_SPACE = 'kip:space:default'
 
-/** The Principal a Nexus attributes its own bootstrap writes to. */
-export const SYSTEM_PRINCIPAL = 'kip:principal:system'
+/**
+ * The Principal a Nexus attributes its own bootstrap writes to.
+ *
+ * Re-exported rather than restated: the Governance lattice already fixes this
+ * id, and two spellings of one identity is the kind of drift that reads as a
+ * different Principal only after something has already been written under the
+ * wrong one.
+ */
+export { SYSTEM_PRINCIPAL }
 
 /** Options a host may set when connecting. */
 export interface NexusOptions {
@@ -126,6 +134,9 @@ export class CognitiveNexus {
   readonly store: Store
   readonly space: string
   private readonly storage: DurableObjectStorage
+
+  /** Lazily built by {@link CognitiveNexus.systemSession}. */
+  private system: Session | null = null
 
   private constructor(
     storage: DurableObjectStorage,
@@ -362,9 +373,15 @@ export class CognitiveNexus {
    * The embedded case: one object, one owner, and the object *is* the owner. A
    * host serving more than one caller must not use this — authenticate and go
    * through {@link CognitiveNexus.session}, or every caller is the owner.
+   *
+   * One instance, reused. A `Session` holds identity and nothing else —
+   * authority is re-resolved from the control plane on every command, which is
+   * what makes a revocation take effect for a session that started before it
+   * (§28.6) — so a cached one is not a cached decision, and the convenience
+   * methods below reach it on every call.
    */
   systemSession(): Session {
-    return this.session(systemAuth())
+    return (this.system ??= this.session(systemAuth()))
   }
 
   /** Parses and runs one KML statement, returning its receipt. */

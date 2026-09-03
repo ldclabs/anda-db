@@ -61,7 +61,13 @@ import { parseKip, parserVersion, specRevision } from '../kip/parser.js'
 import { executeKml } from '../kml/index.js'
 import { Context } from '../kql/context.js'
 import { bindCoordinate, type KqlContext } from '../kql/index.js'
-import { scalarValue, type ReadBindings } from '../kql/matching.js'
+import {
+  readCount,
+  readNumber,
+  readText,
+  scalarValue,
+  type ReadBindings,
+} from '../kql/matching.js'
 import { baseline, forecast, type Policy } from '../projection/policy.js'
 import { endpointFromJson, endpointLocal } from '../term.js'
 import {
@@ -158,7 +164,7 @@ export function executeMeta(command: MetaCommand, cx: MetaContext): Json {
           'engine has not built; see DESCRIBE CAPABILITIES',
       )
     }
-    return previewKml(text(command.Preview.Kml, b, 'PREVIEW KML'), cx)
+    return previewKml(readText(command.Preview.Kml, b, 'PREVIEW KML'), cx)
   }
   if ('History' in command) return history(command.History, cx, b)
   if ('Changes' in command) return changes(command.Changes, cx, b)
@@ -193,12 +199,12 @@ function describe(
       cx,
       target.Primer.mode === null
         ? 'compact'
-        : text(target.Primer.mode, b, 'DESCRIBE PRIMER MODE'),
+        : readText(target.Primer.mode, b, 'DESCRIBE PRIMER MODE'),
     )
   }
   if ('Space' in target) {
     const name =
-      target.Space.value === null ? cx.space : text(target.Space.value, b, 'SPACE')
+      target.Space.value === null ? cx.space : readText(target.Space.value, b, 'SPACE')
     const row = cx.store.space(name)
     if (row === null) {
       throw errors.notFoundOrNotVisible(`no MemorySpace ${name}`)
@@ -231,7 +237,7 @@ function describe(
     } as Json
   }
   if ('Package' in target) {
-    const reference = text(target.Package, b, 'DESCRIBE PACKAGE')
+    const reference = readText(target.Package, b, 'DESCRIBE PACKAGE')
     const row = cx.store.packageByRef(reference)
     if (row === null) {
       throw errors.schemaPackageUnavailable(`${reference} is not installed here`)
@@ -255,11 +261,11 @@ function describe(
     ['StructuralField', 'StructuralField'],
   ] as const) {
     if (key in target) {
-      return symbol(cx, kind, text((target as never)[key], b, `DESCRIBE ${key}`))
+      return symbol(cx, kind, readText((target as never)[key], b, `DESCRIBE ${key}`))
     }
   }
   if ('Error' in target) {
-    const code = text(target.Error, b, 'DESCRIBE ERROR')
+    const code = readText(target.Error, b, 'DESCRIBE ERROR')
     const spec = KIP_ERROR_REGISTRY[code as never] as
       | { category: string; retry: string; hint: string }
       | undefined
@@ -274,7 +280,7 @@ function describe(
     } as Json
   }
   if ('Transaction' in target) {
-    const id = text(target.Transaction, b, 'DESCRIBE TRANSACTION')
+    const id = readText(target.Transaction, b, 'DESCRIBE TRANSACTION')
     const row = cx.store.transaction(id)
     if (row === null) {
       throw errors.transactionUnknown(`no transaction ${id} in this Nexus`)
@@ -282,7 +288,7 @@ function describe(
     return describedTransaction(row)
   }
   if ('TransactionByIdempotencyKey' in target) {
-    const key = text(
+    const key = readText(
       target.TransactionByIdempotencyKey,
       b,
       'DESCRIBE TRANSACTION BY IDEMPOTENCY KEY',
@@ -301,7 +307,7 @@ function describe(
     const named =
       target.EpistemicPolicy.value === null
         ? baseline().id
-        : text(target.EpistemicPolicy.value, b, 'DESCRIBE EPISTEMIC POLICY')
+        : readText(target.EpistemicPolicy.value, b, 'DESCRIBE EPISTEMIC POLICY')
     for (const policy of [baseline(), forecast()]) {
       if (policy.id === named) return policyJson(policy)
     }
@@ -470,7 +476,7 @@ function snapshot(
   // on the other reference engine, rather than the two disagreeing silently.
   let seq: number
   if (target.as_of === null && target.at_time !== null) {
-    const at = normalizeTime(text(target.at_time, b, 'DESCRIBE SNAPSHOT AT TIME'), 'AT TIME')
+    const at = normalizeTime(readText(target.at_time, b, 'DESCRIBE SNAPSHOT AT TIME'), 'AT TIME')
     seq = cx.store.seqAtTime(cx.space, at)
   } else {
     seq =
@@ -749,7 +755,7 @@ function list(command: ListCommand, cx: MetaContext, b: ReadBindings): Json {
       command.cursor === null
         ? 0
         : readPageCursor(command.cursor, b, cx.space, 'list').offset
-    const limit = command.limit === null ? null : count(command.limit, b, 'LIMIT')
+    const limit = command.limit === null ? null : readCount(command.limit, b, 'LIMIT')
     const window = items.slice(offset)
     const rows = limit === null ? window : window.slice(0, limit)
     const consumed = offset + rows.length
@@ -844,7 +850,7 @@ function dependents(
       'LIST DEPENDENTS requires the element whose dependents are listed',
     )
   }
-  const named = text(command.element, b, 'LIST DEPENDENTS')
+  const named = readText(command.element, b, 'LIST DEPENDENTS')
   const depth =
     command.depth === null ? 1 : depthBound(scalarValue(command.depth, b))
 
@@ -1078,12 +1084,12 @@ function history(
     limit: Scalar | null
     cursor: Scalar | null
   }) => ({
-    from: paging.from_seq === null ? 0 : count(paging.from_seq, b, 'FROM SEQ'),
+    from: paging.from_seq === null ? 0 : readCount(paging.from_seq, b, 'FROM SEQ'),
     to:
       paging.to_seq === null
         ? Number.MAX_SAFE_INTEGER
-        : count(paging.to_seq, b, 'TO SEQ'),
-    limit: paging.limit === null ? 100 : count(paging.limit, b, 'LIMIT'),
+        : readCount(paging.to_seq, b, 'TO SEQ'),
+    limit: paging.limit === null ? 100 : readCount(paging.limit, b, 'LIMIT'),
     // A history cursor is a page token of its own family (§87.7): one issued
     // by a FIND or a LIST must not continue a chronology.
     offset:
@@ -1106,7 +1112,7 @@ function history(
 
   if ('Element' in command) {
     const id: ElementId = parseElementId(
-      text(command.Element.value, b, 'HISTORY ELEMENT'),
+      readText(command.Element.value, b, 'HISTORY ELEMENT'),
     )
     // Through the read path's choke point, so an element this caller may not
     // read answers exactly as one that was never written does. A history that
@@ -1285,7 +1291,7 @@ function changes(
       ? Number(scalarValue(command.Since.cursor, b))
       : Number(scalarValue(command.AfterSeq.seq, b))
   const limitScalar = 'Since' in command ? command.Since.limit : command.AfterSeq.limit
-  const limit = limitScalar === null ? 100 : count(limitScalar, b, 'LIMIT')
+  const limit = limitScalar === null ? 100 : readCount(limitScalar, b, 'LIMIT')
   if (!Number.isInteger(after) || after < 0) {
     // §87.7: a change cursor is a Space sequence the consumer durably recorded;
     // anything else is `CursorInvalid` with `family: changes`.
@@ -1341,10 +1347,10 @@ function changes(
  * through a search snippet (§88.5).
  */
 function search(command: SearchCommand, cx: MetaContext, b: ReadBindings): Json {
-  const term = text(command.term, b, 'SEARCH')
+  const term = readText(command.term, b, 'SEARCH')
 
   if (command.mode !== null) {
-    const mode = text(command.mode, b, 'MODE')
+    const mode = readText(command.mode, b, 'MODE')
     if (mode !== 'keyword') {
       throw errors.searchModeUnsupported(
         `this engine has no embedding model, so ${JSON.stringify(mode)} search is ` +
@@ -1361,9 +1367,13 @@ function search(command: SearchCommand, cx: MetaContext, b: ReadBindings): Json 
     )
   }
 
-  const threshold = command.threshold === null ? 0 : numberOf(command.threshold, b, 'THRESHOLD')
+  const threshold = command.threshold === null ? 0 : readNumber(command.threshold, b, 'THRESHOLD')
+  // A count, not a number: `LIMIT -1` would reach `slice(0, -1)` and answer
+  // with every hit but the last, and `LIMIT 2.5` would truncate — a mistyped
+  // command answering rather than refusing. The reference engine reads this
+  // slot through `scalar_usize` for the same reason (§102.28).
   const limit =
-    command.limit === null ? 10 : Math.min(numberOf(command.limit, b, 'LIMIT'), 100)
+    command.limit === null ? 10 : Math.min(readCount(command.limit, b, 'LIMIT'), 100)
   const offset =
     command.cursor === null
       ? 0
@@ -1374,7 +1384,7 @@ function search(command: SearchCommand, cx: MetaContext, b: ReadBindings): Json 
     command.with_type === null
       ? null
       : lineageOfSymbol(
-          cx.env.resolveSymbol('ConceptType', text(command.with_type, b, 'WITH TYPE'), 'read'),
+          cx.env.resolveSymbol('ConceptType', readText(command.with_type, b, 'WITH TYPE'), 'read'),
         )
   const withPredicate =
     command.with_predicate === null
@@ -1382,7 +1392,7 @@ function search(command: SearchCommand, cx: MetaContext, b: ReadBindings): Json 
       : lineageOfSymbol(
           cx.env.resolveSymbol(
             'PredicateType',
-            text(command.with_predicate, b, 'WITH PREDICATE'),
+            readText(command.with_predicate, b, 'WITH PREDICATE'),
             'read',
           ),
         )
@@ -1491,48 +1501,6 @@ function search(command: SearchCommand, cx: MetaContext, b: ReadBindings): Json 
         }
       : {}),
   } as unknown as Json
-}
-
-// --- small helpers ----------------------------------------------------------
-
-function numberOf(scalar: Scalar, b: ReadBindings, what: string): number {
-  const value = scalarValue(scalar, b)
-  if (typeof value !== 'number' || !Number.isFinite(value)) {
-    throw errors.typeMismatch(
-      `${what} takes a number, got ${JSON.stringify(value)}`,
-    )
-  }
-  return value
-}
-
-/**
- * A paging count: `LIMIT`, and the `FROM SEQ` / `TO SEQ` bounds of a
- * chronology.
- *
- * Separate from {@link numberOf} because these are *counts*, and a `LIMIT "x"`
- * coerced with `Number` becomes `NaN` and then silently pages nothing — a
- * mistyped command that answers rather than refuses. §102.28 puts a scalar of
- * the wrong type on `TypeMismatch`, which is also what the KQL side of the
- * engine already does for the same clause.
- */
-function count(scalar: Scalar, b: ReadBindings, what: string): number {
-  const value = scalarValue(scalar, b)
-  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
-    throw errors.typeMismatch(
-      `${what} must be a non-negative integer, got ${JSON.stringify(value)}`,
-    )
-  }
-  return value
-}
-
-function text(scalar: Scalar, b: ReadBindings, what: string): string {
-  const value = scalarValue(scalar, b)
-  if (typeof value !== 'string') {
-    throw errors.typeMismatch(
-      `${what} takes a string, got ${JSON.stringify(value)}`,
-    )
-  }
-  return value
 }
 
 export { capabilities, KIP_VERSION } from './capabilities.js'

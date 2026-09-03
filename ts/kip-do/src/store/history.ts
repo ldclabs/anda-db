@@ -33,7 +33,6 @@
 
 import { detailed, errors, type CursorFamily as WireCursorFamily } from '../errors.js'
 import { formatElementId, kindOfTag, tagOf, type ElementId, type ElementKind } from '../id.js'
-import type { Json } from '../json.js'
 import { decodeRow, type SqlRow } from './codec.js'
 import {
   planesFromJson,
@@ -335,16 +334,3 @@ export function schemaVersionAt(sql: SqlStorage, space: string, seq: number): nu
   return row?.version ?? 0
 }
 
-/** The JSON a snapshot answer carries. */
-export function snapshotJson(
-  spaceId: string,
-  coordinate: Coordinate,
-  schemaVersion: number,
-): Json {
-  return {
-    space_id: spaceId,
-    snapshot_seq: coordinate.seq,
-    schema_environment_version: schemaVersion,
-    snapshot_token: snapshotToken(spaceId, coordinate),
-  }
-}

@@ -35,7 +35,7 @@ import {
   validateFacet,
   validateFacetCarrier,
 } from '../schema/index.js'
-import { State, emptyPlanes, type EvidenceRow } from '../store/index.js'
+import { blankEnvelope, type EvidenceRow } from '../store/index.js'
 import { normalizeTime } from '../time.js'
 import type { Transaction } from '../tx.js'
 import { recordsOutcome } from './clauses.js'
@@ -271,22 +271,8 @@ export function mintIngestedEvidence(
 
     const id = tx.mint('Evidence')
     const row: EvidenceRow = {
-      id: id.seq,
-      space: '',
-      state: State.ACTIVE,
-      version: 0,
-      plane_versions: emptyPlanes(),
-      seq: 0,
-      created_at: '',
-      updated_at: '',
-      created_tx: '',
-      updated_tx: '',
-      origin: {},
+      ...blankEnvelope(id.seq),
       facets: ingestedFacets(tx, entry.facets),
-      structural: {},
-      governance: {},
-      retention: {},
-      expires_at: '',
       client_key: clientKey,
       evidence_class: entry.evidence_class,
       payload_mode: 'inline',

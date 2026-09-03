@@ -12,7 +12,7 @@
  */
 
 import { errors } from '../errors.js'
-import type { Json, JsonMap } from '../json.js'
+import type { JsonMap } from '../json.js'
 
 export const BASELINE_ID = 'kip:policy:baseline'
 
@@ -229,6 +229,3 @@ export function modeExclusion(mode: string): string {
   }
 }
 
-/** The policy identity a projection reports. */
-export const policyIdentity = (policy: Policy): Json =>
-  ({ id: policy.id, version: policy.version }) as Json

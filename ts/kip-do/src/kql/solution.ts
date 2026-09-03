@@ -57,18 +57,6 @@ export function bindingKey(binding: Binding): string {
 export const bindingsEqual = (a: Binding, b: Binding): boolean =>
   bindingKey(a) === bindingKey(b)
 
-/** What a projection or a filter sees when it reads a bound variable bare. */
-export function bindingValue(binding: Binding): Json {
-  switch (binding.kind) {
-    case 'element':
-      return formatElementId(binding.id)
-    case 'symbol':
-      return binding.value
-    case 'literal':
-      return binding.value
-  }
-}
-
 /** One assignment of variables to values. */
 export type Solution = ReadonlyMap<string, Binding>
 

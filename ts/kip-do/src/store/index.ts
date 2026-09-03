@@ -19,6 +19,7 @@ export {
   PAYLOAD_PURGED,
   State,
   TABLES,
+  blankEnvelope,
   bumpPlane,
   changeEntryOf,
   classificationOf,
@@ -36,7 +37,6 @@ export {
   type ConceptRow,
   type Element,
   type ElementRow,
-  type ElementState,
   type ElementVersionRow,
   type Envelope,
   type EvidenceRef,
@@ -69,11 +69,6 @@ export {
 
 export {
   Store,
-  asActivity,
-  asAssertion,
-  asConcept,
-  asEvidence,
-  asProposition,
   wireOp,
   type ChangeVerb,
 } from './store.js'
@@ -93,7 +88,6 @@ export {
   elementOfVersion,
   pageCursorFromToken,
   pageToken,
-  snapshotJson,
   snapshotToken,
   type Coordinate,
   type CursorFamily,

@@ -329,6 +329,27 @@ describe('SEARCH', () => {
     })
   })
 
+  it('refuses a LIMIT that is not a count', async () => {
+    await withNexus('limit-shape', (nexus) => {
+      nexus.execute(SETUP)
+      // A negative LIMIT reaches `slice(0, -1)` and would answer with every
+      // hit but the last — a mistyped command answering rather than refusing.
+      // The reference engine reads this slot as a `usize`, so refusing is also
+      // what keeps the two engines agreeing on the same text (§102.28).
+      expect(() => nexus.describe('SEARCH CONCEPT "Alice" LIMIT -1')).toThrowError(
+        /non-negative integer/,
+      )
+      expect(() => nexus.describe('SEARCH CONCEPT "Alice" LIMIT 2.5')).toThrowError(
+        /non-negative integer/,
+      )
+      // The bound that is a count still works, and still bounds.
+      const one = nexus.describe(
+        'SEARCH CONCEPT "Alice" LIMIT 1',
+      ) as unknown as Answer
+      expect(one.hits).toHaveLength(1)
+    })
+  })
+
   it('keeps a Space out of another Space’s results', async () => {
     await withNexus('isolation', (nexus) => {
       nexus.execute('CREATE CONCEPT ?c { TYPE "Person" NAME "Tenant Alpha" }')

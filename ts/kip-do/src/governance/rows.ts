@@ -47,8 +47,6 @@ export const grantId = (rowId: number): string => `kip:grant:${rowId}`
 export const delegationId = (rowId: number): string => `kip:delegation:${rowId}`
 /** The id an Approval row answers to. */
 export const approvalId = (rowId: number): string => `kip:approval:${rowId}`
-/** The id a Governance audit entry answers to. */
-export const auditId = (rowId: number): string => `kip:audit:${rowId}`
 
 /** Reads the row number back out of a minted Governance id. */
 export function rowIdOf(id: string): number | null {
@@ -600,16 +598,6 @@ export function scopeContains(scope: AuthorityScope, other: AuthorityScope): boo
     narrows(scope.classifications, other.classifications) &&
     narrows(scope.elements, other.elements)
   )
-}
-
-/** The intersection of two scopes, as the effective bound of a chain. */
-export function scopeIntersect(a: AuthorityScope, b: AuthorityScope): AuthorityScope {
-  return {
-    kinds: intersect(a.kinds, b.kinds),
-    schema_refs: intersect(a.schema_refs, b.schema_refs),
-    classifications: intersect(a.classifications, b.classifications),
-    elements: intersect(a.elements, b.elements),
-  }
 }
 
 /** Whether two scopes narrow exactly the same things. */

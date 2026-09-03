@@ -678,11 +678,19 @@ export class KipDatabase<Env = KipDatabaseEnv> extends DurableObject<Env> {
 
 /** The execution modes §75 names. */
 const EXECUTION_MODES = ['independent', 'sequence', 'atomic'] as const
-type ExecutionMode = (typeof EXECUTION_MODES)[number]
+/**
+ * Exported because {@link KipDatabase.executeKipBatch} takes one.
+ *
+ * A public method whose argument type has no name is a method a host can only
+ * call with an inline literal, which is the kind of gap a published surface is
+ * supposed to close rather than create.
+ */
+export type ExecutionMode = (typeof EXECUTION_MODES)[number]
 
 /** The `on_error` values §75.2 names. */
 const ON_ERRORS = ['stop', 'continue'] as const
-type OnError = (typeof ON_ERRORS)[number]
+/** Exported for the same reason as {@link ExecutionMode}. */
+export type OnError = (typeof ON_ERRORS)[number]
 
 /** The request envelope this object reads (Spec §71). */
 interface KipRequestEnvelope {

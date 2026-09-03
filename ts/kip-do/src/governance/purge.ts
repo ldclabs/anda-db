@@ -30,8 +30,46 @@ import {
   type Element,
 } from '../store/index.js'
 import type { Transaction } from '../tx.js'
-import { requireApproved } from './approval.js'
+import { requireApproved, type Approved } from './approval.js'
 import { resourceOfElement } from './decision.js'
+
+/**
+ * The gate both purge forms pass through, and it is one gate on purpose.
+ *
+ * §60.6 gives `PURGE PAYLOAD` the same `purge` authority element purge asks
+ * for, and §60.3 puts a legal hold in front of both. Written once because the
+ * two are the same decision about the same element: a version of this check
+ * that drifted would let one door stay open on an element the other refuses,
+ * and the open one destroys the bytes a hold most often exists to preserve.
+ *
+ * The approval it returns is deliberately unspent. Both callers spend it only
+ * after the erasure has actually happened — an approval buys a completed
+ * erasure, not an attempt.
+ */
+function authorizeErasure(
+  tx: Transaction,
+  id: ElementId,
+  element: Element,
+): Approved {
+  const resource = resourceOfElement(element)
+  // §88.11 lists purging critical Evidence among the operations a policy may
+  // require independent approval for, and this is where such an approval is
+  // resolved — bound to this element, not merely to the permission.
+  const approved = requireApproved(
+    tx.store,
+    tx.cx.space,
+    resource,
+    tx.authority.authorize('purge', resource, tx.auth),
+    tx.auth,
+  )
+  if (hasLegalHold(element)) {
+    throw errors.legalHoldConflict(
+      `${formatElementId(id)} is under a legal hold; lifting the hold is a ` +
+        `separate Governance decision under its own permission`,
+    )
+  }
+  return approved
+}
 
 /**
  * `PURGE` — physical erasure, leaving an identity stub (§19.3, §60.3, §60.4).
@@ -54,27 +92,9 @@ export function stage(
 ): void {
   const named = formatElementId(id)
   const element = tx.load(id)
-
-  // §88.11 lists purging critical Evidence among the operations a policy may
-  // require independent approval for, and this is where such an approval is
-  // resolved — bound to this element, not merely to the permission.
-  const approved = requireApproved(
-    tx.store,
-    tx.cx.space,
-    resourceOfElement(element),
-    tx.authority.authorize('purge', resourceOfElement(element), tx.auth),
-    tx.auth,
-  )
-
-  // §60.3: a legal hold is exactly the thing purge must not walk past, and it is
-  // checked before anything destructive is decided. Lifting the hold is a
-  // separate Governance decision under its own permission.
-  if (hasLegalHold(element)) {
-    throw errors.legalHoldConflict(
-      `${named} is under a legal hold; lifting the hold is a separate ` +
-        `Governance decision under its own permission`,
-    )
-  }
+  // §60.3: a legal hold is exactly the thing purge must not walk past, and the
+  // check happens before anything destructive is decided.
+  const approved = authorizeErasure(tx, id, element)
 
   const referrers = tx.store.referrers(tx.cx.space, id)
   if (policy === 'deny_if_referenced' && referrers.length > 0) {
@@ -160,25 +180,10 @@ export function stagePayload(
     )
   }
 
-  // Payload purge asks for the same `purge` authority element purge asks for
-  // (§60.6). A policy that wants to scope the two apart does it through the
-  // element-scoped approval resolved here.
-  const approved = requireApproved(
-    tx.store,
-    tx.cx.space,
-    resourceOfElement(element),
-    tx.authority.authorize('purge', resourceOfElement(element), tx.auth),
-    tx.auth,
-  )
-
-  // §60.6: a legal hold blocks payload purge exactly as it blocks element
-  // purge. The bytes are the thing a hold most often exists to preserve.
-  if (hasLegalHold(element)) {
-    throw errors.legalHoldConflict(
-      `${named} is under a legal hold; lifting the hold is a separate ` +
-        `Governance decision under its own permission`,
-    )
-  }
+  // The same authority and the same hold check element purge asks for: a
+  // policy that wants to scope the two apart does it through the
+  // element-scoped approval resolved here (§60.6).
+  const approved = authorizeErasure(tx, id, element)
 
   if (element.row.payload_mode === PAYLOAD_PURGED) {
     // Purging an already-purged payload yields `no_effect` (§60.6): no version

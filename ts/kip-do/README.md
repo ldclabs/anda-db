@@ -189,6 +189,33 @@ rather than from the error's name. Two cases matter:
 - **`outcome_lookup_required` is never 500.** The write may well have landed.
   500 reads as "nothing happened", and a client acting on that writes again.
 
+## What the package exports
+
+Two entry points, and the split is deliberate.
+
+```ts
+import { KipDatabase, CognitiveNexus, Session } from '@ldclabs/kip-do'
+import { parseSymbolRef, validateAttributes } from '@ldclabs/kip-do/schema'
+```
+
+- **`@ldclabs/kip-do`** is the host's door: the Durable Object, the engine it
+  owns, the identity a host authenticates callers into (`AuthContext`,
+  `principalAuth`, `mergeRequestContext`), the Governance control plane it seeds
+  (`GovernanceStore` and the draft and row shapes), the failure registry it maps
+  onto HTTP statuses, the parser, and the stored shapes a result is read out of.
+- **`@ldclabs/kip-do/schema`** is the Schema Package author's door: the symbol
+  grammar, the definition shapes, and the validators.
+
+The engine's own working parts stay behind those doors — the SQL codec and DDL,
+the FTS segmenter, the bound-parameter guards, the KML/KQL/META executors, the
+per-element redaction and lifecycle helpers. They are not exported, and that is
+the point: an exported symbol is a promise, and a promise about
+`insertStatement` is a promise that the storage layer can never be rewritten.
+Nothing outside the engine ever needed them, so they bought nothing.
+
+`test/surface.test.ts` pins the list. Adding to it is one deliberate line;
+leaking into it is a failing test.
+
 ## Full-text search and multilingual text
 
 `SEARCH CONCEPT | PROPOSITION | EVIDENCE | COGNITION` is built, in keyword mode,

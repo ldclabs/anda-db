@@ -74,7 +74,7 @@ import { tryParseElementId } from '../id.js'
 import type { Json, JsonMap } from '../json.js'
 import { endpointKey } from '../term.js'
 import { nowTime } from '../time.js'
-import { decodeRow, insertStatement, updateStatement, type SqlRow } from './codec.js'
+import { RowStore } from './table.js'
 import type { SpaceRow } from './rows.js'
 
 // ---------------------------------------------------------------------------
@@ -182,13 +182,7 @@ export interface MutationEntry {
 // The store
 // ---------------------------------------------------------------------------
 
-export class GovernanceStore {
-  readonly sql: SqlStorage
-
-  constructor(sql: SqlStorage) {
-    this.sql = sql
-  }
-
+export class GovernanceStore extends RowStore {
   // --- Principals --------------------------------------------------------
 
   /**
@@ -215,7 +209,7 @@ export class GovernanceStore {
       revoked_at: '',
       version: 1,
     }
-    const id = this.insert('gov_principals', row)
+    const id = this.insertRow('gov_principals', row)
     const stored = { ...row, id }
     this.recordMutation({
       operation: 'create_principal',
@@ -237,7 +231,7 @@ export class GovernanceStore {
 
   /** The Principal record that was current at an instant. */
   principalAt(principalId: string, at: string): PrincipalRow | null {
-    const history = this.many<GovernanceAuditRow>(
+    const history = this.all<GovernanceAuditRow>(
       'gov_audit',
       `SELECT * FROM gov_audit
          WHERE resource = ?
@@ -252,7 +246,7 @@ export class GovernanceStore {
 
   /** The MemorySpace governance record that was current at an instant. */
   spaceAt(spaceId: string, at: string): SpaceRow | null {
-    const history = this.many<GovernanceAuditRow>(
+    const history = this.all<GovernanceAuditRow>(
       'gov_audit',
       `SELECT * FROM gov_audit
          WHERE resource = ?
@@ -263,10 +257,11 @@ export class GovernanceStore {
     const row = history.find((entry) => entry.at <= at)
     if (row !== undefined) return row.record as unknown as SpaceRow
     if (history.length > 0) return null
-    const current = this.sql
-      .exec<SqlRow>('SELECT * FROM spaces WHERE space_id = ?', spaceId)
-      .toArray()[0]
-    return current === undefined ? null : decodeRow<SpaceRow>('spaces', current)
+    return this.one<SpaceRow>(
+      'spaces',
+      'SELECT * FROM spaces WHERE space_id = ?',
+      spaceId,
+    )
   }
 
   /**
@@ -284,7 +279,7 @@ export class GovernanceStore {
     row.updated_at = nowTime()
     if (status === govStatus.REVOKED) row.revoked_at = row.updated_at
     row.version += 1
-    this.update('gov_principals', row)
+    this.updateRow('gov_principals', row)
     this.recordMutation({
       operation: 'set_principal_status',
       at: row.updated_at,
@@ -324,9 +319,9 @@ export class GovernanceStore {
           }
     if (existing === null) {
       const { id: _drop, ...insertable } = row
-      row.id = this.insert('gov_principal_groups', insertable)
+      row.id = this.insertRow('gov_principal_groups', insertable)
     } else {
-      this.update('gov_principal_groups', row)
+      this.updateRow('gov_principal_groups', row)
     }
     // The audit entry is what `groupsOfAt` replays, so it carries the whole
     // membership list rather than the delta: the row says who is in the group
@@ -373,14 +368,12 @@ export class GovernanceStore {
    * rather than diffs is what makes this a lookup instead of a reconstruction.
    */
   groupsOfAt(principalId: string, at: string): string[] {
-    const entries = this.sql
-      .exec<SqlRow>(
-        `SELECT * FROM gov_audit WHERE operation = ? AND at <= ? ORDER BY at, id`,
-        'put_group',
-        at,
-      )
-      .toArray()
-      .map((row) => decodeRow<GovernanceAuditRow>('gov_audit', row))
+    const entries = this.all<GovernanceAuditRow>(
+      'gov_audit',
+      'SELECT * FROM gov_audit WHERE operation = ? AND at <= ? ORDER BY at, id',
+      'put_group',
+      at,
+    )
 
     // Last write wins per group. Ordered by `(at, id)` rather than by `at`
     // alone, because two membership changes inside one millisecond would
@@ -417,7 +410,7 @@ export class GovernanceStore {
       revoked_at: '',
       version: 1,
     }
-    const id = this.insert('gov_actor_bindings', row)
+    const id = this.insertRow('gov_actor_bindings', row)
     const stored = { ...row, id }
     this.recordMutation({
       operation: 'create_actor_binding',
@@ -439,7 +432,7 @@ export class GovernanceStore {
     row.updated_at = nowTime()
     row.revoked_at = row.updated_at
     row.version += 1
-    this.update('gov_actor_bindings', row)
+    this.updateRow('gov_actor_bindings', row)
     this.recordMutation({
       operation: 'revoke_actor_binding',
       at: row.updated_at,
@@ -457,7 +450,7 @@ export class GovernanceStore {
    * into another Space.
    */
   bindingsOf(principalId: string, spaceId: string): ActorBindingRow[] {
-    return this.many<ActorBindingRow>(
+    return this.all<ActorBindingRow>(
       'gov_actor_bindings',
       `SELECT * FROM gov_actor_bindings
          WHERE principal_id = ? AND status = ? AND (scope = ? OR scope = ?)
@@ -471,7 +464,7 @@ export class GovernanceStore {
 
   /** The ActorBindings that were in force at a past instant. */
   bindingsAt(principalId: string, spaceId: string, at: string): ActorBindingRow[] {
-    return this.many<ActorBindingRow>(
+    return this.all<ActorBindingRow>(
       'gov_actor_bindings',
       `SELECT * FROM gov_actor_bindings
          WHERE principal_id = ? AND (scope = ? OR scope = ?) ORDER BY id`,
@@ -502,7 +495,7 @@ export class GovernanceStore {
       revoked_at: '',
       version: 1,
     }
-    const id = this.insert('gov_grants', row)
+    const id = this.insertRow('gov_grants', row)
     const stored = { ...row, id }
     this.recordMutation({
       operation: 'create_grant',
@@ -523,7 +516,7 @@ export class GovernanceStore {
     row.updated_at = nowTime()
     row.revoked_at = row.updated_at
     row.version += 1
-    this.update('gov_grants', row)
+    this.updateRow('gov_grants', row)
     this.recordMutation({
       operation: 'revoke_grant',
       at: row.updated_at,
@@ -547,7 +540,7 @@ export class GovernanceStore {
    * deny fail to see a direct allow.
    */
   grantsFor(spaceId: string, principalId: string, groups: readonly string[]): GrantRow[] {
-    const rows = this.many<GrantRow>(
+    const rows = this.all<GrantRow>(
       'gov_grants',
       `SELECT * FROM gov_grants
          WHERE space_id = ? AND grantee_principal = ? AND status = ? ORDER BY id`,
@@ -557,7 +550,7 @@ export class GovernanceStore {
     )
     for (const group of groups) {
       rows.push(
-        ...this.many<GrantRow>(
+        ...this.all<GrantRow>(
           'gov_grants',
           `SELECT * FROM gov_grants
              WHERE space_id = ? AND grantee_group = ? AND status = ? ORDER BY id`,
@@ -582,7 +575,7 @@ export class GovernanceStore {
     groups: readonly string[],
     at: string,
   ): GrantRow[] {
-    const rows = this.many<GrantRow>(
+    const rows = this.all<GrantRow>(
       'gov_grants',
       `SELECT * FROM gov_grants
          WHERE space_id = ? AND grantee_principal = ? ORDER BY id`,
@@ -591,7 +584,7 @@ export class GovernanceStore {
     )
     for (const group of groups) {
       rows.push(
-        ...this.many<GrantRow>(
+        ...this.all<GrantRow>(
           'gov_grants',
           `SELECT * FROM gov_grants WHERE space_id = ? AND grantee_group = ? ORDER BY id`,
           spaceId,
@@ -623,7 +616,7 @@ export class GovernanceStore {
       revoked_at: '',
       version: 1,
     }
-    const id = this.insert('gov_delegations', row)
+    const id = this.insertRow('gov_delegations', row)
     const stored = { ...row, id }
     this.recordMutation({
       operation: 'create_delegation',
@@ -646,7 +639,7 @@ export class GovernanceStore {
     row.updated_at = nowTime()
     row.revoked_at = row.updated_at
     row.version += 1
-    this.update('gov_delegations', row)
+    this.updateRow('gov_delegations', row)
     this.recordMutation({
       operation: 'revoke_delegation',
       at: row.updated_at,
@@ -664,7 +657,7 @@ export class GovernanceStore {
 
   /** The active Delegations naming a Principal as delegate in a Space. */
   delegationsTo(spaceId: string, principalId: string): DelegationRow[] {
-    return this.many<DelegationRow>(
+    return this.all<DelegationRow>(
       'gov_delegations',
       `SELECT * FROM gov_delegations
          WHERE space_id = ? AND delegate_principal = ? AND status = ? ORDER BY id`,
@@ -676,7 +669,7 @@ export class GovernanceStore {
 
   /** The Delegations that were in force at a past instant. */
   delegationsAt(spaceId: string, principalId: string, at: string): DelegationRow[] {
-    return this.many<DelegationRow>(
+    return this.all<DelegationRow>(
       'gov_delegations',
       `SELECT * FROM gov_delegations
          WHERE space_id = ? AND delegate_principal = ? ORDER BY id`,
@@ -705,7 +698,7 @@ export class GovernanceStore {
       created_at: nowTime(),
       created_by: actor,
     }
-    const id = this.insert('gov_policies', row)
+    const id = this.insertRow('gov_policies', row)
     const stored = { ...row, id }
     this.recordMutation({
       operation: 'publish_policy',
@@ -741,7 +734,7 @@ export class GovernanceStore {
 
   /** Every version of a Policy, oldest first. */
   policyVersions(policyId: string): GovernancePolicyRow[] {
-    return this.many<GovernancePolicyRow>(
+    return this.all<GovernancePolicyRow>(
       'gov_policies',
       'SELECT * FROM gov_policies WHERE policy_id = ? ORDER BY version',
       policyId,
@@ -769,7 +762,7 @@ export class GovernanceStore {
       expires_at: draft.expires_at ?? '',
       version: 1,
     }
-    const id = this.insert('gov_approvals', row)
+    const id = this.insertRow('gov_approvals', row)
     const stored = { ...row, id }
     this.recordMutation({
       operation: 'request_approval',
@@ -817,7 +810,7 @@ export class GovernanceStore {
     if (row.approver_ids.length >= row.required) row.status = 'granted'
     row.updated_at = at
     row.version += 1
-    this.update('gov_approvals', row)
+    this.updateRow('gov_approvals', row)
     this.recordMutation({
       operation: 'approve',
       at: row.updated_at,
@@ -842,7 +835,7 @@ export class GovernanceStore {
     row.status = 'consumed'
     row.updated_at = nowTime()
     row.version += 1
-    this.update('gov_approvals', row)
+    this.updateRow('gov_approvals', row)
     this.recordMutation({
       operation: 'consume_approval',
       at: row.updated_at,
@@ -860,7 +853,7 @@ export class GovernanceStore {
   /** The granted, unexpired approvals bound to one operation subject. */
   grantedApprovals(spaceId: string, subjectDigest: string): ApprovalRow[] {
     const now = nowTime()
-    return this.many<ApprovalRow>(
+    return this.all<ApprovalRow>(
       'gov_approvals',
       `SELECT * FROM gov_approvals
          WHERE space_id = ? AND subject_digest = ? AND status = 'granted'
@@ -896,7 +889,7 @@ export class GovernanceStore {
 
   /** Reads audit entries for a Space, newest first. */
   readAudit(spaceId: string, limit: number): GovernanceAuditRow[] {
-    return this.many<GovernanceAuditRow>(
+    return this.all<GovernanceAuditRow>(
       'gov_audit',
       'SELECT * FROM gov_audit WHERE space_id = ? ORDER BY id DESC LIMIT ?',
       spaceId,
@@ -924,40 +917,7 @@ export class GovernanceStore {
       request_id: partial.request_id ?? '',
       tx_id: partial.tx_id ?? '',
     }
-    return this.insert('gov_audit', row)
-  }
-
-  // --- row plumbing ------------------------------------------------------
-
-  private insert(table: string, row: object): number {
-    const { sql, values } = insertStatement(table, row)
-    this.sql.exec(sql, ...values)
-    const found = this.sql
-      .exec<{ id: number }>('SELECT last_insert_rowid() AS id')
-      .toArray()[0]
-    if (!found) throw errors.internalError('no row id after an insert')
-    return found.id
-  }
-
-  private update(table: string, row: { id: number }): void {
-    const { sql, values } = updateStatement(table, row, row.id)
-    this.sql.exec(sql, ...values)
-  }
-
-  private byId<T>(table: string, id: number): T | null {
-    return this.one<T>(table, `SELECT * FROM ${table} WHERE id = ?`, id)
-  }
-
-  private one<T>(table: string, sql: string, ...values: SqlStorageValue[]): T | null {
-    const row = this.sql.exec<SqlRow>(sql, ...values).toArray()[0]
-    return row ? decodeRow<T>(table, row) : null
-  }
-
-  private many<T>(table: string, sql: string, ...values: SqlStorageValue[]): T[] {
-    return this.sql
-      .exec<SqlRow>(sql, ...values)
-      .toArray()
-      .map((row) => decodeRow<T>(table, row))
+    return this.insertRow('gov_audit', row)
   }
 }
 

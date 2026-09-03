@@ -80,7 +80,7 @@ import {
 } from '../schema/index.js'
 import {
   State,
-  emptyPlanes,
+  blankEnvelope,
   type ActivityRow,
   type AssertionRow,
   type ConceptRow,
@@ -2240,26 +2240,7 @@ function collectStructural(
 // --- small helpers ----------------------------------------------------------
 
 /** The envelope a newly staged element starts from; commit fills the rest. */
-function blank(id: ElementId) {
-  return {
-    id: id.seq,
-    space: '',
-    state: State.ACTIVE,
-    version: 0,
-    plane_versions: emptyPlanes(),
-    seq: 0,
-    created_at: '',
-    updated_at: '',
-    created_tx: '',
-    updated_tx: '',
-    origin: {} as JsonMap,
-    facets: {} as JsonMap,
-    structural: {} as JsonMap,
-    governance: {} as JsonMap,
-    retention: {} as JsonMap,
-    expires_at: '',
-  }
-}
+const blank = (id: ElementId) => blankEnvelope(id.seq)
 
 /** A Proposition endpoint written in a KML clause. */
 function termValue(b: Bindings, term: Term, what: string): Json {

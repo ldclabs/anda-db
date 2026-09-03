@@ -45,8 +45,7 @@ import {
   lineageText,
   structuralFieldDef,
 } from '../schema/index.js'
-import { State, type PropositionRow, type SqlRow } from '../store/index.js'
-import { decodeRow } from '../store/codec.js'
+import { State, type PropositionRow } from '../store/index.js'
 import type { Element, ElementRow } from '../store/index.js'
 import { endpointFromJson, endpointKey } from '../term.js'
 import { readPath } from '../view.js'
@@ -357,17 +356,14 @@ function scan(
   wheres.push('state <> ?')
   values.push(State.PENDING)
 
-  const rows = cx.store.sql
-    .exec<SqlRow>(
-      `SELECT * FROM ${table} WHERE ${wheres.join(' AND ')} ORDER BY id`,
-      ...values,
-    )
-    .toArray()
+  const rows = cx.store.all<ElementRow>(
+    table,
+    `SELECT * FROM ${table} WHERE ${wheres.join(' AND ')} ORDER BY id`,
+    ...values,
+  )
   cx.spend('scans', rows.length)
 
-  return rows.map((row) =>
-    cx.remember({ kind, row: decodeRow<ElementRow>(table, row) } as Element),
-  )
+  return rows.map((row) => cx.remember({ kind, row } as Element))
 }
 
 /**
@@ -653,16 +649,14 @@ function tupleCandidates(
   // would mean loading the row a second time to ask whether the caller may see
   // it — and skipping the question would let a tuple pattern match a
   // Proposition that is outside this caller's query universe (§104).
-  const rows = cx.store.sql
-    .exec<SqlRow>(
-      `SELECT * FROM propositions WHERE ${wheres.join(' AND ')} ORDER BY id`,
-      ...values,
-    )
-    .toArray()
+  const rows = cx.store.all<PropositionRow>(
+    'propositions',
+    `SELECT * FROM propositions WHERE ${wheres.join(' AND ')} ORDER BY id`,
+    ...values,
+  )
   cx.spend('scans', rows.length)
 
-  return rows.map((row) => {
-    const decoded = decodeRow<PropositionRow>('propositions', row)
+  return rows.map((decoded) => {
     cx.remember({ kind: 'Proposition', row: decoded })
     return {
       seq: decoded.id,
@@ -1350,4 +1344,62 @@ export { kipLiteral }
 /** Evaluates a `parameter | literal` slot. */
 export function scalarValue(scalar: Scalar, b: ReadBindings): Json {
   return 'Param' in scalar ? parameterValue(b, scalar.Param) : kipLiteral(scalar.Literal)
+}
+
+/**
+ * A paging count: `LIMIT`, and the `FROM SEQ` / `TO SEQ` bounds of a
+ * chronology.
+ *
+ * Its own reader rather than {@link readNumber}, because these are *counts*:
+ * a `LIMIT "x"` coerced with `Number` becomes `NaN` and then silently pages
+ * nothing — a mistyped command that answers instead of refusing. §102.28 puts
+ * a scalar of the wrong type on `TypeMismatch`.
+ *
+ * Read-side only, and named apart from KML's `scalarNumber` / `scalarText` on
+ * purpose: those take `(bindings, value, what)` because they resolve handles as
+ * well as parameters, and one name over two argument orders is a swap the
+ * compiler is the only thing catching.
+ */
+export function readCount(
+  scalar: Scalar,
+  b: ReadBindings,
+  what: string,
+): number {
+  const value = scalarValue(scalar, b)
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+    throw errors.typeMismatch(
+      `${what} must be a non-negative integer, got ${JSON.stringify(value)}`,
+    )
+  }
+  return value
+}
+
+/** A `parameter | literal` slot that must hold a number of any shape. */
+export function readNumber(
+  scalar: Scalar,
+  b: ReadBindings,
+  what: string,
+): number {
+  const value = scalarValue(scalar, b)
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw errors.typeMismatch(
+      `${what} takes a number, got ${JSON.stringify(value)}`,
+    )
+  }
+  return value
+}
+
+/** A `parameter | literal` slot that must hold a string. */
+export function readText(
+  scalar: Scalar,
+  b: ReadBindings,
+  what: string,
+): string {
+  const value = scalarValue(scalar, b)
+  if (typeof value !== 'string') {
+    throw errors.typeMismatch(
+      `${what} takes a string, got ${JSON.stringify(value)}`,
+    )
+  }
+  return value
 }

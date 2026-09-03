@@ -24,13 +24,7 @@ import {
 import type { Json, JsonMap } from '../json.js'
 import { idSet } from '../sql.js'
 import { nowTime } from '../time.js'
-import {
-  decodeRow,
-  insertStatement,
-  rowToJson,
-  updateStatement,
-  type SqlRow,
-} from './codec.js'
+import { decodeRow, rowToJson, type SqlRow } from './codec.js'
 import { applySchema } from './ddl.js'
 import { GovernanceStore } from './governance.js'
 import {
@@ -47,8 +41,6 @@ import {
   planesFromJson,
   State,
   TABLES,
-  type ActivityRow,
-  type AssertionRow,
   type ChangeOp,
   type ConceptRow,
   type Element,
@@ -61,6 +53,7 @@ import {
   type SpaceRow,
   type TransactionRow,
 } from './rows.js'
+import { RowStore } from './table.js'
 
 /**
  * What a change to an element is called in the version log.
@@ -124,9 +117,7 @@ export function wireOp(verb: ChangeVerb): ChangeOp {
   }
 }
 
-export class Store {
-  readonly sql: SqlStorage
-
+export class Store extends RowStore {
   /**
    * The Governance Control Plane's records.
    *
@@ -139,7 +130,7 @@ export class Store {
   readonly governance: GovernanceStore
 
   constructor(sql: SqlStorage) {
-    this.sql = sql
+    super(sql)
     applySchema(sql)
     this.governance = new GovernanceStore(sql)
   }
@@ -148,25 +139,21 @@ export class Store {
 
   /** The Space registry row, or `null` when the Space does not exist. */
   space(spaceId: string): SpaceRow | null {
-    const row = this.sql
-      .exec<SqlRow>('SELECT * FROM spaces WHERE space_id = ?', spaceId)
-      .toArray()[0]
-    return row ? decodeRow<SpaceRow>('spaces', row) : null
+    return this.one<SpaceRow>(
+      'spaces',
+      'SELECT * FROM spaces WHERE space_id = ?',
+      spaceId,
+    )
   }
 
   /** Every Space, in creation order. */
   spaces(): SpaceRow[] {
-    return this.sql
-      .exec<SqlRow>('SELECT * FROM spaces ORDER BY id')
-      .toArray()
-      .map((row) => decodeRow<SpaceRow>('spaces', row))
+    return this.all<SpaceRow>('spaces', 'SELECT * FROM spaces ORDER BY id')
   }
 
   /** Registers a Space. The caller supplies every Governance column. */
   createSpace(row: Omit<SpaceRow, 'id'>): SpaceRow {
-    const { sql, values } = insertStatement('spaces', row)
-    this.sql.exec(sql, ...values)
-    const stored = { ...row, id: this.lastRowId() }
+    const stored = { ...row, id: this.insertRow('spaces', row) }
     this.governance.recordMutation({
       operation: 'create_space',
       at: stored.created_at,
@@ -253,8 +240,7 @@ export class Store {
 
   /** Overwrites a Space registry row. */
   putSpace(row: SpaceRow): void {
-    const { sql, values } = updateStatement('spaces', row, row.id)
-    this.sql.exec(sql, ...values)
+    this.updateRow('spaces', row)
     this.governance.recordMutation({
       operation: 'put_space',
       at: nowTime(),
@@ -322,12 +308,8 @@ export class Store {
   /** Loads one element, or `null` when no such row exists. */
   load(id: ElementId): Element | null {
     const table = TABLES[id.kind]
-    const row = this.sql
-      .exec<SqlRow>(`SELECT * FROM ${table} WHERE id = ?`, id.seq)
-      .toArray()[0]
-    if (!row) return null
-    const decoded = decodeRow<ElementRow>(table, row)
-    if (decoded.state === State.PENDING) return null
+    const decoded = this.byId<ElementRow>(table, id.seq)
+    if (decoded === null || decoded.state === State.PENDING) return null
     // A row written before the planes existed carries `{}`; every reader
     // wants the full counter set, so it is filled in here rather than in each.
     decoded.plane_versions = planesFromJson(decoded.plane_versions)
@@ -344,19 +326,16 @@ export class Store {
   loadMany(kind: ElementKind, seqs: readonly number[]): Element[] {
     if (seqs.length === 0) return []
     const table = TABLES[kind]
-    return this.sql
-      .exec<SqlRow>(
-        `SELECT t.* FROM ${table} t JOIN json_each(?) j ON t.id = j.value
-           WHERE t.state <> ?`,
-        idSet(seqs),
-        State.PENDING,
-      )
-      .toArray()
-      .map((row) => {
-        const decoded = decodeRow<ElementRow>(table, row)
-        decoded.plane_versions = planesFromJson(decoded.plane_versions)
-        return { kind, row: decoded } as Element
-      })
+    return this.all<ElementRow>(
+      table,
+      `SELECT t.* FROM ${table} t JOIN json_each(?) j ON t.id = j.value
+         WHERE t.state <> ?`,
+      idSet(seqs),
+      State.PENDING,
+    ).map((row) => {
+      row.plane_versions = planesFromJson(row.plane_versions)
+      return { kind, row } as Element
+    })
   }
 
   /**
@@ -382,6 +361,10 @@ export class Store {
     // otherwise every keyless Concept in the Space would answer an upsert
     // meant for one of them.
     if (key === '') return null
+    // The one lookup that does not go through `all()`: the duplicate guard has
+    // to see the count *before* anything is decoded, or a Space holding two
+    // Concepts on one key answers a corrupt JSON column with a parse error
+    // instead of the message telling the caller to name the type.
     const rows =
       lineage === null
         ? this.sql
@@ -407,15 +390,16 @@ export class Store {
       )
     }
     const row = rows[0]
-    return row ? decodeRow<ConceptRow>('concepts', row) : null
+    return row === undefined ? null : decodeRow<ConceptRow>('concepts', row)
   }
 
   /** The canonical Proposition for a tuple identity, if it exists. */
   propositionByTuple(tupleKey: string): PropositionRow | null {
-    const row = this.sql
-      .exec<SqlRow>('SELECT * FROM propositions WHERE tuple_key = ?', tupleKey)
-      .toArray()[0]
-    return row ? decodeRow<PropositionRow>('propositions', row) : null
+    return this.one<PropositionRow>(
+      'propositions',
+      'SELECT * FROM propositions WHERE tuple_key = ?',
+      tupleKey,
+    )
   }
 
   /**
@@ -435,18 +419,16 @@ export class Store {
     // tuple (§12.3), which is what `ENSURE` resolves through instead.
     if (clientKey === '' || kind === 'Proposition') return null
     const table = TABLES[kind]
-    const row = this.sql
-      .exec<SqlRow>(
-        // Lowest id wins, deterministically: a database written before this
-        // lookup existed may hold more than one, and a retry that resolved to
-        // a different one each time would be worse than not resolving at all.
-        `SELECT * FROM ${table} WHERE space = ? AND client_key = ? ORDER BY id LIMIT 1`,
-        space,
-        clientKey,
-      )
-      .toArray()[0]
-    if (!row) return null
-    return { kind, row: decodeRow<ElementRow>(table, row) } as Element
+    const row = this.one<ElementRow>(
+      table,
+      // Lowest id wins, deterministically: a database written before this
+      // lookup existed may hold more than one, and a retry that resolved to
+      // a different one each time would be worse than not resolving at all.
+      `SELECT * FROM ${table} WHERE space = ? AND client_key = ? ORDER BY id LIMIT 1`,
+      space,
+      clientKey,
+    )
+    return row === null ? null : ({ kind, row } as Element)
   }
 
   /**
@@ -462,8 +444,7 @@ export class Store {
   put(element: Element, verb: ChangeVerb, txId: string): void {
     const table = TABLES[element.kind]
     const { row } = element
-    const { sql, values } = updateStatement(table, row, row.id)
-    this.sql.exec(sql, ...values)
+    this.updateRow(table, row)
 
     const id = formatElementId({ kind: element.kind, seq: row.id })
     this.appendVersion({
@@ -527,8 +508,7 @@ export class Store {
 
   /** Appends one historical version. */
   appendVersion(row: Omit<ElementVersionRow, 'id'>): void {
-    const { sql, values } = insertStatement('element_versions', row)
-    this.sql.exec(sql, ...values)
+    this.writeRow('element_versions', row)
   }
 
   /**
@@ -539,17 +519,15 @@ export class Store {
    * that existed and was empty.
    */
   versionAt(space: string, id: ElementId, seq: number): ElementVersionRow | null {
-    const row = this.sql
-      .exec<SqlRow>(
-        `SELECT * FROM element_versions
-           WHERE space = ? AND element = ? AND seq <= ?
-           ORDER BY seq DESC, version DESC LIMIT 1`,
-        space,
-        formatElementId(id),
-        seq,
-      )
-      .toArray()[0]
-    return row ? decodeRow<ElementVersionRow>('element_versions', row) : null
+    return this.one<ElementVersionRow>(
+      'element_versions',
+      `SELECT * FROM element_versions
+         WHERE space = ? AND element = ? AND seq <= ?
+         ORDER BY seq DESC, version DESC LIMIT 1`,
+      space,
+      formatElementId(id),
+      seq,
+    )
   }
 
   /** One element's version log, oldest first. */
@@ -560,19 +538,17 @@ export class Store {
     toSeq: number,
     limit: number,
   ): ElementVersionRow[] {
-    return this.sql
-      .exec<SqlRow>(
-        `SELECT * FROM element_versions
-           WHERE space = ? AND element = ? AND seq >= ? AND seq <= ?
-           ORDER BY seq, version LIMIT ?`,
-        space,
-        formatElementId(id),
-        fromSeq,
-        toSeq,
-        limit,
-      )
-      .toArray()
-      .map((row) => decodeRow<ElementVersionRow>('element_versions', row))
+    return this.all<ElementVersionRow>(
+      'element_versions',
+      `SELECT * FROM element_versions
+         WHERE space = ? AND element = ? AND seq >= ? AND seq <= ?
+         ORDER BY seq, version LIMIT ?`,
+      space,
+      formatElementId(id),
+      fromSeq,
+      toSeq,
+      limit,
+    )
   }
 
   /** The Space's whole version log over a coordinate range, oldest first. */
@@ -582,18 +558,16 @@ export class Store {
     toSeq: number,
     limit: number,
   ): ElementVersionRow[] {
-    return this.sql
-      .exec<SqlRow>(
-        `SELECT * FROM element_versions
-           WHERE space = ? AND seq >= ? AND seq <= ?
-           ORDER BY seq, id LIMIT ?`,
-        space,
-        fromSeq,
-        toSeq,
-        limit,
-      )
-      .toArray()
-      .map((row) => decodeRow<ElementVersionRow>('element_versions', row))
+    return this.all<ElementVersionRow>(
+      'element_versions',
+      `SELECT * FROM element_versions
+         WHERE space = ? AND seq >= ? AND seq <= ?
+         ORDER BY seq, id LIMIT ?`,
+      space,
+      fromSeq,
+      toSeq,
+      limit,
+    )
   }
 
   /** One element as it stood at a coordinate, or `null` when it did not exist. */
@@ -621,16 +595,14 @@ export class Store {
 
   /** The committed transaction that produced one Space coordinate, if any. */
   transactionAtSeq(space: string, seq: number): TransactionRow | null {
-    const row = this.sql
-      .exec<SqlRow>(
-        `SELECT * FROM transactions
-           WHERE space = ? AND seq = ? AND status = 'committed'
-           ORDER BY id DESC LIMIT 1`,
-        space,
-        seq,
-      )
-      .toArray()[0]
-    return row ? decodeRow<TransactionRow>('transactions', row) : null
+    return this.one<TransactionRow>(
+      'transactions',
+      `SELECT * FROM transactions
+         WHERE space = ? AND seq = ? AND status = 'committed'
+         ORDER BY id DESC LIMIT 1`,
+      space,
+      seq,
+    )
   }
 
   /** The Schema Environment version that was in force at a coordinate (§20.9). */
@@ -711,8 +683,7 @@ export class Store {
   // --- the transaction journal -------------------------------------------
 
   putTransaction(row: Omit<TransactionRow, 'id'>): void {
-    const { sql, values } = insertStatement('transactions', row)
-    this.sql.exec(sql, ...values)
+    this.writeRow('transactions', row)
   }
 
   /**
@@ -745,10 +716,11 @@ export class Store {
   }
 
   transaction(txId: string): TransactionRow | null {
-    const row = this.sql
-      .exec<SqlRow>('SELECT * FROM transactions WHERE tx_id = ?', txId)
-      .toArray()[0]
-    return row ? decodeRow<TransactionRow>('transactions', row) : null
+    return this.one<TransactionRow>(
+      'transactions',
+      'SELECT * FROM transactions WHERE tx_id = ?',
+      txId,
+    )
   }
 
   /**
@@ -759,14 +731,12 @@ export class Store {
    */
   transactionByKey(space: string, key: string): TransactionRow | null {
     if (key === '') return null
-    const row = this.sql
-      .exec<SqlRow>(
-        'SELECT * FROM transactions WHERE space = ? AND idempotency_key = ?',
-        space,
-        key,
-      )
-      .toArray()[0]
-    return row ? decodeRow<TransactionRow>('transactions', row) : null
+    return this.one<TransactionRow>(
+      'transactions',
+      'SELECT * FROM transactions WHERE space = ? AND idempotency_key = ?',
+      space,
+      key,
+    )
   }
 
   /** The Space's committed transactions over a coordinate range, oldest first. */
@@ -779,48 +749,42 @@ export class Store {
     // Committed only: a `no_effect` outcome is retained so an idempotent
     // resend can replay it (§34.3), but it took no sequence and is not a
     // state-changing commit, so it is not a Change Envelope (§36.1).
-    return this.sql
-      .exec<SqlRow>(
-        `SELECT * FROM transactions
-           WHERE space = ? AND seq >= ? AND seq <= ? AND status = 'committed'
-           ORDER BY seq LIMIT ?`,
-        space,
-        fromSeq,
-        toSeq,
-        limit,
-      )
-      .toArray()
-      .map((row) => decodeRow<TransactionRow>('transactions', row))
+    return this.all<TransactionRow>(
+      'transactions',
+      `SELECT * FROM transactions
+         WHERE space = ? AND seq >= ? AND seq <= ? AND status = 'committed'
+         ORDER BY seq LIMIT ?`,
+      space,
+      fromSeq,
+      toSeq,
+      limit,
+    )
   }
 
   // --- Schema Packages and Environments ----------------------------------
 
   installPackage(row: Omit<SchemaPackageRow, 'id'>): void {
-    const { sql, values } = insertStatement('schema_packages', row)
-    this.sql.exec(sql, ...values)
+    this.writeRow('schema_packages', row)
   }
 
   packageByRef(packageRef: string): SchemaPackageRow | null {
-    const row = this.sql
-      .exec<SqlRow>(
-        'SELECT * FROM schema_packages WHERE package_ref = ?',
-        packageRef,
-      )
-      .toArray()[0]
-    return row ? decodeRow<SchemaPackageRow>('schema_packages', row) : null
+    return this.one<SchemaPackageRow>(
+      'schema_packages',
+      'SELECT * FROM schema_packages WHERE package_ref = ?',
+      packageRef,
+    )
   }
 
   packages(): SchemaPackageRow[] {
-    return this.sql
-      .exec<SqlRow>('SELECT * FROM schema_packages ORDER BY package_id, version')
-      .toArray()
-      .map((row) => decodeRow<SchemaPackageRow>('schema_packages', row))
+    return this.all<SchemaPackageRow>(
+      'schema_packages',
+      'SELECT * FROM schema_packages ORDER BY package_id, version',
+    )
   }
 
   /** Appends a Schema Environment version. Existing versions are never edited. */
   appendSchemaEnv(row: Omit<SchemaEnvRow, 'id'>): void {
-    const { sql, values } = insertStatement('schema_envs', row)
-    this.sql.exec(sql, ...values)
+    this.writeRow('schema_envs', row)
   }
 
   /**
@@ -828,60 +792,19 @@ export class Store {
    * given.
    */
   schemaEnv(space: string, version?: number): SchemaEnvRow | null {
-    const row =
-      version === undefined
-        ? this.sql
-            .exec<SqlRow>(
-              `SELECT * FROM schema_envs WHERE space = ?
-                 ORDER BY version DESC LIMIT 1`,
-              space,
-            )
-            .toArray()[0]
-        : this.sql
-            .exec<SqlRow>(
-              'SELECT * FROM schema_envs WHERE space = ? AND version = ?',
-              space,
-              version,
-            )
-            .toArray()[0]
-    return row ? decodeRow<SchemaEnvRow>('schema_envs', row) : null
-  }
-
-  // --- helpers -----------------------------------------------------------
-
-  /**
-   * The row id SQLite just assigned.
-   *
-   * `SqlStorage` exposes it on the cursor as `lastRowId`, but only for the
-   * statement that wrote it, so it is read immediately rather than carried.
-   */
-  private lastRowId(): number {
-    const row = this.sql
-      .exec<{ id: number }>('SELECT last_insert_rowid() AS id')
-      .toArray()[0]
-    if (!row) throw errors.internalError('no row id after an insert')
-    return row.id
+    return version === undefined
+      ? this.one<SchemaEnvRow>(
+          'schema_envs',
+          `SELECT * FROM schema_envs WHERE space = ?
+             ORDER BY version DESC LIMIT 1`,
+          space,
+        )
+      : this.one<SchemaEnvRow>(
+          'schema_envs',
+          'SELECT * FROM schema_envs WHERE space = ? AND version = ?',
+          space,
+          version,
+        )
   }
 }
 
-/** Narrowing helpers, so a caller can assert the kind it asked for. */
-export const asConcept = (element: Element): ConceptRow =>
-  expect(element, 'Concept') as ConceptRow
-export const asProposition = (element: Element): PropositionRow =>
-  expect(element, 'Proposition') as PropositionRow
-export const asAssertion = (element: Element): AssertionRow =>
-  expect(element, 'Assertion') as AssertionRow
-export const asEvidence = (element: Element): EvidenceRow =>
-  expect(element, 'Evidence') as EvidenceRow
-export const asActivity = (element: Element): ActivityRow =>
-  expect(element, 'Activity') as ActivityRow
-
-function expect(element: Element, kind: ElementKind): ElementRow {
-  if (element.kind !== kind) {
-    throw errors.structuralReferenceInvalid(
-      `${formatElementId({ kind: element.kind, seq: element.row.id })} is a ` +
-        `${element.kind} where a ${kind} was required`,
-    )
-  }
-  return element.row
-}

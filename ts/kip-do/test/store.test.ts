@@ -12,7 +12,9 @@ import {
 import {
   State,
   Store,
+  TABLE_SPECS,
   emptyPlanes,
+  specOf,
   type ConceptRow,
   type Element,
   type PropositionRow,
@@ -584,5 +586,53 @@ describe('the store', () => {
       expect(store.loadMany('Concept', seqs)).toHaveLength(150)
       expect(store.loadMany('Concept', [])).toEqual([])
     })
+  })
+})
+
+describe('the codec and the DDL describe the same tables', () => {
+  /**
+   * Two spellings of one schema, checked against each other.
+   *
+   * `ddl.ts` declares the columns in SQL and `codec.ts` declares them again in
+   * TypeScript, and the halves fail in opposite, unequally loud ways. A column
+   * in the DDL that the codec does not list is simply never written: the row
+   * loads, the value is gone, and nothing throws. A column in the codec that
+   * the DDL does not have fails at the first write, which is the harmless
+   * direction.
+   *
+   * So the quiet direction is what this exists for. It asks the database
+   * itself rather than re-reading either declaration, because a test that
+   * parsed `SCHEMA_STATEMENTS` would agree with the DDL by construction and
+   * catch nothing.
+   */
+  it('lists every column of every table it encodes', async () => {
+    await withStore('codec-ddl-drift', (store) => {
+      for (const table of Object.keys(TABLE_SPECS)) {
+        const actual = store.sql
+          .exec<{ name: string }>(`PRAGMA table_info(${table})`)
+          .toArray()
+          .map((row) => row.name)
+        expect(actual, `${table} is missing from the DDL`).not.toEqual([])
+        // `id` is the rowid: never bound on a write, so the codec omits it.
+        expect(
+          [...specOf(table).columns].sort(),
+          `${table} column drift between codec.ts and ddl.ts`,
+        ).toEqual(actual.filter((name) => name !== 'id').sort())
+      }
+    })
+  })
+
+  it('marks as JSON only columns it actually encodes', () => {
+    // A column named in `json` but absent from `columns` is never bound, so its
+    // encoding rule silently applies to nothing — the failure mode a set and a
+    // list held side by side always has.
+    for (const [table, spec] of Object.entries(TABLE_SPECS)) {
+      for (const column of spec.json) {
+        expect(
+          spec.columns,
+          `${table}.${column} is marked JSON but is not a column`,
+        ).toContain(column)
+      }
+    }
   })
 })

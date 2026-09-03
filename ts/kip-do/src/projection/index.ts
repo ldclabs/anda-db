@@ -45,9 +45,7 @@ import {
   State,
   type AssertionRow,
   type PropositionRow,
-  type SqlRow,
 } from '../store/index.js'
-import { decodeRow } from '../store/codec.js'
 import type { Context } from '../kql/context.js'
 import { nowTime } from '../time.js'
 import { admits, modeExclusion, type Policy } from './policy.js'
@@ -632,18 +630,16 @@ function assertionsAbout(cx: Context, proposition: ElementId): AssertionRow[] {
       .map((element) => element.row as AssertionRow)
       .filter((row) => row.proposition_id === target)
   }
-  const rows = cx.store.sql
-    .exec<SqlRow>(
-      `SELECT * FROM assertions WHERE space = ? AND proposition_id = ?
-         ORDER BY id`,
-      cx.space,
-      target,
-    )
-    .toArray()
+  const rows = cx.store.all<AssertionRow>(
+    'assertions',
+    `SELECT * FROM assertions WHERE space = ? AND proposition_id = ?
+       ORDER BY id`,
+    cx.space,
+    target,
+  )
   cx.spend('scans', rows.length)
   const visible: AssertionRow[] = []
-  for (const row of rows) {
-    const decoded = decodeRow<AssertionRow>('assertions', row)
+  for (const decoded of rows) {
     const id = cx.remember({ kind: 'Assertion', row: decoded })
     if (cx.view(id) === null) continue
     visible.push(decoded)
@@ -737,26 +733,22 @@ export function slotPropositions(
   // rather than named by id alone. A rival this caller may not read must not
   // widen a functional predicate's conflict set: its Assertions would then be
   // read on the caller's behalf and reported as contest.
-  const rows = cx.store.sql
-    .exec<SqlRow>(
-      `SELECT * FROM propositions
-         WHERE space = ? AND state = ?
-           AND subject_key IN (SELECT value FROM json_each(?))
-           AND predicate_lineage = ?
-         ORDER BY id`,
-      cx.space,
-      State.ACTIVE,
-      JSON.stringify(subjectKeys),
-      predicateLineage,
-    )
-    .toArray()
+  const rows = cx.store.all<PropositionRow>(
+    'propositions',
+    `SELECT * FROM propositions
+       WHERE space = ? AND state = ?
+         AND subject_key IN (SELECT value FROM json_each(?))
+         AND predicate_lineage = ?
+       ORDER BY id`,
+    cx.space,
+    State.ACTIVE,
+    JSON.stringify(subjectKeys),
+    predicateLineage,
+  )
   cx.spend('scans', rows.length)
   const visible: ElementId[] = []
   for (const row of rows) {
-    const id = cx.remember({
-      kind: 'Proposition',
-      row: decodeRow<PropositionRow>('propositions', row),
-    })
+    const id = cx.remember({ kind: 'Proposition', row })
     if (cx.view(id) !== null) visible.push(id)
   }
   return visible
@@ -770,6 +762,5 @@ export {
   forecast,
   modeExclusion,
   policyFromSettings,
-  policyIdentity,
   type Policy,
 } from './policy.js'

@@ -130,11 +130,6 @@ export function principalAuth(
   }
 }
 
-/** Whether a caller was authenticated at all. */
-export function isAuthenticated(auth: AuthContext): boolean {
-  return auth.principal_id !== '' && auth.principal_id !== ANONYMOUS_PRINCIPAL
-}
-
 /**
  * The purpose this request should be evaluated under, given what the caller
  * declared in the envelope.
