@@ -158,28 +158,18 @@ export function executeKqlPage(query: KqlQuery, cx: KqlContext): KqlAnswer {
     expressions.some((e) => 'Aggregation' in e) ||
     (query.order_by ?? []).some((item) => item.aggregation !== null)
   if (grouped) {
-    // Groups page exactly as rows do: the cursor carries the offset over the
-    // same canonical snapshot, and the group order is deterministic, so page
-    // two of an aggregate continues page one rather than repeating it.
+    // Groups page exactly as rows do — through the same window — so the
+    // cursor carries the offset over the same canonical snapshot and page two
+    // of an aggregate continues page one rather than repeating it.
     const groups = aggregate(context, expressions, solutions, query.order_by)
-    const offset = cursor?.offset ?? 0
-    const requested = query.limit === null ? null : count(query.limit, b, 'LIMIT')
-    const governed = context.resultLimit()
-    const limit =
-      requested === null
-        ? governed
-        : governed === null
-          ? requested
-          : Math.min(requested, governed)
-    const from = groups.slice(offset)
-    const rows = limit === null ? from : from.slice(0, limit)
-    const consumed = offset + rows.length
+    const paged = page(groups, query, b, context.resultLimit(), cursor)
+    const consumed = paged.offset + paged.rows.length
     return {
-      rows,
+      rows: paged.rows,
       snapshotSeq: pinnedSeq,
       validAt,
       nextCursor:
-        query.limit !== null && consumed < groups.length
+        query.limit !== null && consumed < paged.total
           ? pageToken(cx.space, {
               family: 'kql',
               snapshotSeq: pinnedSeq,
@@ -402,9 +392,15 @@ function aggregate(
   )
   for (const item of orderBy ?? []) {
     if (item.aggregation === null) continue
+    // `!distinct`, so `ORDER BY COUNT(?x)` beside a projected
+    // `COUNT(DISTINCT ?x)` gets its own count: the two name different
+    // numbers, and sorting by the distinct one answers a question nobody
+    // asked.
     const already = plan.some(
       (entry) =>
-        entry.func === item.aggregation && samePath(entry.var, item.variable),
+        entry.func === item.aggregation &&
+        !entry.distinct &&
+        samePath(entry.var, item.variable),
     )
     if (!already) {
       plan.push({ func: item.aggregation, var: item.variable, distinct: false })
@@ -470,7 +466,11 @@ function samePath(
  */
 function sortGroups(
   groups: { key: Json[]; aggregates: Json[] }[],
-  plan: readonly { func: AggregationFunction; var: { var: string; path: readonly PathStep[] } }[],
+  plan: readonly {
+    func: AggregationFunction
+    var: { var: string; path: readonly PathStep[] }
+    distinct: boolean
+  }[],
   keys: readonly { var: string; path: readonly PathStep[] }[],
   orderBy: readonly OrderByItem[] | null,
 ): void {
@@ -493,6 +493,7 @@ function sortGroups(
               index: plan.findIndex(
                 (entry) =>
                   entry.func === item.aggregation &&
+                  !entry.distinct &&
                   samePath(entry.var, item.variable),
               ),
               isAggregate: true,
@@ -507,6 +508,16 @@ function sortGroups(
       }
       sortPlan.push({ ...position, direction: item.direction })
     }
+    // The tie-breaker that makes a paged aggregate safe, for the same reason
+    // `sort` falls back to `compareSolutions`: without a total order, two
+    // pages of one query overlap or skip. The grouping key is unique per
+    // group, so appending it ascending is one — and where `ORDER BY` already
+    // decided, it changes nothing.
+    keys.forEach((_, index) => {
+      if (!sortPlan.some((at) => !at.isAggregate && at.index === index)) {
+        sortPlan.push({ index, isAggregate: false, direction: 'Asc' })
+      }
+    })
   }
 
   groups.sort((a, b) => {
@@ -617,13 +628,13 @@ function compareValues(left: Json, right: Json): number {
  * canonical snapshot (§44.8) and the family that produced it so a `HISTORY`
  * cursor cannot resume a `FIND` (§102.28).
  */
-function page(
-  solutions: readonly Solution[],
+function page<T>(
+  solutions: readonly T[],
   query: KqlQuery,
   b: ReadBindings,
   governedLimit: number | null,
   cursor: PageCursor | null,
-): { rows: Solution[]; total: number; offset: number } {
+): { rows: T[]; total: number; offset: number } {
   const offset = cursor?.offset ?? 0
   const requested = query.limit === null ? null : count(query.limit, b, 'LIMIT')
   const limit =

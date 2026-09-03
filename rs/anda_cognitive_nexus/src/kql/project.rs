@@ -14,7 +14,7 @@
 use anda_kip::{
     AggregationFunction, FindClause, FindExpression, Json, KipError, OrderByItem, OrderDirection,
 };
-use std::cmp::Ordering;
+use std::{cmp::Ordering, collections::HashMap};
 
 use super::Context;
 use super::binding::{Binding, Solutions};
@@ -225,15 +225,24 @@ impl Context<'_> {
         // One group per distinct key tuple, in first-appearance order until
         // the sort below fixes it. A `FIND` of aggregates alone has an empty
         // key, which is one group over every solution — the global aggregate.
+        //
+        // Indexed by the key's canonical text rather than scanned for: a
+        // linear scan per solution is quadratic in the result size, and an
+        // aggregate is exactly the query someone runs over everything.
         let mut groups: Vec<(Vec<Json>, Vec<Vec<Binding>>)> = Vec::new();
+        let mut index: HashMap<String, usize> = HashMap::new();
         for row in &solutions.rows {
             let key: Vec<Json> = keys
                 .iter()
                 .map(|path| self.read_variable(&solutions, row, path))
                 .collect();
-            match groups.iter_mut().find(|(seen, _)| *seen == key) {
-                Some((_, rows)) => rows.push(row.clone()),
-                None => groups.push((key, vec![row.clone()])),
+            let token = serde_json::to_string(&key).unwrap_or_default();
+            match index.get(&token) {
+                Some(at) => groups[*at].1.push(row.clone()),
+                None => {
+                    index.insert(token, groups.len());
+                    groups.push((key, vec![row.clone()]));
+                }
             }
         }
         // `COUNT` over an empty result is `0`, not an empty answer (§44.6):
@@ -262,10 +271,9 @@ impl Context<'_> {
                 let Some(func) = item.aggregation else {
                     continue;
                 };
-                if !plan
-                    .iter()
-                    .any(|(applied, path, _)| *applied == func && same_path(path, &item.variable))
-                {
+                if !plan.iter().any(|(applied, path, distinct)| {
+                    *applied == func && !*distinct && same_path(path, &item.variable)
+                }) {
                     plan.push((func, &item.variable, false));
                 }
             }
@@ -352,10 +360,14 @@ impl Context<'_> {
             Some(items) => {
                 for item in items {
                     let position = match item.aggregation {
+                        // `!distinct`, matching the plan above: `ORDER BY
+                        // COUNT(?x)` beside a projected `COUNT(DISTINCT ?x)`
+                        // names a different number, and sorting by the
+                        // distinct one would answer a question nobody asked.
                         Some(func) => aggregates
                             .iter()
-                            .position(|(applied, path, _)| {
-                                *applied == func && same_path(path, &item.variable)
+                            .position(|(applied, path, distinct)| {
+                                *applied == func && !*distinct && same_path(path, &item.variable)
                             })
                             .map(|index| (index, true)),
                         None => keys
@@ -372,6 +384,19 @@ impl Context<'_> {
                         )));
                     };
                     plan.push((index, is_aggregate, item.direction));
+                }
+                // The tie-breaker that makes a paged aggregate safe, for the
+                // same reason `sort` appends one: without a total order, two
+                // pages of one query overlap or skip. The grouping key is
+                // unique per group, so appending it in ascending order is one
+                // — and where `ORDER BY` already decided, it changes nothing.
+                for index in 0..keys.len() {
+                    if !plan
+                        .iter()
+                        .any(|(at, is_aggregate, _)| !*is_aggregate && *at == index)
+                    {
+                        plan.push((index, false, OrderDirection::Asc));
+                    }
                 }
             }
         }
