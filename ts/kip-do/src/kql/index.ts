@@ -391,7 +391,6 @@ function aggregate(
   const plan = expressions.flatMap((e) =>
     'Aggregation' in e ? [e.Aggregation] : [],
   )
-  const projectedAggregates = plan.length
   for (const item of orderBy ?? []) {
     if (item.aggregation === null) continue
     const already = plan.some(
@@ -438,7 +437,6 @@ function aggregate(
         ? (aggregates[aggregateAt++] ?? null)
         : (key[keyAt++] ?? null),
     )
-    void projectedAggregates
     return values.length === 1 ? (values[0] as Json) : values
   })
 }
