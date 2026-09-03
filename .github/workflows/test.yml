@@ -8,7 +8,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dfinity/setup-dfx@main
       - name: Run clippy
         run: |
@@ -30,7 +30,7 @@ jobs:
       run:
         working-directory: ts/kip-do
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: pnpm/action-setup@v4
         with:
           # The major developers run, so `make test-ts` and this job apply the
@@ -39,7 +39,15 @@ jobs:
           version: 11
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # Not lower than 22.13, and the pin above is why: `version: 11`
+          # floats to the latest pnpm 11, and 11.25.0 raised its own
+          # `engines.node` to >=22.13 — it `require`s `node:sqlite`, which
+          # Node 20 does not have, so `pnpm install` dies before it reads a
+          # single manifest. A floating package manager under a pinned Node is
+          # a break waiting for a patch release; keep this ahead of pnpm's
+          # floor rather than pinning pnpm to a version this repo has not
+          # asked for.
+          node-version: 24
       - name: Install dependencies
         # The lockfile is deliberately not committed (see .gitignore).
         run: pnpm install --no-frozen-lockfile
@@ -65,7 +73,7 @@ jobs:
     # branches in core paths; quality is enforced by the test suites themselves.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dfinity/setup-dfx@main
       - uses: taiki-e/install-action@cargo-llvm-cov
       - name: Collect coverage
