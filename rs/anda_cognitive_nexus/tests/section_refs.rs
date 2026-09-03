@@ -52,6 +52,10 @@ fn sources() -> Vec<PathBuf> {
         "rs/anda_cognitive_nexus/tests",
         "ts/kip-do/src",
         "ts/kip-do/test",
+        // The generators too, and not only what they generate: the `240.18`
+        // this test exists for lived in a codegen script, and a citation
+        // caught only after someone re-runs codegen is caught one step late.
+        "ts/kip-do/scripts",
     ];
     let mut out = Vec::new();
     for relative in roots {
