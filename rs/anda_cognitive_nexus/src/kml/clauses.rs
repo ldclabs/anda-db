@@ -2379,11 +2379,15 @@ fn creation_differs(new: &Element, old: &Element, pristine: bool) -> Option<&'st
         (Element::Evidence(new), Element::Evidence(old)) => {
             differs("evidence_class", new.evidence_class == old.evidence_class)
                 .or_else(|| differs("payload", new.payload_inline == old.payload_inline))
-                .or_else(|| differs("source", new.source_keys == old.source_keys))
+                // The refs rather than the derived keys, and the key rather
+                // than the raw reference just below: each member is compared
+                // in the one shape *both* engines store, so the two cannot
+                // call the same reuse a retry and a conflict.
+                .or_else(|| differs("source", new.source_refs == old.source_refs))
         }
         (Element::Assertion(new), Element::Assertion(old)) => {
             differs("proposition", new.proposition_id == old.proposition_id)
-                .or_else(|| differs("asserted_by", new.asserted_by == old.asserted_by))
+                .or_else(|| differs("asserted_by", new.asserted_by_key == old.asserted_by_key))
                 .or_else(|| differs("stance", new.stance == old.stance))
                 .or_else(|| differs("mode", new.mode == old.mode))
         }
