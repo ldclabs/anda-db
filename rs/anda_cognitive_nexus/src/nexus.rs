@@ -1332,6 +1332,20 @@ impl Session {
             return Ok(None);
         };
 
+        // Authorized before it answers — a replay is still a read of what
+        // this Space did — and before the conflict below, whose refusal names
+        // the transaction the key already committed: a caller that may not
+        // make this write may not learn that either. `ts/kip-do` orders the
+        // two the same way.
+        let resource = ResourceContext::default();
+        for permission in permissions {
+            let decision = authority.authorize(*permission, &resource, auth);
+            if decision.decision == crate::governance::Decision::RequireApproval {
+                continue;
+            }
+            decision.into_result()?;
+        }
+
         // §34.4: the same key on different work is a caller bug, not a retry.
         // Replaying the first outcome would tell the second write it
         // succeeded, hand back a receipt for a transaction that did something
@@ -1351,14 +1365,6 @@ impl Session {
             ));
         }
 
-        let resource = ResourceContext::default();
-        for permission in permissions {
-            let decision = authority.authorize(*permission, &resource, auth);
-            if decision.decision == crate::governance::Decision::RequireApproval {
-                continue;
-            }
-            decision.into_result()?;
-        }
         Ok(Some(crate::kml::replay(&row)))
     }
 
