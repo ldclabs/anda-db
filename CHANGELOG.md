@@ -120,6 +120,32 @@ a `:parameter` status is bound.
   four names it lists.
 - `§240.18` in the generated profile header is `§20.12`, in the generator.
 
+### Added — the §27 invariant coverage matrix
+
+A shared fixture case may now declare the normative vectors it pins
+(`"vectors": ["CORE-001"]`), and `cargo test -p anda_cognitive_nexus --test
+coverage -- --nocapture` prints §102's 38 invariants against them. The registry
+is blunt — *a Core invariant without a vector does not exist* — and nothing in
+this repository had ever said which of its 258 cases pin which of the 83
+vectors that carry an invariant. 20 of 38 are declared covered today; the test
+refuses a vector name the vendored registry does not know, and holds a floor so
+the number cannot quietly fall.
+
+The 331-vector normative suite itself is still not run: it ships as prose plus
+state fixtures and a harness contract (conformance §5), and running it needs an
+out-of-band `seed_fixture` / `set_governance_fixture` path neither engine has.
+The matrix is what makes the size of that gap visible instead of unstated.
+
+### Fixed — §53.4, conflicting mutation specifications
+
+`MUTATE { UPDATE :X SET FIELDS {name:"A"}  UPDATE :X SET FIELDS {name:"B"} }`
+was last-write-wins by clause order in both engines — the hidden behaviour
+§53.4 names. `DuplicateMutationTarget` was registered and never thrown; a plan
+that gives one path two different final values is now refused, plan-wide, the
+way conflicting ordered structural positions already were. Two clauses writing
+the *same* value still agree, and two clauses writing different paths of one
+target still both apply.
+
 ### Fixed — toolchain
 
 - `pnpm-workspace.yaml`'s `minimumReleaseAgeExclude` entries were

@@ -54,6 +54,13 @@ export interface Case {
    * those are cross-engine contracts too.
    */
   envelope?: Record<string, unknown>
+  /**
+   * The normative conformance vectors this case pins, by their §27 short names
+   * (CORE-001, KML-031, …) — the ones §102's invariant registry names. Read by
+   * the Rust harness's coverage report; the
+   * TypeScript harness carries them so the two run the same fixture file.
+   */
+  vectors?: string[]
 }
 
 export interface Fixture {

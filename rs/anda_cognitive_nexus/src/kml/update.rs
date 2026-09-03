@@ -56,11 +56,13 @@ pub async fn apply_action(
         UpdateAction::SetFields(assignments) => {
             let b = bindings(tx, request, operation);
             let fields = assignments_to_json(&b, assignments, Some(view))?;
+            claim(tx, id, "fields", &fields)?;
             set_fields(tx, id, fields).await
         }
         UpdateAction::SetAttributes(assignments) => {
             let b = bindings(tx, request, operation);
             let values = assignments_to_json(&b, assignments, Some(view))?;
+            claim(tx, id, "attributes", &values)?;
             let attributes = attributes_mut(tx, id, "SET ATTRIBUTES").await?;
             let mut changed = Applied::default();
             for (key, value) in values {
@@ -194,6 +196,11 @@ async fn set_facet(
     let b = bindings(tx, request, operation);
     let facets = resolve_facets(tx, &b, std::slice::from_ref(assignment), Some(view))?;
     let pinned = facet_contract(tx, &b, &assignment.facet)?;
+    for (facet, value) in &facets {
+        if let Json::Object(members) = value {
+            claim(tx, id, &format!("facets.{facet}"), members)?;
+        }
+    }
 
     // A Facet assignment merges members rather than replacing the Facet:
     // `SET FACET "MnemonicState" {salience: 0.4}` must not silently drop a
@@ -674,6 +681,20 @@ async fn structural_mut(
         Element::Concept(row) => Ok(&mut row.structural),
         other => Err(immutable_target(other.kind(), id, "structural mutation")),
     }
+}
+
+/// Claims every path one assignment map writes, refusing a plan that
+/// specifies two different final values for one of them (§53.4).
+fn claim(
+    tx: &mut Transaction,
+    id: ElementId,
+    plane: &str,
+    values: &Map<String, Json>,
+) -> Result<(), KipError> {
+    for (name, value) in values {
+        tx.claim_assignment(id, format!("{plane}.{name}"), value)?;
+    }
+    Ok(())
 }
 
 /// The envelope members the runtime owns (§6.3, §28.1).

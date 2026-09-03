@@ -8,7 +8,11 @@
     {
       "name": "a sweep decays a Facet member by reading the target's own value",
       "command": "UPDATE ?m SET FACET \"MnemonicState\" { memory_strength: MUL(?m.facets[\"MnemonicState\"].memory_strength, 0.5) } WHERE { ?m CONCEPT {type: \"Experience\"} } LIMIT 2",
-      "expect": {}
+      "expect": {},
+      "vectors": [
+        "CORE-018",
+        "X-011"
+      ]
     },
     {
       "name": "LIMIT cuts in ascending element id, so the same sweep twice takes the same elements",

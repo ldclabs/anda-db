@@ -27,6 +27,13 @@ export interface Case {
    * those are cross-engine contracts too.
    */
   envelope?: Record<string, unknown>
+  /**
+   * The normative conformance vectors this case pins, by their §27 short names
+   * (CORE-001, KML-031, …) — the ones §102's invariant registry names. Read by
+   * the Rust harness's coverage report; the
+   * TypeScript harness carries them so the two run the same fixture file.
+   */
+  vectors?: string[]
 }
 
 export interface Fixture {
@@ -61,7 +68,10 @@ export const FIXTURES: readonly Fixture[] = [
               "failure"
             ]
           ]
-        }
+        },
+        "vectors": [
+          "X-016"
+        ]
       },
       {
         "name": "an optional grade member may be absent without the grade being incomplete",
@@ -92,7 +102,11 @@ export const FIXTURES: readonly Fixture[] = [
         "command": "UPDATE \"E-1\" SET FACET \"OutcomeRecord\" {outcome_status: \"failure\"}",
         "expect": {
           "error": "ConstraintViolation"
-        }
+        },
+        "vectors": [
+          "GOV-026",
+          "X-017"
+        ]
       },
       {
         "name": "and erasing a grade is rewriting it to absent",
@@ -106,7 +120,10 @@ export const FIXTURES: readonly Fixture[] = [
         "command": "UPDATE \"E-1\" SET FACET \"OutcomeRecord\" {verdict: \"promote\"}",
         "expect": {
           "error": "ConstraintViolation"
-        }
+        },
+        "vectors": [
+          "X-016"
+        ]
       },
       {
         "name": "an optional grade member may still be established after the fact, once",
@@ -309,7 +326,10 @@ export const FIXTURES: readonly Fixture[] = [
           "result": [
             null
           ]
-        }
+        },
+        "vectors": [
+          "CORE-001"
+        ]
       },
       {
         "name": "the Assertion about it does",
@@ -322,7 +342,10 @@ export const FIXTURES: readonly Fixture[] = [
               "stated"
             ]
           ]
-        }
+        },
+        "vectors": [
+          "CORE-006"
+        ]
       },
       {
         "name": "a local predicate name is persisted as its exact symbol",
@@ -349,7 +372,10 @@ export const FIXTURES: readonly Fixture[] = [
           "result": [
             1
           ]
-        }
+        },
+        "vectors": [
+          "CORE-002"
+        ]
       },
       {
         "name": "a new element starts at version 1",
@@ -372,7 +398,10 @@ export const FIXTURES: readonly Fixture[] = [
         "command": "UPDATE ?a SET FIELDS { confidence: 0.1 } WHERE { ?a ASSERTION {} }",
         "expect": {
           "error": "InvalidSyntax"
-        }
+        },
+        "vectors": [
+          "CORE-007"
+        ]
       },
       {
         "name": "a reference slot carries the name and the shape the Specification fixes",
@@ -500,7 +529,10 @@ export const FIXTURES: readonly Fixture[] = [
               }
             }
           ]
-        }
+        },
+        "vectors": [
+          "META-025"
+        ]
       },
       {
         "name": "DEPTH is what turns one hop into the closure",
@@ -554,7 +586,10 @@ export const FIXTURES: readonly Fixture[] = [
               1
             ]
           ]
-        }
+        },
+        "vectors": [
+          "EPI-028"
+        ]
       },
       {
         "name": "a transformation that recorded no Activity lineage is not discoverable",
@@ -633,7 +668,10 @@ export const FIXTURES: readonly Fixture[] = [
       {
         "name": "a payload purge destroys the bytes",
         "command": "PURGE PAYLOAD \"E-1\" CONFIRM \"PURGE\"",
-        "expect": {}
+        "expect": {},
+        "vectors": [
+          "KML-034"
+        ]
       },
       {
         "name": "the payload reports that it was purged, rather than reporting nothing",
@@ -659,7 +697,10 @@ export const FIXTURES: readonly Fixture[] = [
               "active"
             ]
           ]
-        }
+        },
+        "vectors": [
+          "KML-034"
+        ]
       },
       {
         "name": "and so does the citation that pointed at it",
@@ -726,7 +767,11 @@ export const FIXTURES: readonly Fixture[] = [
           "result": [
             "insufficient"
           ]
-        }
+        },
+        "vectors": [
+          "EPI-001",
+          "EPI-025"
+        ]
       },
       {
         "name": "an unsupported Proposition has no support and no opposition",
@@ -747,7 +792,10 @@ export const FIXTURES: readonly Fixture[] = [
           "result": [
             "normalized_support_not_probability"
           ]
-        }
+        },
+        "vectors": [
+          "EPI-007"
+        ]
       },
       {
         "name": "a projection reports the policy it ran under",
@@ -802,7 +850,10 @@ export const FIXTURES: readonly Fixture[] = [
               }
             ]
           ]
-        }
+        },
+        "vectors": [
+          "EPI-015"
+        ]
       },
       {
         "name": "two claims relaying one observation score as one",
@@ -811,7 +862,10 @@ export const FIXTURES: readonly Fixture[] = [
           "result": [
             0.6
           ]
-        }
+        },
+        "vectors": [
+          "EPI-018"
+        ]
       },
       {
         "name": "a fully grounded BELIEF about a Proposition nobody created still answers",
@@ -919,7 +973,10 @@ export const FIXTURES: readonly Fixture[] = [
         "command": "UPDATE ?alice SET FIELDS { governance: {classification: \"public\"} } WHERE { ?alice CONCEPT {key: \"person:alice\"} }",
         "expect": {
           "error": "InvalidSyntax"
-        }
+        },
+        "vectors": [
+          "GOV-018"
+        ]
       },
       {
         "name": "and neither is it writable at creation",
@@ -938,7 +995,11 @@ export const FIXTURES: readonly Fixture[] = [
               "descriptive"
             ]
           ]
-        }
+        },
+        "vectors": [
+          "GOV-005",
+          "GOV-018"
+        ]
       },
       {
         "name": "an unclassified element does not thereby read as public",
@@ -958,7 +1019,10 @@ export const FIXTURES: readonly Fixture[] = [
               "E:<1>"
             ]
           ]
-        }
+        },
+        "vectors": [
+          "GOV-006"
+        ]
       },
       {
         "name": "erasure refuses by default while anything still references the target",
@@ -1297,14 +1361,21 @@ export const FIXTURES: readonly Fixture[] = [
         "params": {},
         "expect": {
           "error": "InvalidRequestEnvelope"
-        }
+        },
+        "vectors": [
+          "CORE-008",
+          "KML-017"
+        ]
       },
       {
         "name": "an Assertion's stance cannot be rewritten in place",
         "command": "UPDATE ?a SET FIELDS { stance: \"reject\" } WHERE { ?a ASSERTION {} }",
         "expect": {
           "error": "InvalidSyntax"
-        }
+        },
+        "vectors": [
+          "CORE-007"
+        ]
       },
       {
         "name": "an archived element leaves ordinary recall",
@@ -1325,7 +1396,10 @@ export const FIXTURES: readonly Fixture[] = [
               "support"
             ]
           ]
-        }
+        },
+        "vectors": [
+          "X-018"
+        ]
       },
       {
         "name": "an element referenced by a tuple still resolves after archiving",
@@ -1358,7 +1432,10 @@ export const FIXTURES: readonly Fixture[] = [
               "merged"
             ]
           ]
-        }
+        },
+        "vectors": [
+          "CORE-020"
+        ]
       },
       {
         "name": "it forwards to the identity that survived",
@@ -1377,7 +1454,11 @@ export const FIXTURES: readonly Fixture[] = [
             "al",
             "alice"
           ]
-        }
+        },
+        "vectors": [
+          "CORE-021",
+          "HIST-008"
+        ]
       },
       {
         "name": "two post-merge writes resolve to one canonical Proposition on the survivor",
@@ -1655,7 +1736,11 @@ export const FIXTURES: readonly Fixture[] = [
       {
         "name": "a sweep decays a Facet member by reading the target's own value",
         "command": "UPDATE ?m SET FACET \"MnemonicState\" { memory_strength: MUL(?m.facets[\"MnemonicState\"].memory_strength, 0.5) } WHERE { ?m CONCEPT {type: \"Experience\"} } LIMIT 2",
-        "expect": {}
+        "expect": {},
+        "vectors": [
+          "CORE-018",
+          "X-011"
+        ]
       },
       {
         "name": "LIMIT cuts in ascending element id, so the same sweep twice takes the same elements",
@@ -1885,7 +1970,10 @@ export const FIXTURES: readonly Fixture[] = [
           "result": [
             "Bob"
           ]
-        }
+        },
+        "vectors": [
+          "KQL-009"
+        ]
       },
       {
         "name": "OPTIONAL pads rather than drops",
@@ -1952,7 +2040,10 @@ export const FIXTURES: readonly Fixture[] = [
           "result": [
             0
           ]
-        }
+        },
+        "vectors": [
+          "KQL-013"
+        ]
       },
       {
         "name": "an archived element is out of recall by default",
@@ -1983,7 +2074,10 @@ export const FIXTURES: readonly Fixture[] = [
         },
         "expect": {
           "error": "CursorInvalid"
-        }
+        },
+        "vectors": [
+          "KQL-017"
+        ]
       },
       {
         "name": "and a number is the same refusal: a cursor is opaque, never a position a caller can type",
@@ -1993,7 +2087,10 @@ export const FIXTURES: readonly Fixture[] = [
         },
         "expect": {
           "error": "CursorInvalid"
-        }
+        },
+        "vectors": [
+          "KQL-018"
+        ]
       },
       {
         "name": "grouping is implicit: the non-aggregated projected expressions are the key",
@@ -2065,7 +2162,10 @@ export const FIXTURES: readonly Fixture[] = [
             ]
           }
         },
-        "expect": {}
+        "expect": {},
+        "vectors": [
+          "RT-031"
+        ]
       },
       {
         "name": "and arrives byte for byte, whitespace and all",
@@ -2074,7 +2174,10 @@ export const FIXTURES: readonly Fixture[] = [
           "result": [
             "I prefer   dark mode."
           ]
-        }
+        },
+        "vectors": [
+          "RT-031"
+        ]
       },
       {
         "name": "the source actor is resolved to something a reader can follow",
@@ -2164,7 +2267,11 @@ export const FIXTURES: readonly Fixture[] = [
             "idempotency_key": "key-1"
           }
         },
-        "expect": {}
+        "expect": {},
+        "vectors": [
+          "RT-015",
+          "TX-015"
+        ]
       },
       {
         "name": "so there is one Cass, not two",
@@ -2206,7 +2313,10 @@ export const FIXTURES: readonly Fixture[] = [
         },
         "expect": {
           "error": "IdempotencyConflict"
-        }
+        },
+        "vectors": [
+          "TX-014"
+        ]
       },
       {
         "name": "so the key still names the work it was spent on",
@@ -2292,7 +2402,10 @@ export const FIXTURES: readonly Fixture[] = [
           "result": [
             3
           ]
-        }
+        },
+        "vectors": [
+          "RT-008"
+        ]
       },
       {
         "name": "an entry that carries a detail object still answers as supported",
@@ -2619,7 +2732,10 @@ export const FIXTURES: readonly Fixture[] = [
             "id": "C-2"
           }
         },
-        "expect": {}
+        "expect": {},
+        "vectors": [
+          "SCHEMA-019"
+        ]
       },
       {
         "name": "an object of the wrong Concept type is refused where the reference is written",
@@ -3009,7 +3125,10 @@ export const FIXTURES: readonly Fixture[] = [
         "command": "MUTATE {\n  CREATE CONCEPT ?ok { TYPE \"Person\" NAME \"Rollback probe\" }\n  CREATE CONCEPT ?bad { TYPE \"Spaceship\" NAME \"Serenity\" }\n}",
         "expect": {
           "error": "SchemaSymbolNotFound"
-        }
+        },
+        "vectors": [
+          "TX-023"
+        ]
       },
       {
         "name": "so the clause that succeeded left nothing behind",
@@ -3132,6 +3251,44 @@ export const FIXTURES: readonly Fixture[] = [
         "expect": {
           "error": "ClientKeyConflict"
         }
+      },
+      {
+        "name": "two clauses that give one target two final values have no answer but a refusal",
+        "command": "MUTATE {\n  UPDATE ?x SET FIELDS {name: \"One\"} WHERE { ?x CONCEPT {key: \"person:alice\"} }\n  UPDATE ?y SET FIELDS {name: \"Two\"} WHERE { ?y CONCEPT {key: \"person:alice\"} }\n}",
+        "expect": {
+          "error": "DuplicateMutationTarget"
+        }
+      },
+      {
+        "name": "and the refused block changed nothing",
+        "command": "FIND(?c.name) WHERE { ?c CONCEPT {key: \"person:alice\"} }",
+        "expect": {
+          "result": [
+            "Alice"
+          ]
+        }
+      },
+      {
+        "name": "two clauses that agree are not in conflict: a plan assembled from parts may say a thing twice",
+        "command": "MUTATE {\n  UPDATE ?x SET FIELDS {name: \"Agreed\"} WHERE { ?x CONCEPT {key: \"person:alice\"} }\n  UPDATE ?y SET FIELDS {name: \"Agreed\"} WHERE { ?y CONCEPT {key: \"person:alice\"} }\n}",
+        "expect": {}
+      },
+      {
+        "name": "nor are two clauses writing different paths of one target",
+        "command": "MUTATE {\n  UPDATE ?x SET FIELDS {name: \"Split\"} WHERE { ?x CONCEPT {key: \"person:alice\"} }\n  UPDATE ?y SET ATTRIBUTES {role: \"lead\"} WHERE { ?y CONCEPT {key: \"person:alice\"} }\n}",
+        "expect": {}
+      },
+      {
+        "name": "so the two writes that agreed and the two that did not overlap both landed",
+        "command": "FIND(?c.name, ?c.attributes.role) WHERE { ?c CONCEPT {key: \"person:alice\"} }",
+        "expect": {
+          "result": [
+            [
+              "Split",
+              "lead"
+            ]
+          ]
+        }
       }
     ]
   },
@@ -3215,4 +3372,4 @@ export const FIXTURES: readonly Fixture[] = [
 ] as unknown as Fixture[]
 
 /** The total number of cases, so a silent shrink is visible. */
-export const CASE_COUNT = 258
+export const CASE_COUNT = 263

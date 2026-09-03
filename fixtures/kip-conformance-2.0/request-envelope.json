@@ -23,7 +23,10 @@
           ]
         }
       },
-      "expect": {}
+      "expect": {},
+      "vectors": [
+        "RT-031"
+      ]
     },
     {
       "name": "and arrives byte for byte, whitespace and all",
@@ -32,7 +35,10 @@
         "result": [
           "I prefer   dark mode."
         ]
-      }
+      },
+      "vectors": [
+        "RT-031"
+      ]
     },
     {
       "name": "the source actor is resolved to something a reader can follow",
@@ -122,7 +128,11 @@
           "idempotency_key": "key-1"
         }
       },
-      "expect": {}
+      "expect": {},
+      "vectors": [
+        "RT-015",
+        "TX-015"
+      ]
     },
     {
       "name": "so there is one Cass, not two",
@@ -164,7 +174,10 @@
       },
       "expect": {
         "error": "IdempotencyConflict"
-      }
+      },
+      "vectors": [
+        "TX-014"
+      ]
     },
     {
       "name": "so the key still names the work it was spent on",
@@ -250,7 +263,10 @@
         "result": [
           3
         ]
-      }
+      },
+      "vectors": [
+        "RT-008"
+      ]
     },
     {
       "name": "an entry that carries a detail object still answers as supported",

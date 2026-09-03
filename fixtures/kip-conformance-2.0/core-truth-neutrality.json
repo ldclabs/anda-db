@@ -14,7 +14,10 @@
         "result": [
           null
         ]
-      }
+      },
+      "vectors": [
+        "CORE-001"
+      ]
     },
     {
       "name": "the Assertion about it does",
@@ -27,7 +30,10 @@
             "stated"
           ]
         ]
-      }
+      },
+      "vectors": [
+        "CORE-006"
+      ]
     },
     {
       "name": "a local predicate name is persisted as its exact symbol",
@@ -54,7 +60,10 @@
         "result": [
           1
         ]
-      }
+      },
+      "vectors": [
+        "CORE-002"
+      ]
     },
     {
       "name": "a new element starts at version 1",
@@ -77,7 +86,10 @@
       "command": "UPDATE ?a SET FIELDS { confidence: 0.1 } WHERE { ?a ASSERTION {} }",
       "expect": {
         "error": "InvalidSyntax"
-      }
+      },
+      "vectors": [
+        "CORE-007"
+      ]
     },
     {
       "name": "a reference slot carries the name and the shape the Specification fixes",

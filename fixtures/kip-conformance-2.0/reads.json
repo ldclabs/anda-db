@@ -35,7 +35,10 @@
         "result": [
           "Bob"
         ]
-      }
+      },
+      "vectors": [
+        "KQL-009"
+      ]
     },
     {
       "name": "OPTIONAL pads rather than drops",
@@ -102,7 +105,10 @@
         "result": [
           0
         ]
-      }
+      },
+      "vectors": [
+        "KQL-013"
+      ]
     },
     {
       "name": "an archived element is out of recall by default",
@@ -133,7 +139,10 @@
       },
       "expect": {
         "error": "CursorInvalid"
-      }
+      },
+      "vectors": [
+        "KQL-017"
+      ]
     },
     {
       "name": "and a number is the same refusal: a cursor is opaque, never a position a caller can type",
@@ -143,7 +152,10 @@
       },
       "expect": {
         "error": "CursorInvalid"
-      }
+      },
+      "vectors": [
+        "KQL-018"
+      ]
     },
     {
       "name": "grouping is implicit: the non-aggregated projected expressions are the key",

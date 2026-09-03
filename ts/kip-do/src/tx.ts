@@ -55,7 +55,7 @@ import {
   type ElementId,
   type ElementKind,
 } from './id.js'
-import { jsonEquals, type Json, type JsonMap } from './json.js'
+import { canonicalJson, jsonEquals, type Json, type JsonMap } from './json.js'
 import type { SchemaEnvironment } from './schema/index.js'
 import {
   State,
@@ -446,7 +446,39 @@ export class Transaction {
     this.handleMap.set(name, id)
   }
 
+  /**
+   * Records one path's final value, refusing a plan that specifies two.
+   *
+   * §53.4: "Conflicting final mutation specifications for the same existing
+   * target SHOULD fail." Clause source order is not a hidden last-write-wins,
+   * and the alternative to failing is exactly that — the caller reads a
+   * success and gets the value they wrote second, or first, depending on an
+   * ordering the language does not give them.
+   *
+   * Two clauses writing the *same* value are not in conflict: a plan assembled
+   * from parts may legitimately say a thing twice.
+   *
+   * @see rs/anda_cognitive_nexus/src/tx.rs — `claim_assignment`
+   */
+  claimAssignment(id: ElementId, path: string, value: Json): void {
+    const key = `${formatElementId(id)}\u0000${path}`
+    const seen = this.assignments.get(key)
+    const token = canonicalJson(value)
+    if (seen === undefined) {
+      this.assignments.set(key, token)
+      return
+    }
+    if (seen !== token) {
+      throw errors.duplicateMutationTarget(
+        `this mutation block gives ${formatElementId(id)}'s \`${path}\` two ` +
+          `different final values; clause order is not a tie-break (§53.4), ` +
+          `so say it once`,
+      )
+    }
+  }
+
   private readonly structuralPositions = new Map<string, Set<number>>()
+  private readonly assignments = new Map<string, string>()
 
   /** Mints an element with no handle — an anonymous `ENSURE PROPOSITION`. */
   mint(kind: ElementKind): ElementId {

@@ -59,6 +59,17 @@ struct Case {
     /// — and those are cross-engine contracts too.
     #[serde(default)]
     envelope: Map<String, Json>,
+    /// The normative conformance vectors this case pins, by their §27 short
+    /// names (`CORE-001`, `KML-031`, …) — the ones §102's invariant registry
+    /// names, which is what the coverage matrix is about.
+    ///
+    /// Declared, not derived: a case covers a vector when someone has read
+    /// both and decided they test the same thing. `tests/coverage.rs` turns
+    /// these into the §27 coverage matrix for §102's invariants, and refuses a
+    /// name the invariant registry does not know.
+    #[serde(default)]
+    #[allow(dead_code)]
+    vectors: Vec<String>,
 }
 
 #[derive(Deserialize)]

@@ -32,11 +32,34 @@ follows from one engine's storage layout belongs in that engine's own tests.
       "command": "FIND(?x) WHERE { ... }",
       "params":  {"p": "..."},          // optional request parameters
       "expect":  {"result": [...]},     // or {"error": "SchemaSymbolNotFound"}
-      "ordered": false                  // top-level array order is contractual
+      "ordered": false,                 // top-level array order is contractual
+      "vectors": ["CORE-001"]           // §102 invariant vectors this case pins
     }
   ]
 }
 ```
+
+## `vectors`, and the coverage matrix
+
+`KIP-2.0-Invariants.md` Part A registers the 38 cross-cutting invariants §102
+requires, and names the conformance vectors that pin each one. It is blunt
+about what that means: *a Core invariant without a vector does not exist.*
+
+These fixtures are this repository's own suite, not the normative one, so a
+case covers a normative vector only when someone has read both and decided they
+test the same thing — which is what `vectors` records. `rs/anda_cognitive_nexus/tests/coverage.rs`
+turns the declarations into the matrix, refuses a name the registry does not
+know, and holds a floor so coverage cannot quietly shrink:
+
+```bash
+cargo test -p anda_cognitive_nexus --test coverage -- --nocapture
+```
+
+Only vectors the registry names are accepted. The suite has 331 vectors and 83
+of them pin an invariant; this field is about those 83, because the matrix is
+what it feeds. Declare one only where the case really does test what the vector
+tests — a wrong claim is worse than a blank, because it reports an invariant as
+covered when nothing checks it.
 
 The Cognitive Memory Profile is installed and activated for every fixture.
 

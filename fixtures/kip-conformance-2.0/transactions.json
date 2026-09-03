@@ -10,7 +10,10 @@
       "command": "MUTATE {\n  CREATE CONCEPT ?ok { TYPE \"Person\" NAME \"Rollback probe\" }\n  CREATE CONCEPT ?bad { TYPE \"Spaceship\" NAME \"Serenity\" }\n}",
       "expect": {
         "error": "SchemaSymbolNotFound"
-      }
+      },
+      "vectors": [
+        "TX-023"
+      ]
     },
     {
       "name": "so the clause that succeeded left nothing behind",
@@ -132,6 +135,44 @@
       "command": "MUTATE {\n  CREATE CONCEPT ?a { TYPE \"Person\" NAME \"Someone Else\" CLIENT KEY \"person:casey\" }\n}",
       "expect": {
         "error": "ClientKeyConflict"
+      }
+    },
+    {
+      "name": "two clauses that give one target two final values have no answer but a refusal",
+      "command": "MUTATE {\n  UPDATE ?x SET FIELDS {name: \"One\"} WHERE { ?x CONCEPT {key: \"person:alice\"} }\n  UPDATE ?y SET FIELDS {name: \"Two\"} WHERE { ?y CONCEPT {key: \"person:alice\"} }\n}",
+      "expect": {
+        "error": "DuplicateMutationTarget"
+      }
+    },
+    {
+      "name": "and the refused block changed nothing",
+      "command": "FIND(?c.name) WHERE { ?c CONCEPT {key: \"person:alice\"} }",
+      "expect": {
+        "result": [
+          "Alice"
+        ]
+      }
+    },
+    {
+      "name": "two clauses that agree are not in conflict: a plan assembled from parts may say a thing twice",
+      "command": "MUTATE {\n  UPDATE ?x SET FIELDS {name: \"Agreed\"} WHERE { ?x CONCEPT {key: \"person:alice\"} }\n  UPDATE ?y SET FIELDS {name: \"Agreed\"} WHERE { ?y CONCEPT {key: \"person:alice\"} }\n}",
+      "expect": {}
+    },
+    {
+      "name": "nor are two clauses writing different paths of one target",
+      "command": "MUTATE {\n  UPDATE ?x SET FIELDS {name: \"Split\"} WHERE { ?x CONCEPT {key: \"person:alice\"} }\n  UPDATE ?y SET ATTRIBUTES {role: \"lead\"} WHERE { ?y CONCEPT {key: \"person:alice\"} }\n}",
+      "expect": {}
+    },
+    {
+      "name": "so the two writes that agreed and the two that did not overlap both landed",
+      "command": "FIND(?c.name, ?c.attributes.role) WHERE { ?c CONCEPT {key: \"person:alice\"} }",
+      "expect": {
+        "result": [
+          [
+            "Split",
+            "lead"
+          ]
+        ]
       }
     }
   ]

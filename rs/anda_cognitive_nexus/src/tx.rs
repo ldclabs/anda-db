@@ -89,6 +89,14 @@ pub struct Transaction {
     /// explicit positions in one mutation plan* and a plan is free to spread
     /// them across clauses.
     structural_positions: BTreeMap<(ElementId, String), BTreeSet<usize>>,
+    /// The final value this mutation plan has already specified, per element
+    /// and path (§53.4).
+    ///
+    /// Plan-wide for the same reason positions are: a `MUTATE` block is
+    /// declarative, so two clauses may name one target, and clause order
+    /// carries no mutation semantics. Two clauses that agree are fine; two
+    /// that disagree have no answer that is not the engine choosing one.
+    assignments: BTreeMap<(ElementId, String), Json>,
     /// The ActorBinding this transaction exercised, when an Assertion was
     /// written under one (§28.3); reported in the Receipt's `origin` (§33.2).
     exercised_binding: Option<String>,
@@ -153,6 +161,7 @@ impl Transaction {
             approval_decisions: Vec::new(),
             governance_audit: Vec::new(),
             structural_positions: BTreeMap::new(),
+            assignments: BTreeMap::new(),
             exercised_binding: None,
         })
     }
@@ -213,6 +222,41 @@ impl Transaction {
             .entry((id, field.to_string()))
             .or_default()
             .insert(index)
+    }
+
+    /// Records one path's final value, refusing a plan that specifies two.
+    ///
+    /// §53.4: "Conflicting final mutation specifications for the same existing
+    /// target SHOULD fail." Clause source order is not a hidden
+    /// last-write-wins, and the alternative to failing is exactly that — the
+    /// caller reads a success and the value they wrote second, or first,
+    /// depending on an ordering the language does not give them.
+    ///
+    /// Two clauses writing the *same* value are not in conflict: a plan
+    /// assembled from parts may legitimately say a thing twice.
+    pub fn claim_assignment(
+        &mut self,
+        id: ElementId,
+        path: String,
+        value: &Json,
+    ) -> Result<(), KipError> {
+        match self.assignments.entry((id, path.clone())) {
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                if entry.get() != value {
+                    return Err(KipError::new(
+                        KipErrorCode::DuplicateMutationTarget,
+                        format!(
+                            "this mutation block gives {id}'s `{path}` two different final \
+                             values; clause order is not a tie-break (§53.4), so say it once"
+                        ),
+                    ));
+                }
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(value.clone());
+            }
+        }
+        Ok(())
     }
 
     /// Re-points a declared handle at an element that already exists.

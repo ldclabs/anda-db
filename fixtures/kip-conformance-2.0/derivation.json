@@ -22,7 +22,10 @@
             }
           }
         ]
-      }
+      },
+      "vectors": [
+        "META-025"
+      ]
     },
     {
       "name": "DEPTH is what turns one hop into the closure",
@@ -76,7 +79,10 @@
             1
           ]
         ]
-      }
+      },
+      "vectors": [
+        "EPI-028"
+      ]
     },
     {
       "name": "a transformation that recorded no Activity lineage is not discoverable",
@@ -155,7 +161,10 @@
     {
       "name": "a payload purge destroys the bytes",
       "command": "PURGE PAYLOAD \"E-1\" CONFIRM \"PURGE\"",
-      "expect": {}
+      "expect": {},
+      "vectors": [
+        "KML-034"
+      ]
     },
     {
       "name": "the payload reports that it was purged, rather than reporting nothing",
@@ -181,7 +190,10 @@
             "active"
           ]
         ]
-      }
+      },
+      "vectors": [
+        "KML-034"
+      ]
     },
     {
       "name": "and so does the citation that pointed at it",

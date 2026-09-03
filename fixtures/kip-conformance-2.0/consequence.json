@@ -20,7 +20,10 @@
             "failure"
           ]
         ]
-      }
+      },
+      "vectors": [
+        "X-016"
+      ]
     },
     {
       "name": "an optional grade member may be absent without the grade being incomplete",
@@ -51,7 +54,11 @@
       "command": "UPDATE \"E-1\" SET FACET \"OutcomeRecord\" {outcome_status: \"failure\"}",
       "expect": {
         "error": "ConstraintViolation"
-      }
+      },
+      "vectors": [
+        "GOV-026",
+        "X-017"
+      ]
     },
     {
       "name": "and erasing a grade is rewriting it to absent",
@@ -65,7 +72,10 @@
       "command": "UPDATE \"E-1\" SET FACET \"OutcomeRecord\" {verdict: \"promote\"}",
       "expect": {
         "error": "ConstraintViolation"
-      }
+      },
+      "vectors": [
+        "X-016"
+      ]
     },
     {
       "name": "an optional grade member may still be established after the fact, once",
