@@ -2134,6 +2134,19 @@ export const FIXTURES: readonly Fixture[] = [
         "expect": {
           "error": "ConstraintViolation"
         }
+      },
+      {
+        "name": "a bounded aggregate takes groups in a repeatable order, so the cut is the same twice",
+        "command": "FIND(?c.name, COUNT(?c)) WHERE { ?c CONCEPT {type: \"Person\"} } ORDER BY ?c.name LIMIT 1",
+        "ordered": true,
+        "expect": {
+          "result": [
+            [
+              "Alice",
+              1
+            ]
+          ]
+        }
       }
     ]
   },
@@ -3372,4 +3385,4 @@ export const FIXTURES: readonly Fixture[] = [
 ] as unknown as Fixture[]
 
 /** The total number of cases, so a silent shrink is visible. */
-export const CASE_COUNT = 263
+export const CASE_COUNT = 264

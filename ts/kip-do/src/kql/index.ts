@@ -158,23 +158,32 @@ export function executeKqlPage(query: KqlQuery, cx: KqlContext): KqlAnswer {
     expressions.some((e) => 'Aggregation' in e) ||
     (query.order_by ?? []).some((item) => item.aggregation !== null)
   if (grouped) {
-    const rows = aggregate(context, expressions, solutions, query.order_by)
-    const offset = 0
-    const limit = query.limit === null ? null : count(query.limit, b, 'LIMIT')
-    const capped = capResults(
-      limit === null ? rows : rows.slice(offset, offset + limit),
-      context.resultLimit(),
-    )
+    // Groups page exactly as rows do: the cursor carries the offset over the
+    // same canonical snapshot, and the group order is deterministic, so page
+    // two of an aggregate continues page one rather than repeating it.
+    const groups = aggregate(context, expressions, solutions, query.order_by)
+    const offset = cursor?.offset ?? 0
+    const requested = query.limit === null ? null : count(query.limit, b, 'LIMIT')
+    const governed = context.resultLimit()
+    const limit =
+      requested === null
+        ? governed
+        : governed === null
+          ? requested
+          : Math.min(requested, governed)
+    const from = groups.slice(offset)
+    const rows = limit === null ? from : from.slice(0, limit)
+    const consumed = offset + rows.length
     return {
-      rows: capped,
+      rows,
       snapshotSeq: pinnedSeq,
       validAt,
       nextCursor:
-        limit !== null && capped.length < rows.length
+        query.limit !== null && consumed < groups.length
           ? pageToken(cx.space, {
               family: 'kql',
               snapshotSeq: pinnedSeq,
-              offset: capped.length,
+              offset: consumed,
             })
           : null,
     }
@@ -631,9 +640,6 @@ function page(
   }
 }
 
-function capResults(rows: Json[], governedLimit: number | null): Json[] {
-  return governedLimit === null ? rows : rows.slice(0, governedLimit)
-}
 
 /** Reads a `CURSOR` slot as the opaque token this engine issues. */
 function readCursor(

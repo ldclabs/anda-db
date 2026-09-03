@@ -199,6 +199,19 @@
       "expect": {
         "error": "ConstraintViolation"
       }
+    },
+    {
+      "name": "a bounded aggregate takes groups in a repeatable order, so the cut is the same twice",
+      "command": "FIND(?c.name, COUNT(?c)) WHERE { ?c CONCEPT {type: \"Person\"} } ORDER BY ?c.name LIMIT 1",
+      "ordered": true,
+      "expect": {
+        "result": [
+          [
+            "Alice",
+            1
+          ]
+        ]
+      }
     }
   ]
 }
